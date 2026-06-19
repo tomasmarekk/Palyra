@@ -18,9 +18,22 @@ pub enum OnboardingFlowArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OnboardingAuthMethodArg {
+    ChatgptLogin,
     ApiKey,
     AnthropicApiKey,
+    AnthropicOauth,
     MinimaxApiKey,
+    MinimaxApiKeyGlobal,
+    MinimaxApiKeyCn,
+    MinimaxOauthGlobal,
+    MinimaxOauthCn,
+    XaiApiKey,
+    XaiDeviceCode,
+    XaiOauth,
+    GeminiCliOauth,
+    GoogleGeminiApiKey,
+    OpenrouterApiKey,
+    OpenrouterOauth,
     Skip,
     ExistingConfig,
 }

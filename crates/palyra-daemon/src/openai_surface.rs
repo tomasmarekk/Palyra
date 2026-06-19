@@ -35,6 +35,13 @@ const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39
 const MINIMAX_OAUTH_DEFAULT_SCOPES: &[&str] = &["group_id", "profile", "model.completion"];
 const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_code";
 const MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS: &[&str] = &["minimax.io", "minimaxi.com"];
+const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+const XAI_DEFAULT_MODEL: &str = "grok-4.3";
+const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai";
+const GOOGLE_GEMINI_DEFAULT_MODEL: &str = "gemini-3.5-flash";
+const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const OPENROUTER_DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const OPENAI_OAUTH_CALLBACK_PATH: &str = "console/v1/auth/providers/openai/callback";
 
 /// Validates an OpenAI API key against the provider's models endpoint, then
@@ -2587,7 +2594,11 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
     // MiniMax rides the anthropic-compatible provider runtime, so both map to
     // the same model_provider.kind; auth_provider_kind keeps them distinct.
     let provider_kind_value = match provider_kind {
-        ModelProviderAuthProviderKind::Openai => "openai_compatible",
+        ModelProviderAuthProviderKind::Openai
+        | ModelProviderAuthProviderKind::Xai
+        | ModelProviderAuthProviderKind::GoogleGemini
+        | ModelProviderAuthProviderKind::GoogleGeminiCli
+        | ModelProviderAuthProviderKind::Openrouter => "openai_compatible",
         ModelProviderAuthProviderKind::Anthropic | ModelProviderAuthProviderKind::Minimax => {
             "anthropic"
         }
@@ -2661,6 +2672,43 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 &mut document,
                 "model_provider.anthropic_model",
                 MINIMAX_DEFAULT_MODEL,
+            )?;
+        }
+        ModelProviderAuthProviderKind::Xai => {
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_base_url",
+                XAI_DEFAULT_BASE_URL,
+            )?;
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_model",
+                XAI_DEFAULT_MODEL,
+            )?;
+        }
+        ModelProviderAuthProviderKind::GoogleGemini
+        | ModelProviderAuthProviderKind::GoogleGeminiCli => {
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_base_url",
+                GOOGLE_GEMINI_OPENAI_BASE_URL,
+            )?;
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_model",
+                GOOGLE_GEMINI_DEFAULT_MODEL,
+            )?;
+        }
+        ModelProviderAuthProviderKind::Openrouter => {
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_base_url",
+                OPENROUTER_DEFAULT_BASE_URL,
+            )?;
+            set_string_value_at_path(
+                &mut document,
+                "model_provider.openai_model",
+                OPENROUTER_DEFAULT_MODEL,
             )?;
         }
     }

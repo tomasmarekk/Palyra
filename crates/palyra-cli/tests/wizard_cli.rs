@@ -681,6 +681,77 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
 }
 
 #[test]
+fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("config").join("palyra.toml");
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let output = run_cli(
+        &workdir,
+        &[
+            "setup",
+            "--wizard",
+            "--mode",
+            "local",
+            "--path",
+            &config_path_string,
+            "--force",
+            "--flow",
+            "quickstart",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "openrouter-api-key",
+            "--api-key-env",
+            "OPENROUTER_API_KEY",
+            "--skip-channels",
+            "--skip-skills",
+            "--skip-health",
+        ],
+        &[("OPENROUTER_API_KEY", "sk-openrouter-test-setup")],
+    )?;
+    assert!(
+        output.status.success(),
+        "OpenRouter quickstart should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        written.contains("auth_provider_kind = \"openrouter\""),
+        "expected OpenRouter auth provider kind: {written}"
+    );
+    assert!(
+        written.contains("openai_base_url = \"https://openrouter.ai/api/v1\""),
+        "expected OpenRouter OpenAI-compatible base URL: {written}"
+    );
+    assert!(
+        written.contains("default_chat_model_id = \"~openai/gpt-latest\""),
+        "expected OpenRouter default chat model: {written}"
+    );
+    assert!(
+        written.contains("provider_id = \"openrouter-primary\""),
+        "expected OpenRouter provider registry entry: {written}"
+    );
+    assert!(
+        written.contains("api_key_vault_ref = \"global/openrouter_api_key\""),
+        "expected vault-backed OpenRouter registry auth: {written}"
+    );
+
+    let revealed =
+        run_cli(&workdir, &["secrets", "get", "global", "openrouter_api_key", "--reveal"], &[])?;
+    assert!(
+        revealed.status.success(),
+        "secrets get --reveal should succeed after OpenRouter setup: {}",
+        String::from_utf8_lossy(&revealed.stderr)
+    );
+    let revealed_secret =
+        String::from_utf8(revealed.stdout).context("revealed secret should be valid UTF-8")?;
+    assert_eq!(revealed_secret.trim_end(), "sk-openrouter-test-setup");
+    Ok(())
+}
+
+#[test]
 fn onboarding_wizard_existing_config_preserves_ready_auth_state() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");

@@ -293,6 +293,10 @@ pub enum ModelProviderAuthProviderKind {
     Openai,
     Anthropic,
     Minimax,
+    Xai,
+    GoogleGemini,
+    GoogleGeminiCli,
+    Openrouter,
 }
 
 impl ModelProviderAuthProviderKind {
@@ -303,6 +307,10 @@ impl ModelProviderAuthProviderKind {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Minimax => "minimax",
+            Self::Xai => "xai",
+            Self::GoogleGemini => "google_gemini",
+            Self::GoogleGeminiCli => "google_gemini_cli",
+            Self::Openrouter => "openrouter",
         }
     }
 
@@ -315,6 +323,12 @@ impl ModelProviderAuthProviderKind {
             "openai" | "openai_compatible" | "openai-compatible" => Ok(Self::Openai),
             "anthropic" => Ok(Self::Anthropic),
             "minimax" | "minimax-portal" => Ok(Self::Minimax),
+            "xai" | "x-ai" | "grok" => Ok(Self::Xai),
+            "google_gemini" | "google-gemini" | "gemini" => Ok(Self::GoogleGemini),
+            "google_gemini_cli" | "google-gemini-cli" | "gemini_cli" | "gemini-cli" => {
+                Ok(Self::GoogleGeminiCli)
+            }
+            "openrouter" | "open-router" => Ok(Self::Openrouter),
             _ => anyhow::bail!("unsupported model provider auth provider kind: {value}"),
         }
     }
@@ -464,6 +478,19 @@ impl ModelProviderConfig {
 fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderRegistryConfig {
     let provider_id = match (config.kind, config.auth_profile_provider_kind) {
         (ModelProviderKind::Deterministic, _) => "deterministic-primary".to_owned(),
+        (ModelProviderKind::OpenAiCompatible, Some(ModelProviderAuthProviderKind::Xai)) => {
+            "xai-primary".to_owned()
+        }
+        (
+            ModelProviderKind::OpenAiCompatible,
+            Some(
+                ModelProviderAuthProviderKind::GoogleGemini
+                | ModelProviderAuthProviderKind::GoogleGeminiCli,
+            ),
+        ) => "google-gemini-primary".to_owned(),
+        (ModelProviderKind::OpenAiCompatible, Some(ModelProviderAuthProviderKind::Openrouter)) => {
+            "openrouter-primary".to_owned()
+        }
         (ModelProviderKind::OpenAiCompatible, _) => "openai-primary".to_owned(),
         (ModelProviderKind::Anthropic, Some(ModelProviderAuthProviderKind::Minimax)) => {
             "minimax-primary".to_owned()
@@ -479,29 +506,31 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
         model_id,
         auth_kind,
         capabilities,
-    ) =
-        match config.kind {
-            ModelProviderKind::Deterministic => (
-                Some("Deterministic".to_owned()),
-                None,
-                None,
-                None,
-                None,
-                "deterministic".to_owned(),
-                None,
-                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+    ) = match config.kind {
+        ModelProviderKind::Deterministic => (
+            Some("Deterministic".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            "deterministic".to_owned(),
+            None,
+            capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+        ),
+        ModelProviderKind::OpenAiCompatible => (
+            Some(openai_compatible_display_name(config.auth_profile_provider_kind).to_owned()),
+            Some(config.openai_base_url.clone()),
+            config.openai_api_key.clone(),
+            config.openai_api_key_secret_ref.clone(),
+            config.openai_api_key_vault_ref.clone(),
+            config.openai_model.clone(),
+            Some(
+                config.auth_profile_provider_kind.unwrap_or(ModelProviderAuthProviderKind::Openai),
             ),
-            ModelProviderKind::OpenAiCompatible => (
-                Some("OpenAI-compatible".to_owned()),
-                Some(config.openai_base_url.clone()),
-                config.openai_api_key.clone(),
-                config.openai_api_key_secret_ref.clone(),
-                config.openai_api_key_vault_ref.clone(),
-                config.openai_model.clone(),
-                Some(ModelProviderAuthProviderKind::Openai),
-                capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
-            ),
-            ModelProviderKind::Anthropic => (
+            capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
+        ),
+        ModelProviderKind::Anthropic => {
+            (
                 Some(
                     if config.auth_profile_provider_kind
                         == Some(ModelProviderAuthProviderKind::Minimax)
@@ -527,8 +556,9 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
                     ProviderModelRole::Chat,
                     config.auth_profile_provider_kind,
                 ),
-            ),
-        };
+            )
+        }
+    };
     let mut registry = ModelProviderRegistryConfig {
         providers: vec![ProviderRegistryEntryConfig {
             provider_id: provider_id.clone(),
@@ -584,6 +614,20 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
         });
     }
     registry
+}
+
+fn openai_compatible_display_name(
+    auth_provider_kind: Option<ModelProviderAuthProviderKind>,
+) -> &'static str {
+    match auth_provider_kind {
+        Some(ModelProviderAuthProviderKind::Xai) => "xAI (Grok)",
+        Some(
+            ModelProviderAuthProviderKind::GoogleGemini
+            | ModelProviderAuthProviderKind::GoogleGeminiCli,
+        ) => "Google Gemini",
+        Some(ModelProviderAuthProviderKind::Openrouter) => "OpenRouter",
+        _ => "OpenAI-compatible",
+    }
 }
 
 fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Result<()> {

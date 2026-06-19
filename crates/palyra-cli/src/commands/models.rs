@@ -1620,6 +1620,28 @@ fn legacy_provider_identity(
     {
         return ("minimax-primary", "MiniMax");
     }
+    if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
+        if let Some(auth_provider_kind) = auth_provider_kind {
+            if auth_provider_kind.eq_ignore_ascii_case("xai")
+                || auth_provider_kind.eq_ignore_ascii_case("x-ai")
+                || auth_provider_kind.eq_ignore_ascii_case("grok")
+            {
+                return ("xai-primary", "xAI (Grok)");
+            }
+            if auth_provider_kind.eq_ignore_ascii_case("google_gemini")
+                || auth_provider_kind.eq_ignore_ascii_case("google-gemini")
+                || auth_provider_kind.eq_ignore_ascii_case("google_gemini_cli")
+                || auth_provider_kind.eq_ignore_ascii_case("google-gemini-cli")
+            {
+                return ("google-gemini-primary", "Google Gemini");
+            }
+            if auth_provider_kind.eq_ignore_ascii_case("openrouter")
+                || auth_provider_kind.eq_ignore_ascii_case("open-router")
+            {
+                return ("openrouter-primary", "OpenRouter");
+            }
+        }
+    }
     match provider_kind {
         OPENAI_COMPATIBLE_PROVIDER_KIND => ("openai-primary", "OpenAI-compatible"),
         ANTHROPIC_PROVIDER_KIND => ("anthropic-primary", "Anthropic"),
@@ -2150,15 +2172,19 @@ fn resolve_provider_credential(
         };
         let expected_provider = expected_auth_provider_for_probe_target(target);
         if let Some(expected_provider) = expected_provider {
-            let matches_expected =
-                if expected_provider == AuthProviderKind::Custom {
-                    matches!(profile.provider.kind, AuthProviderKind::Custom)
-                        && profile.provider.custom_name.as_deref().is_some_and(|name| {
-                            name.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND)
-                        })
-                } else {
-                    profile.provider.kind == expected_provider
-                };
+            let expected_custom_name = expected_custom_auth_provider_name_for_probe_target(target);
+            let matches_expected = if expected_provider == AuthProviderKind::Custom {
+                matches!(profile.provider.kind, AuthProviderKind::Custom)
+                    && expected_custom_name.is_some_and(|expected_name| {
+                        profile
+                            .provider
+                            .custom_name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(expected_name))
+                    })
+            } else {
+                profile.provider.kind == expected_provider
+            };
             if !matches_expected {
                 anyhow::bail!(
                     "auth profile '{}' belongs to provider '{}' instead of '{}'",
@@ -2207,12 +2233,28 @@ fn target_uses_minimax_auth(target: &ProbeableProvider) -> bool {
 }
 
 fn expected_auth_provider_for_probe_target(target: &ProbeableProvider) -> Option<AuthProviderKind> {
-    if target_uses_minimax_auth(target) {
+    if expected_custom_auth_provider_name_for_probe_target(target).is_some() {
         return Some(AuthProviderKind::Custom);
     }
     match target.kind.as_str() {
         OPENAI_COMPATIBLE_PROVIDER_KIND => Some(AuthProviderKind::Openai),
         ANTHROPIC_PROVIDER_KIND => Some(AuthProviderKind::Anthropic),
+        _ => None,
+    }
+}
+
+fn expected_custom_auth_provider_name_for_probe_target(
+    target: &ProbeableProvider,
+) -> Option<&'static str> {
+    let auth_provider_kind = target.auth_provider_kind.as_deref()?.trim().to_ascii_lowercase();
+    match auth_provider_kind.as_str() {
+        "minimax" | "minimax-portal" => Some(MINIMAX_AUTH_PROVIDER_KIND),
+        "xai" | "x-ai" | "grok" => Some("xai"),
+        "google_gemini" | "google-gemini" | "gemini" => Some("google_gemini"),
+        "google_gemini_cli" | "google-gemini-cli" | "gemini_cli" | "gemini-cli" => {
+            Some("google_gemini_cli")
+        }
+        "openrouter" | "open-router" => Some("openrouter"),
         _ => None,
     }
 }
@@ -2225,13 +2267,14 @@ fn load_vault_secret_utf8(vault: &palyra_vault::Vault, vault_ref: &str) -> Resul
 }
 
 /// Builds the `/v1/models` discovery endpoint URL for a provider base URL,
-/// avoiding a doubled version segment when the base URL already ends in `/v1`.
+/// avoiding a doubled version segment when the base URL already ends in a
+/// versioned OpenAI-compatible route.
 ///
 /// # Errors
 /// Returns an error when the resulting URL cannot be parsed.
 pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
-    let raw = if trimmed.ends_with("/v1") {
+    let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
         format!("{trimmed}/models")
     } else {
         format!("{trimmed}/v1/models")
@@ -2477,6 +2520,22 @@ mod tests {
             validate_provider_probe_base_url(base_url, true)
                 .expect_err("provider base_url must not carry credential-bearing URL parts");
         }
+    }
+
+    #[test]
+    fn provider_models_endpoint_preserves_versioned_openai_base_paths() {
+        assert_eq!(
+            provider_models_endpoint("https://generativelanguage.googleapis.com/v1beta/openai/")
+                .expect("Google Gemini endpoint should parse")
+                .as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/openai/models"
+        );
+        assert_eq!(
+            provider_models_endpoint("https://openrouter.ai/api/v1")
+                .expect("OpenRouter endpoint should parse")
+                .as_str(),
+            "https://openrouter.ai/api/v1/models"
+        );
     }
 
     #[test]

@@ -647,13 +647,16 @@ fn resolve_provider_credential(
             .ok_or_else(|| anyhow::anyhow!("auth profile not found: {profile_id}"))?;
         let expected_provider = expected_auth_provider_for_probe_target(target);
         if let Some(expected_provider) = expected_provider {
+            let expected_custom_name = expected_custom_auth_provider_name_for_probe_target(target);
             let matches_expected = if expected_provider == AuthProviderKind::Custom {
                 matches!(profile.provider.kind, AuthProviderKind::Custom)
-                    && profile
-                        .provider
-                        .custom_name
-                        .as_deref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("minimax"))
+                    && expected_custom_name.is_some_and(|expected_name| {
+                        profile
+                            .provider
+                            .custom_name
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(expected_name))
+                    })
             } else {
                 profile.provider.kind == expected_provider
             };
@@ -704,12 +707,29 @@ fn target_uses_minimax_auth(target: &ConsoleProbeTarget) -> bool {
 fn expected_auth_provider_for_probe_target(
     target: &ConsoleProbeTarget,
 ) -> Option<AuthProviderKind> {
-    if target_uses_minimax_auth(target) {
+    if expected_custom_auth_provider_name_for_probe_target(target).is_some() {
         return Some(AuthProviderKind::Custom);
     }
     match target.kind.as_str() {
         OPENAI_COMPATIBLE_PROVIDER_KIND => Some(AuthProviderKind::Openai),
         ANTHROPIC_PROVIDER_KIND => Some(AuthProviderKind::Anthropic),
+        _ => None,
+    }
+}
+
+fn expected_custom_auth_provider_name_for_probe_target(
+    target: &ConsoleProbeTarget,
+) -> Option<&'static str> {
+    let auth_provider_kind =
+        target.auth_profile_provider_kind.as_deref()?.trim().to_ascii_lowercase();
+    match auth_provider_kind.as_str() {
+        "minimax" | "minimax-portal" => Some("minimax"),
+        "xai" | "x-ai" | "grok" => Some("xai"),
+        "google_gemini" | "google-gemini" | "gemini" => Some("google_gemini"),
+        "google_gemini_cli" | "google-gemini-cli" | "gemini_cli" | "gemini-cli" => {
+            Some("google_gemini_cli")
+        }
+        "openrouter" | "open-router" => Some("openrouter"),
         _ => None,
     }
 }
@@ -727,11 +747,11 @@ fn load_vault_secret_utf8(
         .with_context(|| format!("vault secret '{}' must contain valid UTF-8", parsed.key))
 }
 
-// Configured base URLs appear both with and without a trailing `/v1`
-// segment; normalize so either form probes the same models endpoint.
+// Configured base URLs appear both with and without a trailing `/v1` or
+// `/openai` segment; normalize so either form probes the same models endpoint.
 fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url, anyhow::Error> {
     let trimmed = base_url.trim().trim_end_matches('/');
-    let raw = if trimmed.ends_with("/v1") {
+    let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
         format!("{trimmed}/models")
     } else {
         format!("{trimmed}/v1/models")

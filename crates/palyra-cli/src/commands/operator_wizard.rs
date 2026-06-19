@@ -4,6 +4,8 @@
 //! mutation layer (daemon-schema validation plus backups). API keys land in the vault;
 //! configs that carry inline secrets are persisted with owner-only file semantics.
 
+mod model_auth;
+
 use std::{
     collections::BTreeMap,
     io::IsTerminal,
@@ -11,6 +13,14 @@ use std::{
     time::Duration,
 };
 
+use self::model_auth::{
+    api_key_field_label, api_key_prompt_message, auth_method_flow, auth_method_label,
+    auth_method_requires_api_key, model_provider_auth_choices, provider_display_name,
+    registry_provider_defaults_for_auth_method, AuthMethodFlow, RegistryProviderDefaults,
+    DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_CN_BASE_URL, GOOGLE_GEMINI_AUTH_PROVIDER_KIND,
+    GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND, MINIMAX_AUTH_PROVIDER_KIND,
+    OPENROUTER_AUTH_PROVIDER_KIND, XAI_AUTH_PROVIDER_KIND,
+};
 use crate::commands::models::{
     parse_discovered_provider_models, provider_models_endpoint, sanitize_provider_error,
     select_preferred_discovered_model_id, DiscoveredProviderModel,
@@ -43,10 +53,8 @@ const DEFAULT_TEXT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_EMBEDDINGS_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_EMBEDDINGS_DIMS: u32 = 1536;
 const DEFAULT_ANTHROPIC_TEXT_MODEL: &str = "claude-3-5-sonnet-latest";
-const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
 const MINIMAX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
 
 /// Parameters for the onboarding/setup wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
@@ -511,24 +519,8 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
                 let auth_method = wizard.select(select_step(
                     "auth_method",
                     "Auth Method",
-                    "Choose how this installation should authenticate to OpenAI-compatible APIs.",
-                    vec![
-                        choice(
-                            "existing_config",
-                            "Reuse Current",
-                            Some("keep the existing credential source"),
-                        ),
-                        choice(
-                            "api_key",
-                            "Vault-Backed API Key",
-                            Some("store an API key in the vault and update the config"),
-                        ),
-                        choice(
-                            "skip",
-                            "Skip",
-                            Some("leave auth unset and accept follow-up warnings"),
-                        ),
-                    ],
+                    "Choose how this installation should authenticate to model providers.",
+                    model_provider_auth_choices(),
                     Some(current_auth),
                 ))?;
                 apply_auth_method_choice(
@@ -868,6 +860,7 @@ fn build_onboarding_answers(
             || request.options.api_key_prompt)
             .then(|| "api_key".to_owned())
     });
+    validate_api_key_secret_matches_auth_method(auth_method.as_deref(), secrets.api_key.is_some())?;
     if let Some(auth_method) = auth_method {
         answers.insert("auth_method".to_owned(), WizardValue::Choice(auth_method));
     }
@@ -983,9 +976,10 @@ fn build_configure_answers(
             WizardValue::Choice(deployment_profile_value(deployment_profile).to_owned()),
         );
     }
-    if let Some(auth_method) = request.auth_method {
-        answers
-            .insert("auth_method".to_owned(), WizardValue::Choice(auth_method_value(auth_method)));
+    let auth_method = request.auth_method.map(auth_method_value);
+    validate_api_key_secret_matches_auth_method(auth_method.as_deref(), secrets.api_key.is_some())?;
+    if let Some(auth_method) = auth_method {
+        answers.insert("auth_method".to_owned(), WizardValue::Choice(auth_method));
     }
     if let Some(api_key) = secrets.api_key {
         answers.insert("model_provider_api_key".to_owned(), WizardValue::SensitiveText(api_key));
@@ -1268,33 +1262,7 @@ fn populate_quickstart_plan(
         "auth_method",
         "Model Provider Auth",
         "Choose how QuickStart should configure model-provider access.",
-        vec![
-            choice(
-                "api_key",
-                "OpenAI-Compatible API Key",
-                Some("recommended default for a working local instance"),
-            ),
-            choice(
-                "anthropic_api_key",
-                "Anthropic API Key",
-                Some("use Anthropic as the primary provider for chat workloads"),
-            ),
-            choice(
-                "minimax_api_key",
-                "MiniMax API Key",
-                Some("use MiniMax M2.7 through the Anthropic-compatible endpoint"),
-            ),
-            choice(
-                "existing_config",
-                "Reuse Current",
-                Some("keep the existing credential source if one is already configured"),
-            ),
-            choice(
-                "skip",
-                "Skip for Now",
-                Some("leave model auth unset and continue with warnings"),
-            ),
-        ],
+        model_provider_auth_choices(),
         Some("api_key".to_owned()),
     ))?;
     plan.auth_method = auth_method.clone();
@@ -1351,33 +1319,7 @@ fn populate_manual_plan(
         "auth_method",
         "Model Provider Auth",
         "Choose how this installation should authenticate to model providers.",
-        vec![
-            choice(
-                "api_key",
-                "OpenAI-Compatible API Key",
-                Some("store the key in the vault and point the config at it"),
-            ),
-            choice(
-                "anthropic_api_key",
-                "Anthropic API Key",
-                Some("store the Anthropic key in the vault and switch the config to Anthropic"),
-            ),
-            choice(
-                "minimax_api_key",
-                "MiniMax API Key",
-                Some("store the MiniMax key in the vault and use MiniMax M2.7"),
-            ),
-            choice(
-                "existing_config",
-                "Reuse Current",
-                Some("keep the existing credential source if one is already configured"),
-            ),
-            choice(
-                "skip",
-                "Skip",
-                Some("continue without model auth and accept follow-up warnings"),
-            ),
-        ],
+        model_provider_auth_choices(),
         Some("api_key".to_owned()),
     ))?;
     plan.auth_method = auth_method.clone();
@@ -1797,6 +1739,14 @@ fn apply_onboarding_plan(
         clear_model_provider_auth(&mut document)?;
     } else if let Some(api_key) = plan.api_key.as_ref() {
         apply_model_provider_api_key(&mut document, plan.auth_method.as_str(), api_key.as_str())?;
+    } else if auth_method_flow(plan.auth_method.as_str())
+        == Some(AuthMethodFlow::DeferredAuthProfile)
+    {
+        apply_deferred_provider_auth_method(
+            &mut document,
+            plan.auth_method.as_str(),
+            &mut plan.warnings,
+        )?;
     }
 
     apply_deployment_profile_defaults(&mut document, plan.deployment_profile)?;
@@ -2456,19 +2406,23 @@ fn apply_auth_method_choice(
         }
         "existing_config" => {}
         _ => {
-            let api_key_label = api_key_field_label(auth_method);
-            let api_key = wizard.text(
-                text_step(
-                    "model_provider_api_key",
-                    api_key_label,
-                    api_key_prompt_message(auth_method),
-                    None,
-                    None,
-                    true,
-                ),
-                |value| validate_non_empty_text(value, api_key_label),
-            )?;
-            apply_model_provider_api_key(document, auth_method, api_key.as_str())?;
+            if auth_method_requires_api_key(auth_method) {
+                let api_key_label = api_key_field_label(auth_method);
+                let api_key = wizard.text(
+                    text_step(
+                        "model_provider_api_key",
+                        api_key_label,
+                        api_key_prompt_message(auth_method),
+                        None,
+                        None,
+                        true,
+                    ),
+                    |value| validate_non_empty_text(value, api_key_label),
+                )?;
+                apply_model_provider_api_key(document, auth_method, api_key.as_str())?;
+            } else {
+                apply_deferred_provider_auth_method(document, auth_method, warnings)?;
+            }
         }
     }
     Ok(())
@@ -2882,6 +2836,11 @@ fn clear_model_provider_auth(document: &mut toml::Value) -> Result<()> {
     unset_value_at_path(document, "model_provider.auth_profile_id")?;
     unset_value_at_path(document, "model_provider.auth_profile_ref")?;
     unset_value_at_path(document, "model_provider.auth_provider_kind")?;
+    unset_value_at_path(document, "model_provider.providers")?;
+    unset_value_at_path(document, "model_provider.models")?;
+    unset_value_at_path(document, "model_provider.default_chat_model_id")?;
+    unset_value_at_path(document, "model_provider.default_embeddings_model_id")?;
+    unset_value_at_path(document, "model_provider.default_audio_transcription_model_id")?;
     Ok(())
 }
 
@@ -2894,117 +2853,280 @@ fn apply_model_provider_api_key(
         "anthropic_api_key" => {
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
-            set_value_at_path(
-                document,
-                "model_provider.kind",
-                toml::Value::String("anthropic".to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_base_url",
-                toml::Value::String("https://api.anthropic.com".to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_model",
-                toml::Value::String(DEFAULT_ANTHROPIC_TEXT_MODEL.to_owned()),
-            )?;
-            unset_value_at_path(document, "model_provider.openai_base_url")?;
-            unset_value_at_path(document, "model_provider.openai_model")?;
-            unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
-            unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_api_key_vault_ref",
-                toml::Value::String(vault_ref),
-            )?;
+            configure_anthropic_provider(document, Some(vault_ref))?;
         }
-        "minimax_api_key" => {
+        "minimax_api_key" | "minimax_api_key_global" | "minimax_api_key_cn" => {
             // Discovery must run before clearing auth: it reads the currently configured
-            // MiniMax base URL and chat model from the document as fallbacks.
-            let selection = discover_minimax_model_selection(document, api_key)?;
+            // MiniMax chat model from the document as a fallback for legacy configs.
+            let selection = discover_minimax_model_selection(
+                document,
+                api_key,
+                minimax_base_url_override(auth_method),
+            )?;
             clear_model_provider_auth(document)?;
-            let vault_ref = store_secret_in_vault("global", "minimax_api_key", api_key)?;
-            set_value_at_path(
+            let vault_ref =
+                store_secret_in_vault("global", minimax_secret_key(auth_method), api_key)?;
+            configure_minimax_provider(
                 document,
-                "model_provider.kind",
-                toml::Value::String("anthropic".to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.auth_provider_kind",
-                toml::Value::String(MINIMAX_AUTH_PROVIDER_KIND.to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_base_url",
-                toml::Value::String(selection.base_url.clone()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_model",
-                toml::Value::String(selection.model_id),
-            )?;
-            if minimax_base_url_requires_private_opt_in(selection.base_url.as_str()) {
-                set_value_at_path(
-                    document,
-                    "model_provider.allow_private_base_url",
-                    toml::Value::Boolean(true),
-                )?;
-            }
-            unset_value_at_path(document, "model_provider.openai_base_url")?;
-            unset_value_at_path(document, "model_provider.openai_model")?;
-            unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
-            unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
-            set_value_at_path(
-                document,
-                "model_provider.anthropic_api_key_vault_ref",
-                toml::Value::String(vault_ref),
+                selection.base_url.as_str(),
+                selection.model_id.as_str(),
+                Some(vault_ref),
             )?;
         }
-        _ => {
+        method if registry_provider_defaults_for_auth_method(method).is_some() => {
+            clear_model_provider_auth(document)?;
+            let defaults = registry_provider_defaults_for_auth_method(method)
+                .expect("registry provider defaults should exist after guard");
+            let vault_ref = store_secret_in_vault("global", defaults.secret_key, api_key)?;
+            configure_registry_provider(document, defaults, Some(vault_ref))?;
+        }
+        "api_key" => {
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
-            set_value_at_path(
-                document,
-                "model_provider.kind",
-                toml::Value::String("openai_compatible".to_owned()),
-            )?;
-            if get_value_at_path(document, "model_provider.openai_base_url")?
-                .and_then(toml::Value::as_str)
-                .is_none()
-            {
-                set_value_at_path(
-                    document,
-                    "model_provider.openai_base_url",
-                    toml::Value::String("https://api.openai.com/v1".to_owned()),
-                )?;
-            }
-            set_value_at_path(
-                document,
-                "model_provider.openai_model",
-                toml::Value::String(DEFAULT_TEXT_MODEL.to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.openai_embeddings_model",
-                toml::Value::String(DEFAULT_EMBEDDINGS_MODEL.to_owned()),
-            )?;
-            set_value_at_path(
-                document,
-                "model_provider.openai_embeddings_dims",
-                toml::Value::Integer(i64::from(DEFAULT_EMBEDDINGS_DIMS)),
-            )?;
-            unset_value_at_path(document, "model_provider.anthropic_base_url")?;
-            unset_value_at_path(document, "model_provider.anthropic_model")?;
-            set_value_at_path(
-                document,
-                "model_provider.openai_api_key_vault_ref",
-                toml::Value::String(vault_ref),
-            )?;
+            configure_openai_provider(document, Some(vault_ref))?;
         }
+        _ => anyhow::bail!("unsupported model-provider auth method: {auth_method}"),
     }
     Ok(())
+}
+
+fn apply_deferred_provider_auth_method(
+    document: &mut toml::Value,
+    auth_method: &str,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    clear_model_provider_auth(document)?;
+    match auth_method {
+        "chatgpt_login" => configure_openai_provider(document, None)?,
+        "anthropic_oauth" => configure_anthropic_provider(document, None)?,
+        "minimax_oauth_global" => {
+            configure_minimax_provider(document, DEFAULT_MINIMAX_BASE_URL, "MiniMax-M2.7", None)?;
+        }
+        "minimax_oauth_cn" => {
+            configure_minimax_provider(
+                document,
+                DEFAULT_MINIMAX_CN_BASE_URL,
+                "MiniMax-M2.7",
+                None,
+            )?;
+        }
+        "xai_device_code" | "xai_oauth" => {
+            let defaults = registry_provider_defaults_for_auth_method("xai_api_key")
+                .expect("xAI registry defaults must exist");
+            configure_registry_provider(document, defaults, None)?;
+        }
+        "gemini_cli_oauth" => {
+            let mut defaults = *registry_provider_defaults_for_auth_method("google_gemini_api_key")
+                .expect("Google Gemini registry defaults must exist");
+            defaults.auth_provider_kind = GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND;
+            configure_registry_provider(document, &defaults, None)?;
+        }
+        "openrouter_oauth" => {
+            let defaults = registry_provider_defaults_for_auth_method("openrouter_api_key")
+                .expect("OpenRouter registry defaults must exist");
+            configure_registry_provider(document, defaults, None)?;
+        }
+        _ => anyhow::bail!("unsupported non-API-key auth method: {auth_method}"),
+    }
+    warnings.push(format!(
+        "{} was selected; finish or select a matching auth profile before enabling remote model calls.",
+        auth_method_label(auth_method)
+    ));
+    Ok(())
+}
+
+fn configure_openai_provider(document: &mut toml::Value, vault_ref: Option<String>) -> Result<()> {
+    set_value_at_path(
+        document,
+        "model_provider.kind",
+        toml::Value::String("openai_compatible".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_base_url",
+        toml::Value::String("https://api.openai.com/v1".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_model",
+        toml::Value::String(DEFAULT_TEXT_MODEL.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_embeddings_model",
+        toml::Value::String(DEFAULT_EMBEDDINGS_MODEL.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_embeddings_dims",
+        toml::Value::Integer(i64::from(DEFAULT_EMBEDDINGS_DIMS)),
+    )?;
+    unset_value_at_path(document, "model_provider.anthropic_base_url")?;
+    unset_value_at_path(document, "model_provider.anthropic_model")?;
+    if let Some(vault_ref) = vault_ref {
+        set_value_at_path(
+            document,
+            "model_provider.openai_api_key_vault_ref",
+            toml::Value::String(vault_ref),
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_anthropic_provider(
+    document: &mut toml::Value,
+    vault_ref: Option<String>,
+) -> Result<()> {
+    set_value_at_path(
+        document,
+        "model_provider.kind",
+        toml::Value::String("anthropic".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.anthropic_base_url",
+        toml::Value::String("https://api.anthropic.com".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.anthropic_model",
+        toml::Value::String(DEFAULT_ANTHROPIC_TEXT_MODEL.to_owned()),
+    )?;
+    unset_value_at_path(document, "model_provider.openai_base_url")?;
+    unset_value_at_path(document, "model_provider.openai_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
+    if let Some(vault_ref) = vault_ref {
+        set_value_at_path(
+            document,
+            "model_provider.anthropic_api_key_vault_ref",
+            toml::Value::String(vault_ref),
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_minimax_provider(
+    document: &mut toml::Value,
+    base_url: &str,
+    model_id: &str,
+    vault_ref: Option<String>,
+) -> Result<()> {
+    set_value_at_path(
+        document,
+        "model_provider.kind",
+        toml::Value::String("anthropic".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.auth_provider_kind",
+        toml::Value::String(MINIMAX_AUTH_PROVIDER_KIND.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.anthropic_base_url",
+        toml::Value::String(base_url.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.anthropic_model",
+        toml::Value::String(model_id.to_owned()),
+    )?;
+    if minimax_base_url_requires_private_opt_in(base_url) {
+        set_value_at_path(
+            document,
+            "model_provider.allow_private_base_url",
+            toml::Value::Boolean(true),
+        )?;
+    }
+    unset_value_at_path(document, "model_provider.openai_base_url")?;
+    unset_value_at_path(document, "model_provider.openai_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
+    if let Some(vault_ref) = vault_ref {
+        set_value_at_path(
+            document,
+            "model_provider.anthropic_api_key_vault_ref",
+            toml::Value::String(vault_ref),
+        )?;
+    }
+    Ok(())
+}
+
+fn configure_registry_provider(
+    document: &mut toml::Value,
+    defaults: &RegistryProviderDefaults,
+    vault_ref: Option<String>,
+) -> Result<()> {
+    set_value_at_path(
+        document,
+        "model_provider.kind",
+        toml::Value::String("openai_compatible".to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.auth_provider_kind",
+        toml::Value::String(defaults.auth_provider_kind.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_base_url",
+        toml::Value::String(defaults.base_url.to_owned()),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.openai_model",
+        toml::Value::String(defaults.chat_model.to_owned()),
+    )?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
+    unset_value_at_path(document, "model_provider.anthropic_base_url")?;
+    unset_value_at_path(document, "model_provider.anthropic_model")?;
+    set_value_at_path(
+        document,
+        "model_provider.providers",
+        toml::Value::Array(vec![registry_provider_table(defaults, vault_ref)]),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.models",
+        toml::Value::Array(vec![registry_chat_model_table(defaults)]),
+    )?;
+    set_value_at_path(
+        document,
+        "model_provider.default_chat_model_id",
+        toml::Value::String(defaults.chat_model.to_owned()),
+    )?;
+    Ok(())
+}
+
+fn registry_provider_table(
+    defaults: &RegistryProviderDefaults,
+    vault_ref: Option<String>,
+) -> toml::Value {
+    let mut table = toml::map::Map::new();
+    table.insert("provider_id".to_owned(), toml::Value::String(defaults.provider_id.to_owned()));
+    table.insert("display_name".to_owned(), toml::Value::String(defaults.display_name.to_owned()));
+    table.insert("kind".to_owned(), toml::Value::String("openai_compatible".to_owned()));
+    table.insert("base_url".to_owned(), toml::Value::String(defaults.base_url.to_owned()));
+    table.insert(
+        "auth_provider_kind".to_owned(),
+        toml::Value::String(defaults.auth_provider_kind.to_owned()),
+    );
+    table.insert("enabled".to_owned(), toml::Value::Boolean(true));
+    if let Some(vault_ref) = vault_ref {
+        table.insert("api_key_vault_ref".to_owned(), toml::Value::String(vault_ref));
+    }
+    toml::Value::Table(table)
+}
+
+fn registry_chat_model_table(defaults: &RegistryProviderDefaults) -> toml::Value {
+    let mut table = toml::map::Map::new();
+    table.insert("model_id".to_owned(), toml::Value::String(defaults.chat_model.to_owned()));
+    table.insert("provider_id".to_owned(), toml::Value::String(defaults.provider_id.to_owned()));
+    table.insert("role".to_owned(), toml::Value::String("chat".to_owned()));
+    table.insert("enabled".to_owned(), toml::Value::Boolean(true));
+    toml::Value::Table(table)
 }
 
 #[derive(Debug)]
@@ -3019,8 +3141,12 @@ struct MinimaxModelSelection {
 fn discover_minimax_model_selection(
     document: &toml::Value,
     api_key: &str,
+    base_url_override: Option<&str>,
 ) -> Result<MinimaxModelSelection> {
-    let base_url = minimax_base_url_for_config(document)?;
+    let base_url = match base_url_override {
+        Some(base_url) => normalize_minimax_base_url(base_url, "selected MiniMax endpoint")?,
+        None => minimax_base_url_for_config(document)?,
+    };
     let existing_model = existing_minimax_chat_model(document)?;
     match discover_minimax_models(api_key, base_url.as_str()) {
         Ok(models) => {
@@ -3042,6 +3168,21 @@ fn discover_minimax_model_selection(
                 "failed to discover MiniMax models while configuring API-key auth; no model was written because the wizard no longer uses a hardcoded MiniMax default",
             )
         }
+    }
+}
+
+fn minimax_base_url_override(auth_method: &str) -> Option<&'static str> {
+    match auth_method {
+        "minimax_api_key_global" => Some(DEFAULT_MINIMAX_BASE_URL),
+        "minimax_api_key_cn" => Some(DEFAULT_MINIMAX_CN_BASE_URL),
+        _ => None,
+    }
+}
+
+fn minimax_secret_key(auth_method: &str) -> &'static str {
+    match auth_method {
+        "minimax_api_key_cn" => "minimax_cn_api_key",
+        _ => "minimax_api_key",
     }
 }
 
@@ -3247,6 +3388,25 @@ fn validate_stdin_secret_usage(
     Ok(())
 }
 
+fn validate_api_key_secret_matches_auth_method(
+    auth_method: Option<&str>,
+    api_key_provided: bool,
+) -> Result<()> {
+    if !api_key_provided {
+        return Ok(());
+    }
+    let Some(auth_method) = auth_method else {
+        return Ok(());
+    };
+    if auth_method_requires_api_key(auth_method) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "model-provider API-key secret input was provided, but auth method '{}' does not consume an API key; choose an API-key auth method or remove --api-key-env/--api-key-stdin/--api-key-prompt",
+        auth_method_label(auth_method)
+    );
+}
+
 fn validate_non_empty_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} cannot be empty"));
@@ -3299,10 +3459,16 @@ fn model_auth_configured(document: &toml::Value) -> Result<bool> {
     Ok(get_string_value_at_path(document, "model_provider.openai_api_key_vault_ref")?.is_some()
         || get_string_value_at_path(document, "model_provider.anthropic_api_key_vault_ref")?
             .is_some()
-        || get_string_value_at_path(document, "model_provider.auth_profile_id")?.is_some())
+        || get_string_value_at_path(document, "model_provider.auth_profile_id")?.is_some()
+        || registry_auth_configured(document))
 }
 
 fn configured_chat_model(document: &toml::Value) -> Result<Option<String>> {
+    if let Some(model_id) =
+        get_string_value_at_path(document, "model_provider.default_chat_model_id")?
+    {
+        return Ok(Some(model_id));
+    }
     let provider_kind = get_string_value_at_path(document, "model_provider.kind")?
         .unwrap_or_else(|| "openai_compatible".to_owned());
     if provider_kind == "anthropic" {
@@ -3313,7 +3479,34 @@ fn configured_chat_model(document: &toml::Value) -> Result<Option<String>> {
 }
 
 fn configured_embeddings_model(document: &toml::Value) -> Result<Option<String>> {
+    if let Some(model_id) =
+        get_string_value_at_path(document, "model_provider.default_embeddings_model_id")?
+    {
+        return Ok(Some(model_id));
+    }
     get_string_value_at_path(document, "model_provider.openai_embeddings_model")
+}
+
+fn registry_auth_configured(document: &toml::Value) -> bool {
+    let providers = get_value_at_path(document, "model_provider.providers")
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_array());
+    providers.is_some_and(|providers| {
+        providers.iter().any(|provider| {
+            let Some(table) = provider.as_table() else {
+                return false;
+            };
+            table
+                .get("api_key_vault_ref")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || table
+                    .get("auth_profile_id")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+    })
 }
 
 fn join_section_state(values: &[String]) -> String {
@@ -3367,10 +3560,8 @@ fn describe_configure_section(
                 .unwrap_or_else(|| "unset".to_owned());
             let auth_provider_kind =
                 get_string_value_at_path(document, "model_provider.auth_provider_kind")?;
-            let provider_display_name = configure_provider_display_name(
-                provider_kind.as_str(),
-                auth_provider_kind.as_deref(),
-            );
+            let provider_display_name =
+                provider_display_name(provider_kind.as_str(), auth_provider_kind.as_deref());
             let protocol_compatibility =
                 configure_provider_protocol_compatibility(provider_kind.as_str());
             let auth_source =
@@ -3513,24 +3704,6 @@ fn describe_configure_section(
                     .unwrap_or(false)
             ),
         ]),
-    }
-}
-
-fn configure_provider_display_name(
-    provider_kind: &str,
-    auth_provider_kind: Option<&str>,
-) -> &'static str {
-    if provider_kind == "anthropic"
-        && auth_provider_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("minimax"))
-    {
-        return "MiniMax";
-    }
-    match provider_kind {
-        "openai_compatible" => "OpenAI-compatible",
-        "anthropic" => "Anthropic",
-        "deterministic" => "Deterministic",
-        "unset" => "unset",
-        _ => "Unknown",
     }
 }
 
@@ -3782,6 +3955,9 @@ fn current_auth_method(document: &toml::Value) -> String {
         .ok()
         .flatten()
         .unwrap_or_else(|| "openai_compatible".to_owned());
+    if let Some(method) = current_registry_auth_method(document) {
+        return method.to_owned();
+    }
     if get_string_value_at_path(document, "model_provider.auth_profile_id").ok().flatten().is_some()
     {
         return "existing_config".to_owned();
@@ -3798,7 +3974,7 @@ fn current_auth_method(document: &toml::Value) -> String {
                 .as_deref()
                 .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND))
         {
-            return "minimax_api_key".to_owned();
+            return "minimax_api_key_global".to_owned();
         }
         return if provider_kind == "anthropic" {
             "anthropic_api_key".to_owned()
@@ -3822,7 +3998,7 @@ fn current_auth_method(document: &toml::Value) -> String {
             .as_deref()
             .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND))
     {
-        return "minimax_api_key".to_owned();
+        return "minimax_api_key_global".to_owned();
     }
     if provider_kind == "anthropic" {
         "anthropic_api_key".to_owned()
@@ -3831,37 +4007,60 @@ fn current_auth_method(document: &toml::Value) -> String {
     }
 }
 
+fn current_registry_auth_method(document: &toml::Value) -> Option<&'static str> {
+    let providers =
+        get_value_at_path(document, "model_provider.providers").ok().flatten()?.as_array()?;
+    for provider in providers {
+        let Some(table) = provider.as_table() else {
+            continue;
+        };
+        let Some(auth_provider_kind) =
+            table.get("auth_provider_kind").and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        let has_api_key = table
+            .get("api_key_vault_ref")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !has_api_key {
+            continue;
+        }
+        if auth_provider_kind.eq_ignore_ascii_case(XAI_AUTH_PROVIDER_KIND) {
+            return Some("xai_api_key");
+        }
+        if auth_provider_kind.eq_ignore_ascii_case(GOOGLE_GEMINI_AUTH_PROVIDER_KIND) {
+            return Some("google_gemini_api_key");
+        }
+        if auth_provider_kind.eq_ignore_ascii_case(OPENROUTER_AUTH_PROVIDER_KIND) {
+            return Some("openrouter_api_key");
+        }
+    }
+    None
+}
+
 fn auth_method_value(value: OnboardingAuthMethodArg) -> String {
     match value {
+        OnboardingAuthMethodArg::ChatgptLogin => "chatgpt_login",
         OnboardingAuthMethodArg::ApiKey => "api_key",
         OnboardingAuthMethodArg::AnthropicApiKey => "anthropic_api_key",
+        OnboardingAuthMethodArg::AnthropicOauth => "anthropic_oauth",
         OnboardingAuthMethodArg::MinimaxApiKey => "minimax_api_key",
+        OnboardingAuthMethodArg::MinimaxApiKeyGlobal => "minimax_api_key_global",
+        OnboardingAuthMethodArg::MinimaxApiKeyCn => "minimax_api_key_cn",
+        OnboardingAuthMethodArg::MinimaxOauthGlobal => "minimax_oauth_global",
+        OnboardingAuthMethodArg::MinimaxOauthCn => "minimax_oauth_cn",
+        OnboardingAuthMethodArg::XaiApiKey => "xai_api_key",
+        OnboardingAuthMethodArg::XaiDeviceCode => "xai_device_code",
+        OnboardingAuthMethodArg::XaiOauth => "xai_oauth",
+        OnboardingAuthMethodArg::GeminiCliOauth => "gemini_cli_oauth",
+        OnboardingAuthMethodArg::GoogleGeminiApiKey => "google_gemini_api_key",
+        OnboardingAuthMethodArg::OpenrouterApiKey => "openrouter_api_key",
+        OnboardingAuthMethodArg::OpenrouterOauth => "openrouter_oauth",
         OnboardingAuthMethodArg::Skip => "skip",
         OnboardingAuthMethodArg::ExistingConfig => "existing_config",
     }
     .to_owned()
-}
-
-fn auth_method_requires_api_key(auth_method: &str) -> bool {
-    matches!(auth_method, "api_key" | "anthropic_api_key" | "minimax_api_key")
-}
-
-fn api_key_field_label(auth_method: &str) -> &'static str {
-    match auth_method {
-        "anthropic_api_key" => "Anthropic API Key",
-        "minimax_api_key" => "MiniMax API Key",
-        _ => "OpenAI API Key",
-    }
-}
-
-fn api_key_prompt_message(auth_method: &str) -> &'static str {
-    match auth_method {
-        "anthropic_api_key" => {
-            "Enter the Anthropic API key that should be stored in the local vault."
-        }
-        "minimax_api_key" => "Enter the MiniMax API key that should be stored in the local vault.",
-        _ => "Enter the OpenAI-compatible API key that should be stored in the local vault.",
-    }
 }
 
 fn deployment_profile_value(value: DeploymentProfileArg) -> &'static str {
@@ -4093,6 +4292,19 @@ mod tests {
     }
 
     #[test]
+    fn api_key_secret_inputs_are_rejected_for_deferred_auth_methods() {
+        let error = validate_api_key_secret_matches_auth_method(Some("xai_oauth"), true)
+            .expect_err("deferred OAuth methods must not consume API-key inputs");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("xAI OAuth"), "expected auth method label in error: {message}");
+        assert!(
+            message.contains("--api-key-env"),
+            "expected API-key source remediation in error: {message}"
+        );
+    }
+
+    #[test]
     fn resolve_existing_config_action_uses_force_without_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("palyra.toml");
@@ -4228,12 +4440,23 @@ anthropic_api_key_vault_ref = "global/anthropic_old"
 auth_profile_id = "provider.default"
 auth_profile_ref = "provider.legacy"
 auth_provider_kind = "minimax"
+default_chat_model_id = "old-chat"
+default_embeddings_model_id = "old-embeddings"
+default_audio_transcription_model_id = "old-audio"
 [model_provider.openai_api_key_secret_ref]
 kind = "env"
 variable = "PALYRA_MODEL_PROVIDER_OPENAI_API_KEY"
 [model_provider.anthropic_api_key_secret_ref]
 kind = "env"
 variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
+[[model_provider.providers]]
+provider_id = "old-provider"
+kind = "openai_compatible"
+api_key_vault_ref = "global/old_provider_key"
+[[model_provider.models]]
+model_id = "old-chat"
+provider_id = "old-provider"
+role = "chat"
 "#,
         )
         .expect("model provider config should parse");
@@ -4250,6 +4473,11 @@ variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
             "model_provider.auth_profile_id",
             "model_provider.auth_profile_ref",
             "model_provider.auth_provider_kind",
+            "model_provider.providers",
+            "model_provider.models",
+            "model_provider.default_chat_model_id",
+            "model_provider.default_embeddings_model_id",
+            "model_provider.default_audio_transcription_model_id",
         ] {
             assert!(
                 get_value_at_path(&document, path)
@@ -4258,6 +4486,85 @@ variable = "PALYRA_MODEL_PROVIDER_ANTHROPIC_API_KEY"
                 "{path} should be removed"
             );
         }
+    }
+
+    #[test]
+    fn model_provider_auth_choices_include_requested_provider_options() {
+        let choices = model_provider_auth_choices();
+        for (value, label, hint) in [
+            ("chatgpt_login", "ChatGPT Login", "Sign in with your ChatGPT or Codex subscription"),
+            ("api_key", "OpenAI API Key", "Use your OpenAI API key directly"),
+            ("anthropic_api_key", "Anthropic API key", "Use your Anthropic API key directly"),
+            ("anthropic_oauth", "Anthropic OAuth", "Use an Anthropic OAuth auth profile"),
+            ("minimax_api_key_cn", "MiniMax API key (CN)", "CN endpoint - api.minimaxi.com"),
+            (
+                "minimax_api_key_global",
+                "MiniMax API key (Global)",
+                "Global endpoint - api.minimax.io",
+            ),
+            ("minimax_oauth_cn", "MiniMax OAuth (CN)", "CN endpoint - api.minimaxi.com"),
+            ("minimax_oauth_global", "MiniMax OAuth (Global)", "Global endpoint - api.minimax.io"),
+            ("xai_api_key", "xAI API key", "Use your xAI Grok API key directly"),
+            ("xai_device_code", "xAI device code", "Use an xAI device-code auth profile"),
+            ("xai_oauth", "xAI OAuth", "Use an xAI OAuth auth profile"),
+            (
+                "gemini_cli_oauth",
+                "Gemini CLI OAuth",
+                "Google OAuth with project-aware token payload",
+            ),
+            (
+                "google_gemini_api_key",
+                "Google Gemini API key",
+                "Use your Google Gemini API key directly",
+            ),
+            ("openrouter_api_key", "OpenRouter API key", "Use your OpenRouter API key directly"),
+            ("openrouter_oauth", "OpenRouter OAuth", "Use an OpenRouter OAuth auth profile"),
+        ] {
+            assert!(
+                choices.iter().any(|choice| {
+                    choice.value == value
+                        && choice.label == label
+                        && choice.hint.as_deref() == Some(hint)
+                }),
+                "missing auth choice value={value} label={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_xai_auth_method_writes_profile_ready_registry_defaults() {
+        let mut document = toml::Value::Table(Default::default());
+        let mut warnings = Vec::new();
+
+        apply_deferred_provider_auth_method(&mut document, "xai_oauth", &mut warnings)
+            .expect("xAI OAuth defaults should apply");
+
+        assert_eq!(
+            get_string_value_at_path(&document, "model_provider.auth_provider_kind")
+                .expect("auth provider lookup should succeed")
+                .as_deref(),
+            Some("xai")
+        );
+        assert_eq!(
+            get_string_value_at_path(&document, "model_provider.default_chat_model_id")
+                .expect("default chat lookup should succeed")
+                .as_deref(),
+            Some(model_auth::DEFAULT_XAI_TEXT_MODEL)
+        );
+        let providers = get_value_at_path(&document, "model_provider.providers")
+            .expect("providers lookup should succeed")
+            .and_then(toml::Value::as_array)
+            .expect("registry providers should be written");
+        let provider = providers[0].as_table().expect("provider should be a table");
+        assert_eq!(provider.get("provider_id").and_then(toml::Value::as_str), Some("xai-primary"));
+        assert!(
+            provider.get("api_key_vault_ref").is_none(),
+            "deferred auth profile methods must not fabricate an API-key vault ref"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("xAI OAuth")),
+            "deferred method should emit an actionable auth-profile warning: {warnings:?}"
+        );
     }
 
     #[cfg(unix)]

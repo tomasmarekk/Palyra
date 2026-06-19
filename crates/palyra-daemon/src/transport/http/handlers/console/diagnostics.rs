@@ -3468,6 +3468,10 @@ pub(crate) fn build_provider_state(
             false,
         ),
         ModelProviderAuthProviderKind::Minimax => ("minimax", "", "", true),
+        ModelProviderAuthProviderKind::Xai => ("xai", "", "", true),
+        ModelProviderAuthProviderKind::GoogleGemini => ("google_gemini", "", "", false),
+        ModelProviderAuthProviderKind::GoogleGeminiCli => ("google_gemini_cli", "", "", true),
+        ModelProviderAuthProviderKind::Openrouter => ("openrouter", "", "", true),
     };
     let api_key_vault_ref = get_value_at_path(document, api_key_path)
         .ok()
@@ -3504,6 +3508,10 @@ pub(crate) fn build_provider_state(
             }
         }
         ModelProviderAuthProviderKind::Minimax => None,
+        ModelProviderAuthProviderKind::Xai
+        | ModelProviderAuthProviderKind::GoogleGemini
+        | ModelProviderAuthProviderKind::GoogleGeminiCli
+        | ModelProviderAuthProviderKind::Openrouter => None,
     };
     control_plane::ProviderAuthStateEnvelope {
         contract: contract_descriptor(),

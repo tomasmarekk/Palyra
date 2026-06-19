@@ -2907,6 +2907,16 @@ fn parse_model_provider_registry_entry(
             ModelProviderAuthProviderKind::Minimax => {
                 ModelProviderCredentialSource::AuthProfileApiKey
             }
+            ModelProviderAuthProviderKind::Xai => ModelProviderCredentialSource::AuthProfileApiKey,
+            ModelProviderAuthProviderKind::GoogleGemini => {
+                ModelProviderCredentialSource::AuthProfileApiKey
+            }
+            ModelProviderAuthProviderKind::GoogleGeminiCli => {
+                ModelProviderCredentialSource::AuthProfileApiKey
+            }
+            ModelProviderAuthProviderKind::Openrouter => {
+                ModelProviderCredentialSource::AuthProfileApiKey
+            }
         })
     } else {
         None
@@ -3077,7 +3087,9 @@ fn parse_model_provider_auth_provider_kind(
     source_name: &str,
 ) -> Result<ModelProviderAuthProviderKind> {
     ModelProviderAuthProviderKind::parse(raw).with_context(|| {
-        format!("{source_name} must be one of: openai, openai_compatible, anthropic, minimax")
+        format!(
+            "{source_name} must be one of: openai, openai_compatible, anthropic, minimax, xai, google_gemini, google_gemini_cli, openrouter"
+        )
     })
 }
 
@@ -5388,6 +5400,27 @@ state_dir = "browserd-state"
             )
             .expect("anthropic kind should parse"),
             ModelProviderAuthProviderKind::Anthropic
+        );
+        assert_eq!(
+            parse_model_provider_auth_provider_kind("x-ai", "model_provider.auth_provider_kind",)
+                .expect("xAI alias should parse"),
+            ModelProviderAuthProviderKind::Xai
+        );
+        assert_eq!(
+            parse_model_provider_auth_provider_kind(
+                "google-gemini-cli",
+                "model_provider.auth_provider_kind",
+            )
+            .expect("Google Gemini CLI alias should parse"),
+            ModelProviderAuthProviderKind::GoogleGeminiCli
+        );
+        assert_eq!(
+            parse_model_provider_auth_provider_kind(
+                "openrouter",
+                "model_provider.auth_provider_kind",
+            )
+            .expect("OpenRouter kind should parse"),
+            ModelProviderAuthProviderKind::Openrouter
         );
     }
 

@@ -3554,13 +3554,17 @@ fn resolve_provider_secret_from_auth_profile(
         ModelProviderAuthProviderKind::Anthropic => {
             matches!(profile.provider.kind, AuthProviderKind::Anthropic)
         }
-        ModelProviderAuthProviderKind::Minimax => {
+        ModelProviderAuthProviderKind::Minimax
+        | ModelProviderAuthProviderKind::Xai
+        | ModelProviderAuthProviderKind::GoogleGemini
+        | ModelProviderAuthProviderKind::GoogleGeminiCli
+        | ModelProviderAuthProviderKind::Openrouter => {
             matches!(profile.provider.kind, AuthProviderKind::Custom)
                 && profile
                     .provider
                     .custom_name
                     .as_deref()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("minimax"))
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected_provider.as_str()))
         }
     };
     if !provider_matches {
@@ -5040,6 +5044,51 @@ mod tests {
             model_provider.anthropic_api_key.as_deref(),
             Some("minimax-secret"),
             "MiniMax should hydrate the Anthropic-compatible transport credential"
+        );
+        assert_eq!(
+            model_provider.credential_source,
+            Some(ModelProviderCredentialSource::AuthProfileApiKey)
+        );
+        assert_eq!(audit.action, "model_provider.auth_profile.api_key.resolve");
+    }
+
+    #[test]
+    fn model_provider_secret_resolver_accepts_xai_custom_auth_profile() {
+        let (tempdir, auth_registry, vault) = setup_auth_registry_and_vault();
+        let resolver = SecretResolver::with_working_dir(Some(&vault), tempdir.path());
+        let auth_ref = VaultRef::parse("global/xai_api_key").expect("xAI vault ref should parse");
+        vault
+            .put_secret(&auth_ref.scope, auth_ref.key.as_str(), b"xai-secret")
+            .expect("xAI auth profile API key should be written");
+        auth_registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: "xai-default".to_owned(),
+                provider: AuthProvider {
+                    kind: AuthProviderKind::Custom,
+                    custom_name: Some("xai".to_owned()),
+                },
+                profile_name: "xAI Default".to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey {
+                    api_key_vault_ref: "global/xai_api_key".to_owned(),
+                },
+            })
+            .expect("xAI auth profile should be persisted");
+
+        let mut model_provider = openai_model_provider_config();
+        model_provider.auth_profile_id = Some("xai-default".to_owned());
+        model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Xai);
+
+        let audits =
+            resolve_model_provider_secret(&mut model_provider, &auth_registry, &vault, &resolver)
+                .expect("xAI custom auth profile resolution should succeed");
+        let audit =
+            audits.into_iter().next().expect("audit record should be emitted for resolved secret");
+
+        assert_eq!(
+            model_provider.openai_api_key.as_deref(),
+            Some("xai-secret"),
+            "xAI should hydrate the OpenAI-compatible transport credential"
         );
         assert_eq!(
             model_provider.credential_source,

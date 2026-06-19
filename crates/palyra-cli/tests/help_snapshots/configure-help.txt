@@ -31,7 +31,7 @@ Options:
       --auth-method <AUTH_METHOD>
           Choose how model-provider credentials are configured
 
-          [possible values: api-key, anthropic-api-key, minimax-api-key, skip, existing-config]
+          [possible values: chatgpt-login, api-key, anthropic-api-key, anthropic-oauth, minimax-api-key, minimax-api-key-global, minimax-api-key-cn, minimax-oauth-global, minimax-oauth-cn, xai-api-key, xai-device-code, xai-oauth, gemini-cli-oauth, google-gemini-api-key, openrouter-api-key, openrouter-oauth, skip, existing-config]
 
       --api-key-env <API_KEY_ENV>
           Read the model-provider API key from this environment variable name

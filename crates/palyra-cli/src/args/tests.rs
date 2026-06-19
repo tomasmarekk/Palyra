@@ -4735,6 +4735,33 @@ fn parse_onboarding_wizard_with_custom_path() {
 }
 
 #[test]
+fn parse_onboarding_auth_method_provider_catalog_values() {
+    for (raw, expected) in [
+        ("chatgpt-login", OnboardingAuthMethodArg::ChatgptLogin),
+        ("minimax-api-key-global", OnboardingAuthMethodArg::MinimaxApiKeyGlobal),
+        ("minimax-api-key-cn", OnboardingAuthMethodArg::MinimaxApiKeyCn),
+        ("minimax-oauth-global", OnboardingAuthMethodArg::MinimaxOauthGlobal),
+        ("minimax-oauth-cn", OnboardingAuthMethodArg::MinimaxOauthCn),
+        ("anthropic-oauth", OnboardingAuthMethodArg::AnthropicOauth),
+        ("xai-api-key", OnboardingAuthMethodArg::XaiApiKey),
+        ("xai-device-code", OnboardingAuthMethodArg::XaiDeviceCode),
+        ("xai-oauth", OnboardingAuthMethodArg::XaiOauth),
+        ("gemini-cli-oauth", OnboardingAuthMethodArg::GeminiCliOauth),
+        ("google-gemini-api-key", OnboardingAuthMethodArg::GoogleGeminiApiKey),
+        ("openrouter-api-key", OnboardingAuthMethodArg::OpenrouterApiKey),
+        ("openrouter-oauth", OnboardingAuthMethodArg::OpenrouterOauth),
+    ] {
+        let parsed = Cli::parse_from(["palyra", "onboarding", "wizard", "--auth-method", raw]);
+        let Command::Onboarding { command: OnboardingCommand::Wizard { options, .. } } =
+            parsed.command
+        else {
+            panic!("expected onboarding wizard command");
+        };
+        assert_eq!(options.auth_method, Some(expected), "auth method value {raw} should parse");
+    }
+}
+
+#[test]
 fn parse_setup_wizard_with_overrides() {
     let parsed = Cli::parse_from([
         "palyra",
