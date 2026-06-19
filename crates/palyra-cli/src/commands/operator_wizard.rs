@@ -50,6 +50,11 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.auth_token",
 ];
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
+const OPENAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL";
+const ANTHROPIC_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL";
+const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
+const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BASE_URL";
+const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL";
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
@@ -2848,10 +2853,16 @@ fn apply_model_provider_api_key(
 ) -> Result<()> {
     match auth_method {
         "anthropic_api_key" => {
-            let model_id = discover_anthropic_model_selection(document, api_key)?;
+            let base_url = anthropic_base_url_for_config(document)?;
+            let model_id = discover_anthropic_model_selection(base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
-            configure_anthropic_provider(document, Some(model_id.as_str()), Some(vault_ref))?;
+            configure_anthropic_provider_with_base_url(
+                document,
+                base_url.as_str(),
+                Some(model_id.as_str()),
+                Some(vault_ref),
+            )?;
         }
         "minimax_api_key" | "minimax_api_key_global" | "minimax_api_key_cn" => {
             // Discovery must run before clearing auth: it reads the currently configured
@@ -2874,9 +2885,10 @@ fn apply_model_provider_api_key(
         method if registry_provider_defaults_for_auth_method(method).is_some() => {
             let defaults = registry_provider_defaults_for_auth_method(method)
                 .expect("registry provider defaults should exist after guard");
+            let base_url = registry_provider_base_url(defaults)?;
             let model_id = discover_openai_compatible_model_selection(
                 defaults.display_name,
-                defaults.base_url,
+                base_url.as_str(),
                 api_key,
             )?;
             clear_model_provider_auth(document)?;
@@ -2884,19 +2896,23 @@ fn apply_model_provider_api_key(
             configure_registry_provider(
                 document,
                 defaults,
+                base_url.as_str(),
                 Some(model_id.as_str()),
                 Some(vault_ref),
             )?;
         }
         "api_key" => {
-            let model_id = discover_openai_compatible_model_selection(
-                "OpenAI",
-                "https://api.openai.com/v1",
-                api_key,
-            )?;
+            let base_url = openai_base_url_for_config(document)?;
+            let model_id =
+                discover_openai_compatible_model_selection("OpenAI", base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
-            configure_openai_provider(document, Some(model_id.as_str()), Some(vault_ref))?;
+            configure_openai_provider_with_base_url(
+                document,
+                base_url.as_str(),
+                Some(model_id.as_str()),
+                Some(vault_ref),
+            )?;
         }
         _ => anyhow::bail!("unsupported model-provider auth method: {auth_method}"),
     }
@@ -2921,18 +2937,18 @@ fn apply_deferred_provider_auth_method(
         "xai_device_code" | "xai_oauth" => {
             let defaults = registry_provider_defaults_for_auth_method("xai_api_key")
                 .expect("xAI registry defaults must exist");
-            configure_registry_provider(document, defaults, None, None)?;
+            configure_registry_provider(document, defaults, defaults.base_url, None, None)?;
         }
         "gemini_cli_oauth" => {
             let mut defaults = *registry_provider_defaults_for_auth_method("google_gemini_api_key")
                 .expect("Google Gemini registry defaults must exist");
             defaults.auth_provider_kind = GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND;
-            configure_registry_provider(document, &defaults, None, None)?;
+            configure_registry_provider(document, &defaults, defaults.base_url, None, None)?;
         }
         "openrouter_oauth" => {
             let defaults = registry_provider_defaults_for_auth_method("openrouter_api_key")
                 .expect("OpenRouter registry defaults must exist");
-            configure_registry_provider(document, defaults, None, None)?;
+            configure_registry_provider(document, defaults, defaults.base_url, None, None)?;
         }
         _ => anyhow::bail!("unsupported non-API-key auth method: {auth_method}"),
     }
@@ -2965,6 +2981,20 @@ fn configure_openai_provider(
     model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
+    configure_openai_provider_with_base_url(
+        document,
+        "https://api.openai.com/v1",
+        model_id,
+        vault_ref,
+    )
+}
+
+fn configure_openai_provider_with_base_url(
+    document: &mut toml::Value,
+    base_url: &str,
+    model_id: Option<&str>,
+    vault_ref: Option<String>,
+) -> Result<()> {
     set_value_at_path(
         document,
         "model_provider.kind",
@@ -2973,8 +3003,15 @@ fn configure_openai_provider(
     set_value_at_path(
         document,
         "model_provider.openai_base_url",
-        toml::Value::String("https://api.openai.com/v1".to_owned()),
+        toml::Value::String(base_url.to_owned()),
     )?;
+    if base_url_requires_private_opt_in(base_url) {
+        set_value_at_path(
+            document,
+            "model_provider.allow_private_base_url",
+            toml::Value::Boolean(true),
+        )?;
+    }
     apply_openai_chat_model_selection(document, model_id)?;
     unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
     unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
@@ -2994,7 +3031,7 @@ fn configure_openai_provider(
                 provider_id: "openai-primary",
                 display_name: "OpenAI",
                 kind: "openai_compatible",
-                base_url: "https://api.openai.com/v1",
+                base_url,
                 auth_provider_kind: "openai",
             },
             None,
@@ -3008,6 +3045,20 @@ fn configure_anthropic_provider(
     model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
+    configure_anthropic_provider_with_base_url(
+        document,
+        "https://api.anthropic.com",
+        model_id,
+        vault_ref,
+    )
+}
+
+fn configure_anthropic_provider_with_base_url(
+    document: &mut toml::Value,
+    base_url: &str,
+    model_id: Option<&str>,
+    vault_ref: Option<String>,
+) -> Result<()> {
     set_value_at_path(
         document,
         "model_provider.kind",
@@ -3016,8 +3067,15 @@ fn configure_anthropic_provider(
     set_value_at_path(
         document,
         "model_provider.anthropic_base_url",
-        toml::Value::String("https://api.anthropic.com".to_owned()),
+        toml::Value::String(base_url.to_owned()),
     )?;
+    if base_url_requires_private_opt_in(base_url) {
+        set_value_at_path(
+            document,
+            "model_provider.allow_private_base_url",
+            toml::Value::Boolean(true),
+        )?;
+    }
     apply_anthropic_chat_model_selection(document, model_id)?;
     unset_value_at_path(document, "model_provider.openai_base_url")?;
     unset_value_at_path(document, "model_provider.openai_model")?;
@@ -3037,7 +3095,7 @@ fn configure_anthropic_provider(
                 provider_id: "anthropic-primary",
                 display_name: "Anthropic",
                 kind: "anthropic",
-                base_url: "https://api.anthropic.com",
+                base_url,
                 auth_provider_kind: "anthropic",
             },
             None,
@@ -3068,7 +3126,7 @@ fn configure_minimax_provider(
         toml::Value::String(base_url.to_owned()),
     )?;
     apply_anthropic_chat_model_selection(document, model_id)?;
-    if minimax_base_url_requires_private_opt_in(base_url) {
+    if base_url_requires_private_opt_in(base_url) {
         set_value_at_path(
             document,
             "model_provider.allow_private_base_url",
@@ -3105,6 +3163,7 @@ fn configure_minimax_provider(
 fn configure_registry_provider(
     document: &mut toml::Value,
     defaults: &RegistryProviderDefaults,
+    base_url: &str,
     model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
@@ -3121,8 +3180,15 @@ fn configure_registry_provider(
     set_value_at_path(
         document,
         "model_provider.openai_base_url",
-        toml::Value::String(defaults.base_url.to_owned()),
+        toml::Value::String(base_url.to_owned()),
     )?;
+    if base_url_requires_private_opt_in(base_url) {
+        set_value_at_path(
+            document,
+            "model_provider.allow_private_base_url",
+            toml::Value::Boolean(true),
+        )?;
+    }
     apply_openai_chat_model_selection(document, model_id)?;
     unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
     unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
@@ -3131,7 +3197,7 @@ fn configure_registry_provider(
     set_value_at_path(
         document,
         "model_provider.providers",
-        toml::Value::Array(vec![registry_provider_table(defaults, vault_ref)]),
+        toml::Value::Array(vec![registry_provider_table(defaults, base_url, vault_ref)]),
     )?;
     if let Some(model_id) = model_id {
         set_value_at_path(
@@ -3153,13 +3219,14 @@ fn configure_registry_provider(
 
 fn registry_provider_table(
     defaults: &RegistryProviderDefaults,
+    base_url: &str,
     vault_ref: Option<String>,
 ) -> toml::Value {
     let mut table = toml::map::Map::new();
     table.insert("provider_id".to_owned(), toml::Value::String(defaults.provider_id.to_owned()));
     table.insert("display_name".to_owned(), toml::Value::String(defaults.display_name.to_owned()));
     table.insert("kind".to_owned(), toml::Value::String("openai_compatible".to_owned()));
-    table.insert("base_url".to_owned(), toml::Value::String(defaults.base_url.to_owned()));
+    table.insert("base_url".to_owned(), toml::Value::String(base_url.to_owned()));
     table.insert(
         "auth_provider_kind".to_owned(),
         toml::Value::String(defaults.auth_provider_kind.to_owned()),
@@ -3303,9 +3370,8 @@ fn discover_openai_compatible_models(
     parse_discovered_provider_models(body.as_str())
 }
 
-fn discover_anthropic_model_selection(document: &toml::Value, api_key: &str) -> Result<String> {
-    let base_url = anthropic_base_url_for_config(document)?;
-    let models = discover_anthropic_models(api_key, base_url.as_str())?;
+fn discover_anthropic_model_selection(base_url: &str, api_key: &str) -> Result<String> {
+    let models = discover_anthropic_models(api_key, base_url)?;
     select_preferred_discovered_model_id(models.as_slice()).ok_or_else(|| {
         anyhow::anyhow!(
             "Anthropic model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
@@ -3313,7 +3379,33 @@ fn discover_anthropic_model_selection(document: &toml::Value, api_key: &str) -> 
     })
 }
 
+fn openai_base_url_for_config(document: &toml::Value) -> Result<String> {
+    if let Some(base_url) = provider_base_url_from_env(OPENAI_BASE_URL_ENV)? {
+        return Ok(base_url);
+    }
+    let configured_for_openai = get_string_value_at_path(document, "model_provider.kind")?
+        .as_deref()
+        == Some("openai_compatible")
+        && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
+            .as_deref()
+            .is_none_or(|kind| kind.eq_ignore_ascii_case("openai"));
+    if configured_for_openai {
+        if let Some(base_url) =
+            get_string_value_at_path(document, "model_provider.openai_base_url")?
+        {
+            return normalize_provider_discovery_base_url(
+                base_url.as_str(),
+                "model_provider.openai_base_url",
+            );
+        }
+    }
+    Ok("https://api.openai.com/v1".to_owned())
+}
+
 fn anthropic_base_url_for_config(document: &toml::Value) -> Result<String> {
+    if let Some(base_url) = provider_base_url_from_env(ANTHROPIC_BASE_URL_ENV)? {
+        return Ok(base_url);
+    }
     let configured_for_anthropic =
         get_string_value_at_path(document, "model_provider.kind")?.as_deref() == Some("anthropic")
             && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
@@ -3323,10 +3415,42 @@ fn anthropic_base_url_for_config(document: &toml::Value) -> Result<String> {
         if let Some(base_url) =
             get_string_value_at_path(document, "model_provider.anthropic_base_url")?
         {
-            return Ok(base_url);
+            return normalize_provider_discovery_base_url(
+                base_url.as_str(),
+                "model_provider.anthropic_base_url",
+            );
         }
     }
     Ok("https://api.anthropic.com".to_owned())
+}
+
+fn registry_provider_base_url(defaults: &RegistryProviderDefaults) -> Result<String> {
+    let env_name = match defaults.auth_provider_kind {
+        kind if kind.eq_ignore_ascii_case(XAI_AUTH_PROVIDER_KIND) => Some(XAI_BASE_URL_ENV),
+        kind if kind.eq_ignore_ascii_case(GOOGLE_GEMINI_AUTH_PROVIDER_KIND)
+            || kind.eq_ignore_ascii_case(GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND) =>
+        {
+            Some(GOOGLE_GEMINI_BASE_URL_ENV)
+        }
+        kind if kind.eq_ignore_ascii_case(OPENROUTER_AUTH_PROVIDER_KIND) => {
+            Some(OPENROUTER_BASE_URL_ENV)
+        }
+        _ => None,
+    };
+    if let Some(env_name) = env_name {
+        if let Some(base_url) = provider_base_url_from_env(env_name)? {
+            return Ok(base_url);
+        }
+    }
+    Ok(defaults.base_url.to_owned())
+}
+
+fn provider_base_url_from_env(env_name: &str) -> Result<Option<String>> {
+    match env::var(env_name) {
+        Ok(raw) => normalize_provider_discovery_base_url(raw.as_str(), env_name).map(Some),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => anyhow::bail!("{env_name} must contain valid Unicode: {error}"),
+    }
 }
 
 fn discover_anthropic_models(
@@ -3372,7 +3496,9 @@ fn discover_minimax_model_selection(
     base_url_override: Option<&str>,
 ) -> Result<MinimaxModelSelection> {
     let base_url = match base_url_override {
-        Some(base_url) => normalize_minimax_base_url(base_url, "selected MiniMax endpoint")?,
+        Some(base_url) => {
+            normalize_provider_discovery_base_url(base_url, "selected MiniMax endpoint")?
+        }
         None => minimax_base_url_for_config(document)?,
     };
     let existing_model = existing_minimax_chat_model(document)?;
@@ -3416,7 +3542,9 @@ fn minimax_secret_key(auth_method: &str) -> &'static str {
 
 fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
     match env::var(MINIMAX_BASE_URL_ENV) {
-        Ok(raw) => return normalize_minimax_base_url(raw.as_str(), MINIMAX_BASE_URL_ENV),
+        Ok(raw) => {
+            return normalize_provider_discovery_base_url(raw.as_str(), MINIMAX_BASE_URL_ENV)
+        }
         Err(env::VarError::NotPresent) => {}
         Err(error) => anyhow::bail!("{MINIMAX_BASE_URL_ENV} must contain valid Unicode: {error}"),
     }
@@ -3430,7 +3558,7 @@ fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
         if let Some(base_url) =
             get_string_value_at_path(document, "model_provider.anthropic_base_url")?
         {
-            return normalize_minimax_base_url(
+            return normalize_provider_discovery_base_url(
                 base_url.as_str(),
                 "model_provider.anthropic_base_url",
             );
@@ -3440,9 +3568,9 @@ fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
     Ok(DEFAULT_MINIMAX_BASE_URL.to_owned())
 }
 
-/// Validates and canonicalizes a MiniMax base URL; https is required except for
-/// loopback http endpoints.
-fn normalize_minimax_base_url(raw: &str, source: &str) -> Result<String> {
+/// Validates and canonicalizes a provider discovery base URL; https is required
+/// except for loopback http endpoints used by local test rigs.
+fn normalize_provider_discovery_base_url(raw: &str, source: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{source} cannot be empty");
@@ -3462,9 +3590,7 @@ fn normalize_minimax_base_url(raw: &str, source: &str) -> Result<String> {
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
-// Loopback http endpoints (local proxies and test rigs) need the explicit
-// private-base-url opt-in because the daemon rejects private model endpoints by default.
-fn minimax_base_url_requires_private_opt_in(base_url: &str) -> bool {
+fn base_url_requires_private_opt_in(base_url: &str) -> bool {
     reqwest::Url::parse(base_url)
         .is_ok_and(|url| url.scheme() == "http" && url.host_str().is_some_and(host_is_loopback))
 }

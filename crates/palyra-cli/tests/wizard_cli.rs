@@ -23,6 +23,9 @@ use palyra_vault::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
+const ANTHROPIC_MODELS_RESPONSE: &str = r#"{"data":[{"id":"claude-test-discovered"}]}"#;
+
 fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
     command
         .env("PALYRA_STATE_ROOT", workdir.path().join("state-root"))
@@ -122,6 +125,8 @@ fn profiles_registry_path(workdir: &TempDir) -> PathBuf {
 
 fn seed_quickstart_config(workdir: &TempDir, config_path: &Path) -> Result<()> {
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         workdir,
         &[
@@ -144,8 +149,16 @@ fn seed_quickstart_config(workdir: &TempDir, config_path: &Path) -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[("OPENAI_API_KEY", "sk-test-setup")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "quickstart seed should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "quickstart seed should succeed: {}",
@@ -167,6 +180,8 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
     let grpc_port_arg = grpc_port.to_string();
     let quic_port_arg = quic_port.to_string();
     let dashboard_url = format!("http://127.0.0.1:{daemon_port}/");
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -195,8 +210,16 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
             "--skip-skills",
             "--json",
         ],
-        &[("OPENAI_API_KEY", "sk-test-setup")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "setup wizard should succeed: {}",
@@ -384,6 +407,8 @@ fn quickstart_defaults_do_not_report_optional_sections_as_explicitly_skipped() -
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -405,8 +430,16 @@ fn quickstart_defaults_do_not_report_optional_sections_as_explicitly_skipped() -
             "--skip-health",
             "--json",
         ],
-        &[("OPENAI_API_KEY", "sk-test-setup")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "quickstart should discover OpenAI models before writing config: {discovery_request}"
+    );
 
     assert!(
         output.status.success(),
@@ -449,6 +482,8 @@ fn setup_wizard_bootstraps_missing_global_config_path() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("global-config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -472,8 +507,16 @@ fn setup_wizard_bootstraps_missing_global_config_path() -> Result<()> {
             "--skip-skills",
             "--json",
         ],
-        &[("OPENAI_API_KEY", "sk-test-bootstrap-config")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-bootstrap-config"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "bootstrap should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "setup wizard should accept a missing global --config bootstrap target: {}",
@@ -494,6 +537,8 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn_anthropic(ANTHROPIC_MODELS_RESPONSE)?;
+    let anthropic_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -516,8 +561,16 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[("ANTHROPIC_API_KEY", "sk-ant-test-setup")],
+        &[
+            ("ANTHROPIC_API_KEY", "sk-ant-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL", anthropic_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover Anthropic models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "anthropic quickstart should succeed: {}",
@@ -531,8 +584,8 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
         "expected vault-backed Anthropic auth in onboarding config"
     );
     assert!(
-        written.contains("anthropic_model = \"claude-3-5-sonnet-latest\""),
-        "expected anthropic model default in config"
+        written.contains("anthropic_model = \"claude-test-discovered\""),
+        "expected discovered Anthropic model in config"
     );
     Ok(())
 }
@@ -542,6 +595,8 @@ fn setup_wizard_text_summary_surfaces_gateway_start_guidance() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -563,8 +618,16 @@ fn setup_wizard_text_summary_surfaces_gateway_start_guidance() -> Result<()> {
             "--skip-channels",
             "--skip-skills",
         ],
-        &[("OPENAI_API_KEY", "sk-test-runtime-guidance")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-runtime-guidance"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "setup wizard should succeed in text mode: {}",
@@ -685,6 +748,8 @@ fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openrouter_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -707,8 +772,16 @@ fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[("OPENROUTER_API_KEY", "sk-openrouter-test-setup")],
+        &[
+            ("OPENROUTER_API_KEY", "sk-openrouter-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL", openrouter_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup should discover OpenRouter models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "OpenRouter quickstart should succeed: {}",
@@ -722,12 +795,16 @@ fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
         "expected OpenRouter auth provider kind: {written}"
     );
     assert!(
-        written.contains("openai_base_url = \"https://openrouter.ai/api/v1\""),
+        written.contains(format!("openai_base_url = \"{openrouter_base_url}\"").as_str()),
         "expected OpenRouter OpenAI-compatible base URL: {written}"
     );
     assert!(
-        written.contains("default_chat_model_id = \"~openai/gpt-latest\""),
-        "expected OpenRouter default chat model: {written}"
+        written.contains("default_chat_model_id = \"gpt-test-discovered\""),
+        "expected discovered OpenRouter chat model: {written}"
+    );
+    assert!(
+        written.contains("allow_private_base_url = true"),
+        "expected loopback OpenRouter discovery endpoint to opt into private base URLs"
     );
     assert!(
         written.contains("provider_id = \"openrouter-primary\""),
@@ -935,6 +1012,8 @@ fn setup_wizard_reuse_backfills_admin_defaults() -> Result<()> {
     )?;
     let config_path_string = config_path.to_string_lossy().into_owned();
 
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -956,8 +1035,16 @@ fn setup_wizard_reuse_backfills_admin_defaults() -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[("OPENAI_API_KEY", "sk-test-setup")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-setup"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "reuse setup should discover OpenAI models before writing config: {discovery_request}"
+    );
 
     assert!(
         output.status.success(),
@@ -991,6 +1078,8 @@ fn onboarding_manual_flow_writes_public_tls_config() -> Result<()> {
     let config_path_string = config_path.to_string_lossy().into_owned();
     let cert_path_string = cert_path.to_string_lossy().into_owned();
     let key_path_string = key_path.to_string_lossy().into_owned();
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -1024,8 +1113,16 @@ fn onboarding_manual_flow_writes_public_tls_config() -> Result<()> {
             "--skip-channels",
             "--skip-skills",
         ],
-        &[("OPENAI_API_KEY", "sk-test-manual")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-manual"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "manual onboarding should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "manual onboarding should succeed: {}",
@@ -1195,6 +1292,8 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
 
     let config_path_string = config_path.to_string_lossy().into_owned();
     let secret_bytes = b"sk-configure-stdin-secret\n";
+    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let openai_base_url = model_server.base_url.clone();
     let output = run_cli_with_stdin(
         &workdir,
         &[
@@ -1210,9 +1309,14 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
             "--api-key-stdin",
             "--json",
         ],
-        &[],
+        &[("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str())],
         Some(secret_bytes),
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "configure auth-model should discover OpenAI models before persisting config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "configure auth-model should accept stdin secret: {}",
@@ -1222,11 +1326,12 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
         serde_json::from_slice(&output.stdout).context("configure stdout should be JSON")?;
     assert_eq!(payload.get("status").and_then(Value::as_str), Some("complete"));
     assert!(
-        payload
-            .get("unchanged_sections")
-            .and_then(Value::as_array)
-            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("auth-model"))),
-        "expected auth-model section to complete even when only the stored secret value changes: {payload}"
+        ["changed_sections", "unchanged_sections"].iter().any(|field| {
+            payload.get(*field).and_then(Value::as_array).is_some_and(|values| {
+                values.iter().any(|value| value.as_str() == Some("auth-model"))
+            })
+        }),
+        "expected auth-model section to complete after stdin secret input: {payload}"
     );
 
     let written = fs::read_to_string(&config_path)
@@ -1763,8 +1868,25 @@ struct MockProviderServer {
     handle: thread::JoinHandle<Result<String>>,
 }
 
+#[derive(Clone, Copy)]
+enum MockProviderAuth {
+    Bearer,
+    Anthropic,
+}
+
 impl MockProviderServer {
     fn spawn(response_body: &'static str) -> Result<Self> {
+        Self::spawn_with_auth(response_body, MockProviderAuth::Bearer)
+    }
+
+    fn spawn_anthropic(response_body: &'static str) -> Result<Self> {
+        Self::spawn_with_auth(response_body, MockProviderAuth::Anthropic)
+    }
+
+    fn spawn_with_auth(
+        response_body: &'static str,
+        expected_auth: MockProviderAuth,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("failed to bind mock provider server")?;
         listener.set_nonblocking(true).context("failed to configure mock provider listener")?;
@@ -1784,10 +1906,24 @@ impl MockProviderServer {
                         if !request_text.starts_with("GET /v1/models ") {
                             anyhow::bail!("unexpected provider request: {request_text}");
                         }
-                        if !request_text.to_ascii_lowercase().contains("authorization: bearer ") {
-                            anyhow::bail!(
-                                "model discovery request should use bearer auth: {request_text}"
-                            );
+                        let request_lower = request_text.to_ascii_lowercase();
+                        match expected_auth {
+                            MockProviderAuth::Bearer => {
+                                if !request_lower.contains("authorization: bearer ") {
+                                    anyhow::bail!(
+                                        "model discovery request should use bearer auth: {request_text}"
+                                    );
+                                }
+                            }
+                            MockProviderAuth::Anthropic => {
+                                if !request_lower.contains("x-api-key: ")
+                                    || !request_lower.contains("anthropic-version: ")
+                                {
+                                    anyhow::bail!(
+                                        "Anthropic discovery request should use x-api-key and anthropic-version headers: {request_text}"
+                                    );
+                                }
+                            }
                         }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
