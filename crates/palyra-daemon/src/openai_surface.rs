@@ -3712,13 +3712,13 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 "model_provider.anthropic_base_url",
                 ANTHROPIC_DEFAULT_BASE_URL,
             )?;
-            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Anthropic) {
-                apply_discovered_or_clear_text_model_selection(
-                    &mut document,
-                    "model_provider.anthropic_model",
-                    None,
-                    true,
-                )?;
+            apply_discovered_or_clear_text_model_selection(
+                &mut document,
+                "model_provider.anthropic_model",
+                discovered_model_id,
+                true,
+            )?;
+            if !discovered_model_present {
                 write_pending_model_registry(
                     &mut document,
                     PendingModelRegistryProvider {
@@ -3741,11 +3741,9 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 &mut document,
                 "model_provider.anthropic_model",
                 discovered_model_id,
-                previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax),
+                true,
             )?;
-            if !discovered_model_present
-                && previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax)
-            {
+            if !discovered_model_present {
                 write_pending_model_registry(
                     &mut document,
                     PendingModelRegistryProvider {
@@ -3768,11 +3766,9 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 &mut document,
                 "model_provider.openai_model",
                 discovered_model_id,
-                previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Xai),
+                true,
             )?;
-            if !discovered_model_present
-                && previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Xai)
-            {
+            if !discovered_model_present {
                 write_pending_model_registry(
                     &mut document,
                     PendingModelRegistryProvider {
@@ -3792,19 +3788,13 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 "model_provider.openai_base_url",
                 GOOGLE_GEMINI_OPENAI_BASE_URL,
             )?;
-            if !matches!(
-                previous_auth_provider_kind,
-                Some(
-                    ModelProviderAuthProviderKind::GoogleGemini
-                        | ModelProviderAuthProviderKind::GoogleGeminiCli
-                )
-            ) {
-                apply_discovered_or_clear_text_model_selection(
-                    &mut document,
-                    "model_provider.openai_model",
-                    None,
-                    true,
-                )?;
+            apply_discovered_or_clear_text_model_selection(
+                &mut document,
+                "model_provider.openai_model",
+                discovered_model_id,
+                true,
+            )?;
+            if !discovered_model_present {
                 write_pending_model_registry(
                     &mut document,
                     PendingModelRegistryProvider {
@@ -3823,13 +3813,13 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 "model_provider.openai_base_url",
                 OPENROUTER_DEFAULT_BASE_URL,
             )?;
-            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Openrouter) {
-                apply_discovered_or_clear_text_model_selection(
-                    &mut document,
-                    "model_provider.openai_model",
-                    None,
-                    true,
-                )?;
+            apply_discovered_or_clear_text_model_selection(
+                &mut document,
+                "model_provider.openai_model",
+                discovered_model_id,
+                true,
+            )?;
+            if !discovered_model_present {
                 write_pending_model_registry(
                     &mut document,
                     PendingModelRegistryProvider {
@@ -3989,8 +3979,20 @@ fn apply_openai_provider_selection_defaults(
                 document,
                 "model_provider.openai_model",
                 discovered_model_id,
-                false,
+                true,
             )?;
+            if !discovered_model_present {
+                write_pending_model_registry(
+                    document,
+                    PendingModelRegistryProvider {
+                        provider_id: "openai-primary",
+                        display_name: "OpenAI",
+                        kind: "openai_compatible",
+                        base_url: OPENAI_DEFAULT_BASE_URL,
+                        auth_provider_kind: "openai",
+                    },
+                )?;
+            }
         }
     }
     Ok(())
@@ -4985,6 +4987,42 @@ mod tests {
             Some(OPENAI_DEFAULT_BASE_URL)
         );
         assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
+    }
+
+    #[test]
+    fn openai_selection_defaults_clear_same_provider_stale_model_without_discovery() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "openai"
+            openai_base_url = "https://api.openai.com/v1"
+            openai_model = "stale-provider-model"
+            default_chat_model_id = "stale-provider-model"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_openai_provider_selection_defaults(
+            &mut document,
+            Some(ModelProviderAuthProviderKind::Openai),
+            OpenAiProviderSelectionRuntime::OpenAiCompatible,
+            None,
+        )
+        .expect("OpenAI compatible selection defaults should apply");
+
+        assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.default_chat_model_id"),
+            None
+        );
+        assert!(
+            get_value_at_path(&document, "model_provider.providers")
+                .ok()
+                .flatten()
+                .and_then(toml::Value::as_array)
+                .is_some_and(|providers| !providers.is_empty()),
+            "missing discovery should leave an explicit pending provider registry"
+        );
     }
 
     #[test]

@@ -88,7 +88,6 @@ const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
 const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS: usize = 64;
-const DEFAULT_OPENAI_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 const DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS: u64 = 30_000;
 const DEFAULT_PROVIDER_RESPONSE_CACHE_MAX_ENTRIES: usize = 128;
 const DEFAULT_PROVIDER_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1_000;
@@ -442,8 +441,8 @@ impl Default for ModelProviderConfig {
             openai_base_url: "https://api.openai.com/v1".to_owned(),
             anthropic_base_url: "https://api.anthropic.com".to_owned(),
             allow_private_base_url: false,
-            openai_model: "gpt-4o-mini".to_owned(),
-            anthropic_model: "claude-3-5-sonnet-latest".to_owned(),
+            openai_model: String::new(),
+            anthropic_model: String::new(),
             openai_embeddings_model: None,
             openai_embeddings_dims: None,
             openai_api_key: None,
@@ -491,8 +490,12 @@ impl ModelProviderConfig {
         self.normalized_registry().ok().and_then(|registry| registry.default_chat_model_id).or_else(
             || match self.kind {
                 ModelProviderKind::Deterministic => Some("deterministic".to_owned()),
-                ModelProviderKind::OpenAiCompatible => Some(self.openai_model.clone()),
-                ModelProviderKind::Anthropic => Some(self.anthropic_model.clone()),
+                ModelProviderKind::OpenAiCompatible => {
+                    configured_model_id(self.openai_model.as_str()).map(ToOwned::to_owned)
+                }
+                ModelProviderKind::Anthropic => {
+                    configured_model_id(self.anthropic_model.as_str()).map(ToOwned::to_owned)
+                }
             },
         )
     }
@@ -506,6 +509,15 @@ impl ModelProviderConfig {
             .ok()
             .and_then(|registry| registry.default_embeddings_model_id)
             .or_else(|| self.openai_embeddings_model.clone())
+    }
+}
+
+fn configured_model_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
@@ -595,6 +607,19 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
             )
         }
     };
+    let configured_chat_model_id = configured_model_id(model_id.as_str()).map(ToOwned::to_owned);
+    let mut models = Vec::new();
+    if let Some(chat_model_id) = configured_chat_model_id.clone() {
+        models.push(ProviderModelEntryConfig {
+            model_id: chat_model_id,
+            provider_id: provider_id.clone(),
+            role: ProviderModelRole::Chat,
+            enabled: true,
+            metadata_source: ProviderMetadataSource::LegacyMigration,
+            operator_override: false,
+            capabilities,
+        });
+    }
     let mut registry = ModelProviderRegistryConfig {
         providers: vec![ProviderRegistryEntryConfig {
             provider_id: provider_id.clone(),
@@ -615,16 +640,8 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
             circuit_breaker_failure_threshold: config.circuit_breaker_failure_threshold,
             circuit_breaker_cooldown_ms: config.circuit_breaker_cooldown_ms,
         }],
-        models: vec![ProviderModelEntryConfig {
-            model_id: model_id.clone(),
-            provider_id: provider_id.clone(),
-            role: ProviderModelRole::Chat,
-            enabled: true,
-            metadata_source: ProviderMetadataSource::LegacyMigration,
-            operator_override: false,
-            capabilities,
-        }],
-        default_chat_model_id: Some(model_id),
+        models,
+        default_chat_model_id: configured_chat_model_id,
         default_embeddings_model_id: None,
         default_audio_transcription_model_id: None,
         failover_enabled: true,
@@ -3881,6 +3898,24 @@ impl AttemptError {
     }
 }
 
+fn selected_chat_model_id<'a>(
+    model_override: Option<&'a str>,
+    configured_chat_model_id: &'a str,
+    provider_label: &str,
+    classification_detail: &str,
+) -> Result<&'a str, AttemptError> {
+    model_override
+        .and_then(configured_model_id)
+        .or_else(|| configured_model_id(configured_chat_model_id))
+        .ok_or_else(|| {
+            AttemptError::request_failed(
+                format!("{provider_label} provider has no discovered chat model configured"),
+                false,
+                fail_closed_provider_classification(classification_detail),
+            )
+        })
+}
+
 // Wire-format DTOs for upstream responses. Fields default aggressively so
 // partial vendor payloads still deserialize; validation happens afterwards.
 #[derive(Debug, Deserialize)]
@@ -4410,15 +4445,9 @@ impl OpenAiCompatibleProvider {
         )
     }
 
-    // Chat model ids cannot serve the transcription endpoint, so unless the
-    // configured model is itself a transcription model (heuristic: name
-    // contains "transcribe"), fall back to the known-good default.
-    fn transcription_model_name(&self) -> &str {
-        if self.config.openai_model.contains("transcribe") {
-            self.config.openai_model.as_str()
-        } else {
-            DEFAULT_OPENAI_TRANSCRIPTION_MODEL
-        }
+    fn transcription_model_name(&self) -> Option<&str> {
+        configured_model_id(self.config.openai_model.as_str())
+            .filter(|model_id| model_id.contains("transcribe"))
     }
 
     async fn request_once(
@@ -4426,12 +4455,17 @@ impl OpenAiCompatibleProvider {
         api_key: &str,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, AttemptError> {
+        let requested_model_id = selected_chat_model_id(
+            request.model_override.as_deref(),
+            self.config.openai_model.as_str(),
+            "openai-compatible",
+            "openai_compatible_chat_model_missing",
+        )?;
         if self.uses_codex_responses_transport(api_key) {
-            return self.request_once_codex_responses(api_key, request).await;
+            return self.request_once_codex_responses(api_key, request, requested_model_id).await;
         }
 
-        let actual_model_id =
-            request.model_override.clone().unwrap_or_else(|| self.config.openai_model.clone());
+        let actual_model_id = requested_model_id.to_owned();
         let adapter = OpenAiCompatibleChatAdapter;
         let body = adapter.request_payload(request, actual_model_id.as_str());
 
@@ -4610,9 +4644,8 @@ impl OpenAiCompatibleProvider {
         &self,
         api_key: &str,
         request: &ProviderRequest,
+        requested_model_id: &str,
     ) -> Result<ProviderResponse, AttemptError> {
-        let requested_model_id =
-            request.model_override.as_deref().unwrap_or(self.config.openai_model.as_str());
         let actual_model_id = openai_codex_runtime_model_id(requested_model_id);
         let adapter = OpenAiResponsesChatAdapter;
         let body = adapter.request_payload(request, actual_model_id.as_str());
@@ -4680,6 +4713,16 @@ impl OpenAiCompatibleProvider {
         api_key: &str,
         request: &AudioTranscriptionRequest,
     ) -> Result<AudioTranscriptionResponse, AttemptError> {
+        let transcription_model = self.transcription_model_name().ok_or_else(|| {
+            AttemptError::request_failed(
+                "openai-compatible provider has no discovered audio transcription model configured"
+                    .to_owned(),
+                false,
+                fail_closed_provider_classification(
+                    "openai_compatible_audio_transcription_model_missing",
+                ),
+            )
+        })?;
         let file_part = reqwest::multipart::Part::bytes(request.bytes.clone())
             .file_name(request.file_name.clone())
             .mime_str(request.content_type.as_str())
@@ -4693,7 +4736,7 @@ impl OpenAiCompatibleProvider {
                 )
             })?;
         let mut form = reqwest::multipart::Form::new()
-            .text("model", self.transcription_model_name().to_owned())
+            .text("model", transcription_model.to_owned())
             .text("response_format", "verbose_json".to_owned())
             .part("file", file_part);
         if let Some(language) =
@@ -4769,7 +4812,7 @@ impl OpenAiCompatibleProvider {
             text: parsed.text,
             language: parsed.language,
             duration_ms: parsed.duration.map(provider_seconds_to_millis),
-            model_name: self.transcription_model_name().to_owned(),
+            model_name: transcription_model.to_owned(),
             retry_count: 0,
             segments,
         })
@@ -5256,6 +5299,13 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 (state.consecutive_failures, open)
             })
             .unwrap_or((0, false));
+        let chat_model_id =
+            configured_model_id(self.config.openai_model.as_str()).map(ToOwned::to_owned);
+        let discovered_model_ids = chat_model_id
+            .clone()
+            .into_iter()
+            .chain(self.config.openai_embeddings_model.clone())
+            .collect::<Vec<_>>();
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "openai-primary".to_owned(),
@@ -5264,7 +5314,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 self.config.auth_profile_id.as_deref(),
                 self.config.credential_source,
             ),
-            model_id: Some(self.config.openai_model.clone()),
+            model_id: chat_model_id.clone(),
             capabilities: ProviderCapabilitiesSnapshot {
                 streaming_tokens: true,
                 tool_calls: true,
@@ -5286,7 +5336,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             },
             openai_base_url: Some(self.config.openai_base_url.clone()),
             anthropic_base_url: None,
-            openai_model: Some(self.config.openai_model.clone()),
+            openai_model: chat_model_id.clone(),
             anthropic_model: None,
             openai_embeddings_model: self.config.openai_embeddings_model.clone(),
             openai_embeddings_dims: self.config.openai_embeddings_dims,
@@ -5321,21 +5371,24 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 empty_health_probe_snapshot("missing_auth", "provider has no credential", "runtime")
             },
             discovery: ProviderDiscoverySnapshot {
-                status: "static".to_owned(),
+                status: if discovered_model_ids.is_empty() { "pending" } else { "static" }
+                    .to_owned(),
                 checked_at_unix_ms: None,
                 expires_at_unix_ms: None,
-                discovered_model_ids: std::iter::once(self.config.openai_model.clone())
-                    .chain(self.config.openai_embeddings_model.clone())
-                    .collect(),
+                discovered_model_ids,
                 source: "static".to_owned(),
-                message: None,
+                message: if chat_model_id.is_some() {
+                    None
+                } else {
+                    Some("no provider-discovered models are configured yet".to_owned())
+                },
             },
             registry: ProviderRegistrySnapshot {
-                default_chat_model_id: Some(self.config.openai_model.clone()),
+                default_chat_model_id: chat_model_id,
                 default_embeddings_model_id: self.config.openai_embeddings_model.clone(),
-                default_audio_transcription_model_id: Some(
-                    self.transcription_model_name().to_owned(),
-                ),
+                default_audio_transcription_model_id: self
+                    .transcription_model_name()
+                    .map(ToOwned::to_owned),
                 failover_enabled: true,
                 response_cache_enabled: true,
                 providers: Vec::new(),
@@ -5449,10 +5502,14 @@ impl AnthropicProvider {
         api_key: &str,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, AttemptError> {
-        let model_name =
-            request.model_override.clone().unwrap_or_else(|| self.config.anthropic_model.clone());
+        let model_name = selected_chat_model_id(
+            request.model_override.as_deref(),
+            self.config.anthropic_model.as_str(),
+            "anthropic-compatible",
+            "anthropic_chat_model_missing",
+        )?;
         let adapter = AnthropicCompatibleChatAdapter;
-        let body = adapter.request_payload(request, model_name.as_str());
+        let body = adapter.request_payload(request, model_name);
 
         let request_builder = self
             .client
@@ -5611,12 +5668,12 @@ impl AnthropicProvider {
             events,
             retry_count: 0,
             provider_id: "anthropic-primary".to_owned(),
-            model_id: model_name.clone(),
+            model_id: model_name.to_owned(),
             served_from_cache: false,
             failover_count: 0,
             attempts: vec![ProviderAttemptSummary {
                 provider_id: "anthropic-primary".to_owned(),
-                model_id: model_name,
+                model_id: model_name.to_owned(),
                 outcome: "success".to_owned(),
                 retryable: false,
                 served_from_cache: false,
@@ -5745,6 +5802,8 @@ impl ModelProvider for AnthropicProvider {
                 (state.consecutive_failures, open)
             })
             .unwrap_or((0, false));
+        let chat_model_id =
+            configured_model_id(self.config.anthropic_model.as_str()).map(ToOwned::to_owned);
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "anthropic-primary".to_owned(),
@@ -5753,7 +5812,7 @@ impl ModelProvider for AnthropicProvider {
                 self.config.auth_profile_id.as_deref(),
                 self.config.credential_source,
             ),
-            model_id: Some(self.config.anthropic_model.clone()),
+            model_id: chat_model_id.clone(),
             capabilities: capability_defaults_for_kind(
                 ModelProviderKind::Anthropic,
                 ProviderModelRole::Chat,
@@ -5761,7 +5820,7 @@ impl ModelProvider for AnthropicProvider {
             openai_base_url: None,
             anthropic_base_url: Some(self.config.anthropic_base_url.clone()),
             openai_model: None,
-            anthropic_model: Some(self.config.anthropic_model.clone()),
+            anthropic_model: chat_model_id.clone(),
             openai_embeddings_model: None,
             openai_embeddings_dims: None,
             auth_profile_id: self.config.auth_profile_id.clone(),
@@ -5796,15 +5855,19 @@ impl ModelProvider for AnthropicProvider {
                 empty_health_probe_snapshot("missing_auth", "provider has no credential", "runtime")
             },
             discovery: ProviderDiscoverySnapshot {
-                status: "static".to_owned(),
+                status: if chat_model_id.is_some() { "static" } else { "pending" }.to_owned(),
                 checked_at_unix_ms: None,
                 expires_at_unix_ms: None,
-                discovered_model_ids: vec![self.config.anthropic_model.clone()],
+                discovered_model_ids: chat_model_id.clone().into_iter().collect(),
                 source: "static".to_owned(),
-                message: None,
+                message: if chat_model_id.is_some() {
+                    None
+                } else {
+                    Some("no provider-discovered models are configured yet".to_owned())
+                },
             },
             registry: ProviderRegistrySnapshot {
-                default_chat_model_id: Some(self.config.anthropic_model.clone()),
+                default_chat_model_id: chat_model_id,
                 default_embeddings_model_id: None,
                 default_audio_transcription_model_id: None,
                 failover_enabled: true,
@@ -6390,12 +6453,12 @@ mod tests {
         classify_http_provider_failure, classify_transport_provider_failure,
         extract_completion_text, normalize_tool_arguments, provider_seconds_to_millis,
         sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
-        AnthropicCompatibleChatAdapter, EmbeddingsRequest, ModelProvider,
+        AnthropicCompatibleChatAdapter, AnthropicProvider, EmbeddingsRequest, ModelProvider,
         ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
         ModelProviderKind, ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter,
-        ProviderChatAdapter, ProviderError, ProviderEvent, ProviderFailureAction,
-        ProviderFailureClass, ProviderFinishReason, ProviderImageInput, ProviderMessage,
-        ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+        OpenAiCompatibleProvider, ProviderChatAdapter, ProviderError, ProviderEvent,
+        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
         ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
         ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
@@ -6911,6 +6974,81 @@ mod tests {
             "pending provider registry must not synthesize legacy model defaults"
         );
         assert_eq!(snapshot.discovery.status, "pending");
+    }
+
+    #[test]
+    fn legacy_provider_without_model_is_pending_before_discovery() {
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            allow_private_base_url: true,
+            openai_api_key: Some("sk-test-secret".to_owned()),
+            ..ModelProviderConfig::default()
+        };
+
+        let provider = RegistryBackedModelProvider::new(config)
+            .expect("legacy provider without discovered models should remain valid");
+        let snapshot = provider.status_snapshot();
+
+        assert_eq!(snapshot.model_id, None);
+        assert_eq!(snapshot.registry.default_chat_model_id, None);
+        assert!(
+            snapshot.registry.models.is_empty(),
+            "legacy provider must not synthesize a provider model before discovery"
+        );
+        assert_eq!(snapshot.discovery.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn openai_provider_without_model_fails_before_http() {
+        let mut config = openai_test_config("http://127.0.0.1:1/v1".to_owned());
+        config.openai_model.clear();
+        config.max_retries = 0;
+        let provider = OpenAiCompatibleProvider::new(&config)
+            .expect("provider construction should not require a discovered model");
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
+            .await
+            .expect_err("missing discovered model should fail locally");
+
+        assert!(
+            matches!(
+                error,
+                ProviderError::RequestFailed {
+                    retryable: false,
+                    ref message,
+                    ..
+                } if message.contains("no discovered chat model configured")
+            ),
+            "missing model error should be local and non-retryable: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_provider_without_model_fails_before_http() {
+        let mut config = anthropic_test_config("http://127.0.0.1:1".to_owned());
+        config.anthropic_model.clear();
+        config.max_retries = 0;
+        let provider = AnthropicProvider::new(&config)
+            .expect("provider construction should not require a discovered model");
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
+            .await
+            .expect_err("missing discovered model should fail locally");
+
+        assert!(
+            matches!(
+                error,
+                ProviderError::RequestFailed {
+                    retryable: false,
+                    ref message,
+                    ..
+                } if message.contains("no discovered chat model configured")
+            ),
+            "missing model error should be local and non-retryable: {error:?}"
+        );
     }
 
     fn multi_provider_test_config(

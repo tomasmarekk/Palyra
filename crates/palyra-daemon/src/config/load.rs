@@ -4800,7 +4800,14 @@ mod tests {
             !config.allow_private_base_url,
             "model provider private-network base URLs must require explicit opt-in"
         );
-        assert_eq!(config.openai_model, "gpt-4o-mini");
+        assert!(
+            config.openai_model.is_empty(),
+            "openai model must come from explicit config or provider discovery"
+        );
+        assert!(
+            config.anthropic_model.is_empty(),
+            "anthropic model must come from explicit config or provider discovery"
+        );
         assert!(
             config.openai_embeddings_model.is_none(),
             "openai embeddings model should default to unset"
