@@ -78,6 +78,11 @@ impl OAuthRefreshAdapter for RacingRefreshAdapter {
     }
 }
 
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn open_test_vault(root: &Path, identity_root: &Path) -> Vault {
     Vault::open_with_config(VaultConfigOptions {
         root: Some(root.to_path_buf()),
@@ -215,6 +220,68 @@ fn list_profiles_resumes_from_after_profile_id() {
         vec!["openai-gamma"]
     );
     assert_eq!(second_page.next_after_profile_id, None);
+}
+
+#[test]
+fn readonly_profile_lookup_does_not_create_missing_registry() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let registry_path = tempdir.path().join("auth_profiles.toml");
+
+    let profile =
+        AuthProfileRegistry::get_profile_readonly(identity_root.as_path(), "openai-default")
+            .expect("missing registry should be a clean readonly miss");
+
+    assert!(profile.is_none());
+    assert!(!registry_path.exists(), "readonly lookup must not create registry files");
+}
+
+#[test]
+fn readonly_profile_lookup_reads_existing_profile() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    registry
+        .set_profile(sample_oauth_profile_request_with_identity("openai-default", "default"))
+        .expect("profile should persist");
+
+    let profile =
+        AuthProfileRegistry::get_profile_readonly(identity_root.as_path(), "openai-default")
+            .expect("existing registry should load")
+            .expect("profile should exist");
+
+    assert_eq!(profile.profile_id, "openai-default");
+    assert_eq!(profile.profile_name, "default");
+}
+
+#[test]
+fn readonly_state_root_lookup_uses_explicit_state_root() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let env_state_root = tempdir.path().join("env-state");
+    let explicit_state_root = tempdir.path().join("explicit-state");
+    let explicit_identity_root = explicit_state_root.join("identity");
+    let registry = AuthProfileRegistry::open(explicit_identity_root.as_path())
+        .expect("registry should initialize");
+    registry
+        .set_profile(sample_oauth_profile_request_with_identity("openai-default", "default"))
+        .expect("profile should persist");
+
+    let _guard = env_lock().lock().expect("test env lock should be available");
+    let previous_state_root = std::env::var_os("PALYRA_STATE_ROOT");
+    std::env::set_var("PALYRA_STATE_ROOT", env_state_root.as_os_str());
+    let profile = AuthProfileRegistry::get_profile_readonly_at_state_root(
+        explicit_state_root.as_path(),
+        "openai-default",
+    )
+    .expect("explicit state root should load")
+    .expect("profile should exist");
+    match previous_state_root {
+        Some(value) => std::env::set_var("PALYRA_STATE_ROOT", value),
+        None => std::env::remove_var("PALYRA_STATE_ROOT"),
+    }
+
+    assert_eq!(profile.profile_id, "openai-default");
 }
 
 #[test]

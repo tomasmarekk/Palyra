@@ -32,6 +32,8 @@ const OPENAI_CODEX_MODELS_ENDPOINT: &str =
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
+const DESKTOP_CONTROL_CENTER_DIR: &str = "desktop-control-center";
+const DESKTOP_RUNTIME_DIR: &str = "runtime";
 const PROVIDER_CHECKS_CACHE_PATH: &str = "models/provider_checks.json";
 const CURATED_TEXT_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4.1-mini"];
 const CURATED_EMBEDDING_MODELS: &[&str] = &["text-embedding-3-small", "text-embedding-3-large"];
@@ -1258,9 +1260,11 @@ struct ModelsOverview {
 
 fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
     let path = resolve_config_path(path, true)?;
+    let config_path = Path::new(&path);
     let (document, migration) = load_document_from_existing_path(Path::new(&path))
         .with_context(|| format!("failed to parse {path}"))?;
     let root_config = parse_root_file_config(&document)?;
+    let auth_state_roots = status_auth_profile_state_roots(&root_config, config_path);
     let model_provider = root_config.model_provider.unwrap_or_default();
     let provider_kind =
         model_provider.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
@@ -1272,7 +1276,7 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
         model_provider.default_embeddings_model_id.as_deref(),
     );
     let default_chat_model_id = effective_default_chat_model_id(&model_provider, models.as_slice());
-    let openai_base_url = if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
+    let configured_openai_base_url = if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
         model_provider.openai_base_url.clone()
     } else {
         None
@@ -1332,6 +1336,17 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
         provider_entry.map(|entry| entry.api_key_configured).unwrap_or_else(|| {
             credential_configured_for_kind(provider_kind_for_status.as_str(), &model_provider)
         });
+    let uses_chatgpt_oauth = status_uses_openai_chatgpt_oauth(
+        provider_kind_for_status.as_str(),
+        auth_profile_id.as_deref(),
+        auth_state_roots.as_slice(),
+    );
+    let (endpoint_base_url, openai_base_url) = effective_status_base_urls(
+        provider_kind_for_status.as_str(),
+        endpoint_base_url,
+        configured_openai_base_url,
+        uses_chatgpt_oauth,
+    );
     Ok(ModelsOverview {
         status: ModelsStatusPayload {
             path,
@@ -1469,6 +1484,111 @@ fn default_base_url_for_kind(kind: &str, config: &FileModelProviderConfig) -> Op
             .or_else(|| Some(ANTHROPIC_DEFAULT_BASE_URL.to_owned())),
         _ => None,
     }
+}
+
+fn effective_status_base_urls(
+    provider_kind: &str,
+    endpoint_base_url: Option<String>,
+    openai_base_url: Option<String>,
+    uses_chatgpt_oauth: bool,
+) -> (Option<String>, Option<String>) {
+    if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND && uses_chatgpt_oauth {
+        let codex_base_url = Some(OPENAI_CODEX_BACKEND_BASE_URL.to_owned());
+        return (codex_base_url.clone(), codex_base_url);
+    }
+    (endpoint_base_url, openai_base_url)
+}
+
+fn status_auth_profile_state_roots(
+    config: &palyra_common::daemon_config_schema::RootFileConfig,
+    config_path: &Path,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(identity_store_dir) = config
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.identity_store_dir.as_deref())
+        .and_then(normalize_optional_text)
+    {
+        push_unique_path(
+            &mut roots,
+            state_root_for_identity_store(PathBuf::from(identity_store_dir)),
+        );
+    }
+    if let Ok(identity_store_root) = resolve_cli_identity_store_root() {
+        push_unique_path(&mut roots, state_root_for_identity_store(identity_store_root));
+    }
+    if let Some(state_root) = status_state_root(config_path) {
+        push_unique_path(&mut roots, state_root.clone());
+        // Desktop-managed daemons keep runtime auth state under this child while
+        // the CLI-visible config remains under the parent state root.
+        push_unique_path(
+            &mut roots,
+            state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR),
+        );
+    }
+    roots
+}
+
+fn state_root_for_identity_store(identity_store_root: PathBuf) -> PathBuf {
+    identity_store_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or(identity_store_root)
+}
+
+fn status_state_root(config_path: &Path) -> Option<PathBuf> {
+    let config_dir = config_path.parent()?;
+    if config_dir.file_name().and_then(|name| name.to_str()) == Some("config") {
+        if let Some(state_root) = config_dir.parent() {
+            return Some(state_root.to_path_buf());
+        }
+    }
+    if let Some(context) = app::current_root_context() {
+        return Some(context.state_root().to_path_buf());
+    }
+    app::resolve_cli_state_root(None).ok()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|path| path == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn status_uses_openai_chatgpt_oauth(
+    provider_kind: &str,
+    auth_profile_id: Option<&str>,
+    auth_state_roots: &[PathBuf],
+) -> bool {
+    if provider_kind != OPENAI_COMPATIBLE_PROVIDER_KIND {
+        return false;
+    }
+    let Some(profile_id) = auth_profile_id.and_then(normalize_optional_text) else {
+        return false;
+    };
+    auth_state_roots.iter().any(|state_root| {
+        let Ok(Some(profile)) = AuthProfileRegistry::get_profile_readonly_at_state_root(
+            state_root.as_path(),
+            profile_id,
+        ) else {
+            return false;
+        };
+        auth_credential_uses_openai_chatgpt_oauth(&profile.provider.kind, &profile.credential)
+    })
+}
+
+fn auth_credential_uses_openai_chatgpt_oauth(
+    provider_kind: &AuthProviderKind,
+    credential: &AuthCredential,
+) -> bool {
+    matches!(
+        credential,
+        AuthCredential::Oauth { client_id, .. }
+            if oauth_kind_for_profile(provider_kind, client_id.as_deref())
+                == Some(ResolvedOauthProfileKind::OpenAiChatGptLogin)
+    )
 }
 
 fn inline_api_key_for_kind(kind: &str, config: &FileModelProviderConfig) -> Option<String> {
@@ -2786,6 +2906,98 @@ mod tests {
                 .as_str(),
             "https://openrouter.ai/api/v1/models"
         );
+    }
+
+    #[test]
+    fn models_status_base_urls_use_codex_backend_for_chatgpt_oauth() {
+        let (endpoint_base_url, openai_base_url) = effective_status_base_urls(
+            OPENAI_COMPATIBLE_PROVIDER_KIND,
+            Some("https://api.x.ai/v1".to_owned()),
+            Some("https://api.x.ai/v1".to_owned()),
+            true,
+        );
+
+        assert_eq!(endpoint_base_url.as_deref(), Some(OPENAI_CODEX_BACKEND_BASE_URL));
+        assert_eq!(openai_base_url.as_deref(), Some(OPENAI_CODEX_BACKEND_BASE_URL));
+    }
+
+    #[test]
+    fn models_status_base_urls_keep_configured_url_without_chatgpt_oauth() {
+        let (endpoint_base_url, openai_base_url) = effective_status_base_urls(
+            OPENAI_COMPATIBLE_PROVIDER_KIND,
+            Some("https://api.x.ai/v1".to_owned()),
+            Some("https://api.x.ai/v1".to_owned()),
+            false,
+        );
+
+        assert_eq!(endpoint_base_url.as_deref(), Some("https://api.x.ai/v1"));
+        assert_eq!(openai_base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    #[test]
+    fn openai_chatgpt_oauth_detection_requires_chatgpt_client_id() {
+        let chatgpt_credential = AuthCredential::Oauth {
+            access_token_vault_ref: "global/openai_access".to_owned(),
+            refresh_token_vault_ref: "global/openai_refresh".to_owned(),
+            token_endpoint: "https://auth.openai.com/oauth/token".to_owned(),
+            client_id: Some(OPENAI_CHATGPT_OAUTH_CLIENT_ID.to_owned()),
+            client_secret_vault_ref: None,
+            scopes: Vec::new(),
+            expires_at_unix_ms: None,
+            refresh_state: Default::default(),
+        };
+        let api_key_credential =
+            AuthCredential::ApiKey { api_key_vault_ref: "global/openai_key".to_owned() };
+
+        assert!(auth_credential_uses_openai_chatgpt_oauth(
+            &AuthProviderKind::Openai,
+            &chatgpt_credential
+        ));
+        assert!(!auth_credential_uses_openai_chatgpt_oauth(
+            &AuthProviderKind::Openai,
+            &api_key_credential
+        ));
+    }
+
+    #[test]
+    fn openai_chatgpt_oauth_status_detection_checks_desktop_runtime_registry() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+        let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
+        let desktop_identity = desktop_runtime.join("identity");
+        let registry =
+            AuthProfileRegistry::open(desktop_identity.as_path()).expect("registry should open");
+        registry
+            .set_profile(palyra_auth::AuthProfileSetRequest {
+                profile_id: "chatgpt-login-test".to_owned(),
+                provider: palyra_auth::AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "ChatGPT Login".to_owned(),
+                scope: palyra_auth::AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/openai_access".to_owned(),
+                    refresh_token_vault_ref: "global/openai_refresh".to_owned(),
+                    token_endpoint: "https://auth.openai.com/oauth/token".to_owned(),
+                    client_id: Some(OPENAI_CHATGPT_OAUTH_CLIENT_ID.to_owned()),
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: Default::default(),
+                },
+            })
+            .expect("profile should persist");
+
+        assert!(status_uses_openai_chatgpt_oauth(
+            OPENAI_COMPATIBLE_PROVIDER_KIND,
+            Some("chatgpt-login-test"),
+            &[state_root, desktop_runtime]
+        ));
+    }
+
+    #[test]
+    fn models_status_state_root_is_derived_from_explicit_config_path() {
+        let config_path = Path::new("C:/isolated-state/config/palyra.toml");
+
+        assert_eq!(status_state_root(config_path).as_deref(), Some(Path::new("C:/isolated-state")));
     }
 
     #[test]

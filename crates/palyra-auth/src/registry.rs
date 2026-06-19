@@ -114,6 +114,46 @@ impl AuthProfileRegistry {
         })
     }
 
+    /// Looks up a profile by id from disk without creating or rewriting registry files.
+    ///
+    /// # Errors
+    /// Returns an error when `profile_id` fails normalization or an existing registry
+    /// cannot be read, parsed, or normalized.
+    pub fn get_profile_readonly(
+        identity_store_root: &Path,
+        profile_id: &str,
+    ) -> Result<Option<AuthProfileRecord>, AuthProfileError> {
+        let state_root = resolve_state_root(identity_store_root)?;
+        Self::get_profile_readonly_at_state_root(state_root.as_path(), profile_id)
+    }
+
+    /// Looks up a profile by id from an explicit state root without creating files.
+    ///
+    /// # Errors
+    /// Returns an error when `profile_id` fails normalization or an existing registry
+    /// cannot be read, parsed, or normalized.
+    pub fn get_profile_readonly_at_state_root(
+        state_root: &Path,
+        profile_id: &str,
+    ) -> Result<Option<AuthProfileRecord>, AuthProfileError> {
+        let profile_id = normalize_profile_id(profile_id)?;
+        let registry_path = resolve_registry_path(state_root)?;
+        if !registry_path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&registry_path).map_err(|source| {
+            AuthProfileError::ReadRegistry { path: registry_path.clone(), source }
+        })?;
+        let mut document = toml::from_str::<RegistryDocument>(&raw).map_err(|source| {
+            AuthProfileError::ParseRegistry {
+                path: registry_path.clone(),
+                source: Box::new(source),
+            }
+        })?;
+        normalize_document(&mut document)?;
+        Ok(document.profiles.into_iter().find(|profile| profile.profile_id == profile_id))
+    }
+
     /// Lists profiles matching `filter`, paginated by profile-id cursor.
     ///
     /// # Errors
