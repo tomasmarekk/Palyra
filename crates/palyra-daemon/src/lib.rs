@@ -145,13 +145,14 @@ use openai_auth::{
 use openai_surface::{
     clear_model_provider_auth_profile_selection_if_matches, complete_openai_oauth_callback,
     connect_anthropic_api_key, connect_anthropic_oauth_tokens, connect_minimax_api_key,
-    connect_openai_api_key, load_minimax_oauth_callback_state, load_openai_oauth_callback_state,
-    reconnect_minimax_oauth_attempt, reconnect_openai_oauth_attempt,
-    refresh_anthropic_oauth_profile, refresh_minimax_oauth_profile, refresh_openai_oauth_profile,
-    revoke_anthropic_auth_profile, revoke_minimax_auth_profile, revoke_openai_auth_profile,
+    connect_openai_api_key, connect_xai_oauth_tokens, load_minimax_oauth_callback_state,
+    load_openai_oauth_callback_state, reconnect_minimax_oauth_attempt,
+    reconnect_openai_oauth_attempt, refresh_anthropic_oauth_profile, refresh_minimax_oauth_profile,
+    refresh_openai_oauth_profile, refresh_xai_oauth_profile, revoke_anthropic_auth_profile,
+    revoke_minimax_auth_profile, revoke_openai_auth_profile, revoke_xai_auth_profile,
     select_default_anthropic_auth_profile, select_default_minimax_auth_profile,
-    select_default_openai_auth_profile, start_minimax_oauth_attempt_from_request,
-    start_openai_oauth_attempt_from_request,
+    select_default_openai_auth_profile, select_default_xai_auth_profile,
+    start_minimax_oauth_attempt_from_request, start_openai_oauth_attempt_from_request,
 };
 use palyra_auth::{
     AuthCredential, AuthProfileError, AuthProfileRecord, AuthProfileRegistry, AuthProfileScope,

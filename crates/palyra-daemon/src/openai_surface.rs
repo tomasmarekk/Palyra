@@ -1,4 +1,4 @@
-//! Console provider-auth handlers for OpenAI, Anthropic, and MiniMax:
+//! Console provider-auth handlers for OpenAI, Anthropic, MiniMax, and xAI:
 //! API-key connect, OAuth flows (PKCE authorization-code and ChatGPT/Codex
 //! device login for OpenAI, device user-code polling for MiniMax), refresh,
 //! revoke, and default-profile selection.
@@ -49,6 +49,9 @@ const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_co
 const MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS: &[&str] = &["minimax.io", "minimaxi.com"];
 const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const XAI_DEFAULT_MODEL: &str = "grok-4.3";
+const XAI_PROVIDER_CUSTOM_NAME: &str = "xai";
+const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX: &str = ".x.ai";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
 const GOOGLE_GEMINI_DEFAULT_MODEL: &str = "gemini-3.5-flash";
@@ -290,6 +293,96 @@ pub(crate) async fn connect_anthropic_oauth_tokens(
         ("saved", "Anthropic OAuth profile saved.")
     };
     Ok(provider_action_envelope("anthropic", "oauth", state_name, message, Some(profile_id)))
+}
+
+/// Stores xAI OAuth tokens as a vault-backed auth profile, optionally
+/// selecting it as the default OpenAI-compatible model-provider profile.
+///
+/// # Errors
+/// Returns a validation error response for malformed fields or an unsupported
+/// token endpoint, and an internal/unavailable error response when vault,
+/// profile, or config persistence fails.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn connect_xai_oauth_tokens(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderOAuthTokenUpsertRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_name = normalize_openai_profile_name(payload.profile_name.as_str())?;
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .map(|value| normalize_openai_identifier(value, "profile_id"))
+        .transpose()?
+        .unwrap_or_else(|| generate_provider_profile_id("xai", profile_name.as_str()));
+    let scope = normalize_openai_profile_scope(Some(payload.scope))?;
+    let access_token =
+        normalize_required_openai_text(payload.access_token.as_str(), "access_token")?;
+    let refresh_token =
+        normalize_required_openai_text(payload.refresh_token.as_str(), "refresh_token")?;
+    let token_endpoint = normalize_xai_oauth_token_endpoint(payload.token_endpoint.as_str())?;
+    let client_id = payload
+        .client_id
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .map(str::to_owned)
+        .unwrap_or_else(|| XAI_OAUTH_CLIENT_ID.to_owned());
+    let access_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &scope,
+        profile_id.as_str(),
+        "xai",
+        "oauth_access_token",
+        access_token.as_bytes(),
+    )?;
+    let refresh_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &scope,
+        profile_id.as_str(),
+        "xai",
+        "oauth_refresh_token",
+        refresh_token.as_bytes(),
+    )?;
+    let refresh_state = serde_json::to_value(OAuthRefreshState::default()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize OAuth refresh state: {error}"
+        )))
+    })?;
+    let profile = control_plane::AuthProfileView {
+        profile_id: profile_id.clone(),
+        provider: xai_auth_profile_provider(),
+        profile_name,
+        scope: scope.clone(),
+        credential: control_plane::AuthCredentialView::Oauth {
+            access_token_vault_ref,
+            refresh_token_vault_ref,
+            token_endpoint,
+            client_id: Some(client_id),
+            client_secret_vault_ref: None,
+            scopes: Vec::new(),
+            expires_at_unix_ms: payload.expires_at_unix_ms,
+            refresh_state,
+        },
+        created_at_unix_ms: 0,
+        updated_at_unix_ms: 0,
+    };
+    persist_openai_auth_profile(state, context, profile).await?;
+    if payload.set_default {
+        persist_model_provider_auth_profile_selection(
+            state,
+            context,
+            profile_id.as_str(),
+            ModelProviderAuthProviderKind::Xai,
+        )
+        .await?;
+    }
+
+    let (state_name, message) = if payload.set_default {
+        ("selected", "xAI OAuth profile saved and selected as the default auth profile.")
+    } else {
+        ("saved", "xAI OAuth profile saved.")
+    };
+    Ok(provider_action_envelope("xai", "oauth", state_name, message, Some(profile_id)))
 }
 
 /// Validates a MiniMax API key with a minimal completion probe, then stores
@@ -1315,6 +1408,160 @@ pub(crate) async fn refresh_anthropic_oauth_profile(
     };
     Ok(provider_action_envelope(
         "anthropic",
+        "refresh",
+        state_name,
+        sanitize_http_error_message(message).as_str(),
+        Some(outcome.profile_id),
+    ))
+}
+
+/// Removes an xAI auth profile locally, clears it as the configured default
+/// if selected, and journals the revocation.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-xAI profiles,
+/// and propagates deletion, config, and journaling failures.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn revoke_xai_auth_profile(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderAuthActionRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .ok_or_else(|| {
+            validation_error_response(
+                "profile_id",
+                "required",
+                "profile_id is required for xAI revoke",
+            )
+        })
+        .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
+    let profile = load_xai_auth_profile_record(state, profile_id.as_str())?;
+    let deleted =
+        delete_auth_profile_via_console_service(state, context, profile_id.as_str()).await?;
+    if !deleted {
+        return Ok(provider_action_envelope(
+            "xai",
+            "revoke",
+            "not_found",
+            "xAI auth profile was already removed.",
+            Some(profile_id),
+        ));
+    }
+    let default_cleared =
+        clear_model_provider_auth_profile_selection_if_matches(state, context, profile_id.as_str())
+            .await?;
+    append_console_auth_journal_event(
+        state,
+        context,
+        json!({
+            "event": "auth.profile.revoked",
+            "provider": "xai",
+            "profile_id": profile.profile_id,
+            "credential_type": match profile.credential.credential_type() {
+                palyra_auth::AuthCredentialType::ApiKey => "api_key",
+                palyra_auth::AuthCredentialType::Oauth => "oauth",
+            },
+            "remote_revocation": false,
+            "default_cleared": default_cleared,
+        }),
+    )
+    .await?;
+    Ok(provider_action_envelope(
+        "xai",
+        "revoke",
+        "revoked",
+        "xAI auth profile revoked.",
+        Some(profile_id),
+    ))
+}
+
+/// Marks an existing xAI auth profile as the default model-provider profile.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-xAI profiles,
+/// and propagates config persistence failures.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn select_default_xai_auth_profile(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderAuthActionRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .ok_or_else(|| {
+            validation_error_response(
+                "profile_id",
+                "required",
+                "profile_id is required for default profile selection",
+            )
+        })
+        .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
+    let _profile = load_xai_auth_profile_record(state, profile_id.as_str())?;
+    persist_model_provider_auth_profile_selection(
+        state,
+        context,
+        profile_id.as_str(),
+        ModelProviderAuthProviderKind::Xai,
+    )
+    .await?;
+    Ok(provider_action_envelope(
+        "xai",
+        "default_profile",
+        "selected",
+        "xAI default auth profile updated.",
+        Some(profile_id),
+    ))
+}
+
+/// Triggers an OAuth token refresh for an xAI profile through the auth
+/// runtime and journals the outcome; skip outcomes are returned as envelope
+/// states rather than errors.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-xAI profiles,
+/// and propagates auth-runtime and journaling failures.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn refresh_xai_oauth_profile(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderAuthActionRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .ok_or_else(|| {
+            validation_error_response(
+                "profile_id",
+                "required",
+                "profile_id is required for provider refresh",
+            )
+        })
+        .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
+    let _profile = load_xai_auth_profile_record(state, profile_id.as_str())?;
+    let outcome = state
+        .auth_runtime
+        .refresh_oauth_profile(profile_id.clone(), Arc::clone(&state.vault))
+        .await
+        .map_err(runtime_status_response)?;
+    record_auth_refresh_journal_event(&state.runtime, context, &outcome)
+        .await
+        .map_err(runtime_status_response)?;
+    let (state_name, message) = match outcome.kind {
+        OAuthRefreshOutcomeKind::Succeeded => ("refreshed", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedNotDue => ("not_due", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedCooldown => ("cooldown", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedNotOauth => ("not_oauth", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::Failed => ("failed", outcome.reason.as_str()),
+    };
+    Ok(provider_action_envelope(
+        "xai",
         "refresh",
         state_name,
         sanitize_http_error_message(message).as_str(),
@@ -2509,6 +2756,13 @@ fn minimax_auth_profile_provider() -> control_plane::AuthProfileProvider {
     }
 }
 
+fn xai_auth_profile_provider() -> control_plane::AuthProfileProvider {
+    control_plane::AuthProfileProvider {
+        kind: "custom".to_owned(),
+        custom_name: Some(XAI_PROVIDER_CUSTOM_NAME.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod minimax_tests {
     use super::{
@@ -2865,6 +3119,50 @@ fn normalize_anthropic_oauth_token_endpoint(raw: &str) -> Result<String, Respons
     Ok(parsed.to_string())
 }
 
+#[allow(clippy::result_large_err)]
+fn normalize_xai_oauth_token_endpoint(raw: &str) -> Result<String, Response> {
+    let trimmed = normalize_required_openai_text(raw, "token_endpoint")?;
+    let parsed = Url::parse(trimmed.as_str()).map_err(|_| {
+        validation_error_response(
+            "token_endpoint",
+            "invalid",
+            "token_endpoint must be a valid absolute URL",
+        )
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "xAI OAuth token_endpoint must use https",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "xAI OAuth token_endpoint must not contain embedded credentials",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "xAI OAuth token_endpoint must not contain query or fragment components",
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !host.eq_ignore_ascii_case("auth.x.ai")
+        && !host.to_ascii_lowercase().ends_with(XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX)
+    {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "xAI OAuth token_endpoint host is not trusted",
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
 fn load_minimax_validation_base_url(document: Option<&toml::Value>) -> String {
     env::var("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL")
         .ok()
@@ -3034,6 +3332,37 @@ fn load_minimax_auth_profile_record(
     if !is_minimax {
         return Err(runtime_status_response(tonic::Status::failed_precondition(
             "auth profile does not belong to MiniMax",
+        )));
+    }
+    Ok(record)
+}
+
+/// Loads an auth profile and verifies it is an xAI profile (custom provider
+/// kind with the xAI custom name, matched case-insensitively).
+#[allow(clippy::result_large_err)]
+fn load_xai_auth_profile_record(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<AuthProfileRecord, Response> {
+    let record = state
+        .auth_runtime
+        .registry()
+        .get_profile(profile_id)
+        .map_err(auth_profile_error_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "auth profile not found: {profile_id}"
+            )))
+        })?;
+    let is_xai = matches!(record.provider.kind, AuthProviderKind::Custom)
+        && record
+            .provider
+            .custom_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(XAI_PROVIDER_CUSTOM_NAME));
+    if !is_xai {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(
+            "auth profile does not belong to xAI",
         )));
     }
     Ok(record)
@@ -3993,6 +4322,32 @@ mod tests {
         .expect_err("embedded credentials should be rejected");
 
         assert_eq!(hostile.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(embedded_credentials.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn normalize_xai_oauth_token_endpoint_accepts_trusted_hosts() {
+        let auth = normalize_xai_oauth_token_endpoint("https://auth.x.ai/oauth/token")
+            .expect("xAI auth host should be trusted");
+        let accounts = normalize_xai_oauth_token_endpoint("https://accounts.x.ai/oauth/token")
+            .expect("xAI subdomains should be trusted");
+
+        assert_eq!(auth, "https://auth.x.ai/oauth/token");
+        assert_eq!(accounts, "https://accounts.x.ai/oauth/token");
+    }
+
+    #[test]
+    fn normalize_xai_oauth_token_endpoint_rejects_untrusted_targets() {
+        let hostile = normalize_xai_oauth_token_endpoint("https://attacker.example/token")
+            .expect_err("untrusted host should be rejected");
+        let lookalike = normalize_xai_oauth_token_endpoint("https://evilx.ai/token")
+            .expect_err("lookalike host should be rejected");
+        let embedded_credentials =
+            normalize_xai_oauth_token_endpoint("https://user:secret@auth.x.ai/oauth/token")
+                .expect_err("embedded credentials should be rejected");
+
+        assert_eq!(hostile.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(lookalike.status(), StatusCode::BAD_REQUEST);
         assert_eq!(embedded_credentials.status(), StatusCode::BAD_REQUEST);
     }
 

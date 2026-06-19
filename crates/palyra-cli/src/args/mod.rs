@@ -74,7 +74,7 @@ pub use approvals::{
 };
 pub use auth::{
     AuthAccessCommand, AuthAnthropicCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand,
-    AuthProfilesCommand, AuthProviderArg, AuthScopeArg, WorkspaceRoleArg,
+    AuthProfilesCommand, AuthProviderArg, AuthScopeArg, AuthXaiCommand, WorkspaceRoleArg,
 };
 pub use backup::{BackupCommand, BackupComponentArg};
 pub use browser::{

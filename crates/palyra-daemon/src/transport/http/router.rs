@@ -429,6 +429,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/auth/providers/minimax/default-profile",
             post(console::auth::console_minimax_provider_default_profile_handler),
         )
+        .route(
+            "/console/v1/auth/providers/xai",
+            get(console::auth::console_xai_provider_state_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/xai/oauth-token",
+            post(console::auth::console_xai_provider_oauth_token_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/xai/refresh",
+            post(console::auth::console_xai_provider_refresh_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/xai/revoke",
+            post(console::auth::console_xai_provider_revoke_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/xai/default-profile",
+            post(console::auth::console_xai_provider_default_profile_handler),
+        )
         .route("/console/v1/config/inspect", post(console::config::console_config_inspect_handler))
         .route(
             "/console/v1/config/validate",

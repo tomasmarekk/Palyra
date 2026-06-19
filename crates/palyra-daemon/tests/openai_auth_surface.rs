@@ -348,6 +348,119 @@ fn console_anthropic_oauth_token_flow_persists_vault_refs_and_default_selection(
 }
 
 #[test]
+fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
+        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
+        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
+    )])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let connected = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/auth/providers/xai/oauth-token",
+        &cookie,
+        &csrf_token,
+        &json!({
+            "profile_name": "xAI OAuth",
+            "scope": { "kind": "global" },
+            "access_token": "xai-oauth-test-access",
+            "refresh_token": "xai-oauth-test-refresh",
+            "token_endpoint": "https://auth.x.ai/oauth/token",
+            "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+            "expires_at_unix_ms": 1_900_000_000_000_i64,
+            "set_default": true
+        }),
+    )?;
+    let profile_id = connected
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("xAI oauth-token connect response missing profile_id"))?
+        .to_owned();
+    assert_eq!(connected.get("provider").and_then(Value::as_str), Some("xai"));
+    assert_eq!(connected.get("action").and_then(Value::as_str), Some("oauth"));
+    assert_eq!(connected.get("state").and_then(Value::as_str), Some("selected"));
+
+    let provider_state =
+        get_console_json(&client, admin_port, "/console/v1/auth/providers/xai", &cookie)?;
+    assert_eq!(
+        provider_state.get("default_profile_id").and_then(Value::as_str),
+        Some(profile_id.as_str())
+    );
+
+    let profiles = get_console_json(&client, admin_port, "/console/v1/auth/profiles", &cookie)?;
+    let profile = find_profile(&profiles, profile_id.as_str())?;
+    assert_eq!(
+        profile.get("provider").and_then(|provider| provider.get("kind")).and_then(Value::as_str),
+        Some("custom")
+    );
+    assert_eq!(
+        profile
+            .get("provider")
+            .and_then(|provider| provider.get("custom_name"))
+            .and_then(Value::as_str),
+        Some("xai")
+    );
+    let credential = profile
+        .get("credential")
+        .ok_or_else(|| anyhow::anyhow!("xAI OAuth profile missing credential"))?;
+    assert_eq!(credential.get("type").and_then(Value::as_str), Some("oauth"));
+    assert_eq!(
+        credential.get("client_id").and_then(Value::as_str),
+        Some("b1a00492-073a-47ea-816f-4c329264a828")
+    );
+    assert_eq!(
+        credential.get("token_endpoint").and_then(Value::as_str),
+        Some("https://auth.x.ai/oauth/token")
+    );
+    let access_ref = credential
+        .get("access_token_vault_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("xAI OAuth credential missing access ref"))?;
+    let refresh_ref = credential
+        .get("refresh_token_vault_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("xAI OAuth credential missing refresh ref"))?;
+    assert!(access_ref.contains("xai"), "access token ref should be provider scoped");
+    assert!(refresh_ref.contains("xai"), "refresh token ref should be provider scoped");
+    let profile_json = profile.to_string();
+    assert!(
+        !profile_json.contains("xai-oauth-test-access")
+            && !profile_json.contains("xai-oauth-test-refresh"),
+        "auth profile JSON must not expose raw xAI OAuth tokens"
+    );
+
+    let config = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/config/inspect",
+        &cookie,
+        &csrf_token,
+        &json!({}),
+    )?;
+    let document_toml = config
+        .get("document_toml")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("config inspect response missing document_toml"))?;
+    assert!(document_toml.contains("auth_provider_kind = \"xai\""));
+    assert!(document_toml.contains("kind = \"openai_compatible\""));
+    assert!(document_toml.contains("openai_base_url = \"https://api.x.ai/v1\""));
+    assert!(document_toml.contains("openai_model = \"grok-4.3\""));
+    assert!(
+        !document_toml.contains("xai-oauth-test-access")
+            && !document_toml.contains("xai-oauth-test-refresh"),
+        "config inspect must not leak raw xAI OAuth tokens"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_models_probe_and_discover_publish_live_openai_results() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;

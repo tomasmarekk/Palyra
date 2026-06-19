@@ -943,6 +943,22 @@ pub(crate) async fn console_minimax_provider_state_handler(
     Ok(Json(build_provider_state(&document, profiles, ModelProviderAuthProviderKind::Minimax)))
 }
 
+/// Returns xAI provider-auth state for the console.
+///
+/// # Errors
+/// Returns an error response when session authorization, auth-profile listing,
+/// or config snapshot loading fails.
+pub(crate) async fn console_xai_provider_state_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<control_plane::ProviderAuthStateEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let profiles = list_console_custom_auth_profiles(&state, &session, "xai").await?;
+    let configured_path = std::env::var("PALYRA_CONFIG").ok();
+    let (document, _, _) = load_console_config_snapshot(configured_path.as_deref(), true)?;
+    Ok(Json(build_provider_state(&document, profiles, ModelProviderAuthProviderKind::Xai)))
+}
+
 /// Connects or updates an OpenAI API-key profile.
 ///
 /// # Errors
@@ -1025,6 +1041,40 @@ pub(crate) async fn console_anthropic_provider_oauth_token_handler(
     state.observability.record_provider_auth_attempt();
     let profile_id = payload.profile_id.clone();
     match connect_anthropic_oauth_tokens(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_connect",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
+}
+
+/// Connects or updates an xAI OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider connection
+/// fails.
+pub(crate) async fn console_xai_provider_oauth_token_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderOAuthTokenUpsertRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match connect_xai_oauth_tokens(&state, &session.context, payload).await {
         Ok(envelope) => Ok(Json(envelope)),
         Err(response) => {
             record_provider_auth_failure(
@@ -1374,6 +1424,40 @@ pub(crate) async fn console_minimax_provider_refresh_handler(
     }
 }
 
+/// Refreshes an xAI OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider refresh
+/// fails.
+pub(crate) async fn console_xai_provider_refresh_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match refresh_xai_oauth_profile(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_refresh",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                true,
+            );
+            Err(response)
+        }
+    }
+}
+
 /// Revokes an OpenAI provider-auth profile.
 ///
 /// # Errors
@@ -1490,6 +1574,40 @@ pub(crate) async fn console_minimax_provider_revoke_handler(
     }
 }
 
+/// Revokes an xAI provider-auth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider revoke
+/// fails.
+pub(crate) async fn console_xai_provider_revoke_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match revoke_xai_auth_profile(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_revoke",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
+}
+
 /// Selects an Anthropic auth profile as default for model-provider use.
 ///
 /// # Errors
@@ -1516,6 +1634,20 @@ pub(crate) async fn console_minimax_provider_default_profile_handler(
 ) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     select_default_minimax_auth_profile(&state, &session.context, payload).await.map(Json)
+}
+
+/// Selects an xAI auth profile as default for model-provider use.
+///
+/// # Errors
+/// Returns an error response when session authorization or default selection
+/// fails.
+pub(crate) async fn console_xai_provider_default_profile_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    select_default_xai_auth_profile(&state, &session.context, payload).await.map(Json)
 }
 
 /// Issues and stores a console session with a CSRF token.

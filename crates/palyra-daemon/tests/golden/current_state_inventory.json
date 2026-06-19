@@ -128,6 +128,11 @@
         "/console/v1/auth/providers/minimax/refresh",
         "/console/v1/auth/providers/minimax/revoke",
         "/console/v1/auth/providers/minimax/default-profile",
+        "/console/v1/auth/providers/xai",
+        "/console/v1/auth/providers/xai/oauth-token",
+        "/console/v1/auth/providers/xai/refresh",
+        "/console/v1/auth/providers/xai/revoke",
+        "/console/v1/auth/providers/xai/default-profile",
         "/console/v1/models/test-connection",
         "/console/v1/models/discover"
       ],

@@ -9,12 +9,12 @@ use super::{
     ApprovalDecisionArg, ApprovalDecisionScopeArg, ApprovalExportFormatArg,
     ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand, AuthAccessCommand,
     AuthAnthropicCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand,
-    AuthProviderArg, AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand,
-    BrowserPermissionsCommand, BrowserProfilesCommand, BrowserSessionCommand, ChannelProviderArg,
-    ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli,
-    Command, CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand,
-    CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
-    DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
+    AuthProviderArg, AuthScopeArg, AuthXaiCommand, BackupCommand, BackupComponentArg,
+    BrowserCommand, BrowserPermissionsCommand, BrowserProfilesCommand, BrowserSessionCommand,
+    ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand,
+    ChannelsRouterCommand, Cli, Command, CompletionShell, ConfigCommand, ConfigureSectionArg,
+    CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
+    DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
     JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
     MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
@@ -3412,6 +3412,57 @@ fn parse_auth_anthropic_refresh() {
                 command: AuthAnthropicCommand::Refresh {
                     profile_id: "anthropic-default".to_owned(),
                     json: false,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_xai_oauth_start() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "auth",
+        "xai",
+        "oauth-start",
+        "--profile-name",
+        "SuperGrok",
+        "--set-default",
+        "--open",
+        "--manual-paste",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Xai {
+                command: AuthXaiCommand::OauthStart {
+                    profile_id: None,
+                    profile_name: Some("SuperGrok".to_owned()),
+                    scope: AuthScopeArg::Global,
+                    agent_id: None,
+                    set_default: true,
+                    open: true,
+                    manual_paste: true,
+                    callback_url_env: None,
+                    callback_url_stdin: false,
+                    json: true,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_xai_refresh() {
+    let parsed = Cli::parse_from(["palyra", "auth", "xai", "refresh", "xai-default", "--json"]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Xai {
+                command: AuthXaiCommand::Refresh {
+                    profile_id: "xai-default".to_owned(),
+                    json: true,
                 },
             },
         }

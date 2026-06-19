@@ -24,6 +24,10 @@ pub enum AuthCommand {
         #[command(subcommand)]
         command: AuthAnthropicCommand,
     },
+    Xai {
+        #[command(subcommand)]
+        command: AuthXaiCommand,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -271,6 +275,52 @@ pub enum AuthAnthropicCommand {
         set_default: bool,
         #[arg(long, default_value_t = false)]
         open: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Refresh {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Revoke {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    UseProfile {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuthXaiCommand {
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    OauthStart {
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long)]
+        profile_name: Option<String>,
+        #[arg(long, value_enum, default_value_t = AuthScopeArg::Global)]
+        scope: AuthScopeArg,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        #[arg(long, default_value_t = false)]
+        manual_paste: bool,
+        #[arg(long = "callback-url-env")]
+        callback_url_env: Option<String>,
+        #[arg(long = "callback-url-stdin", default_value_t = false)]
+        callback_url_stdin: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

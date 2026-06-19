@@ -24,6 +24,16 @@ const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 const ANTHROPIC_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const XAI_OAUTH_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const XAI_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
+const XAI_OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
+const XAI_OAUTH_CALLBACK_PORT: u16 = 56_121;
+const XAI_OAUTH_CALLBACK_PATH: &str = "/callback";
+const XAI_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+const XAI_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const XAI_OAUTH_USER_AGENT: &str = "palyra-cli/0.1.0";
 
 /// Runs a `palyra auth` subcommand on a fresh Tokio runtime.
 ///
@@ -60,6 +70,10 @@ pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
         AuthCommand::Anthropic { command } => {
             let runtime = build_runtime()?;
             runtime.block_on(run_auth_anthropic_async(command))
+        }
+        AuthCommand::Xai { command } => {
+            let runtime = build_runtime()?;
+            runtime.block_on(run_auth_xai_async(command))
         }
     }
 }
@@ -764,6 +778,37 @@ struct AnthropicOAuthTokenResponse {
     expires_in: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+struct XaiOAuthDiscovery {
+    authorization_endpoint: String,
+    token_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiOAuthDiscoveryResponse {
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+}
+
+#[derive(Debug)]
+struct XaiOAuthCallback {
+    code: String,
+}
+
+#[derive(Debug)]
+struct XaiOAuthTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XaiOAuthTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+}
+
 async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
     match command {
         AuthOpenAiCommand::Status { json } => {
@@ -1209,6 +1254,203 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
     }
 }
 
+async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
+    match command {
+        AuthXaiCommand::Status { json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let provider_state = context
+                .client
+                .get_provider_auth_state("xai")
+                .await
+                .context("failed to fetch xAI provider state")?;
+            let auth_health = context
+                .client
+                .get_auth_health(true, None)
+                .await
+                .context("failed to fetch xAI auth health")?;
+            let profiles = context
+                .client
+                .list_auth_profiles("provider_kind=custom&provider_custom_name=xai&limit=100")
+                .await
+                .context("failed to list xAI auth profiles")?;
+            let payload =
+                build_provider_status_payload("xai", provider_state, auth_health, profiles)?;
+            emit_provider_status("xai", "xAI", payload, output::preferred_json(json))
+        }
+        AuthXaiCommand::OauthStart {
+            profile_id,
+            profile_name,
+            scope,
+            agent_id,
+            set_default,
+            open,
+            manual_paste,
+            callback_url_env,
+            callback_url_stdin,
+            json,
+        } => {
+            let discovery = discover_xai_oauth_endpoints().await?;
+            let verifier = generate_oauth_pkce_verifier()?;
+            let challenge = oauth_pkce_challenge(verifier.as_str());
+            let state = generate_oauth_state()?;
+            let nonce = generate_oauth_state()?;
+            let authorization_url = build_xai_oauth_authorization_url(
+                discovery.authorization_endpoint.as_str(),
+                challenge.as_str(),
+                state.as_str(),
+                nonce.as_str(),
+            )?;
+            let opened = if open {
+                open_url_in_default_browser(authorization_url.as_str())
+                    .with_context(|| "failed to open xAI OAuth authorization URL".to_owned())?;
+                true
+            } else {
+                false
+            };
+            let callback = if manual_paste || callback_url_env.is_some() || callback_url_stdin {
+                emit_xai_oauth_instructions(
+                    authorization_url.as_str(),
+                    opened,
+                    true,
+                    output::preferred_json(json),
+                )?;
+                let callback_url = load_callback_url_input(
+                    callback_url_env,
+                    callback_url_stdin,
+                    "xAI callback URL: ",
+                )?;
+                parse_xai_callback_url(callback_url.as_str(), state.as_str())?
+            } else {
+                let callback_waiter = start_xai_loopback_callback_waiter(state.clone())?;
+                emit_xai_oauth_instructions(
+                    authorization_url.as_str(),
+                    opened,
+                    false,
+                    output::preferred_json(json),
+                )?;
+                callback_waiter.await.context("xAI OAuth callback worker failed")??
+            };
+            let tokens = exchange_xai_oauth_code(
+                discovery.token_endpoint.as_str(),
+                callback.code.as_str(),
+                verifier.as_str(),
+                challenge.as_str(),
+            )
+            .await?;
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .connect_provider_oauth_tokens(
+                    "xai",
+                    &control_plane::ProviderOAuthTokenUpsertRequest {
+                        profile_id,
+                        profile_name: profile_name.unwrap_or_else(|| "xAI OAuth".to_owned()),
+                        scope: build_control_plane_scope(scope, agent_id)?,
+                        access_token: tokens.access_token,
+                        refresh_token: tokens.refresh_token,
+                        token_endpoint: discovery.token_endpoint,
+                        client_id: Some(XAI_OAUTH_CLIENT_ID.to_owned()),
+                        scopes: XAI_OAUTH_SCOPE.split_whitespace().map(str::to_owned).collect(),
+                        expires_at_unix_ms: tokens.expires_at_unix_ms,
+                        set_default,
+                    },
+                )
+                .await
+                .context("failed to store xAI OAuth profile")?;
+            emit_provider_action(
+                "xai",
+                "xAI",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthXaiCommand::Refresh { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "xai",
+                    "refresh",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to refresh xAI auth profile")?;
+            emit_provider_action(
+                "xai",
+                "xAI",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthXaiCommand::Revoke { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "xai",
+                    "revoke",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to revoke xAI auth profile")?;
+            emit_provider_action(
+                "xai",
+                "xAI",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthXaiCommand::UseProfile { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "xai",
+                    "default-profile",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to select default xAI auth profile")?;
+            emit_provider_action(
+                "xai",
+                "xAI",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+    }
+}
+
 /// Merges three console endpoints (provider state, auth health, profile list) into
 /// the single status payload shown by provider auth status commands.
 fn build_provider_status_payload(
@@ -1593,6 +1835,385 @@ async fn exchange_anthropic_oauth_code(
     Ok(AnthropicOAuthTokens { access_token, refresh_token, expires_at_unix_ms })
 }
 
+async fn discover_xai_oauth_endpoints() -> Result<XaiOAuthDiscovery> {
+    let response = reqwest::Client::builder()
+        .timeout(XAI_OAUTH_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build xAI OAuth discovery client")?
+        .get(XAI_OAUTH_DISCOVERY_URL)
+        .header("accept", "application/json")
+        .header("user-agent", XAI_OAUTH_USER_AGENT)
+        .send()
+        .await
+        .context("xAI OAuth discovery request failed")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "xAI OAuth discovery failed with HTTP {}: {}",
+            status.as_u16(),
+            sanitize_auth_message(redact_auth_error(body.as_str()).as_str())
+        );
+    }
+    let parsed: XaiOAuthDiscoveryResponse =
+        serde_json::from_str(body.as_str()).context("xAI OAuth discovery response was not JSON")?;
+    let authorization_endpoint = normalize_xai_oauth_endpoint(
+        parsed.authorization_endpoint.as_deref().unwrap_or_default(),
+        "authorization_endpoint",
+    )?;
+    let token_endpoint = normalize_xai_oauth_endpoint(
+        parsed.token_endpoint.as_deref().unwrap_or_default(),
+        "token_endpoint",
+    )?;
+    Ok(XaiOAuthDiscovery { authorization_endpoint, token_endpoint })
+}
+
+fn normalize_xai_oauth_endpoint(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("xAI OAuth discovery is missing {field}");
+    }
+    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("invalid xAI {field}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("xAI {field} must use https");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("xAI {field} must not contain embedded credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("xAI {field} must not contain query or fragment components");
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !host.eq_ignore_ascii_case("auth.x.ai") && !host.to_ascii_lowercase().ends_with(".x.ai") {
+        anyhow::bail!("xAI {field} host is not trusted");
+    }
+    Ok(parsed.to_string())
+}
+
+fn build_xai_oauth_authorization_url(
+    authorization_endpoint: &str,
+    code_challenge: &str,
+    state: &str,
+    nonce: &str,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(authorization_endpoint)
+        .context("xAI OAuth authorization endpoint is invalid")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("response_type", "code");
+        pairs.append_pair("client_id", XAI_OAUTH_CLIENT_ID);
+        pairs.append_pair("redirect_uri", XAI_OAUTH_REDIRECT_URI);
+        pairs.append_pair("scope", XAI_OAUTH_SCOPE);
+        pairs.append_pair("state", state);
+        pairs.append_pair("nonce", nonce);
+        pairs.append_pair("code_challenge", code_challenge);
+        pairs.append_pair("code_challenge_method", "S256");
+        pairs.append_pair("plan", "generic");
+        pairs.append_pair("referrer", "palyra");
+    }
+    Ok(url.to_string())
+}
+
+fn emit_xai_oauth_instructions(
+    authorization_url: &str,
+    opened: bool,
+    manual_paste: bool,
+    json_output: bool,
+) -> Result<()> {
+    let safe_url = authorization_url.replace('"', "'");
+    let mode = if manual_paste { "manual_paste" } else { "loopback" };
+    if json_output {
+        eprintln!(
+            "auth.xai.oauth.authorization_url=\"{safe_url}\" opened={opened} callback_mode={mode} message=\"Open this URL to authorize Palyra with xAI.\""
+        );
+    } else {
+        output::print_text_line(
+            format!(
+                "auth.xai.oauth.start authorization_url_present={} opened={opened} callback_mode={mode}",
+                !authorization_url.trim().is_empty()
+            )
+            .as_str(),
+        )?;
+        output::print_text_line(
+            format!("auth.xai.oauth.authorization_url=\"{safe_url}\"").as_str(),
+        )?;
+        if manual_paste {
+            output::print_text_line(
+                "auth.xai.oauth.message=\"Open this URL, authorize Palyra, then paste the full 127.0.0.1 callback URL.\"",
+            )?;
+        } else {
+            output::print_text_line(
+                "auth.xai.oauth.message=\"Open this URL to authorize Palyra; waiting on http://127.0.0.1:56121/callback.\"",
+            )?;
+        }
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    Ok(())
+}
+
+fn start_xai_loopback_callback_waiter(
+    expected_state: String,
+) -> Result<tokio::task::JoinHandle<Result<XaiOAuthCallback>>> {
+    let listener = std::net::TcpListener::bind((XAI_OAUTH_CALLBACK_HOST, XAI_OAUTH_CALLBACK_PORT))
+        .with_context(|| {
+            format!(
+                "failed to bind xAI OAuth callback listener on {XAI_OAUTH_CALLBACK_HOST}:{XAI_OAUTH_CALLBACK_PORT}"
+            )
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to set xAI OAuth callback listener nonblocking")?;
+    Ok(tokio::task::spawn_blocking(move || {
+        wait_for_xai_loopback_callback(listener, expected_state.as_str())
+    }))
+}
+
+fn wait_for_xai_loopback_callback(
+    listener: std::net::TcpListener,
+    expected_state: &str,
+) -> Result<XaiOAuthCallback> {
+    let deadline = std::time::Instant::now() + XAI_OAUTH_CALLBACK_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Some(callback) = handle_xai_callback_stream(stream, expected_state)? {
+                    return Ok(callback);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for xAI OAuth callback");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("failed to accept xAI OAuth callback"),
+        }
+    }
+}
+
+fn handle_xai_callback_stream(
+    stream: std::net::TcpStream,
+    expected_state: &str,
+) -> Result<Option<XaiOAuthCallback>> {
+    let mut reader = std::io::BufReader::new(stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).context("failed to read xAI OAuth callback request")?;
+    let mut header_line = String::new();
+    loop {
+        header_line.clear();
+        if reader
+            .read_line(&mut header_line)
+            .context("failed to read xAI OAuth callback headers")?
+            == 0
+        {
+            break;
+        }
+        if header_line == "\r\n" || header_line == "\n" {
+            break;
+        }
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let mut stream = reader.into_inner();
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        write_xai_callback_response(
+            &mut stream,
+            "HTTP/1.1 204 No Content",
+            "",
+            Some("https://auth.x.ai"),
+        )?;
+        return Ok(None);
+    }
+    if !method.eq_ignore_ascii_case("GET") {
+        write_xai_callback_response(
+            &mut stream,
+            "HTTP/1.1 405 Method Not Allowed",
+            "Method not allowed.",
+            None,
+        )?;
+        return Ok(None);
+    }
+    let callback = parse_xai_callback_target(target, expected_state);
+    match callback {
+        Ok(callback) => {
+            write_xai_callback_response(
+                &mut stream,
+                "HTTP/1.1 200 OK",
+                "xAI authentication completed. You can close this window.",
+                None,
+            )?;
+            Ok(Some(callback))
+        }
+        Err(error) => {
+            write_xai_callback_response(
+                &mut stream,
+                "HTTP/1.1 400 Bad Request",
+                "xAI authentication did not complete.",
+                None,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn write_xai_callback_response(
+    stream: &mut std::net::TcpStream,
+    status_line: &str,
+    body: &str,
+    cors_origin: Option<&str>,
+) -> Result<()> {
+    let mut headers = format!(
+        "{status_line}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n",
+        body.len()
+    );
+    if let Some(origin) = cors_origin {
+        headers.push_str(format!("access-control-allow-origin: {origin}\r\n").as_str());
+        headers.push_str("access-control-allow-methods: GET, OPTIONS\r\n");
+        headers.push_str("access-control-allow-headers: content-type\r\n");
+    }
+    headers.push_str("\r\n");
+    stream.write_all(headers.as_bytes()).context("failed to write xAI OAuth callback headers")?;
+    stream.write_all(body.as_bytes()).context("failed to write xAI OAuth callback body")?;
+    Ok(())
+}
+
+fn load_callback_url_input(
+    env_name: Option<String>,
+    from_stdin: bool,
+    prompt: &str,
+) -> Result<String> {
+    let selected_sources = usize::from(env_name.is_some()) + usize::from(from_stdin);
+    if selected_sources > 1 {
+        anyhow::bail!("select at most one callback URL source");
+    }
+    let value = if let Some(env_name) = env_name {
+        env::var(env_name.as_str())
+            .with_context(|| format!("environment variable {env_name} is not set"))?
+    } else if from_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .context("failed to read callback URL from stdin")?;
+        value
+    } else {
+        print!("{prompt}");
+        std::io::stdout().flush().context("stdout flush failed")?;
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value).context("failed to read callback URL")?;
+        value
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("callback URL input was empty");
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn parse_xai_callback_url(raw: &str, expected_state: &str) -> Result<XaiOAuthCallback> {
+    let parsed = reqwest::Url::parse(raw.trim()).context("xAI callback URL is invalid")?;
+    if parsed.scheme() != "http"
+        || parsed.host_str() != Some(XAI_OAUTH_CALLBACK_HOST)
+        || parsed.port_or_known_default() != Some(XAI_OAUTH_CALLBACK_PORT)
+        || parsed.path() != XAI_OAUTH_CALLBACK_PATH
+    {
+        anyhow::bail!("xAI callback URL does not match {XAI_OAUTH_REDIRECT_URI}");
+    }
+    parse_xai_callback_query(&parsed, expected_state)
+}
+
+fn parse_xai_callback_target(target: &str, expected_state: &str) -> Result<XaiOAuthCallback> {
+    let parsed = reqwest::Url::parse(format!("http://{XAI_OAUTH_CALLBACK_HOST}{target}").as_str())
+        .context("xAI callback request target is invalid")?;
+    if parsed.path() != XAI_OAUTH_CALLBACK_PATH {
+        anyhow::bail!("xAI callback route not found");
+    }
+    parse_xai_callback_query(&parsed, expected_state)
+}
+
+fn parse_xai_callback_query(
+    parsed: &reqwest::Url,
+    expected_state: &str,
+) -> Result<XaiOAuthCallback> {
+    if let Some(error) = parsed.query_pairs().find(|(key, _)| key == "error") {
+        anyhow::bail!("xAI OAuth returned error: {}", error.1);
+    }
+    let code = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("xAI OAuth callback did not include code"))?;
+    let received_state = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default();
+    if received_state != expected_state {
+        anyhow::bail!("xAI OAuth state mismatch; restart the login flow");
+    }
+    Ok(XaiOAuthCallback { code })
+}
+
+async fn exchange_xai_oauth_code(
+    token_endpoint: &str,
+    code: &str,
+    code_verifier: &str,
+    code_challenge: &str,
+) -> Result<XaiOAuthTokens> {
+    let token_endpoint = normalize_xai_oauth_endpoint(token_endpoint, "token_endpoint")?;
+    let response = reqwest::Client::builder()
+        .timeout(XAI_OAUTH_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build xAI OAuth token client")?
+        .post(token_endpoint.as_str())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .header("user-agent", XAI_OAUTH_USER_AGENT)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", XAI_OAUTH_REDIRECT_URI),
+            ("client_id", XAI_OAUTH_CLIENT_ID),
+            ("code_verifier", code_verifier),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .context("xAI OAuth token exchange request failed")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let sanitized = redact_auth_error(redact_url_segments_in_text(body.as_str()).as_str());
+        anyhow::bail!(
+            "xAI OAuth token exchange failed with HTTP {}: {}",
+            status.as_u16(),
+            sanitize_auth_message(sanitized.as_str())
+        );
+    }
+    let parsed: XaiOAuthTokenResponse =
+        serde_json::from_str(body.as_str()).context("xAI OAuth token response was not JSON")?;
+    let access_token = parsed
+        .access_token
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("xAI OAuth token response did not include access_token"))?;
+    let refresh_token = parsed
+        .refresh_token
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("xAI OAuth token response did not include refresh_token"))?;
+    let expires_at_unix_ms = parsed
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .and_then(|duration_ms| now_unix_ms_i64().ok()?.checked_add(duration_ms));
+    Ok(XaiOAuthTokens { access_token, refresh_token, expires_at_unix_ms })
+}
+
 fn emit_openai_oauth_state(payload: OpenAiOAuthStatePayload, json_output: bool) -> Result<()> {
     if json_output {
         output::print_json_pretty(
@@ -1833,11 +2454,13 @@ fn load_secret_input(
 mod tests {
     use super::{
         build_anthropic_oauth_authorization_url, build_auth_profiles_list_json_payload,
-        build_openai_oauth_launch_payload, openai_oauth_launch_text_lines,
-        parse_anthropic_authorization_code, AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload,
-        ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI,
-        ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
-        AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
+        build_openai_oauth_launch_payload, build_xai_oauth_authorization_url,
+        normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
+        parse_anthropic_authorization_code, parse_xai_callback_url, AnthropicOAuthTokenResponse,
+        OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
+        ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
+        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI,
+        XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -1969,5 +2592,82 @@ mod tests {
         assert_eq!(parsed.access_token.as_deref(), Some("at"));
         assert_eq!(parsed.refresh_token.as_deref(), Some("rt"));
         assert_eq!(parsed.expires_in, None);
+    }
+
+    #[test]
+    fn xai_oauth_authorization_url_uses_public_grok_client() {
+        let url = build_xai_oauth_authorization_url(
+            "https://auth.x.ai/oauth/authorize",
+            "challenge",
+            "state-123",
+            "nonce-123",
+        )
+        .expect("authorization URL should build");
+        let parsed = reqwest::Url::parse(url.as_str()).expect("authorization URL should parse");
+
+        assert_eq!(
+            format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path()),
+            "https://auth.x.ai/oauth/authorize"
+        );
+        let params = parsed.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(params.get("client_id").map(|value| value.as_ref()), Some(XAI_OAUTH_CLIENT_ID));
+        assert_eq!(
+            params.get("redirect_uri").map(|value| value.as_ref()),
+            Some(XAI_OAUTH_REDIRECT_URI)
+        );
+        assert_eq!(params.get("scope").map(|value| value.as_ref()), Some(XAI_OAUTH_SCOPE));
+        assert_eq!(params.get("code_challenge").map(|value| value.as_ref()), Some("challenge"));
+        assert_eq!(params.get("code_challenge_method").map(|value| value.as_ref()), Some("S256"));
+        assert_eq!(params.get("state").map(|value| value.as_ref()), Some("state-123"));
+        assert_eq!(params.get("nonce").map(|value| value.as_ref()), Some("nonce-123"));
+        assert_eq!(params.get("plan").map(|value| value.as_ref()), Some("generic"));
+        assert_eq!(params.get("referrer").map(|value| value.as_ref()), Some("palyra"));
+    }
+
+    #[test]
+    fn xai_callback_url_requires_loopback_redirect_and_matching_state() {
+        let callback = parse_xai_callback_url(
+            "http://127.0.0.1:56121/callback?code=auth-code&state=expected-state",
+            "expected-state",
+        )
+        .expect("matching loopback callback should be accepted");
+        assert_eq!(callback.code, "auth-code");
+
+        let state_error = parse_xai_callback_url(
+            "http://127.0.0.1:56121/callback?code=auth-code&state=other-state",
+            "expected-state",
+        )
+        .expect_err("mismatched state should be rejected");
+        let host_error = parse_xai_callback_url(
+            "http://localhost:56121/callback?code=auth-code&state=expected-state",
+            "expected-state",
+        )
+        .expect_err("unexpected host should be rejected");
+
+        assert!(state_error.to_string().contains("state mismatch"));
+        assert!(host_error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn xai_oauth_endpoint_normalizer_rejects_untrusted_hosts() {
+        let trusted =
+            normalize_xai_oauth_endpoint("https://auth.x.ai/oauth/token", "token_endpoint")
+                .expect("xAI auth endpoint should be trusted");
+        let subdomain =
+            normalize_xai_oauth_endpoint("https://accounts.x.ai/oauth/token", "token_endpoint")
+                .expect("xAI subdomain should be trusted");
+        let hostile =
+            normalize_xai_oauth_endpoint("https://attacker.example/token", "token_endpoint")
+                .expect_err("hostile endpoint should be rejected");
+        let credentials = normalize_xai_oauth_endpoint(
+            "https://user:secret@auth.x.ai/oauth/token",
+            "token_endpoint",
+        )
+        .expect_err("embedded credentials should be rejected");
+
+        assert_eq!(trusted, "https://auth.x.ai/oauth/token");
+        assert_eq!(subdomain, "https://accounts.x.ai/oauth/token");
+        assert!(hostile.to_string().contains("host is not trusted"));
+        assert!(credentials.to_string().contains("embedded credentials"));
     }
 }
