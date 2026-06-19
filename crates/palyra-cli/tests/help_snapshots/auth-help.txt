@@ -6,6 +6,7 @@ Commands:
   profiles
   access
   openai
+  anthropic
 
 Options:
   -h, --help  Print help

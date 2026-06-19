@@ -1,5 +1,5 @@
 //! Arguments for `palyra auth`: auth profile registry CRUD and diagnostics,
-//! access control (tokens, workspaces, invitations), and OpenAI API-key/OAuth
+//! access control (tokens, workspaces, invitations), and provider API-key/OAuth
 //! flows. Secret material is referenced via vault refs or read through
 //! env/stdin/prompt selector flags, never passed as raw argument values.
 //! Help text is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
@@ -19,6 +19,10 @@ pub enum AuthCommand {
     Openai {
         #[command(subcommand)]
         command: AuthOpenAiCommand,
+    },
+    Anthropic {
+        #[command(subcommand)]
+        command: AuthAnthropicCommand,
     },
 }
 
@@ -207,6 +211,70 @@ pub enum AuthOpenAiCommand {
         json: bool,
     },
     Reconnect {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Revoke {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    UseProfile {
+        profile_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuthAnthropicCommand {
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ApiKey {
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long, default_value = "Anthropic")]
+        profile_name: String,
+        #[arg(long, value_enum, default_value_t = AuthScopeArg::Global)]
+        scope: AuthScopeArg,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long, default_value_t = false)]
+        api_key_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        api_key_prompt: bool,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    OauthStart {
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long)]
+        profile_name: Option<String>,
+        #[arg(long, value_enum, default_value_t = AuthScopeArg::Global)]
+        scope: AuthScopeArg,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long = "authorization-code-env")]
+        authorization_code_env: Option<String>,
+        #[arg(long = "authorization-code-stdin", default_value_t = false)]
+        authorization_code_stdin: bool,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Refresh {
         profile_id: String,
         #[arg(long, default_value_t = false)]
         json: bool,

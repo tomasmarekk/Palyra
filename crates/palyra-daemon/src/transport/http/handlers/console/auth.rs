@@ -1011,6 +1011,40 @@ pub(crate) async fn console_anthropic_provider_api_key_handler(
     }
 }
 
+/// Connects or updates an Anthropic OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider connection
+/// fails.
+pub(crate) async fn console_anthropic_provider_oauth_token_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderOAuthTokenUpsertRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match connect_anthropic_oauth_tokens(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_connect",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                false,
+            );
+            Err(response)
+        }
+    }
+}
+
 /// Connects or updates a Minimax API-key profile.
 ///
 /// # Errors
@@ -1252,6 +1286,40 @@ pub(crate) async fn console_openai_provider_refresh_handler(
     state.observability.record_provider_auth_attempt();
     let profile_id = payload.profile_id.clone();
     match refresh_openai_oauth_profile(&state, &session.context, payload).await {
+        Ok(envelope) => Ok(Json(envelope)),
+        Err(response) => {
+            record_provider_auth_failure(
+                &state,
+                "provider_auth.oauth_refresh",
+                response.status(),
+                auth_correlation_from_context(
+                    &session.context,
+                    profile_id.as_deref(),
+                    None,
+                    None,
+                    None,
+                ),
+                true,
+            );
+            Err(response)
+        }
+    }
+}
+
+/// Refreshes an Anthropic OAuth profile.
+///
+/// # Errors
+/// Returns an error response when session authorization or provider refresh
+/// fails.
+pub(crate) async fn console_anthropic_provider_refresh_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<control_plane::ProviderAuthActionRequest>,
+) -> Result<Json<control_plane::ProviderAuthActionEnvelope>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    state.observability.record_provider_auth_attempt();
+    let profile_id = payload.profile_id.clone();
+    match refresh_anthropic_oauth_profile(&state, &session.context, payload).await {
         Ok(envelope) => Ok(Json(envelope)),
         Err(response) => {
             record_provider_auth_failure(

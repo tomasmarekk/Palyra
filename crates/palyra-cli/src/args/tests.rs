@@ -8,28 +8,28 @@ use super::{
     AcpSubcommand, AgentApprovalModeArg, AgentAutoResumeArg, AgentCommand, AgentsCommand,
     ApprovalDecisionArg, ApprovalDecisionScopeArg, ApprovalExportFormatArg,
     ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand, AuthAccessCommand,
-    AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
-    AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand, BrowserPermissionsCommand,
-    BrowserProfilesCommand, BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg,
-    ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell,
-    ConfigCommand, ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg,
-    CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand,
-    ExtensionCommand, FlowStateArg, FlowsCommand, GatewayBindProfileArg, HooksCommand, InitModeArg,
-    InitTlsScaffoldArg, JobsCommand, JournalCheckpointModeArg, MemoryCommand,
-    MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand,
-    NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg,
-    ObjectiveUpsertCommandArgs, ObjectivesCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg,
-    PatchCommand, PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg,
-    ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand, RemoteVerificationModeArg,
-    RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
-    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
-    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
-    RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
-    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
-    WizardOverridesArg, WorkspaceRoleArg,
+    AuthAnthropicCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand,
+    AuthProviderArg, AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand,
+    BrowserPermissionsCommand, BrowserProfilesCommand, BrowserSessionCommand, ChannelProviderArg,
+    ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli,
+    Command, CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand,
+    CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand,
+    DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
+    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
+    JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
+    MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
+    ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
+    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
+    PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
+    ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
+    RemoteVerificationModeArg, RequiredCommandIdArg, ResetCommand, ResetScopeArg,
+    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
+    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
+    RoutineUpsertCommand, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
+    SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand, SupportBundleCommand,
+    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
+    UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -3329,6 +3329,89 @@ fn parse_auth_openai_reconnect() {
                 command: AuthOpenAiCommand::Reconnect {
                     profile_id: "openai-default".to_owned(),
                     json: true,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_anthropic_api_key_from_prompt() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "auth",
+        "anthropic",
+        "api-key",
+        "--profile-id",
+        "anthropic-default",
+        "--api-key-prompt",
+        "--set-default",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Anthropic {
+                command: AuthAnthropicCommand::ApiKey {
+                    profile_id: Some("anthropic-default".to_owned()),
+                    profile_name: "Anthropic".to_owned(),
+                    scope: AuthScopeArg::Global,
+                    agent_id: None,
+                    api_key_env: None,
+                    api_key_stdin: false,
+                    api_key_prompt: true,
+                    set_default: true,
+                    json: false,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_anthropic_oauth_start() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "auth",
+        "anthropic",
+        "oauth-start",
+        "--profile-name",
+        "Claude Max",
+        "--authorization-code-env",
+        "ANTHROPIC_AUTH_CODE",
+        "--set-default",
+        "--open",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Anthropic {
+                command: AuthAnthropicCommand::OauthStart {
+                    profile_id: None,
+                    profile_name: Some("Claude Max".to_owned()),
+                    scope: AuthScopeArg::Global,
+                    agent_id: None,
+                    authorization_code_env: Some("ANTHROPIC_AUTH_CODE".to_owned()),
+                    authorization_code_stdin: false,
+                    set_default: true,
+                    open: true,
+                    json: true,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_anthropic_refresh() {
+    let parsed = Cli::parse_from(["palyra", "auth", "anthropic", "refresh", "anthropic-default"]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Anthropic {
+                command: AuthAnthropicCommand::Refresh {
+                    profile_id: "anthropic-default".to_owned(),
+                    json: false,
                 },
             },
         }

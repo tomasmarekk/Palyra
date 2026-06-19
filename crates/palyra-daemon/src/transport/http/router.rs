@@ -382,6 +382,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::auth::console_anthropic_provider_api_key_handler),
         )
         .route(
+            "/console/v1/auth/providers/anthropic/oauth-token",
+            post(console::auth::console_anthropic_provider_oauth_token_handler),
+        )
+        .route(
+            "/console/v1/auth/providers/anthropic/refresh",
+            post(console::auth::console_anthropic_provider_refresh_handler),
+        )
+        .route(
             "/console/v1/auth/providers/anthropic/revoke",
             post(console::auth::console_anthropic_provider_revoke_handler),
         )

@@ -3440,6 +3440,26 @@ pub struct ProviderApiKeyUpsertRequest {
     pub set_default: bool,
 }
 
+/// Request body storing OAuth tokens as a provider auth profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOAuthTokenUpsertRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub profile_name: String,
+    pub scope: AuthProfileScope,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub set_default: bool,
+}
+
 /// Request body storing an OpenAI API key as an auth profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiApiKeyUpsertRequest {

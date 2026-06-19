@@ -252,6 +252,102 @@ fn console_anthropic_api_key_flow_persists_vault_refs_and_default_selection() ->
 }
 
 #[test]
+fn console_anthropic_oauth_token_flow_persists_vault_refs_and_default_selection() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
+        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
+        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
+    )])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let connected = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/auth/providers/anthropic/oauth-token",
+        &cookie,
+        &csrf_token,
+        &json!({
+            "profile_name": "Claude Subscription",
+            "scope": { "kind": "global" },
+            "access_token": "sk-ant-oat-test-access",
+            "refresh_token": "sk-ant-ort-test-refresh",
+            "token_endpoint": "https://console.anthropic.com/v1/oauth/token",
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            "expires_at_unix_ms": 1_900_000_000_000_i64,
+            "set_default": true
+        }),
+    )?;
+    let profile_id = connected
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("oauth-token connect response missing profile_id"))?
+        .to_owned();
+    assert_eq!(connected.get("provider").and_then(Value::as_str), Some("anthropic"));
+    assert_eq!(connected.get("action").and_then(Value::as_str), Some("oauth"));
+    assert_eq!(connected.get("state").and_then(Value::as_str), Some("selected"));
+
+    let provider_state =
+        get_console_json(&client, admin_port, "/console/v1/auth/providers/anthropic", &cookie)?;
+    assert_eq!(
+        provider_state.get("default_profile_id").and_then(Value::as_str),
+        Some(profile_id.as_str())
+    );
+
+    let profiles = get_console_json(&client, admin_port, "/console/v1/auth/profiles", &cookie)?;
+    let profile = find_profile(&profiles, profile_id.as_str())?;
+    assert_eq!(
+        profile.get("provider").and_then(|provider| provider.get("kind")).and_then(Value::as_str),
+        Some("anthropic")
+    );
+    let credential = profile
+        .get("credential")
+        .ok_or_else(|| anyhow::anyhow!("anthropic OAuth profile missing credential"))?;
+    assert_eq!(credential.get("type").and_then(Value::as_str), Some("oauth"));
+    let access_ref = credential
+        .get("access_token_vault_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("anthropic OAuth credential missing access ref"))?;
+    let refresh_ref = credential
+        .get("refresh_token_vault_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("anthropic OAuth credential missing refresh ref"))?;
+    assert!(access_ref.contains("anthropic"), "access token ref should be provider scoped");
+    assert!(refresh_ref.contains("anthropic"), "refresh token ref should be provider scoped");
+    let profile_json = profile.to_string();
+    assert!(
+        !profile_json.contains("sk-ant-oat-test-access")
+            && !profile_json.contains("sk-ant-ort-test-refresh"),
+        "auth profile JSON must not expose raw Anthropic OAuth tokens"
+    );
+
+    let config = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/config/inspect",
+        &cookie,
+        &csrf_token,
+        &json!({}),
+    )?;
+    let document_toml = config
+        .get("document_toml")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("config inspect response missing document_toml"))?;
+    assert!(document_toml.contains("auth_provider_kind = \"anthropic\""));
+    assert!(document_toml.contains("kind = \"anthropic\""));
+    assert!(
+        !document_toml.contains("sk-ant-oat-test-access")
+            && !document_toml.contains("sk-ant-ort-test-refresh"),
+        "config inspect must not leak raw Anthropic OAuth tokens"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_models_probe_and_discover_publish_live_openai_results() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;

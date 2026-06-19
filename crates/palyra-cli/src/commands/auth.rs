@@ -7,7 +7,9 @@
 //! Output lines are pinned by CLI parity tests.
 
 use crate::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use palyra_control_plane as control_plane;
+use ring::rand::{SecureRandom, SystemRandom};
 
 const AUTH_PROFILES_EMPTY_REGISTRY_NOTE: &str = "This command lists auth-profile registry entries only. Model-provider credentials configured with `palyra configure --section auth-model` can be active vault refs even when this registry is empty; use the model-provider diagnostics commands for MiniMax/model-provider auth state.";
 const AUTH_PROFILES_MODEL_PROVIDER_SOURCES: &[&str] = &[
@@ -15,6 +17,13 @@ const AUTH_PROFILES_MODEL_PROVIDER_SOURCES: &[&str] = &[
     "palyra models test-connection --provider minimax --refresh --json",
     "palyra secrets inventory --json",
 ];
+const ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
+const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
+const ANTHROPIC_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Runs a `palyra auth` subcommand on a fresh Tokio runtime.
 ///
@@ -47,6 +56,10 @@ pub(crate) fn run_auth(command: AuthCommand) -> Result<()> {
         AuthCommand::Openai { command } => {
             let runtime = build_runtime()?;
             runtime.block_on(run_auth_openai_async(command))
+        }
+        AuthCommand::Anthropic { command } => {
+            let runtime = build_runtime()?;
+            runtime.block_on(run_auth_anthropic_async(command))
         }
     }
 }
@@ -737,6 +750,20 @@ struct OpenAiOAuthStatePayload {
     expires_at_unix_ms: Option<i64>,
 }
 
+#[derive(Debug)]
+struct AnthropicOAuthTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicOAuthTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+}
+
 async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
     match command {
         AuthOpenAiCommand::Status { json } => {
@@ -758,7 +785,8 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                 .list_auth_profiles("provider_kind=openai&limit=100")
                 .await
                 .context("failed to list OpenAI auth profiles")?;
-            let payload = build_openai_status_payload(provider_state, auth_health, profiles)?;
+            let payload =
+                build_provider_status_payload("openai", provider_state, auth_health, profiles)?;
             emit_openai_status(payload, output::preferred_json(json))
         }
         AuthOpenAiCommand::ApiKey {
@@ -953,9 +981,238 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
     }
 }
 
+async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
+    match command {
+        AuthAnthropicCommand::Status { json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let provider_state = context
+                .client
+                .get_provider_auth_state("anthropic")
+                .await
+                .context("failed to fetch Anthropic provider state")?;
+            let auth_health = context
+                .client
+                .get_auth_health(true, None)
+                .await
+                .context("failed to fetch Anthropic auth health")?;
+            let profiles = context
+                .client
+                .list_auth_profiles("provider_kind=anthropic&limit=100")
+                .await
+                .context("failed to list Anthropic auth profiles")?;
+            let payload =
+                build_provider_status_payload("anthropic", provider_state, auth_health, profiles)?;
+            emit_provider_status("anthropic", "Anthropic", payload, output::preferred_json(json))
+        }
+        AuthAnthropicCommand::ApiKey {
+            profile_id,
+            profile_name,
+            scope,
+            agent_id,
+            api_key_env,
+            api_key_stdin,
+            api_key_prompt,
+            set_default,
+            json,
+        } => {
+            let api_key = load_secret_input(
+                api_key_env,
+                api_key_stdin,
+                api_key_prompt,
+                "Anthropic API key: ",
+            )?;
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .connect_provider_api_key(
+                    "anthropic",
+                    &control_plane::ProviderApiKeyUpsertRequest {
+                        profile_id,
+                        profile_name,
+                        scope: build_control_plane_scope(scope, agent_id)?,
+                        api_key,
+                        set_default,
+                    },
+                )
+                .await
+                .context("failed to configure Anthropic API key profile")?;
+            emit_provider_action(
+                "anthropic",
+                "Anthropic",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthAnthropicCommand::OauthStart {
+            profile_id,
+            profile_name,
+            scope,
+            agent_id,
+            authorization_code_env,
+            authorization_code_stdin,
+            set_default,
+            open,
+            json,
+        } => {
+            let verifier = generate_oauth_pkce_verifier()?;
+            let challenge = oauth_pkce_challenge(verifier.as_str());
+            let state = generate_oauth_state()?;
+            let authorization_url =
+                build_anthropic_oauth_authorization_url(challenge.as_str(), state.as_str())?;
+            let opened = if open {
+                open_url_in_default_browser(authorization_url.as_str()).with_context(|| {
+                    "failed to open Anthropic OAuth authorization URL".to_owned()
+                })?;
+                true
+            } else {
+                false
+            };
+            emit_anthropic_oauth_instructions(
+                authorization_url.as_str(),
+                opened,
+                output::preferred_json(json),
+            )?;
+            let authorization_input = load_authorization_code_input(
+                authorization_code_env,
+                authorization_code_stdin,
+                "Anthropic authorization code: ",
+            )?;
+            let authorization_code =
+                parse_anthropic_authorization_code(authorization_input.as_str(), state.as_str())?;
+            let tokens = exchange_anthropic_oauth_code(
+                authorization_code.as_str(),
+                state.as_str(),
+                verifier.as_str(),
+            )
+            .await?;
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .connect_provider_oauth_tokens(
+                    "anthropic",
+                    &control_plane::ProviderOAuthTokenUpsertRequest {
+                        profile_id,
+                        profile_name: profile_name.unwrap_or_else(|| "Anthropic OAuth".to_owned()),
+                        scope: build_control_plane_scope(scope, agent_id)?,
+                        access_token: tokens.access_token,
+                        refresh_token: tokens.refresh_token,
+                        token_endpoint: ANTHROPIC_OAUTH_TOKEN_URL.to_owned(),
+                        client_id: Some(ANTHROPIC_OAUTH_CLIENT_ID.to_owned()),
+                        scopes: ANTHROPIC_OAUTH_SCOPES
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect(),
+                        expires_at_unix_ms: tokens.expires_at_unix_ms,
+                        set_default,
+                    },
+                )
+                .await
+                .context("failed to store Anthropic OAuth profile")?;
+            emit_provider_action(
+                "anthropic",
+                "Anthropic",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthAnthropicCommand::Refresh { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "anthropic",
+                    "refresh",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to refresh Anthropic auth profile")?;
+            emit_provider_action(
+                "anthropic",
+                "Anthropic",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthAnthropicCommand::Revoke { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "anthropic",
+                    "revoke",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to revoke Anthropic auth profile")?;
+            emit_provider_action(
+                "anthropic",
+                "Anthropic",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+        AuthAnthropicCommand::UseProfile { profile_id, json } => {
+            let context =
+                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+                    .await?;
+            let response = context
+                .client
+                .run_provider_auth_action(
+                    "anthropic",
+                    "default-profile",
+                    &control_plane::ProviderAuthActionRequest { profile_id: Some(profile_id) },
+                )
+                .await
+                .context("failed to select default Anthropic auth profile")?;
+            emit_provider_action(
+                "anthropic",
+                "Anthropic",
+                OpenAiActionPayload {
+                    action: response.action,
+                    state: response.state,
+                    message: response.message,
+                    profile_id: response.profile_id,
+                },
+                output::preferred_json(json),
+            )
+        }
+    }
+}
+
 /// Merges three console endpoints (provider state, auth health, profile list) into
-/// the single status payload shown by `auth openai status`.
-fn build_openai_status_payload(
+/// the single status payload shown by provider auth status commands.
+fn build_provider_status_payload(
+    provider_key: &str,
     provider_state: control_plane::ProviderAuthStateEnvelope,
     auth_health: control_plane::AuthHealthEnvelope,
     profiles: control_plane::AuthProfileListEnvelope,
@@ -968,7 +1225,7 @@ fn build_openai_status_payload(
     let refresh = refresh_metrics
         .by_provider
         .into_iter()
-        .find(|entry| entry.provider.eq_ignore_ascii_case("openai"))
+        .find(|entry| entry.provider.eq_ignore_ascii_case(provider_key))
         .map(|entry| OpenAiRefreshSnapshot {
             attempts: entry.attempts,
             successes: entry.successes,
@@ -983,7 +1240,7 @@ fn build_openai_status_payload(
         .profiles
         .into_iter()
         .filter_map(|value| serde_json::from_value::<OpenAiAuthHealthProfile>(value).ok())
-        .filter(|profile| profile.provider.eq_ignore_ascii_case("openai"))
+        .filter(|profile| profile.provider.eq_ignore_ascii_case(provider_key))
         .map(|profile| (profile.profile_id.clone(), profile))
         .collect::<std::collections::BTreeMap<_, _>>();
     let profiles = profiles
@@ -1038,18 +1295,31 @@ fn build_openai_oauth_launch_payload(
 }
 
 fn emit_openai_status(payload: OpenAiAuthStatusPayload, json_output: bool) -> Result<()> {
+    emit_provider_status("openai", "OpenAI", payload, json_output)
+}
+
+fn emit_provider_status(
+    provider_key: &str,
+    _provider_label: &str,
+    payload: OpenAiAuthStatusPayload,
+    json_output: bool,
+) -> Result<()> {
     if json_output {
-        output::print_json_pretty(&payload, "failed to encode OpenAI auth status as JSON")?;
+        let error_label = match provider_key {
+            "anthropic" => "failed to encode Anthropic auth status as JSON",
+            _ => "failed to encode OpenAI auth status as JSON",
+        };
+        output::print_json_pretty(&payload, error_label)?;
     } else {
         println!(
-            "auth.openai.status provider={} state={} default_profile_id={} note={}",
+            "auth.{provider_key}.status provider={} state={} default_profile_id={} note={}",
             payload.provider,
             payload.provider_state,
             payload.default_profile_id.as_deref().unwrap_or("none"),
             payload.note.as_deref().unwrap_or("none")
         );
         println!(
-            "auth.openai.summary total={} ok={} expiring={} expired={} missing={} static={} refresh_attempts={} refresh_successes={} refresh_failures={}",
+            "auth.{provider_key}.summary total={} ok={} expiring={} expired={} missing={} static={} refresh_attempts={} refresh_successes={} refresh_failures={}",
             payload.summary.total,
             payload.summary.ok,
             payload.summary.expiring,
@@ -1062,7 +1332,7 @@ fn emit_openai_status(payload: OpenAiAuthStatusPayload, json_output: bool) -> Re
         );
         for profile in payload.profiles {
             println!(
-                "auth.openai.profile id={} name={} scope={} credential={} health={} default={} expires_at_unix_ms={} reason=\"{}\"",
+                "auth.{provider_key}.profile id={} name={} scope={} credential={} health={} default={} expires_at_unix_ms={} reason=\"{}\"",
                 profile.profile_id,
                 profile.profile_name,
                 profile.scope,
@@ -1081,11 +1351,24 @@ fn emit_openai_status(payload: OpenAiAuthStatusPayload, json_output: bool) -> Re
 }
 
 fn emit_openai_action(payload: OpenAiActionPayload, json_output: bool) -> Result<()> {
+    emit_provider_action("openai", "OpenAI", payload, json_output)
+}
+
+fn emit_provider_action(
+    provider_key: &str,
+    _provider_label: &str,
+    payload: OpenAiActionPayload,
+    json_output: bool,
+) -> Result<()> {
     if json_output {
-        output::print_json_pretty(&payload, "failed to encode OpenAI action as JSON")?;
+        let error_label = match provider_key {
+            "anthropic" => "failed to encode Anthropic action as JSON",
+            _ => "failed to encode OpenAI action as JSON",
+        };
+        output::print_json_pretty(&payload, error_label)?;
     } else {
         println!(
-            "auth.openai.action action={} state={} profile_id={} message=\"{}\"",
+            "auth.{provider_key}.action action={} state={} profile_id={} message=\"{}\"",
             payload.action,
             payload.state,
             payload.profile_id.as_deref().unwrap_or("none"),
@@ -1122,6 +1405,192 @@ fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String
         format!("auth.openai.oauth.authorization_url=\"{authorization_url}\""),
         format!("auth.openai.oauth.message=\"{}\"", payload.message.replace('"', "'")),
     ]
+}
+
+fn emit_anthropic_oauth_instructions(
+    authorization_url: &str,
+    opened: bool,
+    json_output: bool,
+) -> Result<()> {
+    let safe_url = authorization_url.replace('"', "'");
+    if json_output {
+        eprintln!(
+            "auth.anthropic.oauth.authorization_url=\"{safe_url}\" opened={opened} message=\"Open this URL, authorize Palyra, then paste the code shown by Anthropic.\""
+        );
+    } else {
+        output::print_text_line(
+            format!(
+                "auth.anthropic.oauth.start authorization_url_present={} opened={opened}",
+                !authorization_url.trim().is_empty()
+            )
+            .as_str(),
+        )?;
+        output::print_text_line(
+            format!("auth.anthropic.oauth.authorization_url=\"{safe_url}\"").as_str(),
+        )?;
+        output::print_text_line(
+            "auth.anthropic.oauth.message=\"Open this URL, authorize Palyra, then paste the code shown by Anthropic.\"",
+        )?;
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    Ok(())
+}
+
+fn generate_oauth_random_urlsafe(byte_len: usize, label: &str) -> Result<String> {
+    let rng = SystemRandom::new();
+    let mut bytes = vec![0_u8; byte_len];
+    rng.fill(bytes.as_mut_slice()).map_err(|_| anyhow!("failed to generate {label} randomness"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn generate_oauth_pkce_verifier() -> Result<String> {
+    generate_oauth_random_urlsafe(32, "PKCE verifier")
+}
+
+fn generate_oauth_state() -> Result<String> {
+    generate_oauth_random_urlsafe(32, "OAuth state")
+}
+
+fn oauth_pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest as _;
+
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn build_anthropic_oauth_authorization_url(code_challenge: &str, state: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(ANTHROPIC_OAUTH_AUTHORIZE_URL)
+        .context("Anthropic OAuth authorization endpoint is invalid")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("code", "true");
+        pairs.append_pair("client_id", ANTHROPIC_OAUTH_CLIENT_ID);
+        pairs.append_pair("response_type", "code");
+        pairs.append_pair("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI);
+        pairs.append_pair("scope", ANTHROPIC_OAUTH_SCOPES);
+        pairs.append_pair("code_challenge", code_challenge);
+        pairs.append_pair("code_challenge_method", "S256");
+        pairs.append_pair("state", state);
+    }
+    Ok(url.to_string())
+}
+
+fn load_authorization_code_input(
+    env_name: Option<String>,
+    from_stdin: bool,
+    prompt: &str,
+) -> Result<String> {
+    let selected_sources = usize::from(env_name.is_some()) + usize::from(from_stdin);
+    if selected_sources > 1 {
+        anyhow::bail!("select at most one authorization code source");
+    }
+    let value = if let Some(env_name) = env_name {
+        env::var(env_name.as_str())
+            .with_context(|| format!("environment variable {env_name} is not set"))?
+    } else if from_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .context("failed to read authorization code from stdin")?;
+        value
+    } else {
+        print!("{prompt}");
+        std::io::stdout().flush().context("stdout flush failed")?;
+        let mut value = String::new();
+        std::io::stdin().read_line(&mut value).context("failed to read authorization code")?;
+        value
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("authorization code input was empty");
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn parse_anthropic_authorization_code(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let (code, received_state) = if let Ok(url) = reqwest::Url::parse(trimmed) {
+        (
+            url.query_pairs()
+                .find(|(key, _)| key == "code")
+                .map(|(_, value)| value.to_string())
+                .unwrap_or_default(),
+            url.query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.to_string())
+                .or_else(|| url.fragment().map(str::to_owned))
+                .unwrap_or_default(),
+        )
+    } else {
+        let mut parts = trimmed.splitn(2, '#');
+        (
+            parts.next().unwrap_or_default().trim().to_owned(),
+            parts.next().unwrap_or_default().trim().to_owned(),
+        )
+    };
+    if code.is_empty() {
+        anyhow::bail!("Anthropic authorization code was empty");
+    }
+    if received_state != expected_state {
+        anyhow::bail!("Anthropic OAuth state mismatch; restart the login flow");
+    }
+    Ok(code)
+}
+
+async fn exchange_anthropic_oauth_code(
+    code: &str,
+    state: &str,
+    code_verifier: &str,
+) -> Result<AnthropicOAuthTokens> {
+    let client = reqwest::Client::builder()
+        .timeout(ANTHROPIC_OAUTH_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build Anthropic OAuth HTTP client")?;
+    let response = client
+        .post(ANTHROPIC_OAUTH_TOKEN_URL)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .header("user-agent", ANTHROPIC_OAUTH_USER_AGENT)
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "code": code,
+            "state": state,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": code_verifier,
+        }))
+        .send()
+        .await
+        .context("Anthropic OAuth token exchange request failed")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let sanitized = redact_auth_error(redact_url_segments_in_text(body.as_str()).as_str());
+        anyhow::bail!(
+            "Anthropic OAuth token exchange failed with HTTP {}: {}",
+            status.as_u16(),
+            sanitize_auth_message(sanitized.as_str())
+        );
+    }
+    let parsed: AnthropicOAuthTokenResponse = serde_json::from_str(body.as_str())
+        .context("Anthropic OAuth token response was not JSON")?;
+    let access_token = parsed
+        .access_token
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Anthropic OAuth token response did not include access_token"))?;
+    let refresh_token = parsed
+        .refresh_token
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("Anthropic OAuth token response did not include refresh_token"))?;
+    let expires_at_unix_ms = parsed
+        .expires_in
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .and_then(|duration_ms| now_unix_ms_i64().ok()?.checked_add(duration_ms));
+    Ok(AnthropicOAuthTokens { access_token, refresh_token, expires_at_unix_ms })
 }
 
 fn emit_openai_oauth_state(payload: OpenAiOAuthStatePayload, json_output: bool) -> Result<()> {
@@ -1363,9 +1832,12 @@ fn load_secret_input(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auth_profiles_list_json_payload, build_openai_oauth_launch_payload,
-        openai_oauth_launch_text_lines, OpenAiOAuthLaunchPayload,
-        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
+        build_anthropic_oauth_authorization_url, build_auth_profiles_list_json_payload,
+        build_openai_oauth_launch_payload, openai_oauth_launch_text_lines,
+        parse_anthropic_authorization_code, AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload,
+        ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI,
+        ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
+        AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -1451,5 +1923,51 @@ mod tests {
             ),
             "{output}"
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_authorization_url_uses_public_claude_client() {
+        let url = build_anthropic_oauth_authorization_url("challenge", "state-123")
+            .expect("authorization URL should build");
+        let parsed = reqwest::Url::parse(url.as_str()).expect("authorization URL should parse");
+
+        assert_eq!(
+            format!("{}://{}{}", parsed.scheme(), parsed.host_str().unwrap_or(""), parsed.path()),
+            ANTHROPIC_OAUTH_AUTHORIZE_URL
+        );
+        let params = parsed.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            params.get("client_id").map(|value| value.as_ref()),
+            Some(ANTHROPIC_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|value| value.as_ref()),
+            Some(ANTHROPIC_OAUTH_REDIRECT_URI)
+        );
+        assert_eq!(params.get("scope").map(|value| value.as_ref()), Some(ANTHROPIC_OAUTH_SCOPES));
+        assert_eq!(params.get("code_challenge").map(|value| value.as_ref()), Some("challenge"));
+        assert_eq!(params.get("state").map(|value| value.as_ref()), Some("state-123"));
+    }
+
+    #[test]
+    fn anthropic_authorization_code_requires_matching_state() {
+        let code = parse_anthropic_authorization_code("auth-code#expected-state", "expected-state")
+            .expect("matching state should be accepted");
+        assert_eq!(code, "auth-code");
+
+        let error = parse_anthropic_authorization_code("auth-code#other-state", "expected-state")
+            .expect_err("mismatched state should be rejected");
+        assert!(error.to_string().contains("state mismatch"));
+    }
+
+    #[test]
+    fn anthropic_oauth_token_response_allows_missing_expiry() {
+        let parsed: AnthropicOAuthTokenResponse =
+            serde_json::from_value(json!({"access_token": "at", "refresh_token": "rt"}))
+                .expect("token response should decode without expires_in");
+
+        assert_eq!(parsed.access_token.as_deref(), Some("at"));
+        assert_eq!(parsed.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(parsed.expires_in, None);
     }
 }

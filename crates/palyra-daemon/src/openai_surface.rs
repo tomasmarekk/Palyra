@@ -36,6 +36,9 @@ const OPENAI_CHATGPT_DEVICE_ATTEMPT_TTL_MS: i64 = 15 * 60 * 1_000;
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_ALLOWED_TOKEN_HOSTS: &[&str] =
+    &["console.anthropic.com", "platform.claude.com"];
 const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M2.7";
 const MINIMAX_PROVIDER_CUSTOM_NAME: &str = "minimax";
@@ -194,6 +197,99 @@ pub(crate) async fn connect_anthropic_api_key(
         ("saved", "Anthropic API key profile saved.")
     };
     Ok(provider_action_envelope("anthropic", "api_key", state_name, message, Some(profile_id)))
+}
+
+/// Stores Anthropic OAuth tokens as a vault-backed auth profile, optionally
+/// selecting it as the default model-provider profile.
+///
+/// # Errors
+/// Returns a validation error response for malformed fields or an unsupported
+/// token endpoint, and an internal/unavailable error response when vault,
+/// profile, or config persistence fails.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn connect_anthropic_oauth_tokens(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderOAuthTokenUpsertRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_name = normalize_openai_profile_name(payload.profile_name.as_str())?;
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .map(|value| normalize_openai_identifier(value, "profile_id"))
+        .transpose()?
+        .unwrap_or_else(|| generate_provider_profile_id("anthropic", profile_name.as_str()));
+    let scope = normalize_openai_profile_scope(Some(payload.scope))?;
+    let access_token =
+        normalize_required_openai_text(payload.access_token.as_str(), "access_token")?;
+    let refresh_token =
+        normalize_required_openai_text(payload.refresh_token.as_str(), "refresh_token")?;
+    let token_endpoint = normalize_anthropic_oauth_token_endpoint(payload.token_endpoint.as_str())?;
+    let client_id = payload
+        .client_id
+        .as_deref()
+        .and_then(normalize_optional_text)
+        .map(str::to_owned)
+        .unwrap_or_else(|| ANTHROPIC_OAUTH_CLIENT_ID.to_owned());
+    let access_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &scope,
+        profile_id.as_str(),
+        "anthropic",
+        "oauth_access_token",
+        access_token.as_bytes(),
+    )?;
+    let refresh_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &scope,
+        profile_id.as_str(),
+        "anthropic",
+        "oauth_refresh_token",
+        refresh_token.as_bytes(),
+    )?;
+    let refresh_state = serde_json::to_value(OAuthRefreshState::default()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize OAuth refresh state: {error}"
+        )))
+    })?;
+    let profile = control_plane::AuthProfileView {
+        profile_id: profile_id.clone(),
+        provider: control_plane::AuthProfileProvider {
+            kind: "anthropic".to_owned(),
+            custom_name: None,
+        },
+        profile_name,
+        scope: scope.clone(),
+        credential: control_plane::AuthCredentialView::Oauth {
+            access_token_vault_ref,
+            refresh_token_vault_ref,
+            token_endpoint,
+            client_id: Some(client_id),
+            client_secret_vault_ref: None,
+            scopes: Vec::new(),
+            expires_at_unix_ms: payload.expires_at_unix_ms,
+            refresh_state,
+        },
+        created_at_unix_ms: 0,
+        updated_at_unix_ms: 0,
+    };
+    persist_openai_auth_profile(state, context, profile).await?;
+    if payload.set_default {
+        persist_model_provider_auth_profile_selection(
+            state,
+            context,
+            profile_id.as_str(),
+            ModelProviderAuthProviderKind::Anthropic,
+        )
+        .await?;
+    }
+
+    let (state_name, message) = if payload.set_default {
+        ("selected", "Anthropic OAuth profile saved and selected as the default auth profile.")
+    } else {
+        ("saved", "Anthropic OAuth profile saved.")
+    };
+    Ok(provider_action_envelope("anthropic", "oauth", state_name, message, Some(profile_id)))
 }
 
 /// Validates a MiniMax API key with a minimal completion probe, then stores
@@ -1109,7 +1205,10 @@ pub(crate) async fn revoke_anthropic_auth_profile(
             "event": "auth.profile.revoked",
             "provider": "anthropic",
             "profile_id": profile.profile_id,
-            "credential_type": "api_key",
+            "credential_type": match profile.credential.credential_type() {
+                palyra_auth::AuthCredentialType::ApiKey => "api_key",
+                palyra_auth::AuthCredentialType::Oauth => "oauth",
+            },
             "remote_revocation": false,
             "default_cleared": default_cleared,
         }),
@@ -1166,6 +1265,60 @@ pub(crate) async fn select_default_anthropic_auth_profile(
         "selected",
         "Anthropic default auth profile updated.",
         Some(profile_id),
+    ))
+}
+
+/// Triggers an OAuth token refresh for an Anthropic profile through the auth
+/// runtime and journals the outcome; skip outcomes are returned as envelope
+/// states rather than errors.
+///
+/// # Errors
+/// Returns a validation error response when `profile_id` is missing or
+/// malformed, not-found/failed-precondition for unknown or non-Anthropic
+/// profiles, and propagates auth-runtime and journaling failures.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn refresh_anthropic_oauth_profile(
+    state: &AppState,
+    context: &RequestContext,
+    payload: control_plane::ProviderAuthActionRequest,
+) -> Result<control_plane::ProviderAuthActionEnvelope, Response> {
+    let profile_id = payload
+        .profile_id
+        .as_deref()
+        .ok_or_else(|| {
+            validation_error_response(
+                "profile_id",
+                "required",
+                "profile_id is required for provider refresh",
+            )
+        })
+        .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
+    let _profile = load_auth_profile_record_for_provider(
+        state,
+        profile_id.as_str(),
+        AuthProviderKind::Anthropic,
+    )?;
+    let outcome = state
+        .auth_runtime
+        .refresh_oauth_profile(profile_id.clone(), Arc::clone(&state.vault))
+        .await
+        .map_err(runtime_status_response)?;
+    record_auth_refresh_journal_event(&state.runtime, context, &outcome)
+        .await
+        .map_err(runtime_status_response)?;
+    let (state_name, message) = match outcome.kind {
+        OAuthRefreshOutcomeKind::Succeeded => ("refreshed", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedNotDue => ("not_due", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedCooldown => ("cooldown", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::SkippedNotOauth => ("not_oauth", outcome.reason.as_str()),
+        OAuthRefreshOutcomeKind::Failed => ("failed", outcome.reason.as_str()),
+    };
+    Ok(provider_action_envelope(
+        "anthropic",
+        "refresh",
+        state_name,
+        sanitize_http_error_message(message).as_str(),
+        Some(outcome.profile_id),
     ))
 }
 
@@ -2669,6 +2822,49 @@ fn load_anthropic_validation_base_url_with_env(
         .unwrap_or_else(|| ANTHROPIC_DEFAULT_BASE_URL.to_owned())
 }
 
+#[allow(clippy::result_large_err)]
+fn normalize_anthropic_oauth_token_endpoint(raw: &str) -> Result<String, Response> {
+    let trimmed = normalize_required_openai_text(raw, "token_endpoint")?;
+    let parsed = Url::parse(trimmed.as_str()).map_err(|_| {
+        validation_error_response(
+            "token_endpoint",
+            "invalid",
+            "token_endpoint must be a valid absolute URL",
+        )
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "Anthropic OAuth token_endpoint must use https",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "Anthropic OAuth token_endpoint must not contain embedded credentials",
+        ));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "Anthropic OAuth token_endpoint must not contain query or fragment components",
+        ));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !ANTHROPIC_OAUTH_ALLOWED_TOKEN_HOSTS.iter().any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        return Err(validation_error_response(
+            "token_endpoint",
+            "unsupported",
+            "Anthropic OAuth token_endpoint host is not trusted",
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
 fn load_minimax_validation_base_url(document: Option<&toml::Value>) -> String {
     env::var("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL")
         .ok()
@@ -3771,6 +3967,33 @@ mod tests {
         assert!(profile_id.chars().all(|ch| {
             ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_' || ch == '.'
         }));
+    }
+
+    #[test]
+    fn normalize_anthropic_oauth_token_endpoint_accepts_trusted_hosts() {
+        let console = normalize_anthropic_oauth_token_endpoint(
+            "https://console.anthropic.com/v1/oauth/token",
+        )
+        .expect("console Anthropic token endpoint should be trusted");
+        let platform =
+            normalize_anthropic_oauth_token_endpoint("https://platform.claude.com/v1/oauth/token")
+                .expect("platform Claude token endpoint should be trusted");
+
+        assert_eq!(console, "https://console.anthropic.com/v1/oauth/token");
+        assert_eq!(platform, "https://platform.claude.com/v1/oauth/token");
+    }
+
+    #[test]
+    fn normalize_anthropic_oauth_token_endpoint_rejects_untrusted_targets() {
+        let hostile = normalize_anthropic_oauth_token_endpoint("https://attacker.example/token")
+            .expect_err("untrusted host should be rejected");
+        let embedded_credentials = normalize_anthropic_oauth_token_endpoint(
+            "https://user:secret@console.anthropic.com/v1/oauth/token",
+        )
+        .expect_err("embedded credentials should be rejected");
+
+        assert_eq!(hostile.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(embedded_credentials.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

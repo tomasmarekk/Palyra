@@ -1759,6 +1759,78 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/models/discover", Some(request), true).await
     }
 
+    /// Fetches provider auth state via `GET console/v1/auth/providers/{provider}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn get_provider_auth_state(
+        &self,
+        provider: &str,
+    ) -> Result<ProviderAuthStateEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/auth/providers/{}", urlencoding(provider)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    /// Stores a provider API key via `POST console/v1/auth/providers/{provider}/api-key`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn connect_provider_api_key(
+        &self,
+        provider: &str,
+        request: &ProviderApiKeyUpsertRequest,
+    ) -> Result<ProviderAuthActionEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/auth/providers/{}/api-key", urlencoding(provider)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    /// Stores provider OAuth tokens via `POST console/v1/auth/providers/{provider}/oauth-token`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn connect_provider_oauth_tokens(
+        &self,
+        provider: &str,
+        request: &ProviderOAuthTokenUpsertRequest,
+    ) -> Result<ProviderAuthActionEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/auth/providers/{}/oauth-token", urlencoding(provider)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    /// Runs a named provider auth action via `POST console/v1/auth/providers/{provider}/{action}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn run_provider_auth_action(
+        &self,
+        provider: &str,
+        action: &str,
+        request: &ProviderAuthActionRequest,
+    ) -> Result<ProviderAuthActionEnvelope, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/auth/providers/{}/{}", urlencoding(provider), urlencoding(action)),
+            Some(request),
+            true,
+        )
+        .await
+    }
+
     /// Fetches the OpenAI provider auth state via `GET console/v1/auth/providers/openai`.
     ///
     /// # Errors

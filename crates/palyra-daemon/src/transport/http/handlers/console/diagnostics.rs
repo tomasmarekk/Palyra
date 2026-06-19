@@ -4842,6 +4842,8 @@ pub(crate) fn build_capability_catalog() -> Result<control_plane::CapabilityCata
                     "/console/v1/auth/providers/openai/default-profile",
                     "/console/v1/auth/providers/anthropic",
                     "/console/v1/auth/providers/anthropic/api-key",
+                    "/console/v1/auth/providers/anthropic/oauth-token",
+                    "/console/v1/auth/providers/anthropic/refresh",
                     "/console/v1/auth/providers/anthropic/revoke",
                     "/console/v1/auth/providers/anthropic/default-profile",
                     "/console/v1/auth/providers/minimax",

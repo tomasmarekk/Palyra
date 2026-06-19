@@ -78,6 +78,8 @@ const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const ANTHROPIC_OAUTH_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20";
+const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 // Shared by all HTTP backends; 529 is the Anthropic/MiniMax overload status
 // and must be retried like the other transient upstream codes.
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504, 529];
@@ -346,10 +348,33 @@ impl ModelProviderAuthProviderKind {
     }
 }
 
-// MiniMax exposes an Anthropic-compatible messages API but authenticates with
-// an Authorization bearer header instead of Anthropic's x-api-key header.
-fn anthropic_compatible_uses_bearer_auth(kind: Option<ModelProviderAuthProviderKind>) -> bool {
+// MiniMax exposes an Anthropic-compatible messages API with bearer auth, while
+// native Anthropic uses bearer auth only for Claude subscription OAuth tokens.
+fn anthropic_compatible_uses_bearer_auth(
+    kind: Option<ModelProviderAuthProviderKind>,
+    credential_source: Option<ModelProviderCredentialSource>,
+) -> bool {
     matches!(kind, Some(ModelProviderAuthProviderKind::Minimax))
+        || matches!(
+            (kind, credential_source),
+            (
+                Some(ModelProviderAuthProviderKind::Anthropic),
+                Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken)
+            )
+        )
+}
+
+fn anthropic_compatible_uses_anthropic_oauth_headers(
+    kind: Option<ModelProviderAuthProviderKind>,
+    credential_source: Option<ModelProviderCredentialSource>,
+) -> bool {
+    matches!(
+        (kind, credential_source),
+        (
+            Some(ModelProviderAuthProviderKind::Anthropic),
+            Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken)
+        )
+    )
 }
 
 /// Where a provider credential was sourced from, for audit display; the raw
@@ -5437,12 +5462,24 @@ impl AnthropicProvider {
             .client
             .post(self.messages_endpoint())
             .header("anthropic-version", ANTHROPIC_API_VERSION);
-        let request_builder =
-            if anthropic_compatible_uses_bearer_auth(self.config.auth_profile_provider_kind) {
-                request_builder.bearer_auth(api_key)
-            } else {
-                request_builder.header("x-api-key", api_key)
-            };
+        let request_builder = if anthropic_compatible_uses_bearer_auth(
+            self.config.auth_profile_provider_kind,
+            self.config.credential_source,
+        ) {
+            request_builder.bearer_auth(api_key)
+        } else {
+            request_builder.header("x-api-key", api_key)
+        };
+        let request_builder = if anthropic_compatible_uses_anthropic_oauth_headers(
+            self.config.auth_profile_provider_kind,
+            self.config.credential_source,
+        ) {
+            request_builder
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA_HEADER)
+                .header("user-agent", ANTHROPIC_OAUTH_USER_AGENT)
+        } else {
+            request_builder
+        };
         let response = request_builder.json(&body).send().await.map_err(|error| {
             AttemptError::request_failed(
                 format!("anthropic request failed: {error}"),
@@ -6358,14 +6395,16 @@ mod tests {
         extract_completion_text, normalize_tool_arguments, provider_seconds_to_millis,
         sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
         AnthropicCompatibleChatAdapter, EmbeddingsRequest, ModelProviderAuthProviderKind,
-        ModelProviderConfig, ModelProviderKind, ModelProviderRegistryConfig,
-        OpenAiCompatibleChatAdapter, ProviderChatAdapter, ProviderError, ProviderEvent,
-        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
-        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
-        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
-        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
-        ProviderTurnOutput, ProviderUsage, OPENAI_RETRYABLE_STATUS_CODES,
+        ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
+        ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
+        ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
+        ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
+        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
+        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
+        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
+        ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput,
+        ProviderUsage, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
+        OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -7520,6 +7559,58 @@ mod tests {
             "MiniMax Anthropic-compatible transport must not use Anthropic x-api-key auth"
         );
         handle.join().expect("minimax scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_oauth_provider_uses_bearer_auth_and_oauth_betas() {
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![(
+                200_u16,
+                r#"{"content":[{"type":"text","text":"hello from claude oauth"}],"stop_reason":"end_turn"}"#
+                    .to_owned(),
+            )]);
+        let anthropic_base_url =
+            base_url.strip_suffix("/v1").unwrap_or(base_url.as_str()).to_owned();
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::Anthropic,
+            anthropic_base_url,
+            allow_private_base_url: true,
+            anthropic_model: "claude-3-5-sonnet-latest".to_owned(),
+            anthropic_api_key: Some("anthropic-oauth-access-token".to_owned()),
+            auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Anthropic),
+            credential_source: Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken),
+            request_timeout_ms: 5_000,
+            max_retries: 0,
+            retry_backoff_ms: 1,
+            circuit_breaker_failure_threshold: 1,
+            circuit_breaker_cooldown_ms: 60_000,
+            ..ModelProviderConfig::default()
+        };
+        let provider = build_model_provider(&config).expect("anthropic provider should build");
+
+        provider
+            .complete(ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None))
+            .await
+            .expect("anthropic OAuth provider should succeed");
+
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        assert_eq!(requests[0].path, "/v1/messages");
+        let header = |name: &str| {
+            requests[0]
+                .headers
+                .iter()
+                .find(|(header_name, _)| header_name == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("authorization"), Some("Bearer anthropic-oauth-access-token"));
+        assert_eq!(header("anthropic-beta"), Some(ANTHROPIC_OAUTH_BETA_HEADER));
+        assert_eq!(header("user-agent"), Some(ANTHROPIC_OAUTH_USER_AGENT));
+        assert!(
+            !requests[0].headers.iter().any(|(name, _)| name == "x-api-key"),
+            "Anthropic OAuth transport must not use x-api-key auth"
+        );
+        handle.join().expect("anthropic scripted server thread should exit");
     }
 
     #[tokio::test(flavor = "multi_thread")]
