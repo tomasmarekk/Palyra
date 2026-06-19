@@ -24,6 +24,10 @@ const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
 const ANTHROPIC_PROVIDER_KIND: &str = "anthropic";
 const DETERMINISTIC_PROVIDER_KIND: &str = "deterministic";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_MODELS_ENDPOINT: &str =
+    "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_MS: u64 = 5_000;
@@ -92,7 +96,25 @@ struct ConsoleProbeTarget {
 #[derive(Debug, Clone)]
 enum ResolvedCredential {
     ApiKey { token: String, source: String },
-    Bearer { token: String, source: String },
+    Bearer { token: String, source: String, oauth_kind: Option<ResolvedOauthProfileKind> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedOauthProfileKind {
+    OpenAiChatGptLogin,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderModelsEndpoint {
+    url: reqwest::Url,
+    base_url: String,
+    response_format: ProviderModelsResponseFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderModelsResponseFormat {
+    OpenAiCompatible,
+    OpenAiCodexBackend,
 }
 
 /// Probes provider connectivity and credentials without model discovery.
@@ -494,7 +516,7 @@ async fn probe_console_provider(
         }
     };
 
-    let endpoint = match provider_models_endpoint(base_url) {
+    let endpoint = match provider_models_endpoint_for_probe(target, base_url, &credential) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             payload.state = "endpoint_failed".to_owned();
@@ -502,6 +524,7 @@ async fn probe_console_provider(
             return payload;
         }
     };
+    payload.endpoint_base_url = Some(endpoint.base_url.clone());
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -543,7 +566,7 @@ async fn probe_console_provider(
     }
 
     let started_at = Instant::now();
-    match client.get(endpoint).headers(headers).send().await {
+    match client.get(endpoint.url).headers(headers).send().await {
         Ok(response) => {
             payload.latency_ms =
                 Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
@@ -556,8 +579,9 @@ async fn probe_console_provider(
                     // registry. The equality check below therefore also labels
                     // a live response that exactly matches the registry as
                     // "registry_fallback" -- indistinguishable by design.
-                    let discovered = parse_discovered_model_ids(body.as_str())
-                        .unwrap_or_else(|_| target.configured_model_ids.clone());
+                    let discovered =
+                        parse_discovered_model_ids(body.as_str(), endpoint.response_format)
+                            .unwrap_or_else(|_| target.configured_model_ids.clone());
                     payload.discovered_model_ids = discovered;
                     payload.discovery_source =
                         if payload.discovered_model_ids == target.configured_model_ids {
@@ -674,9 +698,16 @@ fn resolve_provider_credential(
                 let token = load_vault_secret_utf8(&state.vault, api_key_vault_ref.as_str())?;
                 Ok(Some(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() }))
             }
-            AuthCredential::Oauth { access_token_vault_ref, .. } => {
+            AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
                 let token = load_vault_secret_utf8(&state.vault, access_token_vault_ref.as_str())?;
-                Ok(Some(ResolvedCredential::Bearer { token, source: "auth_profile".to_owned() }))
+                Ok(Some(ResolvedCredential::Bearer {
+                    token,
+                    source: "auth_profile".to_owned(),
+                    oauth_kind: oauth_kind_for_profile(
+                        &profile.provider.kind,
+                        client_id.as_deref(),
+                    ),
+                }))
             }
         };
     }
@@ -702,6 +733,29 @@ fn target_uses_minimax_auth(target: &ConsoleProbeTarget) -> bool {
         .auth_profile_provider_kind
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("minimax"))
+}
+
+fn target_uses_openai_chatgpt_oauth(
+    target: &ConsoleProbeTarget,
+    credential: &ResolvedCredential,
+) -> bool {
+    target.kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && matches!(
+            credential,
+            ResolvedCredential::Bearer {
+                oauth_kind: Some(ResolvedOauthProfileKind::OpenAiChatGptLogin),
+                ..
+            }
+        )
+}
+
+fn oauth_kind_for_profile(
+    provider_kind: &AuthProviderKind,
+    client_id: Option<&str>,
+) -> Option<ResolvedOauthProfileKind> {
+    let is_chatgpt_login = provider_kind == &AuthProviderKind::Openai
+        && client_id.map(str::trim).is_some_and(|value| value == OPENAI_CHATGPT_OAUTH_CLIENT_ID);
+    is_chatgpt_login.then_some(ResolvedOauthProfileKind::OpenAiChatGptLogin)
 }
 
 fn expected_auth_provider_for_probe_target(
@@ -747,6 +801,28 @@ fn load_vault_secret_utf8(
         .with_context(|| format!("vault secret '{}' must contain valid UTF-8", parsed.key))
 }
 
+fn provider_models_endpoint_for_probe(
+    target: &ConsoleProbeTarget,
+    base_url: &str,
+    credential: &ResolvedCredential,
+) -> Result<ProviderModelsEndpoint, anyhow::Error> {
+    if target_uses_openai_chatgpt_oauth(target, credential) {
+        let url = reqwest::Url::parse(OPENAI_CODEX_MODELS_ENDPOINT)
+            .context("invalid OpenAI Codex models endpoint")?;
+        return Ok(ProviderModelsEndpoint {
+            url,
+            base_url: OPENAI_CODEX_BACKEND_BASE_URL.to_owned(),
+            response_format: ProviderModelsResponseFormat::OpenAiCodexBackend,
+        });
+    }
+
+    Ok(ProviderModelsEndpoint {
+        url: provider_models_endpoint(base_url)?,
+        base_url: base_url.trim().trim_end_matches('/').to_owned(),
+        response_format: ProviderModelsResponseFormat::OpenAiCompatible,
+    })
+}
+
 // Configured base URLs appear both with and without a trailing `/v1` or
 // `/openai` segment; normalize so either form probes the same models endpoint.
 fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url, anyhow::Error> {
@@ -760,7 +836,17 @@ fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url, anyhow::Erro
         .with_context(|| format!("invalid provider base_url: {base_url}"))
 }
 
-fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> {
+fn parse_discovered_model_ids(
+    body: &str,
+    response_format: ProviderModelsResponseFormat,
+) -> Result<Vec<String>, anyhow::Error> {
+    match response_format {
+        ProviderModelsResponseFormat::OpenAiCompatible => parse_openai_compatible_model_ids(body),
+        ProviderModelsResponseFormat::OpenAiCodexBackend => parse_openai_codex_model_ids(body),
+    }
+}
+
+fn parse_openai_compatible_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> {
     let value: serde_json::Value =
         serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
     Ok(value
@@ -774,6 +860,54 @@ fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default())
+}
+
+fn parse_openai_codex_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
+    let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) else {
+        return parse_openai_compatible_model_ids(body);
+    };
+
+    let mut sortable = Vec::<(i64, String)>::new();
+    for entry in entries {
+        if codex_model_is_hidden(entry) {
+            continue;
+        }
+        let Some(model_id) = entry
+            .get("slug")
+            .or_else(|| entry.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if sortable.iter().any(|(_, existing)| existing == model_id) {
+            continue;
+        }
+        sortable.push((codex_model_priority(entry), model_id.to_owned()));
+    }
+    sortable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(sortable.into_iter().map(|(_, model_id)| model_id).collect())
+}
+
+fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
+    entry
+        .get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|visibility| matches!(visibility.as_str(), "hide" | "hidden"))
+}
+
+fn codex_model_priority(entry: &serde_json::Value) -> i64 {
+    entry
+        .get("priority")
+        .and_then(|value| {
+            value.as_i64().or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+        })
+        .unwrap_or(i64::MAX)
 }
 
 fn classify_provider_failure(status_code: u16) -> String {
@@ -901,5 +1035,69 @@ mod tests {
             target.endpoint_base_url.as_deref().expect("test target should include base URL"),
         )
         .expect("private probe target should be allowed with explicit opt-in");
+    }
+
+    #[test]
+    fn chatgpt_oauth_probe_uses_codex_models_endpoint() {
+        let target = ConsoleProbeTarget {
+            endpoint_base_url: Some("https://api.openai.com/v1".to_owned()),
+            ..sample_probe_target(false)
+        };
+        let credential = ResolvedCredential::Bearer {
+            token: "token".to_owned(),
+            source: "auth_profile".to_owned(),
+            oauth_kind: Some(ResolvedOauthProfileKind::OpenAiChatGptLogin),
+        };
+
+        let endpoint = provider_models_endpoint_for_probe(
+            &target,
+            target.endpoint_base_url.as_deref().expect("test target should include base URL"),
+            &credential,
+        )
+        .expect("ChatGPT OAuth should produce a Codex models endpoint");
+
+        assert_eq!(endpoint.url.as_str(), OPENAI_CODEX_MODELS_ENDPOINT);
+        assert_eq!(endpoint.base_url, OPENAI_CODEX_BACKEND_BASE_URL);
+        assert_eq!(endpoint.response_format, ProviderModelsResponseFormat::OpenAiCodexBackend);
+    }
+
+    #[test]
+    fn openai_api_key_probe_keeps_openai_compatible_models_endpoint() {
+        let target = ConsoleProbeTarget {
+            endpoint_base_url: Some("https://api.openai.com/v1".to_owned()),
+            ..sample_probe_target(false)
+        };
+        let credential = ResolvedCredential::ApiKey {
+            token: "token".to_owned(),
+            source: "auth_profile".to_owned(),
+        };
+
+        let endpoint = provider_models_endpoint_for_probe(
+            &target,
+            target.endpoint_base_url.as_deref().expect("test target should include base URL"),
+            &credential,
+        )
+        .expect("OpenAI API key should produce the public models endpoint");
+
+        assert_eq!(endpoint.url.as_str(), "https://api.openai.com/v1/models");
+        assert_eq!(endpoint.response_format, ProviderModelsResponseFormat::OpenAiCompatible);
+    }
+
+    #[test]
+    fn codex_models_parser_uses_visible_slugs_sorted_by_priority() {
+        let body = serde_json::json!({
+            "models": [
+                {"slug": "gpt-5.3-codex", "priority": 20},
+                {"slug": "gpt-hidden", "priority": 1, "visibility": "hidden"},
+                {"slug": "gpt-5.4", "priority": 10}
+            ]
+        })
+        .to_string();
+
+        let discovered =
+            parse_discovered_model_ids(&body, ProviderModelsResponseFormat::OpenAiCodexBackend)
+                .expect("Codex model response should parse");
+
+        assert_eq!(discovered, vec!["gpt-5.4", "gpt-5.3-codex"]);
     }
 }

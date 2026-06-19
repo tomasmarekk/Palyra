@@ -25,6 +25,10 @@ const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
 const ANTHROPIC_PROVIDER_KIND: &str = "anthropic";
 const DETERMINISTIC_PROVIDER_KIND: &str = "deterministic";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_MODELS_ENDPOINT: &str =
+    "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
@@ -164,6 +168,31 @@ pub(crate) struct ModelsConnectionPayload {
     pub(crate) providers: Vec<ProviderConnectionCheckPayload>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ConsoleModelsConnectionEnvelope {
+    timeout_ms: u64,
+    provider_filter: Option<String>,
+    provider_count: usize,
+    providers: Vec<ConsoleProviderConnectionPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleProviderConnectionPayload {
+    provider_id: String,
+    kind: String,
+    enabled: bool,
+    endpoint_base_url: Option<String>,
+    credential_source: String,
+    state: String,
+    message: String,
+    checked_at_unix_ms: i64,
+    cache_status: String,
+    discovery_source: String,
+    discovered_model_ids: Vec<String>,
+    configured_model_ids: Vec<String>,
+    latency_ms: Option<u64>,
+}
+
 /// One routing candidate (primary or fallback) in the `models explain` output.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsExplainCandidatePayload {
@@ -228,7 +257,25 @@ struct ProbeableProvider {
 #[derive(Debug, Clone)]
 enum ResolvedCredential {
     ApiKey { token: String, source: String },
-    Bearer { token: String, source: String },
+    Bearer { token: String, source: String, oauth_kind: Option<ResolvedOauthProfileKind> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedOauthProfileKind {
+    OpenAiChatGptLogin,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderModelsEndpoint {
+    url: reqwest::Url,
+    base_url: String,
+    response_format: ProviderModelsResponseFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderModelsResponseFormat {
+    OpenAiCompatible,
+    OpenAiCodexBackend,
 }
 
 /// Dispatches `palyra models` subcommands.
@@ -835,6 +882,92 @@ pub(crate) fn load_models_status(path: Option<String>) -> Result<ModelsStatusPay
 }
 
 fn run_provider_checks(
+    path: Option<String>,
+    provider_filter: Option<String>,
+    timeout_ms: u64,
+    refresh: bool,
+    discover: bool,
+) -> Result<ModelsConnectionPayload> {
+    if path.is_none() {
+        if let Ok(payload) =
+            run_provider_checks_via_console(provider_filter.clone(), timeout_ms, discover)
+        {
+            return Ok(payload);
+        }
+    }
+    run_provider_checks_local(path, provider_filter, timeout_ms, refresh, discover)
+}
+
+fn run_provider_checks_via_console(
+    provider_filter: Option<String>,
+    timeout_ms: u64,
+    discover: bool,
+) -> Result<ModelsConnectionPayload> {
+    let overview = load_models_overview(None)?;
+    let runtime = build_runtime()?;
+    let request = json!({
+        "provider_id": provider_filter,
+        "timeout_ms": timeout_ms,
+    });
+    let envelope = runtime.block_on(async {
+        let context = client::control_plane::connect_admin_console_with_request_timeout(
+            app::ConnectionOverrides::default(),
+            Some(Duration::from_millis(timeout_ms.saturating_add(5_000))),
+        )
+        .await?;
+        let payload = if discover {
+            context.client.discover_model_provider_models(&request).await?
+        } else {
+            context.client.test_model_provider_connection(&request).await?
+        };
+        serde_json::from_value::<ConsoleModelsConnectionEnvelope>(payload)
+            .context("failed to decode console model-provider probe response")
+    })?;
+    Ok(console_probe_envelope_to_models_payload(overview.status.path, envelope, discover))
+}
+
+fn console_probe_envelope_to_models_payload(
+    path: String,
+    envelope: ConsoleModelsConnectionEnvelope,
+    discover: bool,
+) -> ModelsConnectionPayload {
+    let mode = if discover { "discover" } else { "test_connection" };
+    let providers = envelope
+        .providers
+        .into_iter()
+        .map(|provider| {
+            let live_discovery_verified = discover
+                && provider.discovery_source == "live"
+                && matches!(provider.state.as_str(), "ok" | "partial");
+            ProviderConnectionCheckPayload {
+                provider_id: provider.provider_id,
+                kind: provider.kind,
+                enabled: provider.enabled,
+                endpoint_base_url: provider.endpoint_base_url,
+                credential_source: provider.credential_source,
+                state: provider.state,
+                message: provider.message,
+                checked_at_unix_ms: provider.checked_at_unix_ms,
+                cache_status: provider.cache_status,
+                live_discovery_verified,
+                discovery_source: provider.discovery_source,
+                discovered_model_ids: provider.discovered_model_ids,
+                configured_model_ids: provider.configured_model_ids,
+                latency_ms: provider.latency_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    ModelsConnectionPayload {
+        path,
+        mode,
+        timeout_ms: envelope.timeout_ms,
+        provider_filter: envelope.provider_filter,
+        provider_count: envelope.provider_count,
+        providers,
+    }
+}
+
+fn run_provider_checks_local(
     path: Option<String>,
     provider_filter: Option<String>,
     timeout_ms: u64,
@@ -1931,7 +2064,7 @@ fn probe_provider(
         }
     };
 
-    let endpoint = match provider_models_endpoint(base_url) {
+    let endpoint = match provider_models_endpoint_for_probe(target, base_url, &credential) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             payload.state = "endpoint_failed".to_owned();
@@ -1939,6 +2072,7 @@ fn probe_provider(
             return payload;
         }
     };
+    payload.endpoint_base_url = Some(endpoint.base_url.clone());
 
     let client = match Client::builder().timeout(Duration::from_millis(timeout_ms)).build() {
         Ok(client) => client,
@@ -1974,14 +2108,17 @@ fn probe_provider(
     }
 
     let started_at = Instant::now();
-    match client.get(endpoint).headers(headers).send() {
+    match client.get(endpoint.url).headers(headers).send() {
         Ok(response) => {
             payload.latency_ms =
                 Some(started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
             let status = response.status();
             let body = response.text().unwrap_or_default();
             if status.is_success() {
-                match parse_discovered_model_ids(body.as_str()) {
+                match parse_discovered_model_ids_with_format(
+                    body.as_str(),
+                    endpoint.response_format,
+                ) {
                     Ok(discovered) => {
                         payload.live_discovery_verified = true;
                         payload.discovery_source = "live".to_owned();
@@ -2165,8 +2302,9 @@ fn resolve_provider_credential(
     vault: &mut Option<palyra_vault::Vault>,
 ) -> Result<Option<ResolvedCredential>> {
     if let Some(profile_id) = target.auth_profile_id.as_deref() {
-        let registry = auth_registry
-            .get_or_insert(AuthProfileRegistry::open(default_identity_store_root()?.as_path())?);
+        let registry = auth_registry.get_or_insert(AuthProfileRegistry::open(
+            resolve_cli_identity_store_root()?.as_path(),
+        )?);
         let Some(profile) = registry.get_profile(profile_id)? else {
             anyhow::bail!("auth profile not found: {profile_id}");
         };
@@ -2200,10 +2338,17 @@ fn resolve_provider_credential(
                 let token = load_vault_secret_utf8(vault_instance, api_key_vault_ref.as_str())?;
                 Ok(Some(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() }))
             }
-            AuthCredential::Oauth { access_token_vault_ref, .. } => {
+            AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
                 let token =
                     load_vault_secret_utf8(vault_instance, access_token_vault_ref.as_str())?;
-                Ok(Some(ResolvedCredential::Bearer { token, source: "auth_profile".to_owned() }))
+                Ok(Some(ResolvedCredential::Bearer {
+                    token,
+                    source: "auth_profile".to_owned(),
+                    oauth_kind: oauth_kind_for_profile(
+                        &profile.provider.kind,
+                        client_id.as_deref(),
+                    ),
+                }))
             }
         };
     }
@@ -2230,6 +2375,29 @@ fn target_uses_minimax_auth(target: &ProbeableProvider) -> bool {
         .auth_provider_kind
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND))
+}
+
+fn target_uses_openai_chatgpt_oauth(
+    target: &ProbeableProvider,
+    credential: &ResolvedCredential,
+) -> bool {
+    target.kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && matches!(
+            credential,
+            ResolvedCredential::Bearer {
+                oauth_kind: Some(ResolvedOauthProfileKind::OpenAiChatGptLogin),
+                ..
+            }
+        )
+}
+
+fn oauth_kind_for_profile(
+    provider_kind: &AuthProviderKind,
+    client_id: Option<&str>,
+) -> Option<ResolvedOauthProfileKind> {
+    let is_chatgpt_login = provider_kind == &AuthProviderKind::Openai
+        && client_id.map(str::trim).is_some_and(|value| value == OPENAI_CHATGPT_OAUTH_CLIENT_ID);
+    is_chatgpt_login.then_some(ResolvedOauthProfileKind::OpenAiChatGptLogin)
 }
 
 fn expected_auth_provider_for_probe_target(target: &ProbeableProvider) -> Option<AuthProviderKind> {
@@ -2272,6 +2440,28 @@ fn load_vault_secret_utf8(vault: &palyra_vault::Vault, vault_ref: &str) -> Resul
 ///
 /// # Errors
 /// Returns an error when the resulting URL cannot be parsed.
+fn provider_models_endpoint_for_probe(
+    target: &ProbeableProvider,
+    base_url: &str,
+    credential: &ResolvedCredential,
+) -> Result<ProviderModelsEndpoint> {
+    if target_uses_openai_chatgpt_oauth(target, credential) {
+        let url = reqwest::Url::parse(OPENAI_CODEX_MODELS_ENDPOINT)
+            .context("invalid OpenAI Codex models endpoint")?;
+        return Ok(ProviderModelsEndpoint {
+            url,
+            base_url: OPENAI_CODEX_BACKEND_BASE_URL.to_owned(),
+            response_format: ProviderModelsResponseFormat::OpenAiCodexBackend,
+        });
+    }
+
+    Ok(ProviderModelsEndpoint {
+        url: provider_models_endpoint(base_url)?,
+        base_url: base_url.trim().trim_end_matches('/').to_owned(),
+        response_format: ProviderModelsResponseFormat::OpenAiCompatible,
+    })
+}
+
 pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
@@ -2306,7 +2496,67 @@ pub(crate) fn parse_discovered_provider_models(body: &str) -> Result<Vec<Discove
 /// # Errors
 /// Returns an error when the body is not valid JSON.
 pub(crate) fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>> {
-    Ok(parse_discovered_provider_models(body)?.into_iter().map(|model| model.id).collect())
+    parse_discovered_model_ids_with_format(body, ProviderModelsResponseFormat::OpenAiCompatible)
+}
+
+fn parse_discovered_model_ids_with_format(
+    body: &str,
+    response_format: ProviderModelsResponseFormat,
+) -> Result<Vec<String>> {
+    match response_format {
+        ProviderModelsResponseFormat::OpenAiCompatible => {
+            Ok(parse_discovered_provider_models(body)?.into_iter().map(|model| model.id).collect())
+        }
+        ProviderModelsResponseFormat::OpenAiCodexBackend => parse_openai_codex_model_ids(body),
+    }
+}
+
+fn parse_openai_codex_model_ids(body: &str) -> Result<Vec<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
+    let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) else {
+        return parse_discovered_model_ids(body);
+    };
+
+    let mut sortable = Vec::<(i64, String)>::new();
+    for entry in entries {
+        if codex_model_is_hidden(entry) {
+            continue;
+        }
+        let Some(model_id) = entry
+            .get("slug")
+            .or_else(|| entry.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if sortable.iter().any(|(_, existing)| existing == model_id) {
+            continue;
+        }
+        sortable.push((codex_model_priority(entry), model_id.to_owned()));
+    }
+    sortable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(sortable.into_iter().map(|(_, model_id)| model_id).collect())
+}
+
+fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
+    entry
+        .get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|visibility| matches!(visibility.as_str(), "hide" | "hidden"))
+}
+
+fn codex_model_priority(entry: &serde_json::Value) -> i64 {
+    entry
+        .get("priority")
+        .and_then(|value| {
+            value.as_i64().or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+        })
+        .unwrap_or(i64::MAX)
 }
 
 /// Selects the preferred model id from a discovery response.
@@ -2539,6 +2789,66 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_oauth_probe_uses_codex_models_endpoint() {
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+        let credential = ResolvedCredential::Bearer {
+            token: "token".to_owned(),
+            source: "auth_profile".to_owned(),
+            oauth_kind: Some(ResolvedOauthProfileKind::OpenAiChatGptLogin),
+        };
+
+        let endpoint = provider_models_endpoint_for_probe(
+            &target,
+            target.endpoint_base_url.as_deref().expect("test target should include base URL"),
+            &credential,
+        )
+        .expect("ChatGPT OAuth should produce a Codex models endpoint");
+
+        assert_eq!(endpoint.url.as_str(), OPENAI_CODEX_MODELS_ENDPOINT);
+        assert_eq!(endpoint.base_url, OPENAI_CODEX_BACKEND_BASE_URL);
+        assert_eq!(endpoint.response_format, ProviderModelsResponseFormat::OpenAiCodexBackend);
+    }
+
+    #[test]
+    fn openai_api_key_probe_keeps_openai_compatible_models_endpoint() {
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+        let credential = ResolvedCredential::ApiKey {
+            token: "token".to_owned(),
+            source: "auth_profile".to_owned(),
+        };
+
+        let endpoint = provider_models_endpoint_for_probe(
+            &target,
+            target.endpoint_base_url.as_deref().expect("test target should include base URL"),
+            &credential,
+        )
+        .expect("OpenAI API key should produce the public models endpoint");
+
+        assert_eq!(endpoint.url.as_str(), "https://api.openai.com/v1/models");
+        assert_eq!(endpoint.response_format, ProviderModelsResponseFormat::OpenAiCompatible);
+    }
+
+    #[test]
+    fn codex_models_parser_uses_visible_slugs_sorted_by_priority() {
+        let body = serde_json::json!({
+            "models": [
+                {"slug": "gpt-5.3-codex", "priority": 20},
+                {"slug": "gpt-hidden", "priority": 1, "visibility": "hidden"},
+                {"slug": "gpt-5.4", "priority": 10}
+            ]
+        })
+        .to_string();
+
+        let discovered = parse_discovered_model_ids_with_format(
+            &body,
+            ProviderModelsResponseFormat::OpenAiCodexBackend,
+        )
+        .expect("Codex model response should parse");
+
+        assert_eq!(discovered, vec!["gpt-5.4", "gpt-5.3-codex"]);
+    }
+
+    #[test]
     fn probe_rejects_unsafe_endpoint_before_resolving_credentials() {
         let target = sample_probe_target("http://127.0.0.1:11434/v1", false);
         let mut auth_registry = None;
@@ -2556,6 +2866,41 @@ mod tests {
             auth_registry.is_none() && vault.is_none(),
             "unsafe endpoints must be rejected before opening auth registry or vault"
         );
+    }
+
+    #[test]
+    fn console_probe_envelope_maps_to_cli_payload_shape() {
+        let payload = console_probe_envelope_to_models_payload(
+            "C:/state/config/palyra.toml".to_owned(),
+            ConsoleModelsConnectionEnvelope {
+                timeout_ms: 5_000,
+                provider_filter: Some("openai-primary".to_owned()),
+                provider_count: 1,
+                providers: vec![ConsoleProviderConnectionPayload {
+                    provider_id: "openai-primary".to_owned(),
+                    kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+                    enabled: true,
+                    endpoint_base_url: Some("https://api.openai.com/v1".to_owned()),
+                    credential_source: "auth_profile".to_owned(),
+                    state: "ok".to_owned(),
+                    message: "provider connection succeeded and discovered 2 model(s)".to_owned(),
+                    checked_at_unix_ms: 1_700_000_000_000,
+                    cache_status: "miss".to_owned(),
+                    discovery_source: "live".to_owned(),
+                    discovered_model_ids: vec!["gpt-a".to_owned(), "gpt-b".to_owned()],
+                    configured_model_ids: vec!["gpt-a".to_owned()],
+                    latency_ms: Some(42),
+                }],
+            },
+            true,
+        );
+
+        assert_eq!(payload.path, "C:/state/config/palyra.toml");
+        assert_eq!(payload.mode, "discover");
+        assert_eq!(payload.provider_filter.as_deref(), Some("openai-primary"));
+        assert_eq!(payload.providers[0].credential_source, "auth_profile");
+        assert!(payload.providers[0].live_discovery_verified);
+        assert_eq!(payload.providers[0].discovered_model_ids, ["gpt-a", "gpt-b"]);
     }
 
     #[test]

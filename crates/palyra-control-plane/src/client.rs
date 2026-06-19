@@ -1736,6 +1736,29 @@ impl ControlPlaneClient {
             .await
     }
 
+    /// Tests model-provider connectivity via `POST console/v1/models/test-connection`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn test_model_provider_connection<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/models/test-connection", Some(request), true)
+            .await
+    }
+
+    /// Discovers live model-provider models via `POST console/v1/models/discover`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn discover_model_provider_models<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/models/discover", Some(request), true).await
+    }
+
     /// Fetches the OpenAI provider auth state via `GET console/v1/auth/providers/openai`.
     ///
     /// # Errors
