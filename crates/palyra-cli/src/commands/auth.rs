@@ -1126,6 +1126,7 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                 opened,
                 output::preferred_json(json),
             )?;
+            std::io::stdout().flush().context("stdout flush failed")?;
             let authorization_input = load_authorization_code_input(
                 authorization_code_env,
                 authorization_code_stdin,
@@ -1316,6 +1317,7 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     true,
                     output::preferred_json(json),
                 )?;
+                std::io::stdout().flush().context("stdout flush failed")?;
                 let callback_url = load_callback_url_input(
                     callback_url_env,
                     callback_url_stdin,
@@ -1330,6 +1332,7 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     false,
                     output::preferred_json(json),
                 )?;
+                std::io::stdout().flush().context("stdout flush failed")?;
                 callback_waiter.await.context("xAI OAuth callback worker failed")??
             };
             let tokens = exchange_xai_oauth_code(
@@ -1682,6 +1685,7 @@ fn emit_anthropic_oauth_instructions(
         eprintln!(
             "auth.anthropic.oauth.authorization_url=\"{safe_url}\" opened={opened} message=\"Open this URL, authorize Palyra, then paste the code shown by Anthropic.\""
         );
+        std::io::stderr().flush().context("stderr flush failed")?;
     } else {
         output::print_text_line(
             format!(
@@ -1950,6 +1954,7 @@ fn emit_xai_oauth_instructions(
         eprintln!(
             "auth.xai.oauth.authorization_url=\"{safe_url}\" opened={opened} callback_mode={mode} message=\"Open this URL to authorize Palyra with xAI.\""
         );
+        std::io::stderr().flush().context("stderr flush failed")?;
     } else {
         output::print_text_line(
             format!(
