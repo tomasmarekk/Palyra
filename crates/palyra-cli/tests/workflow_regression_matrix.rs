@@ -34,6 +34,7 @@ const BROWSER_STATE_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
 
 #[test]
 fn local_remote_and_lifecycle_workflows_are_regression_tested() -> Result<()> {
@@ -62,6 +63,7 @@ fn local_remote_and_lifecycle_workflows_are_regression_tested() -> Result<()> {
     let key_path_string = key_path.display().to_string();
     let gateway_ca_pin = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let server_cert_pin = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let openai_models_server = MockOpenAiModelsServer::spawn()?;
 
     let setup_output = run_cli(
         &workdir,
@@ -86,8 +88,16 @@ fn local_remote_and_lifecycle_workflows_are_regression_tested() -> Result<()> {
             "--skip-skills",
             "--json",
         ],
-        &[("OPENAI_API_KEY", "sk-test-workflow")],
+        &[
+            ("OPENAI_API_KEY", "sk-test-workflow"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_models_server.base_url.as_str()),
+        ],
     )?;
+    let discovery_request = openai_models_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "setup wizard should discover OpenAI models before writing config: {discovery_request}"
+    );
     let setup_payload = assert_json_success(setup_output, "setup wizard")?;
     assert_eq!(setup_payload.get("status").and_then(Value::as_str), Some("next_step_required"));
     assert_eq!(
@@ -1660,6 +1670,65 @@ fn seed_install_root(install_root: &Path) -> Result<()> {
 struct StaticHttpFixture {
     url: String,
     handle: Option<thread::JoinHandle<Result<()>>>,
+}
+
+struct MockOpenAiModelsServer {
+    base_url: String,
+    handle: thread::JoinHandle<Result<String>>,
+}
+
+impl MockOpenAiModelsServer {
+    fn spawn() -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind mock OpenAI models server")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure mock OpenAI models listener")?;
+        let base_url = format!("http://{}", listener.local_addr().context("listener address")?);
+        let handle = thread::spawn(move || -> Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .context("failed to configure mock OpenAI models stream")?;
+                        let request = read_http_request(&mut stream)?;
+                        let request_text = String::from_utf8_lossy(request.as_slice()).to_string();
+                        if !request_text.starts_with("GET /v1/models ") {
+                            anyhow::bail!("unexpected models request: {request_text}");
+                        }
+                        if !request_text.to_ascii_lowercase().contains("authorization: bearer ") {
+                            anyhow::bail!(
+                                "model discovery request should use bearer auth: {request_text}"
+                            );
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            OPENAI_COMPATIBLE_MODELS_RESPONSE.len(),
+                            OPENAI_COMPATIBLE_MODELS_RESPONSE
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .context("failed to write models response")?;
+                        stream.flush().context("failed to flush models response")?;
+                        return Ok(request_text);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error).context("mock OpenAI models accept failed"),
+                }
+            }
+            anyhow::bail!("mock OpenAI models server did not receive a discovery request")
+        });
+
+        Ok(Self { base_url, handle })
+    }
+
+    fn finish(self) -> Result<String> {
+        self.handle.join().map_err(|_| anyhow::anyhow!("mock OpenAI models server panicked"))?
+    }
 }
 
 impl StaticHttpFixture {
