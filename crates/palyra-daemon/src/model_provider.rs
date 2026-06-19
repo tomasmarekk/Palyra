@@ -471,9 +471,9 @@ impl ModelProviderConfig {
     ///
     /// # Errors
     /// Returns an error when the registry is structurally invalid: zero TTLs
-    /// or cache sizes, missing providers/models, duplicate or malformed
-    /// identifiers, unknown provider references, disallowed private base
-    /// URLs, or default models with a mismatched role.
+    /// or cache sizes, missing providers, duplicate or malformed identifiers,
+    /// unknown provider references, disallowed private base URLs, or default
+    /// models with a mismatched role.
     pub fn normalized_registry(&self) -> Result<ModelProviderRegistryConfig> {
         let mut registry = self.registry.clone();
         if registry.providers.is_empty() && registry.models.is_empty() {
@@ -682,10 +682,6 @@ fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Re
     if registry.providers.is_empty() {
         anyhow::bail!("model provider registry must define at least one provider");
     }
-    if registry.models.is_empty() {
-        anyhow::bail!("model provider registry must define at least one model");
-    }
-
     let mut providers = HashMap::<String, ProviderRegistryEntryConfig>::new();
     for provider in &mut registry.providers {
         provider.provider_id = normalize_registry_identifier(
@@ -2671,9 +2667,13 @@ impl RegistryBackedModelProvider {
                         }
                         ModelProviderKind::Deterministic => {}
                     }
+                } else {
+                    snapshot.model_id = None;
+                    snapshot.openai_model = None;
+                    snapshot.anthropic_model = None;
+                    snapshot.discovery.discovered_model_ids.clear();
                 }
                 if snapshot.discovery.discovered_model_ids.is_empty() {
-                    snapshot.discovery.status = "ok".to_owned();
                     snapshot.discovery.discovered_model_ids = self
                         .registry
                         .models
@@ -2682,8 +2682,15 @@ impl RegistryBackedModelProvider {
                         .map(|model| model.model_id.clone())
                         .collect();
                     snapshot.discovery.source = "registry".to_owned();
-                    snapshot.discovery.message =
-                        Some("serving configured registry models".to_owned());
+                    if snapshot.discovery.discovered_model_ids.is_empty() {
+                        snapshot.discovery.status = "pending".to_owned();
+                        snapshot.discovery.message =
+                            Some("no provider-discovered models are configured yet".to_owned());
+                    } else {
+                        snapshot.discovery.status = "ok".to_owned();
+                        snapshot.discovery.message =
+                            Some("serving configured registry models".to_owned());
+                    }
                 }
                 (provider_id.clone(), snapshot)
             })
@@ -6383,17 +6390,17 @@ mod tests {
         classify_http_provider_failure, classify_transport_provider_failure,
         extract_completion_text, normalize_tool_arguments, provider_seconds_to_millis,
         sanitize_remote_error, validate_openai_base_url_network_policy_with_resolver,
-        AnthropicCompatibleChatAdapter, EmbeddingsRequest, ModelProviderAuthProviderKind,
-        ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
-        ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter, ProviderChatAdapter,
-        ProviderError, ProviderEvent, ProviderFailureAction, ProviderFailureClass,
-        ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-        ProviderMessageRole, ProviderMessageToolCall, ProviderMetadataSource,
-        ProviderModelEntryConfig, ProviderModelRole, ProviderOutputContentPart,
-        ProviderRawProviderRefs, ProviderRegistryEntryConfig, ProviderRequest,
-        ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput,
-        ProviderUsage, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
-        OPENAI_RETRYABLE_STATUS_CODES,
+        AnthropicCompatibleChatAdapter, EmbeddingsRequest, ModelProvider,
+        ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+        ModelProviderKind, ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter,
+        ProviderChatAdapter, ProviderError, ProviderEvent, ProviderFailureAction,
+        ProviderFailureClass, ProviderFinishReason, ProviderImageInput, ProviderMessage,
+        ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
+        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
+        ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
+        ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT, OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -6854,6 +6861,56 @@ mod tests {
             circuit_breaker_cooldown_ms: 120_000,
             ..ModelProviderConfig::default()
         }
+    }
+
+    #[test]
+    fn registry_provider_without_discovered_models_does_not_use_legacy_model_default() {
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            allow_private_base_url: true,
+            registry: ModelProviderRegistryConfig {
+                providers: vec![ProviderRegistryEntryConfig {
+                    provider_id: "xai-primary".to_owned(),
+                    display_name: Some("xAI".to_owned()),
+                    kind: ModelProviderKind::OpenAiCompatible,
+                    base_url: Some("http://127.0.0.1:1/v1".to_owned()),
+                    allow_private_base_url: true,
+                    enabled: true,
+                    auth_profile_id: None,
+                    auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Xai),
+                    api_key: None,
+                    api_key_secret_ref: None,
+                    api_key_vault_ref: None,
+                    credential_source: None,
+                    request_timeout_ms: 5_000,
+                    max_retries: 0,
+                    retry_backoff_ms: 1,
+                    circuit_breaker_failure_threshold: 1,
+                    circuit_breaker_cooldown_ms: 60_000,
+                }],
+                models: Vec::new(),
+                default_chat_model_id: None,
+                default_embeddings_model_id: None,
+                default_audio_transcription_model_id: None,
+                failover_enabled: true,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        };
+
+        let provider = RegistryBackedModelProvider::new(config)
+            .expect("pending registry provider should be valid before discovery");
+        let snapshot = provider.status_snapshot();
+
+        assert_eq!(snapshot.model_id, None);
+        assert_eq!(snapshot.openai_model, None);
+        assert_eq!(snapshot.registry.default_chat_model_id, None);
+        assert!(
+            snapshot.registry.models.is_empty(),
+            "pending provider registry must not synthesize legacy model defaults"
+        );
+        assert_eq!(snapshot.discovery.status, "pending");
     }
 
     fn multi_provider_test_config(

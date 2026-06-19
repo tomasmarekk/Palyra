@@ -42,7 +42,6 @@ const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_ALLOWED_TOKEN_HOSTS: &[&str] =
     &["console.anthropic.com", "platform.claude.com"];
 const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.io/anthropic";
-const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M2.7";
 const MINIMAX_PROVIDER_CUSTOM_NAME: &str = "minimax";
 const MINIMAX_OAUTH_DEFAULT_BASE_URL: &str = "https://api.minimax.io";
 const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
@@ -457,7 +456,7 @@ pub(crate) async fn connect_minimax_api_key(
     let scope = normalize_openai_profile_scope(Some(payload.scope))?;
     let api_key = normalize_required_openai_text(payload.api_key.as_str(), "api_key")?;
     let validation_base_url = load_minimax_validation_base_url(None);
-    validate_minimax_api_key(
+    let discovered_model_id = discover_minimax_api_key_model_id(
         validation_base_url.as_str(),
         api_key.as_str(),
         ANTHROPIC_HTTP_TIMEOUT,
@@ -484,11 +483,12 @@ pub(crate) async fn connect_minimax_api_key(
     };
     persist_openai_auth_profile(state, context, profile).await?;
     if payload.set_default {
-        persist_model_provider_auth_profile_selection(
+        persist_model_provider_auth_profile_selection_with_discovered_model(
             state,
             context,
             profile_id.as_str(),
             ModelProviderAuthProviderKind::Minimax,
+            Some(discovered_model_id.as_str()),
         )
         .await?;
     }
@@ -2466,18 +2466,28 @@ async fn apply_minimax_oauth_poll_result(
                 updated_at_unix_ms: 0,
             };
             persist_openai_auth_profile(state, &context, profile).await?;
+            let normalized_resource_base_url =
+                resource_url.as_deref().and_then(normalize_minimax_resource_url);
+            let model_discovery_base_url =
+                normalized_resource_base_url.as_deref().unwrap_or(MINIMAX_DEFAULT_BASE_URL);
+            let discovered_model_id = discover_minimax_api_key_model_id(
+                model_discovery_base_url,
+                access_token.as_str(),
+                ANTHROPIC_HTTP_TIMEOUT,
+            )
+            .await
+            .ok();
             if attempt.set_default {
-                persist_model_provider_auth_profile_selection(
+                persist_model_provider_auth_profile_selection_with_discovered_model(
                     state,
                     &context,
                     attempt.profile_id.as_str(),
                     ModelProviderAuthProviderKind::Minimax,
+                    discovered_model_id.as_deref(),
                 )
                 .await?;
             }
-            if let Some(base_url) =
-                resource_url.and_then(|url| normalize_minimax_resource_url(&url))
-            {
+            if let Some(base_url) = normalized_resource_base_url {
                 persist_minimax_resource_base_url(state, &context, base_url.as_str()).await?;
             }
             let message = if attempt.set_default {
@@ -3597,13 +3607,31 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
     profile_id: &str,
     provider_kind: ModelProviderAuthProviderKind,
 ) -> Result<(), Response> {
+    persist_model_provider_auth_profile_selection_with_discovered_model(
+        state,
+        context,
+        profile_id,
+        provider_kind,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_model_provider_auth_profile_selection_with_discovered_model(
+    state: &AppState,
+    context: &RequestContext,
+    profile_id: &str,
+    provider_kind: ModelProviderAuthProviderKind,
+    discovered_model_id: Option<&str>,
+) -> Result<(), Response> {
     persist_model_provider_auth_profile_selection_with_openai_runtime(
         state,
         context,
         profile_id,
         provider_kind,
         OpenAiProviderSelectionRuntime::OpenAiCompatible,
-        None,
+        discovered_model_id,
     )
     .await
 }
@@ -3622,6 +3650,7 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
     ensure_console_config_parent_dir(path_ref)?;
     let (mut document, _) = load_console_document_for_mutation(path_ref)?;
     let previous_auth_provider_kind = model_provider_auth_provider_kind_from_document(&document);
+    let discovered_model_present = discovered_model_id.and_then(normalize_optional_text).is_some();
     // MiniMax rides the anthropic-compatible provider runtime, so both map to
     // the same model_provider.kind; auth_provider_kind keeps them distinct.
     let provider_kind_value = match provider_kind {
@@ -3689,6 +3718,16 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                     None,
                     true,
                 )?;
+                write_pending_model_registry(
+                    &mut document,
+                    PendingModelRegistryProvider {
+                        provider_id: "anthropic-primary",
+                        display_name: "Anthropic",
+                        kind: "anthropic",
+                        base_url: ANTHROPIC_DEFAULT_BASE_URL,
+                        auth_provider_kind: "anthropic",
+                    },
+                )?;
             }
         }
         ModelProviderAuthProviderKind::Minimax => {
@@ -3697,12 +3736,24 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 "model_provider.anthropic_base_url",
                 MINIMAX_DEFAULT_BASE_URL,
             )?;
-            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax) {
-                apply_discovered_or_clear_text_model_selection(
+            apply_discovered_or_clear_text_model_selection(
+                &mut document,
+                "model_provider.anthropic_model",
+                discovered_model_id,
+                previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax),
+            )?;
+            if !discovered_model_present
+                && previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax)
+            {
+                write_pending_model_registry(
                     &mut document,
-                    "model_provider.anthropic_model",
-                    None,
-                    true,
+                    PendingModelRegistryProvider {
+                        provider_id: "minimax-primary",
+                        display_name: "MiniMax",
+                        kind: "anthropic",
+                        base_url: MINIMAX_DEFAULT_BASE_URL,
+                        auth_provider_kind: MINIMAX_PROVIDER_CUSTOM_NAME,
+                    },
                 )?;
             }
         }
@@ -3718,6 +3769,20 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                 discovered_model_id,
                 previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Xai),
             )?;
+            if !discovered_model_present
+                && previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Xai)
+            {
+                write_pending_model_registry(
+                    &mut document,
+                    PendingModelRegistryProvider {
+                        provider_id: "xai-primary",
+                        display_name: "xAI (Grok)",
+                        kind: "openai_compatible",
+                        base_url: XAI_DEFAULT_BASE_URL,
+                        auth_provider_kind: XAI_PROVIDER_CUSTOM_NAME,
+                    },
+                )?;
+            }
         }
         ModelProviderAuthProviderKind::GoogleGemini
         | ModelProviderAuthProviderKind::GoogleGeminiCli => {
@@ -3739,6 +3804,16 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                     None,
                     true,
                 )?;
+                write_pending_model_registry(
+                    &mut document,
+                    PendingModelRegistryProvider {
+                        provider_id: "google-gemini-primary",
+                        display_name: "Google Gemini",
+                        kind: "openai_compatible",
+                        base_url: GOOGLE_GEMINI_OPENAI_BASE_URL,
+                        auth_provider_kind: provider_kind.as_str(),
+                    },
+                )?;
             }
         }
         ModelProviderAuthProviderKind::Openrouter => {
@@ -3753,6 +3828,16 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
                     "model_provider.openai_model",
                     None,
                     true,
+                )?;
+                write_pending_model_registry(
+                    &mut document,
+                    PendingModelRegistryProvider {
+                        provider_id: "openrouter-primary",
+                        display_name: "OpenRouter",
+                        kind: "openai_compatible",
+                        base_url: OPENROUTER_DEFAULT_BASE_URL,
+                        auth_provider_kind: provider_kind.as_str(),
+                    },
                 )?;
             }
         }
@@ -3839,6 +3924,7 @@ fn apply_openai_provider_selection_defaults(
     runtime: OpenAiProviderSelectionRuntime,
     discovered_model_id: Option<&str>,
 ) -> Result<(), Response> {
+    let discovered_model_present = discovered_model_id.and_then(normalize_optional_text).is_some();
     match runtime {
         OpenAiProviderSelectionRuntime::ChatGptCodex => {
             set_string_value_at_path(
@@ -3852,6 +3938,18 @@ fn apply_openai_provider_selection_defaults(
                 discovered_model_id,
                 true,
             )?;
+            if !discovered_model_present {
+                write_pending_model_registry(
+                    document,
+                    PendingModelRegistryProvider {
+                        provider_id: "openai-primary",
+                        display_name: "ChatGPT Login",
+                        kind: "openai_compatible",
+                        base_url: OPENAI_CHATGPT_CODEX_BASE_URL,
+                        auth_provider_kind: "openai",
+                    },
+                )?;
+            }
         }
         OpenAiProviderSelectionRuntime::OpenAiCompatible
             if should_reset_openai_compatible_defaults(document, previous_auth_provider_kind) =>
@@ -3867,6 +3965,18 @@ fn apply_openai_provider_selection_defaults(
                 discovered_model_id,
                 true,
             )?;
+            if !discovered_model_present {
+                write_pending_model_registry(
+                    document,
+                    PendingModelRegistryProvider {
+                        provider_id: "openai-primary",
+                        display_name: "OpenAI",
+                        kind: "openai_compatible",
+                        base_url: OPENAI_DEFAULT_BASE_URL,
+                        auth_provider_kind: "openai",
+                    },
+                )?;
+            }
         }
         OpenAiProviderSelectionRuntime::OpenAiCompatible => {
             ensure_string_value_at_path(
@@ -3925,6 +4035,7 @@ fn apply_discovered_or_clear_text_model_selection(
 ) -> Result<(), Response> {
     if let Some(model_id) = discovered_model_id.and_then(normalize_optional_text).map(str::to_owned)
     {
+        clear_pending_model_registry(document)?;
         unset_model_value_at_path(document, "model_provider.default_chat_model_id")?;
         return set_string_value_at_path(document, model_path, model_id.as_str());
     }
@@ -3932,6 +4043,49 @@ fn apply_discovered_or_clear_text_model_selection(
         clear_text_model_selection_at_path(document, model_path)?;
     }
     Ok(())
+}
+
+struct PendingModelRegistryProvider<'a> {
+    provider_id: &'a str,
+    display_name: &'a str,
+    kind: &'a str,
+    base_url: &'a str,
+    auth_provider_kind: &'a str,
+}
+
+#[allow(clippy::result_large_err)]
+fn write_pending_model_registry(
+    document: &mut toml::Value,
+    provider: PendingModelRegistryProvider<'_>,
+) -> Result<(), Response> {
+    let mut table = toml::map::Map::new();
+    table.insert("provider_id".to_owned(), toml::Value::String(provider.provider_id.to_owned()));
+    table.insert("display_name".to_owned(), toml::Value::String(provider.display_name.to_owned()));
+    table.insert("kind".to_owned(), toml::Value::String(provider.kind.to_owned()));
+    table.insert("base_url".to_owned(), toml::Value::String(provider.base_url.to_owned()));
+    table.insert(
+        "auth_provider_kind".to_owned(),
+        toml::Value::String(provider.auth_provider_kind.to_owned()),
+    );
+    table.insert("enabled".to_owned(), toml::Value::Boolean(true));
+    set_value_at_path(
+        document,
+        "model_provider.providers",
+        toml::Value::Array(vec![toml::Value::Table(table)]),
+    )
+    .map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to set model_provider.providers: {error}"
+        )))
+    })?;
+    unset_model_value_at_path(document, "model_provider.models")?;
+    unset_model_value_at_path(document, "model_provider.default_chat_model_id")
+}
+
+#[allow(clippy::result_large_err)]
+fn clear_pending_model_registry(document: &mut toml::Value) -> Result<(), Response> {
+    unset_model_value_at_path(document, "model_provider.providers")?;
+    unset_model_value_at_path(document, "model_provider.models")
 }
 
 #[allow(clippy::result_large_err)]
@@ -4070,86 +4224,54 @@ async fn validate_anthropic_api_key(
     Err(AnthropicCredentialValidationError::ProviderUnavailable)
 }
 
-/// Validates a MiniMax key by sending a one-token message to the
-/// anthropic-compatible messages endpoint: the MiniMax surface has no cheap
-/// authenticated listing to probe, and `max_tokens: 1` keeps the probe cost
-/// negligible. Retry semantics match [`validate_anthropic_api_key`].
+/// Validates a MiniMax key by reading the provider-advertised model list and
+/// returns the preferred chat model id. The caller persists only this
+/// discovered id; no local model name is used as a fallback.
 #[allow(clippy::result_large_err)]
-async fn validate_minimax_api_key(
+async fn discover_minimax_api_key_model_id(
     base_url: &str,
     api_key: &str,
     timeout: Duration,
-) -> Result<(), AnthropicCredentialValidationError> {
-    let base = base_url.trim().trim_end_matches('/');
-    let endpoint = format!("{base}/v1/messages");
-    let client = ReqwestClient::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|error| AnthropicCredentialValidationError::Unexpected(error.to_string()))?;
-    let body = json!({
-        "model": MINIMAX_DEFAULT_MODEL,
-        "max_tokens": 1,
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": "ping"
-            }]
-        }],
-    });
-
+) -> Result<String, AnthropicCredentialValidationError> {
     for attempt in 1..=ANTHROPIC_VALIDATION_RETRY_ATTEMPTS {
-        let response = client
-            .post(endpoint.as_str())
-            .bearer_auth(api_key)
-            .header("anthropic-version", ANTHROPIC_API_VERSION)
-            .json(&body)
-            .send()
-            .await;
-
-        let outcome = match response {
-            Ok(response) => match response.status() {
-                status if status.is_success() => Ok(()),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    Err(AnthropicCredentialValidationError::InvalidCredential)
-                }
-                StatusCode::TOO_MANY_REQUESTS => {
-                    Err(AnthropicCredentialValidationError::RateLimited)
-                }
-                status if status.is_server_error() => {
-                    Err(AnthropicCredentialValidationError::ProviderUnavailable)
-                }
-                status => {
-                    let body = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "<minimax error body unavailable>".to_owned());
-                    Err(AnthropicCredentialValidationError::Unexpected(format!(
-                        "MiniMax endpoint returned HTTP {status}: {body}"
-                    )))
-                }
-            },
-            Err(error) => {
-                if error.is_timeout() {
-                    Err(AnthropicCredentialValidationError::ProviderUnavailable)
-                } else {
-                    Err(AnthropicCredentialValidationError::Unexpected(error.to_string()))
-                }
-            }
-        };
-
+        let outcome =
+            discover_preferred_openai_compatible_model_id(base_url, api_key, timeout).await;
         match outcome {
-            Ok(()) => return Ok(()),
-            Err(AnthropicCredentialValidationError::ProviderUnavailable)
+            Ok(Some(model_id)) => return Ok(model_id),
+            Ok(None) => {
+                return Err(AnthropicCredentialValidationError::Unexpected(
+                    "MiniMax model discovery returned no selectable models".to_owned(),
+                ))
+            }
+            Err(OpenAiCredentialValidationError::ProviderUnavailable)
                 if attempt < ANTHROPIC_VALIDATION_RETRY_ATTEMPTS =>
             {
                 tokio::time::sleep(ANTHROPIC_VALIDATION_RETRY_DELAY).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(map_minimax_discovery_error(error)),
         }
     }
 
     Err(AnthropicCredentialValidationError::ProviderUnavailable)
+}
+
+fn map_minimax_discovery_error(
+    error: OpenAiCredentialValidationError,
+) -> AnthropicCredentialValidationError {
+    match error {
+        OpenAiCredentialValidationError::InvalidCredential => {
+            AnthropicCredentialValidationError::InvalidCredential
+        }
+        OpenAiCredentialValidationError::RateLimited => {
+            AnthropicCredentialValidationError::RateLimited
+        }
+        OpenAiCredentialValidationError::ProviderUnavailable => {
+            AnthropicCredentialValidationError::ProviderUnavailable
+        }
+        OpenAiCredentialValidationError::Unexpected(message) => {
+            AnthropicCredentialValidationError::Unexpected(message)
+        }
+    }
 }
 
 fn map_anthropic_validation_error(

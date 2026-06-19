@@ -49,12 +49,9 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
     "model_provider.anthropic_api_key",
     "tool_call.browser_service.auth_token",
 ];
-const DEFAULT_TEXT_MODEL: &str = "gpt-4o-mini";
-const DEFAULT_EMBEDDINGS_MODEL: &str = "text-embedding-3-small";
-const DEFAULT_EMBEDDINGS_DIMS: u32 = 1536;
-const DEFAULT_ANTHROPIC_TEXT_MODEL: &str = "claude-3-5-sonnet-latest";
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
-const MINIMAX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 /// Parameters for the onboarding/setup wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
@@ -2851,9 +2848,10 @@ fn apply_model_provider_api_key(
 ) -> Result<()> {
     match auth_method {
         "anthropic_api_key" => {
+            let model_id = discover_anthropic_model_selection(document, api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
-            configure_anthropic_provider(document, Some(vault_ref))?;
+            configure_anthropic_provider(document, Some(model_id.as_str()), Some(vault_ref))?;
         }
         "minimax_api_key" | "minimax_api_key_global" | "minimax_api_key_cn" => {
             // Discovery must run before clearing auth: it reads the currently configured
@@ -2869,21 +2867,36 @@ fn apply_model_provider_api_key(
             configure_minimax_provider(
                 document,
                 selection.base_url.as_str(),
-                selection.model_id.as_str(),
+                Some(selection.model_id.as_str()),
                 Some(vault_ref),
             )?;
         }
         method if registry_provider_defaults_for_auth_method(method).is_some() => {
-            clear_model_provider_auth(document)?;
             let defaults = registry_provider_defaults_for_auth_method(method)
                 .expect("registry provider defaults should exist after guard");
+            let model_id = discover_openai_compatible_model_selection(
+                defaults.display_name,
+                defaults.base_url,
+                api_key,
+            )?;
+            clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", defaults.secret_key, api_key)?;
-            configure_registry_provider(document, defaults, Some(vault_ref))?;
+            configure_registry_provider(
+                document,
+                defaults,
+                Some(model_id.as_str()),
+                Some(vault_ref),
+            )?;
         }
         "api_key" => {
+            let model_id = discover_openai_compatible_model_selection(
+                "OpenAI",
+                "https://api.openai.com/v1",
+                api_key,
+            )?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
-            configure_openai_provider(document, Some(vault_ref))?;
+            configure_openai_provider(document, Some(model_id.as_str()), Some(vault_ref))?;
         }
         _ => anyhow::bail!("unsupported model-provider auth method: {auth_method}"),
     }
@@ -2897,34 +2910,29 @@ fn apply_deferred_provider_auth_method(
 ) -> Result<()> {
     clear_model_provider_auth(document)?;
     match auth_method {
-        "chatgpt_login" => configure_openai_provider(document, None)?,
-        "anthropic_oauth" => configure_anthropic_provider(document, None)?,
+        "chatgpt_login" => configure_openai_provider(document, None, None)?,
+        "anthropic_oauth" => configure_anthropic_provider(document, None, None)?,
         "minimax_oauth_global" => {
-            configure_minimax_provider(document, DEFAULT_MINIMAX_BASE_URL, "MiniMax-M2.7", None)?;
+            configure_minimax_provider(document, DEFAULT_MINIMAX_BASE_URL, None, None)?;
         }
         "minimax_oauth_cn" => {
-            configure_minimax_provider(
-                document,
-                DEFAULT_MINIMAX_CN_BASE_URL,
-                "MiniMax-M2.7",
-                None,
-            )?;
+            configure_minimax_provider(document, DEFAULT_MINIMAX_CN_BASE_URL, None, None)?;
         }
         "xai_device_code" | "xai_oauth" => {
             let defaults = registry_provider_defaults_for_auth_method("xai_api_key")
                 .expect("xAI registry defaults must exist");
-            configure_registry_provider(document, defaults, None)?;
+            configure_registry_provider(document, defaults, None, None)?;
         }
         "gemini_cli_oauth" => {
             let mut defaults = *registry_provider_defaults_for_auth_method("google_gemini_api_key")
                 .expect("Google Gemini registry defaults must exist");
             defaults.auth_provider_kind = GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND;
-            configure_registry_provider(document, &defaults, None)?;
+            configure_registry_provider(document, &defaults, None, None)?;
         }
         "openrouter_oauth" => {
             let defaults = registry_provider_defaults_for_auth_method("openrouter_api_key")
                 .expect("OpenRouter registry defaults must exist");
-            configure_registry_provider(document, defaults, None)?;
+            configure_registry_provider(document, defaults, None, None)?;
         }
         _ => anyhow::bail!("unsupported non-API-key auth method: {auth_method}"),
     }
@@ -2942,7 +2950,11 @@ fn apply_deferred_provider_auth_method(
     Ok(())
 }
 
-fn configure_openai_provider(document: &mut toml::Value, vault_ref: Option<String>) -> Result<()> {
+fn configure_openai_provider(
+    document: &mut toml::Value,
+    model_id: Option<&str>,
+    vault_ref: Option<String>,
+) -> Result<()> {
     set_value_at_path(
         document,
         "model_provider.kind",
@@ -2953,21 +2965,9 @@ fn configure_openai_provider(document: &mut toml::Value, vault_ref: Option<Strin
         "model_provider.openai_base_url",
         toml::Value::String("https://api.openai.com/v1".to_owned()),
     )?;
-    set_value_at_path(
-        document,
-        "model_provider.openai_model",
-        toml::Value::String(DEFAULT_TEXT_MODEL.to_owned()),
-    )?;
-    set_value_at_path(
-        document,
-        "model_provider.openai_embeddings_model",
-        toml::Value::String(DEFAULT_EMBEDDINGS_MODEL.to_owned()),
-    )?;
-    set_value_at_path(
-        document,
-        "model_provider.openai_embeddings_dims",
-        toml::Value::Integer(i64::from(DEFAULT_EMBEDDINGS_DIMS)),
-    )?;
+    apply_openai_chat_model_selection(document, model_id)?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
+    unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
     unset_value_at_path(document, "model_provider.anthropic_base_url")?;
     unset_value_at_path(document, "model_provider.anthropic_model")?;
     if let Some(vault_ref) = vault_ref {
@@ -2977,11 +2977,25 @@ fn configure_openai_provider(document: &mut toml::Value, vault_ref: Option<Strin
             toml::Value::String(vault_ref),
         )?;
     }
+    if model_id.is_none() {
+        write_pending_registry_provider(
+            document,
+            PendingRegistryProvider {
+                provider_id: "openai-primary",
+                display_name: "OpenAI",
+                kind: "openai_compatible",
+                base_url: "https://api.openai.com/v1",
+                auth_provider_kind: "openai",
+            },
+            None,
+        )?;
+    }
     Ok(())
 }
 
 fn configure_anthropic_provider(
     document: &mut toml::Value,
+    model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
     set_value_at_path(
@@ -2994,11 +3008,7 @@ fn configure_anthropic_provider(
         "model_provider.anthropic_base_url",
         toml::Value::String("https://api.anthropic.com".to_owned()),
     )?;
-    set_value_at_path(
-        document,
-        "model_provider.anthropic_model",
-        toml::Value::String(DEFAULT_ANTHROPIC_TEXT_MODEL.to_owned()),
-    )?;
+    apply_anthropic_chat_model_selection(document, model_id)?;
     unset_value_at_path(document, "model_provider.openai_base_url")?;
     unset_value_at_path(document, "model_provider.openai_model")?;
     unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
@@ -3010,13 +3020,26 @@ fn configure_anthropic_provider(
             toml::Value::String(vault_ref),
         )?;
     }
+    if model_id.is_none() {
+        write_pending_registry_provider(
+            document,
+            PendingRegistryProvider {
+                provider_id: "anthropic-primary",
+                display_name: "Anthropic",
+                kind: "anthropic",
+                base_url: "https://api.anthropic.com",
+                auth_provider_kind: "anthropic",
+            },
+            None,
+        )?;
+    }
     Ok(())
 }
 
 fn configure_minimax_provider(
     document: &mut toml::Value,
     base_url: &str,
-    model_id: &str,
+    model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
     set_value_at_path(
@@ -3034,11 +3057,7 @@ fn configure_minimax_provider(
         "model_provider.anthropic_base_url",
         toml::Value::String(base_url.to_owned()),
     )?;
-    set_value_at_path(
-        document,
-        "model_provider.anthropic_model",
-        toml::Value::String(model_id.to_owned()),
-    )?;
+    apply_anthropic_chat_model_selection(document, model_id)?;
     if minimax_base_url_requires_private_opt_in(base_url) {
         set_value_at_path(
             document,
@@ -3057,12 +3076,26 @@ fn configure_minimax_provider(
             toml::Value::String(vault_ref),
         )?;
     }
+    if model_id.is_none() {
+        write_pending_registry_provider(
+            document,
+            PendingRegistryProvider {
+                provider_id: "minimax-primary",
+                display_name: "MiniMax",
+                kind: "anthropic",
+                base_url,
+                auth_provider_kind: MINIMAX_AUTH_PROVIDER_KIND,
+            },
+            None,
+        )?;
+    }
     Ok(())
 }
 
 fn configure_registry_provider(
     document: &mut toml::Value,
     defaults: &RegistryProviderDefaults,
+    model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
     set_value_at_path(
@@ -3080,11 +3113,7 @@ fn configure_registry_provider(
         "model_provider.openai_base_url",
         toml::Value::String(defaults.base_url.to_owned()),
     )?;
-    set_value_at_path(
-        document,
-        "model_provider.openai_model",
-        toml::Value::String(defaults.chat_model.to_owned()),
-    )?;
+    apply_openai_chat_model_selection(document, model_id)?;
     unset_value_at_path(document, "model_provider.openai_embeddings_model")?;
     unset_value_at_path(document, "model_provider.openai_embeddings_dims")?;
     unset_value_at_path(document, "model_provider.anthropic_base_url")?;
@@ -3094,16 +3123,21 @@ fn configure_registry_provider(
         "model_provider.providers",
         toml::Value::Array(vec![registry_provider_table(defaults, vault_ref)]),
     )?;
-    set_value_at_path(
-        document,
-        "model_provider.models",
-        toml::Value::Array(vec![registry_chat_model_table(defaults)]),
-    )?;
-    set_value_at_path(
-        document,
-        "model_provider.default_chat_model_id",
-        toml::Value::String(defaults.chat_model.to_owned()),
-    )?;
+    if let Some(model_id) = model_id {
+        set_value_at_path(
+            document,
+            "model_provider.models",
+            toml::Value::Array(vec![registry_chat_model_table(defaults, model_id)]),
+        )?;
+        set_value_at_path(
+            document,
+            "model_provider.default_chat_model_id",
+            toml::Value::String(model_id.to_owned()),
+        )?;
+    } else {
+        unset_value_at_path(document, "model_provider.models")?;
+        unset_value_at_path(document, "model_provider.default_chat_model_id")?;
+    }
     Ok(())
 }
 
@@ -3127,19 +3161,196 @@ fn registry_provider_table(
     toml::Value::Table(table)
 }
 
-fn registry_chat_model_table(defaults: &RegistryProviderDefaults) -> toml::Value {
+fn registry_chat_model_table(defaults: &RegistryProviderDefaults, model_id: &str) -> toml::Value {
     let mut table = toml::map::Map::new();
-    table.insert("model_id".to_owned(), toml::Value::String(defaults.chat_model.to_owned()));
+    table.insert("model_id".to_owned(), toml::Value::String(model_id.to_owned()));
     table.insert("provider_id".to_owned(), toml::Value::String(defaults.provider_id.to_owned()));
     table.insert("role".to_owned(), toml::Value::String("chat".to_owned()));
     table.insert("enabled".to_owned(), toml::Value::Boolean(true));
     toml::Value::Table(table)
 }
 
+struct PendingRegistryProvider<'a> {
+    provider_id: &'a str,
+    display_name: &'a str,
+    kind: &'a str,
+    base_url: &'a str,
+    auth_provider_kind: &'a str,
+}
+
+fn write_pending_registry_provider(
+    document: &mut toml::Value,
+    provider: PendingRegistryProvider<'_>,
+    vault_ref: Option<String>,
+) -> Result<()> {
+    let mut table = toml::map::Map::new();
+    table.insert("provider_id".to_owned(), toml::Value::String(provider.provider_id.to_owned()));
+    table.insert("display_name".to_owned(), toml::Value::String(provider.display_name.to_owned()));
+    table.insert("kind".to_owned(), toml::Value::String(provider.kind.to_owned()));
+    table.insert("base_url".to_owned(), toml::Value::String(provider.base_url.to_owned()));
+    table.insert(
+        "auth_provider_kind".to_owned(),
+        toml::Value::String(provider.auth_provider_kind.to_owned()),
+    );
+    table.insert("enabled".to_owned(), toml::Value::Boolean(true));
+    if let Some(vault_ref) = vault_ref {
+        table.insert("api_key_vault_ref".to_owned(), toml::Value::String(vault_ref));
+    }
+    set_value_at_path(
+        document,
+        "model_provider.providers",
+        toml::Value::Array(vec![toml::Value::Table(table)]),
+    )?;
+    unset_value_at_path(document, "model_provider.models")?;
+    unset_value_at_path(document, "model_provider.default_chat_model_id")?;
+    Ok(())
+}
+
+fn apply_openai_chat_model_selection(
+    document: &mut toml::Value,
+    model_id: Option<&str>,
+) -> Result<()> {
+    if let Some(model_id) = model_id {
+        set_value_at_path(
+            document,
+            "model_provider.openai_model",
+            toml::Value::String(model_id.to_owned()),
+        )?;
+    } else {
+        unset_value_at_path(document, "model_provider.openai_model")?;
+    }
+    Ok(())
+}
+
+fn apply_anthropic_chat_model_selection(
+    document: &mut toml::Value,
+    model_id: Option<&str>,
+) -> Result<()> {
+    if let Some(model_id) = model_id {
+        set_value_at_path(
+            document,
+            "model_provider.anthropic_model",
+            toml::Value::String(model_id.to_owned()),
+        )?;
+    } else {
+        unset_value_at_path(document, "model_provider.anthropic_model")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct MinimaxModelSelection {
     base_url: String,
     model_id: String,
+}
+
+fn discover_openai_compatible_model_selection(
+    provider_label: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<String> {
+    let models = discover_openai_compatible_models(provider_label, api_key, base_url)?;
+    select_preferred_discovered_model_id(models.as_slice()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{provider_label} model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
+        )
+    })
+}
+
+fn discover_openai_compatible_models(
+    provider_label: &str,
+    api_key: &str,
+    base_url: &str,
+) -> Result<Vec<DiscoveredProviderModel>> {
+    let endpoint = provider_models_endpoint(base_url)?;
+    let client = Client::builder()
+        .timeout(PROVIDER_MODEL_DISCOVERY_TIMEOUT)
+        .build()
+        .with_context(|| format!("failed to initialize {provider_label} model discovery client"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let bearer = format!("Bearer {api_key}");
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(bearer.as_str()).with_context(|| {
+            format!("{provider_label} API key cannot be sent as an authorization header")
+        })?,
+    );
+
+    let response = client
+        .get(endpoint)
+        .headers(headers)
+        .send()
+        .with_context(|| format!("failed to call {provider_label} model discovery endpoint"))?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "{provider_label} model discovery failed: {}",
+            sanitize_provider_error(body.as_str(), status.as_u16())
+        );
+    }
+    parse_discovered_provider_models(body.as_str())
+}
+
+fn discover_anthropic_model_selection(document: &toml::Value, api_key: &str) -> Result<String> {
+    let base_url = anthropic_base_url_for_config(document)?;
+    let models = discover_anthropic_models(api_key, base_url.as_str())?;
+    select_preferred_discovered_model_id(models.as_slice()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Anthropic model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
+        )
+    })
+}
+
+fn anthropic_base_url_for_config(document: &toml::Value) -> Result<String> {
+    let configured_for_anthropic =
+        get_string_value_at_path(document, "model_provider.kind")?.as_deref() == Some("anthropic")
+            && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
+                .as_deref()
+                .is_none_or(|kind| kind.eq_ignore_ascii_case("anthropic"));
+    if configured_for_anthropic {
+        if let Some(base_url) =
+            get_string_value_at_path(document, "model_provider.anthropic_base_url")?
+        {
+            return Ok(base_url);
+        }
+    }
+    Ok("https://api.anthropic.com".to_owned())
+}
+
+fn discover_anthropic_models(
+    api_key: &str,
+    base_url: &str,
+) -> Result<Vec<DiscoveredProviderModel>> {
+    let endpoint = provider_models_endpoint(base_url)?;
+    let client = Client::builder()
+        .timeout(PROVIDER_MODEL_DISCOVERY_TIMEOUT)
+        .build()
+        .context("failed to initialize Anthropic model discovery client")?;
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(api_key)
+            .context("Anthropic API key cannot be sent as an x-api-key header")?,
+    );
+    headers.insert("anthropic-version", HeaderValue::from_static(ANTHROPIC_API_VERSION));
+
+    let response = client
+        .get(endpoint)
+        .headers(headers)
+        .send()
+        .context("failed to call Anthropic model discovery endpoint")?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "Anthropic model discovery failed: {}",
+            sanitize_provider_error(body.as_str(), status.as_u16())
+        );
+    }
+    parse_discovered_provider_models(body.as_str())
 }
 
 /// Resolves the MiniMax base URL and chat model, preferring live model discovery
@@ -3271,7 +3482,7 @@ fn existing_minimax_chat_model(document: &toml::Value) -> Result<Option<String>>
 fn discover_minimax_models(api_key: &str, base_url: &str) -> Result<Vec<DiscoveredProviderModel>> {
     let endpoint = provider_models_endpoint(base_url)?;
     let client = Client::builder()
-        .timeout(MINIMAX_MODEL_DISCOVERY_TIMEOUT)
+        .timeout(PROVIDER_MODEL_DISCOVERY_TIMEOUT)
         .build()
         .context("failed to initialize MiniMax model discovery client")?;
     let mut headers = HeaderMap::new();
@@ -4539,7 +4750,7 @@ role = "chat"
     }
 
     #[test]
-    fn deferred_xai_auth_method_writes_profile_ready_registry_defaults() {
+    fn deferred_xai_auth_method_does_not_write_hardcoded_model() {
         let mut document = toml::Value::Table(Default::default());
         let mut warnings = Vec::new();
 
@@ -4552,11 +4763,23 @@ role = "chat"
                 .as_deref(),
             Some("xai")
         );
-        assert_eq!(
+        assert!(
             get_string_value_at_path(&document, "model_provider.default_chat_model_id")
                 .expect("default chat lookup should succeed")
-                .as_deref(),
-            Some(model_auth::DEFAULT_XAI_TEXT_MODEL)
+                .is_none(),
+            "deferred auth must wait for provider discovery before selecting a model"
+        );
+        assert!(
+            get_string_value_at_path(&document, "model_provider.openai_model")
+                .expect("OpenAI model lookup should succeed")
+                .is_none(),
+            "deferred auth must not write a flat OpenAI-compatible model fallback"
+        );
+        assert!(
+            get_value_at_path(&document, "model_provider.models")
+                .expect("models lookup should succeed")
+                .is_none(),
+            "deferred auth must not write a registry model before provider discovery"
         );
         let providers = get_value_at_path(&document, "model_provider.providers")
             .expect("providers lookup should succeed")
@@ -4568,6 +4791,8 @@ role = "chat"
             provider.get("api_key_vault_ref").is_none(),
             "deferred auth profile methods must not fabricate an API-key vault ref"
         );
+        validate_daemon_compatible_document(&document)
+            .expect("deferred xAI auth document should remain daemon-compatible");
         assert!(
             warnings.iter().any(|warning| warning.contains("xAI OAuth")),
             "deferred method should emit an actionable auth-profile warning: {warnings:?}"
@@ -4588,6 +4813,20 @@ role = "chat"
                 .as_deref(),
             Some("https://api.openai.com/v1")
         );
+        assert!(
+            get_string_value_at_path(&document, "model_provider.openai_model")
+                .expect("OpenAI model lookup should succeed")
+                .is_none(),
+            "ChatGPT OAuth setup must wait for Codex model discovery before selecting a model"
+        );
+        assert!(
+            get_string_value_at_path(&document, "model_provider.default_chat_model_id")
+                .expect("default chat lookup should succeed")
+                .is_none(),
+            "ChatGPT OAuth setup must not write a registry model fallback"
+        );
+        validate_daemon_compatible_document(&document)
+            .expect("deferred ChatGPT auth document should remain daemon-compatible");
         assert!(
             warnings.iter().any(|warning| {
                 warning.contains("palyra auth openai oauth-start --set-default --open")

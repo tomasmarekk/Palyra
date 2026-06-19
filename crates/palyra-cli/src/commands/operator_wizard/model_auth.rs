@@ -11,9 +11,6 @@ const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-pub(crate) const DEFAULT_XAI_TEXT_MODEL: &str = "grok-4.3";
-const DEFAULT_GOOGLE_GEMINI_TEXT_MODEL: &str = "gemini-3.5-flash";
-const DEFAULT_OPENROUTER_TEXT_MODEL: &str = "~openai/gpt-latest";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthMethodFlow {
@@ -40,7 +37,6 @@ pub(crate) struct RegistryProviderDefaults {
     pub(crate) display_name: &'static str,
     pub(crate) auth_provider_kind: &'static str,
     pub(crate) base_url: &'static str,
-    pub(crate) chat_model: &'static str,
     pub(crate) secret_key: &'static str,
 }
 
@@ -192,7 +188,6 @@ const REGISTRY_PROVIDER_DEFAULTS: &[RegistryProviderDefaults] = &[
         display_name: "xAI (Grok)",
         auth_provider_kind: XAI_AUTH_PROVIDER_KIND,
         base_url: XAI_BASE_URL,
-        chat_model: DEFAULT_XAI_TEXT_MODEL,
         secret_key: "xai_api_key",
     },
     RegistryProviderDefaults {
@@ -201,7 +196,6 @@ const REGISTRY_PROVIDER_DEFAULTS: &[RegistryProviderDefaults] = &[
         display_name: "Google Gemini",
         auth_provider_kind: GOOGLE_GEMINI_AUTH_PROVIDER_KIND,
         base_url: GOOGLE_GEMINI_OPENAI_BASE_URL,
-        chat_model: DEFAULT_GOOGLE_GEMINI_TEXT_MODEL,
         secret_key: "google_gemini_api_key",
     },
     RegistryProviderDefaults {
@@ -210,7 +204,6 @@ const REGISTRY_PROVIDER_DEFAULTS: &[RegistryProviderDefaults] = &[
         display_name: "OpenRouter",
         auth_provider_kind: OPENROUTER_AUTH_PROVIDER_KIND,
         base_url: OPENROUTER_BASE_URL,
-        chat_model: DEFAULT_OPENROUTER_TEXT_MODEL,
         secret_key: "openrouter_api_key",
     },
 ];
