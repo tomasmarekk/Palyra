@@ -35,6 +35,7 @@ const RUN_ID_THIRD: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB0";
 const ENVELOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
 const ENVELOPE_ID_ALT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FB1";
 const OPENAI_API_KEY: &str = "sk-openai-integration-test";
+const OPENAI_TEST_MODEL: &str = "openai-test-model";
 const SAMPLE_PNG_1X1: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
@@ -11643,6 +11644,7 @@ fn spawn_palyrad_with_openai_provider_and_tool_policy_with_execution_gate_rollou
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL")
         .env_remove("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_DIMS")
@@ -11710,6 +11712,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
@@ -11779,6 +11782,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy_and_ex
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
@@ -11835,6 +11839,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_memory_auto_inject
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
@@ -11888,6 +11893,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_memory_auto_inject(
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
@@ -11959,6 +11965,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_and_process_runner(
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", config.openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
@@ -12048,6 +12055,7 @@ fn spawn_palyrad_with_openai_provider_tool_policy_config(
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", config.openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", config.openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
         .env("PALYRA_OFFLINE", "true")
         .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
