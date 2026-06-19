@@ -51,7 +51,10 @@ use windows_sys::Win32::{
 };
 
 use palyra_common::{
-    process_risk::{classify_process_run, ProcessRiskContext, ProcessRiskReport},
+    process_risk::{
+        classify_process_run, ProcessRiskClass, ProcessRiskContext, ProcessRiskReport,
+        TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS,
+    },
     process_runner_input::{
         parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
     },
@@ -313,6 +316,40 @@ pub fn process_runner_allows_host_access(policy: &SandboxProcessRunnerPolicy) ->
             process_runner_effective_path_access_mode(policy),
             PathAccessMode::WorkspaceOnly
         )
+}
+
+fn validate_supported_target_runtime(
+    process_risk: &ProcessRiskReport,
+) -> Result<(), SandboxProcessRunError> {
+    let Some(finding) = process_risk.findings.iter().find(|finding| {
+        finding.risk_class == ProcessRiskClass::TargetRuntimeMismatch
+            && finding.target.as_deref() == Some(TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS)
+    }) else {
+        return Ok(());
+    };
+
+    if !cfg!(windows) {
+        return Ok(());
+    }
+
+    let target_runtime = process_risk
+        .target_runtime
+        .as_ref()
+        .map(|runtime| runtime.kind.as_str())
+        .unwrap_or("unknown");
+    let safer_default = finding
+        .safer_default
+        .as_deref()
+        .unwrap_or("run the command inside the target runtime or stop before mutating host files");
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!(
+            "target runtime unsupported: error_code=target_runtime_unsupported \
+target_runtime={target_runtime} host_runtime=windows target={} message=\"{}\" \
+safer_default=\"{}\"",
+            TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS, finding.message, safer_default
+        ),
+    })
 }
 
 #[must_use]
@@ -786,6 +823,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
             resolved_cwd: Some(working_directory.as_path()),
         },
     );
+    validate_supported_target_runtime(&process_risk)?;
     match path_access_mode {
         PathAccessMode::UnrestrictedOs => {}
         PathAccessMode::ApprovedRoots => {
@@ -4586,7 +4624,7 @@ fn execute_process(
 
     let mut child = command.spawn().map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::SpawnFailed,
-        message: format!("sandbox process spawn failed for command '{}': {error}", input.command),
+        message: process_spawn_failed_message(policy, input, cwd, &error),
     })?;
 
     capture_child_output(
@@ -4595,6 +4633,25 @@ fn execute_process(
         policy.max_output_bytes as usize,
         cancellation_requested,
         progress_sink,
+    )
+}
+
+fn process_spawn_failed_message(
+    policy: &SandboxProcessRunnerPolicy,
+    input: &ProcessRunnerInput,
+    cwd: &Path,
+    error: &io::Error,
+) -> String {
+    let prepend_path_state =
+        if input.prepend_path.is_empty() { "not_provided" } else { "provided" };
+    format!(
+        "sandbox process spawn failed for command '{}': {error}. Runtime={}. \
+Lookup used cwd='{}', prepend_path={prepend_path_state}, and the daemon sanitized PATH, \
+not the interactive shell PATH. Add the executable directory via prepend_path or use an exact \
+executable path allowed by process_runner.allowed_executables.",
+        input.command,
+        process_runner_executor_name(policy),
+        cwd.display()
     )
 }
 
@@ -4639,7 +4696,7 @@ fn spawn_background_process(
         .ok_or_else(|| background_process_startup_budget_expired_error(input, lifetime_ms))?;
     let mut child = command.spawn().map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::SpawnFailed,
-        message: format!("sandbox process spawn failed for command '{}': {error}", input.command),
+        message: process_spawn_failed_message(policy, input, cwd, &error),
     })?;
     let pid = child.id();
     // Job binding is best effort: a bind failure downgrades stop/status to direct-pid tracking
@@ -11796,6 +11853,53 @@ mod tests {
             super::process_runner_executor_name(&policy).starts_with("sandbox_tier_c_"),
             "tier-c should not be downgraded to host access by wildcard allowlists"
         );
+    }
+
+    #[test]
+    fn process_spawn_failed_message_explains_daemon_path_lookup() {
+        let workspace = PathBuf::from("workspace-root");
+        let policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["openssl".to_owned()]);
+        let input = process_runner_input("openssl", &["version"], None);
+        let error = io::Error::new(io::ErrorKind::NotFound, "program not found");
+
+        let message =
+            super::process_spawn_failed_message(&policy, &input, workspace.as_path(), &error);
+
+        assert!(message.contains("Runtime=sandbox_tier_b"));
+        assert!(message.contains("prepend_path=not_provided"));
+        assert!(message.contains("daemon sanitized PATH"));
+        assert!(message.contains("not the interactive shell PATH"));
+        assert!(message.contains("process_runner.allowed_executables"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn run_constrained_process_rejects_docker_posix_target_on_windows_host() {
+        let workspace = unique_temp_dir("docker-posix-target");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should be created");
+        fs::write(workspace.join("Dockerfile"), b"FROM debian:bookworm\nWORKDIR /app\n")
+            .expect("Dockerfile should be written");
+        let policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["openssl".to_owned()]);
+        let input = br#"{"command":"openssl","args":["req","-newkey","rsa:2048","-nodes","-keyout","server.key","-out","server.csr"]}"#;
+
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("Docker/Linux POSIX target work must fail before Windows host spawn");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
+        assert!(error.message.contains("error_code=target_runtime_unsupported"));
+        assert!(error.message.contains("target_runtime=docker"));
+        assert!(error.message.contains("host_runtime=windows"));
+        assert!(
+            error.message.contains("POSIX file-mode semantics"),
+            "error should explain the Linux permission semantic gap"
+        );
+        assert!(
+            !workspace.join("server.key").exists(),
+            "rejection should happen before host key material is created"
+        );
+        fs::remove_dir_all(workspace.as_path()).expect("workspace should be cleaned up");
     }
 
     #[test]

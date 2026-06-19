@@ -9,6 +9,11 @@ use serde::Serialize;
 
 use crate::process_runner_input::ProcessRunnerToolInput;
 
+/// Finding target used when a Windows host command cannot preserve Linux/Docker POSIX file-mode
+/// semantics for generated artifacts.
+pub const TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS: &str =
+    "host_windows_vs_docker_posix_permissions";
+
 /// Risk category detected in a process-run command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -399,17 +404,35 @@ fn classify_target_runtime_mismatch(
     if target_runtime.map(|runtime| runtime.kind.as_str()) != Some("docker") {
         return;
     }
-    if !signature.host_runtime_command_can_miss_docker_target() {
+    let requires_posix_permissions = signature.requires_docker_posix_file_mode_semantics();
+    if !requires_posix_permissions && !signature.host_runtime_command_can_miss_docker_target() {
         return;
     }
+    let (severity, message, target, safer_default, cleanup_hint) = if requires_posix_permissions {
+        (
+            ProcessRiskSeverity::High,
+            "Windows host command cannot satisfy inferred Docker/Linux POSIX file-mode semantics",
+            TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS,
+            "run the command inside the target Docker/Linux runtime or stop before creating host files",
+            "do not treat Windows-created files as verifier-ready POSIX permission artifacts",
+        )
+    } else {
+        (
+            ProcessRiskSeverity::Medium,
+            "Host runtime command may not affect the inferred Docker verifier runtime",
+            "host_runtime_vs_docker_target",
+            "run dependency installs and validation inside the target Docker container or image build",
+            "do not treat host package installs as verifier setup; document any host changes separately",
+        )
+    };
     findings.push(ProcessRiskFinding {
         risk_class: ProcessRiskClass::TargetRuntimeMismatch,
-        severity: ProcessRiskSeverity::Medium,
-        message: "Host runtime command may not affect the inferred Docker verifier runtime".to_owned(),
+        severity,
+        message: message.to_owned(),
         detected_manager: Some(signature.command_name.clone()),
-        target: Some("host_runtime_vs_docker_target".to_owned()),
-        safer_default: Some("run dependency installs and validation inside the target Docker container or image build".to_owned()),
-        cleanup_hint: Some("do not treat host package installs as verifier setup; document any host changes separately".to_owned()),
+        target: Some(target.to_owned()),
+        safer_default: Some(safer_default.to_owned()),
+        cleanup_hint: Some(cleanup_hint.to_owned()),
         affected_paths: Vec::new(),
         created_paths: Vec::new(),
         cleanup_commands: Vec::new(),
@@ -746,6 +769,61 @@ impl CommandSignature {
                 "pytest",
             ])
     }
+
+    fn requires_docker_posix_file_mode_semantics(&self) -> bool {
+        if self.command_name == "docker" {
+            return false;
+        }
+        self.uses_posix_permission_tool()
+            || self.uses_windows_acl_tool_for_posix_substitute()
+            || self.generates_tls_private_key_material()
+    }
+
+    fn uses_posix_permission_tool(&self) -> bool {
+        match self.command_name.as_str() {
+            "chmod" | "chown" | "umask" => true,
+            "stat" => self.args_contain("-c") || self.args_contain("--format"),
+            "ls" => self.args.iter().any(|arg| {
+                arg == "-l"
+                    || (arg.starts_with('-')
+                        && !arg.starts_with("--")
+                        && arg.chars().skip(1).any(|ch| ch == 'l'))
+            }),
+            _ => self.shell_text_contains_any(&[
+                "chmod ",
+                "chown ",
+                "umask ",
+                "stat -c",
+                "stat --format",
+                "ls -l",
+                "ls -al",
+                "ls -la",
+            ]),
+        }
+    }
+
+    fn uses_windows_acl_tool_for_posix_substitute(&self) -> bool {
+        matches!(self.command_name.as_str(), "icacls" | "attrib")
+            || self.shell_text_contains_any(&["icacls ", "attrib "])
+    }
+
+    fn generates_tls_private_key_material(&self) -> bool {
+        let is_openssl = self.command_name == "openssl"
+            || self.shell_text.as_deref().is_some_and(|text| text.contains("openssl "));
+        is_openssl
+            && (self.args_contain("-keyout")
+                || self.args_contain("-out")
+                || self.all_text.contains(".key")
+                || self.all_text.contains("private.key"))
+            && (self.args_contain_any(&["req", "genrsa", "genpkey", "rsa", "ecparam"])
+                || self.shell_text_contains_any(&[
+                    "openssl req",
+                    "openssl genrsa",
+                    "openssl genpkey",
+                    "openssl rsa",
+                    "openssl ecparam",
+                ]))
+    }
 }
 
 struct DockerInvocation<'a> {
@@ -894,7 +972,10 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{classify_process_run, ProcessRiskClass, ProcessRiskContext, ProcessRiskSeverity};
+    use super::{
+        classify_process_run, ProcessRiskClass, ProcessRiskContext, ProcessRiskSeverity,
+        TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS,
+    };
     use crate::process_runner_input::ProcessRunnerToolInput;
 
     fn input(command: &str, args: &[&str]) -> ProcessRunnerToolInput {
@@ -1003,5 +1084,69 @@ mod tests {
             Some("docker")
         );
         assert!(has_class(&report, ProcessRiskClass::TargetRuntimeMismatch));
+    }
+
+    #[test]
+    fn docker_target_runtime_flags_windows_host_permission_substitutes() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        fs::write(workspace.path().join("Dockerfile"), b"FROM debian:bookworm\nWORKDIR /app\n")
+            .expect("Dockerfile should be written");
+
+        let report = classify_process_run(
+            &input("icacls", &["server.key", "/inheritance:r"]),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.risk_class == ProcessRiskClass::TargetRuntimeMismatch)
+            .expect("Windows ACL substitute should be flagged for Docker/Linux targets");
+        assert_eq!(finding.severity, ProcessRiskSeverity::High);
+        assert_eq!(
+            finding.target.as_deref(),
+            Some(TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS)
+        );
+    }
+
+    #[test]
+    fn docker_target_runtime_flags_openssl_key_generation_on_host() {
+        let workspace = tempfile::tempdir().expect("temp workspace should be created");
+        fs::write(workspace.path().join("Dockerfile"), b"FROM debian:bookworm\nWORKDIR /app\n")
+            .expect("Dockerfile should be written");
+
+        let report = classify_process_run(
+            &input(
+                "openssl",
+                &[
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-keyout",
+                    "server.key",
+                    "-out",
+                    "server.csr",
+                ],
+            ),
+            ProcessRiskContext {
+                workspace_root: Some(workspace.path()),
+                resolved_cwd: Some(workspace.path()),
+            },
+        );
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.risk_class == ProcessRiskClass::TargetRuntimeMismatch)
+            .expect("OpenSSL key generation should be flagged for Docker/Linux targets");
+        assert_eq!(finding.severity, ProcessRiskSeverity::High);
+        assert_eq!(
+            finding.target.as_deref(),
+            Some(TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS)
+        );
     }
 }
