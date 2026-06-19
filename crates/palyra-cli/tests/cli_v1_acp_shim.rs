@@ -4,7 +4,7 @@
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     sync::mpsc,
@@ -22,6 +22,7 @@ const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
 
 #[test]
 fn status_reports_http_grpc_and_admin_health() -> Result<()> {
@@ -475,6 +476,7 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().to_string();
+    let model_server = MockOpenAiModelsServer::spawn()?;
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
             "onboarding",
@@ -493,8 +495,14 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
             "--skip-skills",
         ])
         .env("OPENAI_API_KEY", "sk-test-quickstart")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", model_server.base_url.as_str())
         .output()
         .context("failed to execute palyra onboarding wizard")?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "onboarding wizard should discover OpenAI models before writing config: {discovery_request}"
+    );
     assert!(
         output.status.success(),
         "onboarding wizard should succeed: {}",
@@ -513,8 +521,72 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
         written.contains("openai_api_key_vault_ref"),
         "expected vault-backed OpenAI auth in onboarding config"
     );
+    assert!(
+        written.contains("gpt-test-discovered"),
+        "expected provider-discovered OpenAI model in onboarding config"
+    );
     assert!(written.contains("workspace_root"), "expected workspace root in onboarding config");
     Ok(())
+}
+
+struct MockOpenAiModelsServer {
+    base_url: String,
+    handle: thread::JoinHandle<Result<String>>,
+}
+
+impl MockOpenAiModelsServer {
+    fn spawn() -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind mock OpenAI models server")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure mock OpenAI models listener")?;
+        let base_url = format!("http://{}", listener.local_addr().context("listener address")?);
+        let handle = thread::spawn(move || -> Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .context("failed to configure mock OpenAI models stream")?;
+                        let mut buffer = [0_u8; 4096];
+                        let read =
+                            stream.read(&mut buffer).context("failed to read models request")?;
+                        let request_text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        if !request_text.starts_with("GET /v1/models ") {
+                            anyhow::bail!("unexpected models request: {request_text}");
+                        }
+                        if !request_text.to_ascii_lowercase().contains("authorization: bearer ") {
+                            anyhow::bail!(
+                                "model discovery request should use bearer auth: {request_text}"
+                            );
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            OPENAI_COMPATIBLE_MODELS_RESPONSE.len(),
+                            OPENAI_COMPATIBLE_MODELS_RESPONSE
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .context("failed to write models response")?;
+                        return Ok(request_text);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error).context("mock OpenAI models accept failed"),
+                }
+            }
+            anyhow::bail!("mock OpenAI models server did not receive a discovery request")
+        });
+
+        Ok(Self { base_url, handle })
+    }
+
+    fn finish(self) -> Result<String> {
+        self.handle.join().map_err(|_| anyhow::anyhow!("mock OpenAI models server panicked"))?
+    }
 }
 
 fn spawn_palyrad_with_dynamic_ports() -> Result<(Child, u16, u16)> {
