@@ -2041,48 +2041,59 @@ fn handle_xai_callback_stream(
     let target = parts.next().unwrap_or_default();
     let mut stream = reader.into_inner();
     if method.eq_ignore_ascii_case("OPTIONS") {
-        write_xai_callback_response(
+        write_xai_callback_response_best_effort(
             &mut stream,
             "HTTP/1.1 204 No Content",
             "",
             Some("https://auth.x.ai"),
-        )?;
+        );
         return Ok(None);
     }
     if !method.eq_ignore_ascii_case("GET") {
-        write_xai_callback_response(
+        write_xai_callback_response_best_effort(
             &mut stream,
             "HTTP/1.1 405 Method Not Allowed",
             "Method not allowed.",
             None,
-        )?;
+        );
         return Ok(None);
     }
     let callback = parse_xai_callback_target(target, expected_state);
     match callback {
         Ok(callback) => {
-            write_xai_callback_response(
+            write_xai_callback_response_best_effort(
                 &mut stream,
                 "HTTP/1.1 200 OK",
                 "xAI authentication completed. You can close this window.",
                 None,
-            )?;
+            );
             Ok(Some(callback))
         }
         Err(error) => {
-            write_xai_callback_response(
+            write_xai_callback_response_best_effort(
                 &mut stream,
                 "HTTP/1.1 400 Bad Request",
                 "xAI authentication did not complete.",
                 None,
-            )?;
+            );
             Err(error)
         }
     }
 }
 
+fn write_xai_callback_response_best_effort(
+    stream: &mut impl std::io::Write,
+    status_line: &str,
+    body: &str,
+    cors_origin: Option<&str>,
+) {
+    // Browser clients can close the loopback connection after delivering the
+    // callback. The parsed callback is the OAuth result; the response body is UX.
+    let _ = write_xai_callback_response(stream, status_line, body, cors_origin);
+}
+
 fn write_xai_callback_response(
-    stream: &mut std::net::TcpStream,
+    stream: &mut impl std::io::Write,
     status_line: &str,
     body: &str,
     cors_origin: Option<&str>,
@@ -2480,10 +2491,11 @@ mod tests {
         build_openai_oauth_launch_payload, build_provider_status_payload,
         build_xai_oauth_authorization_url, normalize_xai_oauth_endpoint,
         openai_oauth_launch_text_lines, parse_anthropic_authorization_code, parse_xai_callback_url,
-        AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL,
-        ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES,
-        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
-        XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
+        write_xai_callback_response_best_effort, AnthropicOAuthTokenResponse,
+        OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
+        ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
+        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI,
+        XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -2739,6 +2751,29 @@ mod tests {
 
         assert!(state_error.to_string().contains("state mismatch"));
         assert!(host_error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn xai_callback_response_write_failure_is_best_effort() {
+        struct ResetWriter;
+
+        impl std::io::Write for ResetWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = ResetWriter;
+        write_xai_callback_response_best_effort(
+            &mut writer,
+            "HTTP/1.1 200 OK",
+            "xAI authentication completed. You can close this window.",
+            None,
+        );
     }
 
     #[test]
