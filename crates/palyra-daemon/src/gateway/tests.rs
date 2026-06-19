@@ -8,6 +8,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         OnceLock,
@@ -804,6 +805,55 @@ fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecuti
             sandbox_enforcement: "test".to_owned(),
         },
     }
+}
+
+struct CleanupTestProcess {
+    child: Child,
+}
+
+impl CleanupTestProcess {
+    fn spawn() -> Self {
+        let mut command = cleanup_test_process_command();
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().expect("cleanup test process should start");
+        Self { child }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait_for_cleanup(&mut self) {
+        for _ in 0..50 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => panic!("cleanup test process status should be readable: {error}"),
+            }
+        }
+        panic!("run-owned cleanup should terminate the cleanup test process");
+    }
+}
+
+impl Drop for CleanupTestProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_test_process_command() -> Command {
+    let mut command = Command::new("ping");
+    command.args(["-n", "60", "127.0.0.1"]);
+    command
+}
+
+#[cfg(not(windows))]
+fn cleanup_test_process_command() -> Command {
+    let mut command = Command::new("sleep");
+    command.arg("60");
+    command
 }
 
 async fn start_tool_program_test_run(
@@ -4358,8 +4408,9 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     let run_id = Ulid::new().to_string();
     start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
 
-    let impossible_test_pid = u32::MAX;
-    state.record_run_background_process(run_id.as_str(), impossible_test_pid);
+    let mut cleanup_process = CleanupTestProcess::spawn();
+    let cleanup_test_pid = cleanup_process.pid();
+    state.record_run_background_process(run_id.as_str(), cleanup_test_pid);
 
     let (sender, _receiver) = tokio::sync::mpsc::channel(4);
     let mut run_state = RunStateMachine::default();
@@ -4379,6 +4430,7 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     })
     .await;
 
+    cleanup_process.wait_for_cleanup();
     assert_eq!(run_state.state(), RunLifecycleState::Failed);
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
@@ -4404,11 +4456,15 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     );
     assert_eq!(
         payload.pointer("/background_processes/outcomes/0/pid").and_then(Value::as_u64),
-        Some(u64::from(impossible_test_pid))
+        Some(u64::from(cleanup_test_pid))
     );
     assert_eq!(
         payload.pointer("/background_processes/alive_after/0/pid").and_then(Value::as_u64),
-        Some(u64::from(impossible_test_pid))
+        Some(u64::from(cleanup_test_pid))
+    );
+    assert_eq!(
+        payload.pointer("/background_processes/alive_after/0/alive").and_then(Value::as_bool),
+        Some(false)
     );
 }
 
