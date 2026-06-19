@@ -63,6 +63,14 @@ pub enum AgentCommand {
         interrupt_active_run: bool,
         #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce, help = "Select how tool approval requests are handled")]
         approval_mode: AgentApprovalModeArg,
+        #[arg(long, value_enum, default_value_t = AgentAutoResumeArg::Never, help = "Select whether the CLI automatically starts a continuation run")]
+        auto_resume: AgentAutoResumeArg,
+        #[arg(
+            long,
+            default_value_t = 3,
+            help = "Maximum automatic continuation runs when --auto-resume allows them"
+        )]
+        auto_resume_limit: usize,
         #[arg(long, default_value_t = false, help = "Stream run events as newline-delimited JSON")]
         ndjson: bool,
     },
@@ -120,4 +128,10 @@ pub enum AgentApprovalModeArg {
     Prompt,
     Deny,
     AllowOnce,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum AgentAutoResumeArg {
+    Never,
+    OnContinuation,
 }

@@ -113,18 +113,19 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::{CommandFactory, Parser};
 use cli::{
-    AcpCommand, AgentApprovalModeArg, AgentCommand, AgentsCommand, ApprovalDecisionArg,
-    ApprovalExportFormatArg, ApprovalsCommand, AuthAccessCommand, AuthCommand, AuthCredentialArg,
-    AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg, AuthScopeArg, BrowserCommand, Cli,
-    Command as CliCommand, CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand,
-    DaemonCommand, DeploymentCommand, DeploymentProfileArg, DocsCommand, ExtensionCommand,
-    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg,
-    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand,
-    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand,
-    PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg,
-    SecretsCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
-    SkillsPackageCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    AcpCommand, AgentApprovalModeArg, AgentAutoResumeArg, AgentCommand, AgentsCommand,
+    ApprovalDecisionArg, ApprovalExportFormatArg, ApprovalsCommand, AuthAccessCommand, AuthCommand,
+    AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg, AuthScopeArg,
+    BrowserCommand, Cli, Command as CliCommand, CompletionShell, ConfigCommand,
+    ConfigureSectionArg, CronCommand, DaemonCommand, DeploymentCommand, DeploymentProfileArg,
+    DocsCommand, ExtensionCommand, GatewayBindProfileArg, HooksCommand, InitModeArg,
+    InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand,
+    MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand,
+    OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand,
+    RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecurityCommand,
+    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -4147,22 +4148,23 @@ fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
 fn execute_agent_stream(
     connection: AgentConnection,
     request: AgentRunInput,
-    ndjson: bool,
+    options: AgentStreamOptions,
 ) -> Result<AgentStreamOutcome> {
     let runtime = build_runtime()?;
     runtime
-        .block_on(execute_agent_stream_async(connection, request, ndjson))
+        .block_on(execute_agent_stream_async(connection, request, options))
         .context("agent stream execution failed")
 }
 
 async fn execute_agent_stream_async(
     connection: AgentConnection,
     request: AgentRunInput,
-    ndjson: bool,
+    options: AgentStreamOptions,
 ) -> Result<AgentStreamOutcome> {
     let principal = connection.principal.clone();
-    let ndjson = output::preferred_ndjson(false, ndjson);
+    let ndjson = output::preferred_ndjson(false, options.ndjson);
     let json_output = !ndjson && output::preferred_json(false);
+    let auto_resume = options.auto_resume;
     let mut client = client::runtime::GatewayRuntimeClient::connect(connection).await?;
     let mut request = request;
     let mut continuation_count = 0usize;
@@ -4176,10 +4178,10 @@ async fn execute_agent_stream_async(
                         enrich_agent_principal_auth_error(error, principal.as_str())
                     })?;
             if let Some(next_request) =
-                next_agent_auto_continuation_request(&outcome, continuation_count)
+                next_agent_auto_continuation_request(&outcome, auto_resume, continuation_count)
             {
                 continuation_count = continuation_count.saturating_add(1);
-                emit_agent_auto_resume_status(continuation_count, &next_request)?;
+                emit_agent_auto_resume_status(continuation_count, auto_resume, &next_request)?;
                 request = next_request;
                 continue;
             }
@@ -4203,14 +4205,14 @@ async fn execute_agent_stream_async(
             .await
             .map_err(|error| enrich_agent_principal_auth_error(error, principal.as_str()))?;
             if let Some(next_request) =
-                next_agent_auto_continuation_request(&outcome, continuation_count)
+                next_agent_auto_continuation_request(&outcome, auto_resume, continuation_count)
             {
                 if !ndjson {
                     text_emitter.finish()?;
                     text_emitter = AgentTextEmitter::default();
                 }
                 continuation_count = continuation_count.saturating_add(1);
-                emit_agent_auto_resume_status(continuation_count, &next_request)?;
+                emit_agent_auto_resume_status(continuation_count, auto_resume, &next_request)?;
                 request = next_request;
                 continue;
             }
@@ -4227,6 +4229,65 @@ async fn execute_agent_stream_async(
 const AGENT_AUTO_CONTINUATION_LIMIT: usize = 3;
 const AGENT_JSON_STREAM_MAX_EVENTS: usize = 20_000;
 const AGENT_JSON_STREAM_MAX_SERIALIZED_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct AgentStreamOptions {
+    ndjson: bool,
+    auto_resume: AgentAutoResumePolicy,
+}
+
+impl AgentStreamOptions {
+    const fn new(ndjson: bool) -> Self {
+        Self { ndjson, auto_resume: AgentAutoResumePolicy::Never }
+    }
+
+    const fn with_auto_resume(mut self, policy: AgentAutoResumePolicy, limit: usize) -> Self {
+        self.auto_resume = policy.with_limit(limit);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentAutoResumePolicy {
+    Never,
+    OnContinuation { max_continuations: usize },
+}
+
+impl AgentAutoResumePolicy {
+    const fn with_limit(self, limit: usize) -> Self {
+        match self {
+            Self::Never => Self::Never,
+            Self::OnContinuation { .. } => Self::OnContinuation { max_continuations: limit },
+        }
+    }
+
+    const fn allows_continuation(self, completed_continuations: usize) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnContinuation { max_continuations } => {
+                completed_continuations < max_continuations
+            }
+        }
+    }
+
+    const fn max_attempts(self) -> usize {
+        match self {
+            Self::Never => 0,
+            Self::OnContinuation { max_continuations } => max_continuations,
+        }
+    }
+}
+
+impl From<AgentAutoResumeArg> for AgentAutoResumePolicy {
+    fn from(value: AgentAutoResumeArg) -> Self {
+        match value {
+            AgentAutoResumeArg::Never => Self::Never,
+            AgentAutoResumeArg::OnContinuation => {
+                Self::OnContinuation { max_continuations: AGENT_AUTO_CONTINUATION_LIMIT }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AgentJsonStreamLimits {
@@ -5088,10 +5149,11 @@ fn build_agent_auto_continuation_request(
 
 fn next_agent_auto_continuation_request(
     outcome: &AgentStreamOutcome,
+    auto_resume: AgentAutoResumePolicy,
     completed_continuations: usize,
 ) -> Option<AgentRunInput> {
     if outcome.needs_continuation_message.is_none()
-        || completed_continuations >= AGENT_AUTO_CONTINUATION_LIMIT
+        || !auto_resume.allows_continuation(completed_continuations)
     {
         return None;
     }
@@ -5136,10 +5198,14 @@ fn agent_continuation_resume_command(message: &str) -> Option<String> {
     (!command.is_empty()).then(|| command.to_owned())
 }
 
-fn emit_agent_auto_resume_status(attempt: usize, next_request: &AgentRunInput) -> Result<()> {
+fn emit_agent_auto_resume_status(
+    attempt: usize,
+    auto_resume: AgentAutoResumePolicy,
+    next_request: &AgentRunInput,
+) -> Result<()> {
     eprintln!(
         "agent.auto_resume attempt={attempt} max_attempts={} previous_run_id={} next_run_id={} reason=needs_continuation",
-        AGENT_AUTO_CONTINUATION_LIMIT,
+        auto_resume.max_attempts(),
         next_request.origin_run_id.as_deref().unwrap_or(REDACTED),
         next_request.run_id
     );
@@ -6602,12 +6668,55 @@ mod agent_stream_output_tests {
             failed_message: None,
             continuation_request: Some(continuation_request),
         };
+        let auto_resume = AgentAutoResumePolicy::OnContinuation {
+            max_continuations: AGENT_AUTO_CONTINUATION_LIMIT,
+        };
 
-        assert!(next_agent_auto_continuation_request(&outcome, AGENT_AUTO_CONTINUATION_LIMIT - 1)
-            .is_some());
-        assert!(
-            next_agent_auto_continuation_request(&outcome, AGENT_AUTO_CONTINUATION_LIMIT).is_none()
-        );
+        assert!(next_agent_auto_continuation_request(
+            &outcome,
+            auto_resume,
+            AGENT_AUTO_CONTINUATION_LIMIT - 1
+        )
+        .is_some());
+        assert!(next_agent_auto_continuation_request(
+            &outcome,
+            auto_resume,
+            AGENT_AUTO_CONTINUATION_LIMIT
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn auto_continuation_request_defaults_to_never() {
+        let continuation_request = build_agent_run_input(AgentRunInputArgs {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: None,
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+            prompt: "Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: Some("cli_auto_resume".to_owned()),
+            origin_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            parameter_delta_json: None,
+        })
+        .expect("continuation input should build");
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some("needs_continuation=true".to_owned()),
+            needs_continuation_checkpoint: None,
+            failed_message: None,
+            continuation_request: Some(continuation_request),
+        };
+
+        assert!(next_agent_auto_continuation_request(&outcome, AgentAutoResumePolicy::Never, 0)
+            .is_none());
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             allow_sensitive_tools,
             interrupt_active_run,
             approval_mode,
+            auto_resume,
+            auto_resume_limit,
             ndjson,
         } => {
             ensure_agent_run_approval_flags(allow_sensitive_tools, approval_mode, prompt_stdin)?;
@@ -93,8 +95,12 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
                 parameter_delta_json,
             })?;
             let run_id = request.run_id.clone();
-            let outcome =
-                execute_agent_stream(connection, request, output::preferred_ndjson(false, ndjson))?;
+            let outcome = execute_agent_stream(
+                connection,
+                request,
+                AgentStreamOptions::new(output::preferred_ndjson(false, ndjson))
+                    .with_auto_resume(auto_resume.into(), auto_resume_limit),
+            )?;
             if outcome.completed() && root_context.config_path().is_some() {
                 commands::onboarding::record_cli_first_success(
                     root_context.state_root(),

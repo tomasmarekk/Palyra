@@ -66,7 +66,7 @@ pub use acp::{
     AcpBridgeArgs, AcpCommand, AcpConnectionArgs, AcpSessionDefaultsArgs, AcpShimArgs,
     AcpSubcommand,
 };
-pub use agent::{AgentApprovalModeArg, AgentCommand};
+pub use agent::{AgentApprovalModeArg, AgentAutoResumeArg, AgentCommand};
 pub use agents::AgentsCommand;
 pub use approvals::{
     ApprovalDecisionArg, ApprovalDecisionScopeArg, ApprovalExportFormatArg,

@@ -5,16 +5,16 @@ use clap::{CommandFactory as _, Parser};
 
 use super::{
     AcpBridgeArgs, AcpCommand, AcpConnectionArgs, AcpSessionDefaultsArgs, AcpShimArgs,
-    AcpSubcommand, AgentApprovalModeArg, AgentCommand, AgentsCommand, ApprovalDecisionArg,
-    ApprovalDecisionScopeArg, ApprovalExportFormatArg, ApprovalResolveDecisionArg,
-    ApprovalSubjectTypeArg, ApprovalsCommand, AuthAccessCommand, AuthCommand, AuthCredentialArg,
-    AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg, AuthScopeArg, BackupCommand,
-    BackupComponentArg, BrowserCommand, BrowserPermissionsCommand, BrowserProfilesCommand,
-    BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand,
-    ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell, ConfigCommand,
-    ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg,
-    CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand,
-    FlowStateArg, FlowsCommand, GatewayBindProfileArg, HooksCommand, InitModeArg,
+    AcpSubcommand, AgentApprovalModeArg, AgentAutoResumeArg, AgentCommand, AgentsCommand,
+    ApprovalDecisionArg, ApprovalDecisionScopeArg, ApprovalExportFormatArg,
+    ApprovalResolveDecisionArg, ApprovalSubjectTypeArg, ApprovalsCommand, AuthAccessCommand,
+    AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand, AuthProviderArg,
+    AuthScopeArg, BackupCommand, BackupComponentArg, BrowserCommand, BrowserPermissionsCommand,
+    BrowserProfilesCommand, BrowserSessionCommand, ChannelProviderArg, ChannelResolveEntityArg,
+    ChannelsCommand, ChannelsDiscordCommand, ChannelsRouterCommand, Cli, Command, CompletionShell,
+    ConfigCommand, ConfigureSectionArg, CronCommand, CronConcurrencyPolicyArg,
+    CronMisfirePolicyArg, CronScheduleTypeArg, DaemonCommand, DevicesCommand, DocsCommand,
+    ExtensionCommand, FlowStateArg, FlowsCommand, GatewayBindProfileArg, HooksCommand, InitModeArg,
     InitTlsScaffoldArg, JobsCommand, JournalCheckpointModeArg, MemoryCommand,
     MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand,
     NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg,
@@ -594,6 +594,10 @@ fn parse_agent_run_with_prompt() {
         "--prompt",
         "hello",
         "--allow-sensitive-tools",
+        "--auto-resume",
+        "on-continuation",
+        "--auto-resume-limit",
+        "2",
         "--ndjson",
     ]);
     assert_eq!(
@@ -616,6 +620,8 @@ fn parse_agent_run_with_prompt() {
                 allow_sensitive_tools: true,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
+                auto_resume: AgentAutoResumeArg::OnContinuation,
+                auto_resume_limit: 2,
                 ndjson: true,
             }
         }
@@ -659,6 +665,7 @@ fn e2e_reported_help_surfaces_describe_commands_and_flags() {
                 "Override the daemon gRPC endpoint",
                 "Read the prompt text from stdin",
                 "Permit tools classified as sensitive",
+                "Select whether the CLI automatically starts a continuation run",
                 "Stream run events as newline-delimited JSON",
             ],
         ),
@@ -806,6 +813,8 @@ fn parse_agent_run_with_approval_mode_allow_once() {
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
+                auto_resume: AgentAutoResumeArg::Never,
+                auto_resume_limit: 3,
                 ndjson: false,
             }
         }
@@ -882,6 +891,8 @@ fn parse_agent_run_with_session_key_controls() {
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
+                auto_resume: AgentAutoResumeArg::Never,
+                auto_resume_limit: 3,
                 ndjson: false,
             }
         }
