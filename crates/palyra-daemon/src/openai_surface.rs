@@ -1,7 +1,7 @@
 //! Console provider-auth handlers for OpenAI, Anthropic, and MiniMax:
-//! API-key connect, OAuth flows (PKCE authorization-code for OpenAI, device
-//! user-code polling for MiniMax), refresh, revoke, and default-profile
-//! selection.
+//! API-key connect, OAuth flows (PKCE authorization-code and ChatGPT/Codex
+//! device login for OpenAI, device user-code polling for MiniMax), refresh,
+//! revoke, and default-profile selection.
 //!
 //! Credentials are validated against the live provider before anything is
 //! persisted; raw secrets go only into the vault (profiles carry vault refs),
@@ -24,6 +24,15 @@ const ANTHROPIC_VALIDATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const OPENAI_DEFAULT_CONFIG_BACKUPS: usize = 5;
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
+const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CHATGPT_DEVICE_CODE_ENDPOINT: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const OPENAI_CHATGPT_DEVICE_TOKEN_ENDPOINT: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/token";
+const OPENAI_CHATGPT_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const OPENAI_CHATGPT_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CHATGPT_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const OPENAI_CHATGPT_DEVICE_ATTEMPT_TTL_MS: i64 = 15 * 60 * 1_000;
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -259,9 +268,9 @@ pub(crate) async fn connect_minimax_api_key(
 /// attempt for OpenAI, returning the authorization URL the user must open.
 ///
 /// # Errors
-/// Returns a validation error response for malformed identifiers or a missing
-/// `client_id`, and a precondition/internal error response when the callback
-/// URL cannot be derived or the OAuth endpoint config is invalid.
+/// Returns a validation error response for malformed identifiers and an
+/// unavailable/internal error response when either OAuth bootstrap path cannot
+/// be reached or configured.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn start_openai_oauth_attempt_from_request(
     state: &AppState,
@@ -278,23 +287,43 @@ pub(crate) async fn start_openai_oauth_attempt_from_request(
         scopes: payload_scopes,
         set_default,
     } = payload;
+    let uses_public_chatgpt_device_flow =
+        payload_client_id.as_deref().and_then(normalize_optional_text).is_none();
     let profile_name = payload_profile_name
         .as_deref()
         .map(normalize_openai_profile_name)
         .transpose()?
-        .unwrap_or_else(|| "OpenAI".to_owned());
+        .unwrap_or_else(|| {
+            if uses_public_chatgpt_device_flow {
+                "ChatGPT Login".to_owned()
+            } else {
+                "OpenAI".to_owned()
+            }
+        });
     let profile_id = payload_profile_id
         .as_deref()
         .map(|value| normalize_openai_identifier(value, "profile_id"))
         .transpose()?
         .unwrap_or_else(|| generate_openai_profile_id(profile_name.as_str()));
     let scope = normalize_openai_profile_scope(payload_scope)?;
+    let scopes = normalize_scopes(&payload_scopes);
+    if uses_public_chatgpt_device_flow {
+        return start_openai_chatgpt_device_oauth_attempt(
+            state,
+            context,
+            profile_id,
+            profile_name,
+            scope,
+            scopes,
+            set_default,
+        )
+        .await;
+    }
     let client_id = normalize_required_openai_text(
         payload_client_id.as_deref().unwrap_or_default(),
         "client_id",
     )?;
     let client_secret = normalize_optional_openai_secret(payload_client_secret);
-    let scopes = normalize_scopes(&payload_scopes);
     start_openai_oauth_attempt(
         state,
         context,
@@ -537,9 +566,8 @@ pub(crate) async fn refresh_minimax_oauth_profile(
 }
 
 /// Returns the current state of an OpenAI OAuth attempt for UI polling,
-/// flipping a pending attempt to failed once its deadline has passed. Unlike
-/// the MiniMax variant this never contacts the provider: the attempt is
-/// advanced by the browser callback, not by polling.
+/// flipping a pending attempt to failed once its deadline has passed. ChatGPT
+/// device-login attempts are also polled here because they have no callback.
 ///
 /// # Errors
 /// Returns not-found for unknown or purged attempt ids and
@@ -555,29 +583,52 @@ pub(crate) async fn load_openai_oauth_callback_state(
             "failed to read system clock: {error}"
         )))
     })?;
-    let mut attempts = lock_openai_oauth_attempts(state)?;
-    cleanup_openai_oauth_attempts(&mut attempts, now);
-    let attempt = attempts.get_mut(attempt_id.as_str()).ok_or_else(|| {
+    let attempt_to_poll = {
+        let mut attempts = lock_openai_oauth_attempts(state)?;
+        cleanup_openai_oauth_attempts(&mut attempts, now);
+        let attempt = attempts.get_mut(attempt_id.as_str()).ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "OpenAI OAuth attempt not found: {attempt_id}"
+            )))
+        })?;
+        if attempt.provider != ModelProviderAuthProviderKind::Openai {
+            return Err(runtime_status_response(tonic::Status::failed_precondition(
+                "OAuth attempt does not belong to OpenAI",
+            )));
+        }
+        if matches!(
+            attempt.state,
+            OpenAiOAuthAttemptStateRecord::Pending { .. }
+                | OpenAiOAuthAttemptStateRecord::Completing { .. }
+        ) && attempt.expires_at_unix_ms <= now
+        {
+            attempt.state = OpenAiOAuthAttemptStateRecord::Failed {
+                message: "OpenAI OAuth attempt expired before authorization completed.".to_owned(),
+                completed_at_unix_ms: now,
+            };
+        }
+        if attempt.device_auth_id.is_some()
+            && matches!(attempt.state, OpenAiOAuthAttemptStateRecord::Pending { .. })
+            && attempt.next_poll_after_unix_ms <= now
+        {
+            attempt.next_poll_after_unix_ms =
+                now.saturating_add(attempt.poll_interval_ms.try_into().unwrap_or(i64::MAX));
+            Some(attempt.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(attempt) = attempt_to_poll {
+        apply_openai_chatgpt_device_poll_result(state, attempt, now).await?;
+    }
+
+    let attempts = lock_openai_oauth_attempts(state)?;
+    let attempt = attempts.get(attempt_id.as_str()).ok_or_else(|| {
         runtime_status_response(tonic::Status::not_found(format!(
             "OpenAI OAuth attempt not found: {attempt_id}"
         )))
     })?;
-    if attempt.provider != ModelProviderAuthProviderKind::Openai {
-        return Err(runtime_status_response(tonic::Status::failed_precondition(
-            "OAuth attempt does not belong to OpenAI",
-        )));
-    }
-    if matches!(
-        attempt.state,
-        OpenAiOAuthAttemptStateRecord::Pending { .. }
-            | OpenAiOAuthAttemptStateRecord::Completing { .. }
-    ) && attempt.expires_at_unix_ms <= now
-    {
-        attempt.state = OpenAiOAuthAttemptStateRecord::Failed {
-            message: "OpenAI OAuth attempt expired before the callback completed.".to_owned(),
-            completed_at_unix_ms: now,
-        };
-    }
     Ok(oauth_callback_state_envelope(attempt))
 }
 
@@ -701,82 +752,19 @@ pub(crate) async fn complete_openai_oauth_callback(
         );
     }
 
-    let access_token_vault_ref = store_provider_secret(
-        state.vault.as_ref(),
-        &attempt.scope,
-        attempt.profile_id.as_str(),
-        "openai",
-        "oauth_access_token",
-        token_result.access_token.as_bytes(),
-    )?;
-    let refresh_token_vault_ref = store_provider_secret(
-        state.vault.as_ref(),
-        &attempt.scope,
-        attempt.profile_id.as_str(),
-        "openai",
-        "oauth_refresh_token",
-        token_result.refresh_token.as_bytes(),
-    )?;
-    let client_secret_vault_ref = if attempt.client_secret.trim().is_empty() {
-        None
-    } else {
-        Some(store_provider_secret(
-            state.vault.as_ref(),
-            &attempt.scope,
-            attempt.profile_id.as_str(),
-            "openai",
-            "oauth_client_secret",
-            attempt.client_secret.as_bytes(),
-        )?)
-    };
     // `expires_in` is a short relative duration; the `as` cast cannot
     // truncate realistic values, and saturating math caps pathological ones.
     let expires_at_unix_ms = token_result
         .expires_in_seconds
         .map(|seconds| now.saturating_add((seconds as i64).saturating_mul(1_000)));
-    let refresh_state = serde_json::to_value(OAuthRefreshState::default()).map_err(|error| {
-        runtime_status_response(tonic::Status::internal(format!(
-            "failed to serialize OAuth refresh state: {error}"
-        )))
-    })?;
-    let profile = control_plane::AuthProfileView {
-        profile_id: attempt.profile_id.clone(),
-        provider: control_plane::AuthProfileProvider {
-            kind: "openai".to_owned(),
-            custom_name: None,
-        },
-        profile_name: attempt.profile_name.clone(),
-        scope: attempt.scope.clone(),
-        credential: control_plane::AuthCredentialView::Oauth {
-            access_token_vault_ref,
-            refresh_token_vault_ref,
-            token_endpoint: attempt.token_endpoint.to_string(),
-            client_id: Some(attempt.client_id.clone()),
-            client_secret_vault_ref,
-            scopes: attempt.scopes.clone(),
-            expires_at_unix_ms,
-            refresh_state,
-        },
-        created_at_unix_ms: 0,
-        updated_at_unix_ms: 0,
-    };
-    let context = request_context_from_console_action(&attempt.context);
-    persist_openai_auth_profile(state, &context, profile).await?;
-    if attempt.set_default {
-        persist_model_provider_auth_profile_selection(
-            state,
-            &context,
-            attempt.profile_id.as_str(),
-            ModelProviderAuthProviderKind::Openai,
-        )
-        .await?;
-    }
-
-    let message = if attempt.set_default {
-        "OpenAI OAuth profile connected and selected as the default auth profile."
-    } else {
-        "OpenAI OAuth profile connected."
-    };
+    let message = persist_openai_oauth_success(
+        state,
+        &attempt,
+        token_result.access_token.as_str(),
+        token_result.refresh_token.as_str(),
+        expires_at_unix_ms,
+    )
+    .await?;
     let payload_json = {
         let mut attempts = lock_openai_oauth_attempts(state)?;
         if let Some(stored) = attempts.get_mut(attempt_id.as_str()) {
@@ -801,7 +789,7 @@ pub(crate) async fn complete_openai_oauth_callback(
             .to_string()
         }
     };
-    Ok(render_callback_page("OpenAI Connected", message, Some(payload_json.as_str())))
+    Ok(render_callback_page("OpenAI Connected", message.as_str(), Some(payload_json.as_str())))
 }
 
 /// Starts a fresh OpenAI authorization-code attempt that reuses the client
@@ -1347,6 +1335,7 @@ fn start_openai_oauth_attempt(
         token_endpoint: endpoint_config.token_endpoint,
         code_verifier,
         device_user_code: None,
+        device_auth_id: None,
         poll_interval_ms: 0,
         next_poll_after_unix_ms: 0,
         set_default,
@@ -1370,6 +1359,409 @@ fn start_openai_oauth_attempt(
         expires_at_unix_ms,
         profile_id: Some(profile_id),
         message: "OpenAI OAuth authorization URL issued.".to_owned(),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiChatGptDeviceCodeResponse {
+    user_code: String,
+    device_auth_id: String,
+    #[serde(default)]
+    interval: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiChatGptDeviceTokenResponse {
+    #[serde(default)]
+    authorization_code: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+enum OpenAiChatGptDevicePollOutcome {
+    Pending(String),
+    Succeeded { authorization_code: String, code_verifier: String },
+    Failed(String),
+}
+
+/// Starts the public ChatGPT/Codex device flow used by Codex-style clients.
+///
+/// The built-in client id is a public native-app id; there is intentionally no
+/// client secret, matching the competitor CLIs and avoiding user-side app setup.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+async fn start_openai_chatgpt_device_oauth_attempt(
+    state: &AppState,
+    context: &RequestContext,
+    profile_id: String,
+    profile_name: String,
+    scope: control_plane::AuthProfileScope,
+    scopes: Vec<String>,
+    set_default: bool,
+) -> Result<control_plane::OpenAiOAuthBootstrapEnvelope, Response> {
+    let now = unix_ms_now().map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to read system clock: {error}"
+        )))
+    })?;
+    let attempt_id = Ulid::new().to_string().to_ascii_lowercase();
+    let code_endpoint = Url::parse(OPENAI_CHATGPT_DEVICE_CODE_ENDPOINT).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "invalid ChatGPT device code endpoint: {error}"
+        )))
+    })?;
+    let token_endpoint = Url::parse(OPENAI_CHATGPT_TOKEN_ENDPOINT).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "invalid ChatGPT OAuth token endpoint: {error}"
+        )))
+    })?;
+    let code_response =
+        request_openai_chatgpt_device_code(&code_endpoint, OPENAI_CHATGPT_OAUTH_CLIENT_ID)
+            .await
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::unavailable(format!(
+                    "OpenAI ChatGPT device-code request failed: {}",
+                    sanitize_http_error_message(error.to_string().as_str())
+                )))
+            })?;
+    let poll_interval_ms = normalize_openai_chatgpt_poll_interval_ms(code_response.interval);
+    let expires_at_unix_ms = now.saturating_add(OPENAI_CHATGPT_DEVICE_ATTEMPT_TTL_MS);
+    let message = format!(
+        "Open {OPENAI_CHATGPT_DEVICE_VERIFICATION_URL} and enter code {}.",
+        code_response.user_code
+    );
+    let attempt = OpenAiOAuthAttempt {
+        provider: ModelProviderAuthProviderKind::Openai,
+        attempt_id: attempt_id.clone(),
+        expires_at_unix_ms,
+        redirect_uri: OPENAI_CHATGPT_DEVICE_REDIRECT_URI.to_owned(),
+        profile_id: profile_id.clone(),
+        profile_name,
+        scope,
+        client_id: OPENAI_CHATGPT_OAUTH_CLIENT_ID.to_owned(),
+        client_secret: String::new(),
+        scopes,
+        token_endpoint,
+        code_verifier: String::new(),
+        device_user_code: Some(code_response.user_code.clone()),
+        device_auth_id: Some(code_response.device_auth_id),
+        poll_interval_ms,
+        next_poll_after_unix_ms: now.saturating_add(poll_interval_ms.try_into().unwrap_or(0)),
+        set_default,
+        context: ConsoleActionContext {
+            principal: context.principal.clone(),
+            device_id: context.device_id.clone(),
+            channel: context.channel.clone(),
+        },
+        state: OpenAiOAuthAttemptStateRecord::Pending { message: message.clone() },
+    };
+    let mut attempts = lock_openai_oauth_attempts(state)?;
+    cleanup_openai_oauth_attempts(&mut attempts, now);
+    attempts.insert(attempt_id.clone(), attempt);
+    Ok(control_plane::OpenAiOAuthBootstrapEnvelope {
+        contract: contract_descriptor(),
+        provider: "openai".to_owned(),
+        attempt_id,
+        authorization_url: OPENAI_CHATGPT_DEVICE_VERIFICATION_URL.to_owned(),
+        expires_at_unix_ms,
+        profile_id: Some(profile_id),
+        message,
+    })
+}
+
+async fn apply_openai_chatgpt_device_poll_result(
+    state: &AppState,
+    attempt: OpenAiOAuthAttempt,
+    now: i64,
+) -> Result<(), Response> {
+    let device_auth_id = attempt.device_auth_id.clone().ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "OpenAI ChatGPT device attempt is missing a device_auth_id",
+        ))
+    })?;
+    let user_code = attempt.device_user_code.clone().ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "OpenAI ChatGPT device attempt is missing a user_code",
+        ))
+    })?;
+    let token_poll_endpoint =
+        Url::parse(OPENAI_CHATGPT_DEVICE_TOKEN_ENDPOINT).map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "invalid ChatGPT device token endpoint: {error}"
+            )))
+        })?;
+    let outcome = poll_openai_chatgpt_device_token(
+        &token_poll_endpoint,
+        device_auth_id.as_str(),
+        user_code.as_str(),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        OpenAiChatGptDevicePollOutcome::Pending(format!(
+            "OpenAI ChatGPT authorization is still pending: {}",
+            sanitize_http_error_message(error.to_string().as_str())
+        ))
+    });
+    match outcome {
+        OpenAiChatGptDevicePollOutcome::Pending(message) => {
+            let mut attempts = lock_openai_oauth_attempts(state)?;
+            if let Some(stored) = attempts.get_mut(attempt.attempt_id.as_str()) {
+                stored.state = OpenAiOAuthAttemptStateRecord::Pending { message };
+            }
+            Ok(())
+        }
+        OpenAiChatGptDevicePollOutcome::Failed(message) => {
+            let mut attempts = lock_openai_oauth_attempts(state)?;
+            if let Some(stored) = attempts.get_mut(attempt.attempt_id.as_str()) {
+                stored.state =
+                    OpenAiOAuthAttemptStateRecord::Failed { message, completed_at_unix_ms: now };
+            }
+            Ok(())
+        }
+        OpenAiChatGptDevicePollOutcome::Succeeded { authorization_code, code_verifier } => {
+            let token_result = match exchange_authorization_code(
+                &attempt.token_endpoint,
+                attempt.redirect_uri.as_str(),
+                attempt.client_id.as_str(),
+                attempt.client_secret.as_str(),
+                code_verifier.as_str(),
+                authorization_code.as_str(),
+                OPENAI_HTTP_TIMEOUT,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let mut attempts = lock_openai_oauth_attempts(state)?;
+                    if let Some(stored) = attempts.get_mut(attempt.attempt_id.as_str()) {
+                        stored.state = OpenAiOAuthAttemptStateRecord::Failed {
+                            message: sanitize_http_error_message(error.to_string().as_str()),
+                            completed_at_unix_ms: now,
+                        };
+                    }
+                    return Ok(());
+                }
+            };
+            let expires_at_unix_ms = token_result
+                .expires_in_seconds
+                .map(|seconds| now.saturating_add((seconds as i64).saturating_mul(1_000)));
+            // ChatGPT/Codex subscription tokens are accepted by the Codex auth
+            // issuer, not by the public /v1/models API-key validation probe.
+            let message = persist_openai_oauth_success(
+                state,
+                &attempt,
+                token_result.access_token.as_str(),
+                token_result.refresh_token.as_str(),
+                expires_at_unix_ms,
+            )
+            .await?;
+            let mut attempts = lock_openai_oauth_attempts(state)?;
+            if let Some(stored) = attempts.get_mut(attempt.attempt_id.as_str()) {
+                stored.state = OpenAiOAuthAttemptStateRecord::Succeeded {
+                    profile_id: attempt.profile_id,
+                    message,
+                    completed_at_unix_ms: now,
+                };
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Requests a ChatGPT/Codex device user code from OpenAI.
+///
+/// # Errors
+/// Returns an error on transport failure, a non-success status, invalid JSON,
+/// or a response missing the user-visible code or polling handle.
+async fn request_openai_chatgpt_device_code(
+    code_endpoint: &Url,
+    client_id: &str,
+) -> Result<OpenAiChatGptDeviceCodeResponse> {
+    let client = ReqwestClient::builder()
+        .timeout(OPENAI_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build OpenAI ChatGPT device-code client")?;
+    let response =
+        client.post(code_endpoint.clone()).json(&json!({ "client_id": client_id })).send().await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "OpenAI ChatGPT device-code endpoint returned HTTP {}: {}",
+            status.as_u16(),
+            crate::model_provider::sanitize_remote_error(body.as_str())
+        );
+    }
+    let payload: OpenAiChatGptDeviceCodeResponse = serde_json::from_str(body.as_str())
+        .context("OpenAI ChatGPT device-code response was invalid JSON")?;
+    if payload.user_code.trim().is_empty() || payload.device_auth_id.trim().is_empty() {
+        anyhow::bail!(
+            "OpenAI ChatGPT device-code response did not include user_code and device_auth_id"
+        );
+    }
+    Ok(payload)
+}
+
+/// Polls OpenAI's device-auth token endpoint once.
+///
+/// # Errors
+/// Returns an error only for transport or malformed successful JSON; provider
+/// pending/failure statuses are classified in the return value.
+async fn poll_openai_chatgpt_device_token(
+    token_endpoint: &Url,
+    device_auth_id: &str,
+    user_code: &str,
+) -> Result<OpenAiChatGptDevicePollOutcome> {
+    let client = ReqwestClient::builder()
+        .timeout(OPENAI_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build OpenAI ChatGPT device-token client")?;
+    let response = client
+        .post(token_endpoint.clone())
+        .json(&json!({ "device_auth_id": device_auth_id, "user_code": user_code }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if matches!(status.as_u16(), 403 | 404) {
+        return Ok(OpenAiChatGptDevicePollOutcome::Pending(
+            "Awaiting OpenAI ChatGPT sign-in.".to_owned(),
+        ));
+    }
+    if !status.is_success() {
+        return Ok(OpenAiChatGptDevicePollOutcome::Failed(format!(
+            "OpenAI ChatGPT device-token endpoint returned HTTP {}: {}",
+            status.as_u16(),
+            crate::model_provider::sanitize_remote_error(body.as_str())
+        )));
+    }
+    let payload: OpenAiChatGptDeviceTokenResponse = serde_json::from_str(body.as_str())
+        .context("OpenAI ChatGPT device-token response was invalid JSON")?;
+    if let Some(error) = payload.error.as_deref().and_then(normalize_optional_text) {
+        let description = payload
+            .error_description
+            .as_deref()
+            .and_then(normalize_optional_text)
+            .unwrap_or("OpenAI ChatGPT authorization is still pending.");
+        let message = format!("{error}: {description}");
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("pending") || lower.contains("slow_down") {
+            return Ok(OpenAiChatGptDevicePollOutcome::Pending(sanitize_http_error_message(
+                message.as_str(),
+            )));
+        }
+        return Ok(OpenAiChatGptDevicePollOutcome::Failed(sanitize_http_error_message(
+            message.as_str(),
+        )));
+    }
+    let authorization_code = payload
+        .authorization_code
+        .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned));
+    let code_verifier = payload
+        .code_verifier
+        .and_then(|value| normalize_optional_text(value.as_str()).map(str::to_owned));
+    match (authorization_code, code_verifier) {
+        (Some(authorization_code), Some(code_verifier)) => {
+            Ok(OpenAiChatGptDevicePollOutcome::Succeeded { authorization_code, code_verifier })
+        }
+        _ => Ok(OpenAiChatGptDevicePollOutcome::Pending(
+            "Awaiting OpenAI ChatGPT sign-in.".to_owned(),
+        )),
+    }
+}
+
+fn normalize_openai_chatgpt_poll_interval_ms(interval_seconds: Option<serde_json::Value>) -> u64 {
+    let seconds = match interval_seconds {
+        Some(serde_json::Value::Number(value)) => value.as_u64(),
+        Some(serde_json::Value::String(value)) => value.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+    .unwrap_or(5);
+    seconds.clamp(3, 60).saturating_mul(1_000)
+}
+
+async fn persist_openai_oauth_success(
+    state: &AppState,
+    attempt: &OpenAiOAuthAttempt,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at_unix_ms: Option<i64>,
+) -> Result<String, Response> {
+    let access_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &attempt.scope,
+        attempt.profile_id.as_str(),
+        "openai",
+        "oauth_access_token",
+        access_token.as_bytes(),
+    )?;
+    let refresh_token_vault_ref = store_provider_secret(
+        state.vault.as_ref(),
+        &attempt.scope,
+        attempt.profile_id.as_str(),
+        "openai",
+        "oauth_refresh_token",
+        refresh_token.as_bytes(),
+    )?;
+    let client_secret_vault_ref = if attempt.client_secret.trim().is_empty() {
+        None
+    } else {
+        Some(store_provider_secret(
+            state.vault.as_ref(),
+            &attempt.scope,
+            attempt.profile_id.as_str(),
+            "openai",
+            "oauth_client_secret",
+            attempt.client_secret.as_bytes(),
+        )?)
+    };
+    let refresh_state = serde_json::to_value(OAuthRefreshState::default()).map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "failed to serialize OAuth refresh state: {error}"
+        )))
+    })?;
+    let profile = control_plane::AuthProfileView {
+        profile_id: attempt.profile_id.clone(),
+        provider: control_plane::AuthProfileProvider {
+            kind: "openai".to_owned(),
+            custom_name: None,
+        },
+        profile_name: attempt.profile_name.clone(),
+        scope: attempt.scope.clone(),
+        credential: control_plane::AuthCredentialView::Oauth {
+            access_token_vault_ref,
+            refresh_token_vault_ref,
+            token_endpoint: attempt.token_endpoint.to_string(),
+            client_id: Some(attempt.client_id.clone()),
+            client_secret_vault_ref,
+            scopes: attempt.scopes.clone(),
+            expires_at_unix_ms,
+            refresh_state,
+        },
+        created_at_unix_ms: 0,
+        updated_at_unix_ms: 0,
+    };
+    let context = request_context_from_console_action(&attempt.context);
+    persist_openai_auth_profile(state, &context, profile).await?;
+    if attempt.set_default {
+        persist_model_provider_auth_profile_selection(
+            state,
+            &context,
+            attempt.profile_id.as_str(),
+            ModelProviderAuthProviderKind::Openai,
+        )
+        .await?;
+    }
+    Ok(if attempt.set_default {
+        "OpenAI OAuth profile connected and selected as the default auth profile.".to_owned()
+    } else {
+        "OpenAI OAuth profile connected.".to_owned()
     })
 }
 
@@ -1487,6 +1879,7 @@ async fn start_minimax_oauth_attempt(
         token_endpoint: endpoint_config.token_endpoint,
         code_verifier,
         device_user_code: Some(code_response.user_code.clone()),
+        device_auth_id: None,
         poll_interval_ms,
         next_poll_after_unix_ms: now.saturating_add(poll_interval_ms.try_into().unwrap_or(0)),
         set_default,
@@ -3452,10 +3845,11 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: String::new(),
             scopes: vec!["openid".to_owned()],
-            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+            token_endpoint: Url::parse("https://auth.openai.com/oauth/token")
                 .expect("token endpoint URL should parse"),
             code_verifier: "verifier".to_owned(),
             device_user_code: None,
+            device_auth_id: None,
             poll_interval_ms: 0,
             next_poll_after_unix_ms: 0,
             set_default: false,
@@ -3490,10 +3884,11 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: String::new(),
             scopes: vec!["openid".to_owned()],
-            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+            token_endpoint: Url::parse("https://auth.openai.com/oauth/token")
                 .expect("token endpoint URL should parse"),
             code_verifier: "verifier".to_owned(),
             device_user_code: None,
+            device_auth_id: None,
             poll_interval_ms: 0,
             next_poll_after_unix_ms: 0,
             set_default: false,
@@ -3579,6 +3974,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_openai_chatgpt_poll_interval_accepts_number_and_string() {
+        assert_eq!(normalize_openai_chatgpt_poll_interval_ms(Some(json!(2))), 3_000);
+        assert_eq!(normalize_openai_chatgpt_poll_interval_ms(Some(json!("7"))), 7_000);
+        assert_eq!(normalize_openai_chatgpt_poll_interval_ms(Some(json!(120))), 60_000);
+        assert_eq!(normalize_openai_chatgpt_poll_interval_ms(None), 5_000);
+    }
+
     fn test_openai_oauth_attempt(
         state: OpenAiOAuthAttemptStateRecord,
         expires_at_unix_ms: i64,
@@ -3594,10 +3997,11 @@ mod tests {
             client_id: "client".to_owned(),
             client_secret: String::new(),
             scopes: vec!["openid".to_owned()],
-            token_endpoint: Url::parse("https://auth0.openai.com/oauth/token")
+            token_endpoint: Url::parse("https://auth.openai.com/oauth/token")
                 .expect("token endpoint URL should parse"),
             code_verifier: "verifier".to_owned(),
             device_user_code: None,
+            device_auth_id: None,
             poll_interval_ms: 0,
             next_poll_after_unix_ms: 0,
             set_default: false,

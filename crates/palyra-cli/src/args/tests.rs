@@ -3270,13 +3270,47 @@ fn parse_auth_openai_oauth_start() {
                     profile_name: None,
                     scope: AuthScopeArg::Global,
                     agent_id: None,
-                    client_id: "client-123".to_owned(),
+                    client_id: Some("client-123".to_owned()),
                     client_secret_env: Some("OPENAI_CLIENT_SECRET".to_owned()),
                     client_secret_stdin: false,
                     client_secret_prompt: false,
                     scope_value: vec!["openid".to_owned(), "offline_access".to_owned()],
                     set_default: true,
                     open: true,
+                    json: false,
+                },
+            },
+        }
+    );
+}
+
+#[test]
+fn parse_auth_openai_oauth_start_uses_public_device_flow_without_client_id() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "auth",
+        "openai",
+        "oauth-start",
+        "--profile-id",
+        "openai-default",
+        "--set-default",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Openai {
+                command: AuthOpenAiCommand::OauthStart {
+                    profile_id: Some("openai-default".to_owned()),
+                    profile_name: None,
+                    scope: AuthScopeArg::Global,
+                    agent_id: None,
+                    client_id: None,
+                    client_secret_env: None,
+                    client_secret_stdin: false,
+                    client_secret_prompt: false,
+                    scope_value: Vec::new(),
+                    set_default: true,
+                    open: false,
                     json: false,
                 },
             },

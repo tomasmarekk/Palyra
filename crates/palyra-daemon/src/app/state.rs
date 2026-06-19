@@ -146,6 +146,7 @@ pub(crate) struct OpenAiOAuthAttempt {
     pub(crate) token_endpoint: Url,
     pub(crate) code_verifier: String,
     pub(crate) device_user_code: Option<String>,
+    pub(crate) device_auth_id: Option<String>,
     pub(crate) poll_interval_ms: u64,
     pub(crate) next_poll_after_unix_ms: i64,
     pub(crate) set_default: bool,
@@ -172,6 +173,7 @@ impl std::fmt::Debug for OpenAiOAuthAttempt {
             .field("token_endpoint", &redact_url(self.token_endpoint.as_str()))
             .field("code_verifier", &REDACTED)
             .field("device_user_code", &self.device_user_code)
+            .field("device_auth_id", &REDACTED)
             .field("poll_interval_ms", &self.poll_interval_ms)
             .field("next_poll_after_unix_ms", &self.next_poll_after_unix_ms)
             .field("set_default", &self.set_default)

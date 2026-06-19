@@ -2,8 +2,9 @@
 //! control (tokens, workspaces, invitations), and OpenAI provider auth flows.
 //!
 //! Credentials are handled as vault references only; raw secrets enter exclusively
-//! through load_secret_input (env/stdin/prompt) and OAuth authorization URLs are
-//! kept out of text output. Output lines are pinned by CLI parity tests.
+//! through load_secret_input (env/stdin/prompt). OAuth launch text prints the
+//! user-facing URL because device-login flows depend on copy/paste access to it.
+//! Output lines are pinned by CLI parity tests.
 
 use crate::*;
 use palyra_control_plane as control_plane;
@@ -831,7 +832,7 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     profile_id,
                     profile_name,
                     scope: Some(build_control_plane_scope(scope, agent_id)?),
-                    client_id: Some(client_id),
+                    client_id,
                     client_secret,
                     scopes: scope_value,
                     set_default,
@@ -1105,10 +1106,10 @@ fn emit_openai_oauth_launch(payload: OpenAiOAuthLaunchPayload, json_output: bool
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-// Text output reports only authorization_url_present, never the URL itself: the
-// URL carries the OAuth state token and would leak via terminal history or logs.
-// Pinned by openai_oauth_launch_text_output_omits_authorization_url.
-fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String; 2] {
+// OpenAI's ChatGPT/Codex device flow requires the operator to copy or open the
+// verification URL, so text output includes it explicitly.
+fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String; 3] {
+    let authorization_url = payload.authorization_url.replace('"', "'");
     [
         format!(
             "auth.openai.oauth.start attempt_id={} profile_id={} expires_at_unix_ms={} authorization_url_present={} opened={}",
@@ -1118,6 +1119,7 @@ fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String
             !payload.authorization_url.trim().is_empty(),
             payload.opened
         ),
+        format!("auth.openai.oauth.authorization_url=\"{authorization_url}\""),
         format!("auth.openai.oauth.message=\"{}\"", payload.message.replace('"', "'")),
     ]
 }
@@ -1431,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_oauth_launch_text_output_omits_authorization_url() {
+    fn openai_oauth_launch_text_output_includes_authorization_url() {
         let payload = OpenAiOAuthLaunchPayload {
             attempt_id: "attempt-1".to_owned(),
             authorization_url: "https://auth.openai.example/authorize?state=attempt-1".to_owned(),
@@ -1443,7 +1445,11 @@ mod tests {
         let output = openai_oauth_launch_text_lines(&payload).join("\n");
 
         assert!(output.contains("authorization_url_present=true"), "{output}");
-        assert!(!output.contains("https://auth.openai.example"), "{output}");
-        assert!(!output.contains("state=attempt-1"), "{output}");
+        assert!(
+            output.contains(
+                "auth.openai.oauth.authorization_url=\"https://auth.openai.example/authorize?state=attempt-1\""
+            ),
+            "{output}"
+        );
     }
 }

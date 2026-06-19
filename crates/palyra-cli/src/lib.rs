@@ -4132,7 +4132,13 @@ fn browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
 
 #[cfg(any(target_os = "windows", test))]
 fn build_windows_browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
-    vec![BrowserOpenCommand { program: "explorer.exe", args: vec![url.to_owned()] }]
+    vec![
+        BrowserOpenCommand {
+            program: "rundll32.exe",
+            args: vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        },
+        BrowserOpenCommand { program: "explorer.exe", args: vec![url.to_owned()] },
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -12317,12 +12323,17 @@ pinned_gateway_ca_fingerprint_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     }
 
     #[test]
-    fn windows_browser_open_commands_use_direct_explorer_without_cmd_shell() {
+    fn windows_browser_open_commands_use_shell_free_handlers() {
         let url = "https://dashboard.example.com/&calc";
         let commands = build_windows_browser_open_commands(url);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].program, "explorer.exe");
-        assert_eq!(commands[0].args, vec![url]);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].program, "rundll32.exe");
+        assert_eq!(
+            commands[0].args,
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()]
+        );
+        assert_eq!(commands[1].program, "explorer.exe");
+        assert_eq!(commands[1].args, vec![url]);
         assert!(
             commands.iter().all(|command| command.program != "cmd"),
             "dashboard URLs must not be passed through cmd.exe"

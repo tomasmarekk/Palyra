@@ -36,8 +36,8 @@ const OPENAI_REVOCATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const ENV_OPENAI_AUTHORIZATION_ENDPOINT: &str = "PALYRA_OPENAI_OAUTH_AUTHORIZATION_ENDPOINT";
 const ENV_OPENAI_TOKEN_ENDPOINT: &str = "PALYRA_OPENAI_OAUTH_TOKEN_ENDPOINT";
 const ENV_OPENAI_REVOCATION_ENDPOINT: &str = "PALYRA_OPENAI_OAUTH_REVOCATION_ENDPOINT";
-const OPENAI_AUTHORIZATION_ENDPOINT: &str = "https://auth.openai.com/authorize";
-const OPENAI_TOKEN_ENDPOINT: &str = "https://auth0.openai.com/oauth/token";
+const OPENAI_AUTHORIZATION_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_REVOCATION_ENDPOINT: &str = "https://auth0.openai.com/oauth/revoke";
 const MODELS_PATH: &str = "models";
 

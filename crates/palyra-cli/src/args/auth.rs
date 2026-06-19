@@ -180,7 +180,7 @@ pub enum AuthOpenAiCommand {
         #[arg(long)]
         agent_id: Option<String>,
         #[arg(long)]
-        client_id: String,
+        client_id: Option<String>,
         #[arg(long)]
         client_secret_env: Option<String>,
         #[arg(long, default_value_t = false)]

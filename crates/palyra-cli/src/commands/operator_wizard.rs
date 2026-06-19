@@ -2928,10 +2928,17 @@ fn apply_deferred_provider_auth_method(
         }
         _ => anyhow::bail!("unsupported non-API-key auth method: {auth_method}"),
     }
-    warnings.push(format!(
-        "{} was selected; finish or select a matching auth profile before enabling remote model calls.",
-        auth_method_label(auth_method)
-    ));
+    if auth_method == "chatgpt_login" {
+        warnings.push(
+            "ChatGPT Login was selected; after the gateway is running, run `palyra auth openai oauth-start --set-default --open`, sign in at the printed URL, then run `palyra auth openai oauth-state <attempt_id>` until it reports succeeded."
+                .to_owned(),
+        );
+    } else {
+        warnings.push(format!(
+            "{} was selected; finish or select a matching auth profile before enabling remote model calls.",
+            auth_method_label(auth_method)
+        ));
+    }
     Ok(())
 }
 
@@ -4564,6 +4571,29 @@ role = "chat"
         assert!(
             warnings.iter().any(|warning| warning.contains("xAI OAuth")),
             "deferred method should emit an actionable auth-profile warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_chatgpt_auth_method_points_to_public_oauth_command() {
+        let mut document = toml::Value::Table(Default::default());
+        let mut warnings = Vec::new();
+
+        apply_deferred_provider_auth_method(&mut document, "chatgpt_login", &mut warnings)
+            .expect("ChatGPT Login defaults should apply");
+
+        assert_eq!(
+            get_string_value_at_path(&document, "model_provider.openai_base_url")
+                .expect("OpenAI base URL lookup should succeed")
+                .as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.contains("palyra auth openai oauth-start --set-default --open")
+                    && warning.contains("oauth-state <attempt_id>")
+            }),
+            "ChatGPT warning should point to the public OAuth command: {warnings:?}"
         );
     }
 
