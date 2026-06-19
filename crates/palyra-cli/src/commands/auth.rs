@@ -1459,8 +1459,6 @@ fn build_provider_status_payload(
     auth_health: control_plane::AuthHealthEnvelope,
     profiles: control_plane::AuthProfileListEnvelope,
 ) -> Result<OpenAiAuthStatusPayload> {
-    let summary = serde_json::from_value::<OpenAiAuthHealthSummary>(auth_health.summary)
-        .context("failed to decode OpenAI auth health summary")?;
     let refresh_metrics =
         serde_json::from_value::<OpenAiRefreshMetricsEnvelope>(auth_health.refresh_metrics)
             .context("failed to decode OpenAI refresh metrics")?;
@@ -1473,10 +1471,16 @@ fn build_provider_status_payload(
             successes: entry.successes,
             failures: entry.failures,
         })
-        .unwrap_or(OpenAiRefreshSnapshot {
-            attempts: refresh_metrics.attempts,
-            successes: refresh_metrics.successes,
-            failures: refresh_metrics.failures,
+        .unwrap_or_else(|| {
+            if provider_key.eq_ignore_ascii_case("openai") {
+                OpenAiRefreshSnapshot {
+                    attempts: refresh_metrics.attempts,
+                    successes: refresh_metrics.successes,
+                    failures: refresh_metrics.failures,
+                }
+            } else {
+                OpenAiRefreshSnapshot { attempts: 0, successes: 0, failures: 0 }
+            }
         });
     let health_profiles = auth_health
         .profiles
@@ -1485,6 +1489,7 @@ fn build_provider_status_payload(
         .filter(|profile| profile.provider.eq_ignore_ascii_case(provider_key))
         .map(|profile| (profile.profile_id.clone(), profile))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let summary = provider_health_summary(health_profiles.values());
     let profiles = profiles
         .profiles
         .into_iter()
@@ -1521,6 +1526,24 @@ fn build_provider_status_payload(
         refresh,
         profiles,
     })
+}
+
+fn provider_health_summary<'a>(
+    profiles: impl Iterator<Item = &'a OpenAiAuthHealthProfile>,
+) -> OpenAiAuthHealthSummary {
+    let mut summary = OpenAiAuthHealthSummary::default();
+    for profile in profiles {
+        summary.total += 1;
+        match normalize_openai_health_state(profile.state.as_str()).as_str() {
+            "ok" => summary.ok += 1,
+            "expiring" => summary.expiring += 1,
+            "expired" => summary.expired += 1,
+            "missing" => summary.missing += 1,
+            "static" => summary.static_count += 1,
+            _ => summary.missing += 1,
+        }
+    }
+    summary
 }
 
 fn build_openai_oauth_launch_payload(
@@ -2454,13 +2477,13 @@ fn load_secret_input(
 mod tests {
     use super::{
         build_anthropic_oauth_authorization_url, build_auth_profiles_list_json_payload,
-        build_openai_oauth_launch_payload, build_xai_oauth_authorization_url,
-        normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
-        parse_anthropic_authorization_code, parse_xai_callback_url, AnthropicOAuthTokenResponse,
-        OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
-        ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
-        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI,
-        XAI_OAUTH_SCOPE,
+        build_openai_oauth_launch_payload, build_provider_status_payload,
+        build_xai_oauth_authorization_url, normalize_xai_oauth_endpoint,
+        openai_oauth_launch_text_lines, parse_anthropic_authorization_code, parse_xai_callback_url,
+        AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL,
+        ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES,
+        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
+        XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -2502,6 +2525,76 @@ mod tests {
             AUTH_PROFILES_EMPTY_REGISTRY_NOTE.contains("auth-profile registry"),
             "empty-registry note should keep the command boundary explicit"
         );
+    }
+
+    #[test]
+    fn provider_status_payload_summarizes_only_requested_provider() {
+        let contract = control_plane::ContractDescriptor {
+            contract_version: control_plane::CONTROL_PLANE_CONTRACT_VERSION.to_owned(),
+        };
+        let payload = build_provider_status_payload(
+            "xai",
+            control_plane::ProviderAuthStateEnvelope {
+                contract: contract.clone(),
+                provider: "xai".to_owned(),
+                oauth_supported: true,
+                bootstrap_supported: false,
+                callback_supported: false,
+                reconnect_supported: true,
+                revoke_supported: true,
+                default_selection_supported: true,
+                default_profile_id: None,
+                available_profile_ids: Vec::new(),
+                state: "not_configured".to_owned(),
+                note: None,
+            },
+            control_plane::AuthHealthEnvelope {
+                contract: contract.clone(),
+                summary: json!({
+                    "total": 1,
+                    "ok": 1,
+                }),
+                expiry_distribution: json!({}),
+                profiles: vec![json!({
+                    "profile_id": "openai-default",
+                    "provider": "openai",
+                    "state": "ok",
+                    "reason": "oauth access token is healthy",
+                })],
+                refresh_metrics: json!({
+                    "attempts": 4,
+                    "successes": 4,
+                    "failures": 0,
+                    "by_provider": [
+                        {
+                            "provider": "openai",
+                            "attempts": 4,
+                            "successes": 4,
+                            "failures": 0,
+                        }
+                    ],
+                }),
+            },
+            control_plane::AuthProfileListEnvelope {
+                contract,
+                profiles: Vec::new(),
+                page: control_plane::PageInfo {
+                    limit: 50,
+                    returned: 0,
+                    next_cursor: None,
+                    has_more: false,
+                },
+            },
+        )
+        .expect("fixture payload is valid");
+
+        assert_eq!(payload.provider, "xai");
+        assert_eq!(payload.summary.total, 0);
+        assert_eq!(payload.summary.ok, 0);
+        assert_eq!(payload.refresh.attempts, 0);
+        assert_eq!(payload.refresh.successes, 0);
+        assert_eq!(payload.refresh.failures, 0);
+        assert!(payload.profiles.is_empty());
     }
 
     #[test]
