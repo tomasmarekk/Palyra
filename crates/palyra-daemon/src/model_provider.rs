@@ -11,10 +11,11 @@
 //! [`ModelProviderRegistryConfig`] and fails over between providers when the
 //! primary candidate errors.
 //!
-//! Streaming semantics: upstream HTTP calls are non-streaming; each full turn
-//! output is re-chunked into bounded [`ProviderEvent::ModelToken`] preview
-//! events (see the `streaming` and `contract` submodules) so the orchestrator
-//! consumes one uniform event stream regardless of backend.
+//! Streaming semantics: provider output is normalized into bounded
+//! [`ProviderEvent::ModelToken`] preview events (see the `streaming` and
+//! `contract` submodules) so the orchestrator consumes one uniform event
+//! stream regardless of whether the upstream transport is streaming or
+//! response-body based.
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     future::Future,
@@ -26,6 +27,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use palyra_common::secret_refs::SecretRef;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -41,7 +43,10 @@ mod contract;
 mod error_envelope;
 mod streaming;
 
-use adapters::{AnthropicCompatibleChatAdapter, OpenAiCompatibleChatAdapter, ProviderChatAdapter};
+use adapters::{
+    openai_responses_tool_wire_name_map, AnthropicCompatibleChatAdapter,
+    OpenAiCompatibleChatAdapter, OpenAiResponsesChatAdapter, ProviderChatAdapter,
+};
 use contract::provider_request_has_vision;
 pub(crate) use contract::{
     bounded_provider_turn_output_for_persistence, provider_events_from_output,
@@ -62,6 +67,13 @@ use streaming::provider_output_from_text_and_tools;
 pub use streaming::{ProviderStreamAccumulator, ProviderStreamEvent};
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const OPENAI_CODEX_RESPONSES_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_RESPONSES_PATH: &str = "/responses";
+const OPENAI_CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
+const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const OPENAI_CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (Palyra)";
+const OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
+const OPENAI_CHATGPT_ACCOUNT_ID_CLAIM: &str = "chatgpt_account_id";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
@@ -3884,6 +3896,56 @@ struct OpenAiToolFunction {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiResponsesResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<OpenAiResponsesUsage>,
+    #[serde(default)]
+    output: Vec<OpenAiResponsesOutputItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponsesOutputItem {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<Value>,
+    #[serde(default)]
+    content: Vec<OpenAiResponsesContentPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponsesContentPart {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponsesUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiUsage {
     #[serde(default)]
     prompt_tokens: u64,
@@ -4296,6 +4358,19 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    fn codex_responses_endpoint(&self) -> String {
+        format!("{}{}", self.codex_responses_base_url(), OPENAI_CODEX_RESPONSES_PATH)
+    }
+
+    fn codex_responses_base_url(&self) -> String {
+        let configured = self.config.openai_base_url.trim_end_matches('/');
+        if configured.to_ascii_lowercase().contains("api.openai.com") {
+            OPENAI_CODEX_RESPONSES_BASE_URL.to_owned()
+        } else {
+            configured.to_owned()
+        }
+    }
+
     fn audio_transcriptions_endpoint(&self) -> String {
         format!(
             "{}{}",
@@ -4320,6 +4395,10 @@ impl OpenAiCompatibleProvider {
         api_key: &str,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, AttemptError> {
+        if self.uses_codex_responses_transport(api_key) {
+            return self.request_once_codex_responses(api_key, request).await;
+        }
+
         let actual_model_id =
             request.model_override.clone().unwrap_or_else(|| self.config.openai_model.clone());
         let adapter = OpenAiCompatibleChatAdapter;
@@ -4491,6 +4570,80 @@ impl OpenAiCompatibleProvider {
         })
     }
 
+    fn uses_codex_responses_transport(&self, api_key: &str) -> bool {
+        self.config.auth_profile_provider_kind == Some(ModelProviderAuthProviderKind::Openai)
+            && openai_chatgpt_oauth_claims(api_key).is_some()
+    }
+
+    async fn request_once_codex_responses(
+        &self,
+        api_key: &str,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse, AttemptError> {
+        let requested_model_id =
+            request.model_override.as_deref().unwrap_or(self.config.openai_model.as_str());
+        let actual_model_id = openai_codex_runtime_model_id(requested_model_id);
+        let adapter = OpenAiResponsesChatAdapter;
+        let body = adapter.request_payload(request, actual_model_id.as_str());
+        let endpoint = self.codex_responses_endpoint();
+        let mut builder = self
+            .client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Accept", "text/event-stream")
+            .header("User-Agent", OPENAI_CODEX_USER_AGENT)
+            .header("originator", OPENAI_CODEX_ORIGINATOR)
+            .json(&body);
+        if let Some(account_id) = openai_chatgpt_account_id_from_token(api_key) {
+            builder = builder.header("ChatGPT-Account-ID", account_id);
+        }
+
+        let response = builder.send().await.map_err(|error| {
+            AttemptError::request_failed(
+                format!("openai-codex responses request failed: {error}"),
+                true,
+                classify_reqwest_provider_failure("openai_codex_responses_request", &error),
+            )
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<openai-codex error body unavailable>".to_owned());
+            return Err(AttemptError::request_failed(
+                format!(
+                    "openai-codex responses endpoint returned HTTP {status}: {}",
+                    sanitize_remote_error(&body_text)
+                ),
+                retryable,
+                classify_http_provider_failure(
+                    status,
+                    retryable,
+                    "openai_codex_responses_http",
+                    body_text.as_str(),
+                ),
+            ));
+        }
+
+        let body_text = response.text().await.map_err(|error| {
+            AttemptError::request_failed(
+                format!("openai-codex responses stream read failed: {error}"),
+                true,
+                classify_reqwest_provider_failure("openai_codex_responses_body", &error),
+            )
+        })?;
+        let parsed = parse_openai_codex_sse_response(body_text.as_str()).map_err(|error| {
+            AttemptError::invalid_response(
+                format!("openai-codex responses SSE parsing failed: {error}"),
+                "openai_codex_responses_sse",
+            )
+        })?;
+        openai_codex_provider_response(parsed, request, actual_model_id)
+    }
+
     async fn transcribe_audio_once(
         &self,
         api_key: &str,
@@ -4589,6 +4742,327 @@ impl OpenAiCompatibleProvider {
             retry_count: 0,
             segments,
         })
+    }
+}
+
+fn openai_chatgpt_oauth_claims(token: &str) -> Option<Value> {
+    let claims = decode_jwt_payload(token)?;
+    if claims.get(OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE).is_some()
+        || claims.get(OPENAI_CHATGPT_ACCOUNT_ID_CLAIM).is_some()
+    {
+        Some(claims)
+    } else {
+        None
+    }
+}
+
+fn openai_chatgpt_account_id_from_token(token: &str) -> Option<String> {
+    let claims = openai_chatgpt_oauth_claims(token)?;
+    claims
+        .get(OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE)
+        .and_then(|namespace| namespace.get(OPENAI_CHATGPT_ACCOUNT_ID_CLAIM))
+        .or_else(|| claims.get(OPENAI_CHATGPT_ACCOUNT_ID_CLAIM))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    if payload.is_empty() {
+        return None;
+    }
+    let mut padded = payload.to_owned();
+    match padded.len() % 4 {
+        0 => {}
+        2 => padded.push_str("=="),
+        3 => padded.push('='),
+        _ => return None,
+    }
+    let decoded = URL_SAFE.decode(padded.as_bytes()).ok()?;
+    serde_json::from_slice(decoded.as_slice()).ok()
+}
+
+fn openai_codex_runtime_model_id(configured_model_id: &str) -> String {
+    let model_id = configured_model_id.rsplit('/').next().unwrap_or(configured_model_id).trim();
+    if openai_codex_model_id_is_supported(model_id) {
+        model_id.to_owned()
+    } else {
+        OPENAI_CODEX_DEFAULT_MODEL.to_owned()
+    }
+}
+
+fn openai_codex_model_id_is_supported(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    normalized == "chat-latest" || normalized.starts_with("gpt-5.") || normalized.contains("-codex")
+}
+
+fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse> {
+    let mut parsed = OpenAiResponsesResponse {
+        id: None,
+        model: None,
+        status: None,
+        output_text: None,
+        usage: None,
+        output: Vec::new(),
+    };
+    let mut streamed_text = String::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(data)
+            .with_context(|| format!("invalid OpenAI Codex SSE data frame: {data}"))?;
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    streamed_text.push_str(delta);
+                }
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    parsed.output.push(
+                        serde_json::from_value(item.clone())
+                            .context("invalid OpenAI Codex output item frame")?,
+                    );
+                }
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                if event_type == "response.incomplete" && parsed.status.is_none() {
+                    parsed.status = Some("incomplete".to_owned());
+                } else if event_type == "response.failed" && parsed.status.is_none() {
+                    parsed.status = Some("failed".to_owned());
+                }
+                if let Some(response) = event.get("response") {
+                    apply_openai_codex_terminal_response(&mut parsed, response)?;
+                }
+            }
+            "error" => {
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stream emitted error event");
+                anyhow::bail!("OpenAI Codex SSE error event: {}", sanitize_remote_error(message));
+            }
+            _ => {}
+        }
+    }
+
+    if !streamed_text.is_empty() {
+        parsed.output_text = Some(streamed_text);
+    }
+    if parsed.status.is_none() && (parsed.output_text.is_some() || !parsed.output.is_empty()) {
+        parsed.status = Some("completed".to_owned());
+    }
+    if parsed.output_text.is_none() && parsed.output.is_empty() {
+        anyhow::bail!("OpenAI Codex SSE stream did not include output text or output items");
+    }
+    Ok(parsed)
+}
+
+fn apply_openai_codex_terminal_response(
+    parsed: &mut OpenAiResponsesResponse,
+    response: &Value,
+) -> Result<()> {
+    if parsed.id.is_none() {
+        parsed.id = response.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+    }
+    if parsed.model.is_none() {
+        parsed.model = response.get("model").and_then(Value::as_str).map(ToOwned::to_owned);
+    }
+    if parsed.status.is_none() {
+        parsed.status = response.get("status").and_then(Value::as_str).map(ToOwned::to_owned);
+    }
+    if parsed.output_text.is_none() {
+        parsed.output_text =
+            response.get("output_text").and_then(Value::as_str).map(ToOwned::to_owned);
+    }
+    if parsed.usage.is_none() {
+        parsed.usage = response
+            .get("usage")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .context("invalid OpenAI Codex usage frame")?;
+    }
+    if parsed.output.is_empty() {
+        if let Some(items) = response.get("output").and_then(Value::as_array) {
+            for item in items {
+                parsed.output.push(
+                    serde_json::from_value(item.clone())
+                        .context("invalid OpenAI Codex terminal output item")?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn openai_codex_provider_response(
+    parsed: OpenAiResponsesResponse,
+    request: &ProviderRequest,
+    actual_model_id: String,
+) -> Result<ProviderResponse, AttemptError> {
+    let provider_response_id = parsed.id.clone();
+    let provider_model_id = parsed.model.clone();
+    let finish_status = parsed.status.clone();
+    let provider_usage = parsed.usage.as_ref().map(|usage| ProviderUsage {
+        prompt_tokens: usage.input_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: if usage.total_tokens == 0 {
+            usage.input_tokens.saturating_add(usage.output_tokens)
+        } else {
+            usage.total_tokens
+        },
+        source: "provider".to_owned(),
+    });
+
+    let original_tool_names = openai_codex_original_tool_names_by_wire_name(request);
+    let mut text_parts = Vec::new();
+    let mut tool_events = Vec::new();
+    for item in parsed.output {
+        match item.kind.as_str() {
+            "message" => {
+                for part in item.content {
+                    if matches!(part.kind.as_str(), "output_text" | "text") {
+                        if let Some(text) = part.text.filter(|text| !text.is_empty()) {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                let Some(wire_tool_name) = item.name.map(|name| name.trim().to_owned()) else {
+                    continue;
+                };
+                if wire_tool_name.is_empty() {
+                    continue;
+                }
+                let tool_name = original_tool_names
+                    .get(wire_tool_name.as_str())
+                    .cloned()
+                    .unwrap_or(wire_tool_name);
+                let arguments = openai_responses_tool_arguments(item.arguments);
+                let input_json = normalize_tool_arguments(arguments.as_str()).map_err(|error| {
+                    AttemptError::invalid_response(
+                        format!("openai-codex tool arguments are invalid: {error}"),
+                        "openai_codex_responses_tool_arguments",
+                    )
+                })?;
+                tool_events.push(ProviderEvent::ToolProposal {
+                    proposal_id: item
+                        .call_id
+                        .or(item.id)
+                        .unwrap_or_else(|| Ulid::new().to_string()),
+                    tool_name,
+                    input_json,
+                });
+            }
+            _ => {}
+        }
+    }
+    if text_parts.is_empty() {
+        if let Some(output_text) = parsed.output_text.filter(|text| !text.trim().is_empty()) {
+            text_parts.push(output_text);
+        }
+    }
+
+    let completion_text = text_parts.join("");
+    let full_text = if completion_text.trim().is_empty() && tool_events.is_empty() {
+        "ack".to_owned()
+    } else {
+        completion_text
+    };
+    let usage = provider_usage.unwrap_or_else(|| {
+        ProviderUsage::new(
+            estimate_token_count(request.input_text.as_str()),
+            estimate_token_count(full_text.as_str()),
+            "estimated",
+        )
+    });
+    let finish_reason = if tool_events.is_empty() {
+        finish_reason_from_openai_responses_status(finish_status.as_deref())
+    } else {
+        ProviderFinishReason::ToolCalls
+    };
+    let output = provider_output_from_text_and_tools(
+        full_text,
+        tool_events,
+        finish_reason,
+        usage,
+        ProviderRawProviderRefs {
+            provider_response_id,
+            provider_model_id,
+            system_fingerprint: None,
+            provider_trace_ref: Some("openai_codex_responses".to_owned()),
+            stream_spill_ref: None,
+        },
+    );
+    let events = provider_events_from_output(&output);
+
+    Ok(ProviderResponse {
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens: output.usage.completion_tokens,
+        output,
+        events,
+        retry_count: 0,
+        provider_id: "openai-primary".to_owned(),
+        model_id: actual_model_id.clone(),
+        served_from_cache: false,
+        failover_count: 0,
+        attempts: vec![ProviderAttemptSummary {
+            provider_id: "openai-primary".to_owned(),
+            model_id: actual_model_id,
+            outcome: "success".to_owned(),
+            retryable: false,
+            served_from_cache: false,
+            reason_code: None,
+        }],
+    })
+}
+
+fn openai_codex_original_tool_names_by_wire_name(
+    request: &ProviderRequest,
+) -> HashMap<String, String> {
+    let Some(snapshot) = request.tool_catalog_snapshot.as_ref() else {
+        return HashMap::new();
+    };
+    openai_responses_tool_wire_name_map(snapshot)
+        .into_iter()
+        .map(|(original_name, wire_name)| (wire_name, original_name))
+        .collect()
+}
+
+fn openai_responses_tool_arguments(arguments: Option<Value>) -> String {
+    match arguments {
+        Some(Value::String(arguments)) => {
+            let trimmed = arguments.trim();
+            if trimmed.is_empty() {
+                "{}".to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        Some(Value::Null) | None => "{}".to_owned(),
+        Some(arguments) => serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned()),
+    }
+}
+
+fn finish_reason_from_openai_responses_status(status: Option<&str>) -> ProviderFinishReason {
+    match status.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "completed" => ProviderFinishReason::Stop,
+        "incomplete" => ProviderFinishReason::Length,
+        "failed" => ProviderFinishReason::Error,
+        "cancelled" | "canceled" => ProviderFinishReason::Cancelled,
+        _ => ProviderFinishReason::Unknown,
     }
 }
 
@@ -5893,6 +6367,7 @@ mod tests {
         ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
         ProviderTurnOutput, ProviderUsage, OPENAI_RETRYABLE_STATUS_CODES,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     #[test]
     fn provider_seconds_to_millis_preserves_subsecond_precision() {
@@ -6457,7 +6932,7 @@ mod tests {
             "schema_version": 1,
             "snapshot_id": snapshot_id,
             "catalog_hash": catalog_hash,
-            "provider_dialect": "openai_compatible",
+            "provider_dialect": "open_ai_compatible",
             "provider_kind": "openai_compatible",
             "provider_model_id": "gpt-4o-mini",
             "surface": "run_stream",
@@ -6740,6 +7215,126 @@ mod tests {
             "status snapshot should accumulate completion token usage per provider request"
         );
         handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chatgpt_oauth_token_uses_codex_responses_transport() {
+        let response_body = [
+            r#"data: {"type":"response.output_text.delta","delta":"PALYRA_ONBOARDING_OK"}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"id":"resp_test","model":"gpt-5.4-mini","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![(200_u16, response_body)]);
+        let codex_base_url =
+            base_url.strip_suffix("/v1").expect("test helper base URL should end in /v1");
+        let mut config = openai_test_config(codex_base_url.to_owned());
+        config.openai_model = "gpt-5.4-mini".to_owned();
+        config.openai_api_key = Some(fake_chatgpt_oauth_token("acct_test_123"));
+        config.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+        let provider = build_model_provider(&config).expect("openai provider should build");
+        let mut request =
+            ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        request.tool_catalog_snapshot =
+            Some(tool_catalog_response_cache_fixture(1_781_883_663_913, "snapshot-01", "hash-01"));
+
+        let response = provider
+            .complete(request)
+            .await
+            .expect("chatgpt oauth provider should use responses transport");
+
+        assert_eq!(response.output.full_text, "PALYRA_ONBOARDING_OK");
+        assert_eq!(response.prompt_tokens, 3);
+        assert_eq!(response.completion_tokens, 4);
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        let captured = requests.first().expect("server should capture one request");
+        assert_eq!(captured.path, "/responses");
+        assert_eq!(
+            header_value(captured, "originator").as_deref(),
+            Some(super::OPENAI_CODEX_ORIGINATOR)
+        );
+        assert_eq!(
+            header_value(captured, "user-agent").as_deref(),
+            Some(super::OPENAI_CODEX_USER_AGENT)
+        );
+        assert_eq!(header_value(captured, "chatgpt-account-id").as_deref(), Some("acct_test_123"));
+        let request_body: serde_json::Value =
+            serde_json::from_str(captured.body.as_str()).expect("request body should be JSON");
+        assert_eq!(request_body["model"], "gpt-5.4-mini");
+        assert_eq!(request_body["stream"], true);
+        assert_eq!(request_body["store"], false);
+        assert_eq!(request_body["instructions"], "You are a helpful assistant.");
+        assert_eq!(request_body["input"][0]["role"], "user");
+        assert_eq!(request_body["tool_choice"], "auto");
+        assert_eq!(request_body["tools"][0]["name"], "palyra_echo");
+        drop(requests);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chatgpt_oauth_responses_maps_sanitized_tool_names_to_palyra_tools() {
+        let response_body = [
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":"{\"text\":\"hello\"}"}}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"id":"resp_tool","model":"gpt-5.5","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, request_count, handle) =
+            spawn_scripted_server(vec![(200_u16, response_body)]);
+        let codex_base_url =
+            base_url.strip_suffix("/v1").expect("test helper base URL should end in /v1");
+        let mut config = openai_test_config(codex_base_url.to_owned());
+        config.openai_api_key = Some(fake_chatgpt_oauth_token("acct_tool_123"));
+        config.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+        let provider = build_model_provider(&config).expect("openai provider should build");
+        let mut request =
+            ProviderRequest::from_input_text("use a tool".to_owned(), false, Vec::new(), None);
+        request.tool_catalog_snapshot =
+            Some(tool_catalog_response_cache_fixture(1_781_883_663_913, "snapshot-02", "hash-02"));
+
+        let response =
+            provider.complete(request).await.expect("chatgpt oauth tool response should parse");
+
+        let proposal = response
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolProposal { proposal_id, tool_name, input_json } => {
+                    Some((proposal_id, tool_name, input_json))
+                }
+                ProviderEvent::ModelToken { .. } => None,
+            })
+            .expect("responses transport should emit the tool proposal");
+        assert_eq!(proposal.0, "call_01");
+        assert_eq!(proposal.1, "palyra.echo");
+        let input_json: serde_json::Value =
+            serde_json::from_slice(proposal.2).expect("tool input should remain valid JSON");
+        assert_eq!(input_json["text"], "hello");
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[test]
+    fn chatgpt_oauth_account_id_is_read_from_jwt_claims() {
+        let token = fake_chatgpt_oauth_token("acct_unit_456");
+
+        let account_id = super::openai_chatgpt_account_id_from_token(token.as_str());
+
+        assert_eq!(account_id.as_deref(), Some("acct_unit_456"));
+    }
+
+    #[test]
+    fn chatgpt_oauth_runtime_model_falls_back_to_codex_default() {
+        assert_eq!(super::openai_codex_runtime_model_id("gpt-4o-mini"), "gpt-5.5");
+        assert_eq!(super::openai_codex_runtime_model_id("openai/gpt-5.4-mini"), "gpt-5.4-mini");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7711,5 +8306,26 @@ Then I will continue."#;
         }
 
         CapturedHttpRequest { path, headers, body: body_text, received_at_ms: 0 }
+    }
+
+    fn fake_chatgpt_oauth_token(account_id: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                super::OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE: {
+                    super::OPENAI_CHATGPT_ACCOUNT_ID_CLAIM: account_id,
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    fn header_value(request: &CapturedHttpRequest, name: &str) -> Option<String> {
+        request
+            .headers
+            .iter()
+            .find(|(header_name, _)| header_name == name)
+            .map(|(_, value)| value.clone())
     }
 }

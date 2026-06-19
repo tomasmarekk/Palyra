@@ -1,12 +1,14 @@
-//! Request payload builders for the two provider chat dialects.
+//! Request payload builders for provider chat dialects.
 //!
 //! [`ProviderChatAdapter`] turns a provider-neutral [`ProviderRequest`] into
-//! the JSON body each HTTP backend posts. The OpenAI-compatible dialect is a
-//! near-direct mapping; the Anthropic dialect requires reshaping: system and
-//! developer turns move into the top-level system block, tool results travel
-//! as user-turn content blocks adjacent to their tool_use, and orphan tool
-//! results degrade to plain text. Field names and value shapes here are wire
-//! contracts pinned by tests.
+//! the JSON body each HTTP backend posts. OpenAI-compatible chat completions
+//! are a near-direct mapping; ChatGPT/Codex OAuth uses the Responses dialect;
+//! Anthropic requires reshaping: system and developer turns move into the
+//! top-level system block, tool results travel as user-turn content blocks
+//! adjacent to their tool_use, and orphan tool results degrade to plain text.
+//! Field names and value shapes here are wire contracts pinned by tests.
+use std::collections::{HashMap, HashSet};
+
 use serde_json::{json, Value};
 
 use crate::application::tool_registry::{provider_tools_from_catalog_snapshot, ToolSchemaDialect};
@@ -19,6 +21,7 @@ use super::{
 // Anthropic requires max_tokens on every request; this default applies when
 // the caller sets no explicit output budget.
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 4_096;
+const DEFAULT_OPENAI_RESPONSES_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
 fn build_openai_message_content(
     message: &ProviderMessage,
@@ -371,6 +374,232 @@ impl ProviderChatAdapter for OpenAiCompatibleChatAdapter {
             body["max_tokens"] = json!(max_output_tokens.max(1));
         }
         body
+    }
+}
+
+/// Adapter for the OpenAI Responses dialect used by ChatGPT/Codex OAuth.
+pub(super) struct OpenAiResponsesChatAdapter;
+
+impl OpenAiResponsesChatAdapter {
+    /// Serializes `request` into the Responses API payload targeting
+    /// `model_name`.
+    pub(super) fn request_payload(&self, request: &ProviderRequest, model_name: &str) -> Value {
+        let mut response_tools = Vec::new();
+        let mut tool_wire_names = HashMap::new();
+        if let Some(snapshot) = request.tool_catalog_snapshot.as_ref() {
+            tool_wire_names = openai_responses_tool_wire_name_map(snapshot);
+            let tools =
+                provider_tools_from_catalog_snapshot(snapshot, ToolSchemaDialect::OpenAiCompatible);
+            response_tools = openai_responses_tools(tools, &tool_wire_names);
+        }
+        let (input, instructions) =
+            build_openai_responses_input_and_instructions(request, &tool_wire_names);
+        let mut body = json!({
+            "model": model_name,
+            "input": input,
+            "instructions": instructions.unwrap_or_else(|| DEFAULT_OPENAI_RESPONSES_INSTRUCTIONS.to_owned()),
+            "stream": true,
+            "store": false,
+        });
+        if !response_tools.is_empty() {
+            body["tools"] = Value::Array(response_tools);
+            body["tool_choice"] = json!("auto");
+        }
+        body
+    }
+}
+
+fn build_openai_responses_input_and_instructions(
+    request: &ProviderRequest,
+    tool_wire_names: &HashMap<String, String>,
+) -> (Vec<Value>, Option<String>) {
+    let mut messages = request.effective_messages();
+    if !request.vision_inputs.is_empty() {
+        if let Some(last_user) =
+            messages.iter_mut().rev().find(|message| message.role == ProviderMessageRole::User)
+        {
+            for image in &request.vision_inputs {
+                last_user.content.push(ProviderMessageContentPart::Image { image: image.clone() });
+            }
+        }
+    }
+
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in messages {
+        match message.role {
+            ProviderMessageRole::System | ProviderMessageRole::Developer => {
+                let text = message.text_content();
+                if !text.trim().is_empty() {
+                    instructions.push(text);
+                }
+            }
+            ProviderMessageRole::User | ProviderMessageRole::Assistant => {
+                push_openai_responses_message(&mut input, &message);
+                if message.role == ProviderMessageRole::Assistant {
+                    for tool_call in &message.tool_calls {
+                        let tool_name = tool_wire_names
+                            .get(tool_call.tool_name.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                openai_responses_safe_tool_name(tool_call.tool_name.as_str())
+                            });
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": tool_call.proposal_id.as_str(),
+                            "name": tool_name,
+                            "arguments": serde_json::to_string(&tool_call.input_json)
+                                .unwrap_or_else(|_| "{}".to_owned()),
+                        }));
+                    }
+                }
+            }
+            ProviderMessageRole::Tool => {
+                let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                    continue;
+                };
+                if tool_call_id.trim().is_empty() {
+                    continue;
+                }
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": message.text_content(),
+                }));
+            }
+        }
+    }
+
+    if input.is_empty() {
+        input.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": request.input_text.as_str(),
+            }],
+        }));
+    }
+
+    (input, (!instructions.is_empty()).then(|| instructions.join("\n\n")))
+}
+
+fn push_openai_responses_message(input: &mut Vec<Value>, message: &ProviderMessage) {
+    let content = build_openai_responses_content_parts(message);
+    if content.is_empty() {
+        return;
+    }
+    input.push(json!({
+        "role": message.role.as_openai_role(),
+        "content": content,
+    }));
+}
+
+fn build_openai_responses_content_parts(message: &ProviderMessage) -> Vec<Value> {
+    let mut parts = Vec::new();
+    for content_part in &message.content {
+        match content_part {
+            ProviderMessageContentPart::Text { text } => {
+                if text.is_empty() {
+                    continue;
+                }
+                let part_type = if message.role == ProviderMessageRole::Assistant {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
+                parts.push(json!({
+                    "type": part_type,
+                    "text": text,
+                }));
+            }
+            ProviderMessageContentPart::Image { image } => {
+                parts.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", image.mime_type, image.bytes_base64),
+                    "detail": "low",
+                }));
+            }
+        }
+    }
+    parts
+}
+
+pub(super) fn openai_responses_tool_wire_name_map(snapshot: &Value) -> HashMap<String, String> {
+    let tools = provider_tools_from_catalog_snapshot(snapshot, ToolSchemaDialect::OpenAiCompatible);
+    let mut used_wire_names = HashSet::new();
+    let mut tool_wire_names = HashMap::new();
+    for tool in tools {
+        let Some(name) = openai_compatible_tool_name(&tool) else {
+            continue;
+        };
+        let wire_name = unique_openai_responses_tool_name(name, &mut used_wire_names);
+        tool_wire_names.insert(name.to_owned(), wire_name);
+    }
+    tool_wire_names
+}
+
+fn openai_responses_tools(
+    tools: Vec<Value>,
+    tool_wire_names: &HashMap<String, String>,
+) -> Vec<Value> {
+    tools.into_iter().filter_map(|tool| openai_responses_tool(tool, tool_wire_names)).collect()
+}
+
+fn openai_responses_tool(tool: Value, tool_wire_names: &HashMap<String, String>) -> Option<Value> {
+    let function = tool.get("function")?;
+    let name = openai_compatible_tool_name(&tool)?;
+    let wire_name =
+        tool_wire_names.get(name).cloned().unwrap_or_else(|| openai_responses_safe_tool_name(name));
+    Some(json!({
+        "type": "function",
+        "name": wire_name,
+        "description": function.get("description").cloned().unwrap_or_else(|| json!("")),
+        "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({})),
+    }))
+}
+
+fn openai_compatible_tool_name(tool: &Value) -> Option<&str> {
+    tool.get("function")?
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn unique_openai_responses_tool_name(
+    original_name: &str,
+    used_wire_names: &mut HashSet<String>,
+) -> String {
+    let base = openai_responses_safe_tool_name(original_name);
+    if used_wire_names.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2_u64;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if used_wire_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn openai_responses_safe_tool_name(original_name: &str) -> String {
+    let safe_name = original_name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe_name.is_empty() {
+        "tool".to_owned()
+    } else {
+        safe_name
     }
 }
 
