@@ -3094,7 +3094,7 @@ fn agent_loop_budget_exhausted_message(
         if snapshot.completed_tool_calls == 1 { "tool result" } else { "tool results" };
     let recovery_hint = match reason {
         AgentLoopTerminationReason::WallClock => {
-            "Step count was not the terminal condition; continue in the same session with a narrower resume prompt or increase the agent loop wall-clock budget for long process/browser workflows."
+            "Model turns and tool calls were not the active limit; continue in the same session with a narrower resume prompt for long process/browser workflows."
         }
         AgentLoopTerminationReason::MaxTurns | AgentLoopTerminationReason::MaxToolCalls => {
             "Step-count limits are disabled for agent runs; inspect the run tape if an older replay produced this reason."
@@ -3107,9 +3107,14 @@ fn agent_loop_budget_exhausted_message(
         String::new()
     };
     format!(
-        "{base} after {} model turns and {} {tool_result_label}{continuation_marker}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
+        "{base} after {} model turns and {} {tool_result_label}{continuation_marker}; active_limits={}, wall_clock_budget_ms={}, wall_clock_remaining_ms={}, model_turn_limit={}, tool_call_limit={}; partial result summary: run tape for {run_id} contains the exact tool evidence, remaining_model_turns={}, remaining_tool_calls={}, elapsed_ms={}. Continue in the same session and ask to resume from run {run_id}. {recovery_hint}",
         snapshot.current_turn,
         snapshot.completed_tool_calls,
+        snapshot.active_limits.join(","),
+        snapshot.wall_clock_budget_ms,
+        snapshot.wall_clock_remaining_ms,
+        remaining_count_label(snapshot.model_turn_limit),
+        remaining_count_label(snapshot.tool_call_limit),
         remaining_count_label(snapshot.remaining_model_turns),
         remaining_count_label(snapshot.remaining_tool_calls),
         snapshot.elapsed_ms
@@ -4408,9 +4413,14 @@ mod tests {
         assert!(message.contains("1 tool result"));
         assert!(message.contains("needs_continuation=true"));
         assert!(message.contains("reason_code=wall_clock"));
+        assert!(message.contains("active_limits=wall_clock"));
+        assert!(message.contains("wall_clock_budget_ms=10000"));
+        assert!(message.contains("wall_clock_remaining_ms="));
+        assert!(message.contains("model_turn_limit=unlimited"));
+        assert!(message.contains("tool_call_limit=unlimited"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
-        assert!(message.contains("Step count was not the terminal condition"));
+        assert!(message.contains("Model turns and tool calls were not the active limit"));
     }
 
     #[test]
@@ -4447,8 +4457,10 @@ mod tests {
         assert!(message.contains("reason_code=wall_clock"));
         assert!(message.contains("partial result summary"));
         assert!(message.contains("remaining_tool_calls=unlimited"));
+        assert!(message.contains("active_limits=wall_clock"));
+        assert!(message.contains("tool_call_limit=unlimited"));
         assert!(message.contains("elapsed_ms="));
-        assert!(message.contains("Step count was not the terminal condition"));
+        assert!(message.contains("Model turns and tool calls were not the active limit"));
         assert!(!message.contains("tool_call.max_calls_per_run"));
     }
 

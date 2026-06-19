@@ -127,11 +127,15 @@ pub(crate) struct AgentLoopSnapshot {
     pub(crate) schema_version: u32,
     pub(crate) run_id: String,
     pub(crate) current_turn: u32,
+    pub(crate) model_turn_limit: Option<u32>,
     pub(crate) remaining_model_turns: Option<u32>,
+    pub(crate) tool_call_limit: Option<u32>,
     pub(crate) remaining_tool_calls: Option<u32>,
     pub(crate) completed_tool_calls: u32,
     pub(crate) message_count: usize,
     pub(crate) wall_clock_budget_ms: u64,
+    pub(crate) wall_clock_remaining_ms: u64,
+    pub(crate) active_limits: Vec<String>,
     pub(crate) elapsed_ms: u64,
     pub(crate) usage: AgentLoopUsageSnapshot,
     pub(crate) termination_reason: Option<AgentLoopTerminationReason>,
@@ -312,19 +316,35 @@ impl AgentRunLoopState {
         run_id: &str,
         termination_reason: Option<AgentLoopTerminationReason>,
     ) -> AgentLoopSnapshot {
+        let elapsed_ms = self.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         AgentLoopSnapshot {
             schema_version: 1,
             run_id: run_id.to_owned(),
             current_turn: self.current_turn,
+            model_turn_limit: self.max_model_turns,
             remaining_model_turns: self.remaining_model_turns,
+            tool_call_limit: self.max_tool_calls,
             remaining_tool_calls: self.remaining_tool_calls,
             completed_tool_calls: self.completed_tool_calls,
             message_count: self.messages.len(),
             wall_clock_budget_ms: self.wall_clock_budget_ms,
-            elapsed_ms: self.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            wall_clock_remaining_ms: self.wall_clock_budget_ms.saturating_sub(elapsed_ms),
+            active_limits: self.active_limits(),
+            elapsed_ms,
             usage: self.usage.clone(),
             termination_reason,
         }
+    }
+
+    fn active_limits(&self) -> Vec<String> {
+        let mut limits = vec!["wall_clock".to_owned()];
+        if self.max_model_turns.is_some() {
+            limits.push("model_turns".to_owned());
+        }
+        if self.max_tool_calls.is_some() {
+            limits.push("tool_calls".to_owned());
+        }
+        limits
     }
 
     fn finalization_outcome(
@@ -1279,8 +1299,18 @@ mod tests {
         assert_eq!(parsed["max_model_turns"], serde_json::Value::Null);
         assert_eq!(parsed["max_tool_calls"], serde_json::Value::Null);
         assert_eq!(parsed["step_count_limit_active"], false);
+        assert_eq!(parsed["state"]["model_turn_limit"], serde_json::Value::Null);
+        assert_eq!(parsed["state"]["tool_call_limit"], serde_json::Value::Null);
         assert_eq!(parsed["state"]["remaining_model_turns"], serde_json::Value::Null);
         assert_eq!(parsed["state"]["remaining_tool_calls"], serde_json::Value::Null);
+        assert_eq!(parsed["state"]["active_limits"], serde_json::json!(["wall_clock"]));
+        assert_eq!(parsed["state"]["wall_clock_budget_ms"], 10_000);
+        assert!(
+            parsed["state"]["wall_clock_remaining_ms"]
+                .as_u64()
+                .is_some_and(|value| value <= 10_000),
+            "remaining wall-clock budget should be bounded by the configured budget: {parsed}"
+        );
     }
 
     #[test]
