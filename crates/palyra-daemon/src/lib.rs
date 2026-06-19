@@ -62,6 +62,7 @@ mod node_runtime;
 mod objectives;
 mod observability;
 mod openai_auth;
+mod openai_model_discovery;
 mod openai_surface;
 mod orchestrator;
 mod plugins;
