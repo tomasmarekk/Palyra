@@ -2494,8 +2494,9 @@ mod tests {
     use super::{
         build_anthropic_oauth_authorization_url, build_auth_profiles_list_json_payload,
         build_openai_oauth_launch_payload, build_provider_status_payload,
-        build_xai_oauth_authorization_url, normalize_xai_oauth_endpoint,
-        openai_oauth_launch_text_lines, parse_anthropic_authorization_code, parse_xai_callback_url,
+        build_xai_oauth_authorization_url, generate_oauth_random_urlsafe,
+        normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
+        parse_anthropic_authorization_code, parse_xai_callback_url,
         write_xai_callback_response_best_effort, AnthropicOAuthTokenResponse,
         OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
         ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
@@ -2706,11 +2707,13 @@ mod tests {
 
     #[test]
     fn xai_oauth_authorization_url_uses_public_grok_client() {
+        let nonce = generate_oauth_random_urlsafe(32, "xAI OAuth test value")
+            .expect("test nonce should generate");
         let url = build_xai_oauth_authorization_url(
             "https://auth.x.ai/oauth/authorize",
             "challenge",
             "state-123",
-            "nonce-123",
+            nonce.as_str(),
         )
         .expect("authorization URL should build");
         let parsed = reqwest::Url::parse(url.as_str()).expect("authorization URL should parse");
@@ -2729,7 +2732,7 @@ mod tests {
         assert_eq!(params.get("code_challenge").map(|value| value.as_ref()), Some("challenge"));
         assert_eq!(params.get("code_challenge_method").map(|value| value.as_ref()), Some("S256"));
         assert_eq!(params.get("state").map(|value| value.as_ref()), Some("state-123"));
-        assert_eq!(params.get("nonce").map(|value| value.as_ref()), Some("nonce-123"));
+        assert_eq!(params.get("nonce").map(|value| value.as_ref()), Some(nonce.as_str()));
         assert_eq!(params.get("plan").map(|value| value.as_ref()), Some("generic"));
         assert_eq!(params.get("referrer").map(|value| value.as_ref()), Some("palyra"));
     }
