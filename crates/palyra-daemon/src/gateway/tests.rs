@@ -4079,6 +4079,15 @@ async fn run_cleanup_tape_event_records_background_process_outcomes() {
         Some(false)
     );
     assert_eq!(
+        payload.pointer("/background_processes/alive_after/0/pid").and_then(Value::as_u64),
+        Some(4242)
+    );
+    assert_eq!(
+        payload.pointer("/background_processes/alive_after/0/alive").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(payload.pointer("/cleanup_errors").and_then(Value::as_array).map(Vec::len), Some(0));
+    assert_eq!(
         payload.pointer("/background_processes/outcomes/0/alive_before").and_then(Value::as_bool),
         Some(true)
     );
@@ -4339,6 +4348,67 @@ async fn successful_run_finalization_cleans_resources_when_done_status_channel_c
     assert!(
         state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
         "client disconnect during Done status must not skip terminal cleanup"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_run_finalization_cleans_run_owned_process_tracking() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    let impossible_test_pid = u32::MAX;
+    state.record_run_background_process(run_id.as_str(), impossible_test_pid);
+
+    let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+    let mut run_state = RunStateMachine::default();
+    run_state.transition(RunTransition::Accept).expect("run state should accept");
+    run_state.transition(RunTransition::StartStreaming).expect("run state should start streaming");
+    let mut tape_seq = 0;
+
+    super::finalize_run_failure(super::RunFailureFinalization {
+        sender: &sender,
+        runtime_state: &state,
+        request_context: None,
+        active_session_id: Some(session_id.as_str()),
+        run_state: &mut run_state,
+        active_run_id: Some(run_id.as_str()),
+        tape_seq: &mut tape_seq,
+        reason: "provider error forced terminal failure",
+    })
+    .await;
+
+    assert_eq!(run_state.state(), RunLifecycleState::Failed);
+    assert!(
+        state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
+        "failed terminal path must drain run-owned process tracking"
+    );
+    let snapshot = state
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .expect("run status snapshot should query")
+        .expect("run status snapshot should exist");
+    assert_eq!(snapshot.state, RunLifecycleState::Failed.as_str());
+
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    let sequence =
+        tape.iter().map(|event| (event.seq, event.event_type.as_str())).collect::<Vec<_>>();
+    assert_eq!(sequence, vec![(0, "status"), (1, "run.cleanup")]);
+    let cleanup = tape.last().expect("cleanup event should be present");
+    let payload: Value =
+        serde_json::from_str(cleanup.payload_json.as_str()).expect("cleanup payload should decode");
+    assert_eq!(
+        payload.pointer("/background_processes/requested_count").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload.pointer("/background_processes/outcomes/0/pid").and_then(Value::as_u64),
+        Some(u64::from(impossible_test_pid))
+    );
+    assert_eq!(
+        payload.pointer("/background_processes/alive_after/0/pid").and_then(Value::as_u64),
+        Some(u64::from(impossible_test_pid))
     );
 }
 

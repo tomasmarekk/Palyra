@@ -5109,6 +5109,19 @@ fn background_launcher_completed_successfully(
         redaction_reasons: stderr_redaction_reasons,
     } = redacted_process_output(stderr.bytes.as_slice());
     let auto_backgrounded = auto_background_reason.is_some();
+    if auto_backgrounded && matches!(lifetime_mode, BackgroundLifetimeMode::RunOwned) {
+        let reason = auto_background_reason.unwrap_or("recognized_dev_server");
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "auto-backgrounded dev server exited before a trackable process was available: \
+error_code=untracked_auto_background_service auto_background_reason={reason} \
+run_owned_lifetime=false. Start the server as a direct long-running foreground process, or request \
+background=true only for commands whose direct child remains alive and can be stopped by \
+terminal run cleanup."
+            ),
+        });
+    }
     let output_json = serde_json::to_vec(&json!({
         "exit_code": status.code(),
         "stdout": stdout_text,
@@ -10349,6 +10362,47 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .contains("launcher started external service"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn run_constrained_process_rejects_untracked_auto_background_dev_server_launcher() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-auto-background-immediate-exit");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["-m", "http.server", "--help"],
+            "timeout_ms": 60_000
+        }))
+        .expect("input should serialize");
+
+        let error =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect_err("auto-backgrounded dev-server launcher must not look cleanup-safe");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::RuntimeFailure);
+        assert!(error.message.contains("error_code=untracked_auto_background_service"));
+        assert!(error.message.contains("auto_background_reason=recognized_dev_server_command"));
+        assert!(error.message.contains("run_owned_lifetime=false"));
+        assert!(
+            error.message.contains("direct child remains alive"),
+            "error should tell the caller how to get run-owned cleanup"
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }

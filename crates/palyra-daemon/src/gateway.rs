@@ -2170,6 +2170,16 @@ fn run_cleanup_tape_payload(
         .iter()
         .map(background_process_cleanup_outcome_json)
         .collect::<Vec<_>>();
+    let run_owned_alive_after = background_process_outcomes
+        .iter()
+        .map(|outcome| {
+            json!({
+                "pid": outcome.pid,
+                "alive": outcome.alive_after,
+            })
+        })
+        .collect::<Vec<_>>();
+    let cleanup_errors = run_cleanup_errors(browser_outcomes, background_process_outcomes);
     let detached_running = detached_background_process_outcomes
         .iter()
         .map(detached_background_process_handoff_json)
@@ -2194,8 +2204,10 @@ fn run_cleanup_tape_payload(
         },
         "background_processes": {
             "requested_count": background_process_count,
+            "alive_after": run_owned_alive_after,
             "outcomes": run_owned_stopped.clone(),
         },
+        "cleanup_errors": cleanup_errors,
         "background_resources": {
             "run_owned_requested_count": background_process_count,
             "run_owned_stopped": run_owned_stopped,
@@ -2204,6 +2216,29 @@ fn run_cleanup_tape_payload(
         },
     })
     .to_string()
+}
+
+fn run_cleanup_errors(
+    browser_outcomes: &[BrowserCleanupOutcome],
+    background_process_outcomes: &[BackgroundProcessCleanupOutcome],
+) -> Vec<Value> {
+    let browser_errors = browser_outcomes.iter().filter_map(|outcome| {
+        let error = outcome.error.as_ref()?;
+        Some(json!({
+            "kind": "browser_session",
+            "session_id": outcome.session_id.as_str(),
+            "error": error.as_str(),
+        }))
+    });
+    let background_errors = background_process_outcomes.iter().filter_map(|outcome| {
+        let error = outcome.error.as_ref()?;
+        Some(json!({
+            "kind": "background_process",
+            "pid": outcome.pid,
+            "error": error.as_str(),
+        }))
+    });
+    browser_errors.chain(background_errors).collect()
 }
 
 fn background_process_cleanup_outcome_json(outcome: &BackgroundProcessCleanupOutcome) -> Value {
