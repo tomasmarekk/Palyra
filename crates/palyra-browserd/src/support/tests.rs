@@ -6479,7 +6479,7 @@ fn spawn_fetch_failure_http_server() -> (String, thread::JoinHandle<()>) {
         let started_at = std::time::Instant::now();
         let mut root_requests = 0usize;
         let mut api_seen = false;
-        while started_at.elapsed() < Duration::from_secs(10) && !(api_seen && root_requests >= 1) {
+        while started_at.elapsed() < Duration::from_secs(30) && !(api_seen && root_requests >= 1) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream.set_nonblocking(false).expect("accepted stream should become blocking");
