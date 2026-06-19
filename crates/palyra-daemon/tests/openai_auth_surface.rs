@@ -350,10 +350,17 @@ fn console_anthropic_oauth_token_flow_persists_vault_refs_and_default_selection(
 #[test]
 fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
-    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
-        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
-        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
-    )])?;
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.allow_token("xai-oauth-test-access");
+    mock.set_models_response_body(
+        r#"{"data":[{"id":"provider-older","created":1700000000},{"id":"provider-newer","created":1800000000}]}"#,
+    );
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_XAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+    ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
 
@@ -451,8 +458,8 @@ fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> R
     assert!(document_toml.contains("kind = \"openai_compatible\""));
     assert!(document_toml.contains("openai_base_url = \"https://api.x.ai/v1\""));
     assert!(
-        !document_toml.contains("openai_model"),
-        "xAI default selection should leave model choice to live discovery"
+        document_toml.contains("openai_model = \"provider-newer\""),
+        "xAI default selection should store the model returned by live discovery"
     );
     assert!(
         !document_toml.contains("xai-oauth-test-access")
@@ -468,11 +475,16 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;
     mock.allow_token("sk-return-openai");
+    mock.allow_token("xai-access");
+    mock.set_models_response_body(
+        r#"{"data":[{"id":"provider-older","created":1700000000},{"id":"xai-provider-newer","created":1800000000}]}"#,
+    );
     wait_for_openai_mock_ready(&mock)?;
 
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
         ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
         ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+        ("PALYRA_MODEL_PROVIDER_XAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
     ])?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -514,10 +526,13 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
     assert!(xai_document_toml.contains("auth_provider_kind = \"xai\""));
     assert!(xai_document_toml.contains("openai_base_url = \"https://api.x.ai/v1\""));
     assert!(
-        !xai_document_toml.contains("openai_model"),
-        "xAI default selection should not write a hard-coded model"
+        xai_document_toml.contains("openai_model = \"xai-provider-newer\""),
+        "xAI default selection should store the model returned by live discovery"
     );
 
+    mock.set_models_response_body(
+        r#"{"data":[{"id":"openai-provider-older","created":1700000000},{"id":"openai-provider-newer","created":1800000000}]}"#,
+    );
     let openai_connected = post_console_json(
         &client,
         admin_port,
@@ -554,9 +569,10 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
     assert!(openai_document_toml.contains("auth_provider_kind = \"openai\""));
     assert!(openai_document_toml.contains("kind = \"openai_compatible\""));
     assert!(openai_document_toml.contains("openai_base_url = \"https://api.openai.com/v1\""));
+    assert!(openai_document_toml.contains("openai_model = \"openai-provider-newer\""));
     assert!(
         !openai_document_toml.contains("https://api.x.ai/v1")
-            && !openai_document_toml.contains("openai_model"),
+            && !openai_document_toml.contains("xai-provider-newer"),
         "OpenAI reselection must not leave stale xAI endpoint/model values"
     );
 

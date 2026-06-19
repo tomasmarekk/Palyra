@@ -69,7 +69,6 @@ pub use streaming::{ProviderStreamAccumulator, ProviderStreamEvent};
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const OPENAI_CODEX_RESPONSES_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const OPENAI_CODEX_RESPONSES_PATH: &str = "/responses";
-const OPENAI_CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (Palyra)";
 const OPENAI_CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
@@ -4810,17 +4809,7 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
 }
 
 fn openai_codex_runtime_model_id(configured_model_id: &str) -> String {
-    let model_id = configured_model_id.rsplit('/').next().unwrap_or(configured_model_id).trim();
-    if openai_codex_model_id_is_supported(model_id) {
-        model_id.to_owned()
-    } else {
-        OPENAI_CODEX_DEFAULT_MODEL.to_owned()
-    }
-}
-
-fn openai_codex_model_id_is_supported(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    normalized == "chat-latest" || normalized.starts_with("gpt-5.") || normalized.contains("-codex")
+    configured_model_id.rsplit('/').next().unwrap_or(configured_model_id).trim().to_owned()
 }
 
 fn parse_openai_codex_sse_response(body: &str) -> Result<OpenAiResponsesResponse> {
@@ -7261,7 +7250,7 @@ mod tests {
         let response_body = [
             r#"data: {"type":"response.output_text.delta","delta":"PALYRA_ONBOARDING_OK"}"#,
             "",
-            r#"data: {"type":"response.completed","response":{"id":"resp_test","model":"gpt-5.4-mini","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_test","model":"provider-selected-model","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}"#,
             "",
             "data: [DONE]",
             "",
@@ -7272,7 +7261,7 @@ mod tests {
         let codex_base_url =
             base_url.strip_suffix("/v1").expect("test helper base URL should end in /v1");
         let mut config = openai_test_config(codex_base_url.to_owned());
-        config.openai_model = "gpt-5.4-mini".to_owned();
+        config.openai_model = "provider-selected-model".to_owned();
         config.openai_api_key = Some(fake_chatgpt_oauth_token("acct_test_123"));
         config.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
         let provider = build_model_provider(&config).expect("openai provider should build");
@@ -7304,7 +7293,7 @@ mod tests {
         assert_eq!(header_value(captured, "chatgpt-account-id").as_deref(), Some("acct_test_123"));
         let request_body: serde_json::Value =
             serde_json::from_str(captured.body.as_str()).expect("request body should be JSON");
-        assert_eq!(request_body["model"], "gpt-5.4-mini");
+        assert_eq!(request_body["model"], "provider-selected-model");
         assert_eq!(request_body["stream"], true);
         assert_eq!(request_body["store"], false);
         assert_eq!(request_body["instructions"], "You are a helpful assistant.");
@@ -7320,7 +7309,7 @@ mod tests {
         let response_body = [
             r#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_01","name":"palyra_echo","arguments":"{\"text\":\"hello\"}"}}"#,
             "",
-            r#"data: {"type":"response.completed","response":{"id":"resp_tool","model":"gpt-5.5","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_tool","model":"provider-selected-model","status":"completed","usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}"#,
             "",
             "data: [DONE]",
             "",
@@ -7371,9 +7360,9 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_oauth_runtime_model_falls_back_to_codex_default() {
-        assert_eq!(super::openai_codex_runtime_model_id("gpt-4o-mini"), "gpt-5.5");
-        assert_eq!(super::openai_codex_runtime_model_id("openai/gpt-5.4-mini"), "gpt-5.4-mini");
+    fn chatgpt_oauth_runtime_model_preserves_provider_selection() {
+        assert_eq!(super::openai_codex_runtime_model_id("provider-model"), "provider-model");
+        assert_eq!(super::openai_codex_runtime_model_id("openai/provider-model"), "provider-model");
     }
 
     #[tokio::test(flavor = "multi_thread")]
