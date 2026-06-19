@@ -1787,7 +1787,7 @@ pub(crate) async fn cleanup_run_resources(
         let status_before = background_process_cleanup_status(pid);
         match terminate_run_background_process(pid).await {
             Ok(()) => {
-                let status_after = background_process_cleanup_status(pid);
+                let status_after = wait_for_background_process_cleanup_status(pid).await;
                 let alive_after = status_after.as_ref().map(|status| status.alive);
                 if alive_after == Some(false) {
                     crate::sandbox_runner::release_background_process_tracking_if_stopped(pid);
@@ -1921,6 +1921,22 @@ impl From<crate::sandbox_runner::BackgroundProcessRuntimeStatus>
 
 fn background_process_cleanup_status(pid: u32) -> Option<BackgroundProcessCleanupStatus> {
     crate::sandbox_runner::background_process_runtime_status(pid).ok().map(Into::into)
+}
+
+const BACKGROUND_PROCESS_CLEANUP_STATUS_POLLS: usize = 20;
+const BACKGROUND_PROCESS_CLEANUP_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+async fn wait_for_background_process_cleanup_status(
+    pid: u32,
+) -> Option<BackgroundProcessCleanupStatus> {
+    for _ in 0..BACKGROUND_PROCESS_CLEANUP_STATUS_POLLS {
+        let status = background_process_cleanup_status(pid);
+        if !matches!(status.as_ref(), Some(status) if status.alive) {
+            return status;
+        }
+        sleep(BACKGROUND_PROCESS_CLEANUP_STATUS_POLL_INTERVAL).await;
+    }
+    background_process_cleanup_status(pid)
 }
 
 // Hard caps for the PID-file sweep: the scan must stay cheap and bounded even
