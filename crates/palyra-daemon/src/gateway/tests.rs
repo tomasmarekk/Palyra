@@ -17,6 +17,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(not(windows))]
+use std::io::{BufRead, BufReader};
+
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 use palyra_common::{
     runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState, FlowStepState},
@@ -809,18 +812,17 @@ fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecuti
 
 struct CleanupTestProcess {
     child: Child,
+    tracked_pid: u32,
 }
 
 impl CleanupTestProcess {
     fn spawn() -> Self {
-        let mut command = cleanup_test_process_command();
-        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        let child = command.spawn().expect("cleanup test process should start");
-        Self { child }
+        let (child, tracked_pid) = spawn_cleanup_test_process();
+        Self { child, tracked_pid }
     }
 
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.tracked_pid
     }
 
     fn wait_for_cleanup(&mut self) {
@@ -843,17 +845,34 @@ impl Drop for CleanupTestProcess {
 }
 
 #[cfg(windows)]
-fn cleanup_test_process_command() -> Command {
+fn spawn_cleanup_test_process() -> (Child, u32) {
     let mut command = Command::new("ping");
     command.args(["-n", "60", "127.0.0.1"]);
-    command
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let child = command.spawn().expect("cleanup test process should start");
+    let tracked_pid = child.id();
+    (child, tracked_pid)
 }
 
 #[cfg(not(windows))]
-fn cleanup_test_process_command() -> Command {
-    let mut command = Command::new("sleep");
-    command.arg("60");
+fn spawn_cleanup_test_process() -> (Child, u32) {
+    let mut command = Command::new("sh");
     command
+        .args(["-c", "sleep 60 & child=$!; printf '%s\n' \"$child\"; wait \"$child\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("cleanup test process should start");
+    let stdout = child.stdout.take().expect("cleanup test process should expose tracked pid");
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("cleanup test process should report tracked pid");
+    let tracked_pid = line
+        .trim()
+        .parse::<u32>()
+        .expect("cleanup test process should report a numeric tracked pid");
+    (child, tracked_pid)
 }
 
 async fn start_tool_program_test_run(

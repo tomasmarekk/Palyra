@@ -14,8 +14,6 @@
 // resulting dead-code noise in test builds instead of cfg-gating each item.
 #![cfg_attr(test, allow(dead_code, private_interfaces))]
 
-#[cfg(not(windows))]
-use std::process::Command;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
@@ -2321,30 +2319,10 @@ async fn terminate_run_background_process(pid: u32) -> Result<(), String> {
         .map_err(|error| format!("background process cleanup task failed: {error}"))?
 }
 
-#[cfg(windows)]
 fn terminate_run_background_process_blocking(pid: u32) -> Result<(), String> {
     crate::sandbox_runner::terminate_background_process_tree(pid).map_err(|error| {
         format!("failed to terminate background process tree for pid {pid}: {error}")
     })
-}
-
-#[cfg(not(windows))]
-fn terminate_run_background_process_blocking(pid: u32) -> Result<(), String> {
-    let pid_arg = pid.to_string();
-    let output = Command::new("kill")
-        .args(["-TERM", pid_arg.as_str()])
-        .output()
-        .map_err(|error| format!("failed to invoke kill for pid {pid}: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(format!(
-        "kill failed for pid {pid} with status {}; stdout={:?}; stderr={:?}",
-        output.status,
-        String::from_utf8_lossy(output.stdout.as_slice()),
-        String::from_utf8_lossy(output.stderr.as_slice())
-    ))
 }
 
 async fn record_run_failure_journal_event(
