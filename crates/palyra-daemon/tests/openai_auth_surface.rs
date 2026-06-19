@@ -450,11 +450,114 @@ fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> R
     assert!(document_toml.contains("auth_provider_kind = \"xai\""));
     assert!(document_toml.contains("kind = \"openai_compatible\""));
     assert!(document_toml.contains("openai_base_url = \"https://api.x.ai/v1\""));
-    assert!(document_toml.contains("openai_model = \"grok-4.3\""));
+    assert!(
+        !document_toml.contains("openai_model"),
+        "xAI default selection should leave model choice to live discovery"
+    );
     assert!(
         !document_toml.contains("xai-oauth-test-access")
             && !document_toml.contains("xai-oauth-test-refresh"),
         "config inspect must not leak raw xAI OAuth tokens"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let mock = OpenAiMockServer::new(None, None)?;
+    mock.allow_token("sk-return-openai");
+    wait_for_openai_mock_ready(&mock)?;
+
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL".to_owned(), format!("{}/v1", mock.base_url())),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+
+    let xai_connected = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/auth/providers/xai/oauth-token",
+        &cookie,
+        &csrf_token,
+        &json!({
+            "profile_name": "xAI OAuth",
+            "scope": { "kind": "global" },
+            "access_token": "xai-access",
+            "refresh_token": "xai-refresh",
+            "token_endpoint": "https://auth.x.ai/oauth/token",
+            "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+            "expires_at_unix_ms": 1_900_000_000_000_i64,
+            "set_default": true
+        }),
+    )?;
+    assert_eq!(xai_connected.get("state").and_then(Value::as_str), Some("selected"));
+
+    let xai_config = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/config/inspect",
+        &cookie,
+        &csrf_token,
+        &json!({}),
+    )?;
+    let xai_document_toml = xai_config
+        .get("document_toml")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("xAI config inspect response missing document_toml"))?;
+    assert!(xai_document_toml.contains("auth_provider_kind = \"xai\""));
+    assert!(xai_document_toml.contains("openai_base_url = \"https://api.x.ai/v1\""));
+    assert!(
+        !xai_document_toml.contains("openai_model"),
+        "xAI default selection should not write a hard-coded model"
+    );
+
+    let openai_connected = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/auth/providers/openai/api-key",
+        &cookie,
+        &csrf_token,
+        &json!({
+            "profile_id": "openai-after-xai",
+            "profile_name": "OpenAI After xAI",
+            "scope": { "kind": "global" },
+            "api_key": "sk-return-openai",
+            "set_default": true
+        }),
+    )?;
+    assert_eq!(openai_connected.get("state").and_then(Value::as_str), Some("selected"));
+    assert_eq!(
+        openai_connected.get("profile_id").and_then(Value::as_str),
+        Some("openai-after-xai")
+    );
+
+    let openai_config = post_console_json(
+        &client,
+        admin_port,
+        "/console/v1/config/inspect",
+        &cookie,
+        &csrf_token,
+        &json!({}),
+    )?;
+    let openai_document_toml = openai_config
+        .get("document_toml")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("OpenAI config inspect response missing document_toml"))?;
+    assert!(openai_document_toml.contains("auth_profile_id = \"openai-after-xai\""));
+    assert!(openai_document_toml.contains("auth_provider_kind = \"openai\""));
+    assert!(openai_document_toml.contains("kind = \"openai_compatible\""));
+    assert!(openai_document_toml.contains("openai_base_url = \"https://api.openai.com/v1\""));
+    assert!(
+        !openai_document_toml.contains("https://api.x.ai/v1")
+            && !openai_document_toml.contains("openai_model"),
+        "OpenAI reselection must not leave stale xAI endpoint/model values"
     );
 
     Ok(())

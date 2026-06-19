@@ -23,7 +23,7 @@ const ANTHROPIC_VALIDATION_RETRY_ATTEMPTS: usize = 3;
 const ANTHROPIC_VALIDATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const OPENAI_DEFAULT_CONFIG_BACKUPS: usize = 5;
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
+const OPENAI_CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CHATGPT_DEVICE_CODE_ENDPOINT: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -34,7 +34,6 @@ const OPENAI_CHATGPT_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token
 const OPENAI_CHATGPT_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const OPENAI_CHATGPT_DEVICE_ATTEMPT_TTL_MS: i64 = 15 * 60 * 1_000;
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_ALLOWED_TOKEN_HOSTS: &[&str] =
@@ -48,16 +47,40 @@ const MINIMAX_OAUTH_DEFAULT_SCOPES: &[&str] = &["group_id", "profile", "model.co
 const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_code";
 const MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS: &[&str] = &["minimax.io", "minimaxi.com"];
 const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
-const XAI_DEFAULT_MODEL: &str = "grok-4.3";
 const XAI_PROVIDER_CUSTOM_NAME: &str = "xai";
 const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX: &str = ".x.ai";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
-const GOOGLE_GEMINI_DEFAULT_MODEL: &str = "gemini-3.5-flash";
 const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const OPENROUTER_DEFAULT_MODEL: &str = "~openai/gpt-latest";
 const OPENAI_OAUTH_CALLBACK_PATH: &str = "console/v1/auth/providers/openai/callback";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiProviderSelectionRuntime {
+    OpenAiCompatible,
+    ChatGptCodex,
+}
+
+impl OpenAiProviderSelectionRuntime {
+    fn from_profile(profile: &AuthProfileRecord) -> Self {
+        match &profile.credential {
+            AuthCredential::Oauth { client_id: Some(client_id), .. } => {
+                Self::from_client_id(client_id)
+            }
+            AuthCredential::Oauth { client_id: None, .. } | AuthCredential::ApiKey { .. } => {
+                Self::OpenAiCompatible
+            }
+        }
+    }
+
+    fn from_client_id(client_id: &str) -> Self {
+        if client_id == OPENAI_CHATGPT_OAUTH_CLIENT_ID {
+            Self::ChatGptCodex
+        } else {
+            Self::OpenAiCompatible
+        }
+    }
+}
 
 /// Validates an OpenAI API key against the provider's models endpoint, then
 /// stores it as an auth profile (key in the vault, profile via the console
@@ -1231,12 +1254,13 @@ pub(crate) async fn select_default_openai_auth_profile(
             )
         })
         .and_then(|value| normalize_openai_identifier(value, "profile_id"))?;
-    let _profile = load_openai_auth_profile_record(state, profile_id.as_str())?;
-    persist_model_provider_auth_profile_selection(
+    let profile = load_openai_auth_profile_record(state, profile_id.as_str())?;
+    persist_model_provider_auth_profile_selection_with_openai_runtime(
         state,
         context,
         profile_id.as_str(),
         ModelProviderAuthProviderKind::Openai,
+        OpenAiProviderSelectionRuntime::from_profile(&profile),
     )
     .await?;
     Ok(openai_provider_action_envelope(
@@ -2150,11 +2174,12 @@ async fn persist_openai_oauth_success(
     let context = request_context_from_console_action(&attempt.context);
     persist_openai_auth_profile(state, &context, profile).await?;
     if attempt.set_default {
-        persist_model_provider_auth_profile_selection(
+        persist_model_provider_auth_profile_selection_with_openai_runtime(
             state,
             &context,
             attempt.profile_id.as_str(),
             ModelProviderAuthProviderKind::Openai,
+            OpenAiProviderSelectionRuntime::from_client_id(attempt.client_id.as_str()),
         )
         .await?;
     }
@@ -3505,10 +3530,29 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
     profile_id: &str,
     provider_kind: ModelProviderAuthProviderKind,
 ) -> Result<(), Response> {
+    persist_model_provider_auth_profile_selection_with_openai_runtime(
+        state,
+        context,
+        profile_id,
+        provider_kind,
+        OpenAiProviderSelectionRuntime::OpenAiCompatible,
+    )
+    .await
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
+    state: &AppState,
+    context: &RequestContext,
+    profile_id: &str,
+    provider_kind: ModelProviderAuthProviderKind,
+    openai_runtime: OpenAiProviderSelectionRuntime,
+) -> Result<(), Response> {
     let path = resolve_console_config_mutation_path(None)?;
     let path_ref = FsPath::new(path.as_str());
     ensure_console_config_parent_dir(path_ref)?;
     let (mut document, _) = load_console_document_for_mutation(path_ref)?;
+    let previous_auth_provider_kind = model_provider_auth_provider_kind_from_document(&document);
     // MiniMax rides the anthropic-compatible provider runtime, so both map to
     // the same model_provider.kind; auth_provider_kind keeps them distinct.
     let provider_kind_value = match provider_kind {
@@ -3551,21 +3595,15 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
             "failed to set model_provider.kind: {error}"
         )))
     })?;
-    // OpenAI/Anthropic only seed defaults when the keys are missing (ensure_*)
-    // so operator-configured endpoints survive reselection; MiniMax force-sets
-    // (set_*) because switching to MiniMax must repoint the shared anthropic
-    // keys away from whatever provider used them before.
+    // Endpoint defaults are provider wiring; model selection is intentionally
+    // not seeded here. A model chosen for one provider family must not leak
+    // into another family, and new model choices come from live discovery.
     match provider_kind {
         ModelProviderAuthProviderKind::Openai => {
-            ensure_string_value_at_path(
+            apply_openai_provider_selection_defaults(
                 &mut document,
-                "model_provider.openai_base_url",
-                OPENAI_DEFAULT_BASE_URL,
-            )?;
-            ensure_string_value_at_path(
-                &mut document,
-                "model_provider.openai_model",
-                OPENAI_DEFAULT_MODEL,
+                previous_auth_provider_kind,
+                openai_runtime,
             )?;
         }
         ModelProviderAuthProviderKind::Anthropic => {
@@ -3574,11 +3612,12 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 "model_provider.anthropic_base_url",
                 ANTHROPIC_DEFAULT_BASE_URL,
             )?;
-            ensure_string_value_at_path(
-                &mut document,
-                "model_provider.anthropic_model",
-                ANTHROPIC_DEFAULT_MODEL,
-            )?;
+            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Anthropic) {
+                clear_text_model_selection_at_path(
+                    &mut document,
+                    "model_provider.anthropic_model",
+                )?;
+            }
         }
         ModelProviderAuthProviderKind::Minimax => {
             set_string_value_at_path(
@@ -3586,11 +3625,12 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 "model_provider.anthropic_base_url",
                 MINIMAX_DEFAULT_BASE_URL,
             )?;
-            set_string_value_at_path(
-                &mut document,
-                "model_provider.anthropic_model",
-                MINIMAX_DEFAULT_MODEL,
-            )?;
+            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Minimax) {
+                clear_text_model_selection_at_path(
+                    &mut document,
+                    "model_provider.anthropic_model",
+                )?;
+            }
         }
         ModelProviderAuthProviderKind::Xai => {
             set_string_value_at_path(
@@ -3598,11 +3638,9 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 "model_provider.openai_base_url",
                 XAI_DEFAULT_BASE_URL,
             )?;
-            set_string_value_at_path(
-                &mut document,
-                "model_provider.openai_model",
-                XAI_DEFAULT_MODEL,
-            )?;
+            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Xai) {
+                clear_text_model_selection_at_path(&mut document, "model_provider.openai_model")?;
+            }
         }
         ModelProviderAuthProviderKind::GoogleGemini
         | ModelProviderAuthProviderKind::GoogleGeminiCli => {
@@ -3611,11 +3649,15 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 "model_provider.openai_base_url",
                 GOOGLE_GEMINI_OPENAI_BASE_URL,
             )?;
-            set_string_value_at_path(
-                &mut document,
-                "model_provider.openai_model",
-                GOOGLE_GEMINI_DEFAULT_MODEL,
-            )?;
+            if !matches!(
+                previous_auth_provider_kind,
+                Some(
+                    ModelProviderAuthProviderKind::GoogleGemini
+                        | ModelProviderAuthProviderKind::GoogleGeminiCli
+                )
+            ) {
+                clear_text_model_selection_at_path(&mut document, "model_provider.openai_model")?;
+            }
         }
         ModelProviderAuthProviderKind::Openrouter => {
             set_string_value_at_path(
@@ -3623,11 +3665,9 @@ pub(crate) async fn persist_model_provider_auth_profile_selection(
                 "model_provider.openai_base_url",
                 OPENROUTER_DEFAULT_BASE_URL,
             )?;
-            set_string_value_at_path(
-                &mut document,
-                "model_provider.openai_model",
-                OPENROUTER_DEFAULT_MODEL,
-            )?;
+            if previous_auth_provider_kind != Some(ModelProviderAuthProviderKind::Openrouter) {
+                clear_text_model_selection_at_path(&mut document, "model_provider.openai_model")?;
+            }
         }
     }
     // Once an auth profile is selected, credentials come from the vault via
@@ -3703,6 +3743,91 @@ pub(crate) async fn clear_model_provider_auth_profile_selection_if_matches(
     )
     .await?;
     Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_openai_provider_selection_defaults(
+    document: &mut toml::Value,
+    previous_auth_provider_kind: Option<ModelProviderAuthProviderKind>,
+    runtime: OpenAiProviderSelectionRuntime,
+) -> Result<(), Response> {
+    match runtime {
+        OpenAiProviderSelectionRuntime::ChatGptCodex => {
+            set_string_value_at_path(
+                document,
+                "model_provider.openai_base_url",
+                OPENAI_CHATGPT_CODEX_BASE_URL,
+            )?;
+            clear_text_model_selection_at_path(document, "model_provider.openai_model")?;
+        }
+        OpenAiProviderSelectionRuntime::OpenAiCompatible
+            if should_reset_openai_compatible_defaults(document, previous_auth_provider_kind) =>
+        {
+            set_string_value_at_path(
+                document,
+                "model_provider.openai_base_url",
+                OPENAI_DEFAULT_BASE_URL,
+            )?;
+            clear_text_model_selection_at_path(document, "model_provider.openai_model")?;
+        }
+        OpenAiProviderSelectionRuntime::OpenAiCompatible => {
+            ensure_string_value_at_path(
+                document,
+                "model_provider.openai_base_url",
+                OPENAI_DEFAULT_BASE_URL,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn should_reset_openai_compatible_defaults(
+    document: &toml::Value,
+    previous_auth_provider_kind: Option<ModelProviderAuthProviderKind>,
+) -> bool {
+    previous_auth_provider_kind.is_some_and(|kind| kind != ModelProviderAuthProviderKind::Openai)
+        || openai_base_url_matches_non_openai_provider_default(document)
+}
+
+fn openai_base_url_matches_non_openai_provider_default(document: &toml::Value) -> bool {
+    let Some(base_url) = document_string_value_at_path(document, "model_provider.openai_base_url")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    [XAI_DEFAULT_BASE_URL, GOOGLE_GEMINI_OPENAI_BASE_URL, OPENROUTER_DEFAULT_BASE_URL]
+        .iter()
+        .any(|known| base_url.eq_ignore_ascii_case(known))
+}
+
+fn model_provider_auth_provider_kind_from_document(
+    document: &toml::Value,
+) -> Option<ModelProviderAuthProviderKind> {
+    document_string_value_at_path(document, "model_provider.auth_provider_kind")
+        .and_then(|value| ModelProviderAuthProviderKind::parse(value).ok())
+}
+
+fn document_string_value_at_path<'a>(document: &'a toml::Value, path: &str) -> Option<&'a str> {
+    get_value_at_path(document, path).ok().flatten().and_then(toml::Value::as_str)
+}
+
+#[allow(clippy::result_large_err)]
+fn clear_text_model_selection_at_path(
+    document: &mut toml::Value,
+    model_path: &str,
+) -> Result<(), Response> {
+    unset_model_value_at_path(document, model_path)?;
+    unset_model_value_at_path(document, "model_provider.default_chat_model_id")
+}
+
+#[allow(clippy::result_large_err)]
+fn unset_model_value_at_path(document: &mut toml::Value, path: &str) -> Result<(), Response> {
+    unset_value_at_path(document, path).map(|_| ()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "failed to unset {path}: {error}"
+        )))
+    })
 }
 
 /// Sets `path` to `default_value` only when it is currently missing or blank
@@ -4558,6 +4683,58 @@ mod tests {
         assert_eq!(normalize_openai_chatgpt_poll_interval_ms(Some(json!("7"))), 7_000);
         assert_eq!(normalize_openai_chatgpt_poll_interval_ms(Some(json!(120))), 60_000);
         assert_eq!(normalize_openai_chatgpt_poll_interval_ms(None), 5_000);
+    }
+
+    #[test]
+    fn openai_selection_defaults_force_codex_for_chatgpt_runtime() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "xai"
+            openai_base_url = "https://api.x.ai/v1"
+            openai_model = "stale-provider-model"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_openai_provider_selection_defaults(
+            &mut document,
+            Some(ModelProviderAuthProviderKind::Xai),
+            OpenAiProviderSelectionRuntime::ChatGptCodex,
+        )
+        .expect("ChatGPT selection defaults should apply");
+
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_base_url"),
+            Some(OPENAI_CHATGPT_CODEX_BASE_URL)
+        );
+        assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
+    }
+
+    #[test]
+    fn openai_selection_defaults_reset_non_openai_provider_endpoint() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "openai"
+            openai_base_url = "https://api.x.ai/v1"
+            openai_model = "stale-provider-model"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_openai_provider_selection_defaults(
+            &mut document,
+            Some(ModelProviderAuthProviderKind::Openai),
+            OpenAiProviderSelectionRuntime::OpenAiCompatible,
+        )
+        .expect("OpenAI compatible selection defaults should apply");
+
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_base_url"),
+            Some(OPENAI_DEFAULT_BASE_URL)
+        );
+        assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
     }
 
     fn test_openai_oauth_attempt(
