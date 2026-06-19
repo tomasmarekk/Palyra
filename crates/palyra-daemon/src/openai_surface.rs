@@ -52,6 +52,7 @@ const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const XAI_MODEL_DISCOVERY_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
 const XAI_PROVIDER_CUSTOM_NAME: &str = "xai";
 const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const XAI_OAUTH_ALLOWED_ROOT_HOST: &str = "x.ai";
 const XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX: &str = ".x.ai";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -3253,7 +3254,7 @@ fn normalize_xai_oauth_token_endpoint(raw: &str) -> Result<String, Response> {
         ));
     }
     let host = parsed.host_str().unwrap_or_default();
-    if !host.eq_ignore_ascii_case("auth.x.ai")
+    if !host.eq_ignore_ascii_case(XAI_OAUTH_ALLOWED_ROOT_HOST)
         && !host.to_ascii_lowercase().ends_with(XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX)
     {
         return Err(validation_error_response(
@@ -4696,11 +4697,14 @@ mod tests {
 
     #[test]
     fn normalize_xai_oauth_token_endpoint_accepts_trusted_hosts() {
+        let root = normalize_xai_oauth_token_endpoint("https://x.ai/oauth/token")
+            .expect("xAI root host should be trusted");
         let auth = normalize_xai_oauth_token_endpoint("https://auth.x.ai/oauth/token")
             .expect("xAI auth host should be trusted");
         let accounts = normalize_xai_oauth_token_endpoint("https://accounts.x.ai/oauth/token")
             .expect("xAI subdomains should be trusted");
 
+        assert_eq!(root, "https://x.ai/oauth/token");
         assert_eq!(auth, "https://auth.x.ai/oauth/token");
         assert_eq!(accounts, "https://accounts.x.ai/oauth/token");
     }

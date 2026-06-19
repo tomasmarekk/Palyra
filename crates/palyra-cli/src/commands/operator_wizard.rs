@@ -2941,6 +2941,16 @@ fn apply_deferred_provider_auth_method(
             "ChatGPT Login was selected; after the gateway is running, run `palyra auth openai oauth-start --set-default --open`, sign in at the printed URL, then run `palyra auth openai oauth-state <attempt_id>` until it reports succeeded."
                 .to_owned(),
         );
+    } else if auth_method == "xai_device_code" {
+        warnings.push(
+            "xAI device code was selected; after the gateway is running, run `palyra auth xai device-code --set-default --open`, enter the browser code, and wait for authorization to finish."
+                .to_owned(),
+        );
+    } else if auth_method == "xai_oauth" {
+        warnings.push(
+            "xAI OAuth was selected; after the gateway is running, run `palyra auth xai oauth-start --set-default --open` and finish the browser callback."
+                .to_owned(),
+        );
     } else {
         warnings.push(format!(
             "{} was selected; finish or select a matching auth profile before enabling remote model calls.",

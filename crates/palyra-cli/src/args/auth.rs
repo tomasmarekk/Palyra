@@ -324,6 +324,22 @@ pub enum AuthXaiCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    DeviceCode {
+        #[arg(long)]
+        profile_id: Option<String>,
+        #[arg(long)]
+        profile_name: Option<String>,
+        #[arg(long, value_enum, default_value_t = AuthScopeArg::Global)]
+        scope: AuthScopeArg,
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        set_default: bool,
+        #[arg(long, default_value_t = false)]
+        open: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Refresh {
         profile_id: String,
         #[arg(long, default_value_t = false)]

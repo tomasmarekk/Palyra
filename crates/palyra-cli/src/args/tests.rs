@@ -3454,6 +3454,37 @@ fn parse_auth_xai_oauth_start() {
 }
 
 #[test]
+fn parse_auth_xai_device_code() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "auth",
+        "xai",
+        "device-code",
+        "--profile-name",
+        "SuperGrok",
+        "--set-default",
+        "--open",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Auth {
+            command: AuthCommand::Xai {
+                command: AuthXaiCommand::DeviceCode {
+                    profile_id: None,
+                    profile_name: Some("SuperGrok".to_owned()),
+                    scope: AuthScopeArg::Global,
+                    agent_id: None,
+                    set_default: true,
+                    open: true,
+                    json: true,
+                },
+            },
+        }
+    );
+}
+
+#[test]
 fn parse_auth_xai_refresh() {
     let parsed = Cli::parse_from(["palyra", "auth", "xai", "refresh", "xai-default", "--json"]);
     assert_eq!(
