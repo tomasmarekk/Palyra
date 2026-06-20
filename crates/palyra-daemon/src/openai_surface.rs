@@ -17,7 +17,9 @@ use std::env;
 
 use super::*;
 use crate::openai_model_discovery::{
-    discover_preferred_openai_chatgpt_codex_model_id, discover_preferred_openai_compatible_model_id,
+    discover_explicit_tool_capable_openai_compatible_model_id,
+    discover_preferred_openai_chatgpt_codex_model_id,
+    discover_preferred_openai_compatible_model_id,
 };
 
 const OPENAI_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,7 +120,7 @@ pub(crate) async fn connect_openai_api_key(
     )
     .await
     .map_err(|error| map_openai_validation_error("api_key", error))?;
-    let discovered_model_id = discover_preferred_openai_compatible_model_id(
+    let discovered_model_id = discover_explicit_tool_capable_openai_compatible_model_id(
         validation_base_url.as_str(),
         api_key.as_str(),
         OPENAI_HTTP_TIMEOUT,
@@ -3112,21 +3114,27 @@ fn generate_provider_profile_id(provider_slug: &str, profile_name: &str) -> Stri
     format!("{base}-{suffix}")
 }
 
-// Validation base URLs resolve env override > config document > built-in
-// default, mirroring how the model-provider runtime resolves them so the
-// credential is probed against the endpoint it will actually be used with.
+// OpenAI bearer-token validation intentionally ignores the current
+// model-provider document because that document may still point at a
+// ChatGPT/Codex OAuth backend from a previous auth method. Use an explicit env
+// override for tests or private OpenAI-compatible endpoints; otherwise validate
+// against OpenAI's public API.
 fn load_openai_validation_base_url(document: Option<&toml::Value>) -> String {
-    env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL")
-        .ok()
-        .and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        })
-        .or_else(|| document.and_then(openai_validation_base_url_from_document))
+    let env_override = env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL").ok();
+    load_openai_validation_base_url_with_env(env_override.as_deref(), document)
+}
+
+fn openai_compatible_runtime_base_url() -> String {
+    let env_override = env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL").ok();
+    load_openai_validation_base_url_with_env(env_override.as_deref(), None)
+}
+
+fn load_openai_validation_base_url_with_env(
+    env_override: Option<&str>,
+    _document: Option<&toml::Value>,
+) -> String {
+    env_override
+        .and_then(|value| normalize_optional_text(value).map(ToOwned::to_owned))
         .unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_owned())
 }
 
@@ -3169,7 +3177,7 @@ async fn discover_preferred_openai_model_id_for_runtime(
                 ))
             })?;
             let base_url = load_openai_validation_base_url(Some(&document));
-            discover_preferred_openai_compatible_model_id(
+            discover_explicit_tool_capable_openai_compatible_model_id(
                 base_url.as_str(),
                 bearer_token,
                 OPENAI_HTTP_TIMEOUT,
@@ -3299,15 +3307,6 @@ fn resolve_openai_console_config_path(
 ) -> Result<Option<String>, Response> {
     let configured_path = configured_openai_console_config_path(path);
     resolve_console_config_path(configured_path.as_deref(), require_existing)
-}
-
-fn openai_validation_base_url_from_document(document: &toml::Value) -> Option<String> {
-    get_value_at_path(document, "model_provider.openai_base_url")
-        .ok()
-        .and_then(|value| value.and_then(toml::Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 fn anthropic_validation_base_url_from_document(document: &toml::Value) -> Option<String> {
@@ -3916,6 +3915,7 @@ fn apply_openai_provider_selection_defaults(
     discovered_model_id: Option<&str>,
 ) -> Result<(), Response> {
     let discovered_model_present = discovered_model_id.and_then(normalize_optional_text).is_some();
+    let openai_compatible_base_url = openai_compatible_runtime_base_url();
     match runtime {
         OpenAiProviderSelectionRuntime::ChatGptCodex => {
             set_string_value_at_path(
@@ -3948,7 +3948,7 @@ fn apply_openai_provider_selection_defaults(
             set_string_value_at_path(
                 document,
                 "model_provider.openai_base_url",
-                OPENAI_DEFAULT_BASE_URL,
+                openai_compatible_base_url.as_str(),
             )?;
             apply_discovered_or_clear_text_model_selection(
                 document,
@@ -3963,7 +3963,7 @@ fn apply_openai_provider_selection_defaults(
                         provider_id: "openai-primary",
                         display_name: "OpenAI",
                         kind: "openai_compatible",
-                        base_url: OPENAI_DEFAULT_BASE_URL,
+                        base_url: openai_compatible_base_url.as_str(),
                         auth_provider_kind: "openai",
                     },
                 )?;
@@ -3973,7 +3973,7 @@ fn apply_openai_provider_selection_defaults(
             ensure_string_value_at_path(
                 document,
                 "model_provider.openai_base_url",
-                OPENAI_DEFAULT_BASE_URL,
+                openai_compatible_base_url.as_str(),
             )?;
             apply_discovered_or_clear_text_model_selection(
                 document,
@@ -3988,7 +3988,7 @@ fn apply_openai_provider_selection_defaults(
                         provider_id: "openai-primary",
                         display_name: "OpenAI",
                         kind: "openai_compatible",
-                        base_url: OPENAI_DEFAULT_BASE_URL,
+                        base_url: openai_compatible_base_url.as_str(),
                         auth_provider_kind: "openai",
                     },
                 )?;
@@ -4924,6 +4924,30 @@ mod tests {
             )
             .status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn openai_validation_base_url_ignores_stale_chatgpt_codex_config() {
+        let document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "openai"
+            openai_base_url = "https://chatgpt.com/backend-api/codex"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        assert_eq!(
+            load_openai_validation_base_url_with_env(None, Some(&document)),
+            OPENAI_DEFAULT_BASE_URL
+        );
+        assert_eq!(
+            load_openai_validation_base_url_with_env(
+                Some("http://127.0.0.1:9911/v1"),
+                Some(&document)
+            ),
+            "http://127.0.0.1:9911/v1"
         );
     }
 

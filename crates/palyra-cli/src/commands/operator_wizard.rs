@@ -52,6 +52,7 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
 ];
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
 const OPENAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL";
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ANTHROPIC_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL";
 const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
 const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BASE_URL";
@@ -2904,14 +2905,13 @@ fn apply_model_provider_api_key(
         }
         "api_key" => {
             let base_url = openai_base_url_for_config(document)?;
-            let model =
-                discover_openai_compatible_model_selection("OpenAI", base_url.as_str(), api_key)?;
+            let model = discover_openai_api_model_selection("OpenAI", base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
             configure_openai_provider_with_base_url(
                 document,
                 base_url.as_str(),
-                Some(model.id.as_str()),
+                model.as_ref().map(|model| model.id.as_str()),
                 Some(vault_ref),
             )?;
         }
@@ -2982,12 +2982,7 @@ fn configure_openai_provider(
     model_id: Option<&str>,
     vault_ref: Option<String>,
 ) -> Result<()> {
-    configure_openai_provider_with_base_url(
-        document,
-        "https://api.openai.com/v1",
-        model_id,
-        vault_ref,
-    )
+    configure_openai_provider_with_base_url(document, OPENAI_DEFAULT_BASE_URL, model_id, vault_ref)
 }
 
 fn configure_openai_provider_with_base_url(
@@ -3348,6 +3343,18 @@ fn discover_openai_compatible_model_selection(
     })
 }
 
+fn discover_openai_api_model_selection(
+    provider_label: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Option<DiscoveredProviderModel>> {
+    let models = discover_openai_compatible_models(provider_label, api_key, base_url)?;
+    if !models.iter().any(|model| model.supports_tool_calls == Some(true)) {
+        return Ok(None);
+    }
+    Ok(select_preferred_discovered_model(models.as_slice()).cloned())
+}
+
 fn discover_openai_compatible_models(
     provider_label: &str,
     api_key: &str,
@@ -3394,26 +3401,20 @@ fn discover_anthropic_model_selection(base_url: &str, api_key: &str) -> Result<S
 }
 
 fn openai_base_url_for_config(document: &toml::Value) -> Result<String> {
-    if let Some(base_url) = provider_base_url_from_env(OPENAI_BASE_URL_ENV)? {
+    openai_base_url_for_config_with_override(
+        document,
+        provider_base_url_from_env(OPENAI_BASE_URL_ENV)?,
+    )
+}
+
+fn openai_base_url_for_config_with_override(
+    _document: &toml::Value,
+    env_override: Option<String>,
+) -> Result<String> {
+    if let Some(base_url) = env_override {
         return Ok(base_url);
     }
-    let configured_for_openai = get_string_value_at_path(document, "model_provider.kind")?
-        .as_deref()
-        == Some("openai_compatible")
-        && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
-            .as_deref()
-            .is_none_or(|kind| kind.eq_ignore_ascii_case("openai"));
-    if configured_for_openai {
-        if let Some(base_url) =
-            get_string_value_at_path(document, "model_provider.openai_base_url")?
-        {
-            return normalize_provider_discovery_base_url(
-                base_url.as_str(),
-                "model_provider.openai_base_url",
-            );
-        }
-    }
-    Ok("https://api.openai.com/v1".to_owned())
+    Ok(OPENAI_DEFAULT_BASE_URL.to_owned())
 }
 
 fn anthropic_base_url_for_config(document: &toml::Value) -> Result<String> {
@@ -4946,6 +4947,33 @@ role = "chat"
         assert!(
             warnings.iter().any(|warning| warning.contains("xAI OAuth")),
             "deferred method should emit an actionable auth-profile warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn openai_api_key_base_url_ignores_stale_chatgpt_codex_config() {
+        let document: toml::Value = toml::from_str(
+            r#"
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openai"
+openai_base_url = "https://chatgpt.com/backend-api/codex"
+"#,
+        )
+        .expect("test config should parse");
+
+        assert_eq!(
+            openai_base_url_for_config_with_override(&document, None)
+                .expect("OpenAI API key base URL should resolve"),
+            OPENAI_DEFAULT_BASE_URL
+        );
+        assert_eq!(
+            openai_base_url_for_config_with_override(
+                &document,
+                Some("http://127.0.0.1:9876/v1".to_owned())
+            )
+            .expect("explicit OpenAI API key base URL override should resolve"),
+            "http://127.0.0.1:9876/v1"
         );
     }
 

@@ -531,7 +531,7 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
     );
 
     mock.set_models_response_body(
-        r#"{"data":[{"id":"openai-provider-older","created":1700000000},{"id":"openai-provider-newer","created":1800000000}]}"#,
+        r#"{"data":[{"id":"openai-provider-older","created":1700000000},{"id":"openai-provider-newer","created":1800000000,"supported_parameters":["tools"]}]}"#,
     );
     let openai_connected = post_console_json(
         &client,
@@ -568,7 +568,7 @@ fn console_openai_default_selection_after_xai_resets_shared_endpoint() -> Result
     assert!(openai_document_toml.contains("auth_profile_id = \"openai-after-xai\""));
     assert!(openai_document_toml.contains("auth_provider_kind = \"openai\""));
     assert!(openai_document_toml.contains("kind = \"openai_compatible\""));
-    assert!(openai_document_toml.contains("openai_base_url = \"https://api.openai.com/v1\""));
+    assert!(openai_document_toml.contains(&format!("openai_base_url = \"{}/v1\"", mock.base_url())));
     assert!(openai_document_toml.contains("openai_model = \"openai-provider-newer\""));
     assert!(
         !openai_document_toml.contains("https://api.x.ai/v1")
@@ -585,7 +585,7 @@ fn console_models_probe_and_discover_publish_live_openai_results() -> Result<()>
     let mock = OpenAiMockServer::new(None, None)?;
     mock.allow_token("sk-probe-openai");
     mock.set_models_response_body(
-        r#"{"data":[{"id":"gpt-4.1-mini"},{"id":"text-embedding-3-large"}]}"#,
+        r#"{"data":[{"id":"gpt-4.1-mini","supported_parameters":["tools"]},{"id":"text-embedding-3-large"}]}"#,
     );
     wait_for_openai_mock_ready(&mock)?;
 

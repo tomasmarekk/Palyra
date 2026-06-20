@@ -22,7 +22,8 @@ const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str =
+    r#"{"data":[{"id":"gpt-test-discovered","supported_parameters":["tools"]}]}"#;
 
 #[test]
 fn status_reports_http_grpc_and_admin_health() -> Result<()> {

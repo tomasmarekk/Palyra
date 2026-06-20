@@ -16,6 +16,7 @@ const OPENAI_CHATGPT_CODEX_MODELS_ENDPOINT: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiModelDiscoveryFormat {
     OpenAiCompatible,
+    OpenAiCompatibleExplicitToolCapabilities,
     ChatGptCodex,
 }
 
@@ -31,6 +32,22 @@ pub(crate) async fn discover_preferred_openai_compatible_model_id(
         bearer_token,
         timeout,
         OpenAiModelDiscoveryFormat::OpenAiCompatible,
+    )
+    .await
+}
+
+pub(crate) async fn discover_explicit_tool_capable_openai_compatible_model_id(
+    base_url: &str,
+    bearer_token: &str,
+    timeout: Duration,
+) -> Result<Option<String>, OpenAiCredentialValidationError> {
+    let endpoint = openai_compatible_models_endpoint(base_url)
+        .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
+    discover_preferred_openai_model_id_from_endpoint(
+        endpoint,
+        bearer_token,
+        timeout,
+        OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities,
     )
     .await
 }
@@ -108,6 +125,9 @@ fn preferred_openai_model_id_from_body(
         OpenAiModelDiscoveryFormat::OpenAiCompatible => {
             preferred_openai_compatible_model_id_from_body(body)
         }
+        OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities => {
+            preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
+        }
         OpenAiModelDiscoveryFormat::ChatGptCodex => preferred_codex_model_id_from_body(body),
     }
 }
@@ -121,6 +141,31 @@ fn preferred_openai_compatible_model_id_from_body(body: &str) -> Result<Option<S
     let candidates = entries
         .iter()
         .filter_map(|entry| {
+            let model_id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some((model_id.to_owned(), model_recency_rank(entry)))
+        })
+        .collect::<Vec<_>>();
+    Ok(preferred_model_id_from_candidates(candidates))
+}
+
+fn preferred_explicit_tool_capable_openai_compatible_model_id_from_body(
+    body: &str,
+) -> Result<Option<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
+    let Some(entries) = value.get("data").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let candidates = entries
+        .iter()
+        .filter_map(|entry| {
+            if model_supported_parameter(entry, &["tools", "tool_choice"]) != Some(true) {
+                return None;
+            }
             let model_id = entry
                 .get("id")
                 .and_then(serde_json::Value::as_str)
@@ -213,6 +258,19 @@ fn normalize_numeric_model_recency_rank(raw: i64) -> Option<i64> {
     }
 }
 
+fn model_supported_parameter(entry: &serde_json::Value, names: &[&str]) -> Option<bool> {
+    let supported = entry.get("supported_parameters")?.as_array()?;
+    let parameters = supported
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    Some(names.iter().any(|name| {
+        let normalized = name.to_ascii_lowercase();
+        parameters.iter().any(|parameter| parameter == &normalized)
+    }))
+}
+
 fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
     entry
         .get("visibility")
@@ -244,6 +302,26 @@ mod tests {
             .expect("provider model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn openai_public_discovery_requires_explicit_tool_metadata_for_default() {
+        let body = r#"{"data":[{"id":"gpt-realtime-whisper","created":1800000000},{"id":"gpt-chat-candidate","created":1700000000}]}"#;
+
+        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
+            .expect("provider model response should parse");
+
+        assert_eq!(model_id, None);
+    }
+
+    #[test]
+    fn openai_public_discovery_prefers_explicit_tool_capable_model() {
+        let body = r#"{"data":[{"id":"newer-non-tool","created":1800000000,"supported_parameters":["temperature"]},{"id":"tool-capable","created":1700000000,"supported_parameters":["tools","response_format"]}]}"#;
+
+        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
+            .expect("provider model response should parse");
+
+        assert_eq!(model_id.as_deref(), Some("tool-capable"));
     }
 
     #[test]

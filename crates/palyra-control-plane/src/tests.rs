@@ -6,7 +6,10 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::Value;
 
-use crate::{transport::urlencoding, *};
+use crate::{
+    transport::{fallback_error_message, urlencoding},
+    *,
+};
 
 #[test]
 fn secret_reveal_decodes_base64() {
@@ -26,6 +29,26 @@ fn secret_reveal_decodes_base64() {
 #[test]
 fn urlencoding_escapes_reserved_bytes() {
     assert_eq!(urlencoding("global/openai key"), "global%2Fopenai%20key");
+}
+
+#[test]
+fn fallback_error_message_redacts_secret_json_fields() {
+    let body = r#"{"error":"bad request","api_key":"sk-proj-test-secret"}"#;
+
+    let message = fallback_error_message(400, body);
+
+    assert!(message.contains("<redacted>"), "{message}");
+    assert!(!message.contains("sk-proj-test-secret"), "{message}");
+}
+
+#[test]
+fn fallback_error_message_redacts_secret_tokens_in_provider_text() {
+    let body = r#"{"error":{"message":"invalid token sk-proj-test-secret in payload"}}"#;
+
+    let message = fallback_error_message(400, body);
+
+    assert!(message.contains("<redacted>"), "{message}");
+    assert!(!message.contains("sk-proj-test-secret"), "{message}");
 }
 
 #[test]

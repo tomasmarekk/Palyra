@@ -9,7 +9,7 @@ use crate::*;
 use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
 use palyra_common::redaction::redact_auth_error;
-use palyra_vault::VaultRef;
+use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use std::{
@@ -252,6 +252,7 @@ struct ProbeableProvider {
     endpoint_base_url: Option<String>,
     allow_private_base_url: bool,
     auth_profile_id: Option<String>,
+    auth_state_roots: Vec<PathBuf>,
     auth_provider_kind: Option<String>,
     inline_api_key: Option<String>,
     vault_ref: Option<String>,
@@ -1287,6 +1288,7 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
     let (document, _) = load_document_from_existing_path(path_ref)
         .with_context(|| format!("failed to parse {}", path_ref.display()))?;
     let root_config = parse_root_file_config(&document)?;
+    let auth_state_roots = status_auth_profile_state_roots(&root_config, path_ref);
     let model_provider = root_config.model_provider.unwrap_or_default();
     let provider_kind =
         model_provider.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
@@ -1328,6 +1330,7 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
                     auth_profile_id: entry.auth_profile_id.clone().or_else(|| {
                         inherit_globals.then(|| model_provider.auth_profile_id.clone()).flatten()
                     }),
+                    auth_state_roots: auth_state_roots.clone(),
                     auth_provider_kind: entry.auth_provider_kind.clone().or_else(|| {
                         inherit_globals.then(|| model_provider.auth_provider_kind.clone()).flatten()
                     }),
@@ -1361,6 +1364,7 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
         endpoint_base_url: default_base_url_for_kind(provider_kind.as_str(), &model_provider),
         allow_private_base_url: global_allow_private_base_url,
         auth_profile_id: model_provider.auth_profile_id.clone(),
+        auth_state_roots,
         auth_provider_kind: model_provider.auth_provider_kind.clone(),
         inline_api_key: inline_api_key_for_kind(provider_kind.as_str(), &model_provider),
         vault_ref: vault_ref_for_kind(provider_kind.as_str(), &model_provider),
@@ -2423,16 +2427,11 @@ fn resolve_hostname_ip_addrs(host: &str, port: u16) -> std::io::Result<Vec<IpAdd
 
 fn resolve_provider_credential(
     target: &ProbeableProvider,
-    auth_registry: &mut Option<AuthProfileRegistry>,
+    _auth_registry: &mut Option<AuthProfileRegistry>,
     vault: &mut Option<palyra_vault::Vault>,
 ) -> Result<Option<ResolvedCredential>> {
     if let Some(profile_id) = target.auth_profile_id.as_deref() {
-        let registry = auth_registry.get_or_insert(AuthProfileRegistry::open(
-            resolve_cli_identity_store_root()?.as_path(),
-        )?);
-        let Some(profile) = registry.get_profile(profile_id)? else {
-            anyhow::bail!("auth profile not found: {profile_id}");
-        };
+        let (profile, state_root) = find_auth_profile_for_probe(target, profile_id)?;
         let expected_provider = expected_auth_provider_for_probe_target(target);
         if let Some(expected_provider) = expected_provider {
             let expected_custom_name = expected_custom_auth_provider_name_for_probe_target(target);
@@ -2457,15 +2456,16 @@ fn resolve_provider_credential(
                 );
             }
         }
-        let vault_instance = vault.get_or_insert(open_cli_vault()?);
         return match profile.credential {
             AuthCredential::ApiKey { api_key_vault_ref } => {
-                let token = load_vault_secret_utf8(vault_instance, api_key_vault_ref.as_str())?;
+                let vault_instance = open_vault_at_state_root(state_root.as_path())?;
+                let token = load_vault_secret_utf8(&vault_instance, api_key_vault_ref.as_str())?;
                 Ok(Some(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() }))
             }
             AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
+                let vault_instance = open_vault_at_state_root(state_root.as_path())?;
                 let token =
-                    load_vault_secret_utf8(vault_instance, access_token_vault_ref.as_str())?;
+                    load_vault_secret_utf8(&vault_instance, access_token_vault_ref.as_str())?;
                 Ok(Some(ResolvedCredential::Bearer {
                     token,
                     source: "auth_profile".to_owned(),
@@ -2493,6 +2493,54 @@ fn resolve_provider_credential(
         }));
     }
     Ok(None)
+}
+
+fn find_auth_profile_for_probe(
+    target: &ProbeableProvider,
+    profile_id: &str,
+) -> Result<(palyra_auth::AuthProfileRecord, PathBuf)> {
+    let mut searched = Vec::new();
+    for state_root in &target.auth_state_roots {
+        searched.push(state_root.display().to_string());
+        let profile = AuthProfileRegistry::get_profile_readonly_at_state_root(
+            state_root.as_path(),
+            profile_id,
+        )
+        .with_context(|| {
+            format!("failed to load auth profile '{profile_id}' from {}", state_root.display())
+        })?;
+        if let Some(profile) = profile {
+            return Ok((profile, state_root.clone()));
+        }
+    }
+    anyhow::bail!(
+        "auth profile not found: {profile_id} (searched state roots: {})",
+        searched.join(", ")
+    );
+}
+
+fn open_vault_at_state_root(state_root: &Path) -> Result<Vault> {
+    let identity_store_root = state_root.join("identity");
+    let vault_root = match std::env::var("PALYRA_VAULT_DIR") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("PALYRA_VAULT_DIR must not be empty");
+            }
+            Some(PathBuf::from(trimmed))
+        }
+        Err(std::env::VarError::NotPresent) => Some(state_root.join("vault")),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_VAULT_DIR must contain valid UTF-8")
+        }
+    };
+    Vault::open_with_config(VaultConfigOptions {
+        root: vault_root,
+        identity_store_root: Some(identity_store_root),
+        backend_preference: parse_cli_vault_backend_preference()?,
+        ..VaultConfigOptions::default()
+    })
+    .map_err(anyhow::Error::from)
 }
 
 fn target_uses_minimax_auth(target: &ProbeableProvider) -> bool {
@@ -2702,13 +2750,7 @@ pub(crate) fn select_preferred_discovered_model_id(
 pub(crate) fn select_preferred_discovered_model(
     models: &[DiscoveredProviderModel],
 ) -> Option<&DiscoveredProviderModel> {
-    let candidates = models
-        .iter()
-        .filter_map(|model| {
-            let id = model.id.trim();
-            (!id.is_empty()).then_some(model)
-        })
-        .collect::<Vec<_>>();
+    let candidates = models.iter().filter(|model| !model.id.trim().is_empty()).collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
     }
@@ -2871,6 +2913,7 @@ mod tests {
             endpoint_base_url: Some(base_url.to_owned()),
             allow_private_base_url,
             auth_profile_id: Some("missing-auth-profile".to_owned()),
+            auth_state_roots: Vec::new(),
             auth_provider_kind: None,
             inline_api_key: None,
             vault_ref: None,
@@ -3056,6 +3099,63 @@ mod tests {
             Some("chatgpt-login-test"),
             &[state_root, desktop_runtime]
         ));
+    }
+
+    #[test]
+    fn auth_profile_probe_resolves_desktop_runtime_vault_secret() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+        let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
+        let desktop_identity = desktop_runtime.join("identity");
+        let registry =
+            AuthProfileRegistry::open(desktop_identity.as_path()).expect("registry should open");
+        registry
+            .set_profile(palyra_auth::AuthProfileSetRequest {
+                profile_id: "chatgpt-login-test".to_owned(),
+                provider: palyra_auth::AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "ChatGPT Login".to_owned(),
+                scope: palyra_auth::AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/openai_access".to_owned(),
+                    refresh_token_vault_ref: "global/openai_refresh".to_owned(),
+                    token_endpoint: "https://auth.openai.com/oauth/token".to_owned(),
+                    client_id: Some(OPENAI_CHATGPT_OAUTH_CLIENT_ID.to_owned()),
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: Default::default(),
+                },
+            })
+            .expect("profile should persist");
+        let scope = "global".parse::<palyra_vault::VaultScope>().expect("scope should parse");
+        let vault = Vault::open_with_config(VaultConfigOptions {
+            root: Some(desktop_runtime.join("vault")),
+            identity_store_root: Some(desktop_identity),
+            ..VaultConfigOptions::default()
+        })
+        .expect("runtime vault should open");
+        vault
+            .put_secret(&scope, "openai_access", b"runtime-oauth-token")
+            .expect("access token should persist");
+
+        let mut target = sample_probe_target("https://api.openai.com/v1", true);
+        target.auth_profile_id = Some("chatgpt-login-test".to_owned());
+        target.auth_state_roots = vec![state_root, desktop_runtime];
+        let mut auth_registry = None;
+        let mut vault = None;
+        let credential = resolve_provider_credential(&target, &mut auth_registry, &mut vault)
+            .expect("credential lookup should succeed")
+            .expect("credential should be resolved");
+
+        assert!(auth_registry.is_none(), "profile lookup should use explicit state roots");
+        assert!(vault.is_none(), "auth-profile secrets should use their matching state root vault");
+        match credential {
+            ResolvedCredential::Bearer { token, oauth_kind, .. } => {
+                assert_eq!(token, "runtime-oauth-token");
+                assert_eq!(oauth_kind, Some(ResolvedOauthProfileKind::OpenAiChatGptLogin));
+            }
+            ResolvedCredential::ApiKey { .. } => panic!("ChatGPT OAuth profile should be bearer"),
+        }
     }
 
     #[test]
