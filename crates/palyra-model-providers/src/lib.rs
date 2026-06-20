@@ -8,6 +8,7 @@ pub mod config;
 pub mod contract;
 pub mod error_envelope;
 pub mod errors;
+pub mod snapshots;
 pub mod streaming;
 
 mod redaction;
@@ -46,6 +47,13 @@ pub use errors::{
     ProviderRecoveryPlanSnapshot,
 };
 pub use redaction::sanitize_remote_error;
+pub use snapshots::{
+    ProviderCircuitBreakerSnapshot, ProviderCredentialCapabilitySummary, ProviderDiscoverySnapshot,
+    ProviderHealthProbeSnapshot, ProviderRegistryCredentialSnapshot, ProviderRegistryModelSnapshot,
+    ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
+    ProviderRetryPolicySnapshot, ProviderRouteCandidateTrace, ProviderRouteSelectionTrace,
+    ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
+};
 pub use streaming::{
     provider_output_from_text_and_tools, ProviderStreamAccumulator, ProviderStreamEvent,
 };
