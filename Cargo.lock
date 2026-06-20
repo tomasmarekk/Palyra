@@ -3163,6 +3163,8 @@ dependencies = [
 name = "palyra-model-providers"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "palyra-common",
  "reqwest",
  "serde",
  "serde_json",
