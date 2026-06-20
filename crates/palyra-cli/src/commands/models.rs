@@ -3093,6 +3093,9 @@ mod tests {
 
     #[test]
     fn auth_profile_probe_resolves_desktop_runtime_vault_secret() {
+        let _env_guard =
+            crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
+        let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
         let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
@@ -3121,6 +3124,7 @@ mod tests {
         let vault = Vault::open_with_config(VaultConfigOptions {
             root: Some(desktop_runtime.join("vault")),
             identity_store_root: Some(desktop_identity),
+            backend_preference: palyra_vault::BackendPreference::EncryptedFile,
             ..VaultConfigOptions::default()
         })
         .expect("runtime vault should open");
@@ -3145,6 +3149,37 @@ mod tests {
                 assert_eq!(oauth_kind, Some(ResolvedOauthProfileKind::OpenAiChatGptLogin));
             }
             ResolvedCredential::ApiKey { .. } => panic!("ChatGPT OAuth profile should be bearer"),
+        }
+    }
+
+    struct ScopedVaultBackend {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedVaultBackend {
+        fn encrypted_file() -> Self {
+            let previous = std::env::var_os("PALYRA_VAULT_BACKEND");
+            // SAFETY: this test holds the shared CLI test env lock while the override is active.
+            unsafe {
+                std::env::set_var("PALYRA_VAULT_BACKEND", "encrypted_file");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedVaultBackend {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: this test holds the shared CLI test env lock while the override is active.
+                unsafe {
+                    std::env::set_var("PALYRA_VAULT_BACKEND", previous);
+                }
+            } else {
+                // SAFETY: this test holds the shared CLI test env lock while the override is active.
+                unsafe {
+                    std::env::remove_var("PALYRA_VAULT_BACKEND");
+                }
+            }
         }
     }
 
