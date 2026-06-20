@@ -65,6 +65,12 @@ pub enum ModelsCommand {
         model: String,
         #[arg(long)]
         path: Option<String>,
+        #[arg(
+            long,
+            visible_aliases = ["reasoning-effort", "reasoning-level"],
+            help = "Set provider reasoning effort with the chat model: none, minimal, low, medium, high, or xhigh"
+        )]
+        reasoning: Option<String>,
         #[arg(long, default_value_t = 5)]
         backups: usize,
         #[arg(long, default_value_t = false)]

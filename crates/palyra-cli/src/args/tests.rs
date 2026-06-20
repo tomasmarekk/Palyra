@@ -617,6 +617,7 @@ fn parse_agent_run_with_prompt() {
                 run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned()),
                 prompt: Some("hello".to_owned()),
                 prompt_stdin: false,
+                reasoning: None,
                 allow_sensitive_tools: true,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -664,6 +665,7 @@ fn e2e_reported_help_surfaces_describe_commands_and_flags() {
             &[
                 "Override the daemon gRPC endpoint",
                 "Read the prompt text from stdin",
+                "Override provider reasoning effort",
                 "Permit tools classified as sensitive",
                 "Select whether the CLI automatically starts a continuation run",
                 "Stream run events as newline-delimited JSON",
@@ -810,6 +812,7 @@ fn parse_agent_run_with_approval_mode_allow_once() {
                 run_id: None,
                 prompt: Some("inspect".to_owned()),
                 prompt_stdin: false,
+                reasoning: None,
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -819,6 +822,24 @@ fn parse_agent_run_with_approval_mode_allow_once() {
             }
         }
     );
+}
+
+#[test]
+fn parse_agent_run_with_reasoning_effort_alias() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "agent",
+        "run",
+        "--prompt",
+        "inspect",
+        "--reasoning-effort",
+        "high",
+    ]);
+    let Command::Agent { command: AgentCommand::Run { reasoning, .. } } = parsed.command else {
+        panic!("agent run command should parse");
+    };
+
+    assert_eq!(reasoning.as_deref(), Some("high"));
 }
 
 #[test]
@@ -888,6 +909,7 @@ fn parse_agent_run_with_session_key_controls() {
                 run_id: None,
                 prompt: Some("continue".to_owned()),
                 prompt_stdin: false,
+                reasoning: None,
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -6033,6 +6055,34 @@ fn parse_models_set_embeddings() {
                 allow_custom: false,
                 path: Some("custom.toml".to_owned()),
                 backups: 5,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_models_set_with_reasoning_effort_alias() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "models",
+        "set",
+        "gpt-5.5",
+        "--reasoning-effort",
+        "low",
+        "--path",
+        "custom.toml",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Models {
+            command: ModelsCommand::Set {
+                model: "gpt-5.5".to_owned(),
+                path: Some("custom.toml".to_owned()),
+                reasoning: Some("low".to_owned()),
+                backups: 5,
+                allow_custom: false,
                 json: true,
             }
         }

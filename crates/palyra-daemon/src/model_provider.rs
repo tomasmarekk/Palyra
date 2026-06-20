@@ -52,10 +52,10 @@ pub(crate) use palyra_model_providers::{
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
     capability_defaults_for_kind, capability_defaults_for_provider, configured_model_id,
-    validate_model_provider_config, validate_openai_base_url_network_policy,
-    validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
-    ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
-    ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
+    model_id_supports_reasoning_effort, validate_model_provider_config,
+    validate_openai_base_url_network_policy, validate_openai_base_url_network_policy_with_resolver,
+    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+    ModelProviderKind, ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
     ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
     ProviderRegistryEntryConfig,
 };
@@ -72,8 +72,8 @@ pub use palyra_model_providers::{
     EmbeddingsRequest, EmbeddingsResponse, ProviderAttemptSummary, ProviderEvent,
     ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
     ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderRedactionState, ProviderRequest, ProviderResponse,
-    ProviderTurnOutput, ProviderUsage,
+    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
+    ProviderResponse, ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -1510,6 +1510,7 @@ fn build_registry_provider_runtime(
             .auth_profile_provider_kind
             .or(base_config.auth_profile_provider_kind),
         credential_source: entry.credential_source.or(base_config.credential_source),
+        reasoning_effort: base_config.reasoning_effort,
         request_timeout_ms: entry.request_timeout_ms,
         max_retries: entry.max_retries,
         retry_backoff_ms: entry.retry_backoff_ms,
@@ -1907,6 +1908,8 @@ impl ModelProvider for DeterministicProvider {
                 vision: false,
                 audio_transcribe: false,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: Some(8_192),
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2630,6 +2633,14 @@ impl OpenAiCompatibleProvider {
             .filter(|model_id| model_id.contains("transcribe"))
     }
 
+    fn request_with_config_reasoning(&self, request: &ProviderRequest) -> ProviderRequest {
+        let mut effective = request.clone();
+        if effective.reasoning_effort.is_none() {
+            effective.reasoning_effort = self.config.reasoning_effort;
+        }
+        effective
+    }
+
     async fn request_once(
         &self,
         api_key: &str,
@@ -2647,7 +2658,8 @@ impl OpenAiCompatibleProvider {
 
         let actual_model_id = requested_model_id.to_owned();
         let adapter = OpenAiCompatibleChatAdapter;
-        let body = adapter.request_payload(request, actual_model_id.as_str());
+        let effective_request = self.request_with_config_reasoning(request);
+        let body = adapter.request_payload(&effective_request, actual_model_id.as_str());
 
         let endpoint = self.chat_completions_endpoint();
         let response = self
@@ -2828,7 +2840,8 @@ impl OpenAiCompatibleProvider {
     ) -> Result<ProviderResponse, AttemptError> {
         let actual_model_id = openai_codex_runtime_model_id(requested_model_id);
         let adapter = OpenAiResponsesChatAdapter;
-        let body = adapter.request_payload(request, actual_model_id.as_str());
+        let effective_request = self.request_with_config_reasoning(request);
+        let body = adapter.request_payload(&effective_request, actual_model_id.as_str());
         let endpoint = self.codex_responses_endpoint();
         let mut builder = self
             .client
@@ -3502,6 +3515,22 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 vision: true,
                 audio_transcribe: true,
                 embeddings: self.config.openai_embeddings_model.is_some(),
+                reasoning: chat_model_id.as_deref().is_some_and(model_id_supports_reasoning_effort),
+                reasoning_efforts: if chat_model_id
+                    .as_deref()
+                    .is_some_and(model_id_supports_reasoning_effort)
+                {
+                    vec![
+                        ProviderReasoningEffort::None.as_str().to_owned(),
+                        ProviderReasoningEffort::Minimal.as_str().to_owned(),
+                        ProviderReasoningEffort::Low.as_str().to_owned(),
+                        ProviderReasoningEffort::Medium.as_str().to_owned(),
+                        ProviderReasoningEffort::High.as_str().to_owned(),
+                        ProviderReasoningEffort::XHigh.as_str().to_owned(),
+                    ]
+                } else {
+                    Vec::new()
+                },
                 max_context_tokens: Some(128_000),
                 cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -4515,6 +4544,7 @@ mod tests {
             context_trace_id: Some("ctx-01".to_owned()),
             budget_profile: Some("interactive-default".to_owned()),
             max_output_tokens: Some(6_144),
+            reasoning_effort: None,
         };
 
         let openai_payload =
@@ -4572,6 +4602,7 @@ mod tests {
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
+            reasoning_effort: None,
         };
 
         let openai_payload =
@@ -4623,6 +4654,7 @@ mod tests {
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
+            reasoning_effort: None,
         };
 
         let anthropic_payload =
@@ -4676,6 +4708,7 @@ mod tests {
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
+            reasoning_effort: None,
         };
 
         let anthropic_payload =

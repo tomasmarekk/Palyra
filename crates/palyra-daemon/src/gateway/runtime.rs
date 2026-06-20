@@ -10444,6 +10444,8 @@ mod tests {
             vision: false,
             audio_transcribe: false,
             embeddings: false,
+            reasoning: false,
+            reasoning_efforts: Vec::new(),
             max_context_tokens: Some(128_000),
             cost_tier: "standard".to_owned(),
             latency_tier: "standard".to_owned(),

@@ -8,8 +8,8 @@ use crate::config::{
     ProviderCapabilitiesSnapshot, ProviderCostTier, ProviderLatencyTier, ProviderMetadataSource,
 };
 use crate::contract::{
-    ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-    ProviderRequest,
+    model_id_supports_reasoning_effort, ProviderImageInput, ProviderMessage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderReasoningEffort, ProviderRequest,
 };
 
 pub(crate) const PROVIDER_ID: &str = "openai-primary";
@@ -24,6 +24,8 @@ pub(crate) fn chat_capabilities() -> ProviderCapabilitiesSnapshot {
         vision: true,
         audio_transcribe: true,
         embeddings: false,
+        reasoning: false,
+        reasoning_efforts: Vec::new(),
         max_context_tokens: Some(128_000),
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -46,6 +48,8 @@ pub(crate) fn embeddings_capabilities() -> ProviderCapabilitiesSnapshot {
         vision: false,
         audio_transcribe: false,
         embeddings: true,
+        reasoning: false,
+        reasoning_efforts: Vec::new(),
         max_context_tokens: Some(8_192),
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -64,6 +68,8 @@ pub(crate) fn audio_transcription_capabilities() -> ProviderCapabilitiesSnapshot
         vision: false,
         audio_transcribe: true,
         embeddings: false,
+        reasoning: false,
+        reasoning_efforts: Vec::new(),
         max_context_tokens: None,
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -99,6 +105,9 @@ pub fn chat_completions_payload(
     }
     if let Some(max_output_tokens) = request.max_output_tokens {
         body["max_tokens"] = json!(max_output_tokens.max(1));
+    }
+    if let Some(reasoning_effort) = openai_reasoning_effort_for_model(request, model_name) {
+        body["reasoning_effort"] = json!(reasoning_effort.as_str());
     }
     body
 }
@@ -139,7 +148,25 @@ pub fn responses_payload(
         body["tools"] = Value::Array(response_tools);
         body["tool_choice"] = json!("auto");
     }
+    if let Some(reasoning_effort) = openai_reasoning_effort_for_model(request, model_name) {
+        body["reasoning"] = json!({
+            "effort": reasoning_effort.as_str(),
+            "summary": "auto",
+        });
+    }
     ResponsesPayload { body, tool_wire_names }
+}
+
+fn openai_reasoning_effort_for_model(
+    request: &ProviderRequest,
+    model_name: &str,
+) -> Option<ProviderReasoningEffort> {
+    let effort = request.reasoning_effort?;
+    openai_model_supports_reasoning(model_name).then_some(effort)
+}
+
+fn openai_model_supports_reasoning(model_name: &str) -> bool {
+    model_id_supports_reasoning_effort(model_name)
 }
 
 /// Builds the original-to-wire tool-name map for the Responses dialect from
@@ -423,5 +450,51 @@ fn responses_safe_tool_name(original_name: &str) -> String {
         "tool".to_owned()
     } else {
         safe_name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reasoning_request(effort: ProviderReasoningEffort) -> ProviderRequest {
+        let mut request =
+            ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        request.reasoning_effort = Some(effort);
+        request
+    }
+
+    #[test]
+    fn chat_completions_payload_adds_reasoning_effort_for_reasoning_model() {
+        let payload = chat_completions_payload(
+            &reasoning_request(ProviderReasoningEffort::Low),
+            "gpt-5.5",
+            Vec::new(),
+        );
+
+        assert_eq!(payload["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn responses_payload_adds_reasoning_object_for_reasoning_model() {
+        let payload = responses_payload(
+            &reasoning_request(ProviderReasoningEffort::XHigh),
+            "gpt-5.5",
+            Vec::new(),
+        );
+
+        assert_eq!(payload.body["reasoning"]["effort"], "xhigh");
+        assert_eq!(payload.body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn openai_payloads_omit_reasoning_for_non_reasoning_model() {
+        let request = reasoning_request(ProviderReasoningEffort::High);
+
+        let chat_payload = chat_completions_payload(&request, "gpt-4o-mini", Vec::new());
+        let responses_payload = responses_payload(&request, "gpt-4o-mini", Vec::new());
+
+        assert!(chat_payload.get("reasoning_effort").is_none());
+        assert!(responses_payload.body.get("reasoning").is_none());
     }
 }

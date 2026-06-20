@@ -23,6 +23,8 @@ pub(crate) fn chat_capabilities() -> ProviderCapabilitiesSnapshot {
         vision: true,
         audio_transcribe: false,
         embeddings: false,
+        reasoning: false,
+        reasoning_efforts: Vec::new(),
         max_context_tokens: Some(200_000),
         cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),

@@ -32,7 +32,16 @@ fn models_set_updates_text_and_embeddings_defaults() -> Result<()> {
 
     let text_output = run_cli(
         &workdir,
-        &["models", "set", "gpt-4.1-mini", "--path", &config_path_string, "--json"],
+        &[
+            "models",
+            "set",
+            "gpt-4.1-mini",
+            "--path",
+            &config_path_string,
+            "--reasoning-effort",
+            "low",
+            "--json",
+        ],
     )?;
     assert!(
         text_output.status.success(),
@@ -84,6 +93,10 @@ fn models_set_updates_text_and_embeddings_defaults() -> Result<()> {
         status_stdout.contains("\"embeddings_dims\": 3072"),
         "models status should report embeddings dims: {status_stdout}"
     );
+    assert!(
+        status_stdout.contains("\"reasoning_effort\": \"low\""),
+        "models status should report the configured reasoning effort: {status_stdout}"
+    );
 
     let config_body = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -98,6 +111,10 @@ fn models_set_updates_text_and_embeddings_defaults() -> Result<()> {
     assert!(
         config_body.contains("openai_model = \"gpt-4.1-mini\""),
         "models set should persist the text model: {config_body}"
+    );
+    assert!(
+        config_body.contains("reasoning_effort = \"low\""),
+        "models set should persist the reasoning effort: {config_body}"
     );
     assert!(
         config_body.contains("openai_embeddings_model = \"text-embedding-3-large\""),

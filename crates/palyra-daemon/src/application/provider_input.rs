@@ -69,6 +69,7 @@ use crate::{
     media::MediaRuntimeConfig,
     model_provider::{
         ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderReasoningEffort,
     },
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -99,6 +100,7 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) context_trace_id: Option<String>,
     pub(crate) budget_profile: Option<String>,
     pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) reasoning_effort: Option<ProviderReasoningEffort>,
 }
 
 /// How memory-augmentation failures affect the overall input preparation.
@@ -139,6 +141,8 @@ struct ParameterDeltaEnvelope {
     context_references: Option<ContextReferencePreviewEnvelope>,
     #[serde(default)]
     project_context: Option<ProjectContextPreviewEnvelope>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -871,6 +875,23 @@ fn parse_project_context_preview(
     serde_json::from_str::<ParameterDeltaEnvelope>(raw).ok().and_then(|value| value.project_context)
 }
 
+pub(crate) fn parse_provider_reasoning_effort_override(
+    parameter_delta_json: Option<&str>,
+) -> Result<Option<ProviderReasoningEffort>, Status> {
+    let Some(raw) = parameter_delta_json.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<ParameterDeltaEnvelope>(raw).map_err(|error| {
+        Status::invalid_argument(format!("parameter_delta_json is not valid JSON: {error}"))
+    })?;
+    let Some(raw_effort) =
+        parsed.reasoning_effort.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    ProviderReasoningEffort::parse(raw_effort).map(Some).map_err(Status::invalid_argument)
+}
+
 /// Renders a previewed project-context selection into the prompt, if any.
 ///
 /// Returns `Ok(None)` when the parameter delta carries no project-context
@@ -1380,6 +1401,7 @@ async fn prepare_model_provider_input_legacy(
         memory_prompt_failure_mode,
         channel_for_log,
     } = request;
+    let reasoning_effort = parse_provider_reasoning_effort_override(parameter_delta_json)?;
     // When the client previewed @-references, its clean_prompt (with the
     // reference tokens stripped) is the canonical user text for memory
     // ingestion and recall queries; the referenced content is appended later
@@ -1542,6 +1564,7 @@ async fn prepare_model_provider_input_legacy(
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
+            reasoning_effort,
         });
     }
     let provider_input_text = match build_context_reference_prompt(
@@ -1621,6 +1644,7 @@ async fn prepare_model_provider_input_legacy(
         context_trace_id: None,
         budget_profile: None,
         max_output_tokens: None,
+        reasoning_effort,
     })
 }
 
@@ -1927,10 +1951,11 @@ fn memory_auto_inject_tape_payload_with_workspace(
 #[cfg(test)]
 mod tests {
     use super::{
-        curated_memory_sources_for_prompt_context, render_legacy_runtime_context_prompt,
-        sanitize_prompt_inline_value,
+        curated_memory_sources_for_prompt_context, parse_provider_reasoning_effort_override,
+        render_legacy_runtime_context_prompt, sanitize_prompt_inline_value,
     };
     use crate::journal::MemorySource;
+    use crate::model_provider::ProviderReasoningEffort;
     use chrono::TimeZone;
 
     #[test]
@@ -1963,5 +1988,25 @@ mod tests {
         assert!(prompt.contains("current_unix_ms: 1779021296000"));
         assert!(prompt.contains("temporal_evidence_contract"));
         assert!(prompt.contains("Do not invent calendar dates or times"));
+    }
+
+    #[test]
+    fn provider_reasoning_effort_override_accepts_canonical_aliases() {
+        let parsed =
+            parse_provider_reasoning_effort_override(Some(r#"{"reasoning_effort":"x_high"}"#))
+                .expect("reasoning override should parse");
+
+        assert_eq!(parsed, Some(ProviderReasoningEffort::XHigh));
+    }
+
+    #[test]
+    fn provider_reasoning_effort_override_rejects_invalid_values() {
+        let err = parse_provider_reasoning_effort_override(Some(r#"{"reasoning_effort":"turbo"}"#))
+            .expect_err("unknown reasoning effort should fail");
+
+        assert!(
+            err.message().contains("unsupported reasoning effort"),
+            "error should include the failing field contract: {err:?}"
+        );
     }
 }

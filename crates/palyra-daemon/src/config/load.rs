@@ -55,10 +55,11 @@ use crate::channel_router::{
 use crate::cron::CronTimezoneMode;
 use crate::media::MediaRuntimeConfig;
 use crate::model_provider::{
-    validate_openai_base_url_network_policy, ModelProviderAuthProviderKind, ModelProviderConfig,
-    ModelProviderCredentialSource, ModelProviderKind, ProviderCapabilitiesSnapshot,
-    ProviderCostTier, ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig,
-    ProviderModelRole, ProviderRegistryEntryConfig,
+    model_id_supports_reasoning_effort, validate_openai_base_url_network_policy,
+    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+    ModelProviderKind, ProviderCapabilitiesSnapshot, ProviderCostTier, ProviderLatencyTier,
+    ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole, ProviderReasoningEffort,
+    ProviderRegistryEntryConfig,
 };
 use crate::retrieval::{
     RetrievalBackendKind, RetrievalRuntimeConfig, RetrievalSourceScoringProfile,
@@ -645,6 +646,12 @@ pub fn load_config() -> Result<LoadedConfig> {
                         auth_provider_kind.as_str(),
                         "model_provider.auth_provider_kind",
                     )?);
+            }
+            if let Some(reasoning_effort) = file_model_provider.reasoning_effort {
+                model_provider.reasoning_effort = Some(parse_provider_reasoning_effort(
+                    reasoning_effort.as_str(),
+                    "model_provider.reasoning_effort",
+                )?);
             }
             if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
                 model_provider.request_timeout_ms =
@@ -1500,6 +1507,13 @@ pub fn load_config() -> Result<LoadedConfig> {
             "PALYRA_MODEL_PROVIDER_AUTH_PROVIDER_KIND",
         )?);
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_AUTH_PROVIDER_KIND)");
+    }
+    if let Ok(reasoning_effort) = env::var("PALYRA_MODEL_PROVIDER_REASONING_EFFORT") {
+        model_provider.reasoning_effort = Some(parse_provider_reasoning_effort(
+            reasoning_effort.as_str(),
+            "PALYRA_MODEL_PROVIDER_REASONING_EFFORT",
+        )?);
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_REASONING_EFFORT)");
     }
 
     if let Ok(request_timeout_ms) = env::var("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS") {
@@ -2590,6 +2604,46 @@ fn parse_registry_string_list(raw: &[String], source_name: &str) -> Result<Vec<S
     Ok(values)
 }
 
+fn parse_provider_reasoning_effort(
+    raw: &str,
+    source_name: &str,
+) -> Result<ProviderReasoningEffort> {
+    ProviderReasoningEffort::parse(raw)
+        .map_err(|message| anyhow::anyhow!("{source_name}: {message}"))
+}
+
+fn parse_provider_reasoning_efforts(raw: &[String], source_name: &str) -> Result<Vec<String>> {
+    if raw.len() > 16 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 16)", raw.len());
+    }
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in raw.iter().map(String::as_str).map(str::trim).filter(|value| !value.is_empty())
+    {
+        let effort = parse_provider_reasoning_effort(candidate, source_name)?;
+        let normalized = effort.as_str().to_owned();
+        if seen.insert(normalized.clone()) {
+            values.push(normalized);
+        }
+    }
+    Ok(values)
+}
+
+fn default_provider_reasoning_efforts() -> Vec<String> {
+    [
+        ProviderReasoningEffort::None,
+        ProviderReasoningEffort::Minimal,
+        ProviderReasoningEffort::Low,
+        ProviderReasoningEffort::Medium,
+        ProviderReasoningEffort::High,
+        ProviderReasoningEffort::XHigh,
+    ]
+    .into_iter()
+    .map(ProviderReasoningEffort::as_str)
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn parse_provider_model_role(raw: &str, source_name: &str) -> Result<ProviderModelRole> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "chat" => Ok(ProviderModelRole::Chat),
@@ -2654,6 +2708,8 @@ fn provider_capability_defaults(
                 vision: false,
                 audio_transcribe: false,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: Some(8_192),
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2680,6 +2736,8 @@ fn provider_capability_defaults(
                 vision: false,
                 audio_transcribe: false,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2697,6 +2755,8 @@ fn provider_capability_defaults(
                 vision: true,
                 audio_transcribe: true,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: Some(128_000),
                 cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2718,6 +2778,8 @@ fn provider_capability_defaults(
                 vision: false,
                 audio_transcribe: false,
                 embeddings: true,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2738,6 +2800,8 @@ fn provider_capability_defaults(
                 vision: false,
                 audio_transcribe: true,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2754,6 +2818,8 @@ fn provider_capability_defaults(
             vision: true,
             audio_transcribe: false,
             embeddings: false,
+            reasoning: false,
+            reasoning_efforts: Vec::new(),
             max_context_tokens: Some(200_000),
             cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
             latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2777,6 +2843,8 @@ fn provider_capability_defaults(
                 vision: false,
                 audio_transcribe: false,
                 embeddings: false,
+                reasoning: false,
+                reasoning_efforts: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -3056,6 +3124,33 @@ fn parse_model_provider_registry_model(
         })
         .transpose()?
         .unwrap_or_else(|| defaults.known_limitations.clone());
+    let configured_reasoning_efforts = raw
+        .reasoning_efforts
+        .as_ref()
+        .map(|values| {
+            parse_provider_reasoning_efforts(
+                values,
+                format!("{source_name}.reasoning_efforts").as_str(),
+            )
+        })
+        .transpose()?;
+    let reasoning = raw.reasoning.unwrap_or_else(|| {
+        configured_reasoning_efforts.as_ref().is_some_and(|values| !values.is_empty())
+            || defaults.reasoning
+            || (role == ProviderModelRole::Chat && model_id_supports_reasoning_effort(&model_id))
+    });
+    let reasoning_efforts = configured_reasoning_efforts.unwrap_or_else(|| {
+        if reasoning {
+            default_provider_reasoning_efforts()
+        } else {
+            Vec::new()
+        }
+    });
+    if !reasoning && !reasoning_efforts.is_empty() {
+        anyhow::bail!(
+            "{source_name}.reasoning_efforts cannot be set when {source_name}.reasoning=false"
+        );
+    }
 
     Ok(ProviderModelEntryConfig {
         model_id,
@@ -3071,6 +3166,8 @@ fn parse_model_provider_registry_model(
             vision: raw.vision.unwrap_or(defaults.vision),
             audio_transcribe: raw.audio_transcribe.unwrap_or(defaults.audio_transcribe),
             embeddings: raw.embeddings.unwrap_or(defaults.embeddings),
+            reasoning,
+            reasoning_efforts,
             max_context_tokens: raw.max_context_tokens.or(defaults.max_context_tokens),
             cost_tier,
             latency_tier,
@@ -3884,19 +3981,20 @@ mod tests {
         parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
         parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
-        parse_process_runner_tier, parse_root_file_config, parse_storage_prefix_allowlist,
-        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
-        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
-        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
-        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
-        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
-        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
-        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        parse_process_runner_tier, parse_provider_reasoning_effort, parse_root_file_config,
+        parse_storage_prefix_allowlist, parse_tool_allowlist, parse_vault_dir,
+        parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
+        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
+        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
+        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
+        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
         RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
-        ModelProviderAuthProviderKind, ModelProviderKind, ProviderMetadataSource, ProviderModelRole,
+        ModelProviderAuthProviderKind, ModelProviderKind, ProviderMetadataSource,
+        ProviderModelRole, ProviderReasoningEffort,
     };
     use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
     use palyra_common::{
@@ -5441,6 +5539,25 @@ state_dir = "browserd-state"
     }
 
     #[test]
+    fn parse_model_provider_reasoning_effort_accepts_aliases() {
+        assert_eq!(
+            parse_provider_reasoning_effort("med", "model_provider.reasoning_effort")
+                .expect("medium alias should parse"),
+            ProviderReasoningEffort::Medium
+        );
+        assert_eq!(
+            parse_provider_reasoning_effort("x_high", "model_provider.reasoning_effort")
+                .expect("xhigh alias should parse"),
+            ProviderReasoningEffort::XHigh
+        );
+        assert_eq!(
+            parse_provider_reasoning_effort("off", "model_provider.reasoning_effort")
+                .expect("disabled alias should parse"),
+            ProviderReasoningEffort::None
+        );
+    }
+
+    #[test]
     fn parse_model_provider_registry_entry_inherits_model_provider_defaults() {
         let defaults = ModelProviderConfig {
             request_timeout_ms: 9_000,
@@ -5526,6 +5643,8 @@ state_dir = "browserd-state"
                 vision: None,
                 audio_transcribe: None,
                 embeddings: None,
+                reasoning: None,
+                reasoning_efforts: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,
@@ -5545,6 +5664,125 @@ state_dir = "browserd-state"
         assert_eq!(model.capabilities.max_context_tokens, Some(200_000));
         assert_eq!(model.capabilities.cost_tier, "premium");
         assert_eq!(model.capabilities.metadata_source, "static");
+    }
+
+    #[test]
+    fn parse_model_provider_registry_model_infers_reasoning_capabilities_for_reasoning_models() {
+        let providers = vec![parse_model_provider_registry_entry(
+            FileModelProviderRegistryEntry {
+                provider_id: Some("openai-primary".to_owned()),
+                display_name: Some("OpenAI".to_owned()),
+                kind: Some("openai_compatible".to_owned()),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                allow_private_base_url: Some(false),
+                enabled: Some(true),
+                auth_profile_id: None,
+                auth_provider_kind: Some("openai".to_owned()),
+                api_key: None,
+                api_key_secret_ref: None,
+                api_key_vault_ref: None,
+                request_timeout_ms: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                circuit_breaker_failure_threshold: None,
+                circuit_breaker_cooldown_ms: None,
+            },
+            0,
+            &ModelProviderConfig::default(),
+        )
+        .expect("provider entry should parse")];
+
+        let model = parse_model_provider_registry_model(
+            FileModelProviderRegistryModel {
+                model_id: Some("gpt-5.5-codex".to_owned()),
+                provider_id: Some("openai-primary".to_owned()),
+                role: Some("chat".to_owned()),
+                enabled: Some(true),
+                metadata_source: None,
+                operator_override: None,
+                tool_calls: None,
+                json_mode: None,
+                vision: None,
+                audio_transcribe: None,
+                embeddings: None,
+                reasoning: None,
+                reasoning_efforts: None,
+                max_context_tokens: None,
+                cost_tier: None,
+                latency_tier: None,
+                recommended_use_cases: None,
+                known_limitations: None,
+            },
+            0,
+            &providers,
+        )
+        .expect("model entry should parse");
+
+        assert!(model.capabilities.reasoning);
+        assert_eq!(
+            model.capabilities.reasoning_efforts,
+            vec!["none", "minimal", "low", "medium", "high", "xhigh"]
+        );
+    }
+
+    #[test]
+    fn parse_model_provider_registry_model_rejects_disabled_reasoning_with_efforts() {
+        let providers = vec![parse_model_provider_registry_entry(
+            FileModelProviderRegistryEntry {
+                provider_id: Some("openai-primary".to_owned()),
+                display_name: Some("OpenAI".to_owned()),
+                kind: Some("openai_compatible".to_owned()),
+                base_url: Some("https://api.openai.com/v1".to_owned()),
+                allow_private_base_url: Some(false),
+                enabled: Some(true),
+                auth_profile_id: None,
+                auth_provider_kind: Some("openai".to_owned()),
+                api_key: None,
+                api_key_secret_ref: None,
+                api_key_vault_ref: None,
+                request_timeout_ms: None,
+                max_retries: None,
+                retry_backoff_ms: None,
+                circuit_breaker_failure_threshold: None,
+                circuit_breaker_cooldown_ms: None,
+            },
+            0,
+            &ModelProviderConfig::default(),
+        )
+        .expect("provider entry should parse")];
+
+        let result = parse_model_provider_registry_model(
+            FileModelProviderRegistryModel {
+                model_id: Some("gpt-5.5-codex".to_owned()),
+                provider_id: Some("openai-primary".to_owned()),
+                role: Some("chat".to_owned()),
+                enabled: Some(true),
+                metadata_source: None,
+                operator_override: None,
+                tool_calls: None,
+                json_mode: None,
+                vision: None,
+                audio_transcribe: None,
+                embeddings: None,
+                reasoning: Some(false),
+                reasoning_efforts: Some(vec!["low".to_owned()]),
+                max_context_tokens: None,
+                cost_tier: None,
+                latency_tier: None,
+                recommended_use_cases: None,
+                known_limitations: None,
+            },
+            0,
+            &providers,
+        );
+
+        assert!(
+            result
+                .expect_err("inconsistent reasoning capability should fail")
+                .to_string()
+                .contains("reasoning_efforts cannot be set"),
+            "disabled reasoning must reject explicit efforts"
+        );
     }
 
     #[test]
@@ -5586,6 +5824,8 @@ state_dir = "browserd-state"
                 vision: None,
                 audio_transcribe: None,
                 embeddings: None,
+                reasoning: None,
+                reasoning_efforts: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,

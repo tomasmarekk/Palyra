@@ -50,6 +50,12 @@ pub enum AgentCommand {
         prompt_stdin: bool,
         #[arg(
             long,
+            visible_aliases = ["reasoning-effort", "reasoning-level"],
+            help = "Override provider reasoning effort for this run: none, minimal, low, medium, high, or xhigh"
+        )]
+        reasoning: Option<String>,
+        #[arg(
+            long,
             default_value_t = false,
             help = "Permit tools classified as sensitive for this run"
         )]

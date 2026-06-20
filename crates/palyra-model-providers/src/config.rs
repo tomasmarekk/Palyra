@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use palyra_common::secret_refs::SecretRef;
 use serde::{Deserialize, Serialize};
 
+use crate::contract::{model_id_supports_reasoning_effort, ProviderReasoningEffort};
+
 pub use crate::providers::{capability_defaults_for_kind, capability_defaults_for_provider};
 
 /// Default TTL for provider response cache entries, in milliseconds.
@@ -31,6 +33,9 @@ pub struct ProviderCapabilitiesSnapshot {
     pub vision: bool,
     pub audio_transcribe: bool,
     pub embeddings: bool,
+    pub reasoning: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u32>,
     pub cost_tier: String,
@@ -341,6 +346,7 @@ pub struct ModelProviderConfig {
     pub auth_profile_id: Option<String>,
     pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
     pub credential_source: Option<ModelProviderCredentialSource>,
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -369,6 +375,7 @@ impl Default for ModelProviderConfig {
             auth_profile_id: None,
             auth_profile_provider_kind: None,
             credential_source: None,
+            reasoning_effort: None,
             request_timeout_ms: DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
             max_retries: 2,
             retry_backoff_ms: 150,
@@ -377,6 +384,21 @@ impl Default for ModelProviderConfig {
             registry: ModelProviderRegistryConfig::default(),
         }
     }
+}
+
+fn default_reasoning_efforts() -> Vec<String> {
+    [
+        ProviderReasoningEffort::None,
+        ProviderReasoningEffort::Minimal,
+        ProviderReasoningEffort::Low,
+        ProviderReasoningEffort::Medium,
+        ProviderReasoningEffort::High,
+        ProviderReasoningEffort::XHigh,
+    ]
+    .into_iter()
+    .map(ProviderReasoningEffort::as_str)
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 impl ModelProviderConfig {
@@ -519,6 +541,11 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
     let configured_chat_model_id = configured_model_id(model_id.as_str()).map(ToOwned::to_owned);
     let mut models = Vec::new();
     if let Some(chat_model_id) = configured_chat_model_id.clone() {
+        let mut capabilities = capabilities;
+        if model_id_supports_reasoning_effort(chat_model_id.as_str()) {
+            capabilities.reasoning = true;
+            capabilities.reasoning_efforts = default_reasoning_efforts();
+        }
         models.push(ProviderModelEntryConfig {
             model_id: chat_model_id,
             provider_id: provider_id.clone(),

@@ -111,6 +111,70 @@ pub struct ProviderMessageToolCall {
     pub input_json: Value,
 }
 
+/// Provider-neutral reasoning effort requested for a model turn.
+///
+/// Providers map this normalized value to their own wire shape, and must omit
+/// it when the selected provider/model does not support configurable reasoning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningEffort {
+    #[serde(rename = "none")]
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+}
+
+impl ProviderReasoningEffort {
+    /// Parses CLI/config spelling into the canonical effort enum.
+    ///
+    /// # Errors
+    /// Returns an error when `value` is empty or not one of the supported
+    /// normalized effort levels.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "none" | "off" | "disabled" | "false" => Ok(Self::None),
+            "minimal" | "min" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" | "extra" | "extrahigh" => Ok(Self::XHigh),
+            _ => Err(format!(
+                "unsupported reasoning effort '{value}'; expected one of none, minimal, low, medium, high, xhigh"
+            )),
+        }
+    }
+
+    /// Returns the canonical config/JSON spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
+/// Returns true when a provider model id belongs to a known reasoning-capable
+/// model family that accepts a normalized reasoning effort.
+#[must_use]
+pub fn model_id_supports_reasoning_effort(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    let model = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    matches!(model, "o1" | "o1-mini" | "o1-pro" | "o3" | "o3-mini" | "o3-pro" | "o4-mini")
+        || model.starts_with("o1-")
+        || model.starts_with("o3-")
+        || model.starts_with("o4-")
+        || model.starts_with("gpt-5")
+}
+
 impl ProviderMessage {
     /// Creates a plain user text message.
     #[must_use]
@@ -209,6 +273,8 @@ pub struct ProviderRequest {
     pub budget_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
 }
 
 impl ProviderRequest {
@@ -233,6 +299,7 @@ impl ProviderRequest {
             context_trace_id: None,
             budget_profile: None,
             max_output_tokens: None,
+            reasoning_effort: None,
         }
     }
 

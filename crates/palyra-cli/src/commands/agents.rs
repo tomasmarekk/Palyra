@@ -778,6 +778,7 @@ mod tests {
             text_model: Some("MiniMax-M2.7".to_owned()),
             embeddings_model: None,
             embeddings_dims: None,
+            reasoning_effort: None,
             auth_profile_id: None,
             api_key_configured: true,
             default_chat_model_id: Some("MiniMax-M2.7".to_owned()),

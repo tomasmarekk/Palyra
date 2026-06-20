@@ -146,6 +146,8 @@ fn deterministic_chat_capabilities() -> ProviderCapabilitiesSnapshot {
         vision: false,
         audio_transcribe: false,
         embeddings: false,
+        reasoning: false,
+        reasoning_efforts: Vec::new(),
         max_context_tokens: Some(8_192),
         cost_tier: ProviderCostTier::Low.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),

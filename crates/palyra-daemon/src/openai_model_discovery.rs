@@ -146,6 +146,9 @@ fn preferred_openai_compatible_model_id_from_body(body: &str) -> Result<Option<S
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
+            if !model_can_be_chat_default(entry, model_id) {
+                return None;
+            }
             Some((model_id.to_owned(), model_recency_rank(entry)))
         })
         .collect::<Vec<_>>();
@@ -171,6 +174,9 @@ fn preferred_explicit_tool_capable_openai_compatible_model_id_from_body(
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
+            if !model_can_be_chat_default(entry, model_id) {
+                return None;
+            }
             Some((model_id.to_owned(), model_recency_rank(entry)))
         })
         .collect::<Vec<_>>();
@@ -271,6 +277,57 @@ fn model_supported_parameter(entry: &serde_json::Value, names: &[&str]) -> Optio
     }))
 }
 
+fn model_can_be_chat_default(entry: &serde_json::Value, model_id: &str) -> bool {
+    if model_id_looks_non_chat_default(model_id) {
+        return false;
+    }
+
+    let Some(output_modalities) = model_output_modalities(entry) else {
+        return true;
+    };
+    let has_text_output = output_modalities.iter().any(|modality| modality == "text");
+    let has_media_output = output_modalities
+        .iter()
+        .any(|modality| matches!(modality.as_str(), "image" | "video" | "audio"));
+    has_text_output && !has_media_output
+}
+
+fn model_output_modalities(entry: &serde_json::Value) -> Option<Vec<String>> {
+    let modalities = entry
+        .get("architecture")
+        .and_then(|architecture| architecture.get("output_modalities"))
+        .and_then(serde_json::Value::as_array)?;
+    Some(
+        modalities
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|modality| !modality.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect(),
+    )
+}
+
+fn model_id_looks_non_chat_default(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    [
+        "audio",
+        "embed",
+        "embedding",
+        "image",
+        "imagine",
+        "moderation",
+        "realtime",
+        "speech",
+        "transcrib",
+        "tts",
+        "video",
+        "whisper",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
     entry
         .get("visibility")
@@ -305,6 +362,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_model_discovery_rejects_media_output_defaults() {
+        let body = r#"{"data":[{"id":"grok-imagine-video-1.5","created":1800000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["video"]}},{"id":"grok-4.3","created":1700000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["text"]}}]}"#;
+
+        let model_id = preferred_openai_compatible_model_id_from_body(body)
+            .expect("provider model response should parse");
+
+        assert_eq!(model_id.as_deref(), Some("grok-4.3"));
+    }
+
+    #[test]
+    fn openai_model_discovery_returns_none_for_media_only_inventory() {
+        let body = r#"{"data":[{"id":"google/gemini-3-pro-image","created":1800000000,"architecture":{"output_modalities":["image"]}},{"id":"grok-imagine-video-1.5","created":1700000000,"architecture":{"output_modalities":["video"]}}]}"#;
+
+        let model_id = preferred_openai_compatible_model_id_from_body(body)
+            .expect("provider model response should parse");
+
+        assert_eq!(model_id, None);
+    }
+
+    #[test]
     fn openai_public_discovery_requires_explicit_tool_metadata_for_default() {
         let body = r#"{"data":[{"id":"gpt-realtime-whisper","created":1800000000},{"id":"gpt-chat-candidate","created":1700000000}]}"#;
 
@@ -317,6 +394,16 @@ mod tests {
     #[test]
     fn openai_public_discovery_prefers_explicit_tool_capable_model() {
         let body = r#"{"data":[{"id":"newer-non-tool","created":1800000000,"supported_parameters":["temperature"]},{"id":"tool-capable","created":1700000000,"supported_parameters":["tools","response_format"]}]}"#;
+
+        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
+            .expect("provider model response should parse");
+
+        assert_eq!(model_id.as_deref(), Some("tool-capable"));
+    }
+
+    #[test]
+    fn openai_public_discovery_rejects_tool_capable_media_output_default() {
+        let body = r#"{"data":[{"id":"google/gemini-3-pro-image","created":1800000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["image"]}},{"id":"tool-capable","created":1700000000,"supported_parameters":["tools","response_format"],"architecture":{"output_modalities":["text"]}}]}"#;
 
         let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
             .expect("provider model response should parse");

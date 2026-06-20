@@ -58,6 +58,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             run_id,
             prompt,
             prompt_stdin,
+            reasoning,
             allow_sensitive_tools,
             interrupt_active_run,
             approval_mode,
@@ -67,7 +68,11 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
         } => {
             ensure_agent_run_approval_flags(allow_sensitive_tools, approval_mode, prompt_stdin)?;
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
-            let parameter_delta_json = cli_launch_parameter_delta_json(input_prompt.as_str())?;
+            let reasoning_effort = normalize_reasoning_effort_arg(reasoning)?;
+            let parameter_delta_json = cli_launch_parameter_delta_json(
+                input_prompt.as_str(),
+                reasoning_effort.as_deref(),
+            )?;
             let connection = root_context.resolve_grpc_connection(
                 app::ConnectionOverrides {
                     grpc_url,
@@ -322,7 +327,7 @@ async fn run_agent_interactive_async(
             approval_mode: AgentApprovalMode::Prompt,
             origin_kind: None,
             origin_run_id: None,
-            parameter_delta_json: cli_launch_parameter_delta_json(prompt)?,
+            parameter_delta_json: cli_launch_parameter_delta_json(prompt, None)?,
         })?;
         last_run_id = Some(request.run_id.clone());
         let run_id = request.run_id.clone();
@@ -350,9 +355,12 @@ async fn run_agent_interactive_async(
 // anything else (tokens, credentials) must never be serialized into it.
 const CLI_CONTEXT_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E_OS_ROOT"];
 
-fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
+fn cli_launch_parameter_delta_json(
+    prompt: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Option<String>> {
     let cwd = std::env::current_dir().context("failed to resolve CLI current working directory")?;
-    cli_launch_parameter_delta_json_for_cwd(cwd.as_path(), prompt)
+    cli_launch_parameter_delta_json_for_cwd(cwd.as_path(), prompt, reasoning_effort)
 }
 
 // The prompt is accepted but deliberately unused: workspace roots must never
@@ -360,17 +368,42 @@ fn cli_launch_parameter_delta_json(prompt: &str) -> Result<Option<String>> {
 fn cli_launch_parameter_delta_json_for_cwd(
     cwd: &std::path::Path,
     _prompt: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<Option<String>> {
-    let parameter_delta = serde_json::json!({
+    let mut parameter_delta = serde_json::json!({
         "cli_context": {
             "launch_cwd": cwd.to_string_lossy(),
             "workspace_roots": Vec::<String>::new(),
             "env": cli_launch_safe_path_env(),
         }
     });
+    if let Some(reasoning_effort) = reasoning_effort {
+        parameter_delta["reasoning_effort"] = reasoning_effort.into();
+    }
     serde_json::to_string(&parameter_delta)
         .map(Some)
         .context("failed to serialize CLI launch context")
+}
+
+fn normalize_reasoning_effort_arg(raw: Option<String>) -> Result<Option<String>> {
+    let Some(raw) = raw.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let normalized = match raw.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "none" | "off" | "disabled" | "false" => "none",
+        "minimal" | "min" => "minimal",
+        "low" => "low",
+        "medium" | "med" => "medium",
+        "high" => "high",
+        "xhigh" | "extra" | "extrahigh" => "xhigh",
+        _ => {
+            anyhow::bail!(
+                "unsupported --reasoning value '{raw}'; expected one of none, minimal, low, medium, high, xhigh"
+            )
+        }
+    };
+    Ok(Some(normalized.to_owned()))
 }
 
 fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
@@ -723,7 +756,7 @@ mod tests {
     use super::{
         cli_launch_parameter_delta_json_for_cwd, ensure_agent_run_approval_flags,
         interactive_interrupt_message, interactive_session_started_message,
-        normalize_interactive_prompt_line,
+        normalize_interactive_prompt_line, normalize_reasoning_effort_arg,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -840,7 +873,7 @@ mod tests {
     #[test]
     fn cli_launch_context_encodes_current_working_directory() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "")
+        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None)
             .expect("launch context should serialize")
             .expect("launch context should be present");
         let value =
@@ -862,7 +895,7 @@ mod tests {
         fs::create_dir_all(project.as_path()).expect("project directory should exist");
         let prompt = format!("In project `{}` create a Todo app.", project.display());
         let parameter_delta =
-            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), prompt.as_str())
+            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), prompt.as_str(), None)
                 .expect("launch context should serialize")
                 .expect("launch context should be present");
         let value =
@@ -891,7 +924,7 @@ mod tests {
         let _home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
         let _os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
         let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "secret");
-        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "")
+        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None)
             .expect("launch context should serialize")
             .expect("launch context should be present");
         let value =
@@ -915,5 +948,23 @@ mod tests {
             !env.contains_key("PALYRA_ADMIN_TOKEN"),
             "runtime tokens must not be serialized into launch context"
         );
+    }
+
+    #[test]
+    fn cli_launch_context_includes_canonical_reasoning_effort() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let reasoning_effort =
+            normalize_reasoning_effort_arg(Some("med".to_owned())).expect("reasoning should parse");
+        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(
+            tempdir.path(),
+            "",
+            reasoning_effort.as_deref(),
+        )
+        .expect("launch context should serialize")
+        .expect("launch context should be present");
+        let value =
+            serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
+
+        assert_eq!(value.get("reasoning_effort").and_then(Value::as_str), Some("medium"));
     }
 }
