@@ -2,7 +2,13 @@
 //! the PALYRA_INSTALL_* / *_UNDER_TEST paths; every test no-ops when that install context
 //! is not configured.
 
-use std::fs;
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpListener,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -15,6 +21,7 @@ use support::cli_harness::{
     run_cli_with_stdin, temp_workdir,
 };
 
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
 const SERVER_CERT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GATEWAY_CA_PIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -168,34 +175,42 @@ fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()
     let cert_path_string = cert_path.display().to_string();
     let key_path_string = key_path.display().to_string();
 
-    let setup_payload = assert_json_success(
-        run_cli(
-            workdir_path,
-            &[
-                "setup",
-                "--wizard",
-                "--mode",
-                "local",
-                "--path",
-                local_config_string.as_str(),
-                "--force",
-                "--flow",
-                "quickstart",
-                "--non-interactive",
-                "--accept-risk",
-                "--auth-method",
-                "api-key",
-                "--api-key-env",
-                "OPENAI_API_KEY",
-                "--skip-health",
-                "--skip-channels",
-                "--skip-skills",
-                "--json",
-            ],
-            &[("OPENAI_API_KEY", "sk-installed-smoke")],
-        )?,
-        "palyra setup wizard",
+    let model_server = MockOpenAiModelsServer::spawn()?;
+    let setup_output = run_cli(
+        workdir_path,
+        &[
+            "setup",
+            "--wizard",
+            "--mode",
+            "local",
+            "--path",
+            local_config_string.as_str(),
+            "--force",
+            "--flow",
+            "quickstart",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "api-key",
+            "--api-key-env",
+            "OPENAI_API_KEY",
+            "--skip-health",
+            "--skip-channels",
+            "--skip-skills",
+            "--json",
+        ],
+        &[
+            ("OPENAI_API_KEY", "sk-installed-smoke"),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", model_server.base_url.as_str()),
+        ],
     )?;
+    let discovery_request = model_server.finish()?;
+    assert!(
+        discovery_request.starts_with("GET /v1/models "),
+        "expected OpenAI model discovery request, got {discovery_request:?}",
+    );
+
+    let setup_payload = assert_json_success(setup_output, "palyra setup wizard")?;
     assert_eq!(setup_payload.get("status").and_then(Value::as_str), Some("next_step_required"));
     assert_eq!(
         setup_payload.get("recommended_step_id").and_then(Value::as_str),
@@ -357,4 +372,69 @@ fn installed_smoke_requires_explicit_binary_override_in_install_context() -> Res
     );
 
     Ok(())
+}
+
+struct MockOpenAiModelsServer {
+    base_url: String,
+    handle: thread::JoinHandle<Result<String>>,
+}
+
+impl MockOpenAiModelsServer {
+    fn spawn() -> Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("bind OpenAI-compatible model fixture")?;
+        listener.set_nonblocking(true).context("configure OpenAI-compatible fixture listener")?;
+        let port = listener.local_addr().context("read OpenAI-compatible fixture address")?.port();
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 4096];
+                        let read = stream
+                            .read(&mut buffer)
+                            .context("read OpenAI-compatible fixture request")?;
+                        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        let request_line = request.lines().next().unwrap_or_default().to_owned();
+                        let has_bearer = request.lines().any(|line| {
+                            line.to_ascii_lowercase().starts_with("authorization: bearer ")
+                        });
+
+                        let (status, body) = if !request_line.starts_with("GET /v1/models ") {
+                            ("404 Not Found", r#"{"error":"not found"}"#)
+                        } else if !has_bearer {
+                            ("401 Unauthorized", r#"{"error":"missing bearer"}"#)
+                        } else {
+                            ("200 OK", OPENAI_COMPATIBLE_MODELS_RESPONSE)
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len(),
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .context("write OpenAI-compatible fixture response")?;
+                        return Ok(request_line);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            anyhow::bail!("timed out waiting for OpenAI model discovery request");
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        return Err(error).context("accept OpenAI-compatible fixture request");
+                    }
+                }
+            }
+        });
+
+        Ok(Self { base_url: format!("http://127.0.0.1:{port}"), handle })
+    }
+
+    fn finish(self) -> Result<String> {
+        self.handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("OpenAI-compatible fixture thread panicked"))?
+    }
 }

@@ -123,6 +123,149 @@ function Merge-EnvironmentTables {
     return $merged
 }
 
+function Stop-OpenAiModelsFixture {
+    param(
+        [AllowNull()]
+        [pscustomobject]$Fixture
+    )
+
+    if ($null -eq $Fixture -or $null -eq $Fixture.Job) {
+        return
+    }
+
+    try {
+        if ($Fixture.Job.State -eq "Running") {
+            Stop-Job -Job $Fixture.Job -ErrorAction SilentlyContinue
+        }
+        Receive-Job -Job $Fixture.Job -ErrorAction SilentlyContinue | Out-Null
+    }
+    finally {
+        Remove-Job -Job $Fixture.Job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-OpenAiModelsFixture {
+    $probeListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $probeListener.Start()
+        $port = [int]$probeListener.LocalEndpoint.Port
+    }
+    finally {
+        $probeListener.Stop()
+    }
+
+    $responseBody = '{"data":[{"id":"gpt-test-discovered"}]}'
+    $job = Start-Job -Name "palyra-openai-models-fixture" -ScriptBlock {
+        param(
+            [int]$Port,
+            [string]$ResponseBody
+        )
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = "Stop"
+
+        function Write-HttpResponse {
+            param(
+                [Parameter(Mandatory = $true)]
+                [System.IO.Stream]$Stream,
+                [Parameter(Mandatory = $true)]
+                [string]$Status,
+                [Parameter(Mandatory = $true)]
+                [string]$Body
+            )
+
+            $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+            $headers = "HTTP/1.1 $Status`r`nContent-Type: application/json`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+            $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($headers)
+            $Stream.Write($headerBytes, 0, $headerBytes.Length)
+            if ($bodyBytes.Length -gt 0) {
+                $Stream.Write($bodyBytes, 0, $bodyBytes.Length)
+            }
+            $Stream.Flush()
+        }
+
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        try {
+            while ($true) {
+                $client = $listener.AcceptTcpClient()
+                try {
+                    $stream = $client.GetStream()
+                    $stream.ReadTimeout = 5000
+                    $stream.WriteTimeout = 5000
+                    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::ASCII, $false, 4096, $true)
+                    $requestLine = $reader.ReadLine()
+                    if ($null -eq $requestLine) {
+                        continue
+                    }
+
+                    $headers = [System.Collections.Generic.List[string]]::new()
+                    while ($true) {
+                        $line = $reader.ReadLine()
+                        if ($null -eq $line -or $line.Length -eq 0) {
+                            break
+                        }
+                        [void]$headers.Add($line)
+                    }
+
+                    $headersText = $headers -join "`n"
+                    if ($requestLine -notmatch "^GET /v1/models ") {
+                        Write-HttpResponse -Stream $stream -Status "404 Not Found" -Body '{"error":"not found"}'
+                    } elseif ($headersText -notmatch "(?im)^authorization:\s*bearer\s+") {
+                        Write-HttpResponse -Stream $stream -Status "401 Unauthorized" -Body '{"error":"missing bearer"}'
+                    } else {
+                        Write-HttpResponse -Stream $stream -Status "200 OK" -Body $ResponseBody
+                    }
+                }
+                catch [System.IO.IOException] {
+                    continue
+                }
+                finally {
+                    $client.Dispose()
+                }
+            }
+        }
+        finally {
+            $listener.Stop()
+        }
+    } -ArgumentList $port, $responseBody
+
+    $baseUrl = "http://127.0.0.1:$port"
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        if ($job.State -eq "Failed") {
+            $failure = Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-String
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            throw "OpenAI model fixture failed to start: $failure"
+        }
+
+        $client = $null
+        try {
+            $client = [System.Net.Sockets.TcpClient]::new("127.0.0.1", $port)
+            $stream = $client.GetStream()
+            $requestBytes = [System.Text.Encoding]::ASCII.GetBytes("GET /ready HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n")
+            $stream.Write($requestBytes, 0, $requestBytes.Length)
+            $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::ASCII)
+            [void]$reader.ReadToEnd()
+            return [pscustomobject]@{
+                BaseUrl = $baseUrl
+                Job     = $job
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+        }
+        finally {
+            if ($null -ne $client) {
+                $client.Dispose()
+            }
+        }
+    }
+
+    Stop-OpenAiModelsFixture -Fixture ([pscustomobject]@{ Job = $job })
+    throw "OpenAI model fixture did not become ready at $baseUrl."
+}
+
 function Invoke-TranscriptCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -265,6 +408,7 @@ $transcriptStats = [ordered]@{
     help = 0
     functional = 0
 }
+$openAiModelsFixture = $null
 
 Push-Location $repoRoot
 try {
@@ -384,6 +528,8 @@ try {
     Set-Content -LiteralPath $modelsContext.ConfigPath -Value "version = 1`n" -Encoding utf8
     Set-Content -LiteralPath $patchContext.TargetFile -Value "hello`n" -Encoding utf8
 
+    $openAiModelsFixture = Start-OpenAiModelsFixture
+
     $functionalScenarios = @(
         @{ Label = "functional :: version"; Context = $baselineContext; Args = @("version") }
         @{ Label = "functional :: root-help"; Context = $baselineContext; Args = @("--help") }
@@ -393,7 +539,7 @@ try {
         @{ Label = "functional :: docs-search-gateway"; Context = $baselineContext; Args = @("docs", "search", "gateway") }
         @{ Label = "functional :: docs-show-help"; Context = $baselineContext; Args = @("docs", "show", "help/docs-help") }
         @{ Label = "functional :: setup-local"; Context = $bootstrapContext; Args = @("setup", "--mode", "local", "--path", $bootstrapContext.ConfigPath, "--force") }
-        @{ Label = "functional :: setup-wizard-quickstart"; Context = $bootstrapContext; Args = @("setup", "--wizard", "--mode", "local", "--path", $bootstrapContext.ConfigPath, "--force", "--flow", "quickstart", "--non-interactive", "--accept-risk", "--auth-method", "api-key", "--api-key-env", "OPENAI_API_KEY", "--skip-health", "--skip-channels", "--skip-skills", "--json"); Environment = @{ OPENAI_API_KEY = "sk-installed-smoke" } }
+        @{ Label = "functional :: setup-wizard-quickstart"; Context = $bootstrapContext; Args = @("setup", "--wizard", "--mode", "local", "--path", $bootstrapContext.ConfigPath, "--force", "--flow", "quickstart", "--non-interactive", "--accept-risk", "--auth-method", "api-key", "--api-key-env", "OPENAI_API_KEY", "--skip-health", "--skip-channels", "--skip-skills", "--json"); Environment = @{ OPENAI_API_KEY = "sk-installed-smoke"; PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL = $openAiModelsFixture.BaseUrl } }
         @{ Label = "functional :: config-validate"; Context = $bootstrapContext; Args = @("config", "validate", "--path", $bootstrapContext.ConfigPath) }
         @{ Label = "functional :: config-list"; Context = $bootstrapContext; Args = @("config", "list", "--path", $bootstrapContext.ConfigPath) }
         @{ Label = "functional :: onboarding-wizard-remote"; Context = $bootstrapContext; Args = @("onboarding", "wizard", "--path", $bootstrapContext.RemoteConfig, "--flow", "remote", "--non-interactive", "--accept-risk", "--remote-base-url", "https://dashboard.example.com/", "--remote-verification", "server-cert", "--pinned-server-cert-sha256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--admin-token-env", "PALYRA_REMOTE_ADMIN_TOKEN", "--skip-health", "--skip-channels", "--skip-skills", "--json"); Environment = @{ PALYRA_REMOTE_ADMIN_TOKEN = "remote-admin-token" } }
@@ -538,6 +684,7 @@ finally {
         }
     }
     finally {
+        Stop-OpenAiModelsFixture -Fixture $openAiModelsFixture
         Pop-Location
     }
 }
