@@ -63,10 +63,12 @@ use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
-    ProviderAttemptSummary, ProviderEvent, ProviderFinishReason, ProviderImageInput,
-    ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
-    ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderTurnOutput, ProviderUsage,
+    AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
+    EmbeddingsRequest, EmbeddingsResponse, ProviderAttemptSummary, ProviderEvent,
+    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
+    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
+    ProviderRawProviderRefs, ProviderRedactionState, ProviderRequest, ProviderResponse,
+    ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -455,54 +457,6 @@ fn provider_route_reason(
         _ if failover_enabled => "failover_candidate".to_owned(),
         _ => "available_failover_disabled".to_owned(),
     }
-}
-
-/// Batch of texts to embed; validated against batch and byte limits before
-/// any provider call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingsRequest {
-    pub inputs: Vec<String>,
-}
-
-/// Embedding vectors in the same order as the request inputs; all vectors
-/// share `dimensions`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EmbeddingsResponse {
-    pub model_name: String,
-    pub dimensions: usize,
-    pub vectors: Vec<Vec<f32>>,
-    pub retry_count: u32,
-}
-
-/// Audio payload plus optional transcription hints (prompt, language).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AudioTranscriptionRequest {
-    pub file_name: String,
-    pub content_type: String,
-    pub bytes: Vec<u8>,
-    pub prompt: Option<String>,
-    pub language: Option<String>,
-}
-
-/// One timed transcript segment; `confidence` is provider-derived when
-/// available.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AudioTranscriptionSegment {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub text: String,
-    pub confidence: Option<f64>,
-}
-
-/// Full transcription result: flattened text plus per-segment timing.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AudioTranscriptionResponse {
-    pub text: String,
-    pub language: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub model_name: String,
-    pub retry_count: u32,
-    pub segments: Vec<AudioTranscriptionSegment>,
 }
 
 /// Configured retry budget: attempt count and base backoff delay.
