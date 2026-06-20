@@ -990,7 +990,7 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
       has_context_files: true,
       last_context_file: "docs/desktop/companion-preview.md",
       agent_id: "desktop-companion",
-      model_profile: "gpt-5.4",
+      model_profile: "provider-default",
       artifact_count: 2,
       family: {
         root_title: "Preview conversation",
@@ -1024,10 +1024,10 @@ export const DESKTOP_PREVIEW_COMPANION_SNAPSHOT: DesktopCompanionSnapshot = {
           override_active: true,
         },
         model: {
-          value: "gpt-5.4",
-          display_value: "gpt-5.4",
+          value: "provider-default",
+          display_value: "Provider default",
           source: "session",
-          inherited_value: "gpt-5.4-mini",
+          inherited_value: "Provider default",
           override_active: true,
         },
         thinking: {
