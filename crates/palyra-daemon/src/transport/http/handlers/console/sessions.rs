@@ -1257,6 +1257,10 @@ fn normalize_effective_model_profile(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
 }
 
+fn agent_default_model_profile(agent: &AgentRecord) -> Option<String> {
+    normalize_effective_model_profile(Some(agent.default_model_profile.as_str()))
+}
+
 async fn load_session_workspace_summaries(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1728,8 +1732,9 @@ fn build_session_quick_controls(
         },
     };
 
-    let inherited_model =
-        bound_agent.or(inherited_agent).map(|agent| agent.default_model_profile.clone());
+    let inherited_model = bound_agent
+        .and_then(agent_default_model_profile)
+        .or_else(|| inherited_agent.and_then(agent_default_model_profile));
     // The runtime profile only counts as a distinct layer when it differs
     // from the agent default; otherwise the agent default reports as source.
     let runtime_model_profile = context
@@ -1752,18 +1757,19 @@ fn build_session_quick_controls(
                 false,
             )
         } else {
-            match (bound_agent, inherited_agent) {
-                (Some(agent), inherited) => (
-                    Some(agent.default_model_profile.clone()),
-                    agent.default_model_profile.clone(),
+            match (
+                bound_agent.and_then(agent_default_model_profile),
+                inherited_agent.and_then(agent_default_model_profile),
+            ) {
+                (Some(agent_model_profile), inherited) => (
+                    Some(agent_model_profile.clone()),
+                    agent_model_profile.clone(),
                     "agent_default_model_profile".to_owned(),
-                    inherited.is_none_or(|entry| {
-                        entry.default_model_profile != agent.default_model_profile
-                    }),
+                    inherited.as_ref().is_none_or(|entry| entry != &agent_model_profile),
                 ),
-                (None, Some(agent)) => (
-                    Some(agent.default_model_profile.clone()),
-                    agent.default_model_profile.clone(),
+                (None, Some(agent_model_profile)) => (
+                    Some(agent_model_profile.clone()),
+                    agent_model_profile,
                     "default_agent_model_profile".to_owned(),
                     false,
                 ),
@@ -2079,6 +2085,18 @@ mod tests {
         assert_eq!(controls.model.display_value, "MiniMax-M3");
         assert_eq!(controls.model.source, "model_provider_runtime");
         assert_eq!(controls.model.inherited_value.as_deref(), Some("deterministic"));
+        assert!(!controls.model.override_active);
+    }
+
+    #[test]
+    fn session_quick_controls_use_runtime_model_when_agent_default_is_unset() {
+        let context = test_context(test_agent(""), Some("MiniMax-M3"));
+        let controls = build_session_quick_controls(&context, &test_session(None));
+
+        assert_eq!(controls.model.value.as_deref(), Some("MiniMax-M3"));
+        assert_eq!(controls.model.display_value, "MiniMax-M3");
+        assert_eq!(controls.model.source, "model_provider_runtime");
+        assert_eq!(controls.model.inherited_value, None);
         assert!(!controls.model.override_active);
     }
 

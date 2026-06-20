@@ -209,7 +209,9 @@ async fn create_delegation(
         &DelegationParentContext {
             parent_run_id: Some(parent_run_id.clone()),
             agent_id: Some(resolved_agent.agent.agent_id.clone()),
-            parent_model_profile: Some(resolved_agent.agent.default_model_profile.clone()),
+            parent_model_profile: normalize_optional(Some(
+                resolved_agent.agent.default_model_profile.as_str(),
+            )),
             parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist.clone(),
             parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist.clone(),
             parent_budget_tokens,

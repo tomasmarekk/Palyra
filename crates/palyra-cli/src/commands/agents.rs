@@ -101,11 +101,8 @@ pub(crate) async fn run_agents_async(
                         agent.display_name,
                         agent.agent_dir,
                         agent.workspace_roots.len(),
-                        agent.default_model_profile,
-                        model_routing
-                            .effective_model_profile
-                            .as_deref()
-                            .unwrap_or(agent.default_model_profile.as_str()),
+                        text_or_none(agent.default_model_profile.as_str()),
+                        effective_model_profile_label(agent, &model_routing),
                         text_or_none(agent.execution_backend_preference.as_str())
                     );
                 }
@@ -192,11 +189,8 @@ pub(crate) async fn run_agents_async(
                     agent.display_name,
                     agent.agent_dir,
                     response.is_default,
-                    agent.default_model_profile,
-                    model_routing
-                        .effective_model_profile
-                        .as_deref()
-                        .unwrap_or(agent.default_model_profile.as_str()),
+                    text_or_none(agent.default_model_profile.as_str()),
+                    effective_model_profile_label(&agent, &model_routing),
                     text_or_none(agent.execution_backend_preference.as_str()),
                     text_or_none(response.resolved_execution_backend.as_str()),
                     response.execution_backend_fallback_used
@@ -468,10 +462,7 @@ pub(crate) async fn run_agents_async(
                     agent_resolution_source_label(response.source),
                     response.binding_created,
                     response.is_default,
-                    model_routing
-                        .effective_model_profile
-                        .as_deref()
-                        .unwrap_or(agent.default_model_profile.as_str()),
+                    effective_model_profile_label(&agent, &model_routing),
                     text_or_none(agent.execution_backend_preference.as_str()),
                     text_or_none(response.resolved_execution_backend.as_str()),
                     response.execution_backend_fallback_used
@@ -547,12 +538,22 @@ fn agent_to_json_with_model_routing(
     agent: &gateway_v1::Agent,
     routing: &AgentModelRoutingSnapshot,
 ) -> Value {
+    let registry_model_profile = normalize_optional_text_arg(agent.default_model_profile.clone());
     let effective_model_profile =
-        routing.effective_model_profile.as_deref().unwrap_or(agent.default_model_profile.as_str());
-    let default_is_authoritative = routing
-        .effective_model_profile
-        .as_deref()
-        .is_none_or(|model| model.eq_ignore_ascii_case(agent.default_model_profile.as_str()));
+        routing.effective_model_profile.clone().or_else(|| registry_model_profile.clone());
+    let default_is_authoritative =
+        match (routing.effective_model_profile.as_deref(), registry_model_profile.as_deref()) {
+            (Some(model), Some(registry_model)) => model.eq_ignore_ascii_case(registry_model),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+    let model_profile_authority = if default_is_authoritative {
+        "agent_registry"
+    } else if effective_model_profile.is_some() {
+        "model_provider_runtime"
+    } else {
+        "unconfigured"
+    };
     json!({
         "agent_id": agent.agent_id,
         "display_name": agent.display_name,
@@ -563,7 +564,7 @@ fn agent_to_json_with_model_routing(
         "default_model_profile_authoritative": default_is_authoritative,
         "effective_model_profile": effective_model_profile,
         "effective_model_profile_source": routing.source,
-        "model_profile_authority": if default_is_authoritative { "agent_registry" } else { "model_provider_runtime" },
+        "model_profile_authority": model_profile_authority,
         "model_profile_note": if default_is_authoritative {
             Value::Null
         } else {
@@ -726,6 +727,26 @@ fn text_or_none(value: &str) -> &str {
     }
 }
 
+fn effective_model_profile_label<'a>(
+    agent: &'a gateway_v1::Agent,
+    routing: &'a AgentModelRoutingSnapshot,
+) -> &'a str {
+    routing
+        .effective_model_profile
+        .as_deref()
+        .or_else(|| normalized_agent_model_profile(agent))
+        .unwrap_or("none")
+}
+
+fn normalized_agent_model_profile(agent: &gateway_v1::Agent) -> Option<&str> {
+    let trimmed = agent.default_model_profile.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn agent_resolution_source_label(raw: i32) -> &'static str {
     match gateway_v1::AgentResolutionSource::try_from(raw)
         .unwrap_or(gateway_v1::AgentResolutionSource::Unspecified)
@@ -791,6 +812,17 @@ mod tests {
             payload["effective_model_profile_source"],
             "model_provider.default_chat_model_id"
         );
+        assert_eq!(payload["default_model_profile_authoritative"], false);
+        assert_eq!(payload["model_profile_authority"], "model_provider_runtime");
+    }
+
+    #[test]
+    fn agent_json_uses_provider_routing_when_registry_model_is_unset() {
+        let routing = agent_model_routing_snapshot_from_status(&sample_models_status());
+        let payload = agent_to_json_with_model_routing(&sample_agent(""), &routing);
+
+        assert_eq!(payload["default_model_profile"], "");
+        assert_eq!(payload["effective_model_profile"], "MiniMax-M2.7");
         assert_eq!(payload["default_model_profile_authoritative"], false);
         assert_eq!(payload["model_profile_authority"], "model_provider_runtime");
     }

@@ -831,6 +831,7 @@ describe("M56 runtime and operations surfaces", () => {
         target: { value: "workspace\nworkspace-review" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByLabelText("Default model profile")).toHaveValue("");
       fireEvent.change(screen.getByLabelText("Default model profile"), {
         target: { value: "gpt-4.1-mini" },
       });

@@ -27,7 +27,6 @@ const REGISTRY_VERSION: u32 = 1;
 const REGISTRY_FILE: &str = "agents.toml";
 const ENV_STATE_ROOT: &str = "PALYRA_STATE_ROOT";
 const ENV_REGISTRY_PATH: &str = "PALYRA_AGENTS_REGISTRY_PATH";
-const DEFAULT_MODEL_PROFILE: &str = "gpt-4o-mini";
 const MAX_AGENT_COUNT: usize = 1024;
 const MAX_WORKSPACE_ROOTS: usize = 32;
 const MAX_SESSION_BINDINGS: usize = 10_000;
@@ -35,8 +34,8 @@ const REGISTRY_LOCK_MAX_ATTEMPTS: u32 = 40;
 const REGISTRY_LOCK_RETRY_DELAY_MS: u64 = 25;
 const REGISTRY_LOCK_STALE_AFTER_SECS: u64 = 30;
 
-/// Persisted agent profile: identity, canonical directories, default model
-/// profile, and default tool/skill allowlists. All paths are stored in
+/// Persisted agent profile: identity, canonical directories, optional legacy
+/// model profile, and default tool/skill allowlists. All paths are stored in
 /// canonicalized form.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRecord {
@@ -453,10 +452,8 @@ impl AgentRegistry {
     ) -> Result<AgentCreateOutcome, AgentRegistryError> {
         let agent_id = normalize_agent_id(request.agent_id.as_str())?;
         let display_name = normalize_required_text(request.display_name.as_str(), "display_name")?;
-        let default_model_profile = normalize_required_text(
-            request.default_model_profile.as_deref().unwrap_or(DEFAULT_MODEL_PROFILE),
-            "default_model_profile",
-        )?;
+        let default_model_profile =
+            normalize_optional_text(request.default_model_profile.as_deref()).unwrap_or_default();
         let agent_dir = resolve_agent_dir(
             request.agent_dir.as_deref(),
             agent_id.as_str(),
@@ -1042,7 +1039,7 @@ fn normalize_document(
         agent.agent_id = normalize_agent_id(agent.agent_id.as_str())?;
         agent.display_name = normalize_required_text(agent.display_name.as_str(), "display_name")?;
         agent.default_model_profile =
-            normalize_required_text(agent.default_model_profile.as_str(), "default_model_profile")?;
+            normalize_optional_text(Some(agent.default_model_profile.as_str())).unwrap_or_default();
         agent.default_tool_allowlist = normalize_allowlist(agent.default_tool_allowlist.clone());
         agent.default_skill_allowlist = normalize_allowlist(agent.default_skill_allowlist.clone());
 
@@ -1581,6 +1578,7 @@ mod tests {
         let canonical_workspace = canonical_workspace.to_string_lossy().into_owned();
 
         assert_eq!(outcome.agent.workspace_roots, vec![canonical_workspace.clone()]);
+        assert_eq!(outcome.agent.default_model_profile, "");
 
         drop(registry);
         let reopened =

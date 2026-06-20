@@ -2430,7 +2430,9 @@ pub(crate) async fn console_chat_background_task_create_handler(
                 &crate::delegation::DelegationParentContext {
                     parent_run_id: Some(parent_run_id),
                     agent_id: Some(resolved_agent.agent.agent_id),
-                    parent_model_profile: Some(resolved_agent.agent.default_model_profile),
+                    parent_model_profile: trim_to_option(
+                        resolved_agent.agent.default_model_profile,
+                    ),
                     parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist,
                     parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist,
                     parent_budget_tokens: Some(requested_budget_tokens),

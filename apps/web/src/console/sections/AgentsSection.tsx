@@ -81,7 +81,7 @@ function createDefaultDraft(): AgentDraft {
     displayName: "",
     agentDir: "",
     workspaceRoots: "workspace",
-    defaultModelProfile: "gpt-4o-mini",
+    defaultModelProfile: "",
     executionBackendPreference: "automatic",
     defaultToolAllowlist: "",
     defaultSkillAllowlist: "",
@@ -393,7 +393,7 @@ export function AgentsSection({ app }: AgentsSectionProps) {
               label="Search agents"
               value={filter}
               onChange={setFilter}
-              placeholder="main, review, gpt-4o-mini"
+              placeholder="main, review, provider/model"
             />
 
             <EntityTable
@@ -703,7 +703,7 @@ export function AgentsSection({ app }: AgentsSectionProps) {
                           onChange={(defaultModelProfile) =>
                             setDraft((current) => ({ ...current, defaultModelProfile }))
                           }
-                          placeholder="gpt-4o-mini"
+                          placeholder="provider/model-id"
                         />
                         <CheckboxField
                           label="Set as default agent"

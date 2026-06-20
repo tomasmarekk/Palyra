@@ -3480,7 +3480,7 @@ fn resolve_usage_agent_identity(
             binding.agent_id.clone(),
             agent.display_name.clone(),
             "session_binding".to_owned(),
-            Some(agent.default_model_profile.clone()),
+            normalize_usage_model_profile(agent.default_model_profile.as_str()),
         ),
         (Some(binding), None) => {
             (binding.agent_id.clone(), binding.agent_id.clone(), "session_binding".to_owned(), None)
@@ -3501,13 +3501,35 @@ fn resolve_usage_model_identity(
     let binding = metadata.bindings_by_session.get(session.session_id.as_str());
     let agent = binding.and_then(|record| metadata.agents_by_id.get(record.agent_id.as_str()));
     match (binding, agent) {
-        (Some(binding), Some(agent)) => (
-            agent.default_model_profile.clone(),
-            agent.default_model_profile.clone(),
-            "agent_default_model_profile".to_owned(),
-            Some(binding.agent_id.clone()),
-        ),
+        (Some(binding), Some(agent)) => {
+            normalize_usage_model_profile(agent.default_model_profile.as_str())
+                .map(|model_profile| {
+                    (
+                        model_profile.clone(),
+                        model_profile,
+                        "agent_default_model_profile".to_owned(),
+                        Some(binding.agent_id.clone()),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "unassigned".to_owned(),
+                        "Unassigned".to_owned(),
+                        "unassigned".to_owned(),
+                        None,
+                    )
+                })
+        }
         _ => ("unassigned".to_owned(), "Unassigned".to_owned(), "unassigned".to_owned(), None),
+    }
+}
+
+fn normalize_usage_model_profile(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 
