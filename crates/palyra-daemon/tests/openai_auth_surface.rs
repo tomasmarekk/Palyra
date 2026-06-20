@@ -835,7 +835,7 @@ fn compat_embeddings_surface_reports_feature_disabled_and_degraded_posture() -> 
         ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         (
             "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL".to_owned(),
-            "text-embedding-3-small".to_owned(),
+            "operator-embedding-v1".to_owned(),
         ),
         ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
     ])?;
@@ -874,7 +874,7 @@ fn compat_embeddings_surface_reports_feature_disabled_and_degraded_posture() -> 
         ("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL".to_owned(), "true".to_owned()),
         (
             "PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL".to_owned(),
-            "text-embedding-3-small".to_owned(),
+            "operator-embedding-v1".to_owned(),
         ),
         ("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY".to_owned(), "sk-compat-openai".to_owned()),
         ("PALYRA_OFFLINE".to_owned(), "1".to_owned()),

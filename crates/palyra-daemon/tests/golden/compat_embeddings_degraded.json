@@ -1,6 +1,6 @@
 {
   "error": {
-    "message": "PALYRA_OFFLINE is enabled; retrieval embeddings are using the explicit hash fallback",
+    "message": "retrieval embeddings are using hash fallback because dimensions for model 'operator-embedding-v1' are not known and were not configured",
     "type": "server_error",
     "param": null,
     "code": "embeddings_degraded"
