@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use tonic::Status;
 
 const DELEGATED_RUN_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_MODEL_PROFILE: &str = "gpt-4o-mini";
 const DEFAULT_MAX_ATTEMPTS: u64 = 3;
 const DEFAULT_MAX_CONCURRENT_CHILDREN: u64 = 2;
 const DEFAULT_MAX_CHILDREN_PER_PARENT: u64 = 8;
@@ -740,7 +739,8 @@ pub struct DelegationProfileDefinition {
     pub display_name: String,
     pub description: String,
     pub role: DelegationRole,
-    pub model_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile: Option<String>,
     pub tool_allowlist: Vec<String>,
     pub skill_allowlist: Vec<String>,
     pub memory_scope: DelegationMemoryScopeKind,
@@ -868,7 +868,7 @@ fn profile_definition(
         display_name: display_name.to_owned(),
         description: description.to_owned(),
         role,
-        model_profile: DEFAULT_MODEL_PROFILE.to_owned(),
+        model_profile: None,
         tool_allowlist: normalize_allowlist(
             tool_allowlist.iter().map(ToString::to_string).collect(),
         ),
@@ -1377,7 +1377,7 @@ pub fn resolve_delegation_request(
             base_profile.role = role;
         }
         if let Some(model_profile) = normalize_optional_text(manifest.model_profile.as_deref()) {
-            base_profile.model_profile = model_profile;
+            base_profile.model_profile = Some(model_profile);
         }
         let manifest_tool_allowlist = normalize_allowlist(manifest.tool_allowlist.clone());
         if !manifest_tool_allowlist.is_empty() {
@@ -1474,9 +1474,15 @@ pub fn resolve_delegation_request(
         )
     };
 
-    let model_profile = normalize_optional_text(Some(base_profile.model_profile.as_str()))
-        .or(parent.parent_model_profile.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL_PROFILE.to_owned());
+    let model_profile = base_profile
+        .model_profile
+        .clone()
+        .or_else(|| normalize_optional_text(parent.parent_model_profile.as_deref()))
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "delegation requires a model profile from the manifest or parent agent",
+            )
+        })?;
 
     Ok(DelegationSnapshot {
         profile_id: base_profile.profile_id,
@@ -1512,7 +1518,7 @@ mod tests {
         DelegationParentContext {
             parent_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             agent_id: Some("main".to_owned()),
-            parent_model_profile: Some("gpt-4o-mini".to_owned()),
+            parent_model_profile: Some("provider-runtime-model".to_owned()),
             parent_tool_allowlist: vec!["palyra.http.fetch".to_owned()],
             parent_skill_allowlist: vec!["repo.read".to_owned()],
             parent_budget_tokens: Some(2_400),
@@ -1530,6 +1536,56 @@ mod tests {
             catalog.profiles.iter().any(|profile| profile.profile_id == "research"),
             "catalog should expose a research profile"
         );
+    }
+
+    #[test]
+    fn resolve_delegation_request_inherits_parent_model_profile_without_catalog_default() {
+        let snapshot = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("research".to_owned()),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("built-in profiles should inherit the parent provider model");
+
+        assert_eq!(snapshot.model_profile, "provider-runtime-model");
+    }
+
+    #[test]
+    fn resolve_delegation_request_manifest_model_profile_overrides_parent() {
+        let snapshot = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("synthesis".to_owned()),
+                manifest: Some(DelegationManifestInput {
+                    model_profile: Some("operator-selected-model".to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("manifest model profile should remain an explicit operator override");
+
+        assert_eq!(snapshot.model_profile, "operator-selected-model");
+    }
+
+    #[test]
+    fn resolve_delegation_request_requires_parent_or_manifest_model_profile() {
+        let mut parent = parent_context();
+        parent.parent_model_profile = None;
+
+        let error = resolve_delegation_request(
+            &DelegationRequestInput {
+                profile_id: Some("synthesis".to_owned()),
+                ..Default::default()
+            },
+            &parent,
+        )
+        .expect_err("delegation must not fall back to a hard-coded provider model");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("requires a model profile"));
     }
 
     #[test]

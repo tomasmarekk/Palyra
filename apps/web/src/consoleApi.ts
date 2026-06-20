@@ -1055,7 +1055,7 @@ export interface ChatDelegationProfileDefinition {
   display_name: string;
   description: string;
   role: string;
-  model_profile: string;
+  model_profile?: string;
   tool_allowlist: string[];
   skill_allowlist: string[];
   memory_scope: string;
