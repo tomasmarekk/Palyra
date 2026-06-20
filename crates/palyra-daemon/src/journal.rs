@@ -5958,7 +5958,7 @@ impl JournalStore {
     }
 
     /// Opens the journal database: validates config, secures file permissions,
-    /// applies pragmas and pending schema migrations, and seeds the pricing catalog.
+    /// and applies pragmas and pending schema migrations.
     ///
     /// # Errors
     /// Returns [`JournalError`] for an invalid configuration or path, or if the
@@ -6002,7 +6002,6 @@ impl JournalStore {
         )?;
 
         apply_migrations(&mut connection)?;
-        seed_usage_pricing_catalog(&mut connection)?;
         Ok(Self {
             config,
             connection: Mutex::new(connection),
@@ -19535,100 +19534,6 @@ fn nonnegative_i64_to_u64(value: i64) -> Option<u64> {
     (value >= 0).then_some(value as u64)
 }
 
-/// Inserts or refreshes the built-in model pricing rows (idempotent upsert).
-fn seed_usage_pricing_catalog(connection: &mut Connection) -> Result<(), JournalError> {
-    let existing_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM usage_pricing_catalog", [], |row| row.get(0))?;
-    if existing_count > 0 {
-        return Ok(());
-    }
-
-    let now = current_unix_ms()?;
-    let transaction = connection.transaction()?;
-    for (pricing_id, provider_id, provider_kind, model_id, input_cost, output_cost) in [
-        (
-            "01HZ7ZP1CATALOG000000000001",
-            "openai",
-            "openai_compatible",
-            "gpt-4o-mini",
-            Some(0.15_f64),
-            Some(0.60_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000002",
-            "openai",
-            "openai_compatible",
-            "gpt-4.1-mini",
-            Some(0.40_f64),
-            Some(1.60_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000003",
-            "openai",
-            "openai_compatible",
-            "gpt-4.1",
-            Some(2.00_f64),
-            Some(8.00_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000004",
-            "openai",
-            "openai_compatible",
-            "gpt-4o",
-            Some(2.50_f64),
-            Some(10.00_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000005",
-            "openai",
-            "openai_compatible",
-            "gpt-5.4-mini",
-            Some(0.60_f64),
-            Some(2.40_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000006",
-            "openai",
-            "openai_compatible",
-            "gpt-5.4",
-            Some(3.00_f64),
-            Some(12.00_f64),
-        ),
-        (
-            "01HZ7ZP1CATALOG000000000007",
-            "palyra",
-            "deterministic",
-            "deterministic",
-            Some(0.0_f64),
-            Some(0.0_f64),
-        ),
-    ] {
-        transaction.execute(
-            r#"
-                INSERT OR IGNORE INTO usage_pricing_catalog (
-                    pricing_ulid,
-                    provider_id,
-                    provider_kind,
-                    model_id,
-                    effective_from_unix_ms,
-                    effective_to_unix_ms,
-                    input_cost_per_million_usd,
-                    output_cost_per_million_usd,
-                    fixed_request_cost_usd,
-                    source,
-                    precision,
-                    currency,
-                    created_at_unix_ms,
-                    updated_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6, NULL, 'local_estimate', 'estimate_only', 'USD', ?7, ?7)
-            "#,
-            params![pricing_id, provider_id, provider_kind, model_id, input_cost, output_cost, now],
-        )?;
-    }
-    transaction.commit()?;
-    Ok(())
-}
-
 fn map_cron_job_row(row: &rusqlite::Row<'_>) -> Result<CronJobRecord, rusqlite::Error> {
     let schedule_type_raw: String = row.get(8)?;
     let schedule_type =
@@ -22208,6 +22113,21 @@ mod tests {
                 migration.version
             );
         }
+    }
+
+    #[test]
+    fn open_does_not_seed_provider_pricing_catalog() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        assert!(
+            store
+                .list_usage_pricing_records()
+                .expect("pricing catalog should be readable")
+                .is_empty(),
+            "provider pricing must come from operator/provider metadata, not built-in model ids"
+        );
     }
 
     #[test]
