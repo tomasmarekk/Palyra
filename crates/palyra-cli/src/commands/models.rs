@@ -2521,19 +2521,9 @@ fn find_auth_profile_for_probe(
 
 fn open_vault_at_state_root(state_root: &Path) -> Result<Vault> {
     let identity_store_root = state_root.join("identity");
-    let vault_root = match std::env::var("PALYRA_VAULT_DIR") {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                anyhow::bail!("PALYRA_VAULT_DIR must not be empty");
-            }
-            Some(PathBuf::from(trimmed))
-        }
-        Err(std::env::VarError::NotPresent) => Some(state_root.join("vault")),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("PALYRA_VAULT_DIR must contain valid UTF-8")
-        }
-    };
+    // Auth profiles are state-root scoped, so their vault refs must resolve
+    // against the matching state root rather than any process-wide CLI vault.
+    let vault_root = Some(state_root.join("vault"));
     Vault::open_with_config(VaultConfigOptions {
         root: vault_root,
         identity_store_root: Some(identity_store_root),
