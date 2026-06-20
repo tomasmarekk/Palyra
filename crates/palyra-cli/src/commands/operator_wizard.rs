@@ -3349,10 +3349,29 @@ fn discover_openai_api_model_selection(
     api_key: &str,
 ) -> Result<Option<DiscoveredProviderModel>> {
     let models = discover_openai_compatible_models(provider_label, api_key, base_url)?;
-    if !models.iter().any(|model| model.supports_tool_calls == Some(true)) {
-        return Ok(None);
+    Ok(select_openai_api_preferred_model(models.as_slice()))
+}
+
+fn select_openai_api_preferred_model(
+    models: &[DiscoveredProviderModel],
+) -> Option<DiscoveredProviderModel> {
+    if let Some(model) = models.iter().find(|model| is_openai_dynamic_chat_alias(model.id.as_str()))
+    {
+        return Some(model.clone());
     }
-    Ok(select_preferred_discovered_model(models.as_slice()).cloned())
+    if models.iter().any(|model| model.supports_tool_calls == Some(true)) {
+        return select_preferred_discovered_model(models).cloned();
+    }
+    None
+}
+
+fn is_openai_dynamic_chat_alias(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    // OpenAI's public /v1/models response has no capability metadata, but it
+    // does expose a provider-owned rolling chat alias. This is a preference for
+    // automatic defaults, not a runtime allowlist; manual model ids still pass
+    // through to the provider.
+    normalized == "chat-latest" || normalized.ends_with("/chat-latest")
 }
 
 fn discover_openai_compatible_models(
@@ -4975,6 +4994,29 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
             .expect("explicit OpenAI API key base URL override should resolve"),
             "http://127.0.0.1:9876/v1"
         );
+    }
+
+    #[test]
+    fn openai_api_model_selection_prefers_provider_dynamic_chat_alias() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"gpt-realtime-whisper","created":1778012060},{"id":"chat-latest","created":1777704602},{"id":"provider-versioned-chat","created":1776824847}]}"#,
+        )
+        .expect("OpenAI discovery fixture should parse");
+
+        let selected = select_openai_api_preferred_model(models.as_slice())
+            .expect("OpenAI dynamic chat alias should be selected");
+
+        assert_eq!(selected.id, "chat-latest");
+    }
+
+    #[test]
+    fn openai_api_model_selection_waits_when_discovery_has_no_chat_signal() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"gpt-realtime-whisper","created":1778012060},{"id":"gpt-image-2","created":1776399795}]}"#,
+        )
+        .expect("OpenAI discovery fixture should parse");
+
+        assert!(select_openai_api_preferred_model(models.as_slice()).is_none());
     }
 
     #[test]

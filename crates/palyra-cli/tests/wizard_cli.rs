@@ -23,7 +23,8 @@ use palyra_vault::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str =
+    r#"{"data":[{"id":"text-embedding-test"},{"id":"gpt-realtime-test"},{"id":"chat-latest"}]}"#;
 const ANTHROPIC_MODELS_RESPONSE: &str = r#"{"data":[{"id":"claude-test-discovered"}]}"#;
 
 fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
@@ -1345,6 +1346,10 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
     assert!(
         written.contains("openai_api_key_vault_ref = \"global/openai_api_key\""),
         "expected vault-backed OpenAI auth after configure"
+    );
+    assert!(
+        written.contains("openai_model = \"chat-latest\""),
+        "expected OpenAI API key flow to use the provider-owned dynamic chat alias"
     );
 
     let revealed =
