@@ -23,7 +23,8 @@ use self::model_auth::{
 };
 use crate::commands::models::{
     parse_discovered_provider_models, provider_models_endpoint, sanitize_provider_error,
-    select_preferred_discovered_model_id, DiscoveredProviderModel,
+    select_preferred_discovered_model, select_preferred_discovered_model_id,
+    DiscoveredProviderModel,
 };
 use palyra_common::runtime_preview::{
     RuntimePreviewCapability, RuntimePreviewMode, ALL_RUNTIME_PREVIEW_CAPABILITIES,
@@ -2886,7 +2887,7 @@ fn apply_model_provider_api_key(
             let defaults = registry_provider_defaults_for_auth_method(method)
                 .expect("registry provider defaults should exist after guard");
             let base_url = registry_provider_base_url(defaults)?;
-            let model_id = discover_openai_compatible_model_selection(
+            let model = discover_openai_compatible_model_selection(
                 defaults.display_name,
                 base_url.as_str(),
                 api_key,
@@ -2897,20 +2898,20 @@ fn apply_model_provider_api_key(
                 document,
                 defaults,
                 base_url.as_str(),
-                Some(model_id.as_str()),
+                Some(&model),
                 Some(vault_ref),
             )?;
         }
         "api_key" => {
             let base_url = openai_base_url_for_config(document)?;
-            let model_id =
+            let model =
                 discover_openai_compatible_model_selection("OpenAI", base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
             configure_openai_provider_with_base_url(
                 document,
                 base_url.as_str(),
-                Some(model_id.as_str()),
+                Some(model.id.as_str()),
                 Some(vault_ref),
             )?;
         }
@@ -3164,9 +3165,10 @@ fn configure_registry_provider(
     document: &mut toml::Value,
     defaults: &RegistryProviderDefaults,
     base_url: &str,
-    model_id: Option<&str>,
+    model: Option<&DiscoveredProviderModel>,
     vault_ref: Option<String>,
 ) -> Result<()> {
+    let model_id = model.map(|model| model.id.as_str());
     set_value_at_path(
         document,
         "model_provider.kind",
@@ -3199,16 +3201,16 @@ fn configure_registry_provider(
         "model_provider.providers",
         toml::Value::Array(vec![registry_provider_table(defaults, base_url, vault_ref)]),
     )?;
-    if let Some(model_id) = model_id {
+    if let Some(model) = model {
         set_value_at_path(
             document,
             "model_provider.models",
-            toml::Value::Array(vec![registry_chat_model_table(defaults, model_id)]),
+            toml::Value::Array(vec![registry_chat_model_table(defaults, model)]),
         )?;
         set_value_at_path(
             document,
             "model_provider.default_chat_model_id",
-            toml::Value::String(model_id.to_owned()),
+            toml::Value::String(model.id.clone()),
         )?;
     } else {
         unset_value_at_path(document, "model_provider.models")?;
@@ -3238,12 +3240,24 @@ fn registry_provider_table(
     toml::Value::Table(table)
 }
 
-fn registry_chat_model_table(defaults: &RegistryProviderDefaults, model_id: &str) -> toml::Value {
+fn registry_chat_model_table(
+    defaults: &RegistryProviderDefaults,
+    model: &DiscoveredProviderModel,
+) -> toml::Value {
     let mut table = toml::map::Map::new();
-    table.insert("model_id".to_owned(), toml::Value::String(model_id.to_owned()));
+    table.insert("model_id".to_owned(), toml::Value::String(model.id.clone()));
     table.insert("provider_id".to_owned(), toml::Value::String(defaults.provider_id.to_owned()));
     table.insert("role".to_owned(), toml::Value::String("chat".to_owned()));
     table.insert("enabled".to_owned(), toml::Value::Boolean(true));
+    if let Some(supports_tool_calls) = model.supports_tool_calls {
+        table.insert("tool_calls".to_owned(), toml::Value::Boolean(supports_tool_calls));
+    }
+    if let Some(supports_json_mode) = model.supports_json_mode {
+        table.insert("json_mode".to_owned(), toml::Value::Boolean(supports_json_mode));
+    }
+    if let Some(supports_vision) = model.supports_vision {
+        table.insert("vision".to_owned(), toml::Value::Boolean(supports_vision));
+    }
     toml::Value::Table(table)
 }
 
@@ -3325,9 +3339,9 @@ fn discover_openai_compatible_model_selection(
     provider_label: &str,
     base_url: &str,
     api_key: &str,
-) -> Result<String> {
+) -> Result<DiscoveredProviderModel> {
     let models = discover_openai_compatible_models(provider_label, api_key, base_url)?;
-    select_preferred_discovered_model_id(models.as_slice()).ok_or_else(|| {
+    select_preferred_discovered_model(models.as_slice()).cloned().ok_or_else(|| {
         anyhow::anyhow!(
             "{provider_label} model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
         )

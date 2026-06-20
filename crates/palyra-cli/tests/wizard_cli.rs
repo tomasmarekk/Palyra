@@ -748,7 +748,9 @@ fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
+    let model_server = MockProviderServer::spawn(
+        r#"{"data":[{"id":"image-only-newer","created":1800000000,"supported_parameters":["temperature"]},{"id":"openrouter-tools-model","created":1700000000,"supported_parameters":["tools","response_format"]}]}"#,
+    )?;
     let openrouter_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
@@ -799,8 +801,12 @@ fn setup_wizard_quickstart_supports_openrouter_api_key() -> Result<()> {
         "expected OpenRouter OpenAI-compatible base URL: {written}"
     );
     assert!(
-        written.contains("default_chat_model_id = \"gpt-test-discovered\""),
-        "expected discovered OpenRouter chat model: {written}"
+        written.contains("default_chat_model_id = \"openrouter-tools-model\""),
+        "expected tool-capable discovered OpenRouter chat model: {written}"
+    );
+    assert!(
+        written.contains("tool_calls = true"),
+        "expected discovered OpenRouter tool capability to be persisted: {written}"
     );
     assert!(
         written.contains("allow_private_base_url = true"),

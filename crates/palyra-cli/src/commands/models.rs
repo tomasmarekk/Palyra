@@ -157,6 +157,9 @@ pub(crate) struct ProviderConnectionCheckPayload {
 pub(crate) struct DiscoveredProviderModel {
     pub(crate) id: String,
     recency_rank: Option<i64>,
+    pub(crate) supports_tool_calls: Option<bool>,
+    pub(crate) supports_json_mode: Option<bool>,
+    pub(crate) supports_vision: Option<bool>,
 }
 
 /// Aggregate payload for `models test-connection` and `models discover`.
@@ -604,8 +607,8 @@ fn append_ad_hoc_entry(
 
 /// Sets the default text or embeddings model in the config, keeping rotated backups.
 ///
-/// Unless `allow_custom` is set, the model id must be configured in the
-/// registry, curated, or verified by cached live discovery.
+/// Model IDs are intentionally not checked against a local allowlist. Providers
+/// are the source of truth; Palyra only rejects empty or unsafe identifiers here.
 ///
 /// # Errors
 /// Returns an error when the config cannot be parsed, the model id fails
@@ -617,12 +620,13 @@ pub(crate) fn mutate_model_defaults(
     target: &'static str,
     model: String,
     dims: Option<u32>,
-    allow_custom: bool,
+    _allow_custom: bool,
 ) -> Result<ModelsMutationPayload> {
     let path = resolve_config_path(path, false)?;
     let path_ref = Path::new(&path);
     let (mut document, _) = load_document_for_mutation(path_ref)
         .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    let model = validate_model_id_for_mutation(target, model.as_str())?;
     let has_registry = registry_configured(&document)?;
     if !has_registry {
         let provider_kind = legacy_provider_kind_for_mutation(&document)?;
@@ -646,10 +650,6 @@ pub(crate) fn mutate_model_defaults(
                 .context("invalid config key path: model_provider.openai_base_url")?;
             }
         }
-    }
-
-    if !allow_custom {
-        validate_model_mutation_selection(path.as_str(), &document, target, model.as_str())?;
     }
 
     match target {
@@ -707,108 +707,13 @@ pub(crate) fn mutate_model_defaults(
     })
 }
 
-fn validate_model_mutation_selection(
-    path: &str,
-    document: &toml::Value,
-    target: &'static str,
-    model: &str,
-) -> Result<()> {
+fn validate_model_id_for_mutation(target: &'static str, model: &str) -> Result<String> {
     let normalized = normalize_optional_text(model)
         .ok_or_else(|| anyhow::anyhow!("invalid {target} model id: model id must not be empty"))?;
-    let role = model_role_for_target(target)?;
-    let root_config = parse_root_file_config(document)?;
-    let model_provider = root_config.model_provider.unwrap_or_default();
-    let has_registry = model_provider.providers.is_some() || model_provider.models.is_some();
-    let (_, models) = registry_views_from_config(&model_provider);
-
-    let configured_matches = models
-        .iter()
-        .any(|entry| entry.enabled && entry.role == role && entry.model_id.as_str() == normalized);
-    if configured_matches {
-        return Ok(());
+    if normalized.chars().any(char::is_control) {
+        anyhow::bail!("invalid {target} model id: model id must not contain control characters");
     }
-
-    if has_registry {
-        anyhow::bail!(
-            "invalid {target} model id '{normalized}': model is absent from enabled configured {role} models; run `palyra models list --json` to inspect configured models or rerun with `--allow-custom` only for an intentional unsafe provider override"
-        );
-    }
-
-    if curated_models_for_target(target).contains(&normalized) {
-        return Ok(());
-    }
-
-    if let Some(cache_validation) =
-        validate_model_against_discovery_cache(path, target, normalized)?
-    {
-        return cache_validation;
-    }
-
-    anyhow::bail!(
-        "invalid {target} model id '{normalized}': model is not configured or known from live discovery; run `palyra models discover --refresh --json` before selecting a provider-advertised model, or rerun with `--allow-custom` only for an intentional unsafe provider override"
-    );
-}
-
-/// Checks a model id against cached live-discovery results.
-///
-/// Returns `Ok(None)` when no verified discovery data exists (the caller
-/// falls back to its generic error), `Ok(Some(Ok(())))` when the model was
-/// seen in live discovery, and `Ok(Some(Err(_)))` when verified discovery
-/// data exists but does not include the model.
-fn validate_model_against_discovery_cache(
-    path: &str,
-    target: &'static str,
-    model: &str,
-) -> Result<Option<Result<()>>> {
-    let overview = load_models_overview(Some(path.to_owned()))?;
-    let provider_targets = build_probeable_providers(&overview)?;
-    let cache = load_provider_checks_cache()?;
-    let now_unix_ms = unix_timestamp_ms()?;
-    let mut verified_models = Vec::new();
-
-    for provider in provider_targets {
-        for mode in ["discover", "test_connection"] {
-            let cache_key = provider_check_cache_key(mode, &provider);
-            let Some(cached) = read_cached_provider_check(&cache, cache_key.as_str(), now_unix_ms)
-            else {
-                continue;
-            };
-            if !cached.live_discovery_verified {
-                continue;
-            }
-            if cached.discovered_model_ids.iter().any(|candidate| candidate == model) {
-                return Ok(Some(Ok(())));
-            }
-            verified_models.extend(cached.discovered_model_ids);
-        }
-    }
-
-    verified_models.sort();
-    verified_models.dedup();
-    if verified_models.is_empty() {
-        return Ok(None);
-    }
-    let preview = verified_models.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
-    let suffix = if verified_models.len() > 8 { ", ..." } else { "" };
-    Ok(Some(Err(anyhow::anyhow!(
-        "invalid {target} model id '{model}': model is absent from live-discovered provider models ({preview}{suffix}); rerun with `--allow-custom` only for an intentional unsafe provider override"
-    ))))
-}
-
-fn model_role_for_target(target: &str) -> Result<&'static str> {
-    match target {
-        "text" => Ok("chat"),
-        "embeddings" => Ok("embeddings"),
-        _ => anyhow::bail!("unsupported model target: {target}"),
-    }
-}
-
-fn curated_models_for_target(target: &str) -> &'static [&'static str] {
-    match target {
-        "text" => CURATED_TEXT_MODELS,
-        "embeddings" => CURATED_EMBEDDING_MODELS,
-        _ => &[],
-    }
+    Ok(normalized.to_owned())
 }
 
 fn legacy_provider_kind_for_mutation(document: &toml::Value) -> Result<String> {
@@ -1690,7 +1595,7 @@ fn registry_views_from_config(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| legacy_provider_entries(config));
-    let models = config
+    let mut models = config
         .models
         .as_ref()
         .map(|entries| {
@@ -1724,7 +1629,107 @@ fn registry_views_from_config(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| legacy_model_entries(config));
+    append_synthetic_default_model_entry(
+        providers.as_slice(),
+        &mut models,
+        config.default_chat_model_id.as_deref(),
+        "chat",
+    );
+    append_synthetic_default_model_entry(
+        providers.as_slice(),
+        &mut models,
+        config.default_embeddings_model_id.as_deref(),
+        "embeddings",
+    );
     (providers, models)
+}
+
+fn append_synthetic_default_model_entry(
+    providers: &[RegistryProviderEntry],
+    models: &mut Vec<RegistryModelEntry>,
+    model_id: Option<&str>,
+    role: &str,
+) {
+    let Some(model_id) = model_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if models.iter().any(|entry| entry.model_id == model_id) {
+        return;
+    }
+    let Some(provider) = provider_for_synthetic_default_model(providers, models.as_slice(), role)
+    else {
+        return;
+    };
+    models.push(synthetic_default_registry_model(model_id, provider, role));
+}
+
+fn provider_for_synthetic_default_model<'a>(
+    providers: &'a [RegistryProviderEntry],
+    models: &[RegistryModelEntry],
+    role: &str,
+) -> Option<&'a RegistryProviderEntry> {
+    let enabled_providers =
+        providers.iter().filter(|provider| provider.enabled).collect::<Vec<_>>();
+    if enabled_providers.len() == 1 {
+        return enabled_providers.first().copied();
+    }
+    models
+        .iter()
+        .find(|model| model.enabled && model.role == role)
+        .and_then(|model| {
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == model.provider_id && provider.enabled)
+        })
+        .or_else(|| enabled_providers.first().copied())
+}
+
+fn synthetic_default_registry_model(
+    model_id: &str,
+    provider: &RegistryProviderEntry,
+    role: &str,
+) -> RegistryModelEntry {
+    let is_chat = role == "chat";
+    let is_embeddings = role == "embeddings";
+    let is_minimax_chat = is_chat
+        && provider.kind == ANTHROPIC_PROVIDER_KIND
+        && provider
+            .auth_provider_kind
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND));
+    RegistryModelEntry {
+        model_id: model_id.to_owned(),
+        provider_id: provider.provider_id.clone(),
+        role: role.to_owned(),
+        enabled: true,
+        metadata_source: "operator_override".to_owned(),
+        operator_override: true,
+        tool_calls: is_chat,
+        json_mode: is_chat && provider.kind != DETERMINISTIC_PROVIDER_KIND,
+        vision: is_chat && provider.kind != DETERMINISTIC_PROVIDER_KIND && !is_minimax_chat,
+        audio_transcribe: is_chat && provider.kind == OPENAI_COMPATIBLE_PROVIDER_KIND,
+        embeddings: is_embeddings,
+        max_context_tokens: if provider.kind == DETERMINISTIC_PROVIDER_KIND {
+            None
+        } else if is_embeddings {
+            Some(8_192)
+        } else {
+            Some(128_000)
+        },
+        cost_tier: "standard".to_owned(),
+        latency_tier: "standard".to_owned(),
+        recommended_use_cases: if is_embeddings {
+            vec!["memory retrieval".to_owned()]
+        } else {
+            vec!["provider-selected chat".to_owned()]
+        },
+        known_limitations: if is_minimax_chat {
+            vec!["vision unsupported by MiniMax Anthropic-compatible chat".to_owned()]
+        } else {
+            Vec::new()
+        },
+        source: "synthetic_default",
+    }
 }
 
 fn legacy_provider_entries(config: &FileModelProviderConfig) -> Vec<RegistryProviderEntry> {
@@ -2686,32 +2691,53 @@ fn codex_model_priority(entry: &serde_json::Value) -> i64 {
 pub(crate) fn select_preferred_discovered_model_id(
     models: &[DiscoveredProviderModel],
 ) -> Option<String> {
+    select_preferred_discovered_model(models).map(|model| model.id.clone())
+}
+
+/// Selects the preferred model entry from a provider discovery response.
+///
+/// Capability metadata wins over raw provider order when the provider exposes
+/// it: Palyra agents need tool-capable chat models, and providers such as
+/// OpenRouter advertise that via `supported_parameters`.
+pub(crate) fn select_preferred_discovered_model(
+    models: &[DiscoveredProviderModel],
+) -> Option<&DiscoveredProviderModel> {
     let candidates = models
         .iter()
         .filter_map(|model| {
             let id = model.id.trim();
-            (!id.is_empty()).then_some((id, model.recency_rank))
+            (!id.is_empty()).then_some(model)
         })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
     }
+    let candidate_pool = if candidates.iter().any(|model| model.supports_tool_calls == Some(true)) {
+        candidates
+            .iter()
+            .copied()
+            .filter(|model| model.supports_tool_calls == Some(true))
+            .collect::<Vec<_>>()
+    } else {
+        candidates
+    };
 
     // Do not infer freshness from provider-specific model ID strings. Prefer provider metadata
     // when it is complete; otherwise treat the discovery response order as authoritative.
-    if candidates.iter().all(|(_, recency_rank)| recency_rank.is_some()) {
-        let (mut selected_id, mut selected_rank) = (candidates[0].0, candidates[0].1?);
-        for (id, recency_rank) in candidates.iter().skip(1) {
-            let recency_rank = (*recency_rank)?;
+    if candidate_pool.iter().all(|model| model.recency_rank.is_some()) {
+        let (mut selected, mut selected_rank) =
+            (candidate_pool[0], candidate_pool[0].recency_rank?);
+        for model in candidate_pool.iter().skip(1) {
+            let recency_rank = model.recency_rank?;
             if recency_rank > selected_rank {
-                selected_id = *id;
+                selected = model;
                 selected_rank = recency_rank;
             }
         }
-        return Some(selected_id.to_owned());
+        return Some(selected);
     }
 
-    Some(candidates[0].0.to_owned())
+    Some(candidate_pool[0])
 }
 
 fn parse_discovered_provider_model(entry: &serde_json::Value) -> Option<DiscoveredProviderModel> {
@@ -2723,7 +2749,33 @@ fn parse_discovered_provider_model(entry: &serde_json::Value) -> Option<Discover
     Some(DiscoveredProviderModel {
         id: id.to_owned(),
         recency_rank: discovered_model_recency_rank(entry),
+        supports_tool_calls: model_supported_parameter(entry, &["tools", "tool_choice"]),
+        supports_json_mode: model_supported_parameter(entry, &["response_format"]),
+        supports_vision: discovered_model_supports_vision(entry),
     })
+}
+
+fn model_supported_parameter(entry: &serde_json::Value, names: &[&str]) -> Option<bool> {
+    let supported = entry.get("supported_parameters")?.as_array()?;
+    let parameters = supported
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    Some(names.iter().any(|name| {
+        let normalized = name.to_ascii_lowercase();
+        parameters.iter().any(|parameter| parameter == &normalized)
+    }))
+}
+
+fn discovered_model_supports_vision(entry: &serde_json::Value) -> Option<bool> {
+    let modalities = entry
+        .get("architecture")
+        .and_then(|architecture| architecture.get("input_modalities"))
+        .and_then(serde_json::Value::as_array)?;
+    Some(modalities.iter().filter_map(serde_json::Value::as_str).any(|modality| {
+        matches!(modality.trim().to_ascii_lowercase().as_str(), "image" | "vision")
+    }))
 }
 
 fn discovered_model_recency_rank(entry: &serde_json::Value) -> Option<i64> {
@@ -2836,6 +2888,19 @@ mod tests {
         assert_eq!(
             select_preferred_discovered_model_id(models.as_slice()).as_deref(),
             Some("provider-current")
+        );
+    }
+
+    #[test]
+    fn discovered_model_selection_prefers_tool_capable_provider_metadata() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"provider-newer-no-tools","created":1800000000,"supported_parameters":["temperature"]},{"id":"provider-tools","created":1700000000,"supported_parameters":["tools","response_format"],"architecture":{"input_modalities":["text"]}}]}"#,
+        )
+        .expect("provider discovery payload should parse");
+
+        assert_eq!(
+            select_preferred_discovered_model_id(models.as_slice()).as_deref(),
+            Some("provider-tools")
         );
     }
 

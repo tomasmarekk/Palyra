@@ -742,8 +742,15 @@ fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Re
         }
     }
 
-    if let Some(model_id) = registry.default_chat_model_id.as_ref() {
-        validate_default_model_role(model_id, ProviderModelRole::Chat, &model_ids)?;
+    if let Some(model_id) = registry.default_chat_model_id.clone() {
+        synthesize_default_model_if_missing(
+            registry,
+            &providers,
+            &mut model_ids,
+            model_id.as_str(),
+            ProviderModelRole::Chat,
+        )?;
+        validate_default_model_role(model_id.as_str(), ProviderModelRole::Chat, &model_ids)?;
     } else {
         registry.default_chat_model_id = registry
             .models
@@ -751,13 +758,91 @@ fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Re
             .find(|model| model.enabled && model.role == ProviderModelRole::Chat)
             .map(|model| model.model_id.clone());
     }
-    if let Some(model_id) = registry.default_embeddings_model_id.as_ref() {
-        validate_default_model_role(model_id, ProviderModelRole::Embeddings, &model_ids)?;
+    if let Some(model_id) = registry.default_embeddings_model_id.clone() {
+        synthesize_default_model_if_missing(
+            registry,
+            &providers,
+            &mut model_ids,
+            model_id.as_str(),
+            ProviderModelRole::Embeddings,
+        )?;
+        validate_default_model_role(model_id.as_str(), ProviderModelRole::Embeddings, &model_ids)?;
     }
-    if let Some(model_id) = registry.default_audio_transcription_model_id.as_ref() {
-        validate_default_model_role(model_id, ProviderModelRole::AudioTranscription, &model_ids)?;
+    if let Some(model_id) = registry.default_audio_transcription_model_id.clone() {
+        synthesize_default_model_if_missing(
+            registry,
+            &providers,
+            &mut model_ids,
+            model_id.as_str(),
+            ProviderModelRole::AudioTranscription,
+        )?;
+        validate_default_model_role(
+            model_id.as_str(),
+            ProviderModelRole::AudioTranscription,
+            &model_ids,
+        )?;
     }
     Ok(())
+}
+
+fn synthesize_default_model_if_missing(
+    registry: &mut ModelProviderRegistryConfig,
+    providers: &HashMap<String, ProviderRegistryEntryConfig>,
+    models: &mut HashMap<String, ProviderModelEntryConfig>,
+    model_id: &str,
+    role: ProviderModelRole,
+) -> Result<()> {
+    if models.contains_key(model_id) {
+        return Ok(());
+    }
+    let provider =
+        provider_for_unregistered_default_model(registry, providers, role).ok_or_else(|| {
+            anyhow::anyhow!("default model '{}' has no enabled provider to route through", model_id)
+        })?;
+    let model = synthetic_default_model_entry(model_id, &provider, role);
+    models.insert(model.model_id.clone(), model.clone());
+    registry.models.push(model);
+    Ok(())
+}
+
+fn provider_for_unregistered_default_model(
+    registry: &ModelProviderRegistryConfig,
+    providers: &HashMap<String, ProviderRegistryEntryConfig>,
+    role: ProviderModelRole,
+) -> Option<ProviderRegistryEntryConfig> {
+    let enabled_providers =
+        registry.providers.iter().filter(|provider| provider.enabled).cloned().collect::<Vec<_>>();
+    if enabled_providers.len() == 1 {
+        return enabled_providers.into_iter().next();
+    }
+    registry
+        .models
+        .iter()
+        .find(|model| model.enabled && model.role == role)
+        .and_then(|model| providers.get(model.provider_id.as_str()))
+        .filter(|provider| provider.enabled)
+        .cloned()
+        .or_else(|| enabled_providers.first().cloned())
+}
+
+fn synthetic_default_model_entry(
+    model_id: &str,
+    provider: &ProviderRegistryEntryConfig,
+    role: ProviderModelRole,
+) -> ProviderModelEntryConfig {
+    let mut capabilities =
+        capability_defaults_for_provider(provider.kind, role, provider.auth_profile_provider_kind);
+    capabilities.operator_override = true;
+    capabilities.metadata_source = ProviderMetadataSource::OperatorOverride.as_str().to_owned();
+    ProviderModelEntryConfig {
+        model_id: model_id.to_owned(),
+        provider_id: provider.provider_id.clone(),
+        role,
+        enabled: true,
+        metadata_source: ProviderMetadataSource::OperatorOverride,
+        operator_override: true,
+        capabilities,
+    }
 }
 
 fn validate_default_model_role(
@@ -3254,6 +3339,16 @@ fn default_model_for_provider(
     registry: &ModelProviderRegistryConfig,
     provider_id: &str,
 ) -> Option<String> {
+    if let Some(default_model_id) = registry.default_chat_model_id.as_deref() {
+        if registry.models.iter().any(|model| {
+            model.model_id == default_model_id
+                && model.provider_id == provider_id
+                && model.role == ProviderModelRole::Chat
+                && model.enabled
+        }) {
+            return Some(default_model_id.to_owned());
+        }
+    }
     registry
         .models
         .iter()
@@ -6456,14 +6551,15 @@ mod tests {
         AnthropicCompatibleChatAdapter, AnthropicProvider, EmbeddingsRequest, ModelProvider,
         ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
         ModelProviderKind, ModelProviderRegistryConfig, OpenAiCompatibleChatAdapter,
-        OpenAiCompatibleProvider, ProviderChatAdapter, ProviderError, ProviderEvent,
-        ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderImageInput,
-        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
-        ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
-        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
-        ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
-        ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT, OPENAI_RETRYABLE_STATUS_CODES,
+        OpenAiCompatibleProvider, ProviderCapabilitiesSnapshot, ProviderChatAdapter, ProviderError,
+        ProviderEvent, ProviderFailureAction, ProviderFailureClass, ProviderFinishReason,
+        ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        ProviderMessageToolCall, ProviderMetadataSource, ProviderModelEntryConfig,
+        ProviderModelRole, ProviderOutputContentPart, ProviderRawProviderRefs,
+        ProviderRegistryEntryConfig, ProviderRequest, ProviderRetryability,
+        ProviderStreamAccumulator, ProviderStreamEvent, ProviderTurnOutput, ProviderUsage,
+        RegistryBackedModelProvider, ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
+        OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
@@ -6974,6 +7070,78 @@ mod tests {
             "pending provider registry must not synthesize legacy model defaults"
         );
         assert_eq!(snapshot.discovery.status, "pending");
+    }
+
+    #[test]
+    fn registry_default_chat_model_outside_local_models_is_synthesized() {
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_base_url: "http://127.0.0.1:1/v1".to_owned(),
+            allow_private_base_url: true,
+            registry: ModelProviderRegistryConfig {
+                providers: vec![ProviderRegistryEntryConfig {
+                    provider_id: "openrouter-primary".to_owned(),
+                    display_name: Some("OpenRouter".to_owned()),
+                    kind: ModelProviderKind::OpenAiCompatible,
+                    base_url: Some("http://127.0.0.1:1/v1".to_owned()),
+                    allow_private_base_url: true,
+                    enabled: true,
+                    auth_profile_id: None,
+                    auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openrouter),
+                    api_key: None,
+                    api_key_secret_ref: None,
+                    api_key_vault_ref: None,
+                    credential_source: None,
+                    request_timeout_ms: 5_000,
+                    max_retries: 0,
+                    retry_backoff_ms: 1,
+                    circuit_breaker_failure_threshold: 1,
+                    circuit_breaker_cooldown_ms: 60_000,
+                }],
+                models: vec![ProviderModelEntryConfig {
+                    model_id: "google/gemini-3.1-flash-image".to_owned(),
+                    provider_id: "openrouter-primary".to_owned(),
+                    role: ProviderModelRole::Chat,
+                    enabled: true,
+                    metadata_source: ProviderMetadataSource::Static,
+                    operator_override: false,
+                    capabilities: ProviderCapabilitiesSnapshot {
+                        tool_calls: false,
+                        ..capability_defaults_for_kind(
+                            ModelProviderKind::OpenAiCompatible,
+                            ProviderModelRole::Chat,
+                        )
+                    },
+                }],
+                default_chat_model_id: Some("deepseek/deepseek-v4-flash".to_owned()),
+                default_embeddings_model_id: None,
+                default_audio_transcription_model_id: None,
+                failover_enabled: true,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        };
+
+        let provider = RegistryBackedModelProvider::new(config)
+            .expect("provider-selected default models must not require local registry entries");
+        let snapshot = provider.status_snapshot();
+        let synthesized = snapshot
+            .registry
+            .models
+            .iter()
+            .find(|model| model.model_id == "deepseek/deepseek-v4-flash")
+            .expect("custom default model should be synthesized into runtime metadata");
+
+        assert_eq!(snapshot.model_id.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert_eq!(snapshot.openai_model.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert_eq!(
+            snapshot.registry.default_chat_model_id.as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        assert_eq!(synthesized.provider_id, "openrouter-primary");
+        assert!(synthesized.capabilities.tool_calls);
+        assert!(synthesized.capabilities.operator_override);
+        assert_eq!(synthesized.capabilities.metadata_source, "operator_override");
     }
 
     #[test]

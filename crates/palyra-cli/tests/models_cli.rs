@@ -297,7 +297,96 @@ enabled = true
 }
 
 #[test]
-fn models_set_rejects_chat_model_absent_from_live_discovery_cache() -> Result<()> {
+fn models_set_registry_default_is_explainable_without_known_model_entry() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openrouter"
+openai_base_url = "https://openrouter.ai/api/v1"
+default_chat_model_id = "google/gemini-3.1-flash-image"
+
+[[model_provider.providers]]
+provider_id = "openrouter-primary"
+display_name = "OpenRouter"
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+auth_provider_kind = "openrouter"
+enabled = true
+
+[[model_provider.models]]
+model_id = "google/gemini-3.1-flash-image"
+provider_id = "openrouter-primary"
+role = "chat"
+enabled = true
+tool_calls = false
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(
+        &workdir,
+        &["models", "set", "deepseek/deepseek-v4-flash", "--path", &config_path_string, "--json"],
+    )?;
+    assert!(
+        output.status.success(),
+        "models set should accept provider-routed custom model ids: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status_output =
+        run_cli(&workdir, &["models", "status", "--path", &config_path_string, "--json"])?;
+    assert!(
+        status_output.status.success(),
+        "models status should accept custom registry defaults: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_stdout =
+        String::from_utf8(status_output.stdout).context("status stdout was not valid UTF-8")?;
+    let status_payload: Value =
+        serde_json::from_str(status_stdout.as_str()).context("status stdout was not JSON")?;
+    assert_eq!(
+        status_payload.get("default_chat_model_id").and_then(Value::as_str),
+        Some("deepseek/deepseek-v4-flash"),
+        "status should expose the user-selected OpenRouter model: {status_payload}"
+    );
+    assert_eq!(
+        status_payload.get("registry_valid").and_then(Value::as_bool),
+        Some(true),
+        "custom provider model defaults should not invalidate registry status: {status_payload}"
+    );
+
+    let explain_output =
+        run_cli(&workdir, &["models", "explain", "--path", &config_path_string, "--json"])?;
+    assert!(
+        explain_output.status.success(),
+        "models explain should route the custom provider model: {}",
+        String::from_utf8_lossy(&explain_output.stderr)
+    );
+    let explain_stdout =
+        String::from_utf8(explain_output.stdout).context("explain stdout was not valid UTF-8")?;
+    let explain_payload: Value =
+        serde_json::from_str(explain_stdout.as_str()).context("explain stdout was not JSON")?;
+    assert_eq!(
+        explain_payload.get("resolved_model_id").and_then(Value::as_str),
+        Some("deepseek/deepseek-v4-flash"),
+        "explain should select the provider-routed custom model: {explain_payload}"
+    );
+    assert_eq!(
+        explain_payload.pointer("/candidates/0/tool_calls").and_then(Value::as_bool),
+        Some(true),
+        "synthetic custom chat defaults should remain tool-capable: {explain_payload}"
+    );
+    Ok(())
+}
+
+#[test]
+fn models_set_accepts_chat_model_absent_from_live_discovery_cache() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let state_root = workdir.path().join("state");
     fs::create_dir_all(&state_root)
@@ -343,7 +432,7 @@ anthropic_api_key = "sk-minimax-test"
     )?;
     assert!(
         discover.status.success(),
-        "models discover should succeed before selection validation: {}",
+        "models discover should succeed before provider-selected model update: {}",
         String::from_utf8_lossy(&discover.stderr)
     );
 
@@ -360,30 +449,16 @@ anthropic_api_key = "sk-minimax-test"
             "--json",
         ],
     )?;
-    assert!(!output.status.success(), "models set should reject an undiscovered model id");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "undiscovered model selection should be classified as validation"
-    );
-    let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
     assert!(
-        stderr.contains("error[validation_error]"),
-        "stderr should classify the selection as validation: {stderr}"
-    );
-    assert!(
-        stderr.contains("live-discovered provider models") && stderr.contains("--allow-custom"),
-        "stderr should explain the live discovery guard and explicit override: {stderr}"
+        output.status.success(),
+        "models set must not reject provider-routed model ids absent from local discovery cache: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let config_body = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     assert!(
-        config_body.contains("anthropic_model = \"MiniMax-M2.7\""),
-        "rejected model selection must not mutate the config: {config_body}"
-    );
-    assert!(
-        !config_body.contains("definitely-not-a-real-model"),
-        "rejected model id must not be persisted: {config_body}"
+        config_body.contains("anthropic_model = \"definitely-not-a-real-model\""),
+        "provider-routed model id should be persisted without a local allowlist: {config_body}"
     );
     server.finish()?;
     Ok(())
