@@ -37,8 +37,7 @@ pub(crate) use external_index::{
     ExternalRetrievalScaleSloSnapshot,
 };
 
-const DEFAULT_PRODUCTION_EMBEDDINGS_MODEL_ID: &str = "text-embedding-3-small";
-const DEFAULT_PRODUCTION_EMBEDDINGS_DIMS: usize = 1_536;
+const DEFAULT_HASH_FALLBACK_EMBEDDINGS_DIMS: usize = 1_536;
 const DEFAULT_EMBEDDINGS_BATCH_LIMIT: usize = 64;
 const DEFAULT_BACKFILL_STRATEGY: &str = "lazy_reindex";
 
@@ -859,7 +858,7 @@ pub(crate) fn build_memory_embedding_runtime_selection(
             "embeddings_model_not_configured",
             "retrieval embeddings defaulted to hash fallback because no embeddings-capable provider or model is configured. Configure an OpenAI-compatible embeddings provider in model_provider.providers/model_provider.models, set model_provider.default_embeddings_model_id, then run palyra models set-embeddings <model>; otherwise memory remains usable with hash fallback."
                 .to_owned(),
-            DEFAULT_PRODUCTION_EMBEDDINGS_DIMS,
+            DEFAULT_HASH_FALLBACK_EMBEDDINGS_DIMS,
         );
     };
 
@@ -872,7 +871,7 @@ pub(crate) fn build_memory_embedding_runtime_selection(
                 "retrieval embeddings are using hash fallback because dimensions for model '{}' are not known and were not configured",
                 desired_model_id
             ),
-            DEFAULT_PRODUCTION_EMBEDDINGS_DIMS,
+            DEFAULT_HASH_FALLBACK_EMBEDDINGS_DIMS,
         );
     };
 
@@ -1446,9 +1445,6 @@ pub(crate) fn resolve_embeddings_provider_config(
     }
 
     provider_config.openai_embeddings_model = Some(default_model_id.clone());
-    provider_config.openai_embeddings_dims = provider_config.openai_embeddings_dims.or_else(|| {
-        known_embedding_dimensions(default_model_id.as_str()).map(|value| value as u32)
-    });
 
     if !provider_can_use_production_embeddings(&provider_config, provider_entry) {
         return Ok(None);
@@ -1464,10 +1460,7 @@ fn resolve_desired_embeddings_target(
     let model_id =
         registry.default_embeddings_model_id.or_else(|| config.openai_embeddings_model.clone());
     Ok(model_id.map(|model_id| {
-        let dimensions = config
-            .openai_embeddings_dims
-            .map(|value| value as usize)
-            .or_else(|| known_embedding_dimensions(model_id.as_str()));
+        let dimensions = config.openai_embeddings_dims.map(|value| value as usize);
         (model_id, dimensions)
     }))
 }
@@ -1501,17 +1494,6 @@ fn provider_can_use_production_embeddings(
                 )
             })
     })
-}
-
-// Built-in dimension table for well-known OpenAI embedding models, so operators only
-// have to configure dims for models we do not recognize.
-fn known_embedding_dimensions(model_id: &str) -> Option<usize> {
-    match model_id.trim() {
-        DEFAULT_PRODUCTION_EMBEDDINGS_MODEL_ID => Some(DEFAULT_PRODUCTION_EMBEDDINGS_DIMS),
-        "text-embedding-3-large" => Some(3_072),
-        "text-embedding-ada-002" => Some(1_536),
-        _ => None,
-    }
 }
 
 /// Bridges the async [`crate::model_provider::EmbeddingsProvider`] into the journal's
@@ -1691,7 +1673,7 @@ mod tests {
         let config = ModelProviderConfig {
             kind: ModelProviderKind::OpenAiCompatible,
             openai_api_key: Some("sk-test".to_owned()),
-            openai_embeddings_model: Some("text-embedding-3-small".to_owned()),
+            openai_embeddings_model: Some("operator-embedding-v1".to_owned()),
             openai_embeddings_dims: Some(1_536),
             ..ModelProviderConfig::default()
         };
@@ -1699,8 +1681,27 @@ mod tests {
         let selection = build_memory_embedding_runtime_selection(&config, false)
             .expect("explicit embedding runtime selection should succeed");
         assert!(selection.profile.production_default_active);
-        assert_eq!(selection.profile.desired_model_id.as_deref(), Some("text-embedding-3-small"));
+        assert_eq!(selection.profile.desired_model_id.as_deref(), Some("operator-embedding-v1"));
         assert_eq!(selection.profile.active_dims, 1_536);
+    }
+
+    #[test]
+    fn memory_embedding_selection_requires_explicit_dimensions_for_embeddings_model() {
+        let config = ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_api_key: Some("sk-test".to_owned()),
+            openai_embeddings_model: Some("operator-embedding-v1".to_owned()),
+            ..ModelProviderConfig::default()
+        };
+
+        let selection = build_memory_embedding_runtime_selection(&config, false)
+            .expect("missing dimensions should degrade instead of using a built-in model table");
+        assert!(!selection.profile.production_default_active);
+        assert_eq!(
+            selection.profile.degraded_reason_code.as_deref(),
+            Some("embeddings_dimensions_unknown")
+        );
+        assert_eq!(selection.profile.desired_model_id.as_deref(), Some("operator-embedding-v1"));
     }
 
     #[test]
@@ -1708,7 +1709,7 @@ mod tests {
         let config = ModelProviderConfig {
             kind: ModelProviderKind::OpenAiCompatible,
             openai_api_key: Some("sk-test".to_owned()),
-            openai_embeddings_model: Some("text-embedding-3-small".to_owned()),
+            openai_embeddings_model: Some("operator-embedding-v1".to_owned()),
             openai_embeddings_dims: Some(1_536),
             ..ModelProviderConfig::default()
         };
@@ -1833,8 +1834,8 @@ mod tests {
             &MemoryEmbeddingsStatus {
                 mode: MemoryEmbeddingsMode::ModelProvider,
                 posture: super::MemoryEmbeddingsPosture::ProductionDefault,
-                desired_model_id: Some("text-embedding-3-small".to_owned()),
-                target_model_id: "text-embedding-3-small".to_owned(),
+                desired_model_id: Some("operator-embedding-v1".to_owned()),
+                target_model_id: "operator-embedding-v1".to_owned(),
                 target_dims: 1_536,
                 target_version: 1,
                 total_count: 16,
@@ -1866,7 +1867,7 @@ mod tests {
             &MemoryEmbeddingsStatus {
                 mode: MemoryEmbeddingsMode::HashFallback,
                 posture: super::MemoryEmbeddingsPosture::DegradedOffline,
-                desired_model_id: Some("text-embedding-3-small".to_owned()),
+                desired_model_id: Some("operator-embedding-v1".to_owned()),
                 target_model_id: "hash-fallback-v1".to_owned(),
                 target_dims: 1_536,
                 target_version: 1,
