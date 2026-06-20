@@ -10,10 +10,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{
-    contract::{append_provider_text_with_hard_limit, MAX_PROVIDER_TURN_TEXT_BYTES},
-    ProviderErrorEnvelope, ProviderEvent, ProviderFinishReason, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderTurnOutput, ProviderUsage,
+use crate::{
+    append_provider_text_with_hard_limit, ProviderErrorEnvelope, ProviderEvent,
+    ProviderFinishReason, ProviderOutputContentPart, ProviderRawProviderRefs, ProviderTurnOutput,
+    ProviderUsage, MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 
 const DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES: usize = 256 * 1024;
@@ -172,7 +172,8 @@ impl ProviderStreamAccumulator {
 /// Builds a turn output from a non-streaming response by replaying it
 /// through [`ProviderStreamAccumulator`], so HTTP and streamed paths share
 /// the same truncation, spill, and tool-call semantics.
-pub(super) fn provider_output_from_text_and_tools(
+#[must_use]
+pub fn provider_output_from_text_and_tools(
     full_text: String,
     tool_calls: Vec<ProviderEvent>,
     finish_reason: ProviderFinishReason,

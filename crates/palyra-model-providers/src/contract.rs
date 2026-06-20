@@ -10,12 +10,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE: usize =
-    crate::orchestrator::MAX_MODEL_TOKENS_PER_EVENT;
+/// Default number of model-output words per streamed preview event.
+///
+/// This preserves the daemon's historical `MAX_MODEL_TOKENS_PER_EVENT` value
+/// while keeping the provider contract independent from daemon orchestration.
+pub const DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE: usize = 16;
+
 /// Hard inline text bound: keeps a serialized turn output comfortably under
 /// the default journal payload limit (256KiB) even with JSON overhead and
 /// tool-call parts.
-pub(super) const MAX_PROVIDER_TURN_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_TURN_TEXT_BYTES: usize = 64 * 1024;
 const PROVIDER_OUTPUT_TRUNCATED_MARKER: &str = "\n\n[provider output truncated]";
 
 /// Base64-encoded image attached to a request for vision-capable models.
@@ -410,7 +414,8 @@ impl ProviderTurnOutput {
 ///
 /// Needed because outputs assembled part-by-part (e.g. from accumulated tool
 /// exchanges) can bypass the bound enforced by [`ProviderTurnOutput::text`].
-pub(crate) fn bounded_provider_turn_output_for_persistence(
+#[must_use]
+pub fn bounded_provider_turn_output_for_persistence(
     output: &ProviderTurnOutput,
 ) -> ProviderTurnOutput {
     let mut bounded = output.clone();
@@ -440,7 +445,8 @@ pub(crate) fn bounded_provider_turn_output_for_persistence(
 /// occurred. Idempotent after truncation: a target already ending with the
 /// marker rejects further input so the marker stays terminal across repeated
 /// stream deltas.
-pub(super) fn append_provider_text_with_hard_limit(
+#[doc(hidden)]
+pub fn append_provider_text_with_hard_limit(
     target: &mut String,
     incoming: &str,
     max_bytes: usize,
@@ -510,9 +516,22 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
     &value[..boundary]
 }
 
-/// Full result of one [`super::ModelProvider::complete`] call: the bounded
-/// turn output, its projected events, token totals, and routing metadata
-/// (cache/retry/failover attempt history).
+/// Audit record of one provider/model attempt within a single completion,
+/// covering cache hits, failover hops, and terminal errors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAttemptSummary {
+    pub provider_id: String,
+    pub model_id: String,
+    pub outcome: String,
+    pub retryable: bool,
+    pub served_from_cache: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+/// Full result of one provider completion call: the bounded turn output, its
+/// projected events, token totals, and routing metadata (cache/retry/failover
+/// attempt history).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderResponse {
     pub output: ProviderTurnOutput,
@@ -524,13 +543,14 @@ pub struct ProviderResponse {
     pub model_id: String,
     pub served_from_cache: bool,
     pub failover_count: u32,
-    pub attempts: Vec<super::ProviderAttemptSummary>,
+    pub attempts: Vec<ProviderAttemptSummary>,
 }
 
 /// Returns true when the request carries image input anywhere (top-level
 /// vision inputs or image parts inside messages), gating vision-capability
 /// checks.
-pub(super) fn provider_request_has_vision(request: &ProviderRequest) -> bool {
+#[must_use]
+pub fn provider_request_has_vision(request: &ProviderRequest) -> bool {
     !request.vision_inputs.is_empty()
         || request.effective_messages().iter().any(|message| {
             message
@@ -602,7 +622,8 @@ fn split_provider_stream_text(input: &str, max_words_per_chunk: usize) -> Vec<St
 /// The last text token is marked final only when the turn proposes no tools;
 /// a tool-calling turn continues after execution, so its text must not signal
 /// completion to streaming consumers.
-pub(crate) fn provider_events_from_output(output: &ProviderTurnOutput) -> Vec<ProviderEvent> {
+#[must_use]
+pub fn provider_events_from_output(output: &ProviderTurnOutput) -> Vec<ProviderEvent> {
     let mut events = Vec::new();
     let should_mark_final_model_token =
         !matches!(output.finish_reason, ProviderFinishReason::ToolCalls)
@@ -616,7 +637,7 @@ pub(crate) fn provider_events_from_output(output: &ProviderTurnOutput) -> Vec<Pr
             ProviderOutputContentPart::Text { text } => {
                 let chunks = split_provider_stream_text(
                     text.as_str(),
-                    PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE,
+                    DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE,
                 );
                 for token in chunks {
                     last_model_token_index = Some(events.len());

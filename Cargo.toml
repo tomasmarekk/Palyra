@@ -4,6 +4,7 @@ members = [
   "crates/palyra-control-plane",
   "crates/palyra-connectors",
   "crates/palyra-auth",
+  "crates/palyra-model-providers",
   "crates/palyra-daemon",
   "crates/palyra-transport-quic",
   "crates/palyra-sandbox",

@@ -3,9 +3,6 @@
 
 use serde::Serialize;
 
-/// Maximum model tokens emitted in a single streamed run event.
-pub const MAX_MODEL_TOKENS_PER_EVENT: usize = 16;
-
 /// Events that drive [`RunStateMachine::transition`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTransition {

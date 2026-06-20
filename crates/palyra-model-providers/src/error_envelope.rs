@@ -7,7 +7,7 @@
 //! serde shape is a published contract; extend it additively only.
 use serde::{Deserialize, Serialize};
 
-use super::{sanitize_remote_error, ProviderError, ProviderFailureClass, ProviderFailureSnapshot};
+use crate::{sanitize_remote_error, ProviderError, ProviderFailureClass, ProviderFailureSnapshot};
 
 /// Coarse error category exposed to envelope consumers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

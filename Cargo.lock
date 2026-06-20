@@ -3080,6 +3080,7 @@ dependencies = [
  "palyra-control-plane",
  "palyra-egress-proxy",
  "palyra-identity",
+ "palyra-model-providers",
  "palyra-plugins-runtime",
  "palyra-plugins-sdk",
  "palyra-policy",
@@ -3156,6 +3157,16 @@ dependencies = [
  "ulid",
  "x25519-dalek",
  "x509-parser",
+]
+
+[[package]]
+name = "palyra-model-providers"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
