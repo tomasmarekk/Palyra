@@ -41,16 +41,21 @@ use adapters::{
     openai_responses_tool_wire_name_map, AnthropicCompatibleChatAdapter,
     OpenAiCompatibleChatAdapter, OpenAiResponsesChatAdapter, ProviderChatAdapter,
 };
+#[cfg(test)]
+pub(crate) use palyra_model_providers::MAX_TOOL_ARGUMENT_BYTES;
 pub(crate) use palyra_model_providers::{
-    bounded_provider_turn_output_for_persistence, provider_events_from_output,
+    anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
+    bounded_provider_turn_output_for_persistence, coerce_raw_tool_call_markup,
+    normalize_tool_arguments, normalize_tool_input_value, provider_events_from_output,
     sanitize_remote_error,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
     capability_defaults_for_kind, capability_defaults_for_provider, configured_model_id,
-    validate_openai_base_url_network_policy, validate_openai_base_url_network_policy_with_resolver,
-    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
-    ModelProviderKind, ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
+    validate_model_provider_config, validate_openai_base_url_network_policy,
+    validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
+    ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
+    ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
     ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
     ProviderRegistryEntryConfig,
 };
@@ -103,8 +108,6 @@ const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 // Shared by all HTTP backends; 529 is the Anthropic/MiniMax overload status
 // and must be retried like the other transient upstream codes.
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504, 529];
-// Keep provider envelope above default wasm module quota (256KiB) including base64 and JSON overhead.
-const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
 const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
 const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
@@ -114,35 +117,6 @@ const DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH: &str = "reports/deterministic-prov
 const DETERMINISTIC_TOOL_FIXTURE_WRITE_CALL_ID: &str = "deterministic-fixture-write";
 const DETERMINISTIC_TOOL_FIXTURE_READ_CALL_ID: &str = "deterministic-fixture-read";
 const DETERMINISTIC_TOOL_FIXTURE_REPORT: &str = "# Deterministic Provider Fixture\n\nfixture_id: deterministic-provider-tool-call-v1\nstatus: passed\nprovider: deterministic\n";
-
-// MiniMax exposes an Anthropic-compatible messages API with bearer auth, while
-// native Anthropic uses bearer auth only for Claude subscription OAuth tokens.
-fn anthropic_compatible_uses_bearer_auth(
-    kind: Option<ModelProviderAuthProviderKind>,
-    credential_source: Option<ModelProviderCredentialSource>,
-) -> bool {
-    matches!(kind, Some(ModelProviderAuthProviderKind::Minimax))
-        || matches!(
-            (kind, credential_source),
-            (
-                Some(ModelProviderAuthProviderKind::Anthropic),
-                Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken)
-            )
-        )
-}
-
-fn anthropic_compatible_uses_anthropic_oauth_headers(
-    kind: Option<ModelProviderAuthProviderKind>,
-    credential_source: Option<ModelProviderCredentialSource>,
-) -> bool {
-    matches!(
-        (kind, credential_source),
-        (
-            Some(ModelProviderAuthProviderKind::Anthropic),
-            Some(ModelProviderCredentialSource::AuthProfileOauthAccessToken)
-        )
-    )
-}
 
 fn empty_health_probe_snapshot(
     state: &str,
@@ -544,38 +518,6 @@ pub fn build_embeddings_provider(
             "anthropic provider does not expose embeddings through the built-in adapter"
         )),
     }
-}
-
-fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()> {
-    if config.request_timeout_ms == 0 {
-        anyhow::bail!("model provider request timeout must be greater than 0ms");
-    }
-    if config.retry_backoff_ms == 0 {
-        anyhow::bail!("model provider retry backoff must be greater than 0ms");
-    }
-    if config.circuit_breaker_failure_threshold == 0 {
-        anyhow::bail!("model provider circuit breaker failure threshold must be greater than 0");
-    }
-    if config.circuit_breaker_cooldown_ms == 0 {
-        anyhow::bail!("model provider circuit breaker cooldown must be greater than 0ms");
-    }
-    match config.kind {
-        ModelProviderKind::OpenAiCompatible => {
-            validate_openai_base_url_network_policy(
-                config.openai_base_url.as_str(),
-                config.allow_private_base_url,
-            )?;
-        }
-        ModelProviderKind::Anthropic => {
-            validate_openai_base_url_network_policy(
-                config.anthropic_base_url.as_str(),
-                config.allow_private_base_url,
-            )?;
-        }
-        ModelProviderKind::Deterministic => {}
-    }
-    let _ = config.normalized_registry()?;
-    Ok(())
 }
 
 /// One instantiated provider backend paired with its registry entry.
@@ -4389,183 +4331,6 @@ fn extract_completion_text(content: Option<Value>) -> String {
         }
         _ => String::new(),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RawToolCallMarkupExtraction {
-    cleaned_text: String,
-    tool_events: Vec<ProviderEvent>,
-}
-
-// Recovers tool invocations that models (notably MiniMax) emit as inline
-// tag markup inside the text body. ASCII lowercasing preserves byte offsets,
-// so indices found in `lower` slice `text` safely.
-fn coerce_raw_tool_call_markup(text: &str) -> Result<Option<RawToolCallMarkupExtraction>, String> {
-    let lower = text.to_ascii_lowercase();
-    if !lower.contains("<minimax:tool_call") && !lower.contains("<tool_call") {
-        return Ok(None);
-    }
-
-    let mut cursor = 0usize;
-    let mut cleaned_text = String::new();
-    let mut tool_events = Vec::new();
-    while let Some(block) = find_next_raw_tool_call_block(&lower, cursor) {
-        cleaned_text.push_str(&text[cursor..block.start]);
-        let tag_end = text[block.start..]
-            .find('>')
-            .map(|offset| block.start + offset)
-            .ok_or_else(|| "raw tool-call opening tag is missing '>'".to_owned())?;
-        let content_start = tag_end.saturating_add(1);
-        let close_start =
-            lower[content_start..].find(block.close_tag).map(|offset| content_start + offset);
-        let (block_content, block_end, missing_outer_close) = if let Some(close_start) = close_start
-        {
-            (&text[content_start..close_start], close_start + block.close_tag.len(), false)
-        } else {
-            (&text[content_start..], text.len(), true)
-        };
-        let mut parsed_events = parse_raw_tool_call_invocations(block_content)?;
-        // Models often drop the trailing close tag; tolerate that as long as
-        // the block still yields at least one complete invocation.
-        if missing_outer_close && parsed_events.is_empty() {
-            return Err("raw tool-call block is missing a closing tag".to_owned());
-        }
-        tool_events.append(&mut parsed_events);
-        cursor = block_end;
-    }
-    cleaned_text.push_str(&text[cursor..]);
-
-    if tool_events.is_empty() {
-        return Err("raw tool-call markup did not contain any invoke blocks".to_owned());
-    }
-
-    Ok(Some(RawToolCallMarkupExtraction {
-        cleaned_text: cleaned_text.trim().to_owned(),
-        tool_events,
-    }))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RawToolCallBlock<'a> {
-    start: usize,
-    close_tag: &'a str,
-}
-
-fn find_next_raw_tool_call_block(lower: &str, cursor: usize) -> Option<RawToolCallBlock<'static>> {
-    let minimax = lower[cursor..].find("<minimax:tool_call").map(|offset| RawToolCallBlock {
-        start: cursor + offset,
-        close_tag: "</minimax:tool_call>",
-    });
-    let generic = lower[cursor..]
-        .find("<tool_call")
-        .map(|offset| RawToolCallBlock { start: cursor + offset, close_tag: "</tool_call>" });
-    match (minimax, generic) {
-        (Some(left), Some(right)) => Some(if left.start <= right.start { left } else { right }),
-        (Some(block), None) | (None, Some(block)) => Some(block),
-        (None, None) => None,
-    }
-}
-
-fn parse_raw_tool_call_invocations(block: &str) -> Result<Vec<ProviderEvent>, String> {
-    let lower = block.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    let mut events = Vec::new();
-    while let Some(relative_start) = lower[cursor..].find("<invoke") {
-        let start = cursor + relative_start;
-        let tag_end = block[start..]
-            .find('>')
-            .map(|offset| start + offset)
-            .ok_or_else(|| "invoke opening tag is missing '>'".to_owned())?;
-        let opening_tag = &block[start..=tag_end];
-        let tool_name = extract_raw_tool_invoke_name(opening_tag)
-            .ok_or_else(|| "invoke tag is missing a valid name attribute".to_owned())?;
-        let arguments_start = tag_end.saturating_add(1);
-        let (arguments, next_cursor) = if let Some(close_start) =
-            lower[arguments_start..].find("</invoke>").map(|offset| arguments_start + offset)
-        {
-            (block[arguments_start..close_start].trim(), close_start + "</invoke>".len())
-        } else {
-            let trailing_arguments = block[arguments_start..].trim();
-            if trailing_arguments.is_empty() {
-                return Err("invoke block is missing </invoke>".to_owned());
-            }
-            (trailing_arguments, block.len())
-        };
-        let input_json = normalize_tool_arguments(arguments)?;
-        events.push(ProviderEvent::ToolProposal {
-            proposal_id: Ulid::new().to_string(),
-            tool_name,
-            input_json,
-        });
-        cursor = next_cursor;
-    }
-    Ok(events)
-}
-
-fn extract_raw_tool_invoke_name(opening_tag: &str) -> Option<String> {
-    let lower = opening_tag.to_ascii_lowercase();
-    let mut cursor = lower.find("name")? + "name".len();
-    let bytes = opening_tag.as_bytes();
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor = cursor.saturating_add(1);
-    }
-    if bytes.get(cursor).copied() != Some(b'=') {
-        return None;
-    }
-    cursor = cursor.saturating_add(1);
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-        cursor = cursor.saturating_add(1);
-    }
-    let quote = bytes.get(cursor).copied()?;
-    if !matches!(quote, b'"' | b'\'') {
-        return None;
-    }
-    cursor = cursor.saturating_add(1);
-    let value_start = cursor;
-    while let Some(byte) = bytes.get(cursor).copied() {
-        if byte == quote {
-            let value = opening_tag[value_start..cursor].trim();
-            return (!value.is_empty()).then(|| value.to_owned());
-        }
-        cursor = cursor.saturating_add(1);
-    }
-    None
-}
-
-// Tool argument strings from providers are kept verbatim when they already
-// parse as JSON; anything else is wrapped as {"raw": ...} so downstream
-// consumers always receive valid JSON bytes. Size is capped before and after
-// wrapping to bound journal payloads.
-fn normalize_tool_arguments(raw: &str) -> Result<Vec<u8>, String> {
-    if raw.trim().is_empty() {
-        return Ok(b"{}".to_vec());
-    }
-    if raw.len() > MAX_TOOL_ARGUMENT_BYTES {
-        return Err(format!(
-            "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes before normalization"
-        ));
-    }
-    if serde_json::from_str::<Value>(raw).is_ok() {
-        return Ok(raw.as_bytes().to_vec());
-    }
-    let normalized = json!({ "raw": raw }).to_string().into_bytes();
-    if normalized.len() > MAX_TOOL_ARGUMENT_BYTES {
-        return Err(format!(
-            "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes after normalization"
-        ));
-    }
-    Ok(normalized)
-}
-
-fn normalize_tool_input_value(value: &Value) -> Result<Vec<u8>, String> {
-    let normalized = serde_json::to_vec(value)
-        .map_err(|error| format!("tool arguments could not be serialized: {error}"))?;
-    if normalized.len() > MAX_TOOL_ARGUMENT_BYTES {
-        return Err(format!(
-            "tool arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes after serialization"
-        ));
-    }
-    Ok(normalized)
 }
 
 #[cfg(test)]

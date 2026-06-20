@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use palyra_common::secret_refs::SecretRef;
 use serde::{Deserialize, Serialize};
 
+pub use crate::providers::{capability_defaults_for_kind, capability_defaults_for_provider};
+
 /// Default TTL for provider response cache entries, in milliseconds.
 pub const DEFAULT_PROVIDER_RESPONSE_CACHE_TTL_MS: u64 = 30_000;
 /// Default maximum number of response cache entries per registry-backed provider.
@@ -439,27 +441,9 @@ pub fn configured_model_id(raw: &str) -> Option<&str> {
 // Synthesizes a one-provider registry from the legacy flat config fields so
 // pre-registry deployments keep working unchanged.
 fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderRegistryConfig {
-    let provider_id = match (config.kind, config.auth_profile_provider_kind) {
-        (ModelProviderKind::Deterministic, _) => "deterministic-primary".to_owned(),
-        (ModelProviderKind::OpenAiCompatible, Some(ModelProviderAuthProviderKind::Xai)) => {
-            "xai-primary".to_owned()
-        }
-        (
-            ModelProviderKind::OpenAiCompatible,
-            Some(
-                ModelProviderAuthProviderKind::GoogleGemini
-                | ModelProviderAuthProviderKind::GoogleGeminiCli,
-            ),
-        ) => "google-gemini-primary".to_owned(),
-        (ModelProviderKind::OpenAiCompatible, Some(ModelProviderAuthProviderKind::Openrouter)) => {
-            "openrouter-primary".to_owned()
-        }
-        (ModelProviderKind::OpenAiCompatible, _) => "openai-primary".to_owned(),
-        (ModelProviderKind::Anthropic, Some(ModelProviderAuthProviderKind::Minimax)) => {
-            "minimax-primary".to_owned()
-        }
-        (ModelProviderKind::Anthropic, _) => "anthropic-primary".to_owned(),
-    };
+    let provider_id =
+        crate::providers::legacy_provider_id(config.kind, config.auth_profile_provider_kind)
+            .to_owned();
     let (
         display_name,
         base_url,
@@ -471,56 +455,66 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
         capabilities,
     ) = match config.kind {
         ModelProviderKind::Deterministic => (
-            Some("Deterministic".to_owned()),
+            Some(
+                crate::providers::legacy_display_name(
+                    config.kind,
+                    config.auth_profile_provider_kind,
+                )
+                .to_owned(),
+            ),
             None,
             None,
             None,
             None,
             "deterministic".to_owned(),
-            None,
+            crate::providers::default_auth_provider_kind(
+                config.kind,
+                config.auth_profile_provider_kind,
+            ),
             capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
         ),
         ModelProviderKind::OpenAiCompatible => (
-            Some(openai_compatible_display_name(config.auth_profile_provider_kind).to_owned()),
+            Some(
+                crate::providers::legacy_display_name(
+                    config.kind,
+                    config.auth_profile_provider_kind,
+                )
+                .to_owned(),
+            ),
             Some(config.openai_base_url.clone()),
             config.openai_api_key.clone(),
             config.openai_api_key_secret_ref.clone(),
             config.openai_api_key_vault_ref.clone(),
             config.openai_model.clone(),
-            Some(
-                config.auth_profile_provider_kind.unwrap_or(ModelProviderAuthProviderKind::Openai),
+            crate::providers::default_auth_provider_kind(
+                config.kind,
+                config.auth_profile_provider_kind,
             ),
             capability_defaults_for_kind(config.kind, ProviderModelRole::Chat),
         ),
-        ModelProviderKind::Anthropic => {
-            (
-                Some(
-                    if config.auth_profile_provider_kind
-                        == Some(ModelProviderAuthProviderKind::Minimax)
-                    {
-                        "MiniMax"
-                    } else {
-                        "Anthropic"
-                    }
-                    .to_owned(),
-                ),
-                Some(config.anthropic_base_url.clone()),
-                config.anthropic_api_key.clone(),
-                config.anthropic_api_key_secret_ref.clone(),
-                config.anthropic_api_key_vault_ref.clone(),
-                config.anthropic_model.clone(),
-                Some(
-                    config
-                        .auth_profile_provider_kind
-                        .unwrap_or(ModelProviderAuthProviderKind::Anthropic),
-                ),
-                capability_defaults_for_provider(
+        ModelProviderKind::Anthropic => (
+            Some(
+                crate::providers::legacy_display_name(
                     config.kind,
-                    ProviderModelRole::Chat,
                     config.auth_profile_provider_kind,
-                ),
-            )
-        }
+                )
+                .to_owned(),
+            ),
+            Some(config.anthropic_base_url.clone()),
+            config.anthropic_api_key.clone(),
+            config.anthropic_api_key_secret_ref.clone(),
+            config.anthropic_api_key_vault_ref.clone(),
+            config.anthropic_model.clone(),
+            crate::providers::default_auth_provider_kind(
+                config.kind,
+                config.auth_profile_provider_kind,
+            ),
+            capability_defaults_for_provider(
+                config.kind,
+                ProviderModelRole::Chat,
+                config.auth_profile_provider_kind,
+            ),
+        ),
     };
     let configured_chat_model_id = configured_model_id(model_id.as_str()).map(ToOwned::to_owned);
     let mut models = Vec::new();
@@ -582,20 +576,6 @@ fn legacy_registry_from_config(config: &ModelProviderConfig) -> ModelProviderReg
         });
     }
     registry
-}
-
-fn openai_compatible_display_name(
-    auth_provider_kind: Option<ModelProviderAuthProviderKind>,
-) -> &'static str {
-    match auth_provider_kind {
-        Some(ModelProviderAuthProviderKind::Xai) => "xAI (Grok)",
-        Some(
-            ModelProviderAuthProviderKind::GoogleGemini
-            | ModelProviderAuthProviderKind::GoogleGeminiCli,
-        ) => "Google Gemini",
-        Some(ModelProviderAuthProviderKind::Openrouter) => "OpenRouter",
-        _ => "OpenAI-compatible",
-    }
 }
 
 fn normalize_provider_registry(registry: &mut ModelProviderRegistryConfig) -> Result<()> {
@@ -801,129 +781,46 @@ fn validate_provider_base_url(
     }
 }
 
-/// Returns the default capability envelope for a transport family and model role.
-pub fn capability_defaults_for_kind(
-    kind: ModelProviderKind,
-    role: ProviderModelRole,
-) -> ProviderCapabilitiesSnapshot {
-    match (kind, role) {
-        (ModelProviderKind::Deterministic, ProviderModelRole::Chat) => {
-            ProviderCapabilitiesSnapshot {
-                streaming_tokens: true,
-                tool_calls: true,
-                json_mode: true,
-                vision: false,
-                audio_transcribe: false,
-                embeddings: false,
-                max_context_tokens: Some(8_192),
-                cost_tier: ProviderCostTier::Low.as_str().to_owned(),
-                latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
-                recommended_use_cases: vec![
-                    "offline testing".to_owned(),
-                    "scripted tool-call regression".to_owned(),
-                    "deterministic smoke flows".to_owned(),
-                ],
-                known_limitations: vec![
-                    "scripted fixture responses only".to_owned(),
-                    "no real provider auth".to_owned(),
-                    "no vision".to_owned(),
-                ],
-                operator_override: false,
-                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
-            }
-        }
-        (ModelProviderKind::OpenAiCompatible, ProviderModelRole::Chat) => {
-            ProviderCapabilitiesSnapshot {
-                streaming_tokens: true,
-                tool_calls: true,
-                json_mode: true,
-                vision: true,
-                audio_transcribe: true,
-                embeddings: false,
-                max_context_tokens: Some(128_000),
-                cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
-                latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
-                recommended_use_cases: vec![
-                    "general chat".to_owned(),
-                    "JSON workflows".to_owned(),
-                    "vision requests".to_owned(),
-                ],
-                known_limitations: vec![],
-                operator_override: false,
-                metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
-            }
-        }
-        (ModelProviderKind::Anthropic, ProviderModelRole::Chat) => ProviderCapabilitiesSnapshot {
-            streaming_tokens: true,
-            tool_calls: true,
-            json_mode: true,
-            vision: true,
-            audio_transcribe: false,
-            embeddings: false,
-            max_context_tokens: Some(200_000),
-            cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
-            latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
-            recommended_use_cases: vec![
-                "long-context reasoning".to_owned(),
-                "tool-heavy chat".to_owned(),
-            ],
-            known_limitations: vec!["audio transcription not supported".to_owned()],
-            operator_override: false,
-            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
-        },
-        (_, ProviderModelRole::Embeddings) => ProviderCapabilitiesSnapshot {
-            streaming_tokens: false,
-            tool_calls: false,
-            json_mode: false,
-            vision: false,
-            audio_transcribe: false,
-            embeddings: true,
-            max_context_tokens: Some(8_192),
-            cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
-            latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
-            recommended_use_cases: vec!["memory indexing".to_owned()],
-            known_limitations: vec!["text embeddings only".to_owned()],
-            operator_override: false,
-            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
-        },
-        (_, ProviderModelRole::AudioTranscription) => ProviderCapabilitiesSnapshot {
-            streaming_tokens: false,
-            tool_calls: false,
-            json_mode: false,
-            vision: false,
-            audio_transcribe: true,
-            embeddings: false,
-            max_context_tokens: None,
-            cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
-            latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
-            recommended_use_cases: vec!["audio ingestion".to_owned()],
-            known_limitations: vec![],
-            operator_override: false,
-            metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
-        },
+/// Validates model-provider runtime configuration before provider construction.
+///
+/// This covers timeout/retry/circuit-breaker bounds, base URL network policy,
+/// and registry normalization. It intentionally validates the legacy flat
+/// fields and the synthesized/explicit registry so callers can keep accepting
+/// both public TOML shapes unchanged.
+///
+/// # Errors
+/// Returns an error when numeric policy values are invalid, a provider base URL
+/// violates the private-network guard, or the provider registry is malformed.
+pub fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()> {
+    if config.request_timeout_ms == 0 {
+        anyhow::bail!("model provider request timeout must be greater than 0ms");
     }
-}
-
-/// Returns default capabilities adjusted for provider identity quirks.
-pub fn capability_defaults_for_provider(
-    kind: ModelProviderKind,
-    role: ProviderModelRole,
-    auth_provider_kind: Option<ModelProviderAuthProviderKind>,
-) -> ProviderCapabilitiesSnapshot {
-    let mut capabilities = capability_defaults_for_kind(kind, role);
-    if kind == ModelProviderKind::Anthropic
-        && role == ProviderModelRole::Chat
-        && auth_provider_kind == Some(ModelProviderAuthProviderKind::Minimax)
-    {
-        capabilities.vision = false;
-        capabilities
-            .known_limitations
-            .push("vision unsupported by MiniMax Anthropic-compatible chat".to_owned());
-        capabilities
-            .recommended_use_cases
-            .retain(|use_case| !use_case.to_ascii_lowercase().contains("vision"));
+    if config.retry_backoff_ms == 0 {
+        anyhow::bail!("model provider retry backoff must be greater than 0ms");
     }
-    capabilities
+    if config.circuit_breaker_failure_threshold == 0 {
+        anyhow::bail!("model provider circuit breaker failure threshold must be greater than 0");
+    }
+    if config.circuit_breaker_cooldown_ms == 0 {
+        anyhow::bail!("model provider circuit breaker cooldown must be greater than 0ms");
+    }
+    match config.kind {
+        ModelProviderKind::OpenAiCompatible => {
+            validate_openai_base_url_network_policy(
+                config.openai_base_url.as_str(),
+                config.allow_private_base_url,
+            )?;
+        }
+        ModelProviderKind::Anthropic => {
+            validate_openai_base_url_network_policy(
+                config.anthropic_base_url.as_str(),
+                config.allow_private_base_url,
+            )?;
+        }
+        ModelProviderKind::Deterministic => {}
+    }
+    let _ = config.normalized_registry()?;
+    Ok(())
 }
 
 /// Enforces the SSRF guard on a provider base URL: localhost, private, and

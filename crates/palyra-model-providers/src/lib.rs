@@ -8,6 +8,7 @@ pub mod config;
 pub mod contract;
 pub mod error_envelope;
 pub mod errors;
+pub mod providers;
 pub mod snapshots;
 pub mod streaming;
 
@@ -15,9 +16,10 @@ mod redaction;
 
 pub use config::{
     capability_defaults_for_kind, capability_defaults_for_provider, configured_model_id,
-    validate_openai_base_url_network_policy, validate_openai_base_url_network_policy_with_resolver,
-    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
-    ModelProviderKind, ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
+    validate_model_provider_config, validate_openai_base_url_network_policy,
+    validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
+    ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
+    ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
     ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
     ProviderRegistryEntryConfig, DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
     DEFAULT_PROVIDER_DISCOVERY_TTL_MS, DEFAULT_PROVIDER_HEALTH_TTL_MS,
@@ -45,6 +47,13 @@ pub use errors::{
     ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
     ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
     ProviderRecoveryPlanSnapshot,
+};
+pub use providers::{
+    anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
+    anthropic_messages_payload, coerce_raw_tool_call_markup, normalize_tool_arguments,
+    normalize_tool_input_value, openai_chat_completions_payload, openai_responses_payload,
+    openai_responses_tool_wire_name_map_from_tools, OpenAiResponsesPayload,
+    RawToolCallMarkupExtraction, MAX_TOOL_ARGUMENT_BYTES,
 };
 pub use redaction::sanitize_remote_error;
 pub use snapshots::{

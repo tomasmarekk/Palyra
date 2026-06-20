@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn truncates_multibyte_text_without_panicking() {
-        let input = format!("{}{}", "ž".repeat(260), "sk-should-not-appear-1234567890");
+        let input = format!("{}{}", "\u{017E}".repeat(260), "sk-should-not-appear-1234567890");
 
         let sanitized = sanitize_remote_error(input.as_str());
 
