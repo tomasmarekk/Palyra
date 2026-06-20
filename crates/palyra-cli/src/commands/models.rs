@@ -35,8 +35,6 @@ const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
 const DESKTOP_CONTROL_CENTER_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_DIR: &str = "runtime";
 const PROVIDER_CHECKS_CACHE_PATH: &str = "models/provider_checks.json";
-const CURATED_TEXT_MODELS: &[&str] = &["gpt-4o-mini", "gpt-4.1-mini"];
-const CURATED_EMBEDDING_MODELS: &[&str] = &["text-embedding-3-small", "text-embedding-3-large"];
 
 /// Snapshot of the effective model-provider configuration for `models status`.
 #[derive(Debug, Serialize)]
@@ -528,7 +526,7 @@ fn emit_models_explain(payload: &ModelsExplainPayload, json_output: bool) -> Res
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-/// Builds the `models list` payload from curated entries plus the configured registry.
+/// Builds the `models list` payload from configured defaults plus the provider registry.
 ///
 /// # Errors
 /// Returns an error when the config cannot be loaded or parsed.
@@ -536,22 +534,14 @@ pub(crate) fn build_models_list(path: Option<String>) -> Result<ModelsListPayloa
     let overview = load_models_overview(path)?;
     let status = overview.status;
     let mut models = Vec::new();
-    append_catalog_entries(
-        &mut models,
-        "text",
-        CURATED_TEXT_MODELS,
-        status.text_model.as_deref(),
-        Some("gpt-4o-mini"),
-    );
-    append_catalog_entries(
-        &mut models,
-        "embeddings",
-        CURATED_EMBEDDING_MODELS,
-        status.embeddings_model.as_deref(),
-        Some("text-embedding-3-small"),
-    );
+    if let Some(configured) = status.default_chat_model_id.as_deref() {
+        append_ad_hoc_entry(&mut models, "text", configured);
+    }
     if let Some(configured) = status.text_model.as_deref() {
         append_ad_hoc_entry(&mut models, "text", configured);
+    }
+    if let Some(configured) = status.default_embeddings_model_id.as_deref() {
+        append_ad_hoc_entry(&mut models, "embeddings", configured);
     }
     if let Some(configured) = status.embeddings_model.as_deref() {
         append_ad_hoc_entry(&mut models, "embeddings", configured);
@@ -562,31 +552,6 @@ pub(crate) fn build_models_list(path: Option<String>) -> Result<ModelsListPayloa
         providers: overview.providers,
         registry_models: overview.models,
     })
-}
-
-fn append_catalog_entries(
-    target_entries: &mut Vec<ModelCatalogEntry<'static>>,
-    target: &'static str,
-    catalog: &[&str],
-    configured: Option<&str>,
-    preferred: Option<&str>,
-) {
-    let has_configured_model = configured.is_some();
-    for model in catalog {
-        let is_configured = configured.is_some_and(|value| value == *model);
-        let is_preferred = if has_configured_model {
-            is_configured
-        } else {
-            preferred.is_some_and(|value| value == *model)
-        };
-        target_entries.push(ModelCatalogEntry {
-            target,
-            id: (*model).to_owned(),
-            configured: is_configured,
-            preferred: is_preferred,
-            source: "curated",
-        });
-    }
 }
 
 fn append_ad_hoc_entry(
