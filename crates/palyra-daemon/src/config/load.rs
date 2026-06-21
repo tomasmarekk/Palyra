@@ -59,7 +59,7 @@ use crate::model_provider::{
     ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
     ModelProviderKind, ProviderCapabilitiesSnapshot, ProviderCostTier, ProviderLatencyTier,
     ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole, ProviderReasoningEffort,
-    ProviderRegistryEntryConfig,
+    ProviderRegistryEntryConfig, ProviderServiceTier,
 };
 use crate::retrieval::{
     RetrievalBackendKind, RetrievalRuntimeConfig, RetrievalSourceScoringProfile,
@@ -651,6 +651,12 @@ pub fn load_config() -> Result<LoadedConfig> {
                 model_provider.reasoning_effort = Some(parse_provider_reasoning_effort(
                     reasoning_effort.as_str(),
                     "model_provider.reasoning_effort",
+                )?);
+            }
+            if let Some(service_tier) = file_model_provider.service_tier {
+                model_provider.service_tier = Some(parse_provider_service_tier(
+                    service_tier.as_str(),
+                    "model_provider.service_tier",
                 )?);
             }
             if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
@@ -1514,6 +1520,13 @@ pub fn load_config() -> Result<LoadedConfig> {
             "PALYRA_MODEL_PROVIDER_REASONING_EFFORT",
         )?);
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_REASONING_EFFORT)");
+    }
+    if let Ok(service_tier) = env::var("PALYRA_MODEL_PROVIDER_SERVICE_TIER") {
+        model_provider.service_tier = Some(parse_provider_service_tier(
+            service_tier.as_str(),
+            "PALYRA_MODEL_PROVIDER_SERVICE_TIER",
+        )?);
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_SERVICE_TIER)");
     }
 
     if let Ok(request_timeout_ms) = env::var("PALYRA_MODEL_PROVIDER_REQUEST_TIMEOUT_MS") {
@@ -2612,6 +2625,10 @@ fn parse_provider_reasoning_effort(
         .map_err(|message| anyhow::anyhow!("{source_name}: {message}"))
 }
 
+fn parse_provider_service_tier(raw: &str, source_name: &str) -> Result<ProviderServiceTier> {
+    ProviderServiceTier::parse(raw).map_err(|message| anyhow::anyhow!("{source_name}: {message}"))
+}
+
 fn parse_provider_reasoning_efforts(raw: &[String], source_name: &str) -> Result<Vec<String>> {
     if raw.len() > 16 {
         anyhow::bail!("{source_name} exceeds maximum entries ({} > 16)", raw.len());
@@ -2622,6 +2639,23 @@ fn parse_provider_reasoning_efforts(raw: &[String], source_name: &str) -> Result
     {
         let effort = parse_provider_reasoning_effort(candidate, source_name)?;
         let normalized = effort.as_str().to_owned();
+        if seen.insert(normalized.clone()) {
+            values.push(normalized);
+        }
+    }
+    Ok(values)
+}
+
+fn parse_provider_service_tiers(raw: &[String], source_name: &str) -> Result<Vec<String>> {
+    if raw.len() > 16 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 16)", raw.len());
+    }
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in raw.iter().map(String::as_str).map(str::trim).filter(|value| !value.is_empty())
+    {
+        let tier = parse_provider_service_tier(candidate, source_name)?;
+        let normalized = tier.as_str().to_owned();
         if seen.insert(normalized.clone()) {
             values.push(normalized);
         }
@@ -2640,6 +2674,19 @@ fn default_provider_reasoning_efforts() -> Vec<String> {
     ]
     .into_iter()
     .map(ProviderReasoningEffort::as_str)
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn default_provider_service_tiers() -> Vec<String> {
+    [
+        ProviderServiceTier::Auto,
+        ProviderServiceTier::Default,
+        ProviderServiceTier::Priority,
+        ProviderServiceTier::Flex,
+    ]
+    .into_iter()
+    .map(ProviderServiceTier::as_str)
     .map(ToOwned::to_owned)
     .collect()
 }
@@ -2710,6 +2757,8 @@ fn provider_capability_defaults(
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: Some(8_192),
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2738,6 +2787,8 @@ fn provider_capability_defaults(
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2757,6 +2808,8 @@ fn provider_capability_defaults(
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: true,
+                service_tiers: default_provider_service_tiers(),
                 max_context_tokens: Some(128_000),
                 cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2780,6 +2833,8 @@ fn provider_capability_defaults(
                 embeddings: true,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2802,6 +2857,8 @@ fn provider_capability_defaults(
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2820,6 +2877,8 @@ fn provider_capability_defaults(
             embeddings: false,
             reasoning: false,
             reasoning_efforts: Vec::new(),
+            service_tier: false,
+            service_tiers: Vec::new(),
             max_context_tokens: Some(200_000),
             cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
             latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2845,6 +2904,8 @@ fn provider_capability_defaults(
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: None,
                 cost_tier: ProviderCostTier::Premium.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -2877,6 +2938,21 @@ fn provider_capability_defaults_for_entry(
         defaults
             .recommended_use_cases
             .retain(|use_case| !use_case.to_ascii_lowercase().contains("vision"));
+    }
+    if provider.kind == ModelProviderKind::OpenAiCompatible
+        && role == ProviderModelRole::Chat
+        && matches!(
+            provider.auth_profile_provider_kind,
+            Some(
+                ModelProviderAuthProviderKind::Xai
+                    | ModelProviderAuthProviderKind::GoogleGemini
+                    | ModelProviderAuthProviderKind::GoogleGeminiCli
+                    | ModelProviderAuthProviderKind::Openrouter
+            )
+        )
+    {
+        defaults.service_tier = false;
+        defaults.service_tiers.clear();
     }
     defaults
 }
@@ -3134,6 +3210,13 @@ fn parse_model_provider_registry_model(
             )
         })
         .transpose()?;
+    let configured_service_tiers = raw
+        .service_tiers
+        .as_ref()
+        .map(|values| {
+            parse_provider_service_tiers(values, format!("{source_name}.service_tiers").as_str())
+        })
+        .transpose()?;
     let reasoning = raw.reasoning.unwrap_or_else(|| {
         configured_reasoning_efforts.as_ref().is_some_and(|values| !values.is_empty())
             || defaults.reasoning
@@ -3146,9 +3229,29 @@ fn parse_model_provider_registry_model(
             Vec::new()
         }
     });
+    let service_tier = raw.service_tier.unwrap_or_else(|| {
+        configured_service_tiers.as_ref().is_some_and(|values| !values.is_empty())
+            || defaults.service_tier
+    });
+    let service_tiers = configured_service_tiers.unwrap_or_else(|| {
+        if service_tier {
+            if defaults.service_tiers.is_empty() {
+                default_provider_service_tiers()
+            } else {
+                defaults.service_tiers.clone()
+            }
+        } else {
+            Vec::new()
+        }
+    });
     if !reasoning && !reasoning_efforts.is_empty() {
         anyhow::bail!(
             "{source_name}.reasoning_efforts cannot be set when {source_name}.reasoning=false"
+        );
+    }
+    if !service_tier && !service_tiers.is_empty() {
+        anyhow::bail!(
+            "{source_name}.service_tiers cannot be set when {source_name}.service_tier=false"
         );
     }
 
@@ -3168,6 +3271,8 @@ fn parse_model_provider_registry_model(
             embeddings: raw.embeddings.unwrap_or(defaults.embeddings),
             reasoning,
             reasoning_efforts,
+            service_tier,
+            service_tiers,
             max_context_tokens: raw.max_context_tokens.or(defaults.max_context_tokens),
             cost_tier,
             latency_tier,
@@ -3981,9 +4086,9 @@ mod tests {
         parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
         parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
-        parse_process_runner_tier, parse_provider_reasoning_effort, parse_root_file_config,
-        parse_storage_prefix_allowlist, parse_tool_allowlist, parse_vault_dir,
-        parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
+        parse_process_runner_tier, parse_provider_reasoning_effort, parse_provider_service_tier,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
+        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
         AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
         CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
         FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
@@ -3994,7 +4099,7 @@ mod tests {
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
     use crate::model_provider::{
         ModelProviderAuthProviderKind, ModelProviderKind, ProviderMetadataSource,
-        ProviderModelRole, ProviderReasoningEffort,
+        ProviderModelRole, ProviderReasoningEffort, ProviderServiceTier,
     };
     use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
     use palyra_common::{
@@ -5558,6 +5663,20 @@ state_dir = "browserd-state"
     }
 
     #[test]
+    fn parse_model_provider_service_tier_accepts_aliases() {
+        assert_eq!(
+            parse_provider_service_tier("fast", "model_provider.service_tier")
+                .expect("fast alias should parse"),
+            ProviderServiceTier::Priority
+        );
+        assert_eq!(
+            parse_provider_service_tier("no-fast", "model_provider.service_tier")
+                .expect("no-fast alias should parse"),
+            ProviderServiceTier::Default
+        );
+    }
+
+    #[test]
     fn parse_model_provider_registry_entry_inherits_model_provider_defaults() {
         let defaults = ModelProviderConfig {
             request_timeout_ms: 9_000,
@@ -5645,6 +5764,8 @@ state_dir = "browserd-state"
                 embeddings: None,
                 reasoning: None,
                 reasoning_efforts: None,
+                service_tier: None,
+                service_tiers: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,
@@ -5707,6 +5828,8 @@ state_dir = "browserd-state"
                 embeddings: None,
                 reasoning: None,
                 reasoning_efforts: None,
+                service_tier: None,
+                service_tiers: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,
@@ -5766,6 +5889,8 @@ state_dir = "browserd-state"
                 embeddings: None,
                 reasoning: Some(false),
                 reasoning_efforts: Some(vec!["low".to_owned()]),
+                service_tier: None,
+                service_tiers: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,
@@ -5826,6 +5951,8 @@ state_dir = "browserd-state"
                 embeddings: None,
                 reasoning: None,
                 reasoning_efforts: None,
+                service_tier: None,
+                service_tiers: None,
                 max_context_tokens: None,
                 cost_tier: None,
                 latency_tier: None,

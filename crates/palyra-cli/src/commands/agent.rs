@@ -59,6 +59,9 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             prompt,
             prompt_stdin,
             reasoning,
+            fast,
+            no_fast,
+            service_tier,
             allow_sensitive_tools,
             interrupt_active_run,
             approval_mode,
@@ -69,9 +72,11 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             ensure_agent_run_approval_flags(allow_sensitive_tools, approval_mode, prompt_stdin)?;
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
             let reasoning_effort = normalize_reasoning_effort_arg(reasoning)?;
+            let service_tier = normalize_service_tier_arg(fast, no_fast, service_tier)?;
             let parameter_delta_json = cli_launch_parameter_delta_json(
                 input_prompt.as_str(),
                 reasoning_effort.as_deref(),
+                service_tier.as_deref(),
             )?;
             let connection = root_context.resolve_grpc_connection(
                 app::ConnectionOverrides {
@@ -227,6 +232,7 @@ async fn run_agent_interactive_async(
     std::io::stderr().flush().context("stderr flush failed")?;
 
     let mut last_run_id = None::<String>;
+    let mut interactive_service_tier = None::<String>;
     let mut input_rx = spawn_interactive_stdin_reader();
     let mut pending_prompts = VecDeque::<String>::new();
     loop {
@@ -243,8 +249,15 @@ async fn run_agent_interactive_async(
         }
         if prompt.eq_ignore_ascii_case("/help") {
             eprintln!(
-                "agent.interactive.commands /help /session /reset /abort [run_id] /exit | context refs: @file:PATH @folder:PATH @diff[:PATH] @staged[:PATH] @url:URL @memory:\"query\" escape with @@"
+                "agent.interactive.commands /help /session /reset /fast status|on|off|default|flex|auto|clear /abort [run_id] /exit | context refs: @file:PATH @folder:PATH @diff[:PATH] @staged[:PATH] @url:URL @memory:\"query\" escape with @@"
             );
+            std::io::stderr().flush().context("stderr flush failed")?;
+            continue;
+        }
+        if let Some(message) =
+            handle_interactive_fast_command(prompt, &mut interactive_service_tier)?
+        {
+            eprintln!("{message}");
             std::io::stderr().flush().context("stderr flush failed")?;
             continue;
         }
@@ -327,7 +340,11 @@ async fn run_agent_interactive_async(
             approval_mode: AgentApprovalMode::Prompt,
             origin_kind: None,
             origin_run_id: None,
-            parameter_delta_json: cli_launch_parameter_delta_json(prompt, None)?,
+            parameter_delta_json: cli_launch_parameter_delta_json(
+                prompt,
+                None,
+                interactive_service_tier.as_deref(),
+            )?,
         })?;
         last_run_id = Some(request.run_id.clone());
         let run_id = request.run_id.clone();
@@ -358,9 +375,10 @@ const CLI_CONTEXT_SAFE_PATH_ENV_KEYS: &[&str] = &["PALYRA_E2E_HOME", "PALYRA_E2E
 fn cli_launch_parameter_delta_json(
     prompt: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
 ) -> Result<Option<String>> {
     let cwd = std::env::current_dir().context("failed to resolve CLI current working directory")?;
-    cli_launch_parameter_delta_json_for_cwd(cwd.as_path(), prompt, reasoning_effort)
+    cli_launch_parameter_delta_json_for_cwd(cwd.as_path(), prompt, reasoning_effort, service_tier)
 }
 
 // The prompt is accepted but deliberately unused: workspace roots must never
@@ -369,6 +387,7 @@ fn cli_launch_parameter_delta_json_for_cwd(
     cwd: &std::path::Path,
     _prompt: &str,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
 ) -> Result<Option<String>> {
     let mut parameter_delta = serde_json::json!({
         "cli_context": {
@@ -379,6 +398,9 @@ fn cli_launch_parameter_delta_json_for_cwd(
     });
     if let Some(reasoning_effort) = reasoning_effort {
         parameter_delta["reasoning_effort"] = reasoning_effort.into();
+    }
+    if let Some(service_tier) = service_tier {
+        parameter_delta["service_tier"] = service_tier.into();
     }
     serde_json::to_string(&parameter_delta)
         .map(Some)
@@ -404,6 +426,70 @@ fn normalize_reasoning_effort_arg(raw: Option<String>) -> Result<Option<String>>
         }
     };
     Ok(Some(normalized.to_owned()))
+}
+
+fn normalize_service_tier_arg(
+    fast: bool,
+    no_fast: bool,
+    raw: Option<String>,
+) -> Result<Option<String>> {
+    match (
+        fast,
+        no_fast,
+        raw.as_deref().and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+    ) {
+        (true, false, None) => Ok(Some("priority".to_owned())),
+        (false, true, None) => Ok(Some("default".to_owned())),
+        (false, false, Some(raw)) => normalize_service_tier_value(raw).map(Some),
+        (false, false, None) => Ok(None),
+        _ => anyhow::bail!("select at most one of --fast, --no-fast, or --service-tier"),
+    }
+}
+
+fn normalize_service_tier_value(raw: &str) -> Result<String> {
+    let normalized = match raw.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "auto" => "auto",
+        "default" | "standard" | "normal" | "off" | "false" | "nofast" => "default",
+        "priority" | "fast" | "on" | "true" => "priority",
+        "flex" | "lowcost" | "cheap" => "flex",
+        _ => {
+            anyhow::bail!(
+                "unsupported service tier '{raw}'; expected one of auto, default, priority, flex"
+            )
+        }
+    };
+    Ok(normalized.to_owned())
+}
+
+fn handle_interactive_fast_command(
+    prompt: &str,
+    service_tier: &mut Option<String>,
+) -> Result<Option<String>> {
+    let Some(raw_argument) = prompt.trim().strip_prefix("/fast").filter(|_| {
+        prompt.trim().eq_ignore_ascii_case("/fast") || prompt.trim().starts_with("/fast ")
+    }) else {
+        return Ok(None);
+    };
+    let argument = raw_argument.trim();
+    if argument.is_empty() || argument.eq_ignore_ascii_case("status") {
+        return Ok(Some(format!(
+            "agent.interactive.fast service_tier={}",
+            service_tier.as_deref().unwrap_or("inherit")
+        )));
+    }
+    if matches!(
+        argument.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+        "clear" | "inherit" | "unset"
+    ) {
+        *service_tier = None;
+        return Ok(Some("agent.interactive.fast service_tier=inherit".to_owned()));
+    }
+    let normalized = normalize_service_tier_value(argument)?;
+    *service_tier = Some(normalized.clone());
+    Ok(Some(format!("agent.interactive.fast service_tier={normalized}")))
 }
 
 fn cli_launch_safe_path_env() -> serde_json::Map<String, serde_json::Value> {
@@ -525,6 +611,13 @@ async fn execute_interactive_agent_stream(
                         }
                         if prompt.eq_ignore_ascii_case("/reset") {
                             eprintln!("agent.interactive.reset active_run=true deferred=false message=reset_requires_idle_session");
+                            std::io::stderr().flush().context("stderr flush failed")?;
+                            continue;
+                        }
+                        if prompt.eq_ignore_ascii_case("/fast")
+                            || prompt.to_ascii_lowercase().starts_with("/fast ")
+                        {
+                            eprintln!("agent.interactive.fast active_run=true deferred=false message=fast_requires_idle_session");
                             std::io::stderr().flush().context("stderr flush failed")?;
                             continue;
                         }
@@ -757,6 +850,7 @@ mod tests {
         cli_launch_parameter_delta_json_for_cwd, ensure_agent_run_approval_flags,
         interactive_interrupt_message, interactive_session_started_message,
         normalize_interactive_prompt_line, normalize_reasoning_effort_arg,
+        normalize_service_tier_arg,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -873,9 +967,10 @@ mod tests {
     #[test]
     fn cli_launch_context_encodes_current_working_directory() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None)
-            .expect("launch context should serialize")
-            .expect("launch context should be present");
+        let parameter_delta =
+            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None, None)
+                .expect("launch context should serialize")
+                .expect("launch context should be present");
         let value =
             serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
 
@@ -895,7 +990,7 @@ mod tests {
         fs::create_dir_all(project.as_path()).expect("project directory should exist");
         let prompt = format!("In project `{}` create a Todo app.", project.display());
         let parameter_delta =
-            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), prompt.as_str(), None)
+            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), prompt.as_str(), None, None)
                 .expect("launch context should serialize")
                 .expect("launch context should be present");
         let value =
@@ -924,9 +1019,10 @@ mod tests {
         let _home = ScopedEnvVar::set("PALYRA_E2E_HOME", e2e_home.as_os_str());
         let _os_root = ScopedEnvVar::set("PALYRA_E2E_OS_ROOT", e2e_os_root.as_os_str());
         let _admin_token = ScopedEnvVar::set("PALYRA_ADMIN_TOKEN", "secret");
-        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None)
-            .expect("launch context should serialize")
-            .expect("launch context should be present");
+        let parameter_delta =
+            cli_launch_parameter_delta_json_for_cwd(tempdir.path(), "", None, None)
+                .expect("launch context should serialize")
+                .expect("launch context should be present");
         let value =
             serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
 
@@ -959,6 +1055,7 @@ mod tests {
             tempdir.path(),
             "",
             reasoning_effort.as_deref(),
+            None,
         )
         .expect("launch context should serialize")
         .expect("launch context should be present");
@@ -966,5 +1063,28 @@ mod tests {
             serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
 
         assert_eq!(value.get("reasoning_effort").and_then(Value::as_str), Some("medium"));
+    }
+
+    #[test]
+    fn cli_launch_context_includes_canonical_service_tier() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let service_tier =
+            normalize_service_tier_arg(true, false, None).expect("fast flag should parse");
+        let parameter_delta = cli_launch_parameter_delta_json_for_cwd(
+            tempdir.path(),
+            "",
+            None,
+            service_tier.as_deref(),
+        )
+        .expect("launch context should serialize")
+        .expect("launch context should be present");
+        let value =
+            serde_json::from_str::<Value>(parameter_delta.as_str()).expect("JSON should parse");
+
+        assert_eq!(value.get("service_tier").and_then(Value::as_str), Some("priority"));
+        assert_eq!(
+            normalize_service_tier_arg(false, true, None).expect("no-fast should parse"),
+            Some("default".to_owned())
+        );
     }
 }

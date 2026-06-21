@@ -73,7 +73,7 @@ pub use palyra_model_providers::{
     ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
     ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
     ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderTurnOutput, ProviderUsage,
+    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -1463,6 +1463,19 @@ fn fallback_latency_rank(value: &str) -> u8 {
     }
 }
 
+fn default_provider_service_tiers() -> Vec<String> {
+    [
+        ProviderServiceTier::Auto,
+        ProviderServiceTier::Default,
+        ProviderServiceTier::Priority,
+        ProviderServiceTier::Flex,
+    ]
+    .into_iter()
+    .map(ProviderServiceTier::as_str)
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn build_registry_provider_runtime(
     base_config: &ModelProviderConfig,
     registry: &ModelProviderRegistryConfig,
@@ -1511,6 +1524,7 @@ fn build_registry_provider_runtime(
             .or(base_config.auth_profile_provider_kind),
         credential_source: entry.credential_source.or(base_config.credential_source),
         reasoning_effort: base_config.reasoning_effort,
+        service_tier: base_config.service_tier,
         request_timeout_ms: entry.request_timeout_ms,
         max_retries: entry.max_retries,
         retry_backoff_ms: entry.retry_backoff_ms,
@@ -1910,6 +1924,8 @@ impl ModelProvider for DeterministicProvider {
                 embeddings: false,
                 reasoning: false,
                 reasoning_efforts: Vec::new(),
+                service_tier: false,
+                service_tiers: Vec::new(),
                 max_context_tokens: Some(8_192),
                 cost_tier: ProviderCostTier::Low.as_str().to_owned(),
                 latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -2633,12 +2649,45 @@ impl OpenAiCompatibleProvider {
             .filter(|model_id| model_id.contains("transcribe"))
     }
 
-    fn request_with_config_reasoning(&self, request: &ProviderRequest) -> ProviderRequest {
+    fn request_with_config_overrides(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderRequest, AttemptError> {
         let mut effective = request.clone();
         if effective.reasoning_effort.is_none() {
             effective.reasoning_effort = self.config.reasoning_effort;
         }
-        effective
+        if effective.service_tier.is_none() {
+            effective.service_tier = self.config.service_tier;
+        }
+        if let Some(service_tier) = effective.service_tier {
+            if !self.openai_service_tier_supported() {
+                if service_tier == ProviderServiceTier::Default {
+                    effective.service_tier = None;
+                } else {
+                    return Err(AttemptError::request_failed(
+                        format!(
+                            "provider '{}' does not support service_tier={}",
+                            self.config.kind.as_str(),
+                            service_tier.as_str()
+                        ),
+                        false,
+                        user_action_provider_classification("service_tier_unsupported"),
+                    ));
+                }
+            }
+        }
+        Ok(effective)
+    }
+
+    fn openai_service_tier_supported(&self) -> bool {
+        self.config
+            .auth_profile_provider_kind
+            .is_none_or(|kind| kind == ModelProviderAuthProviderKind::Openai)
+            && reqwest::Url::parse(self.config.openai_base_url.as_str())
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
     }
 
     async fn request_once(
@@ -2658,7 +2707,7 @@ impl OpenAiCompatibleProvider {
 
         let actual_model_id = requested_model_id.to_owned();
         let adapter = OpenAiCompatibleChatAdapter;
-        let effective_request = self.request_with_config_reasoning(request);
+        let effective_request = self.request_with_config_overrides(request)?;
         let body = adapter.request_payload(&effective_request, actual_model_id.as_str());
 
         let endpoint = self.chat_completions_endpoint();
@@ -2840,7 +2889,7 @@ impl OpenAiCompatibleProvider {
     ) -> Result<ProviderResponse, AttemptError> {
         let actual_model_id = openai_codex_runtime_model_id(requested_model_id);
         let adapter = OpenAiResponsesChatAdapter;
-        let effective_request = self.request_with_config_reasoning(request);
+        let effective_request = self.request_with_config_overrides(request)?;
         let body = adapter.request_payload(&effective_request, actual_model_id.as_str());
         let endpoint = self.codex_responses_endpoint();
         let mut builder = self
@@ -3499,6 +3548,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .into_iter()
             .chain(self.config.openai_embeddings_model.clone())
             .collect::<Vec<_>>();
+        let service_tier_supported = self.openai_service_tier_supported();
         let mut snapshot = ProviderStatusSnapshot {
             kind: self.config.kind.as_str().to_owned(),
             provider_id: "openai-primary".to_owned(),
@@ -3528,6 +3578,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
                         ProviderReasoningEffort::High.as_str().to_owned(),
                         ProviderReasoningEffort::XHigh.as_str().to_owned(),
                     ]
+                } else {
+                    Vec::new()
+                },
+                service_tier: service_tier_supported,
+                service_tiers: if service_tier_supported {
+                    default_provider_service_tiers()
                 } else {
                     Vec::new()
                 },
@@ -3717,6 +3773,18 @@ impl AnthropicProvider {
             "anthropic-compatible",
             "anthropic_chat_model_missing",
         )?;
+        if let Some(service_tier) = request.service_tier.or(self.config.service_tier) {
+            if service_tier != ProviderServiceTier::Default {
+                return Err(AttemptError::request_failed(
+                    format!(
+                        "provider 'anthropic' does not support service_tier={}",
+                        service_tier.as_str()
+                    ),
+                    false,
+                    user_action_provider_classification("service_tier_unsupported"),
+                ));
+            }
+        }
         let adapter = AnthropicCompatibleChatAdapter;
         let body = adapter.request_payload(request, model_name);
 
@@ -4545,6 +4613,7 @@ mod tests {
             budget_profile: Some("interactive-default".to_owned()),
             max_output_tokens: Some(6_144),
             reasoning_effort: None,
+            service_tier: None,
         };
 
         let openai_payload =
@@ -4603,6 +4672,7 @@ mod tests {
             budget_profile: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            service_tier: None,
         };
 
         let openai_payload =
@@ -4655,6 +4725,7 @@ mod tests {
             budget_profile: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            service_tier: None,
         };
 
         let anthropic_payload =
@@ -4709,6 +4780,7 @@ mod tests {
             budget_profile: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            service_tier: None,
         };
 
         let anthropic_payload =

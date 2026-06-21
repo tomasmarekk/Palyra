@@ -69,7 +69,7 @@ use crate::{
     media::MediaRuntimeConfig,
     model_provider::{
         ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderReasoningEffort,
+        ProviderReasoningEffort, ProviderServiceTier,
     },
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -101,6 +101,7 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) budget_profile: Option<String>,
     pub(crate) max_output_tokens: Option<u64>,
     pub(crate) reasoning_effort: Option<ProviderReasoningEffort>,
+    pub(crate) service_tier: Option<ProviderServiceTier>,
 }
 
 /// How memory-augmentation failures affect the overall input preparation.
@@ -143,6 +144,8 @@ struct ParameterDeltaEnvelope {
     project_context: Option<ProjectContextPreviewEnvelope>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -892,6 +895,23 @@ pub(crate) fn parse_provider_reasoning_effort_override(
     ProviderReasoningEffort::parse(raw_effort).map(Some).map_err(Status::invalid_argument)
 }
 
+pub(crate) fn parse_provider_service_tier_override(
+    parameter_delta_json: Option<&str>,
+) -> Result<Option<ProviderServiceTier>, Status> {
+    let Some(raw) = parameter_delta_json.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<ParameterDeltaEnvelope>(raw).map_err(|error| {
+        Status::invalid_argument(format!("parameter_delta_json is not valid JSON: {error}"))
+    })?;
+    let Some(raw_tier) =
+        parsed.service_tier.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    ProviderServiceTier::parse(raw_tier).map(Some).map_err(Status::invalid_argument)
+}
+
 /// Renders a previewed project-context selection into the prompt, if any.
 ///
 /// Returns `Ok(None)` when the parameter delta carries no project-context
@@ -1402,6 +1422,7 @@ async fn prepare_model_provider_input_legacy(
         channel_for_log,
     } = request;
     let reasoning_effort = parse_provider_reasoning_effort_override(parameter_delta_json)?;
+    let service_tier = parse_provider_service_tier_override(parameter_delta_json)?;
     // When the client previewed @-references, its clean_prompt (with the
     // reference tokens stripped) is the canonical user text for memory
     // ingestion and recall queries; the referenced content is appended later
@@ -1565,6 +1586,7 @@ async fn prepare_model_provider_input_legacy(
             budget_profile: None,
             max_output_tokens: None,
             reasoning_effort,
+            service_tier,
         });
     }
     let provider_input_text = match build_context_reference_prompt(
@@ -1645,6 +1667,7 @@ async fn prepare_model_provider_input_legacy(
         budget_profile: None,
         max_output_tokens: None,
         reasoning_effort,
+        service_tier,
     })
 }
 
@@ -1952,10 +1975,11 @@ fn memory_auto_inject_tape_payload_with_workspace(
 mod tests {
     use super::{
         curated_memory_sources_for_prompt_context, parse_provider_reasoning_effort_override,
-        render_legacy_runtime_context_prompt, sanitize_prompt_inline_value,
+        parse_provider_service_tier_override, render_legacy_runtime_context_prompt,
+        sanitize_prompt_inline_value,
     };
     use crate::journal::MemorySource;
-    use crate::model_provider::ProviderReasoningEffort;
+    use crate::model_provider::{ProviderReasoningEffort, ProviderServiceTier};
     use chrono::TimeZone;
 
     #[test]
@@ -2006,6 +2030,25 @@ mod tests {
 
         assert!(
             err.message().contains("unsupported reasoning effort"),
+            "error should include the failing field contract: {err:?}"
+        );
+    }
+
+    #[test]
+    fn provider_service_tier_override_accepts_fast_alias() {
+        let parsed = parse_provider_service_tier_override(Some(r#"{"service_tier":"fast"}"#))
+            .expect("service tier override should parse");
+
+        assert_eq!(parsed, Some(ProviderServiceTier::Priority));
+    }
+
+    #[test]
+    fn provider_service_tier_override_rejects_invalid_values() {
+        let err = parse_provider_service_tier_override(Some(r#"{"service_tier":"warp"}"#))
+            .expect_err("unknown service tier should fail");
+
+        assert!(
+            err.message().contains("unsupported service tier"),
             "error should include the failing field contract: {err:?}"
         );
     }

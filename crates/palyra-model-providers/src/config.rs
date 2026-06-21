@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use palyra_common::secret_refs::SecretRef;
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{model_id_supports_reasoning_effort, ProviderReasoningEffort};
+use crate::contract::{
+    model_id_supports_reasoning_effort, ProviderReasoningEffort, ProviderServiceTier,
+};
 
 pub use crate::providers::{capability_defaults_for_kind, capability_defaults_for_provider};
 
@@ -36,6 +38,9 @@ pub struct ProviderCapabilitiesSnapshot {
     pub reasoning: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<String>,
+    pub service_tier: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u32>,
     pub cost_tier: String,
@@ -347,6 +352,7 @@ pub struct ModelProviderConfig {
     pub auth_profile_provider_kind: Option<ModelProviderAuthProviderKind>,
     pub credential_source: Option<ModelProviderCredentialSource>,
     pub reasoning_effort: Option<ProviderReasoningEffort>,
+    pub service_tier: Option<ProviderServiceTier>,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -376,6 +382,7 @@ impl Default for ModelProviderConfig {
             auth_profile_provider_kind: None,
             credential_source: None,
             reasoning_effort: None,
+            service_tier: None,
             request_timeout_ms: DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
             max_retries: 2,
             retry_backoff_ms: 150,

@@ -618,6 +618,9 @@ fn parse_agent_run_with_prompt() {
                 prompt: Some("hello".to_owned()),
                 prompt_stdin: false,
                 reasoning: None,
+                fast: false,
+                no_fast: false,
+                service_tier: None,
                 allow_sensitive_tools: true,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -813,6 +816,9 @@ fn parse_agent_run_with_approval_mode_allow_once() {
                 prompt: Some("inspect".to_owned()),
                 prompt_stdin: false,
                 reasoning: None,
+                fast: false,
+                no_fast: false,
+                service_tier: None,
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -840,6 +846,18 @@ fn parse_agent_run_with_reasoning_effort_alias() {
     };
 
     assert_eq!(reasoning.as_deref(), Some("high"));
+}
+
+#[test]
+fn parse_agent_run_with_fast_flag() {
+    let parsed = Cli::parse_from(["palyra", "agent", "run", "--prompt", "inspect", "--fast"]);
+    let Command::Agent { command: AgentCommand::Run { fast, service_tier, .. } } = parsed.command
+    else {
+        panic!("agent run command should parse");
+    };
+
+    assert!(fast);
+    assert!(service_tier.is_none());
 }
 
 #[test]
@@ -910,6 +928,9 @@ fn parse_agent_run_with_session_key_controls() {
                 prompt: Some("continue".to_owned()),
                 prompt_stdin: false,
                 reasoning: None,
+                fast: false,
+                no_fast: false,
+                service_tier: None,
                 allow_sensitive_tools: false,
                 interrupt_active_run: false,
                 approval_mode: AgentApprovalModeArg::AllowOnce,
@@ -6081,12 +6102,27 @@ fn parse_models_set_with_reasoning_effort_alias() {
                 model: "gpt-5.5".to_owned(),
                 path: Some("custom.toml".to_owned()),
                 reasoning: Some("low".to_owned()),
+                fast: false,
+                no_fast: false,
+                service_tier: None,
                 backups: 5,
                 allow_custom: false,
                 json: true,
             }
         }
     );
+}
+
+#[test]
+fn parse_models_set_with_service_tier() {
+    let parsed =
+        Cli::parse_from(["palyra", "models", "set", "gpt-5.5", "--service-tier", "priority"]);
+    let Command::Models { command: ModelsCommand::Set { service_tier, .. } } = parsed.command
+    else {
+        panic!("models set command should parse");
+    };
+
+    assert_eq!(service_tier.as_deref(), Some("priority"));
 }
 
 #[test]

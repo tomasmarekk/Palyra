@@ -10,6 +10,7 @@ use crate::config::{
 use crate::contract::{
     model_id_supports_reasoning_effort, ProviderImageInput, ProviderMessage,
     ProviderMessageContentPart, ProviderMessageRole, ProviderReasoningEffort, ProviderRequest,
+    ProviderServiceTier,
 };
 
 pub(crate) const PROVIDER_ID: &str = "openai-primary";
@@ -26,6 +27,8 @@ pub(crate) fn chat_capabilities() -> ProviderCapabilitiesSnapshot {
         embeddings: false,
         reasoning: false,
         reasoning_efforts: Vec::new(),
+        service_tier: true,
+        service_tiers: default_service_tiers(),
         max_context_tokens: Some(128_000),
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -50,6 +53,8 @@ pub(crate) fn embeddings_capabilities() -> ProviderCapabilitiesSnapshot {
         embeddings: true,
         reasoning: false,
         reasoning_efforts: Vec::new(),
+        service_tier: false,
+        service_tiers: Vec::new(),
         max_context_tokens: Some(8_192),
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),
@@ -70,6 +75,8 @@ pub(crate) fn audio_transcription_capabilities() -> ProviderCapabilitiesSnapshot
         embeddings: false,
         reasoning: false,
         reasoning_efforts: Vec::new(),
+        service_tier: false,
+        service_tiers: Vec::new(),
         max_context_tokens: None,
         cost_tier: ProviderCostTier::Standard.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Standard.as_str().to_owned(),
@@ -78,6 +85,19 @@ pub(crate) fn audio_transcription_capabilities() -> ProviderCapabilitiesSnapshot
         operator_override: false,
         metadata_source: ProviderMetadataSource::Static.as_str().to_owned(),
     }
+}
+
+fn default_service_tiers() -> Vec<String> {
+    [
+        ProviderServiceTier::Auto,
+        ProviderServiceTier::Default,
+        ProviderServiceTier::Priority,
+        ProviderServiceTier::Flex,
+    ]
+    .into_iter()
+    .map(ProviderServiceTier::as_str)
+    .map(str::to_owned)
+    .collect()
 }
 
 /// Builds the OpenAI-compatible chat-completions request body.
@@ -108,6 +128,9 @@ pub fn chat_completions_payload(
     }
     if let Some(reasoning_effort) = openai_reasoning_effort_for_model(request, model_name) {
         body["reasoning_effort"] = json!(reasoning_effort.as_str());
+    }
+    if let Some(service_tier) = request.service_tier {
+        body["service_tier"] = json!(service_tier.as_str());
     }
     body
 }
@@ -153,6 +176,9 @@ pub fn responses_payload(
             "effort": reasoning_effort.as_str(),
             "summary": "auto",
         });
+    }
+    if let Some(service_tier) = request.service_tier {
+        body["service_tier"] = json!(service_tier.as_str());
     }
     ResponsesPayload { body, tool_wire_names }
 }
@@ -464,6 +490,13 @@ mod tests {
         request
     }
 
+    fn service_tier_request(tier: ProviderServiceTier) -> ProviderRequest {
+        let mut request =
+            ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        request.service_tier = Some(tier);
+        request
+    }
+
     #[test]
     fn chat_completions_payload_adds_reasoning_effort_for_reasoning_model() {
         let payload = chat_completions_payload(
@@ -496,5 +529,16 @@ mod tests {
 
         assert!(chat_payload.get("reasoning_effort").is_none());
         assert!(responses_payload.body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn openai_payloads_add_service_tier() {
+        let request = service_tier_request(ProviderServiceTier::Priority);
+
+        let chat_payload = chat_completions_payload(&request, "gpt-5.5", Vec::new());
+        let responses_payload = responses_payload(&request, "gpt-5.5", Vec::new());
+
+        assert_eq!(chat_payload["service_tier"], "priority");
+        assert_eq!(responses_payload.body["service_tier"], "priority");
     }
 }

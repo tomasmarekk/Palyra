@@ -1930,6 +1930,8 @@ mod tests {
             embeddings: false,
             reasoning: false,
             reasoning_efforts: Vec::new(),
+            service_tier: false,
+            service_tiers: Vec::new(),
             max_context_tokens: Some(128_000),
             cost_tier: cost_tier.to_owned(),
             latency_tier: latency_tier.to_owned(),

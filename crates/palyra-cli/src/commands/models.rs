@@ -51,6 +51,7 @@ pub(crate) struct ModelsStatusPayload {
     pub(crate) embeddings_model: Option<String>,
     pub(crate) embeddings_dims: Option<u32>,
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
     pub(crate) auth_profile_id: Option<String>,
     pub(crate) api_key_configured: bool,
     pub(crate) default_chat_model_id: Option<String>,
@@ -105,6 +106,8 @@ pub(crate) struct RegistryModelEntry {
     pub(crate) embeddings: bool,
     pub(crate) reasoning: bool,
     pub(crate) reasoning_efforts: Vec<String>,
+    pub(crate) service_tier: bool,
+    pub(crate) service_tiers: Vec<String>,
     pub(crate) max_context_tokens: Option<u32>,
     pub(crate) cost_tier: String,
     pub(crate) latency_tier: String,
@@ -131,6 +134,7 @@ pub(crate) struct ModelsMutationPayload {
     pub(crate) model: String,
     pub(crate) embeddings_dims: Option<u32>,
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
     pub(crate) backups: usize,
 }
 
@@ -227,6 +231,8 @@ pub(crate) struct ModelsExplainCandidatePayload {
     pub(crate) vision: bool,
     pub(crate) reasoning: bool,
     pub(crate) reasoning_efforts: Vec<String>,
+    pub(crate) service_tier: bool,
+    pub(crate) service_tiers: Vec<String>,
 }
 
 /// Aggregate payload for `models explain`: resolved routing plus its rationale.
@@ -238,6 +244,7 @@ pub(crate) struct ModelsExplainPayload {
     pub(crate) json_mode: bool,
     pub(crate) vision: bool,
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
     pub(crate) failover_enabled: bool,
     pub(crate) response_cache_enabled: bool,
     pub(crate) explanation: Vec<String>,
@@ -314,7 +321,7 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
                 output::print_json_pretty(&payload, "failed to encode models list as JSON")?;
             } else {
                 println!(
-                    "models.list provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} text_model={} embeddings_model={} auth_profile_id={} registry_providers={} registry_models={} registry_valid={}",
+                    "models.list provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} text_model={} embeddings_model={} reasoning_effort={} service_tier={} auth_profile_id={} registry_providers={} registry_models={} registry_valid={}",
                     payload.status.provider_id,
                     payload.status.provider_display_name,
                     payload.status.provider_kind,
@@ -322,6 +329,8 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
                     payload.status.auth_provider_kind.as_deref().unwrap_or("none"),
                     payload.status.text_model.as_deref().unwrap_or("none"),
                     payload.status.embeddings_model.as_deref().unwrap_or("none"),
+                    payload.status.reasoning_effort.as_deref().unwrap_or("none"),
+                    payload.status.service_tier.as_deref().unwrap_or("none"),
                     payload.status.auth_profile_id.as_deref().unwrap_or("none"),
                     payload.providers.len(),
                     payload.registry_models.len(),
@@ -343,7 +352,7 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
                 }
                 for entry in payload.registry_models {
                     println!(
-                        "models.registry_model id={} provider_id={} role={} enabled={} json_mode={} vision={} embeddings={} reasoning={} reasoning_efforts={} source={}",
+                        "models.registry_model id={} provider_id={} role={} enabled={} json_mode={} vision={} embeddings={} reasoning={} reasoning_efforts={} service_tier={} service_tiers={} source={}",
                         entry.model_id,
                         entry.provider_id,
                         entry.role,
@@ -353,6 +362,8 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
                         entry.embeddings,
                         entry.reasoning,
                         entry.reasoning_efforts.join(","),
+                        entry.service_tier,
+                        entry.service_tiers.join(","),
                         entry.source
                     );
                 }
@@ -377,9 +388,29 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
             let payload = explain_models_routing(path, model, json_mode, vision)?;
             emit_models_explain(&payload, output::preferred_json(json))
         }
-        ModelsCommand::Set { model, path, reasoning, backups, allow_custom, json } => {
-            let payload =
-                mutate_model_defaults(path, backups, "text", model, None, reasoning, allow_custom)?;
+        ModelsCommand::Set {
+            model,
+            path,
+            reasoning,
+            fast,
+            no_fast,
+            service_tier,
+            backups,
+            allow_custom,
+            json,
+        } => {
+            let payload = mutate_model_defaults(
+                path,
+                backups,
+                "text",
+                model,
+                None,
+                reasoning,
+                fast,
+                no_fast,
+                service_tier,
+                allow_custom,
+            )?;
             emit_models_mutation(&payload, output::preferred_json(json))
         }
         ModelsCommand::SetEmbeddings { model, dims, path, backups, allow_custom, json } => {
@@ -389,6 +420,9 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
                 "embeddings",
                 model,
                 dims,
+                None,
+                false,
+                false,
                 None,
                 allow_custom,
             )?;
@@ -402,7 +436,7 @@ fn emit_models_status(payload: &ModelsStatusPayload, json_output: bool) -> Resul
         output::print_json_pretty(payload, "failed to encode models status as JSON")?;
     } else {
         println!(
-            "models.status path={} provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} text_model={} embeddings_model={} reasoning_effort={} auth_profile_id={} api_key_configured={} migrated={}",
+            "models.status path={} provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} text_model={} embeddings_model={} reasoning_effort={} service_tier={} auth_profile_id={} api_key_configured={} migrated={}",
             payload.path,
             payload.provider_id,
             payload.provider_display_name,
@@ -412,6 +446,7 @@ fn emit_models_status(payload: &ModelsStatusPayload, json_output: bool) -> Resul
             payload.text_model.as_deref().unwrap_or("none"),
             payload.embeddings_model.as_deref().unwrap_or("none"),
             payload.reasoning_effort.as_deref().unwrap_or("none"),
+            payload.service_tier.as_deref().unwrap_or("none"),
             payload.auth_profile_id.as_deref().unwrap_or("none"),
             payload.api_key_configured,
             payload.migrated
@@ -444,7 +479,7 @@ fn emit_models_mutation(payload: &ModelsMutationPayload, json_output: bool) -> R
         output::print_json_pretty(payload, "failed to encode models mutation as JSON")?;
     } else {
         println!(
-            "models.set path={} provider_kind={} target={} model={} embeddings_dims={} reasoning_effort={} backups={}",
+            "models.set path={} provider_kind={} target={} model={} embeddings_dims={} reasoning_effort={} service_tier={} backups={}",
             payload.path,
             payload.provider_kind,
             payload.target,
@@ -454,6 +489,7 @@ fn emit_models_mutation(payload: &ModelsMutationPayload, json_output: bool) -> R
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_owned()),
             payload.reasoning_effort.as_deref().unwrap_or("none"),
+            payload.service_tier.as_deref().unwrap_or("none"),
             payload.backups
         );
     }
@@ -521,13 +557,14 @@ fn emit_models_explain(payload: &ModelsExplainPayload, json_output: bool) -> Res
         output::print_json_pretty(payload, "failed to encode models explain payload as JSON")?;
     } else {
         println!(
-            "models.explain path={} requested_model={} resolved_model={} json_mode={} vision={} reasoning_effort={} failover_enabled={} response_cache_enabled={} candidates={}",
+            "models.explain path={} requested_model={} resolved_model={} json_mode={} vision={} reasoning_effort={} service_tier={} failover_enabled={} response_cache_enabled={} candidates={}",
             payload.path,
             payload.requested_model_id.as_deref().unwrap_or("default"),
             payload.resolved_model_id.as_deref().unwrap_or("none"),
             payload.json_mode,
             payload.vision,
             payload.reasoning_effort.as_deref().unwrap_or("none"),
+            payload.service_tier.as_deref().unwrap_or("none"),
             payload.failover_enabled,
             payload.response_cache_enabled,
             payload.candidates.len()
@@ -537,7 +574,7 @@ fn emit_models_explain(payload: &ModelsExplainPayload, json_output: bool) -> Res
         }
         for candidate in &payload.candidates {
             println!(
-                "models.explain.candidate order={} provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} model_id={} selected={} reasoning={} reasoning_efforts={} reason={}",
+                "models.explain.candidate order={} provider_id={} provider_display_name={} provider_kind={} protocol_compatibility={} auth_provider_kind={} model_id={} selected={} reasoning={} reasoning_efforts={} service_tier={} service_tiers={} reason={}",
                 candidate.order,
                 candidate.provider_id,
                 candidate.provider_display_name,
@@ -548,6 +585,8 @@ fn emit_models_explain(payload: &ModelsExplainPayload, json_output: bool) -> Res
                 candidate.selected,
                 candidate.reasoning,
                 candidate.reasoning_efforts.join(","),
+                candidate.service_tier,
+                candidate.service_tiers.join(","),
                 candidate.reason
             );
         }
@@ -616,6 +655,9 @@ pub(crate) fn mutate_model_defaults(
     model: String,
     dims: Option<u32>,
     reasoning: Option<String>,
+    fast: bool,
+    no_fast: bool,
+    service_tier: Option<String>,
     _allow_custom: bool,
 ) -> Result<ModelsMutationPayload> {
     let path = resolve_config_path(path, false)?;
@@ -651,6 +693,8 @@ pub(crate) fn mutate_model_defaults(
     match target {
         "text" => {
             let reasoning_effort = normalize_reasoning_effort_for_models_set(reasoning.as_deref())?;
+            let service_tier =
+                normalize_service_tier_for_models_set(fast, no_fast, service_tier.as_deref())?;
             let legacy_provider_kind = if !has_registry {
                 Some(legacy_provider_kind_for_mutation(&document)?)
             } else {
@@ -673,6 +717,14 @@ pub(crate) fn mutate_model_defaults(
                     toml::Value::String(reasoning_effort.to_owned()),
                 )
                 .context("invalid config key path: model_provider.reasoning_effort")?;
+            }
+            if let Some(service_tier) = service_tier.as_deref() {
+                set_value_at_path(
+                    &mut document,
+                    "model_provider.service_tier",
+                    toml::Value::String(service_tier.to_owned()),
+                )
+                .context("invalid config key path: model_provider.service_tier")?;
             }
         }
         "embeddings" => {
@@ -709,6 +761,7 @@ pub(crate) fn mutate_model_defaults(
         model,
         embeddings_dims: dims,
         reasoning_effort: get_string_value_at_path(&document, "model_provider.reasoning_effort")?,
+        service_tier: get_string_value_at_path(&document, "model_provider.service_tier")?,
         backups,
     })
 }
@@ -731,6 +784,35 @@ fn normalize_reasoning_effort_for_models_set(raw: Option<&str>) -> Result<Option
         }
     };
     Ok(Some(normalized.to_owned()))
+}
+
+fn normalize_service_tier_for_models_set(
+    fast: bool,
+    no_fast: bool,
+    raw: Option<&str>,
+) -> Result<Option<String>> {
+    match (fast, no_fast, raw.map(str::trim).filter(|value| !value.is_empty())) {
+        (true, false, None) => Ok(Some("priority".to_owned())),
+        (false, true, None) => Ok(Some("default".to_owned())),
+        (false, false, Some(raw)) => normalize_service_tier_value(raw).map(Some),
+        (false, false, None) => Ok(None),
+        _ => anyhow::bail!("select at most one of --fast, --no-fast, or --service-tier"),
+    }
+}
+
+fn normalize_service_tier_value(raw: &str) -> Result<String> {
+    let normalized = match raw.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        "auto" => "auto",
+        "default" | "standard" | "normal" | "off" | "false" | "nofast" => "default",
+        "priority" | "fast" | "on" | "true" => "priority",
+        "flex" | "lowcost" | "cheap" => "flex",
+        _ => {
+            anyhow::bail!(
+                "unsupported service tier '{raw}'; expected one of auto, default, priority, flex"
+            )
+        }
+    };
+    Ok(normalized.to_owned())
 }
 
 fn validate_model_id_for_mutation(target: &'static str, model: &str) -> Result<String> {
@@ -1041,6 +1123,7 @@ fn explain_models_routing(
             json_mode,
             vision,
             reasoning_effort: overview.status.reasoning_effort.clone(),
+            service_tier: overview.status.service_tier.clone(),
             failover_enabled: overview.status.failover_enabled,
             response_cache_enabled: overview.status.response_cache_enabled,
             explanation,
@@ -1134,6 +1217,8 @@ fn explain_models_routing(
         vision: primary.vision,
         reasoning: primary.reasoning,
         reasoning_efforts: primary.reasoning_efforts.clone(),
+        service_tier: primary.service_tier,
+        service_tiers: primary.service_tiers.clone(),
     }];
     if overview.status.failover_enabled && requested_model_id.is_none() {
         candidates.extend(
@@ -1171,6 +1256,8 @@ fn explain_models_routing(
                     vision: candidate.vision,
                     reasoning: candidate.reasoning,
                     reasoning_efforts: candidate.reasoning_efforts.clone(),
+                    service_tier: candidate.service_tier,
+                    service_tiers: candidate.service_tiers.clone(),
                 }),
         );
     }
@@ -1182,6 +1269,7 @@ fn explain_models_routing(
         json_mode,
         vision,
         reasoning_effort: overview.status.reasoning_effort,
+        service_tier: overview.status.service_tier,
         failover_enabled: overview.status.failover_enabled,
         response_cache_enabled: overview.status.response_cache_enabled,
         explanation,
@@ -1298,6 +1386,7 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
             embeddings_model,
             embeddings_dims,
             reasoning_effort: model_provider.reasoning_effort,
+            service_tier: model_provider.service_tier,
             auth_profile_id,
             api_key_configured,
             default_chat_model_id,
@@ -1637,45 +1726,61 @@ fn registry_views_from_config(
         .map(|entries| {
             entries
                 .iter()
-                .map(|entry| RegistryModelEntry {
-                    model_id: entry.model_id.clone().unwrap_or_default(),
-                    provider_id: entry.provider_id.clone().unwrap_or_default(),
-                    role: entry.role.clone().unwrap_or_else(|| "chat".to_owned()),
-                    enabled: entry.enabled.unwrap_or(true),
-                    metadata_source: entry
-                        .metadata_source
-                        .clone()
-                        .unwrap_or_else(|| "static".to_owned()),
-                    operator_override: entry.operator_override.unwrap_or(false),
-                    tool_calls: entry.tool_calls.unwrap_or(false),
-                    json_mode: entry.json_mode.unwrap_or(false),
-                    vision: entry.vision.unwrap_or(false),
-                    audio_transcribe: entry.audio_transcribe.unwrap_or(false),
-                    embeddings: entry.embeddings.unwrap_or(false),
-                    reasoning: entry.reasoning.unwrap_or_else(|| {
+                .map(|entry| {
+                    let provider_id = entry.provider_id.clone().unwrap_or_default();
+                    let provider =
+                        providers.iter().find(|provider| provider.provider_id == provider_id);
+                    let reasoning = entry.reasoning.unwrap_or_else(|| {
                         entry.model_id.as_deref().is_some_and(model_id_supports_reasoning_effort)
-                    }),
-                    reasoning_efforts: entry.reasoning_efforts.clone().unwrap_or_else(|| {
-                        if entry.reasoning.unwrap_or_else(|| {
-                            entry
-                                .model_id
-                                .as_deref()
-                                .is_some_and(model_id_supports_reasoning_effort)
-                        }) {
-                            default_reasoning_efforts()
-                        } else {
-                            Vec::new()
-                        }
-                    }),
-                    max_context_tokens: entry.max_context_tokens,
-                    cost_tier: entry.cost_tier.clone().unwrap_or_else(|| "standard".to_owned()),
-                    latency_tier: entry
-                        .latency_tier
-                        .clone()
-                        .unwrap_or_else(|| "standard".to_owned()),
-                    recommended_use_cases: entry.recommended_use_cases.clone().unwrap_or_default(),
-                    known_limitations: entry.known_limitations.clone().unwrap_or_default(),
-                    source: "registry",
+                    });
+                    let service_tier = entry.service_tier.unwrap_or_else(|| {
+                        entry.service_tiers.as_ref().is_some_and(|values| !values.is_empty())
+                            || provider.is_some_and(provider_supports_openai_service_tier)
+                    });
+                    RegistryModelEntry {
+                        model_id: entry.model_id.clone().unwrap_or_default(),
+                        provider_id,
+                        role: entry.role.clone().unwrap_or_else(|| "chat".to_owned()),
+                        enabled: entry.enabled.unwrap_or(true),
+                        metadata_source: entry
+                            .metadata_source
+                            .clone()
+                            .unwrap_or_else(|| "static".to_owned()),
+                        operator_override: entry.operator_override.unwrap_or(false),
+                        tool_calls: entry.tool_calls.unwrap_or(false),
+                        json_mode: entry.json_mode.unwrap_or(false),
+                        vision: entry.vision.unwrap_or(false),
+                        audio_transcribe: entry.audio_transcribe.unwrap_or(false),
+                        embeddings: entry.embeddings.unwrap_or(false),
+                        reasoning,
+                        reasoning_efforts: entry.reasoning_efforts.clone().unwrap_or_else(|| {
+                            if reasoning {
+                                default_reasoning_efforts()
+                            } else {
+                                Vec::new()
+                            }
+                        }),
+                        service_tier,
+                        service_tiers: entry.service_tiers.clone().unwrap_or_else(|| {
+                            if service_tier {
+                                default_service_tiers()
+                            } else {
+                                Vec::new()
+                            }
+                        }),
+                        max_context_tokens: entry.max_context_tokens,
+                        cost_tier: entry.cost_tier.clone().unwrap_or_else(|| "standard".to_owned()),
+                        latency_tier: entry
+                            .latency_tier
+                            .clone()
+                            .unwrap_or_else(|| "standard".to_owned()),
+                        recommended_use_cases: entry
+                            .recommended_use_cases
+                            .clone()
+                            .unwrap_or_default(),
+                        known_limitations: entry.known_limitations.clone().unwrap_or_default(),
+                        source: "registry",
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -1782,6 +1887,42 @@ fn default_reasoning_efforts() -> Vec<String> {
         .collect()
 }
 
+fn default_service_tiers() -> Vec<String> {
+    ["auto", "default", "priority", "flex"].into_iter().map(ToOwned::to_owned).collect()
+}
+
+fn provider_supports_openai_service_tier(provider: &RegistryProviderEntry) -> bool {
+    provider.kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && auth_provider_kind_allows_openai_service_tier(provider.auth_provider_kind.as_deref())
+        && base_url_supports_openai_service_tier(provider.base_url.as_deref())
+}
+
+fn legacy_config_supports_openai_service_tier(
+    provider_kind: &str,
+    config: &FileModelProviderConfig,
+) -> bool {
+    provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && auth_provider_kind_allows_openai_service_tier(config.auth_provider_kind.as_deref())
+        && base_url_supports_openai_service_tier(
+            default_base_url_for_kind(provider_kind, config).as_deref(),
+        )
+}
+
+fn auth_provider_kind_allows_openai_service_tier(auth_provider_kind: Option<&str>) -> bool {
+    auth_provider_kind.is_none_or(|kind| {
+        kind.eq_ignore_ascii_case("openai")
+            || kind.eq_ignore_ascii_case("openai_compatible")
+            || kind.eq_ignore_ascii_case("openai-compatible")
+    })
+}
+
+fn base_url_supports_openai_service_tier(base_url: Option<&str>) -> bool {
+    base_url
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+}
+
 fn synthetic_default_registry_model(
     model_id: &str,
     provider: &RegistryProviderEntry,
@@ -1796,6 +1937,7 @@ fn synthetic_default_registry_model(
             .as_deref()
             .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND));
     let reasoning = is_chat && model_id_supports_reasoning_effort(model_id);
+    let service_tier = is_chat && provider_supports_openai_service_tier(provider);
     RegistryModelEntry {
         model_id: model_id.to_owned(),
         provider_id: provider.provider_id.clone(),
@@ -1810,6 +1952,8 @@ fn synthetic_default_registry_model(
         embeddings: is_embeddings,
         reasoning,
         reasoning_efforts: if reasoning { default_reasoning_efforts() } else { Vec::new() },
+        service_tier,
+        service_tiers: if service_tier { default_service_tiers() } else { Vec::new() },
         max_context_tokens: if provider.kind == DETERMINISTIC_PROVIDER_KIND {
             None
         } else if is_embeddings {
@@ -1867,6 +2011,7 @@ fn legacy_model_entries(config: &FileModelProviderConfig) -> Vec<RegistryModelEn
             "chat",
             kind.as_str(),
             config.auth_provider_kind.as_deref(),
+            legacy_config_supports_openai_service_tier(kind.as_str(), config),
         ));
     }
     if let Some(model_id) = config.openai_embeddings_model.clone() {
@@ -1876,6 +2021,7 @@ fn legacy_model_entries(config: &FileModelProviderConfig) -> Vec<RegistryModelEn
             "embeddings",
             OPENAI_COMPATIBLE_PROVIDER_KIND,
             None,
+            false,
         ));
     }
     models
@@ -1920,6 +2066,7 @@ fn legacy_registry_model(
     role: &str,
     provider_kind: &str,
     auth_provider_kind: Option<&str>,
+    supports_service_tier: bool,
 ) -> RegistryModelEntry {
     let is_chat = role == "chat";
     let is_minimax_chat = is_chat
@@ -1927,6 +2074,7 @@ fn legacy_registry_model(
         && auth_provider_kind
             .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND));
     let reasoning = is_chat && model_id_supports_reasoning_effort(model_id.as_str());
+    let service_tier = is_chat && supports_service_tier;
     RegistryModelEntry {
         model_id,
         provider_id,
@@ -1941,6 +2089,8 @@ fn legacy_registry_model(
         embeddings: role == "embeddings",
         reasoning,
         reasoning_efforts: if reasoning { default_reasoning_efforts() } else { Vec::new() },
+        service_tier,
+        service_tiers: if service_tier { default_service_tiers() } else { Vec::new() },
         max_context_tokens: if provider_kind == DETERMINISTIC_PROVIDER_KIND {
             None
         } else {

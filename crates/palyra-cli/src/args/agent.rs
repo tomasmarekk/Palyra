@@ -57,6 +57,27 @@ pub enum AgentCommand {
         #[arg(
             long,
             default_value_t = false,
+            conflicts_with_all = ["no_fast", "service_tier"],
+            help = "Request fast provider processing for this run when supported"
+        )]
+        fast: bool,
+        #[arg(
+            long = "no-fast",
+            default_value_t = false,
+            conflicts_with_all = ["fast", "service_tier"],
+            help = "Use the provider default processing tier for this run"
+        )]
+        no_fast: bool,
+        #[arg(
+            long,
+            value_name = "TIER",
+            conflicts_with_all = ["fast", "no_fast"],
+            help = "Override provider service tier for this run: auto, default, priority, or flex"
+        )]
+        service_tier: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
             help = "Permit tools classified as sensitive for this run"
         )]
         allow_sensitive_tools: bool,

@@ -1689,6 +1689,7 @@ pub(crate) async fn process_run_stream_message(
     base_provider_request.budget_profile = prepared_provider_input.budget_profile.clone();
     base_provider_request.max_output_tokens = prepared_provider_input.max_output_tokens;
     base_provider_request.reasoning_effort = prepared_provider_input.reasoning_effort;
+    base_provider_request.service_tier = prepared_provider_input.service_tier;
     if !prepared_provider_input.provider_messages.is_empty() {
         let mut messages = prepared_provider_input.provider_messages.clone();
         messages.push(ProviderMessage::user_text(base_provider_request.input_text.clone()));
@@ -1956,6 +1957,7 @@ pub(crate) async fn process_run_stream_message(
         provider_request.budget_profile = base_provider_request.budget_profile.clone();
         provider_request.max_output_tokens = base_provider_request.max_output_tokens;
         provider_request.reasoning_effort = base_provider_request.reasoning_effort;
+        provider_request.service_tier = base_provider_request.service_tier;
         if let Some(budget_tokens) = background_budget_tokens {
             let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
             match apply_background_budget_guard(

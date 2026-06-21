@@ -33,7 +33,7 @@ pub use contract::{
     ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
     ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
     ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderTurnOutput, ProviderUsage,
+    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
     DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE, MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 pub use error_envelope::{

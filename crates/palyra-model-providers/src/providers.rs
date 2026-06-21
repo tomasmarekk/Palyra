@@ -130,12 +130,30 @@ pub fn capability_defaults_for_provider(
 ) -> ProviderCapabilitiesSnapshot {
     match (kind, role, auth_provider_kind) {
         (
+            ModelProviderKind::OpenAiCompatible,
+            ProviderModelRole::Chat,
+            Some(
+                ModelProviderAuthProviderKind::Xai
+                | ModelProviderAuthProviderKind::GoogleGemini
+                | ModelProviderAuthProviderKind::GoogleGeminiCli
+                | ModelProviderAuthProviderKind::Openrouter,
+            ),
+        ) => service_tier_disabled(capability_defaults_for_kind(kind, role)),
+        (
             ModelProviderKind::Anthropic,
             ProviderModelRole::Chat,
             Some(ModelProviderAuthProviderKind::Minimax),
         ) => minimax::chat_capabilities(),
         _ => capability_defaults_for_kind(kind, role),
     }
+}
+
+fn service_tier_disabled(
+    mut capabilities: ProviderCapabilitiesSnapshot,
+) -> ProviderCapabilitiesSnapshot {
+    capabilities.service_tier = false;
+    capabilities.service_tiers.clear();
+    capabilities
 }
 
 fn deterministic_chat_capabilities() -> ProviderCapabilitiesSnapshot {
@@ -148,6 +166,8 @@ fn deterministic_chat_capabilities() -> ProviderCapabilitiesSnapshot {
         embeddings: false,
         reasoning: false,
         reasoning_efforts: Vec::new(),
+        service_tier: false,
+        service_tiers: Vec::new(),
         max_context_tokens: Some(8_192),
         cost_tier: ProviderCostTier::Low.as_str().to_owned(),
         latency_tier: ProviderLatencyTier::Low.as_str().to_owned(),

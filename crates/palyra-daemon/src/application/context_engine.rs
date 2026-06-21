@@ -41,8 +41,9 @@ use crate::{
             build_memory_augmented_prompt, build_previous_run_context_prompt,
             build_previous_run_provider_messages, build_project_context_prompt,
             build_provider_image_inputs, parse_provider_reasoning_effort_override,
-            record_provider_pruning_decision, resolve_latest_session_compaction_artifact,
-            MemoryPromptFailureMode, PrepareModelProviderInputRequest, PreparedModelProviderInput,
+            parse_provider_service_tier_override, record_provider_pruning_decision,
+            resolve_latest_session_compaction_artifact, MemoryPromptFailureMode,
+            PrepareModelProviderInputRequest, PreparedModelProviderInput,
         },
         session_pruning::{
             classify_pruning_task, context_engine_pruning_outcome, detect_pruning_risk,
@@ -787,6 +788,7 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         budget_profile: Some(assembled.explain.budget.profile_id),
         max_output_tokens: Some(assembled.explain.budget.reserved_completion_tokens),
         reasoning_effort: parse_provider_reasoning_effort_override(parameter_delta_json)?,
+        service_tier: parse_provider_service_tier_override(parameter_delta_json)?,
     })
 }
 
@@ -2117,6 +2119,8 @@ mod tests {
             embeddings: false,
             reasoning: false,
             reasoning_efforts: Vec::new(),
+            service_tier: false,
+            service_tiers: Vec::new(),
             max_context_tokens: Some(max_context_tokens),
             cost_tier: "standard".to_owned(),
             latency_tier: "standard".to_owned(),

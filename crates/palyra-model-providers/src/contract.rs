@@ -162,6 +162,49 @@ impl ProviderReasoningEffort {
     }
 }
 
+/// Provider-neutral processing tier requested for a model turn.
+///
+/// Providers map this normalized value to their own wire shape, and must omit
+/// it when the selected provider/model does not support service-tier control.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderServiceTier {
+    Auto,
+    Default,
+    Priority,
+    Flex,
+}
+
+impl ProviderServiceTier {
+    /// Parses CLI/config spelling into the canonical service-tier enum.
+    ///
+    /// # Errors
+    /// Returns an error when `value` is empty or not one of the supported
+    /// normalized service tiers.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "auto" => Ok(Self::Auto),
+            "default" | "standard" | "normal" | "off" | "false" | "nofast" => Ok(Self::Default),
+            "priority" | "fast" | "on" | "true" => Ok(Self::Priority),
+            "flex" | "lowcost" | "cheap" => Ok(Self::Flex),
+            _ => Err(format!(
+                "unsupported service tier '{value}'; expected one of auto, default, priority, flex"
+            )),
+        }
+    }
+
+    /// Returns the canonical config/JSON spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Priority => "priority",
+            Self::Flex => "flex",
+        }
+    }
+}
+
 /// Returns true when a provider model id belongs to a known reasoning-capable
 /// model family that accepts a normalized reasoning effort.
 #[must_use]
@@ -275,6 +318,8 @@ pub struct ProviderRequest {
     pub max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ProviderReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ProviderServiceTier>,
 }
 
 impl ProviderRequest {
@@ -300,6 +345,7 @@ impl ProviderRequest {
             budget_profile: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            service_tier: None,
         }
     }
 
