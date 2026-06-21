@@ -748,6 +748,8 @@ struct OpenAiActionPayload {
     state: String,
     message: String,
     profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_reload: Option<crate::commands::runtime_reload::RuntimeConfigReloadOutcome>,
 }
 
 #[derive(Debug, Serialize)]
@@ -771,6 +773,8 @@ struct OpenAiOAuthStatePayload {
     profile_id: Option<String>,
     completed_at_unix_ms: Option<i64>,
     expires_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_reload: Option<crate::commands::runtime_reload::RuntimeConfigReloadOutcome>,
 }
 
 #[derive(Debug)]
@@ -909,6 +913,9 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -971,6 +978,11 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                 .get_openai_oauth_callback_state(attempt_id.as_str())
                 .await
                 .context("failed to fetch OpenAI OAuth callback state")?;
+            let runtime_reload = if response.state == "succeeded" && response.profile_id.is_some() {
+                Some(crate::commands::runtime_reload::try_apply_active_config_reload(None).await)
+            } else {
+                None
+            };
             emit_openai_oauth_state(
                 OpenAiOAuthStatePayload {
                     attempt_id: response.attempt_id,
@@ -979,6 +991,7 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     profile_id: response.profile_id,
                     completed_at_unix_ms: response.completed_at_unix_ms,
                     expires_at_unix_ms: response.expires_at_unix_ms,
+                    runtime_reload,
                 },
                 output::preferred_json(json),
             )
@@ -1001,6 +1014,9 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1039,6 +1055,9 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1061,6 +1080,9 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1135,6 +1157,9 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1215,6 +1240,9 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1240,6 +1268,9 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1265,6 +1296,9 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1290,6 +1324,9 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1414,6 +1451,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1480,6 +1520,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1505,6 +1548,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1530,6 +1576,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1555,6 +1604,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     state: response.state,
                     message: response.message,
                     profile_id: response.profile_id,
+                    runtime_reload: Some(
+                        crate::commands::runtime_reload::try_apply_active_config_reload(None).await,
+                    ),
                 },
                 output::preferred_json(json),
             )
@@ -1754,6 +1806,15 @@ fn emit_provider_action(
             payload.profile_id.as_deref().unwrap_or("none"),
             payload.message.replace('"', "'")
         );
+        if let Some(runtime_reload) = payload.runtime_reload.as_ref() {
+            println!(
+                "{}",
+                crate::commands::runtime_reload::reload_text_line(
+                    format!("auth.{provider_key}").as_str(),
+                    runtime_reload,
+                )
+            );
+        }
     }
     std::io::stdout().flush().context("stdout flush failed")
 }
@@ -2715,6 +2776,15 @@ fn emit_openai_oauth_state(payload: OpenAiOAuthStatePayload, json_output: bool) 
                 .unwrap_or_else(|| "none".to_owned()),
             payload.message.replace('"', "'")
         );
+        if let Some(runtime_reload) = payload.runtime_reload.as_ref() {
+            println!(
+                "{}",
+                crate::commands::runtime_reload::reload_text_line(
+                    "auth.openai.oauth",
+                    runtime_reload,
+                )
+            );
+        }
     }
     std::io::stdout().flush().context("stdout flush failed")
 }

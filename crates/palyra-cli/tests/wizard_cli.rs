@@ -1456,18 +1456,26 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
         .and_then(Value::as_array)
         .context("configure summary should include follow-up checks")?;
     assert!(
-        follow_up_checks.iter().filter_map(Value::as_str).any(|value| {
-            value.contains("model-provider auth changes require runtime reload")
-                && value.contains("gateway install")
-                && value.contains("desktop-managed local runtimes")
-        }),
-        "configure auth-model should explain service-managed versus desktop restart paths: {payload}"
+        follow_up_checks
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|value| value == "palyra models status"),
+        "configure auth-model should keep model diagnostics as the follow-up check: {payload}"
     );
     assert!(
         follow_up_checks.iter().filter_map(Value::as_str).all(|value| {
-            !value.contains("restart daemon so model-provider auth changes take effect")
+            !value.contains("model-provider auth changes require runtime reload")
+                && !value.contains("restart daemon so model-provider auth changes take effect")
         }),
-        "configure auth-model should not emit stale generic restart guidance: {payload}"
+        "configure auth-model should not emit stale restart guidance: {payload}"
+    );
+    assert!(
+        payload.get("restart_required").and_then(Value::as_array).is_some_and(Vec::is_empty),
+        "configure auth-model should not require manual restart: {payload}"
+    );
+    assert!(
+        payload.get("runtime_reload").is_some(),
+        "configure auth-model should report best-effort runtime reload state: {payload}"
     );
 
     let written = fs::read_to_string(&config_path)

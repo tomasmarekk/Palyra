@@ -714,7 +714,8 @@ pub struct GatewayRuntimeState {
     pub(crate) counters: RuntimeCounters,
     pub(crate) journal_store: JournalStore,
     revoked_certificate_count: usize,
-    model_provider: Arc<dyn ModelProvider>,
+    model_provider: RwLock<Arc<dyn ModelProvider>>,
+    model_provider_generation: AtomicU64,
     auth_profile_registry: Option<Arc<AuthProfileRegistry>>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) memory_config: RwLock<MemoryRuntimeConfig>,
@@ -1754,7 +1755,8 @@ impl GatewayRuntimeState {
             },
             journal_store,
             revoked_certificate_count,
-            model_provider,
+            model_provider: RwLock::new(model_provider),
+            model_provider_generation: AtomicU64::new(1),
             auth_profile_registry,
             vault,
             memory_config: RwLock::new(MemoryRuntimeConfig::default()),
@@ -3647,7 +3649,7 @@ impl GatewayRuntimeState {
                 journal_hash_chain_enabled: self.journal_config.hash_chain_enabled,
                 latest_event_hash,
             },
-            model_provider: self.model_provider.status_snapshot(),
+            model_provider: self.current_model_provider().status_snapshot(),
             tool_call_policy: tool_policy_snapshot(&self.config.tool_call),
             counters: self.counters.snapshot(),
             agents: agents_runtime,
@@ -3717,10 +3719,29 @@ impl GatewayRuntimeState {
         self.config.orchestrator_runloop_v1_enabled
     }
 
+    fn current_model_provider(&self) -> Arc<dyn ModelProvider> {
+        Arc::clone(&self.model_provider.read().unwrap_or_else(|error| error.into_inner()))
+    }
+
+    /// Replaces the model provider used by new requests and returns the new generation.
+    #[must_use]
+    pub fn configure_model_provider(&self, model_provider: Arc<dyn ModelProvider>) -> u64 {
+        let mut guard = self.model_provider.write().unwrap_or_else(|error| error.into_inner());
+        *guard = model_provider;
+        self.model_provider_generation.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// Monotonic generation of the live model-provider runtime.
+    #[must_use]
+    #[cfg(test)]
+    pub fn model_provider_generation(&self) -> u64 {
+        self.model_provider_generation.load(Ordering::Relaxed)
+    }
+
     /// Current model provider/registry status.
     #[must_use]
     pub fn model_provider_status_snapshot(&self) -> ProviderStatusSnapshot {
-        self.model_provider.status_snapshot()
+        self.current_model_provider().status_snapshot()
     }
 
     /// Current provider lease manager state (active leases and waiters).
@@ -3782,7 +3803,8 @@ impl GatewayRuntimeState {
         request: ProviderRequest,
     ) -> Result<crate::model_provider::ProviderResponse, Status> {
         self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
-        match self.model_provider.complete(request).await {
+        let model_provider = self.current_model_provider();
+        match model_provider.complete(request).await {
             Ok(response) => {
                 if response.retry_count > 0 {
                     self.counters
@@ -3825,6 +3847,7 @@ impl GatewayRuntimeState {
         lease_context: ProviderLeaseExecutionContext,
     ) -> Result<crate::model_provider::ProviderResponse, Status> {
         let model_override_requested = request.model_override.is_some();
+        let model_provider = self.current_model_provider();
         let _lease = self
             .provider_leases
             .acquire(ProviderLeaseAcquireRequest {
@@ -3846,9 +3869,9 @@ impl GatewayRuntimeState {
                 }
             })?;
         self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
-        match self.model_provider.complete(request).await {
+        match model_provider.complete(request).await {
             Ok(response) => {
-                let provider_status = self.model_provider.status_snapshot();
+                let provider_status = model_provider.status_snapshot();
                 if let Some(attribution) = provider_credential_attribution_for_provider(
                     &provider_status,
                     &lease_context,
@@ -3887,7 +3910,7 @@ impl GatewayRuntimeState {
                 // different provider, the final error cannot be attributed to
                 // the leased credential, so failure feedback is suppressed to
                 // avoid cooling down (or flagging) a healthy credential.
-                let provider_status = self.model_provider.status_snapshot();
+                let provider_status = model_provider.status_snapshot();
                 if !request_may_failover_to_other_provider(
                     &provider_status,
                     model_override_requested,
@@ -3985,7 +4008,8 @@ impl GatewayRuntimeState {
         request: AudioTranscriptionRequest,
     ) -> Result<AudioTranscriptionResponse, Status> {
         self.counters.model_provider_requests.fetch_add(1, Ordering::Relaxed);
-        match self.model_provider.transcribe_audio(request).await {
+        let model_provider = self.current_model_provider();
+        match model_provider.transcribe_audio(request).await {
             Ok(response) => {
                 if response.retry_count > 0 {
                     self.counters
@@ -4644,7 +4668,7 @@ impl GatewayRuntimeState {
     }
 
     fn default_agent_model_profile(&self) -> Option<String> {
-        let snapshot = self.model_provider.status_snapshot();
+        let snapshot = self.current_model_provider().status_snapshot();
         select_default_agent_model_profile(
             snapshot.registry.default_chat_model_id.as_deref(),
             snapshot.model_id.as_deref(),

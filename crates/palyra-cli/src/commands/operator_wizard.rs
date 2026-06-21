@@ -292,6 +292,8 @@ struct ConfigureSummary {
     section_changes: Vec<ConfigureSectionChange>,
     follow_up_checks: Vec<String>,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_reload: Option<crate::commands::runtime_reload::RuntimeConfigReloadOutcome>,
 }
 
 /// Runs `palyra setup` by delegating to the onboarding wizard with an explicit init mode.
@@ -738,6 +740,17 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
         write_operator_document_with_backups(path_ref, &document)
             .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
     }
+    let runtime_reload = if document != original_document
+        && section_changes
+            .iter()
+            .any(|change| change.section == ConfigureSectionArg::AuthModel.slug() && change.changed)
+    {
+        Some(crate::commands::runtime_reload::try_apply_active_config_reload_blocking(Some(
+            config_path.clone(),
+        )))
+    } else {
+        None
+    };
     dedupe_strings(&mut changed_sections);
     dedupe_strings(&mut unchanged_sections);
     dedupe_strings(&mut restart_required);
@@ -752,6 +765,7 @@ pub(crate) fn run_configure_wizard(request: ConfigureWizardRequest) -> Result<()
         section_changes,
         follow_up_checks,
         warnings,
+        runtime_reload,
     };
     emit_configure_summary(&summary, output::preferred_json(request.json))
 }
@@ -2347,6 +2361,12 @@ fn emit_configure_summary(summary: &ConfigureSummary, json_output: bool) -> Resu
         }
         for warning in &summary.warnings {
             println!("configure.warning={warning}");
+        }
+        if let Some(runtime_reload) = summary.runtime_reload.as_ref() {
+            println!(
+                "{}",
+                crate::commands::runtime_reload::reload_text_line("configure", runtime_reload)
+            );
         }
     }
     std::io::stdout().flush().context("stdout flush failed")
@@ -4145,7 +4165,6 @@ fn section_requires_restart(section: ConfigureSectionArg, changed: bool) -> bool
             section,
             ConfigureSectionArg::DeploymentProfile
                 | ConfigureSectionArg::Workspace
-                | ConfigureSectionArg::AuthModel
                 | ConfigureSectionArg::Gateway
                 | ConfigureSectionArg::RuntimeControls
         )
@@ -4170,11 +4189,9 @@ fn section_follow_up_checks(
                 "workspace-root changes require runtime reload for existing daemon processes",
             )]
         }
-        ConfigureSectionArg::AuthModel => vec![
-            "palyra doctor".to_owned(),
-            "palyra models status".to_owned(),
-            gateway_restart_follow_up("model-provider auth changes require runtime reload"),
-        ],
+        ConfigureSectionArg::AuthModel => {
+            vec!["palyra doctor".to_owned(), "palyra models status".to_owned()]
+        }
         ConfigureSectionArg::Gateway => {
             let mut values = vec!["palyra gateway status".to_owned()];
             if get_string_value_at_path(document, "gateway_access.remote_base_url")?.is_some() {

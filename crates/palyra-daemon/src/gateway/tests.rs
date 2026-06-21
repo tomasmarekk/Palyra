@@ -691,6 +691,31 @@ fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayR
     build_test_runtime_state_with_http_fetch_private_targets(hash_chain_enabled, false)
 }
 
+#[test]
+fn configure_model_provider_replaces_live_status_snapshot() {
+    let state = build_test_runtime_state(false);
+    assert_eq!(state.model_provider_generation(), 1);
+    assert_eq!(state.model_provider_status_snapshot().kind, "deterministic");
+
+    let provider =
+        crate::model_provider::build_model_provider(&crate::model_provider::ModelProviderConfig {
+            kind: crate::model_provider::ModelProviderKind::OpenAiCompatible,
+            openai_model: "gpt-4o-mini".to_owned(),
+            openai_api_key: Some("sk-test".to_owned()),
+            ..crate::model_provider::ModelProviderConfig::default()
+        })
+        .expect("test OpenAI-compatible provider should build");
+
+    let generation = state.configure_model_provider(provider);
+
+    assert_eq!(generation, 2);
+    assert_eq!(state.model_provider_generation(), 2);
+    let snapshot = state.model_provider_status_snapshot();
+    assert_eq!(snapshot.kind, "openai_compatible");
+    assert_eq!(snapshot.model_id.as_deref(), Some("gpt-4o-mini"));
+    assert!(snapshot.api_key_configured);
+}
+
 fn unique_temp_test_root(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "{prefix}-{}-{}",

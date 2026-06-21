@@ -2024,7 +2024,7 @@ struct IdentityRuntime {
 /// Journal payload describing one secret resolution; identifies the secret by
 /// config path and fingerprint only, never by value.
 #[derive(Debug, Clone)]
-struct SecretAccessAuditRecord {
+pub(crate) struct SecretAccessAuditRecord {
     action: String,
     config_path: String,
     secret_id: String,
@@ -3343,7 +3343,7 @@ fn validate_process_runner_backend_policy(
 /// Credential precedence per provider: inline config key, then auth profile,
 /// then `*_secret_ref`, then legacy `*_vault_ref` (upgraded to a secret ref
 /// in place). `credential_source` is set to record which path won.
-fn resolve_model_provider_secret(
+pub(crate) fn resolve_model_provider_secret(
     model_provider: &mut ModelProviderConfig,
     auth_registry: &AuthProfileRegistry,
     vault: &Vault,

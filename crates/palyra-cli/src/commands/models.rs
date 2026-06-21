@@ -136,6 +136,7 @@ pub(crate) struct ModelsMutationPayload {
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) service_tier: Option<String>,
     pub(crate) backups: usize,
+    pub(crate) runtime_reload: crate::commands::runtime_reload::RuntimeConfigReloadOutcome,
 }
 
 struct ModelsDefaultMutationRequest {
@@ -505,6 +506,13 @@ fn emit_models_mutation(payload: &ModelsMutationPayload, json_output: bool) -> R
             payload.service_tier.as_deref().unwrap_or("none"),
             payload.backups
         );
+        println!(
+            "{}",
+            crate::commands::runtime_reload::reload_text_line(
+                "models.set",
+                &payload.runtime_reload
+            )
+        );
     }
     std::io::stdout().flush().context("stdout flush failed")
 }
@@ -772,6 +780,9 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
     })?;
     write_document_with_backups(path_ref, &document, backups)
         .with_context(|| format!("failed to persist config {}", path_ref.display()))?;
+    let runtime_reload = crate::commands::runtime_reload::try_apply_active_config_reload_blocking(
+        Some(path.clone()),
+    );
     Ok(ModelsMutationPayload {
         path,
         provider_kind: get_string_value_at_path(&document, "model_provider.kind")?
@@ -782,6 +793,7 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
         reasoning_effort: get_string_value_at_path(&document, "model_provider.reasoning_effort")?,
         service_tier: get_string_value_at_path(&document, "model_provider.service_tier")?,
         backups,
+        runtime_reload,
     })
 }
 

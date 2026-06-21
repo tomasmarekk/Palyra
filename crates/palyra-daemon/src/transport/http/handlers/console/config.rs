@@ -312,6 +312,7 @@ pub(crate) async fn apply_config_reload_for_context(
         plan.steps.iter().filter(|step| step.category != "hot_safe").cloned().collect::<Vec<_>>();
 
     let mut applied_steps = Vec::new();
+    let mut provider_runtime_generation = None;
 
     let (outcome, message) = if payload.dry_run {
         let message = if plan.steps.is_empty() {
@@ -330,8 +331,43 @@ pub(crate) async fn apply_config_reload_for_context(
         ("rejected".to_owned(), message)
     } else {
         let mut next_loaded = current.clone();
+        let mut next_model_provider = None;
+        if current.model_provider != candidate.model_provider {
+            next_loaded.model_provider = candidate.model_provider.clone();
+            let resolver = SecretResolver::with_working_dir(
+                Some(state.vault.as_ref()),
+                secret_resolution_working_dir(&next_loaded).map_err(|error| {
+                    runtime_status_response(tonic::Status::failed_precondition(format!(
+                        "failed to resolve reload working directory: {error}"
+                    )))
+                })?,
+            );
+            crate::resolve_model_provider_secret(
+                &mut next_loaded.model_provider,
+                state.auth_runtime.registry(),
+                state.vault.as_ref(),
+                &resolver,
+            )
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::failed_precondition(format!(
+                    "failed to hydrate model-provider credentials for reload: {error}"
+                )))
+            })?;
+            let model_provider = crate::model_provider::build_model_provider(
+                &next_loaded.model_provider,
+            )
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::failed_precondition(format!(
+                    "failed to build model provider for reload: {error}"
+                )))
+            })?;
+            next_model_provider = Some(model_provider);
+            if let Some(step) = plan.steps.iter().find(|step| step.config_path == "model_provider")
+            {
+                applied_steps.push(step.clone());
+            }
+        }
         if current.memory != candidate.memory {
-            state.runtime.configure_memory(memory_runtime_config_from_loaded(&candidate));
             next_loaded.memory = candidate.memory.clone();
             if let Some(step) = plan.steps.iter().find(|step| step.config_path == "memory") {
                 applied_steps.push(step.clone());
@@ -358,6 +394,13 @@ pub(crate) async fn apply_config_reload_for_context(
                         "failed to rebuild configured secret snapshot after reload: {error}"
                     )))
                 })?;
+        if let Some(model_provider) = next_model_provider {
+            provider_runtime_generation =
+                Some(state.runtime.configure_model_provider(model_provider));
+        }
+        if current.memory != candidate.memory {
+            state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
+        }
         {
             let mut loaded_guard =
                 state.loaded_config.lock().unwrap_or_else(|error| error.into_inner());
@@ -412,6 +455,7 @@ pub(crate) async fn apply_config_reload_for_context(
                 "plan_id": plan.plan_id,
                 "outcome": envelope.outcome,
                 "message": envelope.message,
+                "provider_runtime_generation": provider_runtime_generation,
                 "actor": {
                     "principal": context.principal.as_str(),
                     "device_id": context.device_id.as_str(),
@@ -540,12 +584,11 @@ fn build_reload_plan(
         ));
     }
     if current.model_provider != candidate.model_provider {
-        let category =
-            if active_runs > 0 { "blocked_while_runs_active" } else { "restart_required" };
+        let category = if active_runs > 0 { "blocked_while_runs_active" } else { "hot_safe" };
         let reason = if active_runs > 0 {
             "provider credentials and routing changed while runs are active"
         } else {
-            "provider runtime must be rebuilt to pick up credential or routing changes"
+            "provider runtime can be rebuilt in place before accepting new runs"
         };
         steps.push(reload_plan_step(
             "model_provider",
@@ -556,7 +599,7 @@ fn build_reload_plan(
             "provider registry, auth profile, and private base URL validation",
             "secret_refs_redacted",
             category,
-            "changes model credentials, routing, registry, or provider network targets",
+            "new provider requests use refreshed credentials, routing, registry, and network targets",
             "model provider config changed; credential values and URLs are redacted",
         ));
     }
@@ -715,5 +758,91 @@ fn memory_runtime_config_from_loaded(loaded: &crate::config::LoadedConfig) -> Me
         retention_max_bytes: loaded.memory.retention.max_bytes,
         retention_ttl_days: loaded.memory.retention.ttl_days,
         retention_vacuum_schedule: loaded.memory.retention.vacuum_schedule.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LoadedConfig;
+    use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
+
+    fn loaded_with_model_provider(model_provider: ModelProviderConfig) -> LoadedConfig {
+        LoadedConfig {
+            source: "test-palyra.toml".to_owned(),
+            config_version: 1,
+            migrated_from_version: None,
+            deployment: Default::default(),
+            daemon: Default::default(),
+            gateway: Default::default(),
+            feature_rollouts: Default::default(),
+            session_queue_policy: Default::default(),
+            pruning_policy_matrix: Default::default(),
+            retrieval_dual_path: Default::default(),
+            auxiliary_executor: Default::default(),
+            flow_orchestration: Default::default(),
+            delivery_arbitration: Default::default(),
+            replay_capture: Default::default(),
+            networked_workers: Default::default(),
+            cron: Default::default(),
+            orchestrator: Default::default(),
+            memory: Default::default(),
+            media: Default::default(),
+            model_provider,
+            tool_call: Default::default(),
+            channel_router: Default::default(),
+            canvas_host: Default::default(),
+            admin: Default::default(),
+            identity: Default::default(),
+            storage: Default::default(),
+        }
+    }
+
+    fn openai_model_provider_config() -> ModelProviderConfig {
+        ModelProviderConfig {
+            kind: ModelProviderKind::OpenAiCompatible,
+            openai_model: "gpt-4o-mini".to_owned(),
+            openai_api_key: Some("sk-test".to_owned()),
+            ..ModelProviderConfig::default()
+        }
+    }
+
+    #[test]
+    fn model_provider_reload_is_hot_safe_when_no_runs_are_active() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let candidate = loaded_with_model_provider(openai_model_provider_config());
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 0);
+
+        assert!(!plan.requires_restart);
+        assert!(plan.hot_safe_applicable);
+        assert_eq!(plan.summary.hot_safe, 1);
+        assert_eq!(plan.summary.restart_required, 0);
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| step.config_path == "model_provider")
+            .expect("model-provider reload step should be present");
+        assert_eq!(step.category, "hot_safe");
+        assert_eq!(step.reloadability, "hot_safe");
+    }
+
+    #[test]
+    fn model_provider_reload_is_blocked_while_runs_are_active() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let candidate = loaded_with_model_provider(openai_model_provider_config());
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 1);
+
+        assert!(!plan.requires_restart);
+        assert!(!plan.hot_safe_applicable);
+        assert_eq!(plan.summary.hot_safe, 0);
+        assert_eq!(plan.summary.blocked_while_runs_active, 1);
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| step.config_path == "model_provider")
+            .expect("model-provider reload step should be present");
+        assert_eq!(step.category, "blocked_while_runs_active");
     }
 }
