@@ -360,6 +360,7 @@ pub(crate) async fn connect_xai_oauth_tokens(
     let refresh_token =
         normalize_required_openai_text(payload.refresh_token.as_str(), "refresh_token")?;
     let token_endpoint = normalize_xai_oauth_token_endpoint(payload.token_endpoint.as_str())?;
+    let scopes = normalize_provider_oauth_scopes(payload.scopes.as_slice());
     let discovery_base_url = xai_model_discovery_base_url();
     let discovered_model_id = discover_preferred_openai_compatible_model_id(
         discovery_base_url.as_str(),
@@ -407,7 +408,7 @@ pub(crate) async fn connect_xai_oauth_tokens(
             token_endpoint,
             client_id: Some(client_id),
             client_secret_vault_ref: None,
-            scopes: Vec::new(),
+            scopes,
             expires_at_unix_ms: payload.expires_at_unix_ms,
             refresh_state,
         },
@@ -2523,6 +2524,10 @@ fn normalize_minimax_scopes(scopes: &[String]) -> Vec<String> {
         return MINIMAX_OAUTH_DEFAULT_SCOPES.iter().map(|scope| (*scope).to_owned()).collect();
     }
     normalized
+}
+
+fn normalize_provider_oauth_scopes(scopes: &[String]) -> Vec<String> {
+    scopes.iter().filter_map(|scope| normalize_optional_text(scope)).map(str::to_owned).collect()
 }
 
 /// Resolves the MiniMax OAuth endpoints from `PALYRA_MINIMAX_OAUTH_BASE_URL`

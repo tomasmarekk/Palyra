@@ -380,6 +380,7 @@ fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> R
             "refresh_token": "xai-oauth-test-refresh",
             "token_endpoint": "https://auth.x.ai/oauth/token",
             "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+            "scopes": ["openid", "offline_access", "api:access"],
             "expires_at_unix_ms": 1_900_000_000_000_i64,
             "set_default": true
         }),
@@ -424,6 +425,14 @@ fn console_xai_oauth_token_flow_persists_vault_refs_and_default_selection() -> R
     assert_eq!(
         credential.get("token_endpoint").and_then(Value::as_str),
         Some("https://auth.x.ai/oauth/token")
+    );
+    let scopes = credential
+        .get("scopes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("xAI OAuth credential missing scopes"))?;
+    assert!(
+        scopes.iter().any(|scope| scope.as_str() == Some("offline_access")),
+        "xAI OAuth scopes must preserve offline_access for refresh: {scopes:?}"
     );
     let access_ref = credential
         .get("access_token_vault_ref")

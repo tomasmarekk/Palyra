@@ -148,6 +148,30 @@ fn spawn_oauth_server(response_body: String) -> (String, thread::JoinHandle<()>)
     (format!("http://{address}/oauth/token"), handle)
 }
 
+fn spawn_capturing_oauth_server(
+    response_body: String,
+    captured_body: Arc<Mutex<Option<String>>>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let address = listener.local_addr().expect("test server should resolve local addr");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("test server should accept request");
+        let mut request_buffer = [0_u8; 4096];
+        let bytes_read = stream.read(&mut request_buffer).expect("test server should read request");
+        let request = String::from_utf8_lossy(&request_buffer[..bytes_read]);
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default().to_owned();
+        *captured_body.lock().expect("captured body mutex should be available") = Some(body);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        );
+        stream.write_all(headers.as_bytes()).expect("test server should write response headers");
+        stream.write_all(response_body.as_bytes()).expect("test server should write response body");
+        stream.flush().expect("test server should flush response");
+    });
+    (format!("http://{address}/oauth/token"), handle)
+}
+
 fn spawn_redirect_server(location: String) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     let address = listener.local_addr().expect("test server should resolve local addr");
@@ -466,6 +490,44 @@ fn oauth_refresh_adapter_does_not_follow_redirects() {
         Err(OAuthRefreshError::HttpStatus { status }) if status == 307
     ));
     redirect_thread.join().expect("redirect test server thread should exit cleanly");
+}
+
+#[test]
+fn oauth_refresh_adapter_sends_requested_scopes() {
+    let captured_body = Arc::new(Mutex::new(None::<String>));
+    let (token_endpoint, server_thread) = spawn_capturing_oauth_server(
+        r#"{"access_token":"access-new","refresh_token":"refresh-new","expires_in":120}"#
+            .to_owned(),
+        Arc::clone(&captured_body),
+    );
+    let adapter = HttpOAuthRefreshAdapter::with_timeout(Duration::from_secs(2))
+        .expect("HTTP adapter should initialize");
+    let request = OAuthRefreshRequest {
+        provider: AuthProvider {
+            kind: AuthProviderKind::Custom,
+            custom_name: Some("xai".to_owned()),
+        },
+        token_endpoint,
+        client_id: Some("xai-public-client".to_owned()),
+        client_secret: None,
+        refresh_token: "refresh-token".to_owned(),
+        scopes: vec!["openid".to_owned(), "offline_access".to_owned(), "api:access".to_owned()],
+    };
+
+    let response =
+        adapter.refresh_access_token(&request).expect("refresh request with scopes should succeed");
+
+    assert_eq!(response.access_token, "access-new");
+    server_thread.join().expect("test server thread should exit cleanly");
+    let body = captured_body
+        .lock()
+        .expect("captured body mutex should be available")
+        .clone()
+        .expect("server should capture a request body");
+    assert!(
+        body.contains("scope=openid+offline_access+api%3Aaccess"),
+        "refresh form should preserve requested OAuth scopes: {body}"
+    );
 }
 
 #[test]
