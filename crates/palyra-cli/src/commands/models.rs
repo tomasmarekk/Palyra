@@ -732,6 +732,11 @@ fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<Models
                 )
                 .context("invalid config key path: model_provider.reasoning_effort")?;
             }
+            ensure_document_default_model_supports_service_tier(
+                path_ref,
+                &document,
+                service_tier.as_deref(),
+            )?;
             if let Some(service_tier) = service_tier.as_deref() {
                 set_value_at_path(
                     &mut document,
@@ -908,6 +913,13 @@ fn legacy_embeddings_model_key(provider_kind: &str) -> Result<&'static str> {
 /// Returns an error when the config cannot be located, read, or parsed.
 pub(crate) fn load_models_status(path: Option<String>) -> Result<ModelsStatusPayload> {
     Ok(load_models_overview(path)?.status)
+}
+
+pub(crate) fn ensure_default_model_supports_service_tier(service_tier: Option<&str>) -> Result<()> {
+    if service_tier_is_default_or_unset(service_tier) {
+        return Ok(());
+    }
+    ensure_overview_default_model_supports_service_tier(&load_models_overview(None)?, service_tier)
 }
 
 fn run_provider_checks(
@@ -1302,7 +1314,16 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
     let config_path = Path::new(&path);
     let (document, migration) = load_document_from_existing_path(Path::new(&path))
         .with_context(|| format!("failed to parse {path}"))?;
-    let root_config = parse_root_file_config(&document)?;
+    models_overview_from_document(path.clone(), config_path, &document, migration.migrated)
+}
+
+fn models_overview_from_document(
+    path: String,
+    config_path: &Path,
+    document: &toml::Value,
+    migrated: bool,
+) -> Result<ModelsOverview> {
+    let root_config = parse_root_file_config(document)?;
     let auth_state_roots = status_auth_profile_state_roots(&root_config, config_path);
     let model_provider = root_config.model_provider.unwrap_or_default();
     let provider_kind =
@@ -1411,7 +1432,7 @@ fn load_models_overview(path: Option<String>) -> Result<ModelsOverview> {
             registry_model_count: models.len(),
             registry_valid: validation_issues.is_empty(),
             validation_issues,
-            migrated: migration.migrated,
+            migrated,
         },
         providers,
         models,
@@ -1541,6 +1562,79 @@ fn effective_status_base_urls(
         return (codex_base_url.clone(), codex_base_url);
     }
     (endpoint_base_url, openai_base_url)
+}
+
+fn ensure_document_default_model_supports_service_tier(
+    config_path: &Path,
+    document: &toml::Value,
+    service_tier: Option<&str>,
+) -> Result<()> {
+    if service_tier_is_default_or_unset(service_tier) {
+        return Ok(());
+    }
+    let overview = models_overview_from_document(
+        config_path.display().to_string(),
+        config_path,
+        document,
+        false,
+    )?;
+    ensure_overview_default_model_supports_service_tier(&overview, service_tier)
+}
+
+fn ensure_overview_default_model_supports_service_tier(
+    overview: &ModelsOverview,
+    service_tier: Option<&str>,
+) -> Result<()> {
+    let Some(service_tier) = service_tier
+        .and_then(normalize_optional_text)
+        .filter(|tier| !tier.eq_ignore_ascii_case("default"))
+    else {
+        return Ok(());
+    };
+    let default_model_id = overview
+        .status
+        .default_chat_model_id
+        .as_deref()
+        .or(overview.status.text_model.as_deref())
+        .and_then(normalize_optional_text)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot use service_tier={service_tier}: no default chat model is configured"
+            )
+        })?;
+    let model = overview
+        .models
+        .iter()
+        .find(|model| model.enabled && model.role == "chat" && model.model_id == default_model_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot use service_tier={service_tier}: default chat model '{default_model_id}' is not present in the model registry"
+            )
+        })?;
+    let status_supports_service_tier = status_supports_openai_service_tier(&overview.status);
+    let model_supports_service_tier =
+        model.service_tier && model.service_tiers.iter().any(|tier| tier == service_tier);
+    if status_supports_service_tier && model_supports_service_tier {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "cannot use service_tier={service_tier}: default chat model '{}' on provider '{}' does not support this tier; use `palyra models list --json` to inspect service_tiers or select --no-fast/default",
+        model.model_id,
+        overview.status.provider_id,
+    )
+}
+
+fn service_tier_is_default_or_unset(service_tier: Option<&str>) -> bool {
+    service_tier
+        .is_none_or(|tier| tier.trim().is_empty() || tier.trim().eq_ignore_ascii_case("default"))
+}
+
+fn status_supports_openai_service_tier(status: &ModelsStatusPayload) -> bool {
+    status.provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+        && auth_provider_kind_allows_openai_service_tier(status.auth_provider_kind.as_deref())
+        && base_url_supports_openai_service_tier(
+            status.endpoint_base_url.as_deref().or(status.openai_base_url.as_deref()),
+        )
 }
 
 fn status_auth_profile_state_roots(

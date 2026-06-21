@@ -525,6 +525,66 @@ openai_model = "gpt-4.1-mini"
 }
 
 #[test]
+fn models_set_rejects_fast_for_openai_oauth_codex_backend() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openai"
+auth_profile_id = "chatgpt-login-test"
+openai_base_url = "https://chatgpt.com/backend-api/codex"
+openai_model = "gpt-5.5"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let fast_output = run_cli(
+        &workdir,
+        &["models", "set", "gpt-5.5", "--path", &config_path_string, "--fast", "--json"],
+    )?;
+    assert!(
+        !fast_output.status.success(),
+        "models set --fast should reject unsupported OpenAI OAuth service tiers"
+    );
+    let fast_stderr =
+        String::from_utf8(fast_output.stderr).context("stderr was not valid UTF-8")?;
+    assert!(
+        fast_stderr.contains("service_tier=priority")
+            && fast_stderr.contains("does not support this tier")
+            && fast_stderr.contains("models list --json"),
+        "unsupported fast rejection should explain the local capability mismatch: {fast_stderr}"
+    );
+    let rejected_config = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        !rejected_config.contains("service_tier"),
+        "rejected fast update must not partially persist service_tier: {rejected_config}"
+    );
+
+    let default_output = run_cli(
+        &workdir,
+        &["models", "set", "gpt-5.5", "--path", &config_path_string, "--no-fast", "--json"],
+    )?;
+    assert!(
+        default_output.status.success(),
+        "models set --no-fast should remain valid for OpenAI OAuth: {}",
+        String::from_utf8_lossy(&default_output.stderr)
+    );
+    let accepted_config = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        accepted_config.contains("service_tier = \"default\""),
+        "explicit default tier should be persisted: {accepted_config}"
+    );
+    Ok(())
+}
+
+#[test]
 fn models_list_preserves_minimax_identity_for_legacy_anthropic_configs() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("palyra.toml");

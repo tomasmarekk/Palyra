@@ -73,6 +73,7 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<()> {
             let input_prompt = resolve_prompt_input(prompt, prompt_stdin)?;
             let reasoning_effort = normalize_reasoning_effort_arg(reasoning)?;
             let service_tier = normalize_service_tier_arg(fast, no_fast, service_tier)?;
+            commands::models::ensure_default_model_supports_service_tier(service_tier.as_deref())?;
             let parameter_delta_json = cli_launch_parameter_delta_json(
                 input_prompt.as_str(),
                 reasoning_effort.as_deref(),
@@ -488,6 +489,16 @@ fn handle_interactive_fast_command(
         return Ok(Some("agent.interactive.fast service_tier=inherit".to_owned()));
     }
     let normalized = normalize_service_tier_value(argument)?;
+    if let Err(error) =
+        commands::models::ensure_default_model_supports_service_tier(Some(normalized.as_str()))
+    {
+        let safe_message = error.to_string().replace('"', "'");
+        return Ok(Some(format!(
+            "agent.interactive.fast service_tier={} rejected=true message=\"{}\"",
+            service_tier.as_deref().unwrap_or("inherit"),
+            safe_message
+        )));
+    }
     *service_tier = Some(normalized.clone());
     Ok(Some(format!("agent.interactive.fast service_tier={normalized}")))
 }
