@@ -1592,7 +1592,7 @@ fn registry_configured(document: &toml::Value) -> Result<bool> {
 fn registry_views_from_config(
     config: &FileModelProviderConfig,
 ) -> (Vec<RegistryProviderEntry>, Vec<RegistryModelEntry>) {
-    let providers = config
+    let mut providers = config
         .providers
         .as_ref()
         .map(|entries| {
@@ -1692,7 +1692,37 @@ fn registry_views_from_config(
         config.default_embeddings_model_id.as_deref(),
         "embeddings",
     );
+    apply_global_auth_to_registry_provider_views(&mut providers, models.as_slice(), config);
     (providers, models)
+}
+
+fn apply_global_auth_to_registry_provider_views(
+    providers: &mut [RegistryProviderEntry],
+    models: &[RegistryModelEntry],
+    config: &FileModelProviderConfig,
+) {
+    if config.auth_profile_id.is_none() && config.auth_provider_kind.is_none() {
+        return;
+    }
+    let default_provider_id = default_provider_id(models, config);
+    let has_single_provider = providers.len() == 1;
+    for provider in providers.iter_mut() {
+        if provider.kind == DETERMINISTIC_PROVIDER_KIND {
+            continue;
+        }
+        let inherits_global_auth = default_provider_id
+            .is_some_and(|provider_id| provider_id == provider.provider_id)
+            || (default_provider_id.is_none() && has_single_provider);
+        if !inherits_global_auth {
+            continue;
+        }
+        if provider.auth_profile_id.is_none() {
+            provider.auth_profile_id = config.auth_profile_id.clone();
+        }
+        if provider.auth_provider_kind.is_none() {
+            provider.auth_provider_kind = config.auth_provider_kind.clone();
+        }
+    }
 }
 
 fn append_synthetic_default_model_entry(
@@ -3014,6 +3044,7 @@ fn get_string_value_at_path(document: &toml::Value, key: &str) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palyra_common::daemon_config_schema::FileModelProviderRegistryEntry;
 
     fn sample_probe_target(base_url: &str, allow_private_base_url: bool) -> ProbeableProvider {
         ProbeableProvider {
@@ -3104,6 +3135,29 @@ mod tests {
             select_preferred_discovered_model_id(models.as_slice()).as_deref(),
             Some("MiniMax-M3")
         );
+    }
+
+    #[test]
+    fn registry_provider_view_inherits_global_xai_oauth_profile_for_single_provider() {
+        let config = FileModelProviderConfig {
+            kind: Some(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
+            auth_profile_id: Some("xai-oauth-test".to_owned()),
+            auth_provider_kind: Some("xai".to_owned()),
+            providers: Some(vec![FileModelProviderRegistryEntry {
+                provider_id: Some("xai-primary".to_owned()),
+                kind: Some(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
+                base_url: Some("https://api.x.ai/v1".to_owned()),
+                ..FileModelProviderRegistryEntry::default()
+            }]),
+            ..FileModelProviderConfig::default()
+        };
+
+        let (providers, models) = registry_views_from_config(&config);
+
+        assert!(models.is_empty(), "test covers empty registry state after OAuth");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].auth_profile_id.as_deref(), Some("xai-oauth-test"));
+        assert_eq!(providers[0].auth_provider_kind.as_deref(), Some("xai"));
     }
 
     #[test]

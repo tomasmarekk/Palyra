@@ -59,6 +59,8 @@ const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BA
 const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL";
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const OPENAI_API_CURATED_DEFAULT_ORDER: &[&str] =
+    &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
 
 /// Parameters for the onboarding/setup wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
@@ -3355,17 +3357,55 @@ fn discover_openai_api_model_selection(
 fn select_openai_api_preferred_model(
     models: &[DiscoveredProviderModel],
 ) -> Option<DiscoveredProviderModel> {
-    let concrete_models = models
+    let candidates = models
         .iter()
+        .filter(|model| model.can_be_chat_default())
         .filter(|model| !is_openai_dynamic_chat_alias(model.id.as_str()))
-        .cloned()
+        .filter(|model| !is_openai_expensive_or_snapshot_default(model.id.as_str()))
         .collect::<Vec<_>>();
-    select_preferred_discovered_model(concrete_models.as_slice()).cloned()
+    OPENAI_API_CURATED_DEFAULT_ORDER.iter().find_map(|preferred| {
+        candidates
+            .iter()
+            .copied()
+            .find(|model| openai_model_id_matches(model.id.as_str(), preferred))
+            .cloned()
+    })
 }
 
 fn is_openai_dynamic_chat_alias(model_id: &str) -> bool {
     let normalized = model_id.trim().to_ascii_lowercase();
     normalized == "chat-latest" || normalized.ends_with("/chat-latest")
+}
+
+fn is_openai_expensive_or_snapshot_default(model_id: &str) -> bool {
+    let normalized = openai_model_terminal_id(model_id).to_ascii_lowercase();
+    is_openai_pro_model(normalized.as_str()) || has_date_snapshot_suffix(normalized.as_str())
+}
+
+fn openai_model_id_matches(model_id: &str, expected: &str) -> bool {
+    openai_model_terminal_id(model_id).eq_ignore_ascii_case(expected)
+}
+
+fn openai_model_terminal_id(model_id: &str) -> &str {
+    model_id.trim().rsplit('/').next().unwrap_or_default().trim()
+}
+
+fn is_openai_pro_model(model_id: &str) -> bool {
+    model_id.split('-').any(|part| part == "pro")
+}
+
+fn has_date_snapshot_suffix(model_id: &str) -> bool {
+    let bytes = model_id.as_bytes();
+    if bytes.len() < 11 || bytes[bytes.len() - 11] != b'-' {
+        return false;
+    }
+    let suffix = &bytes[bytes.len() - 10..];
+    suffix[4] == b'-'
+        && suffix[7] == b'-'
+        && suffix
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
 fn discover_openai_compatible_models(
@@ -4991,22 +5031,32 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
     }
 
     #[test]
-    fn openai_api_model_selection_prefers_concrete_model_over_provider_alias() {
+    fn openai_api_model_selection_prefers_curated_non_pro_over_newer_snapshot() {
         let models = parse_discovered_provider_models(
-            r#"{"data":[{"id":"gpt-realtime-whisper","created":1778012060},{"id":"chat-latest","created":1777704602},{"id":"provider-versioned-chat","created":1776824847}]}"#,
+            r#"{"data":[{"id":"gpt-5.5-pro-2026-04-23","created":1778012060},{"id":"chat-latest","created":1777704602},{"id":"gpt-4o","created":1777600000},{"id":"gpt-5.5","created":1700000000}]}"#,
         )
         .expect("OpenAI discovery fixture should parse");
 
         let selected = select_openai_api_preferred_model(models.as_slice())
-            .expect("OpenAI concrete chat model should be selected");
+            .expect("OpenAI curated chat model should be selected");
 
-        assert_eq!(selected.id, "provider-versioned-chat");
+        assert_eq!(selected.id, "gpt-5.5");
     }
 
     #[test]
     fn openai_api_model_selection_waits_when_discovery_has_no_chat_signal() {
         let models = parse_discovered_provider_models(
             r#"{"data":[{"id":"gpt-realtime-whisper","created":1778012060},{"id":"gpt-image-2","created":1776399795}]}"#,
+        )
+        .expect("OpenAI discovery fixture should parse");
+
+        assert!(select_openai_api_preferred_model(models.as_slice()).is_none());
+    }
+
+    #[test]
+    fn openai_api_model_selection_rejects_pro_and_dated_snapshot_defaults() {
+        let models = parse_discovered_provider_models(
+            r#"{"data":[{"id":"gpt-5.5-pro","created":1778012060},{"id":"gpt-5.4-pro-2026-04-23","created":1777704602},{"id":"gpt-4.1-2026-01-01","created":1777600000},{"id":"chat-latest","created":1777500000}]}"#,
         )
         .expect("OpenAI discovery fixture should parse");
 

@@ -1360,12 +1360,12 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     output::preferred_json(json),
                 )?;
                 std::io::stdout().flush().context("stdout flush failed")?;
-                let callback_url = load_callback_url_input(
+                let callback_input = load_callback_input(
                     callback_url_env,
                     callback_url_stdin,
-                    "xAI callback URL: ",
+                    "xAI callback URL or code: ",
                 )?;
-                parse_xai_callback_url(callback_url.as_str(), state.as_str())?
+                parse_xai_callback_url(callback_input.as_str(), state.as_str())?
             } else {
                 let callback_waiter = start_xai_loopback_callback_waiter(state.clone())?;
                 emit_xai_oauth_instructions(
@@ -2396,14 +2396,10 @@ fn write_xai_callback_response(
     Ok(())
 }
 
-fn load_callback_url_input(
-    env_name: Option<String>,
-    from_stdin: bool,
-    prompt: &str,
-) -> Result<String> {
+fn load_callback_input(env_name: Option<String>, from_stdin: bool, prompt: &str) -> Result<String> {
     let selected_sources = usize::from(env_name.is_some()) + usize::from(from_stdin);
     if selected_sources > 1 {
-        anyhow::bail!("select at most one callback URL source");
+        anyhow::bail!("select at most one callback input source");
     }
     let value = if let Some(env_name) = env_name {
         env::var(env_name.as_str())
@@ -2412,24 +2408,40 @@ fn load_callback_url_input(
         let mut value = String::new();
         std::io::stdin()
             .read_to_string(&mut value)
-            .context("failed to read callback URL from stdin")?;
+            .context("failed to read callback input from stdin")?;
         value
     } else {
         print!("{prompt}");
         std::io::stdout().flush().context("stdout flush failed")?;
         let mut value = String::new();
-        std::io::stdin().read_line(&mut value).context("failed to read callback URL")?;
+        std::io::stdin().read_line(&mut value).context("failed to read callback input")?;
         value
     };
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("callback URL input was empty");
+        anyhow::bail!("callback input was empty");
     }
     Ok(trimmed.to_owned())
 }
 
 fn parse_xai_callback_url(raw: &str, expected_state: &str) -> Result<XaiOAuthCallback> {
-    let parsed = reqwest::Url::parse(raw.trim()).context("xAI callback URL is invalid")?;
+    let input = raw.trim();
+    if let Ok(parsed) = reqwest::Url::parse(input) {
+        return parse_xai_callback_url_parts(&parsed, expected_state);
+    }
+    if looks_like_xai_callback_parameters(input) {
+        return parse_xai_callback_parameter_payload(input, expected_state, true);
+    }
+    if input.is_empty() {
+        anyhow::bail!("xAI callback input was empty");
+    }
+    Ok(XaiOAuthCallback { code: input.to_owned() })
+}
+
+fn parse_xai_callback_url_parts(
+    parsed: &reqwest::Url,
+    expected_state: &str,
+) -> Result<XaiOAuthCallback> {
     if parsed.scheme() != "http"
         || parsed.host_str() != Some(XAI_OAUTH_CALLBACK_HOST)
         || parsed.port_or_known_default() != Some(XAI_OAUTH_CALLBACK_PORT)
@@ -2437,7 +2449,13 @@ fn parse_xai_callback_url(raw: &str, expected_state: &str) -> Result<XaiOAuthCal
     {
         anyhow::bail!("xAI callback URL does not match {XAI_OAUTH_REDIRECT_URI}");
     }
-    parse_xai_callback_query(&parsed, expected_state)
+    if let Some(callback) = parse_xai_callback_query(parsed, expected_state)? {
+        return Ok(callback);
+    }
+    if let Some(fragment) = parsed.fragment() {
+        return parse_xai_callback_parameter_payload(fragment, expected_state, false);
+    }
+    anyhow::bail!("xAI OAuth callback did not include code")
 }
 
 fn parse_xai_callback_target(target: &str, expected_state: &str) -> Result<XaiOAuthCallback> {
@@ -2446,31 +2464,73 @@ fn parse_xai_callback_target(target: &str, expected_state: &str) -> Result<XaiOA
     if parsed.path() != XAI_OAUTH_CALLBACK_PATH {
         anyhow::bail!("xAI callback route not found");
     }
-    parse_xai_callback_query(&parsed, expected_state)
+    parse_xai_callback_query(&parsed, expected_state)?
+        .ok_or_else(|| anyhow!("xAI OAuth callback did not include code"))
 }
 
 fn parse_xai_callback_query(
     parsed: &reqwest::Url,
     expected_state: &str,
+) -> Result<Option<XaiOAuthCallback>> {
+    let pairs = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    parse_xai_callback_pairs(pairs.as_slice(), expected_state, false)
+}
+
+fn parse_xai_callback_parameter_payload(
+    raw: &str,
+    expected_state: &str,
+    allow_missing_state: bool,
 ) -> Result<XaiOAuthCallback> {
-    if let Some(error) = parsed.query_pairs().find(|(key, _)| key == "error") {
-        anyhow::bail!("xAI OAuth returned error: {}", error.1);
+    let query = raw.trim().trim_start_matches('?').trim_start_matches('#');
+    let parsed = reqwest::Url::parse(
+        format!("http://{XAI_OAUTH_CALLBACK_HOST}{XAI_OAUTH_CALLBACK_PATH}?{query}").as_str(),
+    )
+    .context("xAI callback parameters are invalid")?;
+    let pairs = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    parse_xai_callback_pairs(pairs.as_slice(), expected_state, allow_missing_state)?
+        .ok_or_else(|| anyhow!("xAI OAuth callback did not include code"))
+}
+
+fn parse_xai_callback_pairs(
+    pairs: &[(String, String)],
+    expected_state: &str,
+    allow_missing_state: bool,
+) -> Result<Option<XaiOAuthCallback>> {
+    if let Some((_, error)) = pairs.iter().find(|(key, _)| key == "error") {
+        anyhow::bail!("xAI OAuth returned error: {error}");
     }
-    let code = parsed
-        .query_pairs()
+    let Some(code) = pairs
+        .iter()
         .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.to_string())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("xAI OAuth callback did not include code"))?;
-    let received_state = parsed
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.to_string())
-        .unwrap_or_default();
-    if received_state != expected_state {
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let received_state =
+        pairs.iter().find(|(key, _)| key == "state").map(|(_, value)| value.to_owned());
+    if received_state.as_deref().is_some_and(|state| state != expected_state)
+        || (!allow_missing_state && received_state.is_none())
+    {
         anyhow::bail!("xAI OAuth state mismatch; restart the login flow");
     }
-    Ok(XaiOAuthCallback { code })
+    Ok(Some(XaiOAuthCallback { code }))
+}
+
+fn looks_like_xai_callback_parameters(input: &str) -> bool {
+    let normalized = input.trim().trim_start_matches('?').trim_start_matches('#');
+    normalized.starts_with("code=")
+        || normalized.starts_with("state=")
+        || normalized.starts_with("error=")
+        || normalized.contains("&code=")
+        || normalized.contains("&state=")
+        || normalized.contains("&error=")
 }
 
 fn required_trimmed_field(value: Option<String>, field: &str) -> Result<String> {
@@ -3139,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_callback_url_requires_loopback_redirect_and_matching_state() {
+    fn xai_callback_input_accepts_loopback_url_query_fragment_and_bare_code() {
         let callback = parse_xai_callback_url(
             "http://127.0.0.1:56121/callback?code=auth-code&state=expected-state",
             "expected-state",
@@ -3147,6 +3207,27 @@ mod tests {
         .expect("matching loopback callback should be accepted");
         assert_eq!(callback.code, "auth-code");
 
+        let query_callback =
+            parse_xai_callback_url("?code=query-code&state=expected-state", "expected-state")
+                .expect("raw callback query should be accepted");
+        assert_eq!(query_callback.code, "query-code");
+
+        let fragment_callback =
+            parse_xai_callback_url("#code=fragment-code&state=expected-state", "expected-state")
+                .expect("raw callback fragment should be accepted");
+        assert_eq!(fragment_callback.code, "fragment-code");
+
+        let bare_callback = parse_xai_callback_url("bare-code-from-xai-page", "expected-state")
+            .expect("bare xAI page code should be accepted");
+        assert_eq!(bare_callback.code, "bare-code-from-xai-page");
+
+        let code_pair_callback = parse_xai_callback_url("code=code-pair", "expected-state")
+            .expect("code-only callback parameter should be accepted");
+        assert_eq!(code_pair_callback.code, "code-pair");
+    }
+
+    #[test]
+    fn xai_callback_url_requires_loopback_redirect_and_matching_state() {
         let state_error = parse_xai_callback_url(
             "http://127.0.0.1:56121/callback?code=auth-code&state=other-state",
             "expected-state",
