@@ -23,7 +23,7 @@ const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
 const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str =
-    r#"{"data":[{"id":"gpt-test-discovered","supported_parameters":["tools"]}]}"#;
+    r#"{"data":[{"id":"gpt-5.5","supported_parameters":["tools"]}]}"#;
 
 #[test]
 fn status_reports_http_grpc_and_admin_health() -> Result<()> {
@@ -523,7 +523,7 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
         "expected vault-backed OpenAI auth in onboarding config"
     );
     assert!(
-        written.contains("gpt-test-discovered"),
+        written.contains("gpt-5.5"),
         "expected provider-discovered OpenAI model in onboarding config"
     );
     assert!(written.contains("workspace_root"), "expected workspace root in onboarding config");

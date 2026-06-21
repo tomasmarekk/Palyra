@@ -34,7 +34,7 @@ const BROWSER_STATE_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-test-discovered"}]}"#;
+const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-5.5"}]}"#;
 
 #[test]
 fn local_remote_and_lifecycle_workflows_are_regression_tested() -> Result<()> {
