@@ -138,6 +138,19 @@ pub(crate) struct ModelsMutationPayload {
     pub(crate) backups: usize,
 }
 
+struct ModelsDefaultMutationRequest {
+    path: Option<String>,
+    backups: usize,
+    target: &'static str,
+    model: String,
+    dims: Option<u32>,
+    reasoning: Option<String>,
+    fast: bool,
+    no_fast: bool,
+    service_tier: Option<String>,
+    allow_custom: bool,
+}
+
 /// Outcome of one provider connection/discovery probe; also the cached entry shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProviderConnectionCheckPayload {
@@ -399,33 +412,33 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
             allow_custom,
             json,
         } => {
-            let payload = mutate_model_defaults(
+            let payload = mutate_model_defaults(ModelsDefaultMutationRequest {
                 path,
                 backups,
-                "text",
+                target: "text",
                 model,
-                None,
+                dims: None,
                 reasoning,
                 fast,
                 no_fast,
                 service_tier,
                 allow_custom,
-            )?;
+            })?;
             emit_models_mutation(&payload, output::preferred_json(json))
         }
         ModelsCommand::SetEmbeddings { model, dims, path, backups, allow_custom, json } => {
-            let payload = mutate_model_defaults(
+            let payload = mutate_model_defaults(ModelsDefaultMutationRequest {
                 path,
                 backups,
-                "embeddings",
+                target: "embeddings",
                 model,
                 dims,
-                None,
-                false,
-                false,
-                None,
+                reasoning: None,
+                fast: false,
+                no_fast: false,
+                service_tier: None,
                 allow_custom,
-            )?;
+            })?;
             emit_models_mutation(&payload, output::preferred_json(json))
         }
     }
@@ -648,18 +661,19 @@ fn append_ad_hoc_entry(
 /// Returns an error when the config cannot be parsed, the model id fails
 /// validation, the mutated document no longer matches the daemon schema, or
 /// the file cannot be persisted.
-pub(crate) fn mutate_model_defaults(
-    path: Option<String>,
-    backups: usize,
-    target: &'static str,
-    model: String,
-    dims: Option<u32>,
-    reasoning: Option<String>,
-    fast: bool,
-    no_fast: bool,
-    service_tier: Option<String>,
-    _allow_custom: bool,
-) -> Result<ModelsMutationPayload> {
+fn mutate_model_defaults(request: ModelsDefaultMutationRequest) -> Result<ModelsMutationPayload> {
+    let ModelsDefaultMutationRequest {
+        path,
+        backups,
+        target,
+        model,
+        dims,
+        reasoning,
+        fast,
+        no_fast,
+        service_tier,
+        allow_custom: _allow_custom,
+    } = request;
     let path = resolve_config_path(path, false)?;
     let path_ref = Path::new(&path);
     let (mut document, _) = load_document_for_mutation(path_ref)
