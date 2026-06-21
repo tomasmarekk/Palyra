@@ -39,6 +39,7 @@ const XAI_DEVICE_CODE_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const XAI_DEVICE_CODE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const XAI_DEVICE_CODE_SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 const XAI_DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const OPENAI_OAUTH_COMPLETION_NOTE: &str = "Browser success is not the final Palyra setup step; run the completion command until state=succeeded.";
 
 /// Runs a `palyra auth` subcommand on a fresh Tokio runtime.
 ///
@@ -757,6 +758,9 @@ struct OpenAiOAuthLaunchPayload {
     profile_id: Option<String>,
     opened: bool,
     message: String,
+    completion_required: bool,
+    completion_command: String,
+    completion_note: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -1656,13 +1660,17 @@ fn provider_health_summary<'a>(
 fn build_openai_oauth_launch_payload(
     response: control_plane::OpenAiOAuthBootstrapEnvelope,
 ) -> OpenAiOAuthLaunchPayload {
+    let attempt_id = response.attempt_id;
     OpenAiOAuthLaunchPayload {
-        attempt_id: response.attempt_id,
+        completion_command: format!("palyra auth openai oauth-state {attempt_id}"),
+        attempt_id,
         authorization_url: response.authorization_url,
         expires_at_unix_ms: response.expires_at_unix_ms,
         profile_id: response.profile_id,
         opened: false,
         message: response.message,
+        completion_required: true,
+        completion_note: OPENAI_OAUTH_COMPLETION_NOTE,
     }
 }
 
@@ -1761,11 +1769,12 @@ fn emit_openai_oauth_launch(payload: OpenAiOAuthLaunchPayload, json_output: bool
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-// OpenAI's ChatGPT/Codex device flow requires the operator to copy or open the
-// verification URL, so text output includes it explicitly.
-fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String; 3] {
+// OpenAI's ChatGPT/Codex device flow requires both browser authorization and a
+// follow-up state poll before Palyra can persist the local auth profile.
+fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> Vec<String> {
     let authorization_url = payload.authorization_url.replace('"', "'");
-    [
+    let completion_command = payload.completion_command.replace('"', "'");
+    vec![
         format!(
             "auth.openai.oauth.start attempt_id={} profile_id={} expires_at_unix_ms={} authorization_url_present={} opened={}",
             payload.attempt_id,
@@ -1776,6 +1785,12 @@ fn openai_oauth_launch_text_lines(payload: &OpenAiOAuthLaunchPayload) -> [String
         ),
         format!("auth.openai.oauth.authorization_url=\"{authorization_url}\""),
         format!("auth.openai.oauth.message=\"{}\"", payload.message.replace('"', "'")),
+        format!(
+            "auth.openai.oauth.completion required={} command=\"{}\" note=\"{}\"",
+            payload.completion_required,
+            completion_command,
+            payload.completion_note.replace('"', "'")
+        ),
     ]
 }
 
@@ -2865,8 +2880,8 @@ mod tests {
         write_xai_callback_response_best_effort, AnthropicOAuthTokenResponse,
         OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
         ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
-        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI,
-        XAI_OAUTH_SCOPE,
+        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID,
+        XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -3001,10 +3016,22 @@ mod tests {
         assert_eq!(payload.profile_id.as_deref(), Some("openai-default"));
         assert!(!payload.opened);
         assert_eq!(payload.message, "Open the authorization URL to reconnect OpenAI.");
+        assert!(payload.completion_required);
+        assert_eq!(payload.completion_command, "palyra auth openai oauth-state attempt-1");
+        assert!(payload.completion_note.contains("Browser success"));
+        let serialized = serde_json::to_value(&payload).expect("launch payload should serialize");
+        assert_eq!(
+            serialized.get("completion_required").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            serialized.get("completion_command").and_then(serde_json::Value::as_str),
+            Some("palyra auth openai oauth-state attempt-1")
+        );
     }
 
     #[test]
-    fn openai_oauth_launch_text_output_includes_authorization_url() {
+    fn openai_oauth_launch_text_output_includes_authorization_and_completion_command() {
         let payload = OpenAiOAuthLaunchPayload {
             attempt_id: "attempt-1".to_owned(),
             authorization_url: "https://auth.openai.example/authorize?state=attempt-1".to_owned(),
@@ -3012,6 +3039,9 @@ mod tests {
             profile_id: Some("openai-default".to_owned()),
             opened: false,
             message: "Open the authorization URL to reconnect OpenAI.".to_owned(),
+            completion_required: true,
+            completion_command: "palyra auth openai oauth-state attempt-1".to_owned(),
+            completion_note: OPENAI_OAUTH_COMPLETION_NOTE,
         };
         let output = openai_oauth_launch_text_lines(&payload).join("\n");
 
@@ -3020,6 +3050,12 @@ mod tests {
             output.contains(
                 "auth.openai.oauth.authorization_url=\"https://auth.openai.example/authorize?state=attempt-1\""
             ),
+            "{output}"
+        );
+        assert!(
+            output.contains("auth.openai.oauth.completion required=true")
+                && output.contains("command=\"palyra auth openai oauth-state attempt-1\"")
+                && output.contains("Browser success is not the final Palyra setup step"),
             "{output}"
         );
     }
