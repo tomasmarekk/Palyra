@@ -180,7 +180,7 @@ async fn run_console_provider_probe(
         .filter(|target| {
             provider_filter
                 .as_deref()
-                .map(|filter| target.provider_id == filter || target.kind == filter)
+                .map(|filter| provider_matches_filter(target, filter))
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
@@ -281,7 +281,8 @@ fn build_console_probe_targets_with_env(
             .collect();
     }
 
-    let provider_id = legacy_provider_id(provider_kind.as_str()).to_owned();
+    let provider_id =
+        legacy_provider_id(provider_kind.as_str(), config.auth_provider_kind.as_deref()).to_owned();
     vec![ConsoleProbeTarget {
         provider_id: provider_id.clone(),
         kind: provider_kind.clone(),
@@ -378,7 +379,8 @@ fn registry_model_ids_by_provider(config: &FileModelProviderConfig) -> Vec<(Stri
     }
 
     let kind = config.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
-    let provider_id = legacy_provider_id(kind.as_str()).to_owned();
+    let provider_id =
+        legacy_provider_id(kind.as_str(), config.auth_provider_kind.as_deref()).to_owned();
     let mut models = Vec::new();
     if let Some(model_id) = config.openai_model.clone().or_else(|| config.anthropic_model.clone()) {
         models.push(model_id);
@@ -404,7 +406,43 @@ fn default_provider_id_from_config<'a>(
     })
 }
 
-fn legacy_provider_id(provider_kind: &str) -> &'static str {
+fn provider_matches_filter(target: &ConsoleProbeTarget, filter: &str) -> bool {
+    let normalized_filter = normalize_provider_filter_alias(filter);
+    [
+        Some(target.provider_id.as_str()),
+        Some(target.kind.as_str()),
+        target.auth_profile_provider_kind.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|candidate| normalize_provider_filter_alias(candidate) == normalized_filter)
+}
+
+fn normalize_provider_filter_alias(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "x_ai" | "grok" => "xai".to_owned(),
+        "open_router" => "openrouter".to_owned(),
+        "gemini" => "google_gemini".to_owned(),
+        "gemini_cli" => "google_gemini_cli".to_owned(),
+        _ => normalized,
+    }
+}
+
+fn legacy_provider_id(provider_kind: &str, auth_provider_kind: Option<&str>) -> &'static str {
+    if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
+        if let Some(auth_provider_kind) = auth_provider_kind {
+            let normalized_auth_kind = normalize_provider_filter_alias(auth_provider_kind);
+            match normalized_auth_kind.as_str() {
+                "xai" | "grok" => return "xai-primary",
+                "google_gemini" | "google_gemini_cli" | "gemini" | "gemini_cli" => {
+                    return "google-gemini-primary";
+                }
+                "openrouter" | "open_router" => return "openrouter-primary",
+                _ => {}
+            }
+        }
+    }
     match provider_kind {
         OPENAI_COMPATIBLE_PROVIDER_KIND => "openai-primary",
         ANTHROPIC_PROVIDER_KIND => "anthropic-primary",
@@ -1011,6 +1049,26 @@ mod tests {
             !targets[0].allow_private_base_url,
             "provider-level allow_private_base_url=false should override the global opt-in"
         );
+    }
+
+    #[test]
+    fn console_probe_targets_use_legacy_xai_identity_and_alias_filter() {
+        let config = FileModelProviderConfig {
+            kind: Some(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
+            openai_base_url: Some("https://api.x.ai/v1".to_owned()),
+            auth_profile_id: Some("xai-oauth-test".to_owned()),
+            auth_provider_kind: Some("xai".to_owned()),
+            ..FileModelProviderConfig::default()
+        };
+
+        let targets = build_console_probe_targets_with_env(&config, None);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider_id, "xai-primary");
+        assert_eq!(targets[0].auth_profile_id.as_deref(), Some("xai-oauth-test"));
+        assert_eq!(targets[0].auth_profile_provider_kind.as_deref(), Some("xai"));
+        assert!(provider_matches_filter(&targets[0], "xai"));
+        assert!(provider_matches_filter(&targets[0], "grok"));
     }
 
     #[test]
