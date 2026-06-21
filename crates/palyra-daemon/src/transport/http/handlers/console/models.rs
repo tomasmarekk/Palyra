@@ -8,12 +8,12 @@
 //! inside the envelope payload, not as HTTP errors, and every outbound error
 //! string is redacted before it reaches the console wire contract.
 
-use std::{path::Path, time::Instant};
+use std::time::Instant;
 
 use palyra_auth::{AuthCredential, AuthProviderKind};
 use palyra_common::daemon_config_schema::{FileModelProviderConfig, RootFileConfig};
 use palyra_common::redaction::redact_auth_error;
-use palyra_vault::{Vault, VaultConfig, VaultRef};
+use palyra_vault::{Vault, VaultRef};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 
@@ -701,8 +701,13 @@ fn resolve_provider_credential(
     target: &ConsoleProbeTarget,
 ) -> Result<Option<ResolvedCredential>, anyhow::Error> {
     if let Some(profile_id) = target.auth_profile_id.as_deref() {
-        return resolve_auth_profile_credential(state.auth_runtime.registry(), target, profile_id)
-            .map(Some);
+        return resolve_auth_profile_credential(
+            state.auth_runtime.registry(),
+            state.vault.as_ref(),
+            target,
+            profile_id,
+        )
+        .map(Some);
     }
 
     if let Some(api_key) = target.inline_api_key.as_deref().and_then(normalize_optional_text) {
@@ -723,6 +728,7 @@ fn resolve_provider_credential(
 
 fn resolve_auth_profile_credential(
     auth_registry: &palyra_auth::AuthProfileRegistry,
+    vault: &Vault,
     target: &ConsoleProbeTarget,
     profile_id: &str,
 ) -> Result<ResolvedCredential, anyhow::Error> {
@@ -755,14 +761,13 @@ fn resolve_auth_profile_credential(
         }
     }
 
-    let vault = open_auth_profile_vault(auth_registry.state_root())?;
     match profile.credential {
         AuthCredential::ApiKey { api_key_vault_ref } => {
-            let token = load_vault_secret_utf8(&vault, api_key_vault_ref.as_str())?;
+            let token = load_vault_secret_utf8(vault, api_key_vault_ref.as_str())?;
             Ok(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() })
         }
         AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
-            let token = load_vault_secret_utf8(&vault, access_token_vault_ref.as_str())?;
+            let token = load_vault_secret_utf8(vault, access_token_vault_ref.as_str())?;
             Ok(ResolvedCredential::Bearer {
                 token,
                 source: "auth_profile".to_owned(),
@@ -770,15 +775,6 @@ fn resolve_auth_profile_credential(
             })
         }
     }
-}
-
-fn open_auth_profile_vault(state_root: &Path) -> Result<Vault, anyhow::Error> {
-    Vault::open_with_config(VaultConfig {
-        root: Some(state_root.join("vault")),
-        identity_store_root: Some(state_root.join("identity")),
-        ..VaultConfig::default()
-    })
-    .with_context(|| format!("failed to open auth profile vault at {}", state_root.display()))
 }
 
 fn target_uses_minimax_auth(target: &ConsoleProbeTarget) -> bool {
@@ -1159,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_profile_probe_resolves_xai_oauth_from_registry_state_root_vault() {
+    fn auth_profile_probe_resolves_xai_oauth_from_runtime_vault() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
         let identity_root = state_root.join("identity");
@@ -1187,8 +1183,8 @@ mod tests {
             })
             .expect("profile should persist");
         let vault = palyra_vault::Vault::open_with_config(VaultConfig {
-            root: Some(state_root.join("vault")),
-            identity_store_root: Some(identity_root),
+            root: Some(tempdir.path().join("runtime-vault")),
+            identity_store_root: Some(identity_root.clone()),
             backend_preference: BackendPreference::EncryptedFile,
             ..VaultConfig::default()
         })
@@ -1211,8 +1207,9 @@ mod tests {
             configured_model_ids: Vec::new(),
         };
 
-        let credential = resolve_auth_profile_credential(&registry, &target, "xai-oauth-test")
-            .expect("credential lookup should succeed");
+        let credential =
+            resolve_auth_profile_credential(&registry, &vault, &target, "xai-oauth-test")
+                .expect("credential lookup should succeed");
 
         match credential {
             ResolvedCredential::Bearer { token, source, oauth_kind } => {
@@ -1221,6 +1218,70 @@ mod tests {
                 assert_eq!(oauth_kind, None);
             }
             ResolvedCredential::ApiKey { .. } => panic!("xAI OAuth profile should be bearer"),
+        }
+    }
+
+    #[test]
+    fn auth_profile_probe_resolves_chatgpt_oauth_from_runtime_vault() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+        let identity_root = state_root.join("identity");
+        let registry =
+            AuthProfileRegistry::open(identity_root.as_path()).expect("registry should open");
+        registry
+            .set_profile(palyra_auth::AuthProfileSetRequest {
+                profile_id: "chatgpt-login-test".to_owned(),
+                provider: palyra_auth::AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: "ChatGPT Login".to_owned(),
+                scope: palyra_auth::AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/openai_access".to_owned(),
+                    refresh_token_vault_ref: "global/openai_refresh".to_owned(),
+                    token_endpoint: "https://auth.openai.com/oauth/token".to_owned(),
+                    client_id: Some(OPENAI_CHATGPT_OAUTH_CLIENT_ID.to_owned()),
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: Default::default(),
+                },
+            })
+            .expect("profile should persist");
+        let vault = palyra_vault::Vault::open_with_config(VaultConfig {
+            root: Some(tempdir.path().join("runtime-vault")),
+            identity_store_root: Some(identity_root.clone()),
+            backend_preference: BackendPreference::EncryptedFile,
+            ..VaultConfig::default()
+        })
+        .expect("runtime vault should open");
+        let scope = "global".parse::<VaultScope>().expect("scope should parse");
+        vault
+            .put_secret(&scope, "openai_access", b"runtime-openai-oauth-token")
+            .expect("access token should persist");
+
+        let target = ConsoleProbeTarget {
+            provider_id: "openai-primary".to_owned(),
+            kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+            enabled: true,
+            endpoint_base_url: Some(OPENAI_CODEX_BACKEND_BASE_URL.to_owned()),
+            allow_private_base_url: false,
+            auth_profile_id: Some("chatgpt-login-test".to_owned()),
+            auth_profile_provider_kind: Some("openai".to_owned()),
+            inline_api_key: None,
+            vault_ref: None,
+            configured_model_ids: Vec::new(),
+        };
+
+        let credential =
+            resolve_auth_profile_credential(&registry, &vault, &target, "chatgpt-login-test")
+                .expect("credential lookup should succeed");
+
+        match credential {
+            ResolvedCredential::Bearer { token, source, oauth_kind } => {
+                assert_eq!(token, "runtime-openai-oauth-token");
+                assert_eq!(source, "auth_profile");
+                assert_eq!(oauth_kind, Some(ResolvedOauthProfileKind::OpenAiChatGptLogin));
+            }
+            ResolvedCredential::ApiKey { .. } => panic!("ChatGPT OAuth profile should be bearer"),
         }
     }
 
