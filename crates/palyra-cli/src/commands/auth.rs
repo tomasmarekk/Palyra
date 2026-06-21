@@ -2090,10 +2090,11 @@ fn emit_xai_oauth_instructions(
     json_output: bool,
 ) -> Result<()> {
     let safe_url = authorization_url.replace('"', "'");
+    let safe_message = xai_oauth_instruction_message(manual_paste).replace('"', "'");
     let mode = if manual_paste { "manual_paste" } else { "loopback" };
     if json_output {
         eprintln!(
-            "auth.xai.oauth.authorization_url=\"{safe_url}\" opened={opened} callback_mode={mode} message=\"Open this URL to authorize Palyra with xAI.\""
+            "auth.xai.oauth.authorization_url=\"{safe_url}\" opened={opened} callback_mode={mode} message=\"{safe_message}\""
         );
         std::io::stderr().flush().context("stderr flush failed")?;
     } else {
@@ -2107,18 +2108,18 @@ fn emit_xai_oauth_instructions(
         output::print_text_line(
             format!("auth.xai.oauth.authorization_url=\"{safe_url}\"").as_str(),
         )?;
-        if manual_paste {
-            output::print_text_line(
-                "auth.xai.oauth.message=\"Open this URL, authorize Palyra, then paste the full 127.0.0.1 callback URL.\"",
-            )?;
-        } else {
-            output::print_text_line(
-                "auth.xai.oauth.message=\"Open this URL to authorize Palyra; waiting on http://127.0.0.1:56121/callback.\"",
-            )?;
-        }
+        output::print_text_line(format!("auth.xai.oauth.message=\"{safe_message}\"").as_str())?;
         std::io::stdout().flush().context("stdout flush failed")?;
     }
     Ok(())
+}
+
+fn xai_oauth_instruction_message(manual_paste: bool) -> &'static str {
+    if manual_paste {
+        "Open this URL, authorize Palyra, then paste the displayed code or full 127.0.0.1 callback URL. After the CLI accepts the code, the xAI browser page may keep waiting and is safe to close."
+    } else {
+        "Open this URL to authorize Palyra; waiting on http://127.0.0.1:56121/callback."
+    }
 }
 
 async fn request_xai_device_code(device_authorization_endpoint: &str) -> Result<XaiDeviceCode> {
@@ -2937,11 +2938,11 @@ mod tests {
         generate_oauth_random_urlsafe, normalize_xai_oauth_browser_url,
         normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
         parse_anthropic_authorization_code, parse_xai_callback_url,
-        write_xai_callback_response_best_effort, AnthropicOAuthTokenResponse,
-        OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID,
-        ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
-        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID,
-        XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
+        write_xai_callback_response_best_effort, xai_oauth_instruction_message,
+        AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL,
+        ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES,
+        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
+        OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -3224,6 +3225,22 @@ mod tests {
         let code_pair_callback = parse_xai_callback_url("code=code-pair", "expected-state")
             .expect("code-only callback parameter should be accepted");
         assert_eq!(code_pair_callback.code, "code-pair");
+    }
+
+    #[test]
+    fn xai_manual_paste_message_clarifies_browser_close_state() {
+        let manual_message = xai_oauth_instruction_message(true);
+        assert!(manual_message.contains("displayed code"), "{manual_message}");
+        assert!(manual_message.contains("127.0.0.1 callback URL"), "{manual_message}");
+        assert!(manual_message.contains("After the CLI accepts the code"), "{manual_message}");
+        assert!(manual_message.contains("safe to close"), "{manual_message}");
+
+        let loopback_message = xai_oauth_instruction_message(false);
+        assert!(
+            loopback_message.contains("waiting on http://127.0.0.1:56121/callback"),
+            "{loopback_message}"
+        );
+        assert!(!loopback_message.contains("safe to close"), "{loopback_message}");
     }
 
     #[test]
