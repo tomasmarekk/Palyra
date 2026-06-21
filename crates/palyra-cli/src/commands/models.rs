@@ -2025,10 +2025,17 @@ fn auth_provider_kind_allows_openai_service_tier(auth_provider_kind: Option<&str
 }
 
 fn base_url_supports_openai_service_tier(base_url: Option<&str>) -> bool {
-    base_url
-        .and_then(|value| reqwest::Url::parse(value).ok())
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+    let Some(url) = base_url.and_then(|value| reqwest::Url::parse(value).ok()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("api.openai.com") {
+        return true;
+    }
+    host.eq_ignore_ascii_case("chatgpt.com")
+        && url.path().trim_end_matches('/').eq_ignore_ascii_case("/backend-api/codex")
 }
 
 fn synthetic_default_registry_model(

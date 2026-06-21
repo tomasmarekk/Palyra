@@ -2684,10 +2684,13 @@ impl OpenAiCompatibleProvider {
         self.config
             .auth_profile_provider_kind
             .is_none_or(|kind| kind == ModelProviderAuthProviderKind::Openai)
-            && reqwest::Url::parse(self.config.openai_base_url.as_str())
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+            && (openai_base_url_supports_service_tier(self.config.openai_base_url.as_str())
+                || self
+                    .config
+                    .openai_api_key
+                    .as_deref()
+                    .and_then(openai_chatgpt_oauth_claims)
+                    .is_some())
     }
 
     async fn request_once(
@@ -3082,6 +3085,20 @@ fn openai_chatgpt_account_id_from_token(token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn openai_base_url_supports_service_tier(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("api.openai.com") {
+        return true;
+    }
+    host.eq_ignore_ascii_case("chatgpt.com")
+        && url.path().trim_end_matches('/').eq_ignore_ascii_case("/backend-api/codex")
 }
 
 fn decode_jwt_payload(token: &str) -> Option<Value> {
@@ -4456,8 +4473,8 @@ mod tests {
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
         ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
-        ProviderRequest, ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
-        ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
+        ProviderRequest, ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator,
+        ProviderStreamEvent, ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
         ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT, OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -5540,6 +5557,7 @@ mod tests {
             ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
         request.tool_catalog_snapshot =
             Some(tool_catalog_response_cache_fixture(1_781_883_663_913, "snapshot-01", "hash-01"));
+        request.service_tier = Some(ProviderServiceTier::Priority);
 
         let response = provider
             .complete(request)
@@ -5570,6 +5588,7 @@ mod tests {
         assert_eq!(request_body["instructions"], "You are a helpful assistant.");
         assert_eq!(request_body["input"][0]["role"], "user");
         assert_eq!(request_body["tool_choice"], "auto");
+        assert_eq!(request_body["service_tier"], "priority");
         assert_eq!(request_body["tools"][0]["name"], "palyra_echo");
         drop(requests);
         handle.join().expect("scripted server thread should exit");

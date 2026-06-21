@@ -525,7 +525,7 @@ openai_model = "gpt-4.1-mini"
 }
 
 #[test]
-fn models_set_rejects_fast_for_openai_oauth_codex_backend() -> Result<()> {
+fn models_set_allows_fast_for_openai_oauth_codex_backend() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("palyra.toml");
     fs::write(
@@ -548,22 +548,15 @@ openai_model = "gpt-5.5"
         &["models", "set", "gpt-5.5", "--path", &config_path_string, "--fast", "--json"],
     )?;
     assert!(
-        !fast_output.status.success(),
-        "models set --fast should reject unsupported OpenAI OAuth service tiers"
+        fast_output.status.success(),
+        "models set --fast should accept OpenAI OAuth service tiers: {}",
+        String::from_utf8_lossy(&fast_output.stderr)
     );
-    let fast_stderr =
-        String::from_utf8(fast_output.stderr).context("stderr was not valid UTF-8")?;
-    assert!(
-        fast_stderr.contains("service_tier=priority")
-            && fast_stderr.contains("does not support this tier")
-            && fast_stderr.contains("models list --json"),
-        "unsupported fast rejection should explain the local capability mismatch: {fast_stderr}"
-    );
-    let rejected_config = fs::read_to_string(&config_path)
+    let fast_config = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     assert!(
-        !rejected_config.contains("service_tier"),
-        "rejected fast update must not partially persist service_tier: {rejected_config}"
+        fast_config.contains("service_tier = \"priority\""),
+        "accepted fast update should persist priority tier: {fast_config}"
     );
 
     let default_output = run_cli(
