@@ -8,12 +8,12 @@
 //! inside the envelope payload, not as HTTP errors, and every outbound error
 //! string is redacted before it reaches the console wire contract.
 
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
 use palyra_auth::{AuthCredential, AuthProviderKind};
 use palyra_common::daemon_config_schema::{FileModelProviderConfig, RootFileConfig};
 use palyra_common::redaction::redact_auth_error;
-use palyra_vault::VaultRef;
+use palyra_vault::{Vault, VaultConfig, VaultRef};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 
@@ -701,53 +701,8 @@ fn resolve_provider_credential(
     target: &ConsoleProbeTarget,
 ) -> Result<Option<ResolvedCredential>, anyhow::Error> {
     if let Some(profile_id) = target.auth_profile_id.as_deref() {
-        let profile = state
-            .auth_runtime
-            .registry()
-            .get_profile(profile_id)
-            .with_context(|| format!("failed to load auth profile '{profile_id}'"))?
-            .ok_or_else(|| anyhow::anyhow!("auth profile not found: {profile_id}"))?;
-        let expected_provider = expected_auth_provider_for_probe_target(target);
-        if let Some(expected_provider) = expected_provider {
-            let expected_custom_name = expected_custom_auth_provider_name_for_probe_target(target);
-            let matches_expected = if expected_provider == AuthProviderKind::Custom {
-                matches!(profile.provider.kind, AuthProviderKind::Custom)
-                    && expected_custom_name.is_some_and(|expected_name| {
-                        profile
-                            .provider
-                            .custom_name
-                            .as_deref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(expected_name))
-                    })
-            } else {
-                profile.provider.kind == expected_provider
-            };
-            if !matches_expected {
-                anyhow::bail!(
-                    "auth profile '{}' belongs to provider '{}' instead of '{}'",
-                    profile_id,
-                    profile.provider.label(),
-                    target.kind
-                );
-            }
-        }
-        return match profile.credential {
-            AuthCredential::ApiKey { api_key_vault_ref } => {
-                let token = load_vault_secret_utf8(&state.vault, api_key_vault_ref.as_str())?;
-                Ok(Some(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() }))
-            }
-            AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
-                let token = load_vault_secret_utf8(&state.vault, access_token_vault_ref.as_str())?;
-                Ok(Some(ResolvedCredential::Bearer {
-                    token,
-                    source: "auth_profile".to_owned(),
-                    oauth_kind: oauth_kind_for_profile(
-                        &profile.provider.kind,
-                        client_id.as_deref(),
-                    ),
-                }))
-            }
-        };
+        return resolve_auth_profile_credential(state.auth_runtime.registry(), target, profile_id)
+            .map(Some);
     }
 
     if let Some(api_key) = target.inline_api_key.as_deref().and_then(normalize_optional_text) {
@@ -764,6 +719,66 @@ fn resolve_provider_credential(
         }));
     }
     Ok(None)
+}
+
+fn resolve_auth_profile_credential(
+    auth_registry: &palyra_auth::AuthProfileRegistry,
+    target: &ConsoleProbeTarget,
+    profile_id: &str,
+) -> Result<ResolvedCredential, anyhow::Error> {
+    let profile = auth_registry
+        .get_profile(profile_id)
+        .with_context(|| format!("failed to load auth profile '{profile_id}'"))?
+        .ok_or_else(|| anyhow::anyhow!("auth profile not found: {profile_id}"))?;
+    let expected_provider = expected_auth_provider_for_probe_target(target);
+    if let Some(expected_provider) = expected_provider {
+        let expected_custom_name = expected_custom_auth_provider_name_for_probe_target(target);
+        let matches_expected = if expected_provider == AuthProviderKind::Custom {
+            matches!(profile.provider.kind, AuthProviderKind::Custom)
+                && expected_custom_name.is_some_and(|expected_name| {
+                    profile
+                        .provider
+                        .custom_name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(expected_name))
+                })
+        } else {
+            profile.provider.kind == expected_provider
+        };
+        if !matches_expected {
+            anyhow::bail!(
+                "auth profile '{}' belongs to provider '{}' instead of '{}'",
+                profile_id,
+                profile.provider.label(),
+                target.kind
+            );
+        }
+    }
+
+    let vault = open_auth_profile_vault(auth_registry.state_root())?;
+    match profile.credential {
+        AuthCredential::ApiKey { api_key_vault_ref } => {
+            let token = load_vault_secret_utf8(&vault, api_key_vault_ref.as_str())?;
+            Ok(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() })
+        }
+        AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
+            let token = load_vault_secret_utf8(&vault, access_token_vault_ref.as_str())?;
+            Ok(ResolvedCredential::Bearer {
+                token,
+                source: "auth_profile".to_owned(),
+                oauth_kind: oauth_kind_for_profile(&profile.provider.kind, client_id.as_deref()),
+            })
+        }
+    }
+}
+
+fn open_auth_profile_vault(state_root: &Path) -> Result<Vault, anyhow::Error> {
+    Vault::open_with_config(VaultConfig {
+        root: Some(state_root.join("vault")),
+        identity_store_root: Some(state_root.join("identity")),
+        ..VaultConfig::default()
+    })
+    .with_context(|| format!("failed to open auth profile vault at {}", state_root.display()))
 }
 
 fn target_uses_minimax_auth(target: &ConsoleProbeTarget) -> bool {
@@ -987,7 +1002,9 @@ fn normalize_optional_text(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
     use palyra_common::daemon_config_schema::FileModelProviderRegistryEntry;
+    use palyra_vault::{BackendPreference, VaultConfig, VaultScope};
 
     fn sample_probe_target(allow_private_base_url: bool) -> ConsoleProbeTarget {
         ConsoleProbeTarget {
@@ -1139,6 +1156,72 @@ mod tests {
 
         assert_eq!(endpoint.url.as_str(), "https://api.openai.com/v1/models");
         assert_eq!(endpoint.response_format, ProviderModelsResponseFormat::OpenAiCompatible);
+    }
+
+    #[test]
+    fn auth_profile_probe_resolves_xai_oauth_from_registry_state_root_vault() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+        let identity_root = state_root.join("identity");
+        let registry =
+            AuthProfileRegistry::open(identity_root.as_path()).expect("registry should open");
+        registry
+            .set_profile(palyra_auth::AuthProfileSetRequest {
+                profile_id: "xai-oauth-test".to_owned(),
+                provider: palyra_auth::AuthProvider {
+                    kind: AuthProviderKind::Custom,
+                    custom_name: Some("xai".to_owned()),
+                },
+                profile_name: "xAI OAuth".to_owned(),
+                scope: palyra_auth::AuthProfileScope::Global,
+                credential: AuthCredential::Oauth {
+                    access_token_vault_ref: "global/xai_access".to_owned(),
+                    refresh_token_vault_ref: "global/xai_refresh".to_owned(),
+                    token_endpoint: "https://auth.x.ai/oauth/token".to_owned(),
+                    client_id: Some("grok-cli".to_owned()),
+                    client_secret_vault_ref: None,
+                    scopes: Vec::new(),
+                    expires_at_unix_ms: None,
+                    refresh_state: Default::default(),
+                },
+            })
+            .expect("profile should persist");
+        let vault = palyra_vault::Vault::open_with_config(VaultConfig {
+            root: Some(state_root.join("vault")),
+            identity_store_root: Some(identity_root),
+            backend_preference: BackendPreference::EncryptedFile,
+            ..VaultConfig::default()
+        })
+        .expect("runtime vault should open");
+        let scope = "global".parse::<VaultScope>().expect("scope should parse");
+        vault
+            .put_secret(&scope, "xai_access", b"runtime-xai-oauth-token")
+            .expect("access token should persist");
+
+        let target = ConsoleProbeTarget {
+            provider_id: "xai-primary".to_owned(),
+            kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+            enabled: true,
+            endpoint_base_url: Some("https://api.x.ai/v1".to_owned()),
+            allow_private_base_url: false,
+            auth_profile_id: Some("xai-oauth-test".to_owned()),
+            auth_profile_provider_kind: Some("xai".to_owned()),
+            inline_api_key: None,
+            vault_ref: None,
+            configured_model_ids: Vec::new(),
+        };
+
+        let credential = resolve_auth_profile_credential(&registry, &target, "xai-oauth-test")
+            .expect("credential lookup should succeed");
+
+        match credential {
+            ResolvedCredential::Bearer { token, source, oauth_kind } => {
+                assert_eq!(token, "runtime-xai-oauth-token");
+                assert_eq!(source, "auth_profile");
+                assert_eq!(oauth_kind, None);
+            }
+            ResolvedCredential::ApiKey { .. } => panic!("xAI OAuth profile should be bearer"),
+        }
     }
 
     #[test]

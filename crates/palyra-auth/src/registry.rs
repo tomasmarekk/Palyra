@@ -50,6 +50,7 @@ use crate::{
 /// `*_with_clock` variant taking `now_unix_ms` for deterministic tests and replay.
 #[derive(Debug)]
 pub struct AuthProfileRegistry {
+    state_root: PathBuf,
     registry_path: PathBuf,
     runtime_state_path: PathBuf,
     state: Mutex<RegistryDocument>,
@@ -107,11 +108,18 @@ impl AuthProfileRegistry {
         persist_runtime_state(runtime_state_path.as_path(), &runtime_document)?;
 
         Ok(Self {
+            state_root,
             registry_path,
             runtime_state_path,
             state: Mutex::new(document),
             runtime_state: Mutex::new(runtime_document),
         })
+    }
+
+    /// Returns the state root that owns this registry and its vault references.
+    #[must_use]
+    pub fn state_root(&self) -> &Path {
+        self.state_root.as_path()
     }
 
     /// Looks up a profile by id from disk without creating or rewriting registry files.
