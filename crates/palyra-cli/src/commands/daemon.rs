@@ -749,6 +749,16 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                     response.total_tokens,
                     response.tape_events
                 );
+                if let Some(lifecycle_state) = response.lifecycle_state.as_deref() {
+                    println!(
+                        "run.lifecycle run_id={} state={} lifecycle_state={} continuation_required={} reason_code={}",
+                        response.run_id,
+                        response.state,
+                        lifecycle_state,
+                        response.continuation_required.unwrap_or(false),
+                        response.reason_code.as_deref().unwrap_or("unknown")
+                    );
+                }
             }
             std::io::stdout().flush().context("stdout flush failed")
         }

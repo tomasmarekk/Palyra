@@ -6600,6 +6600,36 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn run_status_response_preserves_needs_continuation_lifecycle_metadata() {
+        let response: RunStatusResponse = serde_json::from_value(json!({
+            "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "state": "failed",
+            "wire_state": "failed",
+            "lifecycle_state": "needs_continuation",
+            "partial": true,
+            "continuation_required": true,
+            "continuation_available": true,
+            "reason_code": "wall_clock",
+            "cancel_requested": false,
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "tape_events": 42
+        }))
+        .expect("run status response should decode");
+
+        assert_eq!(response.state, "failed");
+        assert_eq!(response.lifecycle_state.as_deref(), Some("needs_continuation"));
+        assert_eq!(response.continuation_required, Some(true));
+        assert_eq!(response.reason_code.as_deref(), Some("wall_clock"));
+
+        let encoded = serde_json::to_value(&response).expect("response should encode");
+        assert_eq!(encoded["lifecycle_state"], "needs_continuation");
+        assert_eq!(encoded["continuation_required"], true);
+        assert_eq!(encoded["reason_code"], "wall_clock");
+    }
+
+    #[test]
     fn agent_failure_sanitizer_redacts_internal_runtime_paths() {
         let message = sanitize_agent_failure_message(
             r#"failed reading C:\Users\Aftab Jafar Ansari\.palyra\sessions\01ABC\tape.ndjson"#,
@@ -11839,6 +11869,18 @@ struct RunCancelRequestBody {
 struct RunStatusResponse {
     run_id: String,
     state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wire_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
     cancel_requested: bool,
     prompt_tokens: u64,
     completion_tokens: u64,

@@ -290,7 +290,7 @@ pub(crate) async fn admin_run_status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(run_id): Path<String>,
-) -> Result<Json<OrchestratorRunStatusSnapshot>, Response> {
+) -> Result<Json<Value>, Response> {
     authorize_headers(&headers, &state.auth).map_err(|error| {
         state.runtime.record_denied();
         auth_error_response(error)
@@ -314,7 +314,53 @@ pub(crate) async fn admin_run_status_handler(
             "orchestrator run not found after resolving {run_id} to {diagnostics_run_id}"
         ))));
     };
-    Ok(Json(snapshot))
+    Ok(Json(
+        run_status_payload(&snapshot)
+            .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
+    ))
+}
+
+fn run_status_payload(snapshot: &OrchestratorRunStatusSnapshot) -> Result<Value, String> {
+    let mut payload = serde_json::to_value(snapshot)
+        .map_err(|error| format!("failed to serialize run status snapshot: {error}"))?;
+    enrich_run_status_lifecycle(&mut payload, snapshot);
+    Ok(payload)
+}
+
+fn enrich_run_status_lifecycle(payload: &mut Value, snapshot: &OrchestratorRunStatusSnapshot) {
+    if snapshot.state != "failed" {
+        return;
+    }
+    let Some(message) = snapshot.last_error.as_deref() else {
+        return;
+    };
+    if !is_needs_continuation_message(message) {
+        return;
+    }
+    payload["wire_state"] = Value::String(snapshot.state.clone());
+    payload["lifecycle_state"] = Value::String("needs_continuation".to_owned());
+    payload["partial"] = Value::Bool(true);
+    payload["continuation_required"] = Value::Bool(true);
+    payload["continuation_available"] = Value::Bool(true);
+    if let Some(reason_code) = continuation_reason_code(message) {
+        payload["reason_code"] = Value::String(reason_code.to_owned());
+    }
+}
+
+fn is_needs_continuation_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("needs_continuation=true") || lower.contains("needs continuation")
+}
+
+fn continuation_reason_code(message: &str) -> Option<&str> {
+    let marker = "reason_code=";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ',' | ')'))
+        .unwrap_or(rest.len());
+    let reason = rest[..end].trim();
+    (!reason.is_empty()).then_some(reason)
 }
 
 /// Returns a paginated orchestrator run tape for admin diagnostics.
@@ -417,4 +463,52 @@ pub(crate) async fn admin_run_cancel_handler(
         .await;
     }
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_status_payload_marks_resumable_failed_runs_as_needs_continuation() {
+        let snapshot = OrchestratorRunStatusSnapshot {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            state: "failed".to_owned(),
+            cancel_requested: false,
+            cancel_reason: None,
+            principal: "user:ops".to_owned(),
+            device_id: "device:test".to_owned(),
+            channel: None,
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            created_at_unix_ms: 1,
+            started_at_unix_ms: 2,
+            completed_at_unix_ms: Some(3),
+            updated_at_unix_ms: 3,
+            last_error: Some(
+                "agent loop wall-clock budget exhausted; needs_continuation=true reason_code=wall_clock"
+                    .to_owned(),
+            ),
+            origin_kind: "agent_run".to_owned(),
+            origin_run_id: None,
+            parent_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+            delegation: None,
+            merge_result: None,
+            tape_events: 42,
+        };
+
+        let payload = run_status_payload(&snapshot).expect("snapshot should serialize");
+
+        assert_eq!(payload["state"], "failed");
+        assert_eq!(payload["wire_state"], "failed");
+        assert_eq!(payload["lifecycle_state"], "needs_continuation");
+        assert_eq!(payload["continuation_required"], true);
+        assert_eq!(payload["continuation_available"], true);
+        assert_eq!(payload["partial"], true);
+        assert_eq!(payload["reason_code"], "wall_clock");
+    }
 }
