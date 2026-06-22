@@ -30,7 +30,10 @@ const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
 const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
 const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
+const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "palyra.fs.list_dir";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+const WORKSPACE_READ_FILE_TOOL_NAME: &str = "palyra.fs.read_file";
+const WORKSPACE_SEARCH_TOOL_NAME: &str = "palyra.fs.search";
 const RUN_PROGRESS_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const RUN_PROGRESS_CHECKPOINT_MAX_BYTES: usize = 8 * 1024;
 const RUN_PROGRESS_MAX_PRODUCED_FILES: usize = 16;
@@ -543,6 +546,7 @@ fn build_run_progress_checkpoint(
 ) -> RunProgressCheckpoint {
     let mut tool_calls_by_id = BTreeMap::<String, ProviderMessageToolCallRef>::new();
     let mut produced_files_by_path = BTreeMap::<String, RunProgressFileSummary>::new();
+    let mut satisfied_file_paths = BTreeSet::<String>::new();
     let mut process_by_pid = BTreeMap::<u32, RunProgressProcessSummary>::new();
     let mut known_failed_attempts = Vec::<String>::new();
     let mut last_successful_tool = None::<RunProgressToolSummary>;
@@ -575,6 +579,11 @@ fn build_run_progress_checkpoint(
                 output,
                 &mut produced_files_by_path,
             );
+            collect_satisfied_file_evidence(
+                tool_call.tool_name.as_str(),
+                output,
+                &mut satisfied_file_paths,
+            );
             collect_process_progress(tool_call.tool_name.as_str(), output, &mut process_by_pid);
             last_successful_tool = Some(tool_success_summary(tool_call.tool_name.as_str(), output));
         } else if known_failed_attempts.len() < RUN_PROGRESS_MAX_FAILED_ATTEMPTS {
@@ -584,7 +593,10 @@ fn build_run_progress_checkpoint(
     }
 
     let produced_files = produced_files_by_path.into_values().collect::<Vec<_>>();
-    let missing_artifacts = missing_artifacts_from_messages(messages, produced_files.as_slice());
+    for file in &produced_files {
+        insert_satisfied_path(file.path.as_str(), &mut satisfied_file_paths);
+    }
+    let missing_artifacts = missing_artifacts_from_messages(messages, &satisfied_file_paths);
     RunProgressCheckpoint {
         schema_version: RUN_PROGRESS_CHECKPOINT_SCHEMA_VERSION,
         run_id: run_id.to_owned(),
@@ -699,6 +711,74 @@ fn collect_os_file_artifacts(
                 .or_else(|| output.get("size_bytes").and_then(Value::as_u64)),
         },
     );
+}
+
+fn collect_satisfied_file_evidence(
+    tool_name: &str,
+    output: &Value,
+    satisfied_file_paths: &mut BTreeSet<String>,
+) {
+    match tool_name {
+        WORKSPACE_READ_FILE_TOOL_NAME => {
+            collect_output_path(output, "path", satisfied_file_paths);
+        }
+        WORKSPACE_LIST_DIR_TOOL_NAME => {
+            collect_output_path(output, "path", satisfied_file_paths);
+            collect_array_item_paths(output, "entries", satisfied_file_paths);
+        }
+        WORKSPACE_SEARCH_TOOL_NAME => {
+            collect_output_path(output, "path", satisfied_file_paths);
+            collect_array_item_paths(output, "matches", satisfied_file_paths);
+        }
+        OS_FILE_TOOL_NAME => collect_os_file_satisfied_paths(output, satisfied_file_paths),
+        _ => {}
+    }
+}
+
+fn collect_os_file_satisfied_paths(output: &Value, satisfied_file_paths: &mut BTreeSet<String>) {
+    match output.get("operation").and_then(Value::as_str).unwrap_or_default() {
+        "read" | "stat" => {
+            collect_output_path(output, "path", satisfied_file_paths);
+            collect_output_path(output, "resolved_path", satisfied_file_paths);
+        }
+        "list_dir" => {
+            collect_output_path(output, "path", satisfied_file_paths);
+            collect_output_path(output, "resolved_path", satisfied_file_paths);
+            collect_array_item_paths(output, "entries", satisfied_file_paths);
+        }
+        "search" => {
+            collect_output_path(output, "path", satisfied_file_paths);
+            collect_output_path(output, "resolved_path", satisfied_file_paths);
+            collect_array_item_paths(output, "matches", satisfied_file_paths);
+        }
+        _ => {}
+    }
+}
+
+fn collect_array_item_paths(
+    output: &Value,
+    array_key: &str,
+    satisfied_file_paths: &mut BTreeSet<String>,
+) {
+    let Some(items) = output.get(array_key).and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        collect_output_path(item, "path", satisfied_file_paths);
+        collect_output_path(item, "resolved_path", satisfied_file_paths);
+    }
+}
+
+fn collect_output_path(output: &Value, key: &str, satisfied_file_paths: &mut BTreeSet<String>) {
+    if let Some(path) = output.get(key).and_then(Value::as_str) {
+        insert_satisfied_path(path, satisfied_file_paths);
+    }
+}
+
+fn insert_satisfied_path(path: &str, satisfied_file_paths: &mut BTreeSet<String>) {
+    if let Some(path) = normalized_checkpoint_path_key(path) {
+        satisfied_file_paths.insert(path);
+    }
 }
 
 fn collect_process_progress(
@@ -884,14 +964,12 @@ fn tool_failure_summary(tool_name: &str, output: &Value) -> String {
 
 fn missing_artifacts_from_messages(
     messages: &[ProviderMessage],
-    produced_files: &[RunProgressFileSummary],
+    satisfied_file_paths: &BTreeSet<String>,
 ) -> Vec<RunProgressMissingArtifact> {
-    let produced =
-        produced_files.iter().map(|file| file.path.to_ascii_lowercase()).collect::<BTreeSet<_>>();
     let mut candidates = BTreeSet::<String>::new();
     for message in messages.iter().filter(|message| message.role == ProviderMessageRole::User) {
         for path in file_artifact_tokens(message.text_content().as_str()) {
-            if !produced.contains(path.to_ascii_lowercase().as_str()) {
+            if !artifact_path_satisfied(path.as_str(), satisfied_file_paths) {
                 candidates.insert(path);
             }
         }
@@ -905,6 +983,18 @@ fn missing_artifacts_from_messages(
             required_by: "task_prompt".to_owned(),
         })
         .collect()
+}
+
+fn artifact_path_satisfied(path: &str, satisfied_file_paths: &BTreeSet<String>) -> bool {
+    let Some(candidate) = normalized_checkpoint_path_key(path) else {
+        return false;
+    };
+    let candidate_suffix = format!("/{candidate}");
+    satisfied_file_paths.iter().any(|satisfied| {
+        satisfied == &candidate
+            || satisfied.ends_with(candidate_suffix.as_str())
+            || candidate.ends_with(format!("/{satisfied}").as_str())
+    })
 }
 
 fn file_artifact_tokens(text: &str) -> Vec<String> {
@@ -996,6 +1086,12 @@ fn checkpoint_next_action<'a>(
 
 fn checkpoint_path(path: &str) -> String {
     checkpoint_text(path.replace('\\', "/").as_str(), 260)
+}
+
+fn normalized_checkpoint_path_key(path: &str) -> Option<String> {
+    let normalized =
+        checkpoint_path(path).trim_start_matches("./").trim_matches('/').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn checkpoint_sha(value: &str) -> String {
@@ -1418,6 +1514,78 @@ mod tests {
         assert_eq!(
             checkpoint.last_successful_tool.as_ref().map(|tool| tool.tool_name.as_str()),
             Some(WORKSPACE_PATCH_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn progress_checkpoint_does_not_mark_successfully_read_prompt_files_missing() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text(
+                "Read SCENARIO_CONTEXT.txt and instruction.md, then continue.".to_owned(),
+            )],
+            2,
+            4,
+            10_000,
+        );
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![
+                crate::model_provider::ProviderOutputContentPart::ToolCall {
+                    proposal_id: "call-context".to_owned(),
+                    tool_name: OS_FILE_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "operation": "read",
+                        "path": "C:/runs/S006/SCENARIO_CONTEXT.txt"
+                    }),
+                },
+                crate::model_provider::ProviderOutputContentPart::ToolCall {
+                    proposal_id: "call-instruction".to_owned(),
+                    tool_name: OS_FILE_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "operation": "read",
+                        "path": "C:/runs/S006/instruction.md"
+                    }),
+                },
+            ],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![
+            ProviderMessage::tool_result(
+                "call-context",
+                serde_json::json!({
+                    "operation": "read",
+                    "path": "C:/runs/S006/SCENARIO_CONTEXT.txt",
+                    "resolved_path": "C:/runs/S006/SCENARIO_CONTEXT.txt",
+                    "text": "scenario context"
+                })
+                .to_string(),
+            ),
+            ProviderMessage::tool_result(
+                "call-instruction",
+                serde_json::json!({
+                    "operation": "read",
+                    "path": "C:/runs/S006/instruction.md",
+                    "resolved_path": "C:/runs/S006/instruction.md",
+                    "text": "scenario instructions"
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let checkpoint = state.progress_checkpoint("run-01", AgentLoopTerminationReason::WallClock);
+
+        assert!(
+            checkpoint.missing_artifacts.is_empty(),
+            "read files should satisfy prompt artifact references: {:?}",
+            checkpoint.missing_artifacts
+        );
+        assert!(
+            !checkpoint.recommended_next_action.contains("missing artifact"),
+            "checkpoint should not ask for already-read files: {}",
+            checkpoint.recommended_next_action
         );
     }
 
