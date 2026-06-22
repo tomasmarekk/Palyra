@@ -915,32 +915,38 @@ fn prepare_target_parent(
 
 fn input_write_bytes(input: &OsFileInput) -> Result<Vec<u8>, String> {
     match (input.content_text.as_ref(), input.bytes_base64.as_ref()) {
+        (Some(text), Some(bytes_base64)) if bytes_base64.is_empty() => input_text_bytes(text),
+        (Some(text), Some(bytes_base64)) if text.is_empty() => input_base64_bytes(bytes_base64),
         (Some(_), Some(_)) => Err(format!(
             "{OS_FILE_TOOL_NAME} write accepts either content_text or bytes_base64, not both"
         )),
-        (Some(text), None) => {
-            if text.len() > MAX_OS_FILE_WRITE_BYTES {
-                return Err(format!(
-                    "{OS_FILE_TOOL_NAME} content_text exceeds {MAX_OS_FILE_WRITE_BYTES} bytes"
-                ));
-            }
-            Ok(text.as_bytes().to_vec())
-        }
-        (None, Some(bytes_base64)) => {
-            let decoded = BASE64_STANDARD.decode(bytes_base64.as_bytes()).map_err(|error| {
-                format!("{OS_FILE_TOOL_NAME} bytes_base64 must be valid base64: {error}")
-            })?;
-            if decoded.len() > MAX_OS_FILE_WRITE_BYTES {
-                return Err(format!(
-                    "{OS_FILE_TOOL_NAME} bytes_base64 decoded payload exceeds {MAX_OS_FILE_WRITE_BYTES} bytes"
-                ));
-            }
-            Ok(decoded)
-        }
+        (Some(text), None) => input_text_bytes(text),
+        (None, Some(bytes_base64)) => input_base64_bytes(bytes_base64),
         (None, None) => {
             Err(format!("{OS_FILE_TOOL_NAME} write requires content_text or bytes_base64"))
         }
     }
+}
+
+fn input_text_bytes(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() > MAX_OS_FILE_WRITE_BYTES {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} content_text exceeds {MAX_OS_FILE_WRITE_BYTES} bytes"
+        ));
+    }
+    Ok(text.as_bytes().to_vec())
+}
+
+fn input_base64_bytes(bytes_base64: &str) -> Result<Vec<u8>, String> {
+    let decoded = BASE64_STANDARD.decode(bytes_base64.as_bytes()).map_err(|error| {
+        format!("{OS_FILE_TOOL_NAME} bytes_base64 must be valid base64: {error}")
+    })?;
+    if decoded.len() > MAX_OS_FILE_WRITE_BYTES {
+        return Err(format!(
+            "{OS_FILE_TOOL_NAME} bytes_base64 decoded payload exceeds {MAX_OS_FILE_WRITE_BYTES} bytes"
+        ));
+    }
+    Ok(decoded)
 }
 
 /// Converts read bytes into model-visible `(text, bytes_base64, redacted)`.
@@ -1571,6 +1577,75 @@ mod tests {
 
         assert_eq!(read.get("text").and_then(Value::as_str), Some("palyra-os-level-ok\n"));
         assert!(read.get("resolved_path").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn os_file_write_ignores_empty_bytes_base64_when_content_text_is_present() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("reports").join("text-write.md");
+
+        let write = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Write,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: Some("report from content_text\n".to_owned()),
+                bytes_base64: Some(String::new()),
+                create_parent_dirs: Some(true),
+                overwrite: Some(true),
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("empty bytes_base64 should not make text writes ambiguous");
+
+        assert_eq!(write.get("operation").and_then(Value::as_str), Some("write"));
+        assert_eq!(
+            fs::read_to_string(target.as_path()).expect("text target should be written"),
+            "report from content_text\n"
+        );
+    }
+
+    #[test]
+    fn os_file_write_ignores_empty_content_text_when_bytes_base64_is_present() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let policy = test_policy(tempdir.path());
+        let target = tempdir.path().join("reports").join("binary-write.bin");
+
+        execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Write,
+                path: target.to_string_lossy().into_owned(),
+                target_path: None,
+                content_text: Some(String::new()),
+                bytes_base64: Some("YmluYXJ5LXNhZmUK".to_owned()),
+                create_parent_dirs: Some(true),
+                overwrite: Some(true),
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect("empty content_text should not make base64 writes ambiguous");
+
+        assert_eq!(
+            fs::read(target.as_path()).expect("binary target should be written"),
+            b"binary-safe\n"
+        );
     }
 
     #[test]
