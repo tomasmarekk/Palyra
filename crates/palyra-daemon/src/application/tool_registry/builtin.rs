@@ -735,7 +735,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "cwd",
-                        json!({"type":"string","description":"Working directory. In sandbox mode, omit for the workspace root or use /workspace and /workspace/subdir as virtual workspace aliases. In host-access E2E mode, safe launch-context path prefixes such as %PALYRA_E2E_OS_ROOT%, $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, and $PALYRA_E2E_HOME are also accepted."}),
+                        json!({"type":"string","description":"Working directory. In sandbox mode, omit for the workspace root or use /workspace and /workspace/subdir as virtual workspace aliases. In host-access E2E mode, launch-context path prefixes are accepted only when they were explicitly provided by the CLI/tool context; do not invent $PALYRA_E2E_OS_ROOT or similar env aliases when the prompt already contains an absolute path."}),
                     ),
                     (
                         "env",
@@ -1456,6 +1456,7 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("cwd description should be visible to models");
         assert!(cwd_description.contains("/workspace/subdir"));
+        assert!(cwd_description.contains("do not invent $PALYRA_E2E_OS_ROOT"));
 
         let env_description = entry
             .input_schema
