@@ -23,7 +23,7 @@ use crate::{
 /// Bump it whenever any contract text below changes so downstream hash
 /// comparisons (caching, journaled identity) see the change; the unit tests
 /// pin the current value.
-pub(crate) const INSTRUCTION_COMPILER_VERSION: u32 = 29;
+pub(crate) const INSTRUCTION_COMPILER_VERSION: u32 = 30;
 
 /// Aggregated trust posture of the context blocks selected for the turn,
 /// embedded into the developer message so the model is told how much of its
@@ -269,7 +269,7 @@ fn tool_specific_contract(tool_names: &[String]) -> String {
         contracts.push("palyra.artifact.read contract: textual tool-result artifacts default to text_preview=true for model evidence. Provider raw artifacts reject full binary reads but the runtime will return a bounded redacted text preview when possible; if an explicit full read is denied, retry once with text_preview=true, a small max_bytes value, and the same artifact_id/digest. Page through evidence with offset_bytes only when the previous preview was useful and eof=false.".to_owned());
     }
     if tool_names.iter().any(|tool| tool == "palyra.image.observe") {
-        contracts.push("palyra.image.observe contract: use this tool for local image files, screenshots saved to a workspace path, or image artifact ids when the task depends on visual or OCR content. The tool returns image metadata plus OCR/vision fields when a backend is available; if no OCR or vision backend is configured, treat error_code=vision_not_available as the authoritative one-step capability result and stop workaround loops. Do not decode image base64, do not install OCR packages globally, and do not call palyra.artifact.read for binary image interpretation.".to_owned());
+        contracts.push("palyra.image.observe contract: use this tool for local image files, screenshots saved to a workspace path, or image artifact ids when the task depends on visual or OCR content. The tool returns image metadata plus OCR/vision fields when a backend is available; if no OCR or vision backend is configured, treat error_code=vision_not_available, capability_status=unsupported, should_continue_image_task=false, and oracle_workaround_allowed=false as the authoritative one-step capability result. For image-dependent tasks, stop workaround loops and report the unsupported OCR/vision capability; do not infer visual content from verifier tests, golden files, expected-output hashes, companion files, or other oracle material. Do not decode image base64, do not install OCR packages globally, and do not call palyra.artifact.read for binary image interpretation.".to_owned());
     }
     if tool_names.iter().any(|tool| tool == "palyra.memory.status") {
         contracts.push("palyra.memory.status contract: for memory capacity, consolidation, cleanup, or retention-limit questions, call palyra.memory.status before deciding whether memory is full. Treat capacity_state as authoritative: no_hard_capacity_configured means there is no configured entries/bytes hard limit, near_limit means consolidation may be useful, and over_limit means cleanup or replacement is needed. Do not infer capacity from palyra.memory.search hit_count; zero search hits means no relevant matches, not empty memory.".to_owned());
@@ -402,7 +402,7 @@ mod tests {
         let first = compiler.compile_with_runtime_context(input.clone(), fixed_runtime_context());
         let second = compiler.compile_with_runtime_context(input, fixed_runtime_context());
         assert_eq!(first.hash, second.hash);
-        assert_eq!(first.version, 29);
+        assert_eq!(first.version, 30);
         assert_eq!(first.provider_messages().len(), 2);
     }
 
@@ -663,7 +663,11 @@ mod tests {
         assert!(contract.contains("local image files"));
         assert!(contract.contains("screenshots saved to a workspace path"));
         assert!(contract.contains("error_code=vision_not_available"));
+        assert!(contract.contains("capability_status=unsupported"));
+        assert!(contract.contains("should_continue_image_task=false"));
+        assert!(contract.contains("oracle_workaround_allowed=false"));
         assert!(contract.contains("stop workaround loops"));
+        assert!(contract.contains("do not infer visual content from verifier tests"));
         assert!(contract.contains("Do not decode image base64"));
         assert!(contract.contains("do not install OCR packages globally"));
         assert!(contract.contains("palyra.artifact.read"));

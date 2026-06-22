@@ -439,7 +439,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.image.observe",
-            "Observe an image path or artifact without returning base64; returns OCR/vision metadata when available, otherwise a structured vision_not_available capability error.",
+            "Observe an image path or artifact without returning base64; returns OCR/vision metadata when available, otherwise a structured unsupported capability error that forbids verifier-oracle workarounds.",
             object_schema(
                 &[],
                 vec![

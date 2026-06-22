@@ -25,6 +25,9 @@ use crate::{
 };
 
 const IMAGE_OBSERVE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const IMAGE_OBSERVE_UNSUPPORTED_MESSAGE: &str =
+    "Current Palyra runtime has no OCR or vision capability configured for image artifacts.";
+const IMAGE_OBSERVE_UNSUPPORTED_NEXT_ACTION: &str = "Stop this image-dependent workflow and report that OCR/vision is unsupported in the current runtime; do not infer visual content from verifier tests, golden files, expected-output hashes, or companion files.";
 
 #[derive(Debug, Deserialize)]
 struct ImageObserveInput {
@@ -251,43 +254,42 @@ fn read_image_metadata(
 }
 
 fn capability_error_for_file(metadata: ImageFileMetadata) -> Value {
-    json!({
-        "success": false,
-        "error": "vision_not_available",
-        "error_code": "vision_not_available",
-        "message": "Current Palyra runtime has no OCR or vision capability configured for image artifacts.",
-        "target": {
+    let mut output = image_observe_unsupported_base();
+    output["target"] = json!({
             "kind": "file",
             "path": metadata.path,
             "workspace_root_index": metadata.workspace_root_index,
-        },
-        "mime_type": metadata.mime_type,
-        "size_bytes": metadata.size_bytes,
-        "sha256": metadata.sha256,
-        "width": metadata.width,
-        "height": metadata.height,
-        "ocr": {
-            "available": false,
-            "text": "",
-            "confidence": null,
-            "blocks": [],
-        },
-        "vision_summary": null,
-        "capabilities": image_observe_capabilities(),
-    })
+    });
+    output["mime_type"] = json!(metadata.mime_type);
+    output["size_bytes"] = json!(metadata.size_bytes);
+    output["sha256"] = json!(metadata.sha256);
+    output["width"] = json!(metadata.width);
+    output["height"] = json!(metadata.height);
+    output
 }
 
 fn capability_error_for_artifact(artifact_id: &str, expected_digest_sha256: Option<&str>) -> Value {
+    let mut output = image_observe_unsupported_base();
+    output["target"] = json!({
+            "kind": "artifact",
+            "artifact_id": artifact_id,
+            "expected_digest_sha256": expected_digest_sha256,
+    });
+    output
+}
+
+fn image_observe_unsupported_base() -> Value {
     json!({
         "success": false,
         "error": "vision_not_available",
         "error_code": "vision_not_available",
-        "message": "Current Palyra runtime has no OCR or vision capability configured for image artifacts.",
-        "target": {
-            "kind": "artifact",
-            "artifact_id": artifact_id,
-            "expected_digest_sha256": expected_digest_sha256,
-        },
+        "message": IMAGE_OBSERVE_UNSUPPORTED_MESSAGE,
+        "capability_status": "unsupported",
+        "blocked_capability": "ocr_or_vision",
+        "should_continue_image_task": false,
+        "oracle_workaround_allowed": false,
+        "next_action": IMAGE_OBSERVE_UNSUPPORTED_NEXT_ACTION,
+        "claim_boundary": "image content is unknown; do not claim image-derived facts unless a later successful OCR/vision capability provides them",
         "ocr": {
             "available": false,
             "text": "",
@@ -314,7 +316,22 @@ fn image_observe_capabilities() -> Value {
         "ocr_available": false,
         "vision_available": false,
         "provider_handoff_available": false,
-        "fallback": "capability_error",
+        "fallback": "unsupported_capability",
+        "unsupported_capability": {
+            "name": "ocr_or_vision",
+            "should_continue_image_task": false,
+            "oracle_workaround_allowed": false,
+        },
+        "actionable_fallbacks": [
+            {
+                "kind": "runtime_configuration",
+                "description": "enable an OCR/vision backend before running image-dependent workflows",
+            },
+            {
+                "kind": "user_attachment",
+                "description": "submit the image as a normal user attachment to a vision-capable provider instead of relying on workspace-path observation",
+            },
+        ],
     })
 }
 
@@ -444,7 +461,8 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        image_dimensions, image_mime_type, read_image_metadata_from_roots, strip_workspace_alias,
+        capability_error_for_file, image_dimensions, image_mime_type,
+        read_image_metadata_from_roots, strip_workspace_alias, ImageFileMetadata,
     };
 
     #[test]
@@ -496,5 +514,32 @@ mod tests {
         assert_eq!(image_mime_type(&gif), "image/gif");
         assert_eq!(image_dimensions(&gif), Some((4, 5)));
         assert_eq!(strip_workspace_alias("/workspace/code.png"), "code.png");
+    }
+
+    #[test]
+    fn image_observe_unsupported_capability_blocks_oracle_workarounds() {
+        let output = capability_error_for_file(ImageFileMetadata {
+            path: "chess_board.png".to_owned(),
+            workspace_root_index: 0,
+            mime_type: "image/png".to_owned(),
+            size_bytes: 128,
+            sha256: "abc123".to_owned(),
+            width: Some(8),
+            height: Some(8),
+        });
+
+        assert_eq!(output["error_code"], "vision_not_available");
+        assert_eq!(output["capability_status"], "unsupported");
+        assert_eq!(output["blocked_capability"], "ocr_or_vision");
+        assert_eq!(output["should_continue_image_task"], false);
+        assert_eq!(output["oracle_workaround_allowed"], false);
+        assert!(output["next_action"]
+            .as_str()
+            .expect("next action should be model-visible")
+            .contains("do not infer visual content from verifier tests"));
+        assert_eq!(
+            output["capabilities"]["unsupported_capability"]["oracle_workaround_allowed"],
+            false
+        );
     }
 }
