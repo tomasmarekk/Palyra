@@ -144,8 +144,9 @@ use palyra_common::{
     },
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{
-        is_sensitive_key, redact_auth_error, redact_internal_runtime_paths, redact_url,
-        redact_url_segments_in_text, redact_url_strict, REDACTED,
+        is_benign_path_reference_value, is_sensitive_key, redact_auth_error,
+        redact_internal_runtime_paths, redact_url, redact_url_segments_in_text, redact_url_strict,
+        REDACTED,
     },
     replay_bundle::{
         build_replay_bundle, canonical_replay_bundle_bytes, ensure_replay_report_passed,
@@ -2319,6 +2320,9 @@ fn flush_diagnostic_sensitive_token(token: &str, output: &mut String) {
 fn redact_diagnostic_assignment_token(token: &str) -> Option<String> {
     let (key, separator, value) = split_diagnostic_assignment(token)?;
     if value.is_empty() || !is_sensitive_key(key) {
+        return None;
+    }
+    if is_benign_path_reference_value(value) {
         return None;
     }
     Some(format!("{key}{separator}{REDACTED}"))
@@ -5836,6 +5840,9 @@ fn agent_status_message_text(status: &common_v1::StreamStatus) -> String {
     if let Some(progress) = safe_agent_progress_status_message(status) {
         return progress.to_owned();
     }
+    if let Some(message) = safe_agent_lifecycle_status_message(status) {
+        return quoted_text_field(message.as_str());
+    }
     redacted_presence_for_output(!status.message.trim().is_empty())
 }
 
@@ -5845,6 +5852,9 @@ fn agent_status_message_json(status: &common_v1::StreamStatus) -> Value {
     }
     if let Some(progress) = safe_agent_progress_status_message(status) {
         return Value::String(progress.to_owned());
+    }
+    if let Some(message) = safe_agent_lifecycle_status_message(status) {
+        return Value::String(message);
     }
     redacted_presence_json_value(!status.message.trim().is_empty())
 }
@@ -5891,6 +5901,18 @@ fn safe_agent_progress_status_message(status: &common_v1::StreamStatus) -> Optio
     } else {
         None
     }
+}
+
+fn safe_agent_lifecycle_status_message(status: &common_v1::StreamStatus) -> Option<String> {
+    if !matches!(
+        common_v1::stream_status::StatusKind::try_from(status.kind).ok()?,
+        common_v1::stream_status::StatusKind::InProgress
+            | common_v1::stream_status::StatusKind::Done
+    ) {
+        return None;
+    }
+    let sanitized = sanitize_diagnostic_error(status.message.as_str()).trim().to_owned();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 fn safe_stream_label_for_output(value: &str) -> String {
@@ -6370,6 +6392,32 @@ mod agent_stream_output_tests {
 
         assert_eq!(agent_status_message_text(&accepted), REDACTED);
         assert_eq!(agent_status_message_json(&accepted), Value::String(REDACTED.to_owned()));
+    }
+
+    #[test]
+    fn done_status_output_preserves_safe_lifecycle_message() {
+        let done = status(common_v1::stream_status::StatusKind::Done, "completed");
+
+        assert_eq!(agent_status_message_text(&done), "\"completed\"");
+        assert_eq!(agent_status_message_json(&done), Value::String("completed".to_owned()));
+    }
+
+    #[test]
+    fn ndjson_status_preserves_benign_secret_file_path_message() {
+        let event = common_v1::RunStreamEvent {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            run_id: Some(common_v1::CanonicalId { ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned() }),
+            body: Some(common_v1::run_stream_event::Body::Status(status(
+                common_v1::stream_status::StatusKind::Done,
+                "completed with SECRET_FILE=/app/secret.txt",
+            ))),
+        };
+
+        let value = agent_event_json_value(&event);
+
+        assert_eq!(value["type"], "run.status");
+        assert_eq!(value["kind"], "done");
+        assert_eq!(value["message"], "completed with SECRET_FILE=/app/secret.txt");
     }
 
     #[test]

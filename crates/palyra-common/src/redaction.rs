@@ -382,6 +382,9 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     if value.is_empty() {
         return false;
     }
+    if strictness == RedactionStrictness::Heuristic && is_benign_path_reference_value(value) {
+        return false;
+    }
     if strictness == RedactionStrictness::Diagnostic {
         return true;
     }
@@ -395,6 +398,43 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
 
 fn assignment_key_is_sensitive(key: &str) -> bool {
     sensitive_assignment_key(key).is_some()
+}
+
+/// Returns true when a sensitive-keyed assignment value is only a local path
+/// reference, not credential material.
+#[must_use]
+pub fn is_benign_path_reference_value(value: &str) -> bool {
+    let normalized =
+        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || lowered.starts_with("bearer ")
+        || lowered.starts_with("sk-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
+        || lowered.starts_with("xox")
+        || lowered.contains("palyra_test_secret")
+        || lowered.contains("dummy_secret")
+        || lowered.contains("should_not_leak")
+        || lowered.contains("secret_should_not_appear")
+    {
+        return false;
+    }
+    let has_path_separator = normalized.contains('/') || normalized.contains('\\');
+    let has_path_extension = normalized
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|file_name| file_name.contains('.') && !file_name.starts_with('.'));
+    has_path_separator
+        && has_path_extension
+        && normalized.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '\\' | ':' | '.' | '_' | '-' | ' ' | '~' | '%' | '+')
+        })
 }
 
 fn sensitive_assignment_key(key: &str) -> Option<&str> {
@@ -646,6 +686,28 @@ mod tests {
 
         assert!(redacted.contains("token=a%3Db%3Dc"), "{redacted}");
         assert!(redacted.contains("selector=#password"), "{redacted}");
+    }
+
+    #[test]
+    fn auth_error_redaction_preserves_secret_file_path_assignments() {
+        let redacted = redact_auth_error(
+            "fixture line: SECRET_FILE=/app/secret.txt PRIVATE_KEY_FILE=C:\\Users\\demo\\keys\\private-key.pem",
+        );
+
+        assert!(redacted.contains("SECRET_FILE=/app/secret.txt"), "{redacted}");
+        assert!(
+            redacted.contains("PRIVATE_KEY_FILE=C:\\Users\\demo\\keys\\private-key.pem"),
+            "{redacted}"
+        );
+        assert!(!redacted.contains(REDACTED), "{redacted}");
+    }
+
+    #[test]
+    fn strict_auth_error_redaction_still_masks_secret_file_path_assignments() {
+        let redacted = redact_auth_error_strict("fixture line: SECRET_FILE=/app/secret.txt");
+
+        assert!(redacted.contains("SECRET_FILE=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("/app/secret.txt"), "{redacted}");
     }
 
     #[test]

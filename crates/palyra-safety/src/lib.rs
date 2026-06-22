@@ -1030,6 +1030,7 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_vault_reference_value(normalized)
         || is_obvious_placeholder_secret_value(normalized)
         || is_benign_mock_credential_fixture_value(normalized)
+        || is_benign_path_reference_value(normalized)
         || is_dom_input_value_reference(normalized)
         || is_non_literal_source_expression_value(normalized)
 }
@@ -1191,6 +1192,33 @@ fn is_benign_mock_credential_fixture_value(value: &str) -> bool {
         normalized.as_str(),
         "demo" | "demo/demo" | "test" | "test/test" | "password" | "password1" | "git"
     )
+}
+
+fn is_benign_path_reference_value(value: &str) -> bool {
+    let normalized =
+        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
+    if normalized.is_empty()
+        || contains_secret_like_marker(normalized)
+        || detect_prefixed_secret_token(normalized).is_some()
+    {
+        return false;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("bearer ")
+    {
+        return false;
+    }
+    let has_path_separator = normalized.contains('/') || normalized.contains('\\');
+    let has_path_extension = normalized
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|file_name| file_name.contains('.') && !file_name.starts_with('.'));
+    has_path_separator
+        && has_path_extension
+        && normalized.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '\\' | ':' | '.' | '_' | '-' | ' ' | '~' | '%' | '+')
+        })
 }
 
 /// Extracts the contents of all balanced `"…"`/`'…'` literals in `value`.
@@ -2449,6 +2477,51 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn secret_file_path_assignments_are_not_redacted_as_secret_values() {
+        let source = "SECRET_FILE=/app/secret.txt\n\
+                      PRIVATE_KEY_FILE=\"C:\\\\Users\\\\demo\\\\keys\\\\private-key.pem\"\n\
+                      token_path = '/tmp/local-token.fixture'";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("SECRET_FILE=/app/secret.txt"));
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn sensitive_assignment_path_allowlist_does_not_hide_token_values() {
+        let source = "SECRET_FILE=/app/secret.txt\n\
+                      API_KEY=sk-test-secret-token-value-1234567890";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("SECRET_FILE=/app/secret.txt"));
+        assert!(outcome.redacted_text.contains("API_KEY=[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("sk-test-secret-token-value"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
     }
 
     #[test]
