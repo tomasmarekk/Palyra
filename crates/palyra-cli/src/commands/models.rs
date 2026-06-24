@@ -941,14 +941,18 @@ fn run_provider_checks(
     refresh: bool,
     discover: bool,
 ) -> Result<ModelsConnectionPayload> {
+    let mut force_local_refresh = refresh;
     if path.is_none() {
         if let Ok(payload) =
             run_provider_checks_via_console(provider_filter.clone(), timeout_ms, discover)
         {
-            return Ok(payload);
+            if !console_missing_auth_needs_local_probe(payload.providers.as_slice())? {
+                return Ok(payload);
+            }
+            force_local_refresh = true;
         }
     }
-    run_provider_checks_local(path, provider_filter, timeout_ms, refresh, discover)
+    run_provider_checks_local(path, provider_filter, timeout_ms, force_local_refresh, discover)
 }
 
 fn run_provider_checks_via_console(
@@ -1018,6 +1022,42 @@ fn console_probe_envelope_to_models_payload(
         provider_count: envelope.provider_count,
         providers,
     }
+}
+
+fn console_missing_auth_needs_local_probe(
+    console_providers: &[ProviderConnectionCheckPayload],
+) -> Result<bool> {
+    if !console_providers.iter().any(provider_probe_reports_missing_auth) {
+        return Ok(false);
+    }
+
+    let overview = load_models_overview(None)?;
+    let targets = build_probeable_providers(&overview)?;
+    Ok(console_missing_auth_matches_local_credentials(console_providers, targets.as_slice()))
+}
+
+fn console_missing_auth_matches_local_credentials(
+    console_providers: &[ProviderConnectionCheckPayload],
+    local_targets: &[ProbeableProvider],
+) -> bool {
+    console_providers.iter().filter(|provider| provider_probe_reports_missing_auth(provider)).any(
+        |provider| {
+            local_targets.iter().any(|target| {
+                target.provider_id == provider.provider_id
+                    && probeable_provider_has_configured_credential(target)
+            })
+        },
+    )
+}
+
+fn provider_probe_reports_missing_auth(provider: &ProviderConnectionCheckPayload) -> bool {
+    provider.state == "missing_auth" && provider.credential_source == "none"
+}
+
+fn probeable_provider_has_configured_credential(provider: &ProbeableProvider) -> bool {
+    provider.auth_profile_id.as_deref().and_then(normalize_optional_text).is_some()
+        || provider.inline_api_key.as_deref().and_then(normalize_optional_text).is_some()
+        || provider.vault_ref.as_deref().and_then(normalize_optional_text).is_some()
 }
 
 fn run_provider_checks_local(
@@ -3339,6 +3379,28 @@ mod tests {
         }
     }
 
+    fn sample_provider_check(
+        state: &str,
+        credential_source: &str,
+    ) -> ProviderConnectionCheckPayload {
+        ProviderConnectionCheckPayload {
+            provider_id: "openai-primary".to_owned(),
+            kind: OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned(),
+            enabled: true,
+            endpoint_base_url: Some("https://api.openai.com/v1".to_owned()),
+            credential_source: credential_source.to_owned(),
+            state: state.to_owned(),
+            message: "test".to_owned(),
+            checked_at_unix_ms: 1,
+            cache_status: "miss".to_owned(),
+            live_discovery_verified: false,
+            discovery_source: "live".to_owned(),
+            discovered_model_ids: Vec::new(),
+            configured_model_ids: Vec::new(),
+            latency_ms: None,
+        }
+    }
+
     #[test]
     fn discovered_model_selection_uses_complete_provider_recency_metadata() {
         let models = parse_discovered_provider_models(
@@ -3435,6 +3497,31 @@ mod tests {
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].auth_profile_id.as_deref(), Some("xai-oauth-test"));
         assert_eq!(providers[0].auth_provider_kind.as_deref(), Some("xai"));
+    }
+
+    #[test]
+    fn console_missing_auth_with_local_profile_requires_local_probe() {
+        let console_provider = sample_provider_check("missing_auth", "none");
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+
+        assert!(console_missing_auth_matches_local_credentials(&[console_provider], &[target]));
+    }
+
+    #[test]
+    fn console_missing_auth_without_local_credential_keeps_console_result() {
+        let console_provider = sample_provider_check("missing_auth", "none");
+        let mut target = sample_probe_target("https://api.openai.com/v1", false);
+        target.auth_profile_id = None;
+
+        assert!(!console_missing_auth_matches_local_credentials(&[console_provider], &[target]));
+    }
+
+    #[test]
+    fn console_ok_probe_does_not_retry_locally() {
+        let console_provider = sample_provider_check("ok", "auth_profile");
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+
+        assert!(!console_missing_auth_matches_local_credentials(&[console_provider], &[target]));
     }
 
     #[test]
