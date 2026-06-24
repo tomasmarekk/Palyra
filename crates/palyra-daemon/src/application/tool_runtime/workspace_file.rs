@@ -593,7 +593,9 @@ fn parse_workspace_search_input(input_json: &[u8]) -> Result<WorkspaceSearchInpu
 }
 
 fn normalize_optional_workspace_root(workspace_root: Option<String>) -> Option<String> {
-    workspace_root.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+    workspace_root
+        .map(|value| normalize_workspace_path_input(value.as_str()))
+        .filter(|value| !value.is_empty())
 }
 
 /// Normalizes raw tool path input to `/` separators and strips the
@@ -3121,6 +3123,94 @@ mod tests {
         assert_eq!(output.path, "calculator.js");
         assert_eq!(output.text.as_deref(), Some("export const add = (a, b) => a + b;\n"));
         assert_eq!(output.workspace_root_index, 0);
+    }
+
+    #[test]
+    fn workspace_file_tools_accept_virtual_workspace_root_override_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        fs::create_dir_all(workspace.join("tmp")).expect("tmp dir should exist");
+        fs::write(workspace.join("tmp").join("status.json"), r#"{"status":"ready"}"#)
+            .expect("workspace file should be written");
+
+        let read_input = parse_workspace_read_file_input(
+            br#"{"path":"tmp/status.json","workspace_root":"/workspace"}"#,
+        )
+        .expect("read input should parse");
+        assert_eq!(read_input.workspace_root, None);
+        let read_roots = resolve_workspace_file_roots_for_override(
+            WORKSPACE_READ_FILE_TOOL_NAME,
+            std::slice::from_ref(&workspace),
+            read_input.workspace_root.as_deref(),
+        )
+        .expect("virtual workspace root should resolve for read_file");
+        let read = read_workspace_file_from_roots(read_roots.as_slice(), &read_input)
+            .expect("virtual workspace-root read should succeed");
+        assert_eq!(read.path, "tmp/status.json");
+        assert_eq!(read.text.as_deref(), Some(r#"{"status":"ready"}"#));
+
+        let list_input = parse_workspace_list_dir_input(
+            br#"{"path":"","workspace_root":"/workspace","max_entries":10}"#,
+        )
+        .expect("list input should parse");
+        assert_eq!(list_input.workspace_root, None);
+        let list_roots = resolve_workspace_file_roots_for_override(
+            WORKSPACE_LIST_DIR_TOOL_NAME,
+            std::slice::from_ref(&workspace),
+            list_input.workspace_root.as_deref(),
+        )
+        .expect("virtual workspace root should resolve for list_dir");
+        let listed = list_workspace_dir_from_roots(list_roots.as_slice(), &list_input)
+            .expect("virtual workspace-root list should succeed");
+        assert_eq!(listed.path, ".");
+        assert_eq!(
+            listed.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["tmp"]
+        );
+
+        let search_input =
+            parse_workspace_search_input(br#"{"query":"ready","workspace_root":"/workspace"}"#)
+                .expect("search input should parse");
+        assert_eq!(search_input.workspace_root, None);
+        let search_roots = resolve_workspace_file_roots_for_override(
+            WORKSPACE_SEARCH_TOOL_NAME,
+            std::slice::from_ref(&workspace),
+            search_input.workspace_root.as_deref(),
+        )
+        .expect("virtual workspace root should resolve for search");
+        let searched = search_workspace_from_roots(search_roots.as_slice(), &search_input)
+            .expect("virtual workspace-root search should succeed");
+        assert_eq!(
+            searched.matches.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["tmp/status.json"]
+        );
+    }
+
+    #[test]
+    fn workspace_file_tools_accept_virtual_workspace_subdirectory_override_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let project = workspace.join("agent-smoke");
+        fs::create_dir_all(&project).expect("project dir should exist");
+        fs::write(project.join("calculator.js"), "export const add = (a, b) => a + b;\n")
+            .expect("workspace file should be written");
+        let input = parse_workspace_read_file_input(
+            br#"{"path":"calculator.js","workspace_root":"/workspace/agent-smoke"}"#,
+        )
+        .expect("workspace_root alias should parse");
+        assert_eq!(input.workspace_root.as_deref(), Some("agent-smoke"));
+        let roots = resolve_workspace_file_roots_for_override(
+            WORKSPACE_READ_FILE_TOOL_NAME,
+            std::slice::from_ref(&workspace),
+            input.workspace_root.as_deref(),
+        )
+        .expect("virtual workspace subdirectory should resolve");
+
+        let output =
+            read_workspace_file_from_roots(roots.as_slice(), &input).expect("file should read");
+
+        assert_eq!(output.path, "calculator.js");
+        assert_eq!(output.text.as_deref(), Some("export const add = (a, b) => a + b;\n"));
     }
 
     #[test]
