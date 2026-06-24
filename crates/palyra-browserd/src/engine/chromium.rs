@@ -2816,6 +2816,49 @@ pub(crate) async fn chromium_clear_active_origin_storage(
     parse_chromium_clear_storage_status(value)
 }
 
+/// Clears cookies visible to Chromium for the active tab's current URL and
+/// returns the number of delete requests sent to CDP.
+///
+/// # Errors
+/// Returns lookup sentinels, remote-IP guard incidents, or a CDP cookie read or
+/// delete failure.
+pub(crate) async fn chromium_clear_active_tab_cookies(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<u32, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    let deleted = run_chromium_blocking("chromium clear active tab cookies", move || {
+        let cookies = tab
+            .get_cookies()
+            .map_err(|error| format!("failed to read Chromium cookies: {error}"))?;
+        let delete_requests = chromium_cookie_delete_requests(cookies.as_slice());
+        let deleted = u32::try_from(delete_requests.len()).unwrap_or(u32::MAX);
+        if !delete_requests.is_empty() {
+            tab.delete_cookies(delete_requests)
+                .map_err(|error| format!("failed to delete Chromium cookies: {error}"))?;
+        }
+        Ok(deleted)
+    })
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(deleted)
+}
+
+fn chromium_cookie_delete_requests(cookies: &[Network::Cookie]) -> Vec<Network::DeleteCookies> {
+    cookies
+        .iter()
+        .filter(|cookie| !cookie.name.trim().is_empty())
+        .map(|cookie| Network::DeleteCookies {
+            name: cookie.name.clone(),
+            url: None,
+            domain: (!cookie.domain.trim().is_empty()).then(|| cookie.domain.clone()),
+            path: (!cookie.path.trim().is_empty()).then(|| cookie.path.clone()),
+            partition_key: cookie.partition_key.clone(),
+        })
+        .collect()
+}
+
 async fn chromium_read_document_cookies(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4866,10 +4909,11 @@ fn chromium_viewport_metrics_mismatch(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        chromium_network_log_headers, chromium_read_document_cookies_script,
-        chromium_read_local_storage_script, chromium_restore_local_storage_script,
-        chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
-        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
+        chromium_cookie_delete_requests, chromium_network_log_headers,
+        chromium_read_document_cookies_script, chromium_read_local_storage_script,
+        chromium_restore_local_storage_script, chromium_touch_emulation_max_touch_points,
+        chromium_transport_idle_timeout, chromium_upload_staging_path,
+        chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -5307,6 +5351,46 @@ mod tests {
             .expect_err("page-side storage clear failure must be surfaced");
 
         assert!(error.contains("localStorage unavailable"));
+    }
+
+    #[test]
+    fn chromium_cookie_delete_requests_preserve_match_fields_without_values() {
+        let cookie: crate::Network::Cookie = serde_json::from_value(serde_json::json!({
+            "name": "session",
+            "value": "secret-cookie-value",
+            "domain": ".example.test",
+            "path": "/app",
+            "expires": -1,
+            "size": 26,
+            "httpOnly": true,
+            "secure": true,
+            "session": true,
+            "priority": "Medium",
+            "sameParty": false,
+            "sourceScheme": "Secure",
+            "sourcePort": 443,
+            "partitionKey": {
+                "topLevelSite": "https://example.test",
+                "hasCrossSiteAncestor": false
+            }
+        }))
+        .expect("test cookie should match CDP schema");
+
+        let delete_requests = chromium_cookie_delete_requests(&[cookie]);
+
+        assert_eq!(delete_requests.len(), 1);
+        let request = &delete_requests[0];
+        assert_eq!(request.name, "session");
+        assert_eq!(request.domain.as_deref(), Some(".example.test"));
+        assert_eq!(request.path.as_deref(), Some("/app"));
+        assert!(request.url.is_none());
+        assert!(request.partition_key.is_some());
+        let encoded =
+            serde_json::to_value(request).expect("delete request should serialize as CDP JSON");
+        assert!(
+            encoded.get("value").is_none(),
+            "cookie values must not be sent in delete requests"
+        );
     }
 
     #[test]

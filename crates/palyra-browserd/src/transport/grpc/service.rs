@@ -110,6 +110,19 @@ fn observe_capture_text_limit(requested: u64, session_limit: u64) -> usize {
     observe_byte_limit(requested, session_limit)
 }
 
+fn append_reset_state_error(current: &mut String, next: impl AsRef<str>) {
+    let next = next.as_ref();
+    if next.trim().is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(next);
+    } else {
+        current.push_str("; ");
+        current.push_str(next);
+    }
+}
+
 /// Trims, dedupes, length-caps, and count-caps requested capture selectors.
 fn normalize_observe_capture_selectors(selectors: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
@@ -3475,8 +3488,26 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 }
                 Err(error) => {
                     response.success = false;
-                    response.error =
-                        format!("failed to clear active Chromium origin storage: {error}");
+                    append_reset_state_error(
+                        &mut response.error,
+                        format!("failed to clear active Chromium origin storage: {error}"),
+                    );
+                }
+            }
+        }
+        if clear_cookies && matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium) {
+            match chromium_clear_active_tab_cookies(self.runtime.as_ref(), session_id.as_str())
+                .await
+            {
+                Ok(cookies_cleared) => {
+                    response.cookies_cleared = response.cookies_cleared.max(cookies_cleared);
+                }
+                Err(error) => {
+                    response.success = false;
+                    append_reset_state_error(
+                        &mut response.error,
+                        format!("failed to clear active Chromium cookies: {error}"),
+                    );
                 }
             }
         }
