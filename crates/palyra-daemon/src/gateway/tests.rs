@@ -53,7 +53,8 @@ use ulid::Ulid;
 use super::vault::vault_get_requires_approval;
 use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
-    enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
+    enforce_vault_get_approval_policy, enforce_vault_scope_access,
+    has_windows_absolute_path_prefix, ingest_memory_best_effort,
     matching_tool_approval_response_id, process_runner_input_should_use_active_root,
     process_runner_input_should_use_launch_root, process_runner_input_with_path_env,
     process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
@@ -165,6 +166,14 @@ fn process_runner_launch_root_selection_handles_generic_workspace_cwd() {
     assert!(!process_runner_input_should_use_launch_root(
         br#"{"command":"node","args":["C:/fixtures/project/slow-report.js"],"cwd":"/workspace"}"#
     ));
+}
+
+#[test]
+fn process_runner_detects_windows_absolute_paths_on_any_host() {
+    assert!(has_windows_absolute_path_prefix(r"C:\fixtures\project\slow-report.js"));
+    assert!(has_windows_absolute_path_prefix("C:/fixtures/project/slow-report.js"));
+    assert!(has_windows_absolute_path_prefix(r"\\server\share\project\slow-report.js"));
+    assert!(!has_windows_absolute_path_prefix("fixtures/project/slow-report.js"));
 }
 
 #[test]

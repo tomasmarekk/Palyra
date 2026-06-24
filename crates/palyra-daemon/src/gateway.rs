@@ -1474,9 +1474,19 @@ fn process_path_candidates(raw: &str) -> Vec<PathBuf> {
 
 fn push_process_path_candidate(candidates: &mut Vec<PathBuf>, value: &str) {
     let path = PathBuf::from(value);
-    if path.is_absolute() {
+    if path.is_absolute() || has_windows_absolute_path_prefix(value) {
         candidates.push(path);
     }
+}
+
+fn has_windows_absolute_path_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+
+    drive_absolute || value.starts_with(r"\\")
 }
 
 fn workspace_root_containing_path(
