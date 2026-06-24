@@ -7326,6 +7326,61 @@ async fn memory_retain_tool_updates_exact_duplicate_instead_of_writing_twice() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_retain_tool_session_ttl_memory_is_searchable_by_marker_tag_until_expiry() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    let retain = execute_memory_retain_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FCJ",
+        br#"{"content_text":"aktualni testovaci batch je B-17","category":"transient_runtime_fact","scope":"session","source":"manual","tags":["S047-BATCH-B17-20260623"],"ttl_ms":60000}"#,
+    )
+    .await;
+    assert!(retain.success, "session TTL retain should succeed: {}", retain.error);
+    let retain_payload = parse_tool_output_json(&retain);
+    assert_eq!(retain_payload.get("status").and_then(Value::as_str), Some("retained"));
+    assert_eq!(retain_payload.get("scope").and_then(Value::as_str), Some("session"));
+    assert!(
+        retain_payload.pointer("/item/ttl_unix_ms").and_then(Value::as_i64).is_some(),
+        "bounded TTL should be reported in retain output: {retain_payload}"
+    );
+
+    let marker_search = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FCK",
+        br#"{"query":"S047-BATCH-B17-20260623","scope":"session","top_k":4,"min_score":0.0}"#,
+    )
+    .await;
+    assert!(marker_search.success, "marker search should succeed: {}", marker_search.error);
+    let marker_payload = parse_tool_output_json(&marker_search);
+    assert_eq!(marker_payload.get("hit_count").and_then(Value::as_u64), Some(1));
+    let marker_tags = marker_payload
+        .pointer("/hits/0/tags")
+        .and_then(Value::as_array)
+        .expect("search hit should include tags");
+    assert!(
+        marker_tags.iter().any(|tag| tag.as_str() == Some("s047-batch-b17-20260623")),
+        "search by marker tag should return the retained session memory: {marker_payload}"
+    );
+
+    let filtered_search = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FCL",
+        br#"{"query":"aktualni testovaci batch je B-17 S047-BATCH-B17-20260623","scope":"session","tags":["s047-batch-b17-20260623"],"top_k":4,"min_score":0.0}"#,
+    )
+    .await;
+    assert!(
+        filtered_search.success,
+        "content plus marker-tag search should succeed: {}",
+        filtered_search.error
+    );
+    let filtered_payload = parse_tool_output_json(&filtered_search);
+    assert_eq!(filtered_payload.get("hit_count").and_then(Value::as_u64), Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_retain_tool_replaces_near_duplicate_preference_content() {
     let state = build_test_runtime_state(false);
     let context = admin_routines_tool_test_context();

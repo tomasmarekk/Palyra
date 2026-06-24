@@ -15005,6 +15005,7 @@ impl JournalStore {
         let normalized_query_terms = normalized_fts_terms(query_text.as_str());
         let allow_vector_only_candidates = normalized_query_terms.len() > 1;
         let fts_queries = build_memory_fts_queries(query_text.as_str());
+        let tag_query_terms = memory_tag_query_terms(query_text.as_str());
         let cache_scope = memory_query_embedding_cache_scope(request);
         let query_embedding = self.query_embedding_for_search(
             cache_scope.as_str(),
@@ -15136,6 +15137,124 @@ impl JournalStore {
                 }
             }
             lexical_latency_ms = elapsed_millis(lexical_started);
+        }
+
+        if !tag_query_terms.is_empty() {
+            let tag_started = Instant::now();
+            let mut statement = guard.prepare(
+                r#"
+                    SELECT
+                        memory.memory_ulid,
+                        memory.principal,
+                        memory.channel,
+                        memory.session_ulid,
+                        memory.source,
+                        memory.content_text,
+                        memory.content_hash,
+                        memory.tags_json,
+                        memory.confidence,
+                        memory.ttl_unix_ms,
+                        memory.created_at_unix_ms,
+                        memory.updated_at_unix_ms,
+                        COALESCE(vectors.embedding_model_id, vectors.embedding_model),
+                        COALESCE(vectors.embedding_dims, vectors.dims),
+                        COALESCE(vectors.embedding_version, ?6),
+                        COALESCE(vectors.embedding_vector, vectors.vector_blob)
+                    FROM memory_items AS memory
+                    LEFT JOIN memory_vectors AS vectors
+                        ON vectors.memory_ulid = memory.memory_ulid
+                    WHERE
+                        LOWER(memory.tags_json) LIKE ?1 ESCAPE '\' AND
+                        memory.principal = ?2 AND
+                        (
+                            (
+                                ?4 IS NOT NULL AND
+                                memory.session_ulid = ?4 AND
+                                (
+                                    (?3 IS NOT NULL AND (memory.channel = ?3 OR memory.channel IS NULL)) OR
+                                    (?3 IS NULL AND memory.channel IS NULL)
+                                )
+                            ) OR
+                            (
+                                memory.session_ulid IS NULL AND
+                                (
+                                    (?3 IS NOT NULL AND (memory.channel = ?3 OR memory.channel IS NULL)) OR
+                                    (?3 IS NULL AND memory.channel IS NULL)
+                                )
+                            )
+                        ) AND
+                        (memory.ttl_unix_ms IS NULL OR memory.ttl_unix_ms > ?5)
+                    ORDER BY memory.updated_at_unix_ms DESC, memory.memory_ulid ASC
+                    LIMIT ?7
+                "#,
+            )?;
+            for term in tag_query_terms {
+                let like_pattern = format!("%{}%", escape_sql_like(term.as_str()));
+                let mut rows = statement.query(params![
+                    like_pattern,
+                    request.principal.as_str(),
+                    request.channel.as_deref(),
+                    request.session_id.as_deref(),
+                    now,
+                    embedding_version,
+                    candidate_limit as i64,
+                ])?;
+
+                while let Some(row) = rows.next()? {
+                    let item = map_memory_item_row(row)?;
+                    if !memory_source_matches(item.source, request.sources.as_slice()) {
+                        continue;
+                    }
+                    if !memory_tags_match(item.tags.as_slice(), requested_tags.as_slice()) {
+                        continue;
+                    }
+                    let tag_raw = memory_tag_query_score(item.tags.as_slice(), term.as_str());
+                    if tag_raw <= 0.0 {
+                        continue;
+                    }
+                    let model_id = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+                    let dims = row.get::<_, Option<i64>>(13)?.unwrap_or_default() as usize;
+                    let version = row.get::<_, Option<i64>>(14)?.unwrap_or(embedding_version);
+                    let vector_raw = if model_id == embedding_model_id
+                        && dims == embedding_dims
+                        && version == embedding_version
+                    {
+                        let vector_blob: Option<Vec<u8>> = row.get(15)?;
+                        vector_blob
+                            .as_ref()
+                            .map(|blob| decode_vector_blob(blob.as_slice(), dims))
+                            .map(|embedding| {
+                                cosine_similarity(query_vector.as_slice(), embedding.as_slice())
+                            })
+                            .unwrap_or(0.0)
+                            .max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let recency_raw = recency_score(now, item.created_at_unix_ms);
+                    let snippet = memory_snippet(item.content_text.as_str(), query_text.as_str());
+                    let key = item.memory_id.clone();
+                    if let Some(existing) = candidates_by_id.get_mut(key.as_str()) {
+                        existing.lexical_raw = existing.lexical_raw.max(tag_raw);
+                        existing.vector_raw = existing.vector_raw.max(vector_raw);
+                        existing.lexical_candidate = true;
+                        continue;
+                    }
+                    candidates_by_id.insert(
+                        key,
+                        MemorySearchCandidateRecord {
+                            item,
+                            snippet,
+                            lexical_raw: tag_raw,
+                            vector_raw,
+                            recency_raw,
+                            lexical_candidate: true,
+                            vector_candidate: false,
+                        },
+                    );
+                }
+            }
+            lexical_latency_ms = lexical_latency_ms.saturating_add(elapsed_millis(tag_started));
         }
 
         let vector_started = Instant::now();
@@ -20800,6 +20919,39 @@ fn build_memory_fts_queries(query: &str) -> Vec<String> {
     }
 
     queries
+}
+
+fn memory_tag_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let full_query_tag = query.trim().to_ascii_lowercase();
+    if valid_memory_tag_query_term(full_query_tag.as_str()) {
+        push_unique_fts_query(&mut terms, full_query_tag);
+    }
+    for term in normalized_fts_terms(query) {
+        if is_distinctive_memory_fts_term(term.as_str())
+            && valid_memory_tag_query_term(term.as_str())
+        {
+            push_unique_fts_query(&mut terms, term);
+        }
+    }
+    terms
+}
+
+fn valid_memory_tag_query_term(term: &str) -> bool {
+    !term.is_empty()
+        && term.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, ':' | '_' | '-' | '.')
+        })
+}
+
+fn memory_tag_query_score(item_tags: &[String], term: &str) -> f64 {
+    if item_tags.iter().any(|tag| tag == term) {
+        return 1.0;
+    }
+    if item_tags.iter().any(|tag| tag.split([':', '_', '-', '.']).any(|part| part == term)) {
+        return 0.9;
+    }
+    0.0
 }
 
 fn build_sparse_memory_fts_queries(query: &str) -> Vec<String> {
