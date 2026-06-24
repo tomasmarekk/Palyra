@@ -92,7 +92,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                 &["query"],
                 vec![
                     ("query", json!({"type":"string","maxLength":8192})),
-                    ("channel", json!({"type":"string"})),
+                    ("channel", json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."})),
                     (
                         "session_id",
                         json!({"type":"string","description":"Optional exact session id. Do not ask users for this for 'previous session' or 'last time'; omit it for principal cross-session recall."}),
@@ -122,7 +122,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                 &["query"],
                 vec![
                     ("query", json!({"type":"string","maxLength":8192,"description":"Search text for prior-session transcript recall. Use this for previous session, last time, earlier conversation, or temporary facts explicitly not saved as memory."})),
-                    ("channel", json!({"type":"string"})),
+                    ("channel", json!({"type":"string","description":"Optional authenticated runtime channel. Omit to use the current run channel; do not guess default/current/commentary/final/analysis sentinel values."})),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":24})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     ("window_before", json!({"type":"integer","minimum":0,"maximum":8})),

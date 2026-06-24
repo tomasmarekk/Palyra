@@ -5941,6 +5941,52 @@ async fn memory_recall_tool_channel_override_requires_authenticated_channel_cont
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_recall_tool_treats_empty_channel_as_current_context() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+    let marker = "PALYRA_RECALL_EMPTY_CHANNEL_MARKER";
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FG1".to_owned(),
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            session_id: Some(context.session_id.to_owned()),
+            source: MemorySource::Manual,
+            content_text: format!("Current channel recall marker was {marker}"),
+            tags: vec!["e2e".to_owned()],
+            confidence: Some(0.95),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("current-channel memory should ingest");
+
+    let input_json = br#"{"query":"PALYRA_RECALL_EMPTY_CHANNEL_MARKER","channel":"","memory_top_k":4,"workspace_top_k":0,"min_score":0.0}"#;
+    let outcome =
+        execute_memory_recall_tool(&state, context, "01ARZ3NDEKTSV4RRFFQ69G5FG2", input_json).await;
+
+    assert!(outcome.success, "empty channel should inherit runtime context: {}", outcome.error);
+    let payload = parse_tool_output_json(&outcome);
+    assert_eq!(
+        payload.pointer("/parameter_delta/explicit_recall/channel").and_then(Value::as_str),
+        Some("cli"),
+        "empty channel string should bind to the authenticated runtime channel: {payload}"
+    );
+    let memory_hits = payload
+        .get("memory_hits")
+        .and_then(Value::as_array)
+        .expect("recall output should include memory_hits");
+    assert!(
+        memory_hits.iter().any(|hit| {
+            hit.get("content_text")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(marker))
+        }),
+        "recall should find current-channel memory after empty-channel normalization: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_recall_tool_finds_principal_memory_without_session_override() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
@@ -6143,6 +6189,52 @@ async fn memory_session_search_tool_returns_session_fallback_when_windows_are_em
             .and_then(Value::as_str)
             .is_some_and(|boundary| boundary.contains("session recall")),
         "claim boundary should allow evidence-backed session recall without durable memory: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_session_search_tool_treats_default_channel_as_current_context() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    ensure_tool_context_session(&state, &context);
+    let prior_session_id = "01ARZ3NDEKTSV4RRFFQ69G5FH1";
+
+    state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: prior_session_id.to_owned(),
+            session_key: "scenario-default-channel-session-search".to_owned(),
+            session_label: Some("Prior default-channel PALYRA_SESSION_DEFAULT_MARKER".to_owned()),
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+        })
+        .expect("prior session should persist");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FH2",
+        "palyra.memory.session_search",
+        br#"{"query":"PALYRA_SESSION_DEFAULT_MARKER","channel":"default","top_k":4,"window_before":0,"window_after":0}"#,
+        None,
+    )
+    .await;
+
+    assert!(
+        outcome.success,
+        "default channel sentinel should inherit runtime context: {}",
+        outcome.error
+    );
+    let payload = parse_tool_output_json(&outcome);
+    assert_eq!(
+        payload.get("session_hit_count").and_then(Value::as_u64),
+        Some(1),
+        "session search should find prior session after default-channel normalization: {payload}"
+    );
+    assert!(
+        !payload.to_string().contains(prior_session_id),
+        "session search output should still hide raw internal session ids: {payload}"
     );
 }
 

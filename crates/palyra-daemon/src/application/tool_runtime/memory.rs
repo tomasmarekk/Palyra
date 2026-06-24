@@ -2724,47 +2724,20 @@ pub(crate) async fn execute_memory_recall_tool(
         );
     }
 
-    let requested_channel = match parsed.get("channel") {
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-        Some(Value::Null) | None => None,
-        Some(_) => {
-            return memory_tool_execution_outcome(
-                namespace,
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                "palyra.memory.recall channel must be a string when provided".to_owned(),
-            );
-        }
-    };
-    if let Some(requested_channel) = requested_channel.as_deref() {
-        match context.channel {
-            Some(current_channel) if current_channel == requested_channel => {}
-            Some(_) => {
+    let channel =
+        match parse_agent_memory_read_channel(&parsed, "palyra.memory.recall", context.channel) {
+            Ok(channel) => channel,
+            Err(error) => {
                 return memory_tool_execution_outcome(
                     namespace,
                     proposal_id,
                     input_json,
                     false,
                     b"{}".to_vec(),
-                    "palyra.memory.recall channel must match the authenticated runtime channel"
-                        .to_owned(),
+                    error,
                 );
             }
-            None => {
-                return memory_tool_execution_outcome(
-                    namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    "palyra.memory.recall channel override requires authenticated channel context"
-                        .to_owned(),
-                );
-            }
-        }
-    }
+        };
 
     let min_score = parsed.get("min_score").and_then(Value::as_f64).unwrap_or(0.0);
     if !min_score.is_finite() || !(0.0..=1.0).contains(&min_score) {
@@ -2880,7 +2853,7 @@ pub(crate) async fn execute_memory_recall_tool(
 
     let request = RecallRequest {
         query,
-        channel: requested_channel.or_else(|| context.channel.map(str::to_owned)),
+        channel,
         session_id: optional_trimmed_string(parsed.get("session_id"))
             .or_else(|| Some(context.session_id.to_owned())),
         agent_id: optional_trimmed_string(parsed.get("agent_id")),
@@ -2986,49 +2959,22 @@ pub(crate) async fn execute_memory_session_search_tool(
         );
     }
 
-    let requested_channel = match parsed.get("channel") {
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-        Some(Value::Null) | None => None,
-        Some(_) => {
+    let channel = match parse_agent_memory_read_channel(
+        &parsed,
+        "palyra.memory.session_search",
+        context.channel,
+    ) {
+        Ok(channel) => channel,
+        Err(error) => {
             return memory_tool_execution_outcome(
                 attestation_namespace,
                 proposal_id,
                 input_json,
                 false,
                 b"{}".to_vec(),
-                "palyra.memory.session_search channel must be a string when provided".to_owned(),
+                error,
             );
         }
-    };
-    let channel = match requested_channel {
-        Some(requested_channel) => match context.channel {
-            Some(current_channel) if current_channel == requested_channel => {
-                Some(requested_channel)
-            }
-            Some(_) => {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    "palyra.memory.session_search channel must match the authenticated runtime channel"
-                        .to_owned(),
-                );
-            }
-            None => {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    "palyra.memory.session_search channel override requires authenticated channel context"
-                        .to_owned(),
-                );
-            }
-        },
-        None => context.channel.map(str::to_owned),
     };
 
     if let Err(error) =
@@ -3260,6 +3206,54 @@ fn required_string_field(parsed: &Map<String, Value>, field: &str) -> Result<Str
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| format!("requires non-empty string field '{field}'"))
+}
+
+fn parse_agent_memory_read_channel(
+    parsed: &Map<String, Value>,
+    tool_name: &str,
+    context_channel: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(value) = parsed.get("channel") else {
+        return Ok(context_channel.map(str::to_owned));
+    };
+    let Some(requested) = optional_channel_string(value, tool_name)? else {
+        return Ok(context_channel.map(str::to_owned));
+    };
+    if is_current_channel_sentinel(requested.as_str()) {
+        return Ok(context_channel.map(str::to_owned));
+    }
+    match context_channel {
+        Some(current_channel) if current_channel == requested => Ok(Some(requested)),
+        Some(_) => Err(format!("{tool_name} channel must match the authenticated runtime channel")),
+        None => Err(format!("{tool_name} channel override requires authenticated channel context")),
+    }
+}
+
+fn optional_channel_string(value: &Value, tool_name: &str) -> Result<Option<String>, String> {
+    match value {
+        Value::String(raw) => {
+            let normalized = raw.trim();
+            Ok((!normalized.is_empty()).then(|| normalized.to_owned()))
+        }
+        Value::Null => Ok(None),
+        _ => Err(format!("{tool_name} channel must be a string when provided")),
+    }
+}
+
+fn is_current_channel_sentinel(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "_" | "__current__"
+            | "api"
+            | "api-v1"
+            | "authenticated"
+            | "commentary"
+            | "current"
+            | "default"
+            | "final"
+            | "analysis"
+            | "palyra"
+    )
 }
 
 fn parse_string_array_field(
@@ -4466,6 +4460,47 @@ mod tests {
         .expect_err("string limits should be rejected");
 
         assert!(error.contains("window_before must be an integer"));
+    }
+
+    #[test]
+    fn agent_memory_read_channel_uses_context_for_agent_sentinels() {
+        let omitted = Map::new();
+        assert_eq!(
+            parse_agent_memory_read_channel(&omitted, "palyra.memory.recall", Some("cli"))
+                .expect("omitted channel should inherit context"),
+            Some("cli".to_owned())
+        );
+
+        for raw in
+            ["", " ", "default", "current", "__current__", "analysis", "final", "api-v1", "_"]
+        {
+            let mut parsed = Map::new();
+            parsed.insert("channel".to_owned(), Value::String(raw.to_owned()));
+            assert_eq!(
+                parse_agent_memory_read_channel(&parsed, "palyra.memory.recall", Some("cli"))
+                    .expect("agent sentinel should inherit context"),
+                Some("cli".to_owned()),
+                "raw channel {raw:?} should not force models to guess runtime channel ids"
+            );
+        }
+
+        let mut parsed = Map::new();
+        parsed.insert("channel".to_owned(), Value::String("prod".to_owned()));
+        let error =
+            parse_agent_memory_read_channel(&parsed, "palyra.memory.recall", Some("staging"))
+                .expect_err("explicit cross-channel reads must stay fail-closed");
+        assert!(
+            error.contains("channel must match the authenticated runtime channel"),
+            "error should explain tenant-channel boundary: {error}"
+        );
+
+        parsed.insert("channel".to_owned(), serde_json::json!([]));
+        let error = parse_agent_memory_read_channel(&parsed, "palyra.memory.recall", Some("cli"))
+            .expect_err("non-string channel values should remain invalid");
+        assert!(
+            error.contains("channel must be a string when provided"),
+            "error should preserve strict type validation: {error}"
+        );
     }
 
     #[test]
