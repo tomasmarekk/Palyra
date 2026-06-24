@@ -3743,19 +3743,39 @@ fn cron_process_run_command_is_read_only(command: &str) -> bool {
 }
 
 fn cron_tool_output_is_background(output_json: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(output_json)
-        .ok()
-        .and_then(|value| value.get("background").and_then(Value::as_bool))
-        .unwrap_or(false)
+    let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
+        return false;
+    };
+    cron_tool_output_background(&value).unwrap_or_else(|| {
+        cron_tool_output_summary_value(&value)
+            .and_then(|summary| cron_tool_output_background(&summary))
+            .unwrap_or(false)
+    })
 }
 
 fn cron_tool_output_has_saved_file(output_json: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
-        value
-            .pointer("/saved_file/path")
-            .and_then(Value::as_str)
-            .is_some_and(|path| !path.trim().is_empty())
-    })
+    let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
+        return false;
+    };
+    cron_tool_output_saved_file_path(&value).is_some_and(|path| !path.trim().is_empty())
+        || cron_tool_output_summary_value(&value).is_some_and(|summary| {
+            cron_tool_output_saved_file_path(&summary).is_some_and(|path| !path.trim().is_empty())
+        })
+}
+
+fn cron_tool_output_background(value: &Value) -> Option<bool> {
+    value.get("background").and_then(Value::as_bool)
+}
+
+fn cron_tool_output_saved_file_path(value: &Value) -> Option<&str> {
+    value.pointer("/saved_file/path").and_then(Value::as_str)
+}
+
+fn cron_tool_output_summary_value(value: &Value) -> Option<Value> {
+    value
+        .get("summary")
+        .and_then(Value::as_str)
+        .and_then(|summary| serde_json::from_str::<Value>(summary).ok())
 }
 
 fn build_cron_prompt(
@@ -4716,6 +4736,8 @@ mod tests {
             br#"{"command":"node","args":["scripts/update-feed.js"],"background":false}"#;
         assert!(cron_completion_candidate_for_tool_proposal("palyra.process.run", process_script)
             .is_confirmed_by_output(br#"{"background":false,"exit_code":0}"#));
+        assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", process_script)
+            .is_confirmed_by_output(br#"{"summary":"{\"background\":true,\"pid\":1234}"}"#));
 
         let read_only = br#"{"command":"rg","args":["feed-001","reports/feed.md"]}"#;
         assert!(!cron_completion_candidate_for_tool_proposal("palyra.process.run", read_only)
@@ -4739,6 +4761,13 @@ mod tests {
             b"{}"
         )
         .is_confirmed_by_output(br#"{"success":true,"saved_file":{"path":"reports/weekly.pdf"}}"#));
+        assert!(cron_completion_candidate_for_tool_proposal(
+            crate::gateway::BROWSER_PDF_TOOL_NAME,
+            b"{}"
+        )
+        .is_confirmed_by_output(
+            br#"{"summary":"{\"success\":true,\"saved_file\":{\"path\":\"reports/weekly.pdf\"}}"}"#
+        ));
         assert!(!cron_completion_candidate_for_tool_proposal(
             crate::gateway::BROWSER_PDF_TOOL_NAME,
             b"{}"
