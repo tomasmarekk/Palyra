@@ -111,6 +111,8 @@ const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504, 529];
 const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
 const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
+const CODEX_TEXT_REPLAY_FALLBACK_MAX_BYTES: usize =
+    palyra_model_providers::MAX_PROVIDER_TURN_TEXT_BYTES;
 const DEFAULT_DETERMINISTIC_EMBEDDINGS_DIMS: usize = 64;
 const DETERMINISTIC_TOOL_FIXTURE_ID: &str = "deterministic-provider-tool-call-v1";
 const DETERMINISTIC_TOOL_FIXTURE_REPORT_PATH: &str = "reports/deterministic-provider.md";
@@ -2894,6 +2896,46 @@ impl OpenAiCompatibleProvider {
         let adapter = OpenAiResponsesChatAdapter;
         let effective_request = self.request_with_config_overrides(request)?;
         let body = adapter.request_payload(&effective_request, actual_model_id.as_str());
+        let body_text = match self.send_codex_responses_payload(api_key, &body).await {
+            Ok(body_text) => body_text,
+            Err(error)
+                if codex_unsupported_content_type_retryable_with_text_replay(
+                    &error,
+                    &effective_request,
+                ) =>
+            {
+                let fallback_request = codex_text_replay_fallback_request(&effective_request);
+                let fallback_body =
+                    adapter.request_payload(&fallback_request, actual_model_id.as_str());
+                self.send_codex_responses_payload(api_key, &fallback_body)
+                    .await
+                    .map_err(|fallback_error| {
+                        AttemptError::request_failed(
+                            format!(
+                                "openai-codex responses compatibility retry failed after unsupported content type: {}; original failure: {}",
+                                fallback_error.message, error.message
+                            ),
+                            fallback_error.retryable,
+                            fallback_error.classification,
+                        )
+                    })?
+            }
+            Err(error) => return Err(error),
+        };
+        let parsed = parse_openai_codex_sse_response(body_text.as_str()).map_err(|error| {
+            AttemptError::invalid_response(
+                format!("openai-codex responses SSE parsing failed: {error}"),
+                "openai_codex_responses_sse",
+            )
+        })?;
+        openai_codex_provider_response(parsed, request, actual_model_id)
+    }
+
+    async fn send_codex_responses_payload(
+        &self,
+        api_key: &str,
+        body: &Value,
+    ) -> Result<String, AttemptError> {
         let endpoint = self.codex_responses_endpoint();
         let mut builder = self
             .client
@@ -2902,7 +2944,7 @@ impl OpenAiCompatibleProvider {
             .header("Accept", "text/event-stream")
             .header("User-Agent", OPENAI_CODEX_USER_AGENT)
             .header("originator", OPENAI_CODEX_ORIGINATOR)
-            .json(&body);
+            .json(body);
         if let Some(account_id) = openai_chatgpt_account_id_from_token(api_key) {
             builder = builder.header("ChatGPT-Account-ID", account_id);
         }
@@ -2937,20 +2979,13 @@ impl OpenAiCompatibleProvider {
             ));
         }
 
-        let body_text = response.text().await.map_err(|error| {
+        response.text().await.map_err(|error| {
             AttemptError::request_failed(
                 format!("openai-codex responses stream read failed: {error}"),
                 true,
                 classify_reqwest_provider_failure("openai_codex_responses_body", &error),
             )
-        })?;
-        let parsed = parse_openai_codex_sse_response(body_text.as_str()).map_err(|error| {
-            AttemptError::invalid_response(
-                format!("openai-codex responses SSE parsing failed: {error}"),
-                "openai_codex_responses_sse",
-            )
-        })?;
-        openai_codex_provider_response(parsed, request, actual_model_id)
+        })
     }
 
     async fn transcribe_audio_once(
@@ -3377,6 +3412,133 @@ fn openai_responses_tool_arguments(arguments: Option<Value>) -> String {
         Some(Value::Null) | None => "{}".to_owned(),
         Some(arguments) => serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_owned()),
     }
+}
+
+fn codex_unsupported_content_type_retryable_with_text_replay(
+    error: &AttemptError,
+    request: &ProviderRequest,
+) -> bool {
+    if error.retryable || error.invalid_response {
+        return false;
+    }
+    let message = error.message.to_ascii_lowercase();
+    message.contains("openai-codex responses endpoint returned http 400")
+        && message.contains("unsupported content type")
+        && request.messages.iter().any(|message| message.role == ProviderMessageRole::Tool)
+}
+
+fn codex_text_replay_fallback_request(request: &ProviderRequest) -> ProviderRequest {
+    let source_messages = request.effective_messages();
+    let transcript = codex_text_replay_transcript(&source_messages);
+    let mut messages = source_messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, ProviderMessageRole::System | ProviderMessageRole::Developer)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.push(ProviderMessage::user_text(transcript.clone()));
+
+    let mut fallback = request.clone();
+    fallback.input_text = transcript;
+    fallback.messages = messages;
+    fallback.vision_inputs.clear();
+    fallback
+}
+
+fn codex_text_replay_transcript(messages: &[ProviderMessage]) -> String {
+    let mut transcript = String::new();
+    let mut truncated = false;
+    codex_append_bounded_text(
+        &mut transcript,
+        "Codex Responses strict tool-result replay returned HTTP 400 Unsupported content type. Continue from this model-visible transcript of the same conversation and successful tool evidence. Do not repeat completed side effects unless fresh verification is required.\n",
+        &mut truncated,
+    );
+    codex_append_bounded_text(
+        &mut transcript,
+        "Original provider error class: HTTP 400 Unsupported content type.\n",
+        &mut truncated,
+    );
+    codex_append_bounded_text(&mut transcript, "\n\n", &mut truncated);
+
+    for message in messages {
+        match message.role {
+            ProviderMessageRole::System | ProviderMessageRole::Developer => {}
+            ProviderMessageRole::User => {
+                codex_append_bounded_text(&mut transcript, "[user]\n", &mut truncated);
+                codex_append_bounded_text(
+                    &mut transcript,
+                    message.text_content().as_str(),
+                    &mut truncated,
+                );
+                codex_append_bounded_text(&mut transcript, "\n\n", &mut truncated);
+            }
+            ProviderMessageRole::Assistant => {
+                let text = message.text_content();
+                if !text.trim().is_empty() {
+                    codex_append_bounded_text(&mut transcript, "[assistant]\n", &mut truncated);
+                    codex_append_bounded_text(&mut transcript, text.as_str(), &mut truncated);
+                    codex_append_bounded_text(&mut transcript, "\n", &mut truncated);
+                }
+                for tool_call in &message.tool_calls {
+                    let arguments = serde_json::to_string(&tool_call.input_json)
+                        .unwrap_or_else(|_| "{}".to_owned());
+                    codex_append_bounded_text(
+                        &mut transcript,
+                        format!(
+                            "[assistant_tool_call call_id={} name={} arguments={}]\n",
+                            tool_call.proposal_id, tool_call.tool_name, arguments
+                        )
+                        .as_str(),
+                        &mut truncated,
+                    );
+                }
+                if !message.tool_calls.is_empty() {
+                    codex_append_bounded_text(&mut transcript, "\n", &mut truncated);
+                }
+            }
+            ProviderMessageRole::Tool => {
+                let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
+                codex_append_bounded_text(
+                    &mut transcript,
+                    format!("[tool_result call_id={call_id}]\n").as_str(),
+                    &mut truncated,
+                );
+                codex_append_bounded_text(
+                    &mut transcript,
+                    message.text_content().as_str(),
+                    &mut truncated,
+                );
+                codex_append_bounded_text(&mut transcript, "\n\n", &mut truncated);
+            }
+        }
+    }
+
+    if truncated {
+        let marker = "\n[transcript truncated at compatibility replay byte limit]\n";
+        if transcript.len().saturating_add(marker.len()) <= CODEX_TEXT_REPLAY_FALLBACK_MAX_BYTES {
+            transcript.push_str(marker);
+        }
+    }
+    transcript
+}
+
+fn codex_append_bounded_text(target: &mut String, text: &str, truncated: &mut bool) {
+    if *truncated || target.len() >= CODEX_TEXT_REPLAY_FALLBACK_MAX_BYTES {
+        *truncated = true;
+        return;
+    }
+    let remaining = CODEX_TEXT_REPLAY_FALLBACK_MAX_BYTES.saturating_sub(target.len());
+    if text.len() <= remaining {
+        target.push_str(text);
+        return;
+    }
+    let mut boundary = remaining;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    target.push_str(&text[..boundary]);
+    *truncated = true;
 }
 
 fn finish_reason_from_openai_responses_status(status: Option<&str>) -> ProviderFinishReason {
@@ -5637,6 +5799,90 @@ mod tests {
             serde_json::from_slice(proposal.2).expect("tool input should remain valid JSON");
         assert_eq!(input_json["text"], "hello");
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        handle.join().expect("scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chatgpt_oauth_responses_retries_unsupported_content_type_with_text_replay() {
+        let response_body = [
+            r#"data: {"type":"response.output_text.delta","delta":"RECOVERED_AFTER_COMPAT"}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"id":"resp_recovered","model":"provider-selected-model","status":"completed","usage":{"input_tokens":8,"output_tokens":3,"total_tokens":11}}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, request_count, request_log, handle) =
+            spawn_inspecting_scripted_server(vec![
+                (400_u16, r#"{"detail":"Unsupported content type"}"#.to_owned()),
+                (200_u16, response_body),
+            ]);
+        let codex_base_url =
+            base_url.strip_suffix("/v1").expect("test helper base URL should end in /v1");
+        let mut config = openai_test_config(codex_base_url.to_owned());
+        config.openai_model = "provider-selected-model".to_owned();
+        config.openai_api_key = Some(fake_chatgpt_oauth_token("acct_tool_replay_123"));
+        config.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+        config.max_retries = 0;
+        let provider = build_model_provider(&config).expect("openai provider should build");
+
+        let mut request = ProviderRequest::from_input_text(
+            "use a tool then continue".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        request.tool_catalog_snapshot = Some(tool_catalog_response_cache_fixture(
+            1_781_883_663_913,
+            "snapshot-replay",
+            "hash-replay",
+        ));
+        request.messages = vec![
+            ProviderMessage::user_text("use a tool then continue"),
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "call_01".to_owned(),
+                    tool_name: "palyra.echo".to_owned(),
+                    input_json: serde_json::json!({"text": "hello"}),
+                }],
+            },
+            ProviderMessage::tool_result("call_01", r#"{"echo":"hello"}"#),
+        ];
+
+        let response = provider
+            .complete(request)
+            .await
+            .expect("unsupported content type retry should recover through text replay");
+
+        assert_eq!(response.output.full_text, "RECOVERED_AFTER_COMPAT");
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        let requests = request_log.lock().expect("request log lock should not be poisoned");
+        assert_eq!(requests.len(), 2);
+        let first_body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_str()).expect("first body should be JSON");
+        let second_body: serde_json::Value =
+            serde_json::from_str(requests[1].body.as_str()).expect("second body should be JSON");
+        let first_input = first_body["input"].as_array().expect("first input should be an array");
+        let second_input =
+            second_body["input"].as_array().expect("second input should be an array");
+        assert!(first_input
+            .iter()
+            .any(|item| item["type"].as_str() == Some("function_call_output")));
+        assert!(!second_input
+            .iter()
+            .any(|item| item["type"].as_str() == Some("function_call_output")));
+        let replay_text = second_body["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("fallback request should carry replay text");
+        assert!(replay_text.contains("[tool_result call_id=call_01]"));
+        assert!(replay_text.contains(r#""echo":"hello""#));
+        assert_eq!(second_body["tools"][0]["name"], "palyra_echo");
+        drop(requests);
         handle.join().expect("scripted server thread should exit");
     }
 
