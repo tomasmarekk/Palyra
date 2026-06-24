@@ -3808,6 +3808,127 @@ async function checkGeo(){
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_click_registers_window_open_tab() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let (url, handle) = spawn_static_http_server_with_request_budget(
+        200,
+        r#"<html><head><title>MockID App</title><script>
+function login(){ window.open('/callback.html', '_blank'); }
+</script></head><body><button id="login" onclick="login()">Login with MockID</button></body></html>"#,
+        8,
+    );
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium popup mode");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(navigate.success, "chromium navigate should succeed: {}", navigate.error);
+
+    let initial_tabs = service
+        .list_tabs(Request::new(browser_v1::ListTabsRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+        }))
+        .await
+        .expect("initial tabs list should execute")
+        .into_inner();
+    assert_eq!(initial_tabs.tabs.len(), 1, "fixture should start with one session tab");
+
+    let click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#login".to_owned(),
+            max_retries: 1,
+            timeout_ms: 3_000,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("login click should execute")
+        .into_inner();
+    assert!(click.success, "login click should succeed: {}", click.error);
+    assert_eq!(
+        click.action_log.as_ref().map(|entry| entry.outcome.as_str()),
+        Some("clicked_new_tab")
+    );
+
+    let tabs = service
+        .list_tabs(Request::new(browser_v1::ListTabsRequest { v: 1, session_id: Some(session_id) }))
+        .await
+        .expect("tabs list after popup should execute")
+        .into_inner();
+    assert!(tabs.success, "tabs list after popup should succeed");
+    assert_eq!(
+        tabs.tabs.len(),
+        2,
+        "window.open _blank should register a second tab: {:?}",
+        tabs.tabs
+    );
+    assert!(
+        tabs.tabs.iter().any(|tab| tab.url.contains("/callback.html")),
+        "registered tabs should include the callback URL: {:?}",
+        tabs.tabs
+    );
+
+    drop(handle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_tabs_keep_independent_state() {
     let (url, handle) = spawn_static_http_server(
         200,

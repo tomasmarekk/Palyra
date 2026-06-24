@@ -143,6 +143,14 @@ pub(crate) struct ChromiumClientDownload {
     pub(crate) content: Vec<u8>,
 }
 
+struct DiscoveredChromiumTab {
+    tab: Arc<HeadlessTab>,
+    network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
+    download_capture: Arc<std::sync::Mutex<VecDeque<ChromiumClientDownload>>>,
+    url: String,
+    title: String,
+}
+
 type ChromiumLocalStorageSnapshot = Option<(String, HashMap<String, String>)>;
 
 /// Parameters for a guarded Chromium navigation.
@@ -2203,6 +2211,124 @@ pub(crate) async fn chromium_open_tab_runtime(
     Ok(())
 }
 
+/// Registers live Chromium tabs opened outside `palyra.browser.tabs.open`
+/// (for example, `window.open(..., "_blank")`) into the Palyra session model.
+///
+/// # Errors
+/// Returns lookup sentinels, tab-budget errors, remote-IP guard incidents, or a
+/// CDP/configuration failure while discovering new Chromium targets.
+pub(crate) async fn chromium_sync_session_tabs(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<u32, String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let (browser, private_target_policy, security_incident, timeout, existing_target_ids) = {
+        let sessions = runtime.sessions.lock().await;
+        let Some(session) = sessions.get(session_id) else {
+            return Err("session_not_found".to_owned());
+        };
+        let timeout = Duration::from_millis(session.budget.max_navigation_timeout_ms.max(1));
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        let existing_target_ids = chromium_session
+            .tabs
+            .values()
+            .map(|tab| tab.get_target_id().to_string())
+            .collect::<HashSet<_>>();
+        (
+            Arc::clone(&chromium_session.browser),
+            Arc::clone(&chromium_session.private_target_policy),
+            Arc::clone(&chromium_session.security_incident),
+            timeout,
+            existing_target_ids,
+        )
+    };
+    let discovered = run_chromium_blocking("chromium sync session tabs", move || {
+        browser.register_missing_tabs();
+        let live_tabs = browser
+            .get_tabs()
+            .lock()
+            .map_err(|_| "failed to inspect Chromium live tabs".to_owned())?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut discovered = Vec::new();
+        for tab in live_tabs {
+            let target_id = tab.get_target_id().to_string();
+            if existing_target_ids.contains(target_id.as_str()) {
+                continue;
+            }
+            let _ = tab.wait_until_navigated();
+            let url = tab.get_url();
+            if !chromium_sync_tab_url_is_trackable(url.as_str()) {
+                continue;
+            }
+            let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+            configure_chromium_tab(
+                &tab,
+                Arc::clone(&private_target_policy),
+                Arc::clone(&network_log),
+                Arc::clone(&download_capture),
+                timeout,
+                Arc::clone(&security_incident),
+            )?;
+            let title = tab.get_title().unwrap_or_default();
+            discovered.push(DiscoveredChromiumTab {
+                tab,
+                network_log,
+                download_capture,
+                url,
+                title,
+            });
+        }
+        Ok(discovered)
+    })
+    .await?;
+    if discovered.is_empty() {
+        return Ok(0);
+    }
+
+    let mut new_tab_ids = Vec::new();
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err("session_not_found".to_owned());
+        };
+        let mut chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        for discovered_tab in discovered {
+            if !session.can_create_tab() {
+                return Err("tab budget exceeded while registering Chromium popup tab".to_owned());
+            }
+            let tab_id = session.create_tab();
+            if let Some(record) = session.tabs.get_mut(tab_id.as_str()) {
+                record.last_url =
+                    (!discovered_tab.url.trim().is_empty()).then(|| discovered_tab.url.clone());
+                record.last_title = discovered_tab.title.clone();
+            }
+            session.active_tab_id = tab_id.clone();
+            chromium_session.tabs.insert(tab_id.clone(), discovered_tab.tab);
+            chromium_session.network_logs.insert(tab_id.clone(), discovered_tab.network_log);
+            chromium_session
+                .download_captures
+                .insert(tab_id.clone(), discovered_tab.download_capture);
+            new_tab_ids.push(tab_id);
+        }
+    }
+
+    for tab_id in &new_tab_ids {
+        let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id.as_str()).await;
+        let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
+    }
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(u32::try_from(new_tab_ids.len()).unwrap_or(u32::MAX))
+}
+
 /// Removes a tab's runtime state and closes the live tab best-effort.
 ///
 /// # Errors
@@ -2904,6 +3030,12 @@ fn chromium_permission_origin(raw_url: &str) -> Result<String, String> {
         origin.push_str(port.to_string().as_str());
     }
     Ok(origin)
+}
+
+fn chromium_sync_tab_url_is_trackable(raw_url: &str) -> bool {
+    Url::parse(raw_url)
+        .map(|url| matches!(url.scheme(), "http" | "https" | "file"))
+        .unwrap_or(false)
 }
 
 fn chromium_permission_set_requests(
@@ -3994,11 +4126,24 @@ pub(crate) async fn click_with_chromium(
 
         match attempt {
             Ok(ClickAttempt::Clicked { download_like }) => {
+                let new_tab_count = match chromium_sync_session_tabs(runtime, session_id).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return ChromiumActionOutcome {
+                            success: false,
+                            outcome: "new_tab_sync_failed".to_owned(),
+                            error,
+                            attempts,
+                        };
+                    }
+                };
                 let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
                 return ChromiumActionOutcome {
                     success: true,
                     outcome: if download_like {
                         "download_allowed".to_owned()
+                    } else if new_tab_count > 0 {
+                        "clicked_new_tab".to_owned()
                     } else {
                         "clicked".to_owned()
                     },
@@ -4993,8 +5138,9 @@ mod tests {
         chromium_cookie_delete_requests, chromium_network_log_headers, chromium_permission_origin,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
-        chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
-        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
+        chromium_sync_tab_url_is_trackable, chromium_touch_emulation_max_touch_points,
+        chromium_transport_idle_timeout, chromium_upload_staging_path,
+        chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -5491,6 +5637,16 @@ mod tests {
             chromium_permission_origin("about:blank").is_err(),
             "permission override must fail loud when there is no page origin"
         );
+    }
+
+    #[test]
+    fn chromium_sync_tab_url_filter_ignores_browser_internal_tabs() {
+        assert!(chromium_sync_tab_url_is_trackable("http://127.0.0.1:5175/callback.html"));
+        assert!(chromium_sync_tab_url_is_trackable("https://example.test/callback"));
+        assert!(chromium_sync_tab_url_is_trackable("file:///tmp/callback.html"));
+        assert!(!chromium_sync_tab_url_is_trackable("about:blank"));
+        assert!(!chromium_sync_tab_url_is_trackable("chrome://newtab/"));
+        assert!(!chromium_sync_tab_url_is_trackable(""));
     }
 
     #[test]
