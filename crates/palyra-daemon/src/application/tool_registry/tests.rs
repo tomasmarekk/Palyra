@@ -501,6 +501,14 @@ fn routines_query_schema_exposes_scheduler_wait_terminal_operation() {
         .as_str()
         .unwrap_or_default()
         .contains("max_runs"));
+    assert!(entry.input_schema["properties"]["start_date"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("schedule_preview"));
+    assert!(entry.input_schema["properties"]["end_date"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("end of that local day"));
 }
 
 #[test]

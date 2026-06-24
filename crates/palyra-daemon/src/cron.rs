@@ -157,6 +157,12 @@ pub struct ScheduleNormalization {
     pub next_run_at_unix_ms: Option<i64>,
 }
 
+/// One future schedule fire time returned by schedule preview helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulePreviewRun {
+    pub run_at_unix_ms: i64,
+}
+
 /// Outcome of one dispatch decision for a cron job.
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
@@ -628,6 +634,34 @@ pub fn normalize_schedule(
             Err(Status::invalid_argument("schedule.type must be specified"))
         }
     }
+}
+
+/// Computes bounded future schedule ticks from a persisted schedule payload.
+///
+/// # Errors
+/// Returns `Status::internal` when the payload cannot be decoded or
+/// `Status::invalid_argument` for an invalid cron expression.
+pub fn preview_schedule_runs(
+    schedule_type: CronScheduleType,
+    schedule_payload_json: &str,
+    start_after_unix_ms: i64,
+    end_before_unix_ms: Option<i64>,
+    limit: usize,
+) -> Result<Vec<SchedulePreviewRun>, Status> {
+    let parsed = parse_schedule_payload(schedule_type, schedule_payload_json)?;
+    let mut runs = Vec::with_capacity(limit);
+    let mut cursor_unix_ms = start_after_unix_ms;
+    for _ in 0..limit {
+        let Some(next_run_unix_ms) = parsed.next_after(cursor_unix_ms) else {
+            break;
+        };
+        if end_before_unix_ms.is_some_and(|end| next_run_unix_ms >= end) {
+            break;
+        }
+        runs.push(SchedulePreviewRun { run_at_unix_ms: next_run_unix_ms });
+        cursor_unix_ms = next_run_unix_ms;
+    }
+    Ok(runs)
 }
 
 /// Reconstructs the wire-format schedule from a persisted payload.

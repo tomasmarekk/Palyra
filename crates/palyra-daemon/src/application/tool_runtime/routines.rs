@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{TimeZone, Timelike, Utc};
+use chrono::{Local, LocalResult, NaiveDate, TimeZone, Timelike, Utc};
 use palyra_common::validate_canonical_id;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -65,6 +65,8 @@ const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 1_000;
 const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 250;
 const MAX_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 30_000;
 const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
+const DEFAULT_SCHEDULE_PREVIEW_LIMIT: usize = 1;
+const MAX_SCHEDULE_PREVIEW_LIMIT: usize = 64;
 const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_ROUTINE_RETRY_BACKOFF_MS: u64 = 1_000;
 
@@ -604,12 +606,144 @@ fn preview_schedule(
     let phrase = required_string_field(payload, "phrase")?;
     let timezone =
         parse_routine_timezone(optional_string_field(payload, "timezone"), timezone_mode)?;
-    let preview =
-        natural_language_schedule_preview(phrase.as_str(), timezone, unix_ms_now_string_safe()?)
-            .map_err(map_registry_error)?;
+    let now_unix_ms = unix_ms_now_string_safe()?;
+    let preview = natural_language_schedule_preview(phrase.as_str(), timezone, now_unix_ms)
+        .map_err(map_registry_error)?;
+    let limit = schedule_preview_limit(payload)?;
+    let window = schedule_preview_window(payload, timezone, now_unix_ms)?;
+    let schedule_type = parse_schedule_type(preview.schedule_type.as_str())?;
+    let preview_runs = cron::preview_schedule_runs(
+        schedule_type,
+        preview.schedule_payload_json.as_str(),
+        window.start_after_unix_ms,
+        window.end_before_unix_ms,
+        limit,
+    )
+    .map_err(sanitize_status_message)?
+    .into_iter()
+    .map(|run| schedule_preview_run_json(run.run_at_unix_ms, timezone))
+    .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "operation": "schedule_preview",
+        "preview_limit": limit,
+        "preview_window": {
+            "start_date": window.start_date,
+            "end_date": window.end_date,
+            "start_after_unix_ms": window.start_after_unix_ms,
+            "end_before_unix_ms": window.end_before_unix_ms,
+        },
+        "preview_runs": preview_runs,
         "preview": preview,
+    }))
+}
+
+struct SchedulePreviewWindow {
+    start_date: Option<String>,
+    end_date: Option<String>,
+    start_after_unix_ms: i64,
+    end_before_unix_ms: Option<i64>,
+}
+
+fn schedule_preview_limit(payload: &Map<String, Value>) -> Result<usize, String> {
+    match optional_usize_field(payload, "limit")? {
+        Some(0) => Err("limit must be greater than zero for schedule_preview".to_owned()),
+        Some(value) => Ok(value.min(MAX_SCHEDULE_PREVIEW_LIMIT)),
+        None => Ok(DEFAULT_SCHEDULE_PREVIEW_LIMIT),
+    }
+}
+
+fn schedule_preview_window(
+    payload: &Map<String, Value>,
+    timezone: CronTimezoneMode,
+    now_unix_ms: i64,
+) -> Result<SchedulePreviewWindow, String> {
+    let start_date = optional_schedule_preview_date(payload, "start_date")?;
+    let end_date = optional_schedule_preview_date(payload, "end_date")?;
+    let start_after_unix_ms = match start_date {
+        Some(date) => schedule_preview_date_start_unix_ms(date, timezone)?.saturating_sub(1),
+        None => now_unix_ms,
+    };
+    let end_before_unix_ms = match end_date {
+        Some(date) => {
+            let next_date = date
+                .succ_opt()
+                .ok_or_else(|| "end_date is too large for schedule_preview".to_owned())?;
+            Some(schedule_preview_date_start_unix_ms(next_date, timezone)?)
+        }
+        None => None,
+    };
+    if end_before_unix_ms.is_some_and(|end| end <= start_after_unix_ms) {
+        return Err("end_date must be on or after start_date for schedule_preview".to_owned());
+    }
+    Ok(SchedulePreviewWindow {
+        start_date: start_date.map(|date| date.to_string()),
+        end_date: end_date.map(|date| date.to_string()),
+        start_after_unix_ms,
+        end_before_unix_ms,
+    })
+}
+
+fn optional_schedule_preview_date(
+    payload: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<NaiveDate>, String> {
+    let Some(raw) = optional_string_field(payload, key) else {
+        return Ok(None);
+    };
+    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map(Some)
+        .map_err(|error| format!("{key} must use YYYY-MM-DD for schedule_preview: {error}"))
+}
+
+fn schedule_preview_date_start_unix_ms(
+    date: NaiveDate,
+    timezone: CronTimezoneMode,
+) -> Result<i64, String> {
+    let local_midnight = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| "schedule_preview date boundary is invalid".to_owned())?;
+    match timezone {
+        CronTimezoneMode::Utc => Ok(Utc.from_utc_datetime(&local_midnight).timestamp_millis()),
+        CronTimezoneMode::Local => match Local.from_local_datetime(&local_midnight) {
+            LocalResult::Single(value) => Ok(value.with_timezone(&Utc).timestamp_millis()),
+            LocalResult::Ambiguous(earliest, _) => {
+                Ok(earliest.with_timezone(&Utc).timestamp_millis())
+            }
+            LocalResult::None => Err(format!(
+                "schedule_preview date boundary {date} does not exist in local timezone"
+            )),
+        },
+        CronTimezoneMode::Named(tz) => match tz.from_local_datetime(&local_midnight) {
+            LocalResult::Single(value) => Ok(value.with_timezone(&Utc).timestamp_millis()),
+            LocalResult::Ambiguous(earliest, _) => {
+                Ok(earliest.with_timezone(&Utc).timestamp_millis())
+            }
+            LocalResult::None => Err(format!(
+                "schedule_preview date boundary {date} does not exist in timezone {}",
+                tz.name()
+            )),
+        },
+    }
+}
+
+fn schedule_preview_run_json(
+    run_at_unix_ms: i64,
+    timezone: CronTimezoneMode,
+) -> Result<Value, String> {
+    let utc = Utc
+        .timestamp_millis_opt(run_at_unix_ms)
+        .single()
+        .ok_or_else(|| "schedule preview timestamp is out of range".to_owned())?;
+    let run_at_local = match timezone {
+        CronTimezoneMode::Utc => utc.to_rfc3339(),
+        CronTimezoneMode::Local => utc.with_timezone(&Local).to_rfc3339(),
+        CronTimezoneMode::Named(tz) => utc.with_timezone(&tz).to_rfc3339(),
+    };
+    Ok(json!({
+        "run_at_unix_ms": run_at_unix_ms,
+        "run_at_utc": utc.to_rfc3339(),
+        "run_at_local": run_at_local,
+        "timezone": timezone.as_str(),
     }))
 }
 
@@ -3217,6 +3351,64 @@ mod tests {
         assert_eq!(local.weekday().num_days_from_sunday(), 1);
         assert_eq!(local.hour(), 9);
         assert_eq!(local.minute(), 0);
+    }
+
+    #[test]
+    fn preview_schedule_returns_requested_limit() {
+        let payload = json!({
+            "operation": "schedule_preview",
+            "phrase": "every Monday at 09:00",
+            "timezone": "Europe/Prague",
+            "start_date": "2026-06-24",
+            "limit": 3,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let value = super::preview_schedule(&payload, crate::cron::CronTimezoneMode::Utc)
+            .expect("limited preview should succeed");
+        let runs = value["preview_runs"].as_array().expect("preview runs should be an array");
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0]["run_at_local"], json!("2026-06-29T09:00:00+02:00"));
+        assert_eq!(runs[1]["run_at_local"], json!("2026-07-06T09:00:00+02:00"));
+        assert_eq!(runs[2]["run_at_local"], json!("2026-07-13T09:00:00+02:00"));
+    }
+
+    #[test]
+    fn preview_schedule_uses_requested_dst_window() {
+        let payload = json!({
+            "operation": "schedule_preview",
+            "phrase": "daily at 02:30",
+            "timezone": "Europe/Prague",
+            "start_date": "2026-10-24",
+            "end_date": "2026-10-27",
+            "limit": 10,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let value = super::preview_schedule(&payload, crate::cron::CronTimezoneMode::Utc)
+            .expect("DST preview should succeed");
+        let run_times = value["preview_runs"]
+            .as_array()
+            .expect("preview runs should be an array")
+            .iter()
+            .map(|run| run["run_at_local"].as_str().expect("run should have local time"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            run_times,
+            vec![
+                "2026-10-24T02:30:00+02:00",
+                "2026-10-25T02:30:00+02:00",
+                "2026-10-25T02:30:00+01:00",
+                "2026-10-26T02:30:00+01:00",
+                "2026-10-27T02:30:00+01:00",
+            ]
+        );
     }
 
     #[test]

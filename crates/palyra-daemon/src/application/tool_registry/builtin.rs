@@ -327,7 +327,18 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "timezone",
                         json!({"type":"string","description":"local, utc, or an IANA timezone such as Europe/Prague."}),
                     ),
-                    ("limit", json!({"type":"integer","minimum":1,"maximum":500})),
+                    (
+                        "limit",
+                        json!({"type":"integer","minimum":1,"maximum":500,"description":"Page size for list/list_runs, or requested preview run count for operation=schedule_preview (runtime caps previews to a safe bounded maximum)."}),
+                    ),
+                    (
+                        "start_date",
+                        json!({"type":"string","description":"Optional YYYY-MM-DD local date for operation=schedule_preview. The date is interpreted in timezone and included in the preview window."}),
+                    ),
+                    (
+                        "end_date",
+                        json!({"type":"string","description":"Optional YYYY-MM-DD local date for operation=schedule_preview. The date is interpreted in timezone and included through the end of that local day."}),
+                    ),
                     (
                         "expected_successful_runs",
                         json!({"type":"integer","minimum":0,"description":"Optional success count to wait for when operation=wait_terminal, for example max_runs from a capped recurring schedule."}),
