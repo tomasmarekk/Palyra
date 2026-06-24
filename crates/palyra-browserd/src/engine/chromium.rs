@@ -6,7 +6,7 @@
 //! through [`run_chromium_blocking`].
 
 use crate::*;
-use headless_chrome::protocol::cdp::Emulation;
+use headless_chrome::protocol::cdp::{Browser, Emulation};
 use headless_chrome::{
     browser::tab::ModifierKey,
     types::{Bounds, PrintToPdfOptions},
@@ -2859,6 +2859,87 @@ fn chromium_cookie_delete_requests(cookies: &[Network::Cookie]) -> Vec<Network::
         .collect()
 }
 
+/// Applies the session permission policy to the active tab's current origin so
+/// page-level `navigator.permissions.query()` observes the same state.
+///
+/// # Errors
+/// Returns lookup sentinels, invalid active-origin diagnostics, remote-IP guard
+/// incidents, or CDP permission override failures.
+pub(crate) async fn chromium_apply_active_origin_permissions(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    permissions: SessionPermissionsInternal,
+) -> Result<(), String> {
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
+    run_chromium_blocking("chromium apply active origin permissions", move || {
+        let origin = chromium_permission_origin(tab.get_url().as_str())?;
+        for request in chromium_permission_set_requests(origin.as_str(), permissions) {
+            tab.call_method(request)
+                .map_err(|error| format!("failed to set Chromium page permission: {error}"))?;
+        }
+        Ok(())
+    })
+    .await?;
+    enforce_chromium_remote_ip_guard(runtime, session_id).await?;
+    Ok(())
+}
+
+fn chromium_permission_origin(raw_url: &str) -> Result<String, String> {
+    let url = Url::parse(raw_url).map_err(|error| {
+        format!("failed to parse active tab URL for permission override: {error}")
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "active tab URL scheme '{}' does not support browser permission overrides",
+            url.scheme()
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "active tab URL has no host for permission override".to_owned())?;
+    let mut origin = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(port.to_string().as_str());
+    }
+    Ok(origin)
+}
+
+fn chromium_permission_set_requests(
+    origin: &str,
+    permissions: SessionPermissionsInternal,
+) -> Vec<Browser::SetPermission> {
+    [
+        ("camera", permissions.camera),
+        ("microphone", permissions.microphone),
+        ("geolocation", permissions.location),
+    ]
+    .into_iter()
+    .map(|(name, setting)| Browser::SetPermission {
+        permission: Browser::PermissionDescriptor {
+            name: name.to_owned(),
+            sysex: None,
+            user_visible_only: None,
+            allow_without_sanitization: None,
+            allow_without_gesture: None,
+            pan_tilt_zoom: None,
+        },
+        setting: chromium_permission_setting(setting),
+        origin: Some(origin.to_owned()),
+        embedding_origin: None,
+        browser_context_id: None,
+    })
+    .collect()
+}
+
+fn chromium_permission_setting(setting: PermissionSettingInternal) -> Browser::PermissionSetting {
+    match setting {
+        PermissionSettingInternal::Deny => Browser::PermissionSetting::Denied,
+        PermissionSettingInternal::Allow => Browser::PermissionSetting::Granted,
+    }
+}
+
 async fn chromium_read_document_cookies(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -4909,11 +4990,11 @@ fn chromium_viewport_metrics_mismatch(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        chromium_cookie_delete_requests, chromium_network_log_headers,
-        chromium_read_document_cookies_script, chromium_read_local_storage_script,
-        chromium_restore_local_storage_script, chromium_touch_emulation_max_touch_points,
-        chromium_transport_idle_timeout, chromium_upload_staging_path,
-        chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
+        chromium_cookie_delete_requests, chromium_network_log_headers, chromium_permission_origin,
+        chromium_permission_set_requests, chromium_read_document_cookies_script,
+        chromium_read_local_storage_script, chromium_restore_local_storage_script,
+        chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
+        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -4930,8 +5011,9 @@ mod tests {
         MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
-        DEFAULT_SESSION_IDLE_TTL_MS, MAX_CONSOLE_MESSAGE_BYTES, MAX_CONSOLE_SOURCE_BYTES,
-        MAX_CONSOLE_STACK_BYTES, MAX_NETWORK_LOG_URL_BYTES,
+        PermissionSettingInternal, SessionPermissionsInternal, DEFAULT_SESSION_IDLE_TTL_MS,
+        MAX_CONSOLE_MESSAGE_BYTES, MAX_CONSOLE_SOURCE_BYTES, MAX_CONSOLE_STACK_BYTES,
+        MAX_NETWORK_LOG_URL_BYTES,
     };
     use base64::Engine as _;
     use std::collections::HashMap;
@@ -5391,6 +5473,46 @@ mod tests {
             encoded.get("value").is_none(),
             "cookie values must not be sent in delete requests"
         );
+    }
+
+    #[test]
+    fn chromium_permission_origin_requires_http_origin() {
+        assert_eq!(
+            chromium_permission_origin("http://127.0.0.1:5175/path?token=secret")
+                .expect("http origin should parse"),
+            "http://127.0.0.1:5175"
+        );
+        assert_eq!(
+            chromium_permission_origin("https://example.test/app")
+                .expect("https origin should parse"),
+            "https://example.test"
+        );
+        assert!(
+            chromium_permission_origin("about:blank").is_err(),
+            "permission override must fail loud when there is no page origin"
+        );
+    }
+
+    #[test]
+    fn chromium_permission_set_requests_match_session_policy() {
+        let requests = chromium_permission_set_requests(
+            "http://127.0.0.1:5175",
+            SessionPermissionsInternal {
+                camera: PermissionSettingInternal::Deny,
+                microphone: PermissionSettingInternal::Deny,
+                location: PermissionSettingInternal::Allow,
+            },
+        );
+
+        assert_eq!(requests.len(), 3);
+        let encoded = serde_json::to_value(&requests).expect("permission requests should encode");
+        assert_eq!(encoded[0]["permission"]["name"], "camera");
+        assert_eq!(encoded[0]["setting"], "denied");
+        assert_eq!(encoded[1]["permission"]["name"], "microphone");
+        assert_eq!(encoded[1]["setting"], "denied");
+        assert_eq!(encoded[2]["permission"]["name"], "geolocation");
+        assert_eq!(encoded[2]["setting"], "granted");
+        assert_eq!(encoded[2]["origin"], "http://127.0.0.1:5175");
     }
 
     #[test]

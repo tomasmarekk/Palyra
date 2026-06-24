@@ -193,6 +193,43 @@ async fn create_test_session_with_private_targets(
         .into_inner()
 }
 
+async fn click_permission_check_and_wait_for_text(
+    service: &BrowserServiceImpl,
+    session_id: proto::palyra::common::v1::CanonicalId,
+    text: &str,
+) {
+    let click = service
+        .click(Request::new(browser_v1::ClickRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#check".to_owned(),
+            max_retries: 1,
+            timeout_ms: 3_000,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("permission check click should execute")
+        .into_inner();
+    assert!(click.success, "permission check click should succeed: {}", click.error);
+
+    let observed = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id),
+            selector: "#status".to_owned(),
+            text: text.to_owned(),
+            timeout_ms: 5_000,
+            poll_interval_ms: 50,
+            capture_failure_screenshot: true,
+            max_failure_screenshot_bytes: 16 * 1024,
+        }))
+        .await
+        .expect("permission status wait should execute")
+        .into_inner();
+    assert!(observed.success, "permission status should become '{text}': {}", observed.error);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_service_health_reports_engine_capabilities() {
     let runtime = simulated_runtime_for_tests();
@@ -3614,6 +3651,160 @@ async fn browser_service_permissions_default_to_deny() {
     assert_eq!(effective.camera, 1, "camera permission should default to deny");
     assert_eq!(effective.microphone, 1, "microphone permission should default to deny");
     assert_eq!(effective.location, 1, "location permission should default to deny");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_set_permissions_updates_session_state() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created.session_id.expect("session id should be present");
+
+    let updated = service
+        .set_permissions(Request::new(browser_v1::SetPermissionsRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            camera: 0,
+            microphone: 0,
+            location: 2,
+            reset_to_default: false,
+        }))
+        .await
+        .expect("set_permissions should execute")
+        .into_inner();
+
+    assert!(updated.success, "permission update should succeed");
+    let effective = updated.permissions.expect("permissions should be returned");
+    assert_eq!(effective.camera, 1, "camera should remain denied by default");
+    assert_eq!(effective.microphone, 1, "microphone should remain denied by default");
+    assert_eq!(effective.location, 2, "location should be allowed");
+
+    let reset = service
+        .set_permissions(Request::new(browser_v1::SetPermissionsRequest {
+            v: 1,
+            session_id: Some(session_id),
+            camera: 0,
+            microphone: 0,
+            location: 0,
+            reset_to_default: true,
+        }))
+        .await
+        .expect("permission reset should execute")
+        .into_inner();
+
+    assert!(reset.success, "permission reset should succeed");
+    let effective = reset.permissions.expect("reset permissions should be returned");
+    assert_eq!(effective.camera, 1, "camera should reset to deny");
+    assert_eq!(effective.microphone, 1, "microphone should reset to deny");
+    assert_eq!(effective.location, 1, "location should reset to deny");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_permissions_set_updates_page_permissions_api() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let (url, handle) = spawn_static_http_server_with_request_budget(
+        200,
+        r#"<html><head><title>Permission Fixture</title><script>
+async function checkGeo(){
+  const status = await navigator.permissions.query({ name: 'geolocation' });
+  document.getElementById('status').textContent = 'Permission: ' + status.state;
+}
+</script></head><body onload="checkGeo()"><button id="check" onclick="checkGeo()">Check</button><div id="status">loading</div></body></html>"#,
+        8,
+    );
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium permissions mode");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(navigate.success, "chromium navigate should succeed: {}", navigate.error);
+
+    let denied = service
+        .set_permissions(Request::new(browser_v1::SetPermissionsRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            camera: 0,
+            microphone: 0,
+            location: 1,
+            reset_to_default: false,
+        }))
+        .await
+        .expect("deny permission update should execute")
+        .into_inner();
+    assert!(denied.success, "deny should apply to Chromium: {}", denied.error);
+    click_permission_check_and_wait_for_text(&service, session_id.clone(), "Permission: denied")
+        .await;
+
+    let allowed = service
+        .set_permissions(Request::new(browser_v1::SetPermissionsRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            camera: 0,
+            microphone: 0,
+            location: 2,
+            reset_to_default: false,
+        }))
+        .await
+        .expect("allow permission update should execute")
+        .into_inner();
+    assert!(allowed.success, "allow should apply to Chromium: {}", allowed.error);
+    click_permission_check_and_wait_for_text(&service, session_id, "Permission: granted").await;
+
+    drop(handle);
 }
 
 #[tokio::test(flavor = "multi_thread")]

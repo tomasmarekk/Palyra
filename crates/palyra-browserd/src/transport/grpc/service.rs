@@ -3908,7 +3908,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
         let mut session_for_persist = None;
-        let response = {
+        let updated_permissions = {
             let mut sessions = self.runtime.sessions.lock().await;
             let Some(session) = sessions.get_mut(session_id.as_str()) else {
                 return Ok(Response::new(browser_v1::SetPermissionsResponse {
@@ -3919,22 +3919,47 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 }));
             };
             session.last_active = Instant::now();
-            session.permissions.apply_update(
+            let mut updated_permissions = session.permissions.clone();
+            updated_permissions.apply_update(
                 payload.camera,
                 payload.microphone,
                 payload.location,
                 payload.reset_to_default,
             );
-            if session.persistence.enabled {
-                session_for_persist = Some(session.clone());
-            }
-            browser_v1::SetPermissionsResponse {
-                v: CANONICAL_PROTOCOL_MAJOR,
-                success: true,
-                permissions: Some(session.permissions.to_proto()),
-                error: String::new(),
-            }
+            updated_permissions
         };
+        let mut response = browser_v1::SetPermissionsResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            success: true,
+            permissions: Some(updated_permissions.to_proto()),
+            error: String::new(),
+        };
+        if self.runtime.engine_mode == BrowserEngineMode::Chromium {
+            if let Err(error) = chromium_apply_active_origin_permissions(
+                self.runtime.as_ref(),
+                session_id.as_str(),
+                updated_permissions.clone(),
+            )
+            .await
+            {
+                response.success = false;
+                response.error = format!("failed to apply Chromium page permissions: {error}");
+            }
+        }
+        if response.success {
+            let mut sessions = self.runtime.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                session.last_active = Instant::now();
+                session.permissions = updated_permissions;
+                if session.persistence.enabled {
+                    session_for_persist = Some(session.clone());
+                }
+                response.permissions = Some(session.permissions.to_proto());
+            } else {
+                response.success = false;
+                response.error = "session_not_found".to_owned();
+            }
+        }
         persist_session_after_mutation(
             self.runtime.as_ref(),
             session_for_persist,
