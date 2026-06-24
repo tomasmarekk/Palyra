@@ -724,6 +724,7 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.artifact.read",
     "palyra.image.observe",
     "palyra.delegation.query",
+    "palyra.delegation.control",
     "palyra.routines.query",
     "palyra.routines.control",
     "palyra.http.fetch",
@@ -760,6 +761,7 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.browser.permissions.set",
     "palyra.browser.downloads.list",
     "palyra.browser.downloads.get",
+    "palyra.tool_program.run",
     "palyra.plugin.run",
     "palyra.process.run",
     "palyra.process.stop",
@@ -13361,6 +13363,14 @@ mod init_command_tests {
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.routines.control"),
             "local init should expose approval-gated routine creation for autonomous monitors"
+        );
+        assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.delegation.control"),
+            "local init should expose approval-gated child-run delegation for orchestration tests"
+        );
+        assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.tool_program.run"),
+            "local init should expose bounded ToolProgram execution for nested-tool policy tests"
         );
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.fs.apply_patch"),
