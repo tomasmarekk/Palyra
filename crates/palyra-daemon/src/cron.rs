@@ -3584,12 +3584,14 @@ struct CronCompletionCandidate {
     completion_surface: bool,
     noop_observation_surface: bool,
     reject_background_output: bool,
+    require_saved_file: bool,
 }
 
 impl CronCompletionCandidate {
     fn is_confirmed_by_output(self, output_json: &[u8]) -> bool {
         self.completion_surface
             && (!self.reject_background_output || !cron_tool_output_is_background(output_json))
+            && (!self.require_saved_file || cron_tool_output_has_saved_file(output_json))
     }
 
     fn is_noop_observation_confirmed_by_output(self, output_json: &[u8]) -> bool {
@@ -3620,6 +3622,7 @@ fn cron_completion_candidate_for_tool_proposal(
             completion_surface: true,
             noop_observation_surface: false,
             reject_background_output: false,
+            require_saved_file: false,
         };
     }
     if tool_name == "palyra.fs.os_file" && cron_os_file_operation_is_mutation(input_json) {
@@ -3627,6 +3630,15 @@ fn cron_completion_candidate_for_tool_proposal(
             completion_surface: true,
             noop_observation_surface: false,
             reject_background_output: false,
+            require_saved_file: false,
+        };
+    }
+    if tool_name == crate::gateway::BROWSER_PDF_TOOL_NAME {
+        return CronCompletionCandidate {
+            completion_surface: true,
+            noop_observation_surface: false,
+            reject_background_output: false,
+            require_saved_file: true,
         };
     }
     if tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME
@@ -3636,6 +3648,7 @@ fn cron_completion_candidate_for_tool_proposal(
             completion_surface: true,
             noop_observation_surface: false,
             reject_background_output: true,
+            require_saved_file: false,
         };
     }
     if cron_tool_call_is_noop_observation_candidate(tool_name, input_json) {
@@ -3643,12 +3656,14 @@ fn cron_completion_candidate_for_tool_proposal(
             completion_surface: false,
             noop_observation_surface: true,
             reject_background_output: tool_name == crate::gateway::PROCESS_RUNNER_TOOL_NAME,
+            require_saved_file: false,
         };
     }
     CronCompletionCandidate {
         completion_surface: false,
         noop_observation_surface: false,
         reject_background_output: false,
+        require_saved_file: false,
     }
 }
 
@@ -3732,6 +3747,15 @@ fn cron_tool_output_is_background(output_json: &[u8]) -> bool {
         .ok()
         .and_then(|value| value.get("background").and_then(Value::as_bool))
         .unwrap_or(false)
+}
+
+fn cron_tool_output_has_saved_file(output_json: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(output_json).ok().is_some_and(|value| {
+        value
+            .pointer("/saved_file/path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+    })
 }
 
 fn build_cron_prompt(
@@ -4709,6 +4733,17 @@ mod tests {
             auto_backgrounded
         )
         .is_confirmed_by_output(br#"{"background":true,"pid":1234}"#));
+
+        assert!(cron_completion_candidate_for_tool_proposal(
+            crate::gateway::BROWSER_PDF_TOOL_NAME,
+            b"{}"
+        )
+        .is_confirmed_by_output(br#"{"success":true,"saved_file":{"path":"reports/weekly.pdf"}}"#));
+        assert!(!cron_completion_candidate_for_tool_proposal(
+            crate::gateway::BROWSER_PDF_TOOL_NAME,
+            b"{}"
+        )
+        .is_confirmed_by_output(br#"{"success":true,"saved_file":null}"#));
     }
 
     #[test]
