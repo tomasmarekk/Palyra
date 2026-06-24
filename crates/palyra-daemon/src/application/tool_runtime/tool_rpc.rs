@@ -22,7 +22,7 @@ use crate::{
     },
     gateway::{
         execute_tool_with_runtime_dispatch, GatewayRuntimeState, SharedToolBudget,
-        ToolRuntimeExecutionContext,
+        ToolRuntimeExecutionContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, HTTP_FETCH_TOOL_NAME,
     },
     tool_protocol::{self, ToolAttestation},
     transport::grpc::auth::RequestContext,
@@ -220,18 +220,37 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         });
     let child_tool_requires_approval =
         tool_protocol::tool_requires_approval(request.tool_name.as_str());
+    let inherits_parent_approval =
+        child_tool_can_inherit_parent_approval(request.tool_name.as_str(), &decision);
+    let mut execution_decision = decision;
+    if inherits_parent_approval {
+        execution_decision.allowed = true;
+        execution_decision.approval_required = false;
+        execution_decision.reason = format!(
+            "parent tool program approval inherited for child tool={}; original_reason={}",
+            request.tool_name, execution_decision.reason
+        );
+    }
     // A nested call has no operator to prompt, so anything approval-shaped
     // (proposal gate, tool metadata, or resolved decision) fails closed here
-    // instead of suspending the program.
-    if proposal_approval_required || child_tool_requires_approval || decision.approval_required {
+    // instead of suspending the program. `palyra.http.fetch` is the one
+    // approval-required child allowed to inherit the already-approved parent
+    // program; it still runs through normal fetch egress and content policy.
+    if (proposal_approval_required
+        || child_tool_requires_approval
+        || execution_decision.approval_required)
+        && !inherits_parent_approval
+    {
         budget_debit.refund();
-        let denial_reason =
-            nested_approval_denial_reason(request.tool_name.as_str(), decision.reason.as_str());
+        let denial_reason = nested_approval_denial_reason(
+            request.tool_name.as_str(),
+            execution_decision.reason.as_str(),
+        );
         return (denied_response(request, denial_reason, true), 0);
     }
-    if !decision.allowed {
+    if !execution_decision.allowed {
         budget_debit.refund();
-        return (denied_response(request, decision.reason, false), 0);
+        return (denied_response(request, execution_decision.reason, false), 0);
     }
 
     let timeout = request.timeout_ms.map(Duration::from_millis);
@@ -261,8 +280,8 @@ pub(crate) async fn execute_granted_tool_rpc_call(
                         tool_name: request.tool_name,
                         status: ToolRpcStatus::TimedOut,
                         success: false,
-                        decision_reason: decision.reason,
-                        approval_required: decision.approval_required,
+                        decision_reason: execution_decision.reason,
+                        approval_required: execution_decision.approval_required,
                         output: json!({}),
                         error: "tool rpc call timed out".to_owned(),
                         redacted_preview: String::new(),
@@ -283,8 +302,8 @@ pub(crate) async fn execute_granted_tool_rpc_call(
             tool_name: request.tool_name,
             status: if outcome.success { ToolRpcStatus::Completed } else { ToolRpcStatus::Failed },
             success: outcome.success,
-            decision_reason: decision.reason,
-            approval_required: decision.approval_required,
+            decision_reason: execution_decision.reason,
+            approval_required: execution_decision.approval_required,
             output: project_rpc_output(
                 outcome.output_json.as_slice(),
                 request.result_projection,
@@ -415,6 +434,21 @@ fn nested_approval_denial_reason(tool_name: &str, original_reason: &str) -> Stri
     )
 }
 
+fn child_tool_can_inherit_parent_approval(
+    tool_name: &str,
+    decision: &tool_protocol::ToolDecision,
+) -> bool {
+    tool_name == HTTP_FETCH_TOOL_NAME
+        && decision.approval_required
+        && (decision.allowed || child_decision_is_approval_gate_only(decision.reason.as_str()))
+}
+
+fn child_decision_is_approval_gate_only(reason: &str) -> bool {
+    reason.contains(APPROVAL_CHANNEL_UNAVAILABLE_REASON)
+        || reason.contains("approval required (pending approval_id=")
+        || reason.contains("explicit user approval required")
+}
+
 fn validate_tool_rpc_request(request: &ToolRpcRequest) -> Result<(), String> {
     if request.schema_version != TOOL_RPC_SCHEMA_VERSION {
         return Err(format!("tool rpc schema_version={} is unsupported", request.schema_version));
@@ -509,7 +543,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        build_python_tool_rpc_bridge_context, python_tool_rpc_sdk_source, TOOL_RPC_SCHEMA_VERSION,
+        build_python_tool_rpc_bridge_context, child_tool_can_inherit_parent_approval,
+        python_tool_rpc_sdk_source, TOOL_RPC_SCHEMA_VERSION,
     };
 
     #[test]
@@ -531,5 +566,24 @@ mod tests {
         assert!(source.contains("json.dumps"));
         assert!(!source.contains("API_KEY"));
         assert!(!source.contains("TOKEN"));
+    }
+
+    #[test]
+    fn only_http_fetch_child_can_inherit_parent_approval() {
+        let approval_gate_decision = crate::tool_protocol::ToolDecision {
+            allowed: false,
+            reason: crate::gateway::APPROVAL_CHANNEL_UNAVAILABLE_REASON.to_owned(),
+            approval_required: true,
+            policy_enforced: true,
+        };
+
+        assert!(child_tool_can_inherit_parent_approval(
+            crate::gateway::HTTP_FETCH_TOOL_NAME,
+            &approval_gate_decision
+        ));
+        assert!(!child_tool_can_inherit_parent_approval(
+            crate::gateway::PROCESS_RUNNER_TOOL_NAME,
+            &approval_gate_decision
+        ));
     }
 }

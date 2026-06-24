@@ -23,7 +23,7 @@ use crate::{
 /// Bump it whenever any contract text below changes so downstream hash
 /// comparisons (caching, journaled identity) see the change; the unit tests
 /// pin the current value.
-pub(crate) const INSTRUCTION_COMPILER_VERSION: u32 = 30;
+pub(crate) const INSTRUCTION_COMPILER_VERSION: u32 = 31;
 
 /// Aggregated trust posture of the context blocks selected for the turn,
 /// embedded into the developer message so the model is told how much of its
@@ -265,6 +265,11 @@ fn tool_specific_contract(tool_names: &[String]) -> String {
     if tool_names.iter().any(|tool| tool == "palyra.http.fetch") {
         contracts.push("palyra.http.fetch research contract: for public documentation research, prefer official compact endpoints such as JSON indexes, release metadata, changelogs, or version files before large HTML landing pages. For current/latest support, release, pricing, or availability facts, prefer official or primary sources and do not infer current status from stale memory or package names alone. For docs and public web assets, include allowed_content_types containing text/html, text/plain, text/markdown, application/json, text/css, text/javascript, and application/javascript unless the task needs a narrower policy. For text/html responses, body_text is a readable page-text extraction when possible rather than raw head asset markup. A successful fetch may return truncated=true with a bounded body_text; use the returned body_text as partial evidence, then switch to a smaller official URL or one browser observe attempt if the needed fact is not present. Do not repeat fetch/browser fallbacks against the same oversized or blocked URL until the model turn limit; report which source was blocked or truncated and what remains unknown.".to_owned());
     }
+    if tool_names.iter().any(|tool| tool == "palyra.http.fetch")
+        && tool_names.iter().any(|tool| tool == "palyra.tool_program.run")
+    {
+        contracts.push("palyra.http.fetch short-window contract: for sub-second cache TTL, rate-limit, debounce, retry-after, or other immediate time-window probes, use palyra.tool_program.run with granted_tools=['palyra.http.fetch'] and dependent http.fetch steps so the immediate follow-up request runs inside one runtime tool step without model-turn or approval latency. Use normal sequential http.fetch calls only when the TTL/window is long enough to survive full agent loop latency; otherwise report the timing limit instead of treating delayed misses as cache or endpoint evidence.".to_owned());
+    }
     if tool_names.iter().any(|tool| tool == "palyra.artifact.read") {
         contracts.push("palyra.artifact.read contract: textual tool-result artifacts default to text_preview=true for model evidence. Provider raw artifacts reject full binary reads but the runtime will return a bounded redacted text preview when possible; if an explicit full read is denied, retry once with text_preview=true, a small max_bytes value, and the same artifact_id/digest. Page through evidence with offset_bytes only when the previous preview was useful and eof=false.".to_owned());
     }
@@ -402,7 +407,7 @@ mod tests {
         let first = compiler.compile_with_runtime_context(input.clone(), fixed_runtime_context());
         let second = compiler.compile_with_runtime_context(input, fixed_runtime_context());
         assert_eq!(first.hash, second.hash);
-        assert_eq!(first.version, 30);
+        assert_eq!(first.version, 31);
         assert_eq!(first.provider_messages().len(), 2);
     }
 
@@ -643,6 +648,20 @@ mod tests {
         assert!(contract.contains("truncated=true"));
         assert!(contract.contains("partial evidence"));
         assert!(contract.contains("same oversized or blocked URL"));
+    }
+
+    #[test]
+    fn tool_specific_contract_explains_short_window_http_fetch_programs() {
+        let contract = super::tool_specific_contract(&[
+            "palyra.http.fetch".to_owned(),
+            "palyra.tool_program.run".to_owned(),
+        ]);
+
+        assert!(contract.contains("sub-second cache TTL"));
+        assert!(contract.contains("granted_tools=['palyra.http.fetch']"));
+        assert!(contract.contains("dependent http.fetch steps"));
+        assert!(contract.contains("without model-turn or approval latency"));
+        assert!(contract.contains("timing limit"));
     }
 
     #[test]
