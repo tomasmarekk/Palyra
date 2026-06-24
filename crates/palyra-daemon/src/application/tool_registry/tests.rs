@@ -562,6 +562,14 @@ fn memory_search_schema_defaults_to_all_scope() {
         .as_str()
         .unwrap_or_default()
         .contains("Defaults to all"));
+    assert!(entry.input_schema["properties"]["channel"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("isolation_probe=true"));
+    assert_eq!(
+        entry.input_schema["properties"]["isolation_probe"]["type"],
+        serde_json::json!("boolean")
+    );
 }
 
 #[test]

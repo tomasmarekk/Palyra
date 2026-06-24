@@ -6196,6 +6196,97 @@ async fn memory_search_tool_channel_scope_requires_authenticated_channel_context
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_search_tool_cross_channel_isolation_probe_redacts_content() {
+    let state = build_test_runtime_state(false);
+    let context = super::ToolRuntimeExecutionContext {
+        channel: Some("staging"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBB",
+        ..routines_tool_test_context()
+    };
+    let staging_marker = "PALYRA_STAGING_ONLY_ISOLATION_MARKER";
+    let prod_marker = "PALYRA_PROD_ONLY_ISOLATION_MARKER";
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FBC".to_owned(),
+            principal: context.principal.to_owned(),
+            channel: Some("staging".to_owned()),
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: format!("Staging-only billing rule {staging_marker}"),
+            tags: vec!["isolation".to_owned()],
+            confidence: Some(0.95),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("staging memory should be seeded");
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: "01ARZ3NDEKTSV4RRFFQ69G5FBD".to_owned(),
+            principal: context.principal.to_owned(),
+            channel: Some("prod".to_owned()),
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: format!("Prod-only billing rule {prod_marker}"),
+            tags: vec!["isolation".to_owned()],
+            confidence: Some(0.95),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("prod memory should be seeded");
+
+    let denied = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBE",
+        br#"{"query":"PALYRA_PROD_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod"}"#,
+    )
+    .await;
+    assert!(
+        !denied.success,
+        "cross-channel content search should remain fail-closed without probe"
+    );
+    assert!(
+        denied.error.contains("isolation_probe=true"),
+        "error should identify the safe probe mode: {}",
+        denied.error
+    );
+
+    let absent_probe = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBF",
+        br#"{"query":"PALYRA_STAGING_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod","isolation_probe":true,"top_k":20}"#,
+    )
+    .await;
+    assert!(absent_probe.success, "absent probe should succeed: {}", absent_probe.error);
+    let absent_payload = parse_tool_output_json(&absent_probe);
+    assert_eq!(absent_payload["probe"], "channel_isolation");
+    assert_eq!(absent_payload["authenticated_channel"], "staging");
+    assert_eq!(absent_payload["target_channel"], "prod");
+    assert_eq!(absent_payload["isolated"], true);
+    assert_eq!(absent_payload["hit_count"], 0);
+    assert!(absent_payload.get("hits").is_none(), "probe output must not include hit content");
+
+    let present_probe = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FC0",
+        br#"{"query":"PALYRA_PROD_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod","isolation_probe":true,"top_k":20}"#,
+    )
+    .await;
+    assert!(present_probe.success, "present probe should succeed: {}", present_probe.error);
+    let present_payload = parse_tool_output_json(&present_probe);
+    assert_eq!(present_payload["isolated"], false);
+    assert_eq!(present_payload["hit_count"], 1);
+    assert_eq!(present_payload["content_redacted"], true);
+    assert!(
+        !present_payload.to_string().contains("Prod-only billing rule"),
+        "present probe must reveal existence only, never memory content: {present_payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_recall_tool_channel_override_requires_authenticated_channel_context() {
     let state = build_test_runtime_state(false);
     let input_json = br#"{"query":"incident summary","channel":"cli"}"#;

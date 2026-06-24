@@ -62,6 +62,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         "scope",
                         json!({"type":"string","enum":["all","principal","session","channel","workspace","project"],"description":"Defaults to all, which searches durable principal memory plus indexed workspace/project documents. Use principal, session, channel, workspace, or project to narrow the search."}),
                     ),
+                    (
+                        "channel",
+                        json!({"type":"string","description":"Only valid with scope=channel. Omit or use current/default sentinels for the authenticated run channel. To verify that a marker is absent in a different channel, set isolation_probe=true; the result returns only hit_count/isolated metadata and never memory content."}),
+                    ),
+                    (
+                        "isolation_probe",
+                        json!({"type":"boolean","description":"Only valid with scope=channel. When true, permits a read-only negative probe against channel and redacts all hit content from the output."}),
+                    ),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":20})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),
                     (

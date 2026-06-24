@@ -82,6 +82,10 @@ const MEMORY_SOURCE_VALUES: &[&str] =
 const MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "memory hits are retrieved evidence; do not claim no stored preference or prior fact exists unless the hits are irrelevant to the user's question";
 const MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no memory hits were returned; do not invent stored preferences or prior facts";
+const MEMORY_CHANNEL_ISOLATION_ABSENT_CLAIM_BOUNDARY: &str =
+    "no hits were found in the requested channel for this bounded query; this is a negative isolation probe, not a general memory inventory";
+const MEMORY_CHANNEL_ISOLATION_PRESENT_CLAIM_BOUNDARY: &str =
+    "one or more hits exist in the requested channel for this bounded query; content is withheld by the isolation probe";
 const COMBINED_MEMORY_HITS_PRESENT_CLAIM_BOUNDARY: &str = "durable lifecycle or workspace memory hits are retrieved evidence; do not claim no stored preference or project fact exists unless the hits are irrelevant";
 const COMBINED_MEMORY_HITS_ABSENT_CLAIM_BOUNDARY: &str =
     "no durable lifecycle or workspace memory hits were returned";
@@ -180,6 +184,27 @@ fn combined_memory_search_tool_output_payload(
     })
 }
 
+fn memory_channel_isolation_probe_output_payload(
+    probe: &MemorySearchIsolationProbe,
+    search_hits: &[MemorySearchHit],
+) -> Value {
+    let matched = !search_hits.is_empty();
+    json!({
+        "scope": "channel",
+        "probe": "channel_isolation",
+        "authenticated_channel": probe.authenticated_channel.as_str(),
+        "target_channel": probe.target_channel.as_str(),
+        "hit_count": if matched { 1 } else { 0 },
+        "isolated": !matched,
+        "content_redacted": true,
+        "claim_boundary": if matched {
+            MEMORY_CHANNEL_ISOLATION_PRESENT_CLAIM_BOUNDARY
+        } else {
+            MEMORY_CHANNEL_ISOLATION_ABSENT_CLAIM_BOUNDARY
+        },
+    })
+}
+
 fn workspace_search_tool_output_hits(search_hits: &[WorkspaceSearchHit]) -> Vec<Value> {
     search_hits.iter().map(workspace_search_hit_tool_output_payload).collect()
 }
@@ -258,6 +283,12 @@ struct WorkspaceMemorySearchPlan {
     primary_prefix: Option<String>,
     search_primary_without_prefix: bool,
     fallbacks: Vec<WorkspaceMemorySearchFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemorySearchIsolationProbe {
+    authenticated_channel: String,
+    target_channel: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2223,6 +2254,30 @@ pub(crate) async fn execute_memory_search_tool(
         .unwrap_or(8);
 
     let scope = memory_search_scope_text(&parsed);
+    let isolation_probe_enabled = match parse_memory_search_isolation_probe_flag(&parsed) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            return memory_tool_execution_outcome(
+                attestation_namespace,
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    if (isolation_probe_enabled || parsed.contains_key("channel")) && scope != "channel" {
+        return memory_tool_execution_outcome(
+            attestation_namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.memory.search channel and isolation_probe are only supported with scope=channel"
+                .to_owned(),
+        );
+    }
     if matches!(scope.as_str(), "workspace" | "project") {
         if let Err(error) = authorize_memory_action(principal, "memory.search", "memory:workspace")
         {
@@ -2502,27 +2557,33 @@ pub(crate) async fn execute_memory_search_tool(
         };
     }
 
-    let (channel_scope, session_scope, resource) = match scope.as_str() {
-        "principal" => (channel.map(str::to_owned), None, "memory:principal".to_owned()),
+    let (channel_scope, session_scope, resource, isolation_probe) = match scope.as_str() {
+        "principal" => (channel.map(str::to_owned), None, "memory:principal".to_owned(), None),
         "channel" => {
-            let Some(channel) = channel.map(str::to_owned) else {
-                return memory_tool_execution_outcome(
-                    attestation_namespace,
-                    proposal_id,
-                    input_json,
-                    false,
-                    b"{}".to_vec(),
-                    "palyra.memory.search scope=channel requires authenticated channel context"
-                        .to_owned(),
-                );
+            let (channel, isolation_probe) = match resolve_memory_search_channel_scope(
+                &parsed,
+                channel,
+                isolation_probe_enabled,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return memory_tool_execution_outcome(
+                        attestation_namespace,
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
             };
             let resource = format!("memory:channel:{channel}");
-            (Some(channel), None, resource)
+            (Some(channel), None, resource, isolation_probe)
         }
         "session" => {
             let channel = channel.map(str::to_owned);
             let session = Some(session_id.to_owned());
-            (channel, session, format!("memory:session:{session_id}"))
+            (channel, session, format!("memory:session:{session_id}"), None)
         }
         _ => {
             return memory_tool_execution_outcome(
@@ -2574,6 +2635,7 @@ pub(crate) async fn execute_memory_search_tool(
             );
         }
     };
+    let search_top_k = if isolation_probe.is_some() { 1 } else { top_k };
 
     let search_hits = match runtime_state
         .search_memory(MemorySearchRequest {
@@ -2581,7 +2643,7 @@ pub(crate) async fn execute_memory_search_tool(
             channel: channel_scope,
             session_id: session_scope,
             query,
-            top_k,
+            top_k: search_top_k,
             min_score,
             tags,
             sources,
@@ -2600,7 +2662,11 @@ pub(crate) async fn execute_memory_search_tool(
             );
         }
     };
-    let payload = memory_search_tool_output_payload(search_hits.as_slice());
+    let payload = if let Some(probe) = &isolation_probe {
+        memory_channel_isolation_probe_output_payload(probe, search_hits.as_slice())
+    } else {
+        memory_search_tool_output_payload(search_hits.as_slice())
+    };
     match serde_json::to_vec(&payload) {
         Ok(output_json) => memory_tool_execution_outcome(
             attestation_namespace,
@@ -2621,8 +2687,52 @@ pub(crate) async fn execute_memory_search_tool(
     }
 }
 
-/// Parses the optional `tags` filter array (bounded, strings only, blanks
-/// dropped); absent means no tag filtering.
+fn parse_memory_search_isolation_probe_flag(parsed: &Map<String, Value>) -> Result<bool, String> {
+    match parsed.get("isolation_probe") {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Null) | None => Ok(false),
+        Some(_) => Err("palyra.memory.search isolation_probe must be a boolean".to_owned()),
+    }
+}
+
+fn resolve_memory_search_channel_scope(
+    parsed: &Map<String, Value>,
+    context_channel: Option<&str>,
+    isolation_probe_enabled: bool,
+) -> Result<(String, Option<MemorySearchIsolationProbe>), String> {
+    let Some(current_channel) = context_channel.map(str::to_owned) else {
+        return Err(
+            "palyra.memory.search scope=channel requires authenticated channel context".to_owned()
+        );
+    };
+    let requested_channel = match parsed.get("channel") {
+        Some(value) => match optional_channel_string(value, "palyra.memory.search")? {
+            Some(requested) if !is_current_channel_sentinel(requested.as_str()) => requested,
+            _ => current_channel.clone(),
+        },
+        None => current_channel.clone(),
+    };
+    if requested_channel == current_channel {
+        let probe = isolation_probe_enabled.then(|| MemorySearchIsolationProbe {
+            authenticated_channel: current_channel,
+            target_channel: requested_channel.clone(),
+        });
+        return Ok((requested_channel, probe));
+    }
+    if !isolation_probe_enabled {
+        return Err(
+            "palyra.memory.search cross-channel reads require isolation_probe=true".to_owned()
+        );
+    }
+    Ok((
+        requested_channel.clone(),
+        Some(MemorySearchIsolationProbe {
+            authenticated_channel: current_channel,
+            target_channel: requested_channel,
+        }),
+    ))
+}
+
 fn parse_memory_search_tags(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
     match parsed.get("tags") {
         Some(Value::Array(values)) => {
@@ -4517,6 +4627,33 @@ mod tests {
             error.contains("channel must be a string when provided"),
             "error should preserve strict type validation: {error}"
         );
+    }
+
+    #[test]
+    fn memory_search_channel_isolation_probe_is_explicit_and_redacted() {
+        let mut parsed = Map::new();
+        parsed.insert("channel".to_owned(), Value::String("prod".to_owned()));
+        let error = resolve_memory_search_channel_scope(&parsed, Some("staging"), false)
+            .expect_err("cross-channel search should require isolation probe opt-in");
+        assert!(
+            error.contains("isolation_probe=true"),
+            "error should point callers at the bounded probe mode: {error}"
+        );
+
+        let (target_channel, probe) =
+            resolve_memory_search_channel_scope(&parsed, Some("staging"), true)
+                .expect("explicit isolation probe should resolve target channel");
+        let probe = probe.expect("cross-channel probe metadata should be present");
+        assert_eq!(target_channel, "prod");
+        assert_eq!(probe.authenticated_channel, "staging");
+        assert_eq!(probe.target_channel, "prod");
+
+        let payload = memory_channel_isolation_probe_output_payload(&probe, &[]);
+        assert_eq!(payload["probe"], "channel_isolation");
+        assert_eq!(payload["target_channel"], "prod");
+        assert_eq!(payload["isolated"], true);
+        assert_eq!(payload["content_redacted"], true);
+        assert!(payload.get("hits").is_none(), "isolation probes must not expose hit content");
     }
 
     #[test]
