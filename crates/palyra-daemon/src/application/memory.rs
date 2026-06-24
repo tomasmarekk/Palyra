@@ -1571,8 +1571,8 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
             if contains_any(
                 normalized,
                 &[
-                    "risk", "rizik", "hazard", "unsafe", "blocker", "blocked", "failure",
-                    "failing", "problem", "hroz", "chyba",
+                    "risk", "hazard", "unsafe", "blocker", "blocked", "failure", "failing",
+                    "problem", "threat", "error",
                 ],
             ) {
                 4
@@ -1594,13 +1594,9 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
                     "current",
                     "active",
                     "token",
-                    "docas",
-                    "dočas",
-                    "zatim",
-                    "zatím",
-                    "dnes",
-                    "aktualni",
-                    "aktuální",
+                    "ephemeral",
+                    "provisional",
+                    "pending",
                 ],
             ) {
                 3
@@ -1609,10 +1605,7 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
             }
         }
         MemoryReflectionCategory::Preferences => {
-            if contains_any(
-                normalized,
-                &["prefer", "preference", "prefers", "pouzivej", "používej", "default"],
-            ) {
+            if contains_any(normalized, &["prefer", "preference", "prefers", "use", "default"]) {
                 2
             } else {
                 0
@@ -1629,11 +1622,8 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
                     "never",
                     "must",
                     "should",
-                    "postup",
-                    "pravidlo",
-                    "vzdy",
-                    "vždy",
-                    "nikdy",
+                    "procedure",
+                    "policy",
                 ],
             ) {
                 2
@@ -1642,7 +1632,7 @@ fn reflection_category_score(category: MemoryReflectionCategory, normalized: &st
             }
         }
         MemoryReflectionCategory::Facts => {
-            if contains_any(normalized, &["decision", "decided", "rozhodn", "fact"]) {
+            if contains_any(normalized, &["decision", "decided", "fact"]) {
                 1
             } else {
                 0
