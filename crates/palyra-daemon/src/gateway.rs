@@ -71,7 +71,7 @@ use crate::{
         inbound_coalescer::InboundCoalescer,
         tool_runtime::workspace_scope::{
             relative_path_already_targets_active_root, run_launch_context_path_env,
-            session_active_workspace_root,
+            run_launch_context_primary_workspace_root, session_active_workspace_root,
             workspace_roots_with_run_launch_context_for_agent_source, ActiveWorkspaceRoot,
         },
     },
@@ -1292,6 +1292,14 @@ async fn process_runner_tool_config_for_session(
     let mut config = runtime_state.config.tool_call.clone();
     let workspace_roots =
         process_runner_workspace_roots_for_session(runtime_state, context, &config).await;
+    if let Some(launch_root) =
+        run_launch_context_primary_workspace_root(runtime_state, context.run_id).await
+    {
+        if process_runner_input_should_use_launch_root(input_json) {
+            config.process_runner.workspace_root = launch_root;
+            return config;
+        }
+    }
     match session_active_workspace_root(
         runtime_state,
         context.session_id,
@@ -1414,6 +1422,28 @@ fn process_runner_workspace_root_for_input(
         .iter()
         .find_map(|arg| workspace_root_containing_process_path(arg.as_str(), workspace_roots))
         .or_else(|| workspace_roots.first().cloned())
+}
+
+fn process_runner_input_should_use_launch_root(input_json: &[u8]) -> bool {
+    let Ok(input) = parse_process_runner_tool_input(input_json) else {
+        return false;
+    };
+    if !process_runner_cwd_is_generic_workspace(input.cwd.as_deref()) {
+        return false;
+    }
+    if !process_path_candidates(input.command.as_str()).is_empty() {
+        return false;
+    }
+    !input.args.iter().any(|arg| !process_path_candidates(arg.as_str()).is_empty())
+}
+
+fn process_runner_cwd_is_generic_workspace(cwd: Option<&str>) -> bool {
+    let Some(raw_cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    let normalized = raw_cwd.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    matches!(trimmed, "." | "./" | "workspace" | "/workspace")
 }
 
 fn workspace_root_containing_process_path(

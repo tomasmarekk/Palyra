@@ -121,6 +121,16 @@ pub(crate) async fn run_launch_context_path_env(
     parameter_delta.cli_context.map(launch_path_env_from_context).unwrap_or_default()
 }
 
+/// Returns the launch-context root that represents generic `/workspace`
+/// process execution for this run, if the run supplied one.
+pub(crate) async fn run_launch_context_primary_workspace_root(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Option<PathBuf> {
+    let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
+    launch_roots.launch_cwd.or_else(|| launch_roots.extra_roots.into_iter().next())
+}
+
 async fn run_launch_context_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,

@@ -697,9 +697,7 @@ async fn resolve_workspace_file_roots(
         if let Some(active_root) =
             session_active_workspace_root(runtime_state, session_id, agent_workspace_roots).await?
         {
-            if requested_path.is_empty()
-                || relative_path_should_use_active_root(requested_path, &active_root)
-            {
+            if relative_path_should_use_active_root(requested_path, &active_root) {
                 return Ok(workspace_roots_with_active_first(
                     active_root.root,
                     agent_workspace_roots,

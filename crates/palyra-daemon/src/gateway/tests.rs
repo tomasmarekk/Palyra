@@ -55,7 +55,8 @@ use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access, ingest_memory_best_effort,
     matching_tool_approval_response_id, process_runner_input_should_use_active_root,
-    process_runner_input_with_path_env, process_runner_workspace_root_for_input,
+    process_runner_input_should_use_launch_root, process_runner_input_with_path_env,
+    process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
     resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
     workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
@@ -156,6 +157,17 @@ fn process_runner_input_uses_active_root_for_default_cwd() {
 }
 
 #[test]
+fn process_runner_launch_root_selection_handles_generic_workspace_cwd() {
+    assert!(process_runner_input_should_use_launch_root(
+        br#"{"command":"node","args":["slow-report.js"],"cwd":"/workspace"}"#
+    ));
+    assert!(process_runner_input_should_use_launch_root(br#"{"command":"npm","args":["test"]}"#));
+    assert!(!process_runner_input_should_use_launch_root(
+        br#"{"command":"node","args":["C:/fixtures/project/slow-report.js"],"cwd":"/workspace"}"#
+    ));
+}
+
+#[test]
 fn process_runner_input_preserves_explicit_active_root_paths() {
     let active_root = active_workspace_root_for_gateway_test();
 
@@ -171,6 +183,188 @@ fn process_runner_input_preserves_explicit_active_root_paths() {
         br#"{"command":"npm","args":["--prefix=notes-api","test"]}"#,
         &active_root,
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspace_cwd() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = PathBuf::from(".");
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let workspace = tempdir.path().join("workspace");
+    let reports = workspace.join("reports");
+    fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
+    fs::write(workspace.join("slow-report.js"), "console.log('slow');\n")
+        .expect("workspace script should exist");
+    let workspace =
+        fs::canonicalize(workspace.as_path()).expect("workspace root should canonicalize");
+    let reports = fs::canonicalize(reports.as_path()).expect("reports root should canonicalize");
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "process-launch-root".to_owned(),
+            display_name: "Process Launch Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FJ1",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FJ2",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .upsert_session_project_context_state(SessionProjectContextStateUpsertRequest {
+            session_id: context.session_id.to_owned(),
+            focus_paths: vec!["reports".to_owned()],
+            disabled_entry_ids: Vec::new(),
+            approved_entry_ids: Vec::new(),
+            last_refreshed_at_unix_ms: None,
+        })
+        .await
+        .expect("session focus should be stored");
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "process-launch-root-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": workspace,
+                        "workspace_roots": [workspace],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let config = process_runner_tool_config_for_session(
+        &state,
+        context,
+        br#"{"command":"node","args":["slow-report.js"],"cwd":"/workspace"}"#,
+    )
+    .await;
+
+    assert_eq!(
+        fs::canonicalize(config.process_runner.workspace_root.as_path())
+            .expect("selected workspace should canonicalize"),
+        workspace,
+        "generic /workspace process cwd must use launch root, not reports focus {reports:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_reports_focus() {
+    let state = build_test_runtime_state(false);
+    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let workspace = tempdir.path().join("workspace");
+    let reports = workspace.join("reports");
+    fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
+    fs::write(workspace.join("slow-report.js"), "console.log('slow');\n")
+        .expect("workspace script should exist");
+    let workspace =
+        fs::canonicalize(workspace.as_path()).expect("workspace root should canonicalize");
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "workspace-launch-root".to_owned(),
+            display_name: "Workspace Launch Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FK1",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FK2",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .upsert_session_project_context_state(SessionProjectContextStateUpsertRequest {
+            session_id: context.session_id.to_owned(),
+            focus_paths: vec!["reports".to_owned()],
+            disabled_entry_ids: Vec::new(),
+            approved_entry_ids: Vec::new(),
+            last_refreshed_at_unix_ms: None,
+        })
+        .await
+        .expect("session focus should be stored");
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "workspace-launch-root-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": workspace,
+                        "workspace_roots": [workspace],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let list_input =
+        serde_json::to_vec(&json!({"path":"","max_entries":10})).expect("list input serializes");
+    let outcome = execute_workspace_list_dir_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FK3",
+        list_input.as_slice(),
+    )
+    .await;
+
+    assert!(outcome.success, "list_dir should succeed: {}", outcome.error);
+    let payload = parse_tool_output_json(&outcome);
+    let entries = payload
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("list_dir entries should be present");
+    assert!(
+        entries.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some("slow-report.js")),
+        "top-level discovery should list launch workspace files, not reports-only contents: {payload}"
+    );
+    assert!(
+        entries.iter().any(|entry| entry.get("name").and_then(Value::as_str) == Some("reports")),
+        "top-level discovery should include the reports directory from launch root: {payload}"
+    );
 }
 
 #[test]
