@@ -122,6 +122,7 @@ const DEFAULT_HTTP_FETCH_ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "if-none-match",
     "if-modified-since",
     "user-agent",
+    "x-client-version",
 ];
 const DEFAULT_HTTP_FETCH_CACHE_ENABLED: bool = true;
 const DEFAULT_HTTP_FETCH_CACHE_TTL_MS: u64 = 30_000;

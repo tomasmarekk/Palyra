@@ -4831,6 +4831,14 @@ mod tests {
             "http fetch default request header allowlist should include JSON content-type"
         );
         assert!(
+            config
+                .http_fetch
+                .allowed_request_headers
+                .iter()
+                .any(|value| value == "x-client-version"),
+            "http fetch default request header allowlist should include safe client-version headers"
+        );
+        assert!(
             config.http_fetch.allowed_credential_vault_refs.is_empty(),
             "http fetch credential injection must default to no vault refs until explicitly configured"
         );

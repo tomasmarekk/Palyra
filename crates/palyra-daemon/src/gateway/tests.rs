@@ -679,6 +679,7 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
                     "if-none-match".to_owned(),
                     "if-modified-since".to_owned(),
                     "user-agent".to_owned(),
+                    "x-client-version".to_owned(),
                 ],
                 allowed_credential_vault_refs: Vec::new(),
                 cache_enabled: true,
@@ -1451,6 +1452,39 @@ async fn http_fetch_sends_allowed_json_request_content_type() {
     assert!(
         request.lines().any(|line| line.eq_ignore_ascii_case("content-type: application/json")),
         "captured request should include JSON content type header: {request}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_sends_allowed_safe_client_version_header() {
+    let state = build_test_runtime_state_with_http_fetch_private_targets(false, true);
+    let (url, handle) = spawn_request_capture_http_server(
+        r#"{"safe_headers":{"x-client-version":"e2e-v2"}}"#,
+        "application/json",
+    );
+    let input = serde_json::to_vec(&json!({
+        "url": url,
+        "headers": {
+            "x-client-version": "e2e-v2"
+        },
+        "allowed_content_types": ["application/json", "text/plain"],
+        "max_response_bytes": 4096
+    }))
+    .expect("input should serialize");
+
+    let outcome =
+        execute_http_fetch_tool(&state, "proposal-http-fetch-safe-custom-header", input.as_slice())
+            .await;
+
+    assert!(
+        outcome.success,
+        "safe x-client-version header should pass http.fetch policy: {}",
+        outcome.error
+    );
+    let request = handle.join().expect("capture server should return request");
+    assert!(
+        request.lines().any(|line| line.eq_ignore_ascii_case("x-client-version: e2e-v2")),
+        "captured request should include x-client-version header: {request}"
     );
 }
 
