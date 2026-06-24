@@ -315,7 +315,12 @@ pub(crate) async fn execute_workspace_patch_tool(
     };
 
     if dry_run {
-        return serialize_workspace_patch_success(proposal_id, input_json, &planned_outcome);
+        return serialize_workspace_patch_success(
+            proposal_id,
+            input_json,
+            &planned_outcome,
+            workspace_roots.as_slice(),
+        );
     }
 
     checkpoint_flow::execute_workspace_patch_mutation(
@@ -1040,8 +1045,22 @@ fn serialize_workspace_patch_success(
     proposal_id: &str,
     input_json: &[u8],
     outcome: &WorkspacePatchOutcome,
+    workspace_roots: &[PathBuf],
 ) -> ToolExecutionOutcome {
-    match serde_json::to_vec(outcome) {
+    let mut output_value = match serde_json::to_value(outcome) {
+        Ok(value) => value,
+        Err(error) => {
+            return workspace_patch_tool_execution_outcome(
+                proposal_id,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("palyra.fs.apply_patch failed to serialize output: {error}"),
+            );
+        }
+    };
+    augment_workspace_patch_output_paths(&mut output_value, workspace_roots);
+    match serde_json::to_vec(&output_value) {
         Ok(output_json) => workspace_patch_tool_execution_outcome(
             proposal_id,
             input_json,
@@ -1056,6 +1075,45 @@ fn serialize_workspace_patch_success(
             b"{}".to_vec(),
             format!("palyra.fs.apply_patch failed to serialize output: {error}"),
         ),
+    }
+}
+
+pub(super) fn augment_workspace_patch_output_paths(
+    output_value: &mut Value,
+    workspace_roots: &[PathBuf],
+) {
+    for files_key in ["files_touched", "no_op_files"] {
+        let Some(files) = output_value.get_mut(files_key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for file in files {
+            let Some(file) = file.as_object_mut() else {
+                continue;
+            };
+            let Some(root_index) = file
+                .get("workspace_root_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                continue;
+            };
+            let Some(relative_path) = file.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(root) = workspace_roots.get(root_index) else {
+                continue;
+            };
+            let workspace_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let resolved_path = workspace_root.join(Path::new(relative_path));
+            file.insert(
+                "workspace_root".to_owned(),
+                Value::String(workspace_root.to_string_lossy().into_owned()),
+            );
+            file.insert(
+                "resolved_path".to_owned(),
+                Value::String(resolved_path.to_string_lossy().into_owned()),
+            );
+        }
     }
 }
 
@@ -1253,9 +1311,10 @@ mod tests {
     use super::{
         normalize_workspace_patch_header_paths, patch_operation_paths,
         patch_should_use_active_root, reject_env_prefixed_workspace_patch_paths,
-        resolve_workspace_root_override, workspace_patch_error_outcome,
-        workspace_patch_planning_request, workspace_patch_recovery_hint,
-        workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
+        resolve_workspace_root_override, serialize_workspace_patch_success,
+        workspace_patch_error_outcome, workspace_patch_planning_request,
+        workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
+        WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
@@ -1296,6 +1355,49 @@ mod tests {
             output.get("grammar_hint").and_then(Value::as_str).is_some(),
             "apply_patch diagnostics should include grammar guidance: {output}"
         );
+    }
+
+    #[test]
+    fn workspace_patch_success_output_includes_resolved_root_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let launch_root = tempdir.path().join("launch");
+        let registry_root = tempdir.path().join("state").join("workspace");
+        std::fs::create_dir_all(&launch_root).expect("launch root should exist");
+        std::fs::create_dir_all(&registry_root).expect("registry root should exist");
+        let workspace_roots = vec![launch_root.clone(), registry_root.clone()];
+
+        let outcome = apply_workspace_patch(
+            workspace_roots.as_slice(),
+            &WorkspacePatchRequest {
+                patch: "*** Begin Patch\n*** Add File: math.test.js\n+test('adds', () => {});\n*** End Patch\n"
+                    .to_owned(),
+                dry_run: false,
+                redaction_policy: WorkspacePatchRedactionPolicy::default(),
+            },
+            &WorkspacePatchLimits::default(),
+        )
+        .expect("patch should apply under launch root");
+
+        let tool_outcome = serialize_workspace_patch_success(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            br#"{"patch":"..."}"#,
+            &outcome,
+            workspace_roots.as_slice(),
+        );
+        let output = serde_json::from_slice::<Value>(tool_outcome.output_json.as_slice())
+            .expect("output JSON should parse");
+        let file =
+            output["files_touched"][0].as_object().expect("file attestation should be an object");
+        let expected_root =
+            std::fs::canonicalize(launch_root.as_path()).expect("launch root should canonicalize");
+        let expected_file = expected_root.join("math.test.js");
+        let expected_root_text = expected_root.to_string_lossy().into_owned();
+        let expected_file_text = expected_file.to_string_lossy().into_owned();
+
+        assert_eq!(file["workspace_root_index"], 0);
+        assert_eq!(file["workspace_root"].as_str(), Some(expected_root_text.as_str()));
+        assert_eq!(file["resolved_path"].as_str(), Some(expected_file_text.as_str()));
+        assert!(!registry_root.join("math.test.js").exists());
     }
 
     #[test]

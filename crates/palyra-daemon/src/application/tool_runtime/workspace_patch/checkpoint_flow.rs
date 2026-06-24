@@ -145,6 +145,7 @@ pub(super) async fn execute_workspace_patch_mutation(
                     proposal_id,
                     input_json,
                     &planned_outcome,
+                    workspace_roots,
                     mutation_id.as_str(),
                     &risk,
                     status.message(),
@@ -191,6 +192,7 @@ pub(super) async fn execute_workspace_patch_mutation(
             );
         }
     };
+    super::augment_workspace_patch_output_paths(&mut output_value, workspace_roots);
 
     let mut post_change_checkpoint = None;
     let mut post_change_error = None;
@@ -687,11 +689,13 @@ fn workspace_patch_preflight_failure_outcome(
     proposal_id: &str,
     input_json: &[u8],
     planned_outcome: &WorkspacePatchOutcome,
+    workspace_roots: &[PathBuf],
     mutation_id: &str,
     risk: &WorkspaceMutationRisk,
     checkpoint_error: &str,
 ) -> ToolExecutionOutcome {
     let mut output_value = serde_json::to_value(planned_outcome).unwrap_or_else(|_| json!({}));
+    super::augment_workspace_patch_output_paths(&mut output_value, workspace_roots);
     if let Some(payload) = output_value.as_object_mut() {
         payload.insert("dry_run".to_owned(), Value::Bool(false));
         payload.insert(
