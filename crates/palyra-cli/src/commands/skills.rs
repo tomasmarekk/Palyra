@@ -9,6 +9,10 @@
 use crate::cli::SkillsProcedureCommand;
 use crate::{client::skills as skills_client, output::skills as skills_output, *};
 
+const E2E_REPORTER_SKILL_ID: &str = "e2e.reporter";
+const E2E_REPORTER_SKILL_VERSION: &str = "1.0.0";
+const E2E_REPORTER_PUBLISHER: &str = "palyra-e2e";
+
 /// Entry point for `palyra skills`, dispatching to the per-subcommand handlers.
 ///
 /// # Errors
@@ -359,7 +363,279 @@ pub(crate) fn run_skills(command: SkillsCommand) -> Result<()> {
             channel,
             json,
         }),
+        SkillsCommand::SeedE2eFixtures { allow_outside_harness, json } => {
+            run_skills_seed_e2e_fixtures(allow_outside_harness, json)
+        }
     }
+}
+
+fn run_skills_seed_e2e_fixtures(allow_outside_harness: bool, json_output: bool) -> Result<()> {
+    let state_root = app::current_root_context()
+        .map(|context| context.state_root().to_path_buf())
+        .map(Ok)
+        .unwrap_or_else(|| app::resolve_cli_state_root(None))?;
+    let report = seed_e2e_skill_fixtures(state_root.as_path(), allow_outside_harness)?;
+    if json_output {
+        return output::print_json_pretty(
+            &json!({
+                "event": "skills.seed_e2e_fixtures",
+                "state_root": report.state_root,
+                "skills_root": report.skills_root,
+                "journal_path": report.journal_path,
+                "installed": report.installed,
+                "status": report.status,
+                "fixtures": [{
+                    "skill_id": E2E_REPORTER_SKILL_ID,
+                    "version": E2E_REPORTER_SKILL_VERSION,
+                    "publisher": E2E_REPORTER_PUBLISHER,
+                }],
+            }),
+            "failed to encode E2E skill fixture seed report",
+        );
+    }
+
+    println!(
+        "skills.seed_e2e_fixtures state_root={} skill_id={} version={} installed={} status={}",
+        report.state_root.display(),
+        E2E_REPORTER_SKILL_ID,
+        E2E_REPORTER_SKILL_VERSION,
+        report.installed,
+        report.status
+    );
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+#[derive(Debug)]
+struct E2eSkillFixtureSeedReport {
+    state_root: PathBuf,
+    skills_root: PathBuf,
+    journal_path: PathBuf,
+    installed: bool,
+    status: String,
+}
+
+fn seed_e2e_skill_fixtures(
+    state_root: &Path,
+    allow_outside_harness: bool,
+) -> Result<E2eSkillFixtureSeedReport> {
+    ensure_e2e_harness_state_root(state_root, allow_outside_harness)?;
+    let skills_root = state_root.join("skills");
+    let artifact_bytes = build_e2e_reporter_skill_artifact()?;
+    let installed = ensure_e2e_reporter_skill_installed(skills_root.as_path(), &artifact_bytes)?;
+    let journal_path = state_root.join(DEFAULT_JOURNAL_DB_PATH);
+    upsert_e2e_reporter_skill_status(journal_path.as_path())?;
+    Ok(E2eSkillFixtureSeedReport {
+        state_root: state_root.to_path_buf(),
+        skills_root,
+        journal_path,
+        installed,
+        status: "active".to_owned(),
+    })
+}
+
+fn ensure_e2e_harness_state_root(state_root: &Path, allow_outside_harness: bool) -> Result<()> {
+    if allow_outside_harness || path_has_component(state_root, "Palyra-TestHarness") {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots; pass --allow-outside-harness only for isolated tests"
+    )
+}
+
+fn path_has_component(path: &Path, expected: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy().eq_ignore_ascii_case(expected))
+}
+
+fn build_e2e_reporter_skill_artifact() -> Result<Vec<u8>> {
+    let manifest_toml = format!(
+        r#"
+manifest_version = 1
+skill_id = "{E2E_REPORTER_SKILL_ID}"
+name = "E2E Reporter Fixture"
+version = "{E2E_REPORTER_SKILL_VERSION}"
+publisher = "{E2E_REPORTER_PUBLISHER}"
+
+[entrypoints]
+[[entrypoints.tools]]
+id = "palyra-e2e.reporter"
+name = "reporter"
+description = "Deterministic reporter fixture for installed-skill capability-denial E2E coverage"
+input_schema = {{ type = "object" }}
+output_schema = {{ type = "object" }}
+risk = {{ default_sensitive = false, requires_approval = false }}
+
+[capabilities.filesystem]
+read_roots = []
+write_roots = []
+
+[capabilities]
+http_egress_allowlist = []
+device_capabilities = []
+node_capabilities = []
+
+[capabilities.quotas]
+wall_clock_timeout_ms = 2000
+fuel_budget = 500000
+max_memory_bytes = 1048576
+
+[compat]
+required_protocol_major = 1
+min_palyra_version = "0.1.0"
+"#
+    );
+    let output =
+        build_signed_skill_artifact(SkillArtifactBuildRequest {
+            manifest_toml,
+            modules: vec![ArtifactFile {
+                path: "module.wasm".to_owned(),
+                bytes: br#"(module (func (export "run") (result i32) i32.const 7))"#.to_vec(),
+            }],
+            assets: Vec::new(),
+            sbom_cyclonedx_json:
+                br#"{"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}"#
+                    .to_vec(),
+            provenance_json:
+                br#"{"builder":{"id":"palyra-e2e"},"subject":[{"name":"modules/module.wasm"}]}"#
+                    .to_vec(),
+            signing_key: [42_u8; 32],
+        })
+        .context("failed to build e2e.reporter skill fixture artifact")?;
+    Ok(output.artifact_bytes)
+}
+
+fn ensure_e2e_reporter_skill_installed(skills_root: &Path, artifact_bytes: &[u8]) -> Result<bool> {
+    fs::create_dir_all(skills_root)
+        .with_context(|| format!("failed to create skills root {}", skills_root.display()))?;
+    let trust_store_path = skills_root.join("trust-store.json");
+    let mut trust_store = load_trust_store_with_integrity(trust_store_path.as_path())?;
+    let verification_report = verify_skill_artifact(artifact_bytes, &mut trust_store, true)
+        .context("failed to verify e2e.reporter skill fixture artifact")?;
+    let security_report = audit_skill_artifact_security(
+        artifact_bytes,
+        &mut trust_store,
+        true,
+        &SkillSecurityAuditPolicy::default(),
+    )
+    .context("failed to audit e2e.reporter skill fixture artifact")?;
+    if security_report.should_quarantine {
+        anyhow::bail!(
+            "e2e.reporter skill fixture failed security audit: {}",
+            security_report.quarantine_reasons.join(" | ")
+        );
+    }
+    save_trust_store_with_integrity(trust_store_path.as_path(), &trust_store)?;
+
+    let mut index = load_installed_skills_index(skills_root)?;
+    let existing = index.entries.iter().any(|entry| {
+        entry.skill_id == E2E_REPORTER_SKILL_ID && entry.version == E2E_REPORTER_SKILL_VERSION
+    });
+    if existing {
+        append_skills_audit_event(
+            skills_root,
+            "skill.e2e_fixture_refreshed",
+            json!({
+                "skill_id": E2E_REPORTER_SKILL_ID,
+                "version": E2E_REPORTER_SKILL_VERSION,
+                "publisher": E2E_REPORTER_PUBLISHER,
+            }),
+        )?;
+        return Ok(false);
+    }
+
+    let artifact_sha256 = sha256_hex(artifact_bytes);
+    let inspected = inspect_skill_artifact(artifact_bytes)
+        .context("failed to inspect e2e.reporter skill fixture artifact")?;
+    install_verified_skill_artifact(
+        skills_root,
+        &mut index,
+        artifact_bytes,
+        &inspected,
+        &verification_report,
+        InstallMetadataContext {
+            source: InstalledSkillSource {
+                kind: "e2e_fixture".to_owned(),
+                reference: "palyra://fixtures/e2e.reporter".to_owned(),
+            },
+            artifact_sha256,
+            missing_secrets: Vec::new(),
+        },
+    )?;
+    save_installed_skills_index(skills_root, &index)?;
+    append_skills_audit_event(
+        skills_root,
+        "skill.e2e_fixture_seeded",
+        json!({
+            "skill_id": verification_report.manifest.skill_id,
+            "version": verification_report.manifest.version,
+            "publisher": verification_report.manifest.publisher,
+            "payload_sha256": verification_report.payload_sha256,
+            "trust_decision": trust_decision_label(verification_report.trust_decision),
+            "security_audit_passed": security_report.passed,
+        }),
+    )?;
+    Ok(true)
+}
+
+fn upsert_e2e_reporter_skill_status(journal_path: &Path) -> Result<()> {
+    if let Some(parent) = journal_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create journal directory {}", parent.display()))?;
+    }
+    let connection = rusqlite::Connection::open(journal_path)
+        .with_context(|| format!("failed to open journal database {}", journal_path.display()))?;
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS skill_status (
+                skill_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                detected_at_ms INTEGER NOT NULL,
+                operator_principal TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(skill_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_status_skill_detected
+                ON skill_status(skill_id, detected_at_ms DESC, version DESC);
+            CREATE INDEX IF NOT EXISTS idx_skill_status_state
+                ON skill_status(status, detected_at_ms DESC);
+            "#,
+        )
+        .context("failed to initialize skill_status table for E2E skill fixture")?;
+    let now = unix_now_ms();
+    connection
+        .execute(
+            r#"
+            INSERT INTO skill_status (
+                skill_id,
+                version,
+                status,
+                reason,
+                detected_at_ms,
+                operator_principal,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            )
+            VALUES (?1, ?2, 'active', ?3, ?4, 'palyra:e2e-harness', ?4, ?4)
+            ON CONFLICT(skill_id, version) DO UPDATE SET
+                status = excluded.status,
+                reason = excluded.reason,
+                detected_at_ms = excluded.detected_at_ms,
+                operator_principal = excluded.operator_principal,
+                updated_at_unix_ms = excluded.updated_at_unix_ms
+            "#,
+            rusqlite::params![
+                E2E_REPORTER_SKILL_ID,
+                E2E_REPORTER_SKILL_VERSION,
+                "seeded by clean desktop E2E harness",
+                now,
+            ],
+        )
+        .context("failed to activate e2e.reporter skill fixture")?;
+    Ok(())
 }
 
 /// Parsed arguments of `skills procedure save`.
@@ -2072,6 +2348,62 @@ mod tests {
         assert_eq!(first, second);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seed_e2e_skill_fixtures_installs_reporter_and_active_status() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
+
+        let report = seed_e2e_skill_fixtures(state_root.as_path(), false)?;
+
+        assert!(report.installed, "first seed should install the e2e.reporter artifact");
+        let skills_root = state_root.join("skills");
+        let index = load_installed_skills_index(skills_root.as_path())?;
+        let reporter = index
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.skill_id == E2E_REPORTER_SKILL_ID
+                    && entry.version == E2E_REPORTER_SKILL_VERSION
+            })
+            .expect("e2e.reporter should be present in installed skills index");
+        assert!(reporter.current, "seeded reporter should be current");
+        assert_eq!(reporter.publisher, E2E_REPORTER_PUBLISHER);
+        assert!(
+            skills_root
+                .join(E2E_REPORTER_SKILL_ID)
+                .join(E2E_REPORTER_SKILL_VERSION)
+                .join(SKILLS_ARTIFACT_FILE_NAME)
+                .is_file(),
+            "managed e2e.reporter artifact should be cached"
+        );
+
+        let connection = rusqlite::Connection::open(report.journal_path.as_path())?;
+        let status: String = connection.query_row(
+            "SELECT status FROM skill_status WHERE skill_id = ?1 AND version = ?2",
+            rusqlite::params![E2E_REPORTER_SKILL_ID, E2E_REPORTER_SKILL_VERSION],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "active");
+
+        let second = seed_e2e_skill_fixtures(state_root.as_path(), false)?;
+        assert!(!second.installed, "second seed should be idempotent");
+        Ok(())
+    }
+
+    #[test]
+    fn seed_e2e_skill_fixtures_rejects_non_harness_state_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+
+        let error = seed_e2e_skill_fixtures(state_root.as_path(), false)
+            .expect_err("non-harness state roots must be rejected");
+
+        assert!(
+            error.to_string().contains("restricted to Palyra-TestHarness state roots"),
+            "error should explain harness restriction: {error}"
+        );
     }
 
     #[test]

@@ -670,6 +670,17 @@ PALYRA_STATE_ROOT="$state_root" PALYRA_CONFIG="$config_path" "$cli_binary_instal
 "$cli_command_path" browser --help >/dev/null
 "$cli_command_path" docs search gateway >/dev/null
 PALYRA_STATE_ROOT="$state_root" PALYRA_CONFIG="$config_path" "$cli_command_path" doctor --json >/dev/null
+"$cli_command_path" skills seed-e2e-fixtures --allow-outside-harness --json >/dev/null
+"$cli_command_path" skills list --json > "$workspace_root/e2e-skills-list.json"
+python3 - "$workspace_root/e2e-skills-list.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
+if not any(entry.get("skill_id") == "e2e.reporter" for entry in payload.get("entries", [])):
+    raise SystemExit("Clean desktop harness e2e.reporter skill fixture is missing from skills list.")
+PY
 
 cli_path_preflight_source="$(command -v palyra || true)"
 cli_path_preflight_matches_command_root=false
@@ -756,6 +767,7 @@ write_json_metadata "$workspace_root/clean-install-metadata.json" \
   "cli_path_preflight_source=$cli_path_preflight_source" \
   "cli_path_preflight_matches_command_root=$cli_path_preflight_matches_command_root" \
   "cli_path_preflight_matches_harness=$cli_path_preflight_matches_command_root" \
+  "e2e_skill_fixtures_seeded=true" \
   "launcher_path=$launcher_path" \
   "launched=$should_launch"
 
@@ -779,5 +791,6 @@ echo "cli_parent_shell_note=$cli_parent_shell_note"
 echo "cli_path_preflight_source=$cli_path_preflight_source"
 echo "cli_path_preflight_matches_command_root=$cli_path_preflight_matches_command_root"
 echo "cli_path_preflight_matches_harness=$cli_path_preflight_matches_command_root"
+echo "e2e_skill_fixtures_seeded=true"
 echo "launcher_path=$launcher_path"
 echo "launched=$should_launch"

@@ -188,6 +188,13 @@ pub enum SkillsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(hide = true)]
+    SeedE2eFixtures {
+        #[arg(long, default_value_t = false)]
+        allow_outside_harness: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

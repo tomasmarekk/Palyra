@@ -251,6 +251,22 @@ if ($IsWindows) {
     }
 }
 
+$seedE2eSkillOutput = & $resolvedCliCommandPath `
+    skills `
+    seed-e2e-fixtures `
+    --allow-outside-harness `
+    --json
+$seedE2eSkillPayload = ($seedE2eSkillOutput -join [Environment]::NewLine) | ConvertFrom-Json
+if ($seedE2eSkillPayload.fixtures[0].skill_id -ne "e2e.reporter" -or $seedE2eSkillPayload.status -ne "active") {
+    throw "Clean desktop harness failed to seed active e2e.reporter skill fixture."
+}
+$seedE2eSkillListOutput = & $resolvedCliCommandPath skills list --json
+$seedE2eSkillListPayload = ($seedE2eSkillListOutput -join [Environment]::NewLine) | ConvertFrom-Json
+$seedE2eReporterEntry = @($seedE2eSkillListPayload.entries | Where-Object { $_.skill_id -eq "e2e.reporter" }) | Select-Object -First 1
+if ($null -eq $seedE2eReporterEntry) {
+    throw "Clean desktop harness e2e.reporter skill fixture is missing from skills list."
+}
+
 $launcherFileName =
     if ($IsWindows) {
         "Launch-Palyra-Test.ps1"
@@ -379,6 +395,7 @@ $installSummary = [ordered]@{
     cli_path_preflight_source = $cliPathPreflightSource
     cli_path_preflight_matches_command_root = $cliPathPreflightMatchesCommandRoot
     cli_path_preflight_matches_harness = $cliPathPreflightMatchesCommandRoot
+    e2e_skill_fixtures_seeded = $true
     launcher_path = $launcherPath
     launched = $shouldLaunch
 }
@@ -409,5 +426,6 @@ Write-Output "cli_parent_shell_note=$resolvedCliParentShellNote"
 Write-Output "cli_path_preflight_source=$cliPathPreflightSource"
 Write-Output "cli_path_preflight_matches_command_root=$cliPathPreflightMatchesCommandRoot"
 Write-Output "cli_path_preflight_matches_harness=$cliPathPreflightMatchesCommandRoot"
+Write-Output "e2e_skill_fixtures_seeded=true"
 Write-Output "launcher_path=$launcherPath"
 Write-Output "launched=$shouldLaunch"
