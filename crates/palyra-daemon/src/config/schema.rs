@@ -115,8 +115,14 @@ const DEFAULT_HTTP_FETCH_ALLOWED_CONTENT_TYPES: &[&str] = &[
     "application/x-javascript",
     "application/ecmascript",
 ];
-const DEFAULT_HTTP_FETCH_ALLOWED_REQUEST_HEADERS: &[&str] =
-    &["accept", "accept-language", "if-none-match", "if-modified-since", "user-agent"];
+const DEFAULT_HTTP_FETCH_ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-language",
+    "content-type",
+    "if-none-match",
+    "if-modified-since",
+    "user-agent",
+];
 const DEFAULT_HTTP_FETCH_CACHE_ENABLED: bool = true;
 const DEFAULT_HTTP_FETCH_CACHE_TTL_MS: u64 = 30_000;
 const DEFAULT_HTTP_FETCH_MAX_CACHE_ENTRIES: u64 = 256;

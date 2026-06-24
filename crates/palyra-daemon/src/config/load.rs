@@ -4827,6 +4827,10 @@ mod tests {
             "http fetch default content-type allowlist should include JavaScript assets"
         );
         assert!(
+            config.http_fetch.allowed_request_headers.iter().any(|value| value == "content-type"),
+            "http fetch default request header allowlist should include JSON content-type"
+        );
+        assert!(
             config.http_fetch.allowed_credential_vault_refs.is_empty(),
             "http fetch credential injection must default to no vault refs until explicitly configured"
         );

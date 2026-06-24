@@ -409,11 +409,16 @@ fn unique_temp_journal_path() -> PathBuf {
 }
 
 fn read_http_request(stream: &mut TcpStream) {
+    let _ = read_http_request_text(stream);
+}
+
+fn read_http_request_text(stream: &mut TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("request read timeout should be configured");
-    let mut buffer = [0_u8; 1024];
-    let _ = stream.read(&mut buffer);
+    let mut buffer = [0_u8; 8192];
+    let bytes_read = stream.read(&mut buffer).unwrap_or(0);
+    String::from_utf8_lossy(&buffer[..bytes_read]).to_string()
 }
 
 fn spawn_redirect_loop_http_server(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
@@ -472,6 +477,30 @@ fn spawn_static_http_server_with_content_type(
             );
         stream.write_all(response.as_bytes()).expect("static test response should write");
         stream.flush().expect("static test response should flush");
+    });
+    (format!("http://{address}/"), handle)
+}
+
+fn spawn_request_capture_http_server(
+    response_body: &str,
+    response_content_type: &str,
+) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("capture test listener should bind");
+    let address = listener.local_addr().expect("capture test listener address should resolve");
+    let response_body = response_body.to_owned();
+    let response_content_type = response_content_type.to_owned();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) =
+            listener.accept().expect("capture test listener should accept request");
+        let request = read_http_request_text(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).expect("capture test response should write");
+        stream.flush().expect("capture test response should flush");
+        request
     });
     (format!("http://{address}/"), handle)
 }
@@ -646,6 +675,7 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
                 allowed_request_headers: vec![
                     "accept".to_owned(),
                     "accept-language".to_owned(),
+                    "content-type".to_owned(),
                     "if-none-match".to_owned(),
                     "if-modified-since".to_owned(),
                     "user-agent".to_owned(),
@@ -1386,6 +1416,42 @@ async fn http_fetch_ignores_disallowed_requested_content_type_when_json_is_allow
     assert_eq!(output["content_type"], "application/json");
     assert_eq!(output["body_text"], r#"{"ready":true}"#);
     handle.join().expect("static JSON server should complete after one request");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_sends_allowed_json_request_content_type() {
+    let state = build_test_runtime_state_with_http_fetch_private_targets(false, true);
+    let (url, handle) =
+        spawn_request_capture_http_server(r#"{"accepted":true}"#, "application/json");
+    let input = serde_json::to_vec(&json!({
+        "url": url,
+        "method": "POST",
+        "body": r#"{"event":"invoice.paid","invoice_id":"INV-S030-001"}"#,
+        "headers": {
+            "Content-Type": "application/json"
+        },
+        "allowed_content_types": ["application/json"],
+        "max_response_bytes": 4096
+    }))
+    .expect("input should serialize");
+
+    let outcome = execute_http_fetch_tool(
+        &state,
+        "proposal-http-fetch-json-request-content-type",
+        input.as_slice(),
+    )
+    .await;
+
+    assert!(
+        outcome.success,
+        "JSON POST with Content-Type should pass http.fetch policy: {}",
+        outcome.error
+    );
+    let request = handle.join().expect("capture server should return request");
+    assert!(
+        request.lines().any(|line| line.eq_ignore_ascii_case("content-type: application/json")),
+        "captured request should include JSON content type header: {request}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
