@@ -1501,12 +1501,13 @@ pub(crate) fn reflect_memory_candidates(
     } else {
         request.allowed_categories.clone()
     };
-    let category = allowed_categories.first().copied().unwrap_or(MemoryReflectionCategory::Facts);
     for observation in request.observations {
         let content_text = normalize_lifecycle_content(observation.as_str());
         if content_text.is_empty() {
             continue;
         }
+        let category =
+            reflection_category_for_observation(&allowed_categories, content_text.as_str());
         let confidence = reflection_confidence(category, content_text.as_str());
         let tags = lifecycle_tags(
             &["lifecycle:reflect".to_owned(), format!("category:{}", category.as_str())],
@@ -1541,6 +1542,112 @@ pub(crate) fn reflect_memory_candidates(
             .collect(),
         candidates,
         provenance: request.provenance,
+    }
+}
+
+fn reflection_category_for_observation(
+    allowed_categories: &[MemoryReflectionCategory],
+    content_text: &str,
+) -> MemoryReflectionCategory {
+    let Some((first, rest)) = allowed_categories.split_first() else {
+        return MemoryReflectionCategory::Facts;
+    };
+    let normalized = content_text.to_lowercase();
+    let mut selected = *first;
+    let mut best_score = reflection_category_score(selected, normalized.as_str());
+    for category in rest {
+        let score = reflection_category_score(*category, normalized.as_str());
+        if score > best_score {
+            selected = *category;
+            best_score = score;
+        }
+    }
+    selected
+}
+
+fn reflection_category_score(category: MemoryReflectionCategory, normalized: &str) -> u8 {
+    match category {
+        MemoryReflectionCategory::Risks => {
+            if contains_any(
+                normalized,
+                &[
+                    "risk", "rizik", "hazard", "unsafe", "blocker", "blocked", "failure",
+                    "failing", "problem", "hroz", "chyba",
+                ],
+            ) {
+                4
+            } else {
+                0
+            }
+        }
+        MemoryReflectionCategory::TemporaryState => {
+            if contains_any(
+                normalized,
+                &[
+                    "temporary",
+                    "temporarily",
+                    "transient",
+                    "rollback",
+                    "staging",
+                    "scratch",
+                    "today",
+                    "current",
+                    "active",
+                    "token",
+                    "docas",
+                    "dočas",
+                    "zatim",
+                    "zatím",
+                    "dnes",
+                    "aktualni",
+                    "aktuální",
+                ],
+            ) {
+                3
+            } else {
+                0
+            }
+        }
+        MemoryReflectionCategory::Preferences => {
+            if contains_any(
+                normalized,
+                &["prefer", "preference", "prefers", "pouzivej", "používej", "default"],
+            ) {
+                2
+            } else {
+                0
+            }
+        }
+        MemoryReflectionCategory::WorkflowRules => {
+            if contains_any(
+                normalized,
+                &[
+                    "workflow",
+                    "procedure",
+                    "rule",
+                    "always",
+                    "never",
+                    "must",
+                    "should",
+                    "postup",
+                    "pravidlo",
+                    "vzdy",
+                    "vždy",
+                    "nikdy",
+                ],
+            ) {
+                2
+            } else {
+                0
+            }
+        }
+        MemoryReflectionCategory::Facts => {
+            if contains_any(normalized, &["decision", "decided", "rozhodn", "fact"]) {
+                1
+            } else {
+                0
+            }
+        }
     }
 }
 

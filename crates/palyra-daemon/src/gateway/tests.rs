@@ -7926,6 +7926,58 @@ async fn memory_reflect_tool_returns_candidates_without_durable_write() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_reflect_tool_preserves_boundaries_and_classifies_candidates() {
+    let content_text = [
+        "Rozhodnuti: pro projekt pouzivej pnpm S050-DECISION-20260623.",
+        "Riziko: variable_symbol muze byt nejednoznacny S050-RISK-20260623.",
+        "Docasny stav: staging token plati jen dnes S050-TEMP-20260623.",
+    ]
+    .join("\n");
+    let input_json = serde_json::to_vec(&json!({
+        "content_text": content_text,
+        "categories": ["facts", "risks", "temporary_state"],
+        "max_candidates": 8
+    }))
+    .expect("reflect input should serialize");
+    let outcome = execute_memory_reflect_tool(
+        routines_tool_test_context(),
+        "01ARZ3NDEKTSV4RRFFQ69G5FC8",
+        input_json.as_slice(),
+    )
+    .await;
+    assert!(outcome.success, "reflect should succeed: {}", outcome.error);
+    let payload = parse_tool_output_json(&outcome);
+    assert_eq!(payload.get("durable_memory_write").and_then(Value::as_bool), Some(false));
+    assert_eq!(payload.get("candidate_count").and_then(Value::as_u64), Some(3));
+
+    let candidates = payload
+        .get("candidates")
+        .and_then(Value::as_array)
+        .expect("reflect output should include candidates");
+    let categories = candidates
+        .iter()
+        .map(|candidate| candidate.get("category").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(categories, vec![Some("facts"), Some("risks"), Some("temporary_state")]);
+    assert_eq!(
+        candidates[0].get("content_text").and_then(Value::as_str),
+        Some("Rozhodnuti: pro projekt pouzivej pnpm S050-DECISION-20260623.")
+    );
+    assert_eq!(
+        candidates[1].get("content_text").and_then(Value::as_str),
+        Some("Riziko: variable_symbol muze byt nejednoznacny S050-RISK-20260623.")
+    );
+    assert_eq!(
+        candidates[2].get("content_text").and_then(Value::as_str),
+        Some("Docasny stav: staging token plati jen dnes S050-TEMP-20260623.")
+    );
+    assert_eq!(
+        candidates[2].pointer("/retain_input/category").and_then(Value::as_str),
+        Some("transient_runtime_fact")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn model_token_tape_compaction_emits_real_lifecycle_event() {
     let state = build_test_runtime_state(false);
     state

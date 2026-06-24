@@ -3330,12 +3330,20 @@ fn parse_reflection_observations(parsed: &Map<String, Value>) -> Result<Vec<Stri
             return Ok(observations);
         }
     }
-    match parsed.get("content_text").and_then(Value::as_str).map(normalize_lifecycle_content) {
-        Some(value) if !value.is_empty() => Ok(value
-            .split(['\n', ';'])
-            .map(normalize_lifecycle_content)
-            .filter(|entry| !entry.is_empty())
-            .collect()),
+    match parsed.get("content_text").and_then(Value::as_str) {
+        Some(value) => {
+            let observations = value
+                .split(['\n', ';'])
+                .map(normalize_lifecycle_content)
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>();
+            if observations.is_empty() {
+                Err("palyra.memory.reflect requires observations, messages, or content_text"
+                    .to_owned())
+            } else {
+                Ok(observations)
+            }
+        }
         _ => {
             Err("palyra.memory.reflect requires observations, messages, or content_text".to_owned())
         }
