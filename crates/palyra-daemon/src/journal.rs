@@ -5782,6 +5782,32 @@ struct StoredToolResultArtifact {
     purge_requested: bool,
 }
 
+fn tool_result_artifact_scope_mismatch(
+    connection: &Connection,
+    artifact: &ToolResultArtifactRef,
+    request: &ToolResultArtifactReadRequest,
+) -> Result<bool, JournalError> {
+    if artifact.session_id == request.session_id && artifact.run_id == request.run_id {
+        return Ok(false);
+    }
+    if artifact.session_id == request.session_id {
+        return Ok(true);
+    }
+    if !request.text_preview {
+        return Ok(true);
+    }
+    if request.expected_digest_sha256.as_deref() != Some(artifact.digest_sha256.as_str()) {
+        return Ok(true);
+    }
+    let Some(artifact_session) =
+        load_orchestrator_session_by_id(connection, artifact.session_id.as_str())?
+    else {
+        return Ok(true);
+    };
+    Ok(artifact_session.principal != request.principal
+        || artifact_session.channel.as_deref() != request.channel.as_deref())
+}
+
 fn record_tool_result_artifact_read(
     connection: &Connection,
     request: &ToolResultArtifactReadRequest,
@@ -8420,9 +8446,8 @@ impl JournalStore {
             purge_requested,
         } = stored;
 
-        let deny_reason = if artifact.session_id != request.session_id
-            || artifact.run_id != request.run_id
-        {
+        let scope_mismatch = tool_result_artifact_scope_mismatch(&guard, &artifact, request)?;
+        let deny_reason = if scope_mismatch {
             Some("scope_mismatch")
         } else if request
             .expected_digest_sha256
@@ -22702,6 +22727,79 @@ mod tests {
             })
             .expect_err("foreign run scope should fail closed");
         assert!(matches!(scope_error, JournalError::ToolResultArtifactScopeMismatch { .. }));
+
+        let prior_session_id = "01ARZ3NDEKTSV4RRFFQ69G5P30";
+        let prior_run_id = "01ARZ3NDEKTSV4RRFFQ69G5P31";
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: prior_session_id.to_owned(),
+                session_key: "session:artifact-prior".to_owned(),
+                session_label: Some("Prior artifact".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "device:prior".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("prior session should be created");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: prior_run_id.to_owned(),
+                session_id: prior_session_id.to_owned(),
+                origin_kind: "run_stream".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:ops".to_owned()),
+                parameter_delta_json: None,
+            })
+            .expect("prior run should start");
+        let prior_artifact = store
+            .create_tool_result_artifact(&ToolResultArtifactCreateRequest {
+                artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5P32".to_owned(),
+                session_id: prior_session_id.to_owned(),
+                run_id: prior_run_id.to_owned(),
+                proposal_id: "01ARZ3NDEKTSV4RRFFQ69G5P33".to_owned(),
+                tool_name: "palyra.echo".to_owned(),
+                mime_type: "application/json".to_owned(),
+                sensitivity: ToolResultSensitivity::Public,
+                retention: ArtifactRetentionPolicy::keep(),
+                redacted_preview: "{\"topic\":\"billing\"}".to_owned(),
+                content: br#"{"topic":"billing","value":"invoice-ready"}"#.to_vec(),
+            })
+            .expect("prior artifact should be stored");
+        let portable_preview = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: prior_artifact.artifact_id.clone(),
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: Some(prior_artifact.digest_sha256.clone()),
+                offset_bytes: 0,
+                max_bytes: 128,
+                text_preview: true,
+            })
+            .expect("same-owner prior-session artifact preview should be readable by digest");
+        assert!(
+            portable_preview.text.as_deref().is_some_and(|text| text.contains("invoice-ready")),
+            "portable artifact preview should include bounded evidence text"
+        );
+        let portable_without_digest = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: prior_artifact.artifact_id,
+                session_id: session_id.to_owned(),
+                run_id: run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:local".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: None,
+                offset_bytes: 0,
+                max_bytes: 128,
+                text_preview: true,
+            })
+            .expect_err("prior-session artifact preview should require an explicit digest");
+        assert!(matches!(
+            portable_without_digest,
+            JournalError::ToolResultArtifactScopeMismatch { .. }
+        ));
 
         let secret = store
             .create_tool_result_artifact(&ToolResultArtifactCreateRequest {
