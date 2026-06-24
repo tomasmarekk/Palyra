@@ -8906,6 +8906,132 @@ async fn routines_tool_accepts_explicit_sensitive_posture_without_approval_gate(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn routines_tool_test_run_bypasses_disabled_state_but_not_approval_gate() {
+    let state = build_test_runtime_state(false);
+    let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
+    let context = routines_tool_test_context();
+
+    let upsert_input = serde_json::to_vec(&json!({
+        "operation": "upsert",
+        "name": "Sensitive config audit",
+        "prompt": "Audit OS-level user config and report whether any write would be required.",
+        "trigger_kind": "schedule",
+        "natural_language_schedule": "every 2h",
+        "run_mode": "fresh_session",
+        "execution_posture": "sensitive_tools",
+        "approval_mode": "before_first_run",
+        "enabled": false,
+    }))
+    .expect("sensitive routine upsert payload should serialize");
+    let upsert_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_CONTROL_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBO",
+        upsert_input.as_slice(),
+    )
+    .await;
+    assert!(upsert_outcome.success, "disabled sensitive routine upsert should succeed");
+    let upsert_json = parse_tool_output_json(&upsert_outcome);
+    let routine = upsert_json
+        .get("routine")
+        .and_then(Value::as_object)
+        .expect("upsert response should include routine metadata");
+    let routine_id = routine
+        .get("routine_id")
+        .and_then(Value::as_str)
+        .expect("routine id should be returned")
+        .to_owned();
+    assert_eq!(routine.get("enabled").and_then(Value::as_bool), Some(false));
+    assert_eq!(routine.get("approval_mode").and_then(Value::as_str), Some("before_first_run"));
+
+    let test_run_input = serde_json::to_vec(&json!({
+        "operation": "test_run",
+        "routine_id": routine_id,
+        "trigger_reason": "approval boundary drill",
+    }))
+    .expect("test-run payload should serialize");
+    let test_run_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_CONTROL_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBP",
+        test_run_input.as_slice(),
+    )
+    .await;
+    assert!(test_run_outcome.success, "safe test-run should return approval evidence");
+    let test_run_json = parse_tool_output_json(&test_run_outcome);
+    let run_id = test_run_json
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("approval-gated test-run should still record a run id")
+        .to_owned();
+    assert_eq!(test_run_json.get("status").and_then(Value::as_str), Some("denied"));
+    assert_eq!(test_run_json.get("dispatch_mode").and_then(Value::as_str), Some("test_run"));
+    assert!(
+        test_run_json
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("approval is required")),
+        "test-run should expose the approval boundary instead of reporting disabled state"
+    );
+    assert!(
+        test_run_json
+            .get("approval")
+            .and_then(Value::as_object)
+            .and_then(|approval| approval.get("approval_id"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "approval-gated test-run response should include an approval record"
+    );
+
+    let list_runs_input = serde_json::to_vec(&json!({
+        "operation": "list_runs",
+        "routine_id": routine_id,
+        "limit": 10,
+    }))
+    .expect("run listing payload should serialize");
+    let list_runs_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_QUERY_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBQ",
+        list_runs_input.as_slice(),
+    )
+    .await;
+    assert!(list_runs_outcome.success, "run history listing should succeed");
+    let list_runs_json = parse_tool_output_json(&list_runs_outcome);
+    let runs = list_runs_json
+        .get("runs")
+        .and_then(Value::as_array)
+        .expect("run history should include routine runs");
+    assert!(
+        runs.iter().all(|run| run.get("dispatch_mode").and_then(Value::as_str) != Some("normal")),
+        "safe test-run over a disabled routine must not create normal scheduler runs"
+    );
+    let test_run_entry = runs
+        .iter()
+        .find(|run| run.get("run_id").and_then(Value::as_str) == Some(run_id.as_str()))
+        .expect("approval-gated test-run should be recorded in run history");
+    assert_eq!(test_run_entry.get("dispatch_mode").and_then(Value::as_str), Some("test_run"));
+    assert_eq!(
+        test_run_entry.get("skip_reason").and_then(Value::as_str),
+        Some("approval_required")
+    );
+    assert_eq!(
+        test_run_entry.get("execution_posture").and_then(Value::as_str),
+        Some("sensitive_tools")
+    );
+    assert!(
+        test_run_entry
+            .get("safety_note")
+            .and_then(Value::as_str)
+            .is_some_and(|note| note.contains("audit-only")),
+        "run history should retain safe test-run audit metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn routines_tool_test_run_and_replay_force_fresh_sessions_and_audit_only_delivery() {
     let state = build_test_runtime_state(false);
     let (grpc_url, shutdown_tx, server_task) =

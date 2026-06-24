@@ -1288,11 +1288,11 @@ async fn dispatch_single_routine(
     let delivery =
         request.delivery_override.clone().unwrap_or_else(|| routine.metadata.delivery.clone());
 
-    // Gate order: disabled routines short-circuit, before_first_run approval
-    // fails closed, then operator throttles (trigger-kind match, dedupe,
-    // cooldown, quiet hours) apply unless this is a sanctioned bypass
-    // (test_run/replay, which force fresh-session, audit-only delivery).
-    if !routine.job.enabled {
+    // Gate order: production dispatch honors the persisted enabled state,
+    // before_first_run approval fails closed, then operator throttles apply.
+    // Safe test_run/replay bypass scheduler state while still enforcing
+    // approval boundaries and audit-only delivery.
+    if !routine.job.enabled && !request.bypass_operator_gates {
         return register_terminal_routine_run(
             runtime_state,
             &runtime.registry,
