@@ -51,6 +51,10 @@ fn proto_enum_label(name: &str, prefix: &str) -> String {
 
 const RUN_TAPE_COMPACT_PREVIEW_BYTES: usize = 2048;
 const TOOL_CATALOG_SNAPSHOT_EVENT: &str = "tool_catalog_snapshot";
+const DESKTOP_MANAGED_RESTART_HEALTH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(12);
+const DESKTOP_MANAGED_RESTART_HEALTH_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
 
 #[derive(Debug, serde::Serialize)]
 struct CompactRunTapeResponse {
@@ -141,7 +145,7 @@ mod tests {
         is_desktop_runtime_state_root, journal_event_actor_label, journal_event_kind_label,
         read_remote_dashboard_assist_payload, request_desktop_managed_gateway_restart,
     };
-    use crate::{common_v1, RunTapeEvent, RunTapeResponse};
+    use crate::{common_v1, HealthResponse, RunTapeEvent, RunTapeResponse};
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
@@ -251,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_managed_gateway_restart_touches_config() {
+    fn desktop_managed_gateway_restart_touches_config_and_verifies_health() {
         let temp = tempdir().expect("tempdir should be created");
         let state_root = temp.path().join("state");
         let desktop_runtime = state_root.join("desktop-control-center").join("runtime");
@@ -270,6 +274,16 @@ mod tests {
         let status = request_desktop_managed_gateway_restart(
             state_root.as_path(),
             Some(config_path.as_path()),
+            || {
+                Ok(HealthResponse {
+                    service: "palyrad".to_owned(),
+                    status: "ok".to_owned(),
+                    version: "test".to_owned(),
+                    git_hash: "test".to_owned(),
+                    build_profile: "debug".to_owned(),
+                    uptime_seconds: 1,
+                })
+            },
         )
         .expect("desktop restart request should succeed")
         .expect("desktop runtime should be restartable");
@@ -278,7 +292,7 @@ mod tests {
         assert_eq!(status.service_name, "desktop-managed-palyrad");
         assert!(status.installed);
         assert!(
-            status.detail.as_deref().is_some_and(|detail| detail.contains("restart requested")),
+            status.detail.as_deref().is_some_and(|detail| detail.contains("health verified")),
             "status should explain the restart request: {status:?}"
         );
         let after = fs::metadata(config_path.as_path())
@@ -290,6 +304,31 @@ mod tests {
             fs::read_to_string(config_path.as_path()).expect("config should remain readable"),
             "version = 1\n"
         );
+    }
+
+    #[test]
+    fn desktop_managed_gateway_restart_fails_when_health_is_not_verified() {
+        let temp = tempdir().expect("tempdir should be created");
+        let state_root = temp.path().join("state");
+        let desktop_runtime = state_root.join("desktop-control-center").join("runtime");
+        let config_dir = state_root.join("config");
+        let config_path = config_dir.join("palyra.toml");
+        fs::create_dir_all(desktop_runtime.as_path())
+            .expect("desktop runtime directory should be created");
+        fs::create_dir_all(config_dir.as_path()).expect("config directory should be created");
+        fs::write(config_path.as_path(), "version = 1\n").expect("config should be written");
+
+        let error = request_desktop_managed_gateway_restart(
+            state_root.as_path(),
+            Some(config_path.as_path()),
+            || anyhow::bail!("connection refused"),
+        )
+        .expect_err("unverified desktop restart must fail loudly");
+        let message = error.to_string();
+
+        assert!(message.contains("health was not confirmed"), "{message}");
+        assert!(message.contains("desktop app/test harness"), "{message}");
+        assert!(message.contains("--state-root"), "{message}");
     }
 
     #[test]
@@ -1036,9 +1075,11 @@ fn run_gateway_install(
 fn run_gateway_service_action(action: &str) -> Result<()> {
     let context = root_context()?;
     if action == "restart" {
-        if let Some(status) =
-            request_desktop_managed_gateway_restart(context.state_root(), context.config_path())?
-        {
+        if let Some(status) = request_desktop_managed_gateway_restart(
+            context.state_root(),
+            context.config_path(),
+            || verify_desktop_managed_gateway_restart_health(&context),
+        )? {
             return emit_gateway_service_status(format!("gateway.{action}").as_str(), &status);
         }
     }
@@ -1056,6 +1097,7 @@ fn run_gateway_service_action(action: &str) -> Result<()> {
 fn request_desktop_managed_gateway_restart(
     requested_state_root: &Path,
     config_path: Option<&Path>,
+    verify_health: impl FnOnce() -> Result<HealthResponse>,
 ) -> Result<Option<support::service::GatewayServiceStatus>> {
     // Only desktop-managed runtimes without their own installed service are
     // restarted by touching the config; the desktop supervisor watches that
@@ -1078,6 +1120,22 @@ fn request_desktop_managed_gateway_restart(
             config_path.display()
         )
     })?;
+    let desktop_runtime = desktop_runtime_state_root(requested_state_root);
+    let health = verify_health().with_context(|| {
+        format!(
+            "desktop-managed gateway restart was requested by updating {}, but runtime health was not confirmed. Restart the desktop app/test harness or run `palyra --state-root \"{}\" gateway run`.",
+            config_path.display(),
+            desktop_runtime.display()
+        )
+    })?;
+    if !health.status.eq_ignore_ascii_case("ok") {
+        anyhow::bail!(
+            "desktop-managed gateway restart was requested by updating {}, but runtime health returned status '{}'. Restart the desktop app/test harness or run `palyra --state-root \"{}\" gateway run`.",
+            config_path.display(),
+            health.status,
+            desktop_runtime.display()
+        );
+    }
 
     Ok(Some(support::service::GatewayServiceStatus {
         installed: true,
@@ -1089,10 +1147,59 @@ fn request_desktop_managed_gateway_restart(
         stdout_log_path: None,
         stderr_log_path: None,
         detail: Some(format!(
-            "desktop-managed gateway restart requested by updating {}; the desktop supervisor will reload the runtime",
-            config_path.display()
+            "desktop-managed gateway restart requested by updating {}; health verified for service {} after supervisor reload",
+            config_path.display(),
+            health.service
         )),
     }))
+}
+
+fn verify_desktop_managed_gateway_restart_health(
+    context: &app::RootCommandContext,
+) -> Result<HealthResponse> {
+    let connection = context.resolve_http_connection(
+        app::ConnectionOverrides::default(),
+        app::ConnectionDefaults::USER,
+    )?;
+    let status_url = format!("{}/healthz", connection.base_url.trim_end_matches('/'));
+    wait_for_desktop_managed_gateway_health(
+        status_url.as_str(),
+        DESKTOP_MANAGED_RESTART_HEALTH_TIMEOUT,
+        DESKTOP_MANAGED_RESTART_HEALTH_POLL_INTERVAL,
+    )
+    .with_context(|| format!("desktop-managed gateway did not become healthy at {status_url}"))
+}
+
+fn wait_for_desktop_managed_gateway_health(
+    status_url: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<HealthResponse> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let started = std::time::Instant::now();
+
+    loop {
+        match client
+            .get(status_url)
+            .send()
+            .context("failed to call daemon health endpoint")
+            .and_then(|response| {
+                response
+                    .error_for_status()
+                    .context("daemon health endpoint returned non-success status")
+            })
+            .and_then(|response| response.json().context("failed to parse daemon health payload"))
+        {
+            Ok(health) => return Ok(health),
+            Err(error) if started.elapsed() >= timeout => return Err(error),
+            Err(_) => {}
+        }
+
+        std::thread::sleep(poll_interval);
+    }
 }
 
 /// Bumps the file's mtime by rewriting its current bytes; std offers no
