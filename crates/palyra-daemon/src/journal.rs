@@ -37,6 +37,7 @@ use palyra_common::runtime_contracts::{
     RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, StableErrorEnvelope,
     ToolResultArtifactRef, ToolResultSensitivity, ToolResultVisibility,
 };
+use palyra_safety::{redact_text_for_export, SafetyContentKind, SafetySourceKind, TrustLabel};
 use rusqlite::{
     params, params_from_iter, Connection, ErrorCode, OptionalExtension, ToSql, Transaction,
 };
@@ -17246,10 +17247,7 @@ fn load_orchestrator_session_event_text(
 }
 
 fn normalize_orchestrator_session_text(raw: &str, max_chars: usize) -> Option<String> {
-    let normalized = palyra_common::redaction::redact_url_segments_in_text(
-        palyra_common::redaction::redact_auth_error(raw).as_str(),
-    )
-    .replace(['\r', '\n'], " ");
+    let normalized = redact_free_text_for_persistence(raw).replace(['\r', '\n'], " ");
     let trimmed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.is_empty() {
         return None;
@@ -21122,8 +21120,9 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
             }
 
             let marker_redacted = redact_secret_like_markers(text);
-            if marker_redacted != *text {
-                *value = Value::String(marker_redacted);
+            let free_text_redacted = redact_free_text_for_persistence(marker_redacted.as_str());
+            if free_text_redacted != *text {
+                *value = Value::String(free_text_redacted);
                 return true;
             }
 
@@ -21131,6 +21130,23 @@ fn redact_value(value: &mut Value, key_context: Option<&str>) -> bool {
         }
         _ => key_context.is_some_and(is_sensitive_key),
     }
+}
+
+fn redact_free_text_for_persistence(raw: &str) -> String {
+    if looks_like_secret(raw) {
+        return REDACTED_MARKER.to_owned();
+    }
+    let marker_redacted = redact_secret_like_markers(raw);
+    let url_redacted =
+        palyra_common::redaction::redact_url_segments_in_text(marker_redacted.as_str());
+    let auth_redacted = palyra_common::redaction::redact_auth_error(url_redacted.as_str());
+    redact_text_for_export(
+        auth_redacted.as_str(),
+        SafetySourceKind::ToolOutput,
+        SafetyContentKind::PlainText,
+        TrustLabel::TrustedLocal,
+    )
+    .redacted_text
 }
 
 fn is_binary_payload_key(key: &str) -> bool {
@@ -21192,12 +21208,62 @@ fn looks_like_secret(value: &str) -> bool {
         || normalized.starts_with("sk-")
         || normalized.contains("api_key=")
         || normalized.contains("secret=")
+        || contains_spaced_sensitive_assignment(normalized.as_str())
         || contains_secret_like_bare_token_assignment(normalized.as_str())
         || normalized.contains("refresh_token")
         || normalized.contains("oauth_refresh_token")
         || normalized.contains("set-cookie:")
         || normalized.contains("cookie:")
         || SENSITIVE_VALUE_PHRASES.iter().any(|phrase| normalized.contains(phrase))
+}
+
+fn contains_spaced_sensitive_assignment(normalized: &str) -> bool {
+    const SENSITIVE_ASSIGNMENT_KEYS: &[&str] = &[
+        "access_token",
+        "accesstoken",
+        "api_key",
+        "apikey",
+        "auth_token",
+        "authtoken",
+        "bearer_token",
+        "bearertoken",
+        "client_secret",
+        "clientsecret",
+        "password",
+        "private_key",
+        "privatekey",
+        "refresh_token",
+        "refreshtoken",
+        "secret",
+        "token",
+    ];
+
+    SENSITIVE_ASSIGNMENT_KEYS.iter().any(|key| contains_spaced_assignment_for_key(normalized, key))
+}
+
+fn contains_spaced_assignment_for_key(normalized: &str, key: &str) -> bool {
+    let mut search_start = 0usize;
+    while let Some(relative_index) = normalized[search_start..].find(key) {
+        let after_key = search_start + relative_index + key.len();
+        let mut assignment_separator_index = None;
+        for (offset, ch) in normalized[after_key..].char_indices() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            if matches!(ch, '=' | ':') {
+                assignment_separator_index = Some(after_key + offset + ch.len_utf8());
+            }
+            break;
+        }
+        if let Some(value_start) = assignment_separator_index {
+            if key == "token" {
+                return bare_token_value_looks_secret(&normalized[value_start..]);
+            }
+            return true;
+        }
+        search_start = after_key.min(normalized.len());
+    }
+    false
 }
 
 fn contains_secret_like_bare_token_assignment(normalized: &str) -> bool {
@@ -21839,6 +21905,29 @@ mod tests {
 
         assert!(redacted.contains("<redacted>"), "{redacted}");
         assert!(!redacted.contains("palyra_test_secret_123456"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_payload_json_masks_spaced_sensitive_assignments_inside_text() {
+        let redacted = super::redact_payload_json(
+            br#"{"reply_text":"Done: PALYRA_SAMPLE_API_KEY = 'local-dev-secret-value'."}"#,
+        )
+        .expect("payload redaction should succeed");
+
+        assert_eq!(redacted, r#"{"reply_text":"<redacted>"}"#);
+    }
+
+    #[test]
+    fn redact_payload_json_preserves_safe_sensitive_key_name_references() {
+        let redacted = super::redact_payload_json(
+            br#"{"reply_text":"Use api_key_name = \"PALYRA_E2E_API_KEY\" for lookup."}"#,
+        )
+        .expect("payload redaction should succeed");
+
+        assert_eq!(
+            redacted,
+            r#"{"reply_text":"Use api_key_name = \"PALYRA_E2E_API_KEY\" for lookup."}"#
+        );
     }
 
     #[test]
@@ -23315,6 +23404,48 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_tape_append_redacts_secret_like_free_text_diagnostics() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAY");
+        start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5FAY", "01ARZ3NDEKTSV4RRFFQ69G5FAZ");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
+                seq: 0,
+                event_type: "agent_loop.terminated".to_owned(),
+                payload_json: serde_json::json!({
+                    "provider_turn_output": {
+                        "full_text": "const apiKey: string = \"super-secret-value\";",
+                    },
+                    "message": {
+                        "replied": {
+                            "reply_text": "const apiKey: string = \"super-secret-value\";",
+                        },
+                    },
+                    "finalization": {
+                        "user_visible_message": "const apiKey: string = \"super-secret-value\";",
+                    },
+                })
+                .to_string(),
+            })
+            .expect("terminal tape event should persist");
+
+        let tape = store
+            .orchestrator_tape("01ARZ3NDEKTSV4RRFFQ69G5FAZ")
+            .expect("run tape query should succeed");
+
+        assert_eq!(tape.len(), 1);
+        assert!(!tape[0].payload_json.contains("super-secret-value"));
+        assert!(
+            tape[0].payload_json.contains("[REDACTED_SECRET]")
+                || tape[0].payload_json.contains("<redacted>")
+        );
+    }
+
+    #[test]
     fn orchestrator_tape_page_applies_after_seq_and_limit() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
@@ -24289,6 +24420,75 @@ mod tests {
             !preview.contains("super-secret") && !preview.contains("abc123"),
             "raw secret-like values must not leak into previews: {preview}"
         );
+    }
+
+    #[test]
+    fn orchestrator_session_listing_redacts_secret_like_transcript_fields() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FCA");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FCB".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FCA".to_owned(),
+                origin_kind: String::new(),
+                origin_run_id: None,
+                triggered_by_principal: None,
+                parameter_delta_json: None,
+            })
+            .expect("run should start");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FCB".to_owned(),
+                seq: 0,
+                event_type: "message.received".to_owned(),
+                payload_json:
+                    r#"{"text":"Please inspect PALYRA_SAMPLE_API_KEY = 'local-dev-secret-value'."}"#
+                        .to_owned(),
+            })
+            .expect("user intent should persist");
+        store
+            .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FCB".to_owned(),
+                seq: 1,
+                event_type: "message.replied".to_owned(),
+                payload_json:
+                    r#"{"reply_text":"Done: PALYRA_SAMPLE_API_KEY = 'local-dev-secret-value'."}"#
+                        .to_owned(),
+            })
+            .expect("assistant summary should persist");
+
+        let session = store
+            .list_orchestrator_sessions(
+                None,
+                "user:ops",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                Some("cli"),
+                false,
+                10,
+            )
+            .expect("session listing should succeed")
+            .into_iter()
+            .find(|entry| entry.session_id == "01ARZ3NDEKTSV4RRFFQ69G5FCA")
+            .expect("session should exist");
+
+        for (field_name, value) in [
+            ("preview", session.preview.as_deref()),
+            ("last_intent", session.last_intent.as_deref()),
+            ("last_summary", session.last_summary.as_deref()),
+        ] {
+            let value = value.unwrap_or_else(|| panic!("{field_name} should exist"));
+            assert!(
+                !value.contains("local-dev-secret-value"),
+                "raw secret-like value leaked through {field_name}: {value}"
+            );
+            assert!(
+                value.contains("[REDACTED_SECRET]") || value == "<redacted>",
+                "redaction marker missing from {field_name}: {value}"
+            );
+        }
     }
 
     #[test]
