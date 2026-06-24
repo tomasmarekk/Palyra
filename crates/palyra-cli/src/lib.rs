@@ -8644,12 +8644,39 @@ fn load_trust_store_with_integrity(path: &Path) -> Result<SkillTrustStore> {
     Ok(store)
 }
 
+fn load_trust_store_with_state_root_integrity(
+    path: &Path,
+    state_root: &Path,
+) -> Result<SkillTrustStore> {
+    let store = SkillTrustStore::load(path)?;
+    let vault = open_cli_vault_for_state_root(state_root, VaultBackendPreference::EncryptedFile)
+        .context("failed to open state-root vault for trust-store integrity check")?;
+    verify_or_initialize_trust_store_integrity_with_vault(path, &vault)?;
+    Ok(store)
+}
+
 fn save_trust_store_with_integrity(path: &Path, store: &SkillTrustStore) -> Result<()> {
     store.save(path)?;
     update_trust_store_integrity_digest(path)
 }
 
+fn save_trust_store_with_state_root_integrity(
+    path: &Path,
+    store: &SkillTrustStore,
+    state_root: &Path,
+) -> Result<()> {
+    store.save(path)?;
+    let vault = open_cli_vault_for_state_root(state_root, VaultBackendPreference::EncryptedFile)
+        .context("failed to open state-root vault for trust-store integrity update")?;
+    update_trust_store_integrity_digest_with_vault(path, &vault)
+}
+
 fn verify_or_initialize_trust_store_integrity(path: &Path) -> Result<()> {
+    let vault = open_cli_vault().context("failed to open vault for trust-store integrity check")?;
+    verify_or_initialize_trust_store_integrity_with_vault(path, &vault)
+}
+
+fn verify_or_initialize_trust_store_integrity_with_vault(path: &Path, vault: &Vault) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -8657,7 +8684,6 @@ fn verify_or_initialize_trust_store_integrity(path: &Path) -> Result<()> {
         fs::read(path).with_context(|| format!("failed to read trust store {}", path.display()))?;
     let observed_digest = sha256_hex(payload.as_slice());
     let key = trust_store_integrity_vault_key(path);
-    let vault = open_cli_vault().context("failed to open vault for trust-store integrity check")?;
     match vault.get_secret(&TRUST_STORE_INTEGRITY_VAULT_SCOPE, key.as_str()) {
         Ok(expected_bytes) => {
             let expected_digest = String::from_utf8(expected_bytes).with_context(|| {
@@ -8699,12 +8725,16 @@ fn verify_or_initialize_trust_store_integrity(path: &Path) -> Result<()> {
 }
 
 fn update_trust_store_integrity_digest(path: &Path) -> Result<()> {
+    let vault =
+        open_cli_vault().context("failed to open vault for trust-store integrity update")?;
+    update_trust_store_integrity_digest_with_vault(path, &vault)
+}
+
+fn update_trust_store_integrity_digest_with_vault(path: &Path, vault: &Vault) -> Result<()> {
     let payload =
         fs::read(path).with_context(|| format!("failed to read trust store {}", path.display()))?;
     let digest = sha256_hex(payload.as_slice());
     let key = trust_store_integrity_vault_key(path);
-    let vault =
-        open_cli_vault().context("failed to open vault for trust-store integrity update")?;
     vault
         .put_secret(&TRUST_STORE_INTEGRITY_VAULT_SCOPE, key.as_str(), digest.as_bytes())
         .with_context(|| {
@@ -10621,6 +10651,19 @@ fn open_cli_vault() -> Result<Vault> {
     Vault::open_with_config(VaultConfigOptions {
         root: vault_root,
         identity_store_root: Some(identity_store_root),
+        backend_preference,
+        ..VaultConfigOptions::default()
+    })
+    .map_err(anyhow::Error::from)
+}
+
+fn open_cli_vault_for_state_root(
+    state_root: &Path,
+    backend_preference: VaultBackendPreference,
+) -> Result<Vault> {
+    Vault::open_with_config(VaultConfigOptions {
+        root: Some(state_root.join("vault")),
+        identity_store_root: Some(state_root.join("identity")),
         backend_preference,
         ..VaultConfigOptions::default()
     })

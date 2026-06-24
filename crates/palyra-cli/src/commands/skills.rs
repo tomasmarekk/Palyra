@@ -421,7 +421,8 @@ fn seed_e2e_skill_fixtures(
     ensure_e2e_harness_state_root(state_root, allow_outside_harness)?;
     let skills_root = state_root.join("skills");
     let artifact_bytes = build_e2e_reporter_skill_artifact()?;
-    let installed = ensure_e2e_reporter_skill_installed(skills_root.as_path(), &artifact_bytes)?;
+    let installed =
+        ensure_e2e_reporter_skill_installed(state_root, skills_root.as_path(), &artifact_bytes)?;
     let journal_path = state_root.join(DEFAULT_JOURNAL_DB_PATH);
     upsert_e2e_reporter_skill_status(journal_path.as_path())?;
     Ok(E2eSkillFixtureSeedReport {
@@ -504,11 +505,16 @@ min_palyra_version = "0.1.0"
     Ok(output.artifact_bytes)
 }
 
-fn ensure_e2e_reporter_skill_installed(skills_root: &Path, artifact_bytes: &[u8]) -> Result<bool> {
+fn ensure_e2e_reporter_skill_installed(
+    state_root: &Path,
+    skills_root: &Path,
+    artifact_bytes: &[u8],
+) -> Result<bool> {
     fs::create_dir_all(skills_root)
         .with_context(|| format!("failed to create skills root {}", skills_root.display()))?;
     let trust_store_path = skills_root.join("trust-store.json");
-    let mut trust_store = load_trust_store_with_integrity(trust_store_path.as_path())?;
+    let mut trust_store =
+        load_trust_store_with_state_root_integrity(trust_store_path.as_path(), state_root)?;
     let verification_report = verify_skill_artifact(artifact_bytes, &mut trust_store, true)
         .context("failed to verify e2e.reporter skill fixture artifact")?;
     let security_report = audit_skill_artifact_security(
@@ -524,7 +530,11 @@ fn ensure_e2e_reporter_skill_installed(skills_root: &Path, artifact_bytes: &[u8]
             security_report.quarantine_reasons.join(" | ")
         );
     }
-    save_trust_store_with_integrity(trust_store_path.as_path(), &trust_store)?;
+    save_trust_store_with_state_root_integrity(
+        trust_store_path.as_path(),
+        &trust_store,
+        state_root,
+    )?;
 
     let mut index = load_installed_skills_index(skills_root)?;
     let existing = index.entries.iter().any(|entry| {
