@@ -710,6 +710,8 @@ fn generate_admin_token() -> String {
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
 const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
+const LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS: &[&str] =
+    &["global/palyra-e2e-token"];
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
@@ -944,6 +946,11 @@ fn apply_local_desktop_tool_defaults(
         document,
         "tool_call.execution_timeout_ms",
         toml::Value::Integer(LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS),
+    )?;
+    set_value_at_path(
+        document,
+        "tool_call.http_fetch.allowed_credential_vault_refs",
+        string_array_value(LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS),
     )?;
     set_value_at_path(document, "tool_call.process_runner.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(document, "tool_call.wasm_runtime.enabled", toml::Value::Boolean(true))?;
@@ -13427,6 +13434,10 @@ mod init_command_tests {
         assert_eq!(
             read_integer(&document, "tool_call.execution_timeout_ms"),
             Some(super::LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS)
+        );
+        assert_eq!(
+            read_string_array(&document, "tool_call.http_fetch.allowed_credential_vault_refs"),
+            vec!["global/palyra-e2e-token".to_owned()]
         );
         assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));
         assert_eq!(
