@@ -100,7 +100,7 @@ use crate::application::{
         },
         memory::{
             execute_memory_delete_tool, execute_memory_recall_tool, execute_memory_reflect_tool,
-            execute_memory_retain_tool, execute_memory_search_tool,
+            execute_memory_replace_tool, execute_memory_retain_tool, execute_memory_search_tool,
             memory_search_tool_output_payload,
         },
         os_file::execute_os_file_tool,
@@ -7058,6 +7058,95 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
     );
     let after_payload = parse_tool_output_json(&search_after_delete);
     assert_eq!(after_payload.get("hit_count").and_then(Value::as_u64), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_replace() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    let marker = "S048-PACKAGE-MANAGER-PREFERENCE-20260623";
+    let path = "projects/project-workspace-e18a2abbf6/MEMORY.md";
+    state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: path.to_owned(),
+            title: Some("Project memory".to_owned()),
+            content_text: format!("pro tento projekt pouzivej npm {marker}"),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("workspace document should be indexed");
+
+    let search = execute_memory_search_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FE9",
+        br#"{"query":"S048-PACKAGE-MANAGER-PREFERENCE-20260623","scope":"project","workspace_prefix":"projects/project-workspace-e18a2abbf6","top_k":4,"min_score":0.0}"#,
+    )
+    .await;
+    assert!(search.success, "workspace search tool should succeed: {}", search.error);
+    let search_payload = parse_tool_output_json(&search);
+    let document_id = search_payload
+        .pointer("/hits/0/document/document_id")
+        .and_then(Value::as_str)
+        .expect("workspace search should expose document_id")
+        .to_owned();
+
+    let input_json = serde_json::to_vec(&json!({
+        "memory_id": document_id,
+        "content_text": format!("pro tento projekt pouzivej pnpm {marker}"),
+        "tags": [marker, "package-manager", "pnpm"],
+        "confidence": 1.0,
+        "ttl_ms": 0,
+        "ttl_unix_ms": 0
+    }))
+    .expect("replace input should serialize");
+    let replace = execute_memory_replace_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FEA",
+        input_json.as_slice(),
+    )
+    .await;
+    assert!(
+        replace.success,
+        "zero TTL defaults should not block workspace document replace: {}",
+        replace.error
+    );
+    let replace_payload = parse_tool_output_json(&replace);
+    assert_eq!(
+        replace_payload.get("status").and_then(Value::as_str),
+        Some("workspace_document_replaced")
+    );
+    assert_eq!(replace_payload.get("durable_memory_write").and_then(Value::as_bool), Some(true));
+
+    let replaced_document = state
+        .workspace_document_by_path(
+            context.principal.to_owned(),
+            context.channel.map(str::to_owned),
+            None,
+            path.to_owned(),
+            false,
+        )
+        .await
+        .expect("workspace document lookup should succeed")
+        .expect("workspace document should exist after replace");
+    assert!(
+        replaced_document.content_text.contains("pouzivej pnpm"),
+        "workspace document should contain corrected package-manager preference"
+    );
+    assert!(
+        !replaced_document.content_text.contains("pouzivej npm"),
+        "workspace document should not retain obsolete package-manager preference"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

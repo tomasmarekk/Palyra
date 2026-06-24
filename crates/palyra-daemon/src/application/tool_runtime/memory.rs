@@ -1786,10 +1786,7 @@ pub(crate) async fn execute_memory_replace_tool(
         }
         None => None,
     };
-    let ttl_unix_ms = match ttl_unix_ms_from_input(
-        parsed.get("ttl_ms").and_then(Value::as_i64),
-        parsed.get("ttl_unix_ms").and_then(Value::as_i64),
-    ) {
+    let ttl_unix_ms = match replace_ttl_unix_ms_from_input(&parsed) {
         Ok(value) => value,
         Err(error) => {
             return memory_tool_execution_outcome(
@@ -1929,6 +1926,17 @@ pub(crate) async fn execute_memory_replace_tool(
             format!("palyra.memory.replace failed to serialize output: {error}"),
         ),
     }
+}
+
+fn replace_ttl_unix_ms_from_input(parsed: &Map<String, Value>) -> Result<Option<i64>, Status> {
+    ttl_unix_ms_from_input(
+        zero_ttl_default_as_omitted(parsed.get("ttl_ms")),
+        zero_ttl_default_as_omitted(parsed.get("ttl_unix_ms")),
+    )
+}
+
+fn zero_ttl_default_as_omitted(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64).filter(|value| *value != 0)
 }
 
 /// Parameter bundle for the workspace branch of the replace tool.

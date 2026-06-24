@@ -285,8 +285,14 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     ("tags", json!({"type":"array","items":{"type":"string"},"maxItems":16})),
                     ("confidence", json!({"type":"number","minimum":0.0,"maximum":1.0})),
-                    ("ttl_ms", json!({"type":"integer","minimum":0})),
-                    ("ttl_unix_ms", json!({"type":"integer","minimum":0})),
+                    (
+                        "ttl_ms",
+                        json!({"type":"integer","minimum":0,"description":"Optional relative TTL in milliseconds. Omit both TTL fields to keep existing/default retention; do not set this with ttl_unix_ms."}),
+                    ),
+                    (
+                        "ttl_unix_ms",
+                        json!({"type":"integer","minimum":0,"description":"Optional absolute expiry time in Unix milliseconds. Omit both TTL fields to keep existing/default retention; do not set this with ttl_ms."}),
+                    ),
                 ],
                 false,
             ),

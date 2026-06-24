@@ -634,6 +634,14 @@ fn memory_replace_schema_requires_id_and_corrected_content() {
         .as_str()
         .unwrap_or_default()
         .contains("not both stale and corrected values"));
+    assert!(entry.input_schema["properties"]["ttl_ms"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Omit both TTL fields"));
+    assert!(entry.input_schema["properties"]["ttl_unix_ms"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("do not set this with ttl_ms"));
     assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
 }
 
