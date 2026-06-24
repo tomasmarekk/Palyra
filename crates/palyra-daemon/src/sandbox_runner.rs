@@ -873,6 +873,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
         }
     }
     let requested_hosts = if matches!(policy.egress_enforcement_mode, EgressEnforcementMode::None) {
+        validate_requested_egress_hosts_require_enforcement(&input)?;
         Vec::new()
     } else {
         collect_requested_egress_hosts(&input)?
@@ -4314,6 +4315,18 @@ fn collect_requested_egress_hosts(
         }
     }
     Ok(hosts)
+}
+
+fn validate_requested_egress_hosts_require_enforcement(
+    input: &ProcessRunnerInput,
+) -> Result<(), SandboxProcessRunError> {
+    if input.requested_egress_hosts.is_empty() {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::EgressDenied,
+        message: "sandbox denied: requested_egress_hosts requires active process-runner egress enforcement; current egress_enforcement_mode is none".to_owned(),
+    })
 }
 
 fn collect_hosts_from_token(
@@ -11769,6 +11782,26 @@ mod tests {
         let output: serde_json::Value =
             serde_json::from_slice(&result.output_json).expect("output should parse");
         assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+    }
+
+    #[test]
+    fn run_constrained_process_rejects_requested_egress_hosts_in_none_mode() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace, vec!["echo".to_owned()]);
+        policy.egress_enforcement_mode = EgressEnforcementMode::None;
+        let input = br#"{"command":"echo","args":["ok"],"requested_egress_hosts":["localhost"]}"#;
+
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("explicit requested_egress_hosts must fail closed in none mode");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(
+            error.message.contains("requested_egress_hosts")
+                && error.message.contains("egress_enforcement_mode is none"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
