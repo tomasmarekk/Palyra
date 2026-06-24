@@ -2267,15 +2267,16 @@ pub(crate) async fn execute_memory_search_tool(
             );
         }
     };
-    if (isolation_probe_enabled || parsed.contains_key("channel")) && scope != "channel" {
+    if let Err(error) =
+        validate_memory_search_channel_only_fields(&parsed, scope.as_str(), isolation_probe_enabled)
+    {
         return memory_tool_execution_outcome(
             attestation_namespace,
             proposal_id,
             input_json,
             false,
             b"{}".to_vec(),
-            "palyra.memory.search channel and isolation_probe are only supported with scope=channel"
-                .to_owned(),
+            error,
         );
     }
     if matches!(scope.as_str(), "workspace" | "project") {
@@ -2693,6 +2694,35 @@ fn parse_memory_search_isolation_probe_flag(parsed: &Map<String, Value>) -> Resu
         Some(Value::Null) | None => Ok(false),
         Some(_) => Err("palyra.memory.search isolation_probe must be a boolean".to_owned()),
     }
+}
+
+fn validate_memory_search_channel_only_fields(
+    parsed: &Map<String, Value>,
+    scope: &str,
+    isolation_probe_enabled: bool,
+) -> Result<(), String> {
+    if scope == "channel" {
+        return Ok(());
+    }
+    if isolation_probe_enabled || memory_search_has_explicit_channel_override(parsed)? {
+        return Err(
+            "palyra.memory.search channel and isolation_probe are only supported with scope=channel"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn memory_search_has_explicit_channel_override(
+    parsed: &Map<String, Value>,
+) -> Result<bool, String> {
+    let Some(value) = parsed.get("channel") else {
+        return Ok(false);
+    };
+    let Some(requested) = optional_channel_string(value, "palyra.memory.search")? else {
+        return Ok(false);
+    };
+    Ok(!is_current_channel_sentinel(requested.as_str()))
 }
 
 fn resolve_memory_search_channel_scope(
@@ -4626,6 +4656,51 @@ mod tests {
         assert!(
             error.contains("channel must be a string when provided"),
             "error should preserve strict type validation: {error}"
+        );
+    }
+
+    #[test]
+    fn memory_search_non_channel_scope_ignores_default_channel_fields() {
+        for channel in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("default".to_owned()),
+            Value::String("__current__".to_owned()),
+            Value::String("analysis".to_owned()),
+        ] {
+            let mut parsed = Map::new();
+            parsed.insert("scope".to_owned(), Value::String("workspace".to_owned()));
+            parsed.insert("channel".to_owned(), channel);
+            parsed.insert("isolation_probe".to_owned(), Value::Bool(false));
+
+            validate_memory_search_channel_only_fields(&parsed, "workspace", false)
+                .expect("default channel fields should not block workspace search");
+        }
+
+        let mut explicit_channel = Map::new();
+        explicit_channel.insert("channel".to_owned(), Value::String("prod".to_owned()));
+        let error = validate_memory_search_channel_only_fields(&explicit_channel, "project", false)
+            .expect_err("explicit channel override should require channel scope");
+        assert!(
+            error.contains("only supported with scope=channel"),
+            "error should preserve scope guidance: {error}"
+        );
+
+        let error = validate_memory_search_channel_only_fields(&Map::new(), "all", true)
+            .expect_err("isolation probes should require channel scope");
+        assert!(
+            error.contains("only supported with scope=channel"),
+            "error should preserve scope guidance: {error}"
+        );
+
+        let mut invalid_channel = Map::new();
+        invalid_channel.insert("channel".to_owned(), json!([]));
+        let error =
+            validate_memory_search_channel_only_fields(&invalid_channel, "workspace", false)
+                .expect_err("invalid channel type should stay invalid");
+        assert!(
+            error.contains("channel must be a string when provided"),
+            "error should preserve strict channel typing: {error}"
         );
     }
 
