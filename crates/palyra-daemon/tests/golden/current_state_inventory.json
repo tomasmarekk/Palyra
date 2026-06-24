@@ -719,7 +719,7 @@
       "env_var": "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE",
       "trace_schema_version": 1,
       "trace_event_type": "context.engine.plan",
-      "instruction_compiler_version": 30
+      "instruction_compiler_version": 31
     },
     "execution_backend_remote_node": {
       "enabled": false,
