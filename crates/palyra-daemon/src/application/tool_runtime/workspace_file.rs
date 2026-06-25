@@ -3200,6 +3200,10 @@ mod tests {
         let sibling_file = watched_dir.join("sibling-secret.txt");
         fs::write(watched_file.as_path(), "watched\n").expect("watched file should exist");
         fs::write(sibling_file.as_path(), "secret\n").expect("sibling file should exist");
+        let watched_file =
+            fs::canonicalize(watched_file.as_path()).expect("watched file should canonicalize");
+        let sibling_file =
+            fs::canonicalize(sibling_file.as_path()).expect("sibling file should canonicalize");
 
         let watched_input = WorkspaceReadFileInput {
             path: watched_file.to_string_lossy().into_owned(),
