@@ -42,10 +42,10 @@ use crate::journal::{
     JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
     MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
     MemorySearchRequest, MemorySource, OrchestratorBackgroundTaskCreateRequest,
-    OrchestratorBackgroundTaskUpdateRequest, OrchestratorRunStartRequest,
-    OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
-    OrchestratorTapeAppendRequest, SessionProjectContextStateUpsertRequest,
-    WorkspaceDocumentWriteRequest,
+    OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
+    OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
+    OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
+    SessionProjectContextStateUpsertRequest, WorkspaceDocumentWriteRequest,
 };
 use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
@@ -4561,6 +4561,44 @@ fn cleanup_resource_registry_deduplicates_and_drains_by_run() {
     assert_eq!(resources.browser_session_ids, vec![session_id]);
     assert_eq!(resources.background_process_pids, vec![42]);
     assert!(state.take_run_cleanup_resources(run_id.as_str()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_cancel_cleanup_drains_registered_resources_after_noop_snapshot() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    state.record_run_browser_session(run_id.as_str(), "browser-session-terminal-noop");
+    state
+        .update_orchestrator_run_state(
+            run_id.clone(),
+            RunLifecycleState::Done,
+            Some("done before cleanup".to_owned()),
+        )
+        .await
+        .expect("run should transition to terminal state");
+
+    let snapshot = state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "admin_cancel_after_terminal_state".to_owned(),
+        })
+        .await
+        .expect("terminal cancel request should return a no-op snapshot");
+
+    assert!(!snapshot.cancel_requested);
+    super::cleanup_run_resources(&state, snapshot.run_id.as_str(), snapshot.reason.as_str()).await;
+    assert!(
+        state.take_run_cleanup_resources(run_id.as_str()).is_empty(),
+        "terminal no-op cancel handlers must still drain registered run resources"
+    );
+    let tape = state.journal_store.orchestrator_tape(run_id.as_str()).expect("tape should load");
+    assert!(
+        tape.iter().any(|event| event.event_type == "run.cleanup"),
+        "cleanup after terminal cancel should leave an audit event"
+    );
 }
 
 #[test]
