@@ -9325,6 +9325,149 @@ async fn routines_tool_test_run_bypasses_disabled_state_but_not_approval_gate() 
             .is_some_and(|note| note.contains("audit-only")),
         "run history should retain safe test-run audit metadata"
     );
+
+    let before_enable_input = serde_json::to_vec(&json!({
+        "operation": "upsert",
+        "name": "Before enable guarded audit",
+        "prompt": "Audit privileged configuration and report whether any write would be required.",
+        "trigger_kind": "schedule",
+        "natural_language_schedule": "every 2h",
+        "run_mode": "fresh_session",
+        "execution_posture": "sensitive_tools",
+        "approval_mode": "before_enable",
+        "enabled": true,
+    }))
+    .expect("before_enable routine upsert payload should serialize");
+    let before_enable_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_CONTROL_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBR",
+        before_enable_input.as_slice(),
+    )
+    .await;
+    assert!(
+        before_enable_outcome.success,
+        "before_enable routine upsert should succeed: {}",
+        before_enable_outcome.error
+    );
+    let before_enable_json = parse_tool_output_json(&before_enable_outcome);
+    let before_enable_routine = before_enable_json
+        .get("routine")
+        .and_then(Value::as_object)
+        .expect("before_enable upsert response should include routine metadata");
+    let before_enable_routine_id = before_enable_routine
+        .get("routine_id")
+        .and_then(Value::as_str)
+        .expect("before_enable routine id should be returned")
+        .to_owned();
+    assert_eq!(
+        before_enable_routine.get("enabled").and_then(Value::as_bool),
+        Some(false),
+        "before_enable routines stay disabled while approval is pending"
+    );
+    assert_eq!(
+        before_enable_routine.get("approval_mode").and_then(Value::as_str),
+        Some("before_enable")
+    );
+    assert!(
+        before_enable_json
+            .get("approval")
+            .and_then(Value::as_object)
+            .and_then(|approval| approval.get("approval_id"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "before_enable upsert should expose the pending approval"
+    );
+
+    let before_enable_test_run_input = serde_json::to_vec(&json!({
+        "operation": "test_run",
+        "routine_id": before_enable_routine_id,
+        "trigger_reason": "before-enable approval boundary drill",
+    }))
+    .expect("before_enable test-run payload should serialize");
+    let before_enable_test_run_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_CONTROL_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBS",
+        before_enable_test_run_input.as_slice(),
+    )
+    .await;
+    assert!(
+        before_enable_test_run_outcome.success,
+        "safe before_enable test-run should return approval evidence: {}",
+        before_enable_test_run_outcome.error
+    );
+    let before_enable_test_run_json = parse_tool_output_json(&before_enable_test_run_outcome);
+    let before_enable_run_id = before_enable_test_run_json
+        .get("run_id")
+        .and_then(Value::as_str)
+        .expect("before_enable test-run should still record a run id")
+        .to_owned();
+    assert_eq!(
+        before_enable_test_run_json.get("status").and_then(Value::as_str),
+        Some("denied"),
+        "safe test-run must not dispatch before_enable-pending routines"
+    );
+    assert_eq!(
+        before_enable_test_run_json.get("message").and_then(Value::as_str),
+        Some("routine approval is required before enable")
+    );
+    assert!(
+        before_enable_test_run_json
+            .get("approval")
+            .and_then(Value::as_object)
+            .and_then(|approval| approval.get("approval_id"))
+            .and_then(Value::as_str)
+            .is_some(),
+        "before_enable test-run denial should include an approval record"
+    );
+
+    let before_enable_list_runs_input = serde_json::to_vec(&json!({
+        "operation": "list_runs",
+        "routine_id": before_enable_routine_id,
+        "limit": 10,
+    }))
+    .expect("before_enable run listing payload should serialize");
+    let before_enable_list_runs_outcome = execute_routines_tool(
+        &state,
+        context,
+        super::ROUTINES_QUERY_TOOL_NAME,
+        "01ARZ3NDEKTSV4RRFFQ69G5FBT",
+        before_enable_list_runs_input.as_slice(),
+    )
+    .await;
+    assert!(before_enable_list_runs_outcome.success, "run history listing should succeed");
+    let before_enable_list_runs_json = parse_tool_output_json(&before_enable_list_runs_outcome);
+    let before_enable_runs = before_enable_list_runs_json
+        .get("runs")
+        .and_then(Value::as_array)
+        .expect("before_enable run history should include routine runs");
+    assert!(
+        before_enable_runs
+            .iter()
+            .all(|run| run.get("dispatch_mode").and_then(Value::as_str) != Some("normal")),
+        "safe before_enable test-run must not create normal scheduler runs"
+    );
+    let before_enable_test_run_entry = before_enable_runs
+        .iter()
+        .find(|run| {
+            run.get("run_id").and_then(Value::as_str) == Some(before_enable_run_id.as_str())
+        })
+        .expect("before_enable test-run should be recorded in run history");
+    assert_eq!(
+        before_enable_test_run_entry.get("dispatch_mode").and_then(Value::as_str),
+        Some("test_run")
+    );
+    assert_eq!(
+        before_enable_test_run_entry.get("skip_reason").and_then(Value::as_str),
+        Some("approval_required")
+    );
+    assert_eq!(
+        before_enable_test_run_entry.get("execution_posture").and_then(Value::as_str),
+        Some("sensitive_tools")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

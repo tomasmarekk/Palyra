@@ -1371,9 +1371,9 @@ async fn dispatch_single_routine(
         request.delivery_override.clone().unwrap_or_else(|| routine.metadata.delivery.clone());
 
     // Gate order: production dispatch honors the persisted enabled state,
-    // before_first_run approval fails closed, then operator throttles apply.
-    // Safe test_run/replay bypass scheduler state while still enforcing
-    // approval boundaries and audit-only delivery.
+    // approval modes fail closed, then operator throttles apply. Safe
+    // test_run/replay bypass scheduler state while still enforcing approval
+    // boundaries and audit-only delivery.
     if !routine.job.enabled && !request.bypass_operator_gates {
         return register_terminal_routine_run(
             runtime_state,
@@ -1398,6 +1398,53 @@ async fn dispatch_single_routine(
             },
         )
         .await;
+    }
+    if routine.metadata.approval_policy.mode == RoutineApprovalMode::BeforeEnable
+        && !routine_approval_granted(
+            runtime_state,
+            routine_approval_subject_id(
+                routine.metadata.routine_id.as_str(),
+                RoutineApprovalMode::BeforeEnable,
+            ),
+        )
+        .await?
+    {
+        let approval = ensure_routine_approval_requested(
+            runtime_state,
+            context.principal.as_str(),
+            Some(routine.job.channel.as_str()),
+            &routine.job,
+            &routine.metadata,
+            RoutineApprovalMode::BeforeEnable,
+        )
+        .await?;
+        let mut response = register_terminal_routine_run(
+            runtime_state,
+            &runtime.registry,
+            TerminalRoutineRunRequest {
+                routine_id: routine.job.job_id.as_str(),
+                trigger_kind: request.trigger_kind,
+                trigger_reason: request.trigger_reason,
+                trigger_payload: &request.trigger_payload,
+                trigger_dedupe_key: request.trigger_dedupe_key,
+                execution,
+                delivery,
+                dispatch_mode: request.dispatch_mode,
+                source_run_id: request.source_run_id,
+                status: CronRunStatus::Denied,
+                outcome_override: RoutineRunOutcomeKind::Denied,
+                message: "routine approval is required before enable",
+                skip_reason: Some("approval_required".to_owned()),
+                delivery_reason: None,
+                approval_note: Some("before_enable approval is still pending".to_owned()),
+                safety_note: request.safety_note,
+            },
+        )
+        .await?;
+        if let Some(object) = response.as_object_mut() {
+            object.insert("approval".to_owned(), approval);
+        }
+        return Ok(response);
     }
     if routine.metadata.approval_policy.mode == RoutineApprovalMode::BeforeFirstRun
         && !routine_approval_granted(
