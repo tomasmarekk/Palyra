@@ -350,7 +350,17 @@ fn looks_like_url_token(token: &str) -> bool {
     if base.is_empty() || base.contains('(') || base.contains(')') {
         return false;
     }
+    if query_or_fragment_contains_sensitive_value(&token[separator_index + 1..]) {
+        return true;
+    }
     base.starts_with('/') || base.starts_with("./") || base.starts_with("../") || base.contains('.')
+}
+
+fn query_or_fragment_contains_sensitive_value(raw: &str) -> bool {
+    raw.split('&').any(|pair| {
+        let (key, value) = split_query_pair(pair);
+        !value.is_empty() && sensitive_assignment_key(key).is_some()
+    })
 }
 
 fn redact_assignment_token(token: &str, strictness: RedactionStrictness) -> Cow<'_, str> {
@@ -388,10 +398,11 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     if strictness == RedactionStrictness::Diagnostic {
         return true;
     }
-    // Heuristic mode: bare "token" keys are common in benign fixture/test text, so only
-    // redact when the value itself looks like a real credential.
+    // Heuristic mode: bare "token" keys are common in benign fixture/test text, but
+    // real callback, CSRF, and magic-link tokens can be very short. Keep only the
+    // narrow source-fixture shapes known to be non-secret.
     if normalize_key(sensitive_key) == "token" {
-        return value_looks_like_secret_token(value);
+        return !is_benign_bare_token_fixture_value(value);
     }
     true
 }
@@ -478,7 +489,7 @@ fn trailing_plain_key_segment(value: &str) -> Option<PlainKeySegment<'_>> {
     Some(PlainKeySegment { segment: &value[start..end], prefix })
 }
 
-fn value_looks_like_secret_token(value: &str) -> bool {
+fn is_benign_bare_token_fixture_value(value: &str) -> bool {
     let trimmed = value
         .trim()
         .trim_matches(['"', '\'', '`'])
@@ -486,22 +497,17 @@ fn value_looks_like_secret_token(value: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    // Matches well-known provider credential prefixes plus a length/charset heuristic for
-    // opaque token-shaped values; short structured values (e.g. URL-encoded pairs) pass.
     let lowered = trimmed.to_ascii_lowercase();
-    lowered.contains("secret")
-        || lowered.starts_with("bearer")
-        || lowered.starts_with("sk-")
-        || lowered.starts_with("ghp_")
-        || lowered.starts_with("github_pat_")
-        || lowered.starts_with("xox")
-        || simple_token_value_looks_secret(trimmed)
-        || trimmed.len() >= 16
+    lowered == "a%3db%3dc" || looks_like_parser_fixture_value(lowered.as_str())
 }
 
-fn simple_token_value_looks_secret(value: &str) -> bool {
-    value.len() >= 6
-        && value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+fn looks_like_parser_fixture_value(value: &str) -> bool {
+    value.contains('=')
+        && value.len() <= 96
+        && value
+            .split('=')
+            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
+        && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
 }
 
 fn split_assignment(token: &str) -> Option<(&str, char, &str)> {
@@ -638,6 +644,13 @@ mod tests {
     }
 
     #[test]
+    fn url_redaction_masks_short_bare_token_values() {
+        let redacted = redact_url("https://example.test/path?token=abc&mode=full");
+
+        assert_eq!(redacted, "https://example.test/path?token=<redacted>&mode=full");
+    }
+
+    #[test]
     fn strict_url_redaction_masks_short_sensitive_query_values() {
         let redacted = redact_url_strict(
             "https://user:pass@example.test/path?token=abc&mode=full#access_token=x",
@@ -712,10 +725,10 @@ mod tests {
 
     #[test]
     fn auth_error_redaction_masks_simple_short_token_assignments() {
-        let redacted = redact_auth_error("stderr preview token=abc123 next");
+        let redacted = redact_auth_error("stderr preview token=abc next");
 
         assert!(redacted.contains("token=<redacted>"), "{redacted}");
-        assert!(!redacted.contains("token=abc123"), "{redacted}");
+        assert!(!redacted.contains("token=abc"), "{redacted}");
     }
 
     #[test]
@@ -779,6 +792,19 @@ mod tests {
         assert!(redacted.contains("refresh_token=<redacted>"));
         assert!(redacted.contains("mode=ok"));
         assert!(!redacted.contains("refresh_token=secret"));
+    }
+
+    #[test]
+    fn url_segments_in_text_redacts_relative_sensitive_query_params() {
+        let redacted = redact_url_segments_in_text(
+            "callback failed: oauth/callback?access_token=abc&refresh_token=r&state=ok",
+        );
+
+        assert!(redacted.contains("state=ok"), "{redacted}");
+        assert!(redacted.contains("access_token=<redacted>"), "{redacted}");
+        assert!(redacted.contains("refresh_token=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("access_token=abc"), "{redacted}");
+        assert!(!redacted.contains("refresh_token=r"), "{redacted}");
     }
 
     #[test]

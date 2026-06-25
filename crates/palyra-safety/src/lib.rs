@@ -906,10 +906,12 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
         return None;
     }
     let classification = classify_sensitive_assignment_key(key.as_str())?;
-    // "key"/"token" keys are too generic (storage keys, parser tokens, ...) to
-    // flag on the name alone; require the value itself to look like a secret.
-    if matches!(classification, "key" | "token") && !bare_token_assignment_value_looks_secret(value)
-    {
+    if classification == "token" && !bare_token_assignment_value_requires_redaction(value) {
+        return None;
+    }
+    // "key" is too generic (storage keys, parser keys, ...) to flag on the
+    // name alone; require the value itself to look like a secret.
+    if classification == "key" && !generic_key_assignment_value_looks_secret(value) {
         return None;
     }
     Some(classification)
@@ -1735,10 +1737,48 @@ fn is_env_identifier(value: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Heuristic for whether the value of a generic `key`/`token` assignment
-/// looks like real secret material (known prefixes, "secret" substring, or
-/// length >= 16) after allowlisting identifiers and fixture markers.
-fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
+fn bare_token_assignment_value_requires_redaction(value: &str) -> bool {
+    let candidate = value.trim().trim_start_matches(['"', '\'', '`']);
+    let bounded_value = candidate
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace()
+                || matches!(ch, '&' | '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}'))
+            .then_some(index)
+        })
+        .map(|index| &candidate[..index])
+        .unwrap_or(candidate);
+    let normalized = bounded_value
+        .trim()
+        .trim_matches(['"', '\'', '`'])
+        .trim_end_matches([',', ';', '.', ')', ']', '}']);
+    if normalized.is_empty() {
+        return false;
+    }
+    let lowered = normalized.to_ascii_lowercase();
+    if looks_like_segmented_auth_secret_value(lowered.as_str()) {
+        return true;
+    }
+    if is_env_reference_identifier_literal(normalized)
+        || looks_like_application_identifier(lowered.as_str())
+        || looks_like_parser_fixture_value(lowered.as_str())
+        || looks_like_url_encoded_parser_fixture_value(lowered.as_str())
+        || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
+    {
+        return false;
+    }
+    if quoted_string_literals(value).iter().any(|literal| {
+        let literal = literal.trim();
+        !literal.is_empty() && bare_token_assignment_value_requires_redaction(literal)
+    }) {
+        return true;
+    }
+    true
+}
+
+/// Heuristic for whether the value of a generic `key` assignment looks like
+/// real secret material after allowlisting identifiers and fixture markers.
+fn generic_key_assignment_value_looks_secret(value: &str) -> bool {
     let candidate = value.trim().trim_start_matches(['"', '\'', '`']);
     let bounded_value = candidate
         .char_indices()
@@ -1769,7 +1809,7 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
     }
     if quoted_string_literals(value).iter().any(|literal| {
         let literal = literal.trim();
-        !literal.is_empty() && bare_token_assignment_value_looks_secret(literal)
+        !literal.is_empty() && generic_key_assignment_value_looks_secret(literal)
     }) {
         return true;
     }
@@ -1905,6 +1945,10 @@ fn looks_like_parser_fixture_value(value: &str) -> bool {
             .split('=')
             .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
         && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
+}
+
+fn looks_like_url_encoded_parser_fixture_value(value: &str) -> bool {
+    value == "a%3db%3dc"
 }
 
 /// Returns the provider tag for the first known credential-token shape found
@@ -3313,6 +3357,28 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn short_bare_token_values_are_redacted_for_export() {
+        let source = "token=abc\n\
+                      callback?token=x&state=ok";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("token=[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("token=abc"));
+        assert!(!outcome.redacted_text.contains("token=x"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
     }
 
     #[test]
