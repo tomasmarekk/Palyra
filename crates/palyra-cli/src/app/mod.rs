@@ -603,7 +603,7 @@ impl RootCommandContext {
         }
         let connection_env = ConnectionEnvironment::read(self.profile.as_ref());
         let environment_token_matches =
-            self.environment_token_matches_endpoint(endpoint, endpoint_kind, &connection_env);
+            self.environment_token_matches_endpoint(endpoint, endpoint_kind);
         if profile_token_matches {
             if let Some(token) = connection_env.profile_admin_token {
                 return Some(token);
@@ -656,21 +656,35 @@ impl RootCommandContext {
         &self,
         endpoint: &ResolvedConnectionEndpoint,
         endpoint_kind: ConnectionEndpointKind,
-        connection_env: &ConnectionEnvironment,
+    ) -> bool {
+        match endpoint.source {
+            ConnectionEndpointSource::Environment => {
+                self.environment_endpoint_can_use_ambient_token(endpoint, endpoint_kind)
+            }
+            ConnectionEndpointSource::Config | ConnectionEndpointSource::Default => true,
+            ConnectionEndpointSource::Explicit | ConnectionEndpointSource::Profile => false,
+        }
+    }
+
+    fn environment_endpoint_can_use_ambient_token(
+        &self,
+        endpoint: &ResolvedConnectionEndpoint,
+        endpoint_kind: ConnectionEndpointKind,
     ) -> bool {
         if self
-            .environment_endpoint_url(connection_env, endpoint_kind)
-            .is_some_and(|env_url| same_connection_origin(endpoint.url.as_str(), env_url))
+            .config_endpoint_url(endpoint_kind)
+            .is_some_and(|config_url| same_connection_origin(endpoint.url.as_str(), config_url))
         {
             return true;
         }
-        // The ambient env token also applies to locally resolved endpoints
-        // (config or built-in default), but never to explicit or profile
-        // endpoints that point somewhere else.
-        matches!(
-            endpoint.source,
-            ConnectionEndpointSource::Config | ConnectionEndpointSource::Default
-        )
+        // Keep env-only launches working, but do not let an injected endpoint
+        // move the global admin token away from a configured profile/config
+        // origin.
+        self.profile
+            .as_ref()
+            .and_then(|profile| self.profile_endpoint_url(profile, endpoint_kind))
+            .is_none()
+            && self.config_endpoint_url(endpoint_kind).is_none()
     }
 
     fn profile_endpoint_url<'a>(
@@ -689,17 +703,6 @@ impl RootCommandContext {
         match endpoint_kind {
             ConnectionEndpointKind::DaemonHttp => self.config_defaults.daemon_url.as_deref(),
             ConnectionEndpointKind::GatewayGrpc => self.config_defaults.grpc_url.as_deref(),
-        }
-    }
-
-    fn environment_endpoint_url<'a>(
-        &self,
-        connection_env: &'a ConnectionEnvironment,
-        endpoint_kind: ConnectionEndpointKind,
-    ) -> Option<&'a str> {
-        match endpoint_kind {
-            ConnectionEndpointKind::DaemonHttp => connection_env.daemon_url.as_deref(),
-            ConnectionEndpointKind::GatewayGrpc => connection_env.grpc_url.as_deref(),
         }
     }
 
@@ -1732,6 +1735,7 @@ admin_token = "profile-token"
         env::set_var(CLI_PROFILES_PATH_ENV, &profile_path);
         env::set_var("PALYRA_DAEMON_URL", "http://127.0.0.1:9999");
         env::set_var("PALYRA_GATEWAY_GRPC_URL", "http://127.0.0.1:9998");
+        env::set_var("PALYRA_ADMIN_TOKEN", "global-env-token");
 
         let context =
             build_root_context(RootOptions::default(), ExplicitConfigPathPolicy::RequireExisting)?;
@@ -1744,6 +1748,49 @@ admin_token = "profile-token"
         assert_eq!(grpc.grpc_url, "http://127.0.0.1:9998");
         assert_eq!(http.token, None);
         assert_eq!(grpc.token, None);
+        Ok(())
+    }
+
+    #[test]
+    fn environment_endpoints_use_global_admin_token_when_origin_matches_config() -> Result<()> {
+        let _guard = super::test_env_lock_for_tests().lock().expect("env lock");
+        clear_env();
+        let temp = tempdir()?;
+        let state_root = temp.path().join("state");
+        let config_path = temp.path().join("palyra.toml");
+        fs::write(
+            &config_path,
+            r#"
+[daemon]
+bind_addr = "127.0.0.1"
+port = 9999
+
+[gateway]
+grpc_bind_addr = "127.0.0.1"
+grpc_port = 9998
+"#,
+        )?;
+        env::set_var("PALYRA_DAEMON_URL", "http://127.0.0.1:9999/console");
+        env::set_var("PALYRA_GATEWAY_GRPC_URL", "http://127.0.0.1:9998");
+        env::set_var("PALYRA_ADMIN_TOKEN", "global-env-token");
+
+        let context = build_root_context(
+            RootOptions {
+                config_path: Some(config_path.display().to_string()),
+                state_root: Some(state_root.display().to_string()),
+                ..RootOptions::default()
+            },
+            ExplicitConfigPathPolicy::RequireExisting,
+        )?;
+        let http = context
+            .resolve_http_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
+        let grpc = context
+            .resolve_grpc_connection(ConnectionOverrides::default(), ConnectionDefaults::ADMIN)?;
+
+        assert_eq!(http.base_url, "http://127.0.0.1:9999/console");
+        assert_eq!(grpc.grpc_url, "http://127.0.0.1:9998");
+        assert_eq!(http.token.as_deref(), Some("global-env-token"));
+        assert_eq!(grpc.token.as_deref(), Some("global-env-token"));
         Ok(())
     }
 
