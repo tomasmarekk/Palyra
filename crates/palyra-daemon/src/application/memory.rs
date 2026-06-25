@@ -1282,11 +1282,7 @@ fn contains_unnegated_memory_write_word(lowered: &str, word: &str) -> bool {
     lowered.match_indices(word).any(|(index, _)| {
         let clause_prefix = current_clause_prefix(lowered, index);
         has_word_boundaries(lowered, index, word.len())
-            && !clause_prefix.contains("do not ")
-            && !clause_prefix.contains("don't ")
-            && !clause_prefix.contains("must not ")
-            && !clause_prefix.contains("never ")
-            && !clause_prefix.contains("no ")
+            && !memory_write_word_is_negated(clause_prefix)
     })
 }
 
@@ -1296,8 +1292,15 @@ fn contains_unnegated_memory_write_word(lowered: &str, word: &str) -> bool {
 fn current_clause_prefix(text: &str, index: usize) -> &str {
     let prefix = &text[..index];
     let clause_start =
-        prefix.rfind(['.', '!', '?', ';', '\n']).map(|offset| offset + 1).unwrap_or(0);
+        prefix.rfind(['.', '!', '?', ';', ',', '\n']).map(|offset| offset + 1).unwrap_or(0);
     &text[clause_start..index]
+}
+
+fn memory_write_word_is_negated(clause_prefix: &str) -> bool {
+    let compact = clause_prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+    ["do not", "don't", "must not", "never", "no", "no need to", "no need for", "without"]
+        .iter()
+        .any(|negation| compact.ends_with(negation))
 }
 
 fn has_word_boundaries(text: &str, index: usize, len: usize) -> bool {
@@ -1922,6 +1925,30 @@ mod tests {
         assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Sensitive);
         assert_eq!(classification.approval_state, MemoryWriteApprovalState::Required);
         assert!(classification.reason_codes.iter().any(|reason| reason == "sensitivity:sensitive"));
+    }
+
+    #[test]
+    fn write_classifier_marks_comma_prefixed_positive_save_intent_for_review() {
+        let classification = classify_memory_write(classification_input(
+            "No extra steps, save the admin token abc123 for deployments.",
+        ));
+
+        assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Sensitive);
+        assert_eq!(classification.approval_state, MemoryWriteApprovalState::Required);
+        assert!(classification.reason_codes.iter().any(|reason| reason == "sensitivity:sensitive"));
+    }
+
+    #[test]
+    fn write_classifier_allows_negated_secret_storage_instruction() {
+        let classification =
+            classify_memory_write(classification_input("Do not store the admin token abc123."));
+
+        assert_eq!(classification.sensitivity, MemoryWriteSensitivity::Normal);
+        assert_eq!(classification.approval_state, MemoryWriteApprovalState::NotRequired);
+        assert!(!classification
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "sensitivity:sensitive"));
     }
 
     #[test]
