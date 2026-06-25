@@ -2165,13 +2165,20 @@ async fn ensure_routine_approval_requested(
     }
 
     let details_json = json!({
-        "routine_id": metadata.routine_id,
-        "name": job.name,
+        "routine_id": metadata.routine_id.as_str(),
+        "name": job.name.as_str(),
         "approval_mode": mode.as_str(),
         "trigger_kind": metadata.trigger_kind.as_str(),
+        "workdir": job.workdir.as_deref(),
+        "run_mode": metadata.execution.run_mode.as_str(),
+        "execution_posture": metadata.execution.execution_posture.as_str(),
+        "allow_sensitive_tools": metadata.execution.execution_posture == RoutineExecutionPosture::SensitiveTools,
+        "procedure_profile_id": metadata.execution.procedure_profile_id.as_deref(),
+        "skill_profile_id": metadata.execution.skill_profile_id.as_deref(),
+        "provider_profile_id": metadata.execution.provider_profile_id.as_deref(),
         "delivery_mode": metadata.delivery.mode.as_str(),
-        "channel": job.channel,
-        "template_id": metadata.template_id,
+        "channel": job.channel.as_str(),
+        "template_id": metadata.template_id.as_deref(),
     })
     .to_string();
     let prompt = ApprovalPromptRecord {
@@ -2221,18 +2228,20 @@ async fn ensure_routine_approval_requested(
             subject_type: ApprovalSubjectType::Tool,
             subject_id: subject_id.clone(),
             request_summary: format!(
-                "routine_id={} routine_name={} approval_mode={}",
+                "routine_id={} routine_name={} approval_mode={} execution_posture={}",
                 metadata.routine_id,
                 job.name,
-                mode.as_str()
+                mode.as_str(),
+                metadata.execution.execution_posture.as_str()
             ),
             policy_snapshot: ApprovalPolicySnapshot {
                 policy_id: "routine.approval.v1".to_owned(),
                 policy_hash,
                 evaluation_summary: format!(
-                    "routine approval required mode={} trigger={} delivery={}",
+                    "routine approval required mode={} trigger={} execution_posture={} delivery={}",
                     mode.as_str(),
                     metadata.trigger_kind.as_str(),
+                    metadata.execution.execution_posture.as_str(),
                     metadata.delivery.mode.as_str()
                 ),
             },
@@ -2816,15 +2825,18 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, S
     Ok(RoutineApprovalPolicy { mode })
 }
 
-// INTENTIONAL: a pass-through today. Tests pin that sensitive-tools posture
-// alone must not force an approval mode; the unused parameters keep the seam
-// where a posture-aware default would plug in.
 fn default_approval_policy_for_execution(
-    _execution: &RoutineExecutionConfig,
+    execution: &RoutineExecutionConfig,
     approval_policy: RoutineApprovalPolicy,
     _approval_mode_was_requested: bool,
-    _execution_posture_was_requested: bool,
+    execution_posture_was_requested: bool,
 ) -> RoutineApprovalPolicy {
+    if approval_policy.mode == RoutineApprovalMode::None
+        && execution.execution_posture == RoutineExecutionPosture::SensitiveTools
+        && !execution_posture_was_requested
+    {
+        return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
+    }
     approval_policy
 }
 
@@ -3790,7 +3802,7 @@ mod tests {
     }
 
     #[test]
-    fn default_approval_policy_keeps_implicit_sensitive_tools_unblocked() {
+    fn default_approval_policy_requires_first_run_for_implicit_sensitive_tools() {
         let execution = RoutineExecutionConfig {
             run_mode: RoutineRunMode::FreshSession,
             execution_posture: RoutineExecutionPosture::SensitiveTools,
@@ -3803,7 +3815,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
     }
 
     #[test]

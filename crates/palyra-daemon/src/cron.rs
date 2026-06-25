@@ -2324,6 +2324,13 @@ async fn ensure_scheduled_routine_approval_requested(
         "name": job.name.as_str(),
         "approval_mode": mode.as_str(),
         "trigger_kind": routine.trigger_kind.as_str(),
+        "workdir": job.workdir.as_deref(),
+        "run_mode": routine.execution.run_mode.as_str(),
+        "execution_posture": routine.execution.execution_posture.as_str(),
+        "allow_sensitive_tools": routine.execution.execution_posture == RoutineExecutionPosture::SensitiveTools,
+        "procedure_profile_id": routine.execution.procedure_profile_id.as_deref(),
+        "skill_profile_id": routine.execution.skill_profile_id.as_deref(),
+        "provider_profile_id": routine.execution.provider_profile_id.as_deref(),
         "delivery_mode": routine.delivery.mode.as_str(),
         "channel": job.channel.as_str(),
         "template_id": routine.template_id.as_deref(),
@@ -2376,18 +2383,20 @@ async fn ensure_scheduled_routine_approval_requested(
             subject_type: ApprovalSubjectType::Tool,
             subject_id,
             request_summary: format!(
-                "routine_id={} routine_name={} approval_mode={}",
+                "routine_id={} routine_name={} approval_mode={} execution_posture={}",
                 routine.routine_id,
                 job.name,
-                mode.as_str()
+                mode.as_str(),
+                routine.execution.execution_posture.as_str()
             ),
             policy_snapshot: ApprovalPolicySnapshot {
                 policy_id: "routine.approval.v1".to_owned(),
                 policy_hash,
                 evaluation_summary: format!(
-                    "routine approval required mode={} trigger={} delivery={}",
+                    "routine approval required mode={} trigger={} execution_posture={} delivery={}",
                     mode.as_str(),
                     routine.trigger_kind.as_str(),
+                    routine.execution.execution_posture.as_str(),
                     routine.delivery.mode.as_str()
                 ),
             },
