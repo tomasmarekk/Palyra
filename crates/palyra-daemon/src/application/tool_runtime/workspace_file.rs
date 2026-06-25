@@ -1877,13 +1877,25 @@ fn search_workspace_line(
     };
     let query_len = state.query.len().max(1);
     let mut search_start = 0usize;
+    let mut line_redaction: Option<(String, bool, Vec<String>)> = None;
     while let Some(relative_index) = haystack[search_start..].find(state.normalized_query.as_str())
     {
         let byte_index = search_start + relative_index;
         let column = line[..byte_index].chars().count() + 1;
-        let excerpt = workspace_search_line_excerpt(line, byte_index, query_len);
-        let (line_text, redacted, redaction_reasons) =
-            redact_workspace_search_line(excerpt.as_str());
+        let (line_text, redacted, redaction_reasons) = {
+            let redaction =
+                line_redaction.get_or_insert_with(|| redact_workspace_search_line(line));
+            if redaction.1 {
+                let excerpt_start = byte_index.min(redaction.0.len());
+                (
+                    workspace_search_line_excerpt(redaction.0.as_str(), excerpt_start, query_len),
+                    true,
+                    redaction.2.clone(),
+                )
+            } else {
+                (workspace_search_line_excerpt(line, byte_index, query_len), false, Vec::new())
+            }
+        };
         if !state.reserve_match_output(path, line_text.as_str()) {
             return;
         }
@@ -3827,6 +3839,36 @@ mod tests {
             .any(|reason| reason == "secret_leak.marker"));
         assert!(output.matches[0].line_text.contains("[REDACTED_SECRET]"));
         assert!(!output.matches[0].line_text.contains("DUMMY_SECRET_SHOULD_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn search_workspace_redacts_full_long_line_before_excerpt() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let secret_body =
+            format!("MIIC{}UNIQUEPRIVATEKEYBODY", "A".repeat(WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES));
+        let line = format!(
+            "private_key=-----BEGIN PRIVATE KEY-----{secret_body}-----END PRIVATE KEY-----"
+        );
+        fs::write(tempdir.path().join("private-key.txt"), line)
+            .expect("workspace file should be written");
+        let input = parse_workspace_search_input(br#"{"query":"END PRIVATE KEY"}"#)
+            .expect("search input should parse");
+
+        let output = search_workspace_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace search should complete");
+
+        assert_eq!(output.matches.len(), 1);
+        assert!(output.matches[0].redacted);
+        assert!(output.matches[0].line_text.contains("[REDACTED_SECRET]"));
+        assert!(!output.matches[0].line_text.contains("UNIQUEPRIVATEKEYBODY"));
+        assert!(
+            output.matches[0].line_text.len() <= WORKSPACE_SEARCH_MAX_LINE_TEXT_BYTES + 6,
+            "redacted excerpt should stay bounded"
+        );
+        assert!(output.matches[0]
+            .redaction_reasons
+            .iter()
+            .any(|reason| reason == "secret_leak.private_key"));
     }
 
     #[test]
