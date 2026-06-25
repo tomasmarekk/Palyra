@@ -134,7 +134,7 @@ struct ChromiumComputedStylePayload {
     value: String,
 }
 
-/// A captured download (blob anchor click or attachment response) with decoded bytes.
+/// A page-captured client-side download with decoded bytes.
 #[derive(Debug)]
 pub(crate) struct ChromiumClientDownload {
     pub(crate) source_url: String,
@@ -146,7 +146,6 @@ pub(crate) struct ChromiumClientDownload {
 struct DiscoveredChromiumTab {
     tab: Arc<HeadlessTab>,
     network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
-    download_capture: Arc<std::sync::Mutex<VecDeque<ChromiumClientDownload>>>,
     url: String,
     title: String,
 }
@@ -1735,8 +1734,8 @@ pub(crate) fn chromium_loopback_remote_ip_is_expected_proxy_hop(
 }
 
 /// Wires a fresh tab with policy and diagnostics: request interception that
-/// fails disallowed targets, network log capture, attachment download capture,
-/// page diagnostics hooks, and the remote-IP response guard.
+/// fails disallowed targets, network log capture, page diagnostics hooks, and
+/// the remote-IP response guard.
 ///
 /// # Errors
 /// Returns an error string when any CDP registration call fails.
@@ -1744,7 +1743,6 @@ pub(crate) fn configure_chromium_tab(
     tab: &Arc<HeadlessTab>,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
     network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
-    download_captures: Arc<std::sync::Mutex<VecDeque<ChromiumClientDownload>>>,
     timeout: Duration,
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<(), String> {
@@ -1782,71 +1780,6 @@ pub(crate) fn configure_chromium_tab(
         }),
     )
     .map_err(|error| format!("failed to register Chromium network log callback: {error}"))?;
-    let download_capture_buffer = Arc::clone(&download_captures);
-    tab.register_response_handling(
-        CHROMIUM_DOWNLOAD_CAPTURE_HANDLER_NAME,
-        Box::new(move |response, fetch_body| {
-            let Some(content_disposition) =
-                chromium_header_value(&response.response.headers, "content-disposition")
-            else {
-                return;
-            };
-            if !content_disposition_is_attachment(content_disposition.as_str()) {
-                return;
-            }
-            let file_name = content_disposition_attachment_file_name(content_disposition.as_str())
-                .unwrap_or_else(|| infer_download_file_name(response.response.url.as_str()));
-            let body = match fetch_body() {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        url = normalize_url_with_redaction(response.response.url.as_str()).as_str(),
-                        "failed to read Chromium attachment response body"
-                    );
-                    return;
-                }
-            };
-            let content = if body.base_64_encoded {
-                match base64::engine::general_purpose::STANDARD.decode(body.body.as_bytes()) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            url = normalize_url_with_redaction(response.response.url.as_str()).as_str(),
-                            "failed to decode Chromium attachment response body"
-                        );
-                        return;
-                    }
-                }
-            } else {
-                body.body.into_bytes()
-            };
-            if content.is_empty() || content.len() as u64 > DOWNLOAD_MAX_FILE_BYTES {
-                return;
-            }
-            let header_content_type = chromium_header_value(&response.response.headers, "content-type")
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| response.response.mime_type.clone());
-            let mime_type = sniff_download_mime_type(
-                Some(header_content_type.as_str()),
-                file_name.as_str(),
-                content.as_slice(),
-            );
-            if let Ok(mut guard) = download_capture_buffer.lock() {
-                guard.push_back(ChromiumClientDownload {
-                    source_url: response.response.url,
-                    file_name,
-                    mime_type,
-                    content,
-                });
-                while guard.len() > CHROMIUM_PENDING_DOWNLOAD_CAPTURE_MAX_ENTRIES {
-                    let _ = guard.pop_front();
-                }
-            }
-        }),
-    )
-    .map_err(|error| format!("failed to register Chromium download capture callback: {error}"))?;
     tab.call_method(Page::AddScriptToEvaluateOnNewDocument {
         source: CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.to_owned(),
         world_name: None,
@@ -1918,18 +1851,6 @@ fn chromium_network_log_headers(headers: &Network::Headers) -> Vec<NetworkLogHea
     output
 }
 
-fn chromium_header_value(headers: &Network::Headers, target_name: &str) -> Option<String> {
-    headers.0.as_ref().and_then(serde_json::Value::as_object).and_then(|object| {
-        object.iter().find_map(|(name, value)| {
-            if name.eq_ignore_ascii_case(target_name) {
-                value.as_str().map(str::to_owned).or_else(|| Some(value.to_string()))
-            } else {
-                None
-            }
-        })
-    })
-}
-
 /// Returns true for transient `new_tab` failures seen during Chromium startup races.
 pub(crate) fn chromium_new_tab_error_is_retryable(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
@@ -1952,7 +1873,6 @@ pub(crate) fn create_configured_chromium_tab_with_retry(
     browser: &Arc<HeadlessBrowser>,
     private_target_policy: Arc<ChromiumPrivateTargetPolicy>,
     network_log: Arc<std::sync::Mutex<VecDeque<NetworkLogEntryInternal>>>,
-    download_captures: Arc<std::sync::Mutex<VecDeque<ChromiumClientDownload>>>,
     timeout: Duration,
     security_incident: Arc<std::sync::Mutex<Option<String>>>,
     failure_prefix: &str,
@@ -1964,7 +1884,6 @@ pub(crate) fn create_configured_chromium_tab_with_retry(
                     &tab,
                     Arc::clone(&private_target_policy),
                     Arc::clone(&network_log),
-                    Arc::clone(&download_captures),
                     timeout,
                     security_incident,
                 )?;
@@ -2039,15 +1958,12 @@ pub(crate) async fn initialize_chromium_session_runtime(
                 })?);
             let mut tabs = HashMap::new();
             let mut network_logs = HashMap::new();
-            let mut download_captures = HashMap::new();
             for tab_id in tab_order.iter() {
                 let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-                let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
                 let tab = create_configured_chromium_tab_with_retry(
                     &browser,
                     Arc::clone(&private_target_policy),
                     Arc::clone(&network_log),
-                    Arc::clone(&download_capture),
                     navigation_timeout,
                     Arc::clone(&security_incident),
                     "failed to create Chromium tab for session restore",
@@ -2069,13 +1985,11 @@ pub(crate) async fn initialize_chromium_session_runtime(
                 }
                 tabs.insert(tab_id.clone(), tab);
                 network_logs.insert(tab_id.clone(), network_log);
-                download_captures.insert(tab_id.clone(), download_capture);
             }
             Ok(ChromiumSessionState {
                 browser,
                 tabs,
                 network_logs,
-                download_captures,
                 private_target_policy,
                 security_incident,
                 _profile_dir: profile_dir,
@@ -2185,29 +2099,25 @@ pub(crate) async fn chromium_open_tab_runtime(
             Arc::clone(&chromium_session.security_incident),
         )
     };
-    let (tab, network_log, download_capture) =
-        run_chromium_blocking("chromium open tab", move || {
-            let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let tab = create_configured_chromium_tab_with_retry(
-                &browser,
-                private_target_policy,
-                Arc::clone(&network_log),
-                Arc::clone(&download_capture),
-                Duration::from_millis(timeout_ms),
-                security_incident,
-                "failed to allocate Chromium tab",
-            )?;
-            Ok((tab, network_log, download_capture))
-        })
-        .await?;
+    let (tab, network_log) = run_chromium_blocking("chromium open tab", move || {
+        let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let tab = create_configured_chromium_tab_with_retry(
+            &browser,
+            private_target_policy,
+            Arc::clone(&network_log),
+            Duration::from_millis(timeout_ms),
+            security_incident,
+            "failed to allocate Chromium tab",
+        )?;
+        Ok((tab, network_log))
+    })
+    .await?;
     let mut chromium_sessions = runtime.chromium_sessions.lock().await;
     let Some(chromium_session) = chromium_sessions.get_mut(session_id) else {
         return Err("chromium_session_not_found".to_owned());
     };
     chromium_session.tabs.insert(tab_id.to_owned(), tab);
     chromium_session.network_logs.insert(tab_id.to_owned(), network_log);
-    chromium_session.download_captures.insert(tab_id.to_owned(), download_capture);
     Ok(())
 }
 
@@ -2278,23 +2188,15 @@ pub(crate) async fn chromium_sync_session_tabs(
                 }
             }
             let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-            let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             configure_chromium_tab(
                 &tab,
                 Arc::clone(&private_target_policy),
                 Arc::clone(&network_log),
-                Arc::clone(&download_capture),
                 timeout,
                 Arc::clone(&security_incident),
             )?;
             let title = tab.get_title().unwrap_or_default();
-            discovered.push(DiscoveredChromiumTab {
-                tab,
-                network_log,
-                download_capture,
-                url,
-                title,
-            });
+            discovered.push(DiscoveredChromiumTab { tab, network_log, url, title });
         }
         Ok(discovered)
     })
@@ -2326,9 +2228,6 @@ pub(crate) async fn chromium_sync_session_tabs(
             session.active_tab_id = tab_id.clone();
             chromium_session.tabs.insert(tab_id.clone(), discovered_tab.tab);
             chromium_session.network_logs.insert(tab_id.clone(), discovered_tab.network_log);
-            chromium_session
-                .download_captures
-                .insert(tab_id.clone(), discovered_tab.download_capture);
             new_tab_ids.push(tab_id);
         }
     }
@@ -2363,7 +2262,6 @@ pub(crate) async fn chromium_close_tab_runtime(
             return Err("chromium_session_not_found".to_owned());
         };
         chromium_session.network_logs.remove(tab_id);
-        chromium_session.download_captures.remove(tab_id);
         chromium_session.tabs.remove(tab_id)
     };
     if let Some(tab) = tab {
@@ -2507,28 +2405,6 @@ pub(crate) async fn chromium_clear_network_diagnostics(
     }
 
     Ok(())
-}
-
-async fn chromium_drain_response_downloads(
-    runtime: &BrowserRuntimeState,
-    session_id: &str,
-    tab_id: &str,
-) -> Result<Vec<ChromiumClientDownload>, String> {
-    let download_capture = {
-        let chromium_sessions = runtime.chromium_sessions.lock().await;
-        let Some(chromium_session) = chromium_sessions.get(session_id) else {
-            return Err("chromium_session_not_found".to_owned());
-        };
-        chromium_session
-            .download_captures
-            .get(tab_id)
-            .cloned()
-            .ok_or_else(|| "chromium_download_capture_not_found".to_owned())?
-    };
-    let mut guard = download_capture
-        .lock()
-        .map_err(|_| "chromium download capture lock poisoned".to_owned())?;
-    Ok(guard.drain(..).collect())
 }
 
 /// Looks up a live tab together with the session's private-target policy.
@@ -3249,8 +3125,7 @@ async fn chromium_drain_page_network_log(
     Ok(parse_chromium_page_network_entries(value))
 }
 
-/// Drains all captured downloads for a tab: page-captured blob downloads
-/// merged with attachment responses captured via CDP interception.
+/// Drains page-captured client-side downloads for a tab.
 ///
 /// # Errors
 /// Returns lookup sentinels, remote-IP guard incidents, or script evaluation
@@ -3272,9 +3147,7 @@ pub(crate) async fn chromium_drain_client_downloads(
     })
     .await?;
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
-    let mut downloads = parse_chromium_client_download_entries(value);
-    downloads.extend(chromium_drain_response_downloads(runtime, session_id, tab_id).await?);
-    Ok(downloads)
+    Ok(parse_chromium_client_download_entries(value))
 }
 
 fn decode_chromium_console_entries_value(value: serde_json::Value) -> serde_json::Value {

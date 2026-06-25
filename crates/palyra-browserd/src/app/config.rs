@@ -145,9 +145,7 @@ pub(crate) const MAX_STORAGE_ENTRIES_PER_ORIGIN: usize = 32;
 pub(crate) const MAX_STORAGE_ENTRY_VALUE_BYTES: usize = 4 * 1024;
 pub(crate) const CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME: &str = "palyra.security.remote_ip_guard";
 pub(crate) const CHROMIUM_NETWORK_LOG_HANDLER_NAME: &str = "palyra.network_log";
-pub(crate) const CHROMIUM_DOWNLOAD_CAPTURE_HANDLER_NAME: &str = "palyra.download_capture";
 pub(crate) const CHROMIUM_PENDING_NETWORK_LOG_MAX_ENTRIES: usize = 512;
-pub(crate) const CHROMIUM_PENDING_DOWNLOAD_CAPTURE_MAX_ENTRIES: usize = 32;
 pub(crate) const DNS_VALIDATION_CACHE_MAX_ENTRIES: usize = 512;
 /// How long a cached NXDOMAIN answer suppresses repeat lookups for a host.
 pub(crate) const DNS_VALIDATION_NEGATIVE_TTL: Duration = Duration::from_secs(10);
