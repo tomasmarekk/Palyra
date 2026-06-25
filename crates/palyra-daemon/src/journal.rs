@@ -5816,6 +5816,7 @@ fn tool_result_artifact_scope_mismatch(
         return Ok(true);
     };
     Ok(artifact_session.principal != request.principal
+        || artifact_session.device_id != request.device_id
         || artifact_session.channel.as_deref() != request.channel.as_deref())
 }
 
@@ -22827,7 +22828,7 @@ mod tests {
                 content: br#"{"topic":"billing","value":"invoice-ready"}"#.to_vec(),
             })
             .expect("prior artifact should be stored");
-        let portable_preview = store
+        let cross_device_preview = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
                 artifact_id: prior_artifact.artifact_id.clone(),
                 session_id: session_id.to_owned(),
@@ -22840,7 +22841,49 @@ mod tests {
                 max_bytes: 128,
                 text_preview: true,
             })
-            .expect("same-owner prior-session artifact preview should be readable by digest");
+            .expect_err("prior-session artifact preview should not cross device boundaries");
+        assert!(matches!(
+            cross_device_preview,
+            JournalError::ToolResultArtifactScopeMismatch { .. }
+        ));
+
+        let prior_reader_session_id = "01ARZ3NDEKTSV4RRFFQ69G5P34";
+        let prior_reader_run_id = "01ARZ3NDEKTSV4RRFFQ69G5P35";
+        store
+            .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+                session_id: prior_reader_session_id.to_owned(),
+                session_key: "session:artifact-prior-reader".to_owned(),
+                session_label: Some("Prior artifact reader".to_owned()),
+                principal: "user:ops".to_owned(),
+                device_id: "device:prior".to_owned(),
+                channel: Some("cli".to_owned()),
+            })
+            .expect("same-device reader session should be created");
+        store
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: prior_reader_run_id.to_owned(),
+                session_id: prior_reader_session_id.to_owned(),
+                origin_kind: "run_stream".to_owned(),
+                origin_run_id: None,
+                triggered_by_principal: Some("user:ops".to_owned()),
+                parameter_delta_json: None,
+            })
+            .expect("same-device reader run should start");
+
+        let portable_preview = store
+            .read_tool_result_artifact(&ToolResultArtifactReadRequest {
+                artifact_id: prior_artifact.artifact_id.clone(),
+                session_id: prior_reader_session_id.to_owned(),
+                run_id: prior_reader_run_id.to_owned(),
+                principal: "user:ops".to_owned(),
+                device_id: "device:prior".to_owned(),
+                channel: Some("cli".to_owned()),
+                expected_digest_sha256: Some(prior_artifact.digest_sha256.clone()),
+                offset_bytes: 0,
+                max_bytes: 128,
+                text_preview: true,
+            })
+            .expect("same-device prior-session artifact preview should be readable by digest");
         assert!(
             portable_preview.text.as_deref().is_some_and(|text| text.contains("invoice-ready")),
             "portable artifact preview should include bounded evidence text"
@@ -22848,10 +22891,10 @@ mod tests {
         let portable_without_digest = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
                 artifact_id: prior_artifact.artifact_id,
-                session_id: session_id.to_owned(),
-                run_id: run_id.to_owned(),
+                session_id: prior_reader_session_id.to_owned(),
+                run_id: prior_reader_run_id.to_owned(),
                 principal: "user:ops".to_owned(),
-                device_id: "device:local".to_owned(),
+                device_id: "device:prior".to_owned(),
                 channel: Some("cli".to_owned()),
                 expected_digest_sha256: None,
                 offset_bytes: 0,
