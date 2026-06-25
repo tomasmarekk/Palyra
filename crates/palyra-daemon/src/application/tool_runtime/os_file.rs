@@ -1051,6 +1051,7 @@ fn resolve_workspace_relative_target_path(
         let resolved_path = fs::canonicalize(requested_path.as_path()).map_err(|error| {
             format!("{OS_FILE_TOOL_NAME} failed to resolve existing workspace target: {error}")
         })?;
+        ensure_workspace_relative_target_in_workspace(root, resolved_path.as_path())?;
         return Ok(ResolvedOsPath { requested_path, resolved_path, existed: true });
     }
     let (existing_ancestor, missing_suffix) = nearest_existing_ancestor(requested_path.as_path())?;
@@ -1058,7 +1059,20 @@ fn resolve_workspace_relative_target_path(
         format!("{OS_FILE_TOOL_NAME} failed to resolve workspace target ancestor: {error}")
     })?;
     let resolved_path = canonical_ancestor.join(missing_suffix);
+    ensure_workspace_relative_target_in_workspace(root, resolved_path.as_path())?;
     Ok(ResolvedOsPath { requested_path, resolved_path, existed: false })
+}
+
+fn ensure_workspace_relative_target_in_workspace(
+    root: &Path,
+    resolved_path: &Path,
+) -> Result<(), String> {
+    if path_starts_with(resolved_path, root) {
+        return Ok(());
+    }
+    Err(format!(
+        "{OS_FILE_TOOL_NAME} workspace-relative target_path must stay inside the active workspace"
+    ))
 }
 
 fn is_workspace_relative_target(target_path: &str) -> bool {
@@ -1504,6 +1518,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
     fn test_policy(root: &Path) -> OsFilePolicy {
         OsFilePolicy {
             path_access_mode: PathAccessMode::ApprovedRoots,
@@ -1765,6 +1789,63 @@ mod tests {
             Some("data/imported/orders-valid.csv")
         );
         assert_eq!(moved.get("target_existed_before").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn os_file_copy_rejects_workspace_relative_symlink_target_escape() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let os_root = tempdir.path().join("os-root");
+        let inbox = os_root.join("downloads").join("inbox");
+        let autostart = os_root.join(".config").join("autostart");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::create_dir_all(inbox.as_path()).expect("inbox should exist");
+        fs::create_dir_all(autostart.as_path()).expect("autostart should exist");
+        let source = inbox.join("payload.desktop");
+        fs::write(source.as_path(), "[Desktop Entry]\nName=Palyra\n").expect("source should exist");
+        let link = workspace.join("data");
+        if let Err(error) = create_directory_symlink(autostart.as_path(), link.as_path()) {
+            eprintln!(
+                "skipping os_file workspace-relative symlink regression because symlink creation failed: {error}"
+            );
+            return;
+        }
+        let policy = OsFilePolicy {
+            path_access_mode: PathAccessMode::ApprovedRoots,
+            workspace_roots: vec![fs::canonicalize(workspace.as_path()).expect("workspace root")],
+            user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
+            path_env: BTreeMap::new(),
+        };
+
+        let error = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Copy,
+                path: source.to_string_lossy().into_owned(),
+                target_path: Some("data/payload.desktop".to_owned()),
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: Some(true),
+                overwrite: Some(false),
+                full_replace: None,
+                dry_run: Some(false),
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect_err(
+            "workspace-relative target must not resolve through a symlink outside workspace",
+        );
+
+        assert!(error.contains("workspace-relative target_path must stay inside"));
+        assert!(
+            !autostart.join("payload.desktop").exists(),
+            "denied workspace-relative target must not write through the symlink"
+        );
     }
 
     #[test]
