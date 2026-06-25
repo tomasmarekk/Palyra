@@ -37,7 +37,7 @@ use tonic::{Request, Status};
 use ulid::Ulid;
 
 use crate::{
-    agents::AgentResolveRequest,
+    agents::{AgentResolutionSource, AgentResolveRequest},
     application::tool_runtime::workspace_scope::{
         relative_path_already_targets_active_root, relative_path_should_use_active_root,
         run_launch_context_path_env, session_active_workspace_root,
@@ -369,9 +369,12 @@ async fn validate_browser_file_url_workspace_scope(
         return Err("palyra.browser.navigate file URL target is not a regular file".to_owned());
     }
 
-    let canonical_roots =
-        resolve_browser_agent_workspace_roots(runtime_state, context, BROWSER_NAVIGATE_TOOL_NAME)
-            .await?;
+    let canonical_roots = resolve_browser_configured_agent_workspace_roots(
+        runtime_state,
+        context,
+        BROWSER_NAVIGATE_TOOL_NAME,
+    )
+    .await?;
     if canonical_file_path_is_inside_workspace_roots(canonical_target.as_path(), &canonical_roots) {
         return Ok(());
     }
@@ -398,21 +401,22 @@ fn browser_file_url_to_path(parsed: &Url) -> Result<PathBuf, String> {
 /// # Errors
 /// Returns a tool-facing message when a root cannot be canonicalized, is not
 /// a directory, or the agent has no roots at all.
-fn canonicalize_browser_workspace_roots(roots: &[String]) -> Result<Vec<PathBuf>, String> {
+fn canonicalize_browser_workspace_roots(
+    tool_name: &str,
+    roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
     let mut canonical_roots = Vec::with_capacity(roots.len());
     for (index, root) in roots.iter().enumerate() {
-        let canonical = fs::canonicalize(Path::new(root)).map_err(|error| {
-            format!("palyra.browser.navigate failed to resolve workspace root {index}: {error}")
+        let canonical = fs::canonicalize(root).map_err(|error| {
+            format!("{tool_name} failed to resolve workspace root {index}: {error}")
         })?;
         if !canonical.is_dir() {
-            return Err(format!(
-                "palyra.browser.navigate workspace root {index} is not a directory"
-            ));
+            return Err(format!("{tool_name} workspace root {index} is not a directory"));
         }
         canonical_roots.push(canonical);
     }
     if canonical_roots.is_empty() {
-        return Err("palyra.browser.navigate agent has no accessible workspace roots".to_owned());
+        return Err(format!("{tool_name} agent has no accessible workspace roots"));
     }
     Ok(canonical_roots)
 }
@@ -424,18 +428,48 @@ fn canonical_file_path_is_inside_workspace_roots(
     canonical_roots.iter().any(|root| canonical_target.starts_with(root))
 }
 
-/// Resolves the agent for this execution context and returns its
-/// canonicalized workspace roots, augmented with run-launch-context roots
-/// (e.g. the CLI launch cwd) when the agent resolution source allows them.
+/// Resolves the agent for this execution context and returns only its
+/// configured workspace roots. Use this for browser read/navigation
+/// authorization; launch-context roots are intentionally excluded.
 ///
 /// # Errors
 /// Returns a tool-facing message when agent resolution fails or the roots do
 /// not canonicalize to existing directories.
-async fn resolve_browser_agent_workspace_roots(
+async fn resolve_browser_configured_agent_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     tool_name: &str,
 ) -> Result<Vec<PathBuf>, String> {
+    let (workspace_roots, _) =
+        browser_agent_workspace_root_inputs(runtime_state, context, tool_name).await?;
+    canonicalize_browser_workspace_roots(tool_name, workspace_roots.as_slice())
+}
+
+/// Resolves workspace roots for browser artifact output. Launch-context roots
+/// stay in this path so outputs land next to the operator's active project
+/// when explicitly requested, without widening browser read/navigation scope.
+async fn resolve_browser_output_workspace_roots(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    tool_name: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let (workspace_roots, source) =
+        browser_agent_workspace_root_inputs(runtime_state, context, tool_name).await?;
+    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        workspace_roots.as_slice(),
+        source,
+    )
+    .await;
+    canonicalize_browser_workspace_roots(tool_name, workspace_roots.as_slice())
+}
+
+async fn browser_agent_workspace_root_inputs(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    tool_name: &str,
+) -> Result<(Vec<PathBuf>, AgentResolutionSource), String> {
     let agent_outcome = runtime_state
         .resolve_agent_for_context(AgentResolveRequest {
             principal: context.principal.to_owned(),
@@ -450,16 +484,7 @@ async fn resolve_browser_agent_workspace_roots(
         })?;
     let workspace_roots =
         agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
-        runtime_state,
-        context.run_id,
-        &workspace_roots,
-        agent_outcome.source,
-    )
-    .await;
-    let workspace_roots =
-        workspace_roots.iter().map(|root| root.to_string_lossy().to_string()).collect::<Vec<_>>();
-    canonicalize_browser_workspace_roots(workspace_roots.as_slice())
+    Ok((workspace_roots, agent_outcome.source))
 }
 
 /// Extracts the `file_path` field for `upload`, rejecting empty values and
@@ -499,9 +524,12 @@ async fn read_browser_upload_file(
     context: ToolRuntimeExecutionContext<'_>,
     file_path: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    let workspace_roots =
-        resolve_browser_agent_workspace_roots(runtime_state, context, BROWSER_UPLOAD_TOOL_NAME)
-            .await?;
+    let workspace_roots = resolve_browser_configured_agent_workspace_roots(
+        runtime_state,
+        context,
+        BROWSER_UPLOAD_TOOL_NAME,
+    )
+    .await?;
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
     let user_owned_roots = browser_user_owned_os_roots();
     let canonical = resolve_browser_upload_path(
@@ -665,7 +693,7 @@ async fn save_browser_output_file_from_payload(
     let Some(output_path) = browser_output_path_from_payload(payload, tool_name)? else {
         return Ok(None);
     };
-    let workspace_roots = resolve_browser_agent_workspace_roots(runtime_state, context, tool_name)
+    let workspace_roots = resolve_browser_output_workspace_roots(runtime_state, context, tool_name)
         .await
         .map_err(|error| format!("{tool_name} failed to resolve output workspace: {error}"))?;
     let active_workspace_root = session_active_workspace_root(
@@ -5702,6 +5730,29 @@ mod tests {
     }
 
     #[test]
+    fn browser_upload_path_rejects_absolute_path_inside_unapproved_launch_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let agent_workspace = temp.path().join("agent-workspace");
+        let launch_workspace = temp.path().join("launch-workspace");
+        std::fs::create_dir_all(agent_workspace.as_path()).expect("workspace should exist");
+        std::fs::create_dir_all(launch_workspace.as_path()).expect("launch workspace should exist");
+        let upload = launch_workspace.join("secret-upload.csv");
+        std::fs::write(upload.as_path(), "secret").expect("upload should exist");
+        let canonical_agent =
+            agent_workspace.canonicalize().expect("workspace should canonicalize");
+
+        let error = resolve_browser_upload_path(
+            upload.to_string_lossy().as_ref(),
+            std::slice::from_ref(&canonical_agent),
+            &BTreeMap::new(),
+            &[],
+        )
+        .expect_err("launch cwd must not implicitly authorize browser upload reads");
+
+        assert!(error.contains("outside agent workspace roots"), "{error}");
+    }
+
+    #[test]
     fn browser_output_path_resolves_relative_artifact_inside_workspace() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let workspace = temp.path().join("workspace");
@@ -6132,5 +6183,40 @@ mod tests {
             sibling_target.as_path(),
             &[canonical_workspace]
         ));
+    }
+
+    #[test]
+    fn browser_file_url_scope_does_not_treat_launch_workspace_as_agent_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let agent_workspace = temp.path().join("agent-workspace");
+        let launch_workspace = temp.path().join("launch-workspace");
+        std::fs::create_dir_all(agent_workspace.as_path()).expect("workspace should be created");
+        std::fs::create_dir_all(launch_workspace.as_path())
+            .expect("launch workspace should be created");
+        let launch_file = launch_workspace.join("secret.html");
+        std::fs::write(launch_file.as_path(), "secret").expect("launch file should be written");
+
+        let launch_url =
+            reqwest::Url::from_file_path(launch_file.as_path()).expect("launch file URL");
+        let launch_target = browser_file_url_to_path(&launch_url)
+            .expect("launch file URL should resolve to path")
+            .canonicalize()
+            .expect("launch file should canonicalize");
+        let canonical_agent =
+            agent_workspace.canonicalize().expect("workspace should canonicalize");
+        let canonical_launch =
+            launch_workspace.canonicalize().expect("launch workspace should canonicalize");
+
+        assert!(!canonical_file_path_is_inside_workspace_roots(
+            launch_target.as_path(),
+            std::slice::from_ref(&canonical_agent)
+        ));
+        assert!(
+            canonical_file_path_is_inside_workspace_roots(
+                launch_target.as_path(),
+                &[canonical_launch, canonical_agent]
+            ),
+            "adding launch roots would widen browser file:// read scope"
+        );
     }
 }
