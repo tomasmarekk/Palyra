@@ -1720,9 +1720,10 @@ fn should_project_tool_result_for_model(
     }
 }
 
-// Small OS-file list_dir and text-only read results bypass artifact
+// Small OS-file list_dir and redacted text-only read results bypass artifact
 // projection: cleanup and config-audit workflows need the full payload
-// model-visible, and the read tool has already redacted any secrets.
+// model-visible, but read text can stay inline only after the runtime marks it
+// non-authoritative redacted placeholder text.
 fn os_file_result_can_stay_inline(
     tool_name: &str,
     output_json: &[u8],
@@ -1746,6 +1747,8 @@ fn os_file_result_can_stay_inline(
 fn os_file_read_result_has_model_visible_text(value: &Value) -> bool {
     value.get("text").is_some_and(Value::is_string)
         && value.get("bytes_base64").is_none_or(Value::is_null)
+        && value.get("redacted").is_some_and(|value| value.as_bool() == Some(true))
+        && value.get("text_authoritative").is_some_and(|value| value.as_bool() == Some(false))
 }
 
 fn tool_result_sensitivity(
@@ -2497,5 +2500,54 @@ mod tests {
             ),
             "small redacted OS read text must stay model-visible for config audits"
         );
+    }
+
+    #[test]
+    fn os_file_read_text_results_require_redaction_metadata_to_stay_inline() {
+        let base_payload = json!({
+            "operation": "read",
+            "path": "/home/example/.config/palyra-e2e/session.txt",
+            "resolved_path": "/home/example/.config/palyra-e2e/session.txt",
+            "text": "oauth_callback=https://idp.example/callback?ticket=CORPLOGIN-9f2c7a84&nonce=N-44129\n",
+            "bytes_base64": null,
+            "size_bytes": 91,
+        });
+        let mut unredacted_authoritative = base_payload.clone();
+        unredacted_authoritative["redacted"] = json!(false);
+        unredacted_authoritative["text_authoritative"] = json!(true);
+        let mut missing_redacted = base_payload.clone();
+        missing_redacted["text_authoritative"] = json!(false);
+        let mut missing_text_authority = base_payload;
+        missing_text_authority["redacted"] = json!(true);
+        let cases = [
+            ("unredacted authoritative text", unredacted_authoritative),
+            ("missing redacted marker", missing_redacted),
+            ("missing text authority marker", missing_text_authority),
+        ];
+
+        for (case, payload) in cases {
+            let outcome = ToolExecutionOutcome {
+                success: true,
+                output_json: serde_json::to_vec(&payload).expect("test payload should serialize"),
+                error: String::new(),
+                attestation: ToolAttestation {
+                    attestation_id: "01ARZ3NDEKTSV4RRFFQ69G5FAD".to_owned(),
+                    execution_sha256: "0".repeat(64),
+                    executed_at_unix_ms: 0,
+                    timed_out: false,
+                    executor: "test".to_owned(),
+                    sandbox_enforcement: "n/a".to_owned(),
+                },
+            };
+
+            assert!(
+                super::should_project_tool_result_for_model(
+                    crate::gateway::OS_FILE_TOOL_NAME,
+                    &outcome,
+                    &ToolTurnBudget::default()
+                ),
+                "{case} must use RedactedPreviewAndArtifact projection"
+            );
+        }
     }
 }
