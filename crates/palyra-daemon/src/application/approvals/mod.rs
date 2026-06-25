@@ -6,7 +6,7 @@
 //! Workspace patches and process-runner commands get extra risk context so
 //! operators see what they are approving.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use palyra_common::process_runner_input::parse_process_runner_tool_input;
 use serde_json::{json, Map, Value};
@@ -26,6 +26,7 @@ use crate::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
         ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType, JournalAppendRequest,
     },
+    sandbox_runner::background_process_lifetime_approval_metadata,
     tool_protocol::{tool_policy_snapshot, ToolCallConfig, ToolDecision},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -147,11 +148,10 @@ pub(crate) fn build_pending_tool_approval(
     execution_context: Option<&ApprovalExecutionContext>,
 ) -> PendingToolApproval {
     let subject_id = build_tool_approval_subject_id(tool_name, skill_context, input_json);
-    let request_summary =
-        build_tool_request_summary(tool_name, skill_context, input_json, execution_context);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
-    let mut details = serde_json::from_slice::<Value>(input_json)
-        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    let mut details = approval_input_details(tool_name, input_json, config);
+    let request_summary =
+        build_tool_request_summary(tool_name, skill_context, &details, execution_context);
     if let Some(execution_context) = execution_context {
         details["execution_backend"] = json!({
             "requested": execution_context.requested_backend,
@@ -206,6 +206,47 @@ pub(crate) fn build_pending_tool_approval(
         policy_snapshot,
         prompt,
     }
+}
+
+fn approval_input_details(tool_name: &str, input_json: &[u8], config: &ToolCallConfig) -> Value {
+    let mut details = serde_json::from_slice::<Value>(input_json)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
+    if tool_name == PROCESS_RUNNER_TOOL_NAME {
+        add_process_runner_background_lifetime_context(&mut details, input_json, config);
+    }
+    details
+}
+
+fn add_process_runner_background_lifetime_context(
+    details: &mut Value,
+    input_json: &[u8],
+    config: &ToolCallConfig,
+) {
+    let Ok(input) = parse_process_runner_tool_input(input_json) else {
+        return;
+    };
+    if !input.background {
+        return;
+    }
+    let lifetime = background_process_lifetime_approval_metadata(
+        input.timeout_ms,
+        Duration::from_millis(config.execution_timeout_ms),
+    );
+    let Value::Object(details) = details else {
+        return;
+    };
+    details.insert(
+        "background_lifetime".to_owned(),
+        json!({
+            "requested_lifetime_ms": lifetime.requested_lifetime_ms,
+            "effective_lifetime_ms": lifetime.effective_lifetime_ms,
+            "max_lifetime_ms": lifetime.max_lifetime_ms,
+            "min_background_lifetime_ms": lifetime.min_background_lifetime_ms,
+            "adjusted": lifetime.adjusted,
+            "adjustment_reason": lifetime.adjustment_reason,
+            "approval_applies_to": "effective_lifetime_ms",
+        }),
+    );
 }
 
 /// Builds the approval cache subject for a tool call.
@@ -371,17 +412,15 @@ fn default_approval_prompt_options() -> Vec<ApprovalPromptOption> {
 fn build_tool_request_summary(
     tool_name: &str,
     skill_context: Option<&ToolSkillContext>,
-    input_json: &[u8],
+    input_details: &Value,
     execution_context: Option<&ApprovalExecutionContext>,
 ) -> String {
-    let normalized_input = serde_json::from_slice::<Value>(input_json)
-        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(input_json).to_string() }));
     let summary = truncate_with_ellipsis(
         json!({
             "tool_name": tool_name,
             "skill_id": skill_context.map(ToolSkillContext::skill_id),
             "skill_version": skill_context.and_then(ToolSkillContext::version),
-            "input_json": normalized_input,
+            "input_json": input_details,
         })
         .to_string(),
         APPROVAL_REQUEST_SUMMARY_MAX_BYTES,
@@ -908,6 +947,45 @@ mod tests {
         assert_eq!(detached, "tool:palyra.process.run|process_lifetime:detached");
         assert_eq!(compatibility_alias, detached);
         assert_eq!(until_verifier, "tool:palyra.process.run|process_lifetime:until_verifier");
+    }
+
+    #[test]
+    fn process_runner_background_approval_exposes_effective_lifetime() {
+        let mut config = test_tool_call_config("palyra.process.run");
+        config.execution_timeout_ms = 180_000;
+        let pending = build_pending_tool_approval(
+            "palyra.process.run",
+            None,
+            br#"{"command":"cargo","args":["test"],"background":true,"timeout_ms":1}"#,
+            &config,
+            None,
+        );
+
+        assert!(pending.request_summary.contains("background_lifetime"));
+        assert!(pending.request_summary.contains("effective_lifetime_ms"));
+        assert!(pending.request_summary.contains("120000"));
+
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        let lifetime = details_json
+            .pointer("/input_json/background_lifetime")
+            .expect("background lifetime context should be embedded");
+        assert_eq!(lifetime.get("requested_lifetime_ms").and_then(Value::as_u64), Some(1));
+        assert_eq!(lifetime.get("effective_lifetime_ms").and_then(Value::as_u64), Some(120_000));
+        assert_eq!(lifetime.get("max_lifetime_ms").and_then(Value::as_u64), Some(180_000));
+        assert_eq!(
+            lifetime.get("min_background_lifetime_ms").and_then(Value::as_u64),
+            Some(120_000)
+        );
+        assert_eq!(lifetime.get("adjusted").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            lifetime.get("adjustment_reason").and_then(Value::as_str),
+            Some("raised_to_minimum_background_lifetime")
+        );
+        assert_eq!(
+            lifetime.get("approval_applies_to").and_then(Value::as_str),
+            Some("effective_lifetime_ms")
+        );
     }
 
     #[test]

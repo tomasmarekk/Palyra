@@ -6067,6 +6067,34 @@ fn background_process_lifetime(timeout_ms: Option<u64>, execution_timeout: Durat
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackgroundProcessLifetimeApprovalMetadata {
+    pub(crate) requested_lifetime_ms: Option<u64>,
+    pub(crate) effective_lifetime_ms: u64,
+    pub(crate) max_lifetime_ms: u64,
+    pub(crate) min_background_lifetime_ms: u64,
+    pub(crate) adjusted: bool,
+    pub(crate) adjustment_reason: Option<&'static str>,
+}
+
+pub(crate) fn background_process_lifetime_approval_metadata(
+    timeout_ms: Option<u64>,
+    execution_timeout: Duration,
+) -> BackgroundProcessLifetimeApprovalMetadata {
+    let effective_lifetime_ms =
+        background_process_lifetime(timeout_ms, execution_timeout).as_millis() as u64;
+    let adjustment_reason =
+        background_lifetime_adjustment_reason(timeout_ms, effective_lifetime_ms);
+    BackgroundProcessLifetimeApprovalMetadata {
+        requested_lifetime_ms: timeout_ms,
+        effective_lifetime_ms,
+        max_lifetime_ms: background_process_lifetime_limit(execution_timeout).as_millis() as u64,
+        min_background_lifetime_ms: MIN_BACKGROUND_PROCESS_LIFETIME_MS,
+        adjusted: adjustment_reason.is_some(),
+        adjustment_reason,
+    }
+}
+
 fn foreground_process_timeout(timeout_ms: Option<u64>, execution_timeout: Duration) -> Duration {
     let default_timeout = Duration::from_millis(DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS);
     timeout_ms.map(Duration::from_millis).unwrap_or(default_timeout).min(execution_timeout)
