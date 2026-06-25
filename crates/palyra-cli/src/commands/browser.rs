@@ -24,7 +24,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tonic::{metadata::MetadataMap, transport::Endpoint, Code, Request};
+use tonic::{metadata::MetadataMap, transport::Endpoint, Code, Request, Status};
 
 use crate::args::{
     BrowserPermissionsCommand, BrowserProfilesCommand, BrowserSessionCommand, BrowserTabsCommand,
@@ -997,9 +997,9 @@ async fn run_browser_start(
     }
     lifecycle_warnings.extend(browser_start_auth_token_warnings(&resolved));
     if fetch_browser_health(resolved.connection.health_base_url.as_str()).await.is_ok() {
-        if let Err(error) = probe_browser_grpc(&resolved.connection).await {
+        if let Err(error) = probe_browser_start_grpc_reachability(&resolved.connection).await {
             anyhow::bail!(
-                "browser health endpoint is reachable at {}, but authenticated gRPC readiness failed at {}: {}. This usually means another browserd is running with a different token; stop that process or restart the desktop supervisor, then rerun `palyra browser start --setup`.",
+                "browser health endpoint is reachable at {}, but gRPC readiness failed at {} without sending the browser auth token: {}. This usually means another browserd is starting, another process is bound to the gRPC port, or the configured endpoint is stale; stop that process or restart the desktop supervisor, then rerun `palyra browser start --setup`.",
                 resolved.connection.health_base_url,
                 resolved.connection.grpc_url,
                 error
@@ -1014,7 +1014,7 @@ async fn run_browser_start(
             health_base_url: resolved.connection.health_base_url,
             stdout_log_path: metadata.as_ref().map(|value| value.stdout_log_path.clone()),
             stderr_log_path: metadata.as_ref().map(|value| value.stderr_log_path.clone()),
-            detail: "browser service is already healthy".to_owned(),
+            detail: "browser service health and gRPC endpoints are already reachable".to_owned(),
             warnings: lifecycle_warnings,
         };
         let value =
@@ -1111,7 +1111,7 @@ async fn run_browser_start(
     let mut last_grpc_error: Option<String> = None;
     loop {
         match fetch_browser_health(resolved.connection.health_base_url.as_str()).await {
-            Ok(_) => match probe_browser_grpc(&resolved.connection).await {
+            Ok(_) => match probe_browser_start_grpc_reachability(&resolved.connection).await {
                 Ok(()) => {
                     let payload = BrowserLifecyclePayload {
                         action: "start".to_owned(),
@@ -1121,7 +1121,7 @@ async fn run_browser_start(
                         health_base_url: resolved.connection.health_base_url,
                         stdout_log_path: Some(metadata.stdout_log_path),
                         stderr_log_path: Some(metadata.stderr_log_path),
-                        detail: "browser service started and passed authenticated readiness checks"
+                        detail: "browser service started and passed non-secret readiness checks"
                             .to_owned(),
                         warnings: lifecycle_warnings,
                     };
@@ -1164,7 +1164,7 @@ fn browser_start_readiness_timeout_detail(
 ) -> String {
     match (last_health_error, last_grpc_error) {
         (_, Some(grpc_error)) => {
-            format!("authenticated gRPC readiness failed: {grpc_error}")
+            format!("gRPC readiness failed: {grpc_error}")
         }
         (Some(health_error), None) => format!("health check failed: {health_error}"),
         (None, None) => "no readiness response was observed".to_owned(),
@@ -3207,6 +3207,39 @@ async fn probe_browser_grpc(connection: &BrowserServiceConnection) -> Result<()>
     Ok(())
 }
 
+fn browser_start_grpc_readiness_request() -> Result<Request<browser_v1::ListSessionsRequest>> {
+    browser_request(
+        browser_v1::ListSessionsRequest {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            principal: String::new(),
+            limit: 1,
+        },
+        // `browser start` may be talking to a pre-existing endpoint; never spend
+        // the reusable browserd bearer token on this readiness path.
+        None,
+        BROWSER_PROBE_PRINCIPAL,
+    )
+}
+
+fn browser_start_grpc_readiness_result<T>(
+    response: Result<tonic::Response<T>, Status>,
+) -> Result<()> {
+    match response {
+        Ok(_) => Ok(()),
+        // Auth-enabled browserd proves gRPC readiness by rejecting the tokenless probe.
+        Err(status) if status.code() == Code::Unauthenticated => Ok(()),
+        Err(status) => Err(anyhow!("failed to call browser ListSessions without auth: {status}")),
+    }
+}
+
+async fn probe_browser_start_grpc_reachability(
+    connection: &BrowserServiceConnection,
+) -> Result<()> {
+    let mut client = connect_browser_service(connection).await?;
+    let response = client.list_sessions(browser_start_grpc_readiness_request()?).await;
+    browser_start_grpc_readiness_result(response)
+}
+
 async fn probe_browser_profile_readiness(connection: &BrowserServiceConnection) -> Result<bool> {
     let mut client = connect_browser_service(connection).await?;
     let response = client
@@ -4981,6 +5014,7 @@ mod tests {
         browser_service_stop_complete, browser_service_stop_pending_reasons,
         browser_session_handle_text, browser_setup_gateway_reload_warning,
         browser_snapshot_emits_json_to_stdout, browser_start_auth_token_warnings,
+        browser_start_grpc_readiness_request, browser_start_grpc_readiness_result,
         browser_start_readiness_timeout_detail, browser_status_control_plane_policy_snapshot,
         browser_status_warnings, effective_browser_lifecycle_running,
         ensure_browser_command_success, ensure_browser_gateway_auth_token_alignment,
@@ -4995,6 +5029,7 @@ mod tests {
     use palyra_control_plane as control_plane;
     use serde_json::{json, Value};
     use std::{process::Command, time::Duration};
+    use tonic::{Code, Status};
 
     fn disabled_policy() -> BrowserPolicySnapshot {
         BrowserPolicySnapshot {
@@ -5338,6 +5373,42 @@ mod tests {
 
         ensure_browser_start_preflight(&resolved)
             .expect("configured gateway browser token should satisfy browser start preflight");
+    }
+
+    #[test]
+    fn browser_start_readiness_probe_omits_authorization_metadata() {
+        let request = browser_start_grpc_readiness_request()
+            .expect("start readiness probe request should be constructible");
+
+        assert!(
+            !request.metadata().contains_key("authorization"),
+            "browser start readiness must not disclose the reusable browserd bearer token"
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(super::BROWSER_CALLER_PRINCIPAL_HEADER)
+                .and_then(|value| { value.to_str().ok() }),
+            Some(super::BROWSER_PROBE_PRINCIPAL)
+        );
+    }
+
+    #[test]
+    fn browser_start_readiness_treats_unauthenticated_as_reachable() {
+        browser_start_grpc_readiness_result::<browser_v1::ListSessionsResponse>(Err(Status::new(
+            Code::Unauthenticated,
+            "missing bearer token",
+        )))
+        .expect("authenticated browserd should be reachable before token-bearing calls");
+
+        let error = browser_start_grpc_readiness_result::<browser_v1::ListSessionsResponse>(Err(
+            Status::new(Code::Unimplemented, "not a BrowserService"),
+        ))
+        .expect_err("non-BrowserService responses should not satisfy gRPC readiness");
+        assert!(
+            error.to_string().contains("without auth"),
+            "start readiness error should make clear no token was sent: {error}"
+        );
     }
 
     #[test]
@@ -5872,13 +5943,13 @@ mod tests {
     }
 
     #[test]
-    fn browser_start_timeout_detail_prefers_authenticated_grpc_failure() {
+    fn browser_start_timeout_detail_prefers_grpc_failure() {
         let detail = browser_start_readiness_timeout_detail(
             Some("health endpoint refused connection"),
             Some("failed to call browser ListSessions: unauthenticated"),
         );
 
-        assert!(detail.contains("authenticated gRPC readiness failed"));
+        assert!(detail.contains("gRPC readiness failed"));
         assert!(detail.contains("failed to call browser ListSessions"));
         assert!(!detail.contains("health endpoint refused connection"));
     }
