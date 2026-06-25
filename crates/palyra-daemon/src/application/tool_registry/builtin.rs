@@ -768,7 +768,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                             "type":"object",
                             "additionalProperties":{"type":"string"},
                             "maxProperties":32,
-                            "description":"Optional environment variables for this child process, for fixture and local app settings such as PALYRA_E2E_HOME. Values are applied without shell syntax, after the sandbox base environment. Reserved runtime/path keys such as PATH, PATHEXT, PALYRA_CONFIG, PALYRA_STATE_ROOT, PALYRA_HOME, PALYRA_CLI_PROFILE, PALYRA_CLI_PROFILES_PATH, PALYRA_VAULT_DIR, LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, and DYLD_LIBRARY_PATH are rejected."
+                            "description":"Optional environment variables for this child process, for inert fixture and local app settings such as PALYRA_E2E_HOME. Values are applied without shell syntax, after the sandbox base environment, and URL/host-shaped values are included in egress preflight. Runtime/path/loader/network-routing/credential-discovery keys such as PATH, HOME, HTTPS_PROXY, npm_config_registry, PIP_INDEX_URL, AWS_SHARED_CREDENTIALS_FILE, GOOGLE_APPLICATION_CREDENTIALS, KUBECONFIG, PALYRA_CONFIG, LD_PRELOAD, and DYLD_LIBRARY_PATH are rejected."
                         }),
                     ),
                     (
@@ -1494,6 +1494,8 @@ mod tests {
         assert!(env_description.contains("PALYRA_E2E_HOME"));
         assert!(env_description.contains("without shell syntax"));
         assert!(env_description.contains("PATH"));
+        assert!(env_description.contains("HTTPS_PROXY"));
+        assert!(env_description.contains("egress preflight"));
 
         let prepend_path_description = entry
             .input_schema

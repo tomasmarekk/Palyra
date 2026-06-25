@@ -2262,25 +2262,63 @@ fn valid_process_env_key_shape(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-// Overriding any of these would defeat the sandbox without touching a single path check:
-// PATH/PATHEXT redirect executable resolution, the LD_*/DYLD_* loader variables inject code
-// into the child, and the PALYRA_* keys repoint runtime config, state, and vault locations.
 fn process_env_key_is_reserved(key: &str) -> bool {
-    matches!(
-        key.to_ascii_uppercase().as_str(),
+    let key = key.to_ascii_uppercase();
+    if matches!(
+        key.as_str(),
         "PATH"
             | "PATHEXT"
+            | "HOME"
+            | "USERPROFILE"
+            | "HOMEDRIVE"
+            | "HOMEPATH"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "XDG_CONFIG_HOME"
+            | "XDG_CACHE_HOME"
+            | "XDG_DATA_HOME"
             | "LD_PRELOAD"
             | "LD_LIBRARY_PATH"
             | "DYLD_INSERT_LIBRARIES"
             | "DYLD_LIBRARY_PATH"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "NETRC"
+            | "CURL_HOME"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
+            | "GIT_ASKPASS"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "AWS_CONFIG_FILE"
+            | "AWS_SHARED_CREDENTIALS_FILE"
+            | "GOOGLE_APPLICATION_CREDENTIALS"
+            | "KUBECONFIG"
+            | "DOCKER_CONFIG"
+            | "NPM_CONFIG_USERCONFIG"
+            | "PIP_CONFIG_FILE"
+            | "REQUESTS_CA_BUNDLE"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "SSH_AUTH_SOCK"
             | "PALYRA_CONFIG"
             | "PALYRA_STATE_ROOT"
             | "PALYRA_HOME"
             | "PALYRA_CLI_PROFILE"
             | "PALYRA_CLI_PROFILES_PATH"
             | "PALYRA_VAULT_DIR"
-    )
+    ) {
+        return true;
+    }
+    key.ends_with("_PROXY")
+        || key.starts_with("NPM_CONFIG_")
+        || key.starts_with("YARN_")
+        || key.starts_with("PIP_")
+        || key.starts_with("AWS_")
+        || key.starts_with("GOOGLE_")
+        || key.starts_with("GIT_CONFIG_")
 }
 
 fn redact_env_key_for_error(key: &str) -> String {
@@ -4480,9 +4518,9 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, SandboxProcessRunEr
 }
 
 // Best-effort preflight extraction of every host the invocation appears to target: explicit
-// requested_egress_hosts, URL arguments, --host=value style assignments, and values following
-// host-hint flags. This is a heuristic deny gate, not runtime isolation; strict mode layers
-// backend-enforced network isolation on top.
+// requested_egress_hosts, URL arguments, --host=value style assignments, values following
+// host-hint flags, and URL/host-shaped env values. This is a heuristic deny gate, not runtime
+// isolation; strict mode layers backend-enforced network isolation on top.
 fn collect_requested_egress_hosts(
     input: &ProcessRunnerInput,
 ) -> Result<Vec<String>, SandboxProcessRunError> {
@@ -4501,6 +4539,9 @@ fn collect_requested_egress_hosts(
                 collect_hosts_from_token(&mut hosts, next_value, true)?;
             }
         }
+    }
+    for (key, value) in &input.env {
+        collect_hosts_from_token(&mut hosts, value, is_env_host_hint_key(key))?;
     }
     Ok(hosts)
 }
@@ -4680,6 +4721,7 @@ fn is_host_hint_key(raw: &str) -> bool {
                 | "hostname"
                 | "server"
                 | "endpoint"
+                | "registry"
                 | "url"
                 | "uri"
                 | "domain"
@@ -4688,6 +4730,10 @@ fn is_host_hint_key(raw: &str) -> bool {
                 | "addr"
         )
     })
+}
+
+fn is_env_host_hint_key(raw: &str) -> bool {
+    is_host_hint_key(raw)
 }
 
 fn push_normalized_host(hosts: &mut Vec<String>, raw: &str) -> Result<(), SandboxProcessRunError> {
@@ -8813,11 +8859,16 @@ mod tests {
         env.insert("PALYRA_E2E_HOME".to_owned(), "/tmp/palyra-e2e-home".to_owned());
         validate_process_env_overrides(&env).expect("fixture env keys should be accepted");
 
-        env.insert("PATH".to_owned(), "/tmp/bin".to_owned());
-        let error =
-            validate_process_env_overrides(&env).expect_err("PATH overrides must be reserved");
-        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
-        assert!(error.message.contains("reserved by the runtime"), "{}", error.message);
+        for reserved_key in
+            ["PATH", "HTTPS_PROXY", "HOME", "AWS_SHARED_CREDENTIALS_FILE", "npm_config_registry"]
+        {
+            let mut env = BTreeMap::new();
+            env.insert(reserved_key.to_owned(), "https://blocked.example".to_owned());
+            let error = validate_process_env_overrides(&env)
+                .expect_err("sensitive env overrides must be reserved");
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+            assert!(error.message.contains("reserved by the runtime"), "{}", error.message);
+        }
     }
 
     #[test]
@@ -9329,6 +9380,18 @@ mod tests {
         let input = br#"{"command":"uname","args":["--host=blocked.example"]}"#;
         let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
             .expect_err("host hint should be validated against egress allowlists");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
+        assert!(error.message.contains("blocked.example"));
+    }
+
+    #[test]
+    fn run_constrained_process_rejects_non_allowlisted_egress_host_from_env_value() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let mut policy = sandbox_policy(workspace);
+        policy.allowed_egress_hosts = vec!["allowed.example".to_owned()];
+        let input = br#"{"command":"uname","args":["--version","https://allowed.example/path"],"env":{"APP_ENDPOINT":"https://blocked.example/api"}}"#;
+        let error = run_constrained_process(&policy, input, Duration::from_millis(1_000))
+            .expect_err("env URL values should be validated against egress allowlists");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::EgressDenied);
         assert!(error.message.contains("blocked.example"));
     }
@@ -11686,6 +11749,35 @@ mod tests {
         assert!(
             !hosts.iter().any(|host| host == "readme.md"),
             "file-like args should not be treated as host candidates by default"
+        );
+    }
+
+    #[test]
+    fn collect_requested_egress_hosts_extracts_hosts_from_env_values() {
+        let input = ProcessRunnerInput {
+            command: "uname".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::from([
+                ("APP_ENDPOINT".to_owned(), "https://blocked.example/api".to_owned()),
+                ("APP_HOST".to_owned(), "allowed.example:443".to_owned()),
+                ("FIXTURE_NAME".to_owned(), "readme.md".to_owned()),
+            ]),
+            prepend_path: Vec::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
+        };
+
+        let hosts = collect_requested_egress_hosts(&input)
+            .expect("env host hint parsing should succeed for valid host values");
+        assert!(hosts.iter().any(|host| host == "blocked.example"));
+        assert!(hosts.iter().any(|host| host == "allowed.example"));
+        assert!(
+            !hosts.iter().any(|host| host == "readme.md"),
+            "non-host env values should not be collected"
         );
     }
 
