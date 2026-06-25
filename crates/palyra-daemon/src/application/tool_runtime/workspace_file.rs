@@ -37,8 +37,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents::AgentResolveRequest,
     application::tool_runtime::workspace_scope::{
-        relative_path_should_use_active_root, session_active_workspace_root,
-        workspace_root_override_targets_active_root,
+        relative_path_should_use_active_root, run_launch_context_read_file_grants,
+        session_active_workspace_root, workspace_root_override_targets_active_root,
         workspace_roots_with_run_launch_context_for_agent_source,
     },
     gateway::{
@@ -198,6 +198,13 @@ struct WorkspaceReadWindow {
     line_end: Option<u64>,
 }
 
+struct ResolvedWorkspaceFile {
+    workspace_root_index: usize,
+    canonical_root: PathBuf,
+    canonical_target: PathBuf,
+    display_path: String,
+}
+
 /// Executes the workspace read-file tool: resolves the scoped roots, reads a
 /// bounded chunk, and returns UTF-8 text (secret-redacted) or base64 binary.
 ///
@@ -278,7 +285,17 @@ pub(crate) async fn execute_workspace_read_file_tool(
             );
         }
     };
-    let read = match read_workspace_file_from_roots(workspace_roots.as_slice(), &input) {
+    let file_grants = if input.workspace_root.as_deref().is_some_and(|root| !root.trim().is_empty())
+    {
+        Vec::new()
+    } else {
+        run_launch_context_read_file_grants(runtime_state, context.run_id).await
+    };
+    let read = match read_workspace_file_from_roots_and_file_grants(
+        workspace_roots.as_slice(),
+        file_grants.as_slice(),
+        &input,
+    ) {
         Ok(read) => read,
         Err(error) => {
             return workspace_read_file_outcome(
@@ -952,13 +969,27 @@ fn looks_like_windows_drive_path(path: &str) -> bool {
 /// # Errors
 /// Returns tool-facing error strings for escapes, missing files,
 /// non-regular-file targets, and IO failures.
+#[cfg(test)]
 fn read_workspace_file_from_roots(
     workspace_roots: &[PathBuf],
     input: &WorkspaceReadFileInput,
 ) -> Result<WorkspaceReadFileOutput, String> {
+    read_workspace_file_from_roots_and_file_grants(workspace_roots, &[], input)
+}
+
+fn read_workspace_file_from_roots_and_file_grants(
+    workspace_roots: &[PathBuf],
+    file_grants: &[PathBuf],
+    input: &WorkspaceReadFileInput,
+) -> Result<WorkspaceReadFileOutput, String> {
     let canonical_roots =
         canonicalize_workspace_roots(workspace_roots, WORKSPACE_READ_FILE_TOOL_NAME)?;
-    if canonical_roots.is_empty() {
+    let canonical_file_grants = canonicalize_workspace_file_grants(
+        file_grants,
+        WORKSPACE_READ_FILE_TOOL_NAME,
+        workspace_roots.len(),
+    )?;
+    if canonical_roots.is_empty() && canonical_file_grants.is_empty() {
         return Err(format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} agent has no accessible workspace roots"
         ));
@@ -966,23 +997,17 @@ fn read_workspace_file_from_roots(
 
     let requested = Path::new(input.path.as_str());
     if requested.is_absolute() {
-        let (workspace_root_index, canonical_target, display_path) =
-            resolve_absolute_workspace_file(canonical_roots.as_slice(), requested, input)?;
-        let canonical_root = canonical_roots
-            .iter()
-            .find_map(|(index, root)| {
-                (*index == workspace_root_index).then_some(root.as_path())
-            })
-            .ok_or_else(|| {
-                format!(
-                    "{WORKSPACE_READ_FILE_TOOL_NAME} internal error resolving workspace root {workspace_root_index}"
-                )
-            })?;
+        let resolved = resolve_absolute_workspace_file(
+            canonical_roots.as_slice(),
+            canonical_file_grants.as_slice(),
+            requested,
+            input,
+        )?;
         return read_workspace_file_chunk(
-            workspace_root_index,
-            canonical_root,
-            canonical_target,
-            display_path,
+            resolved.workspace_root_index,
+            resolved.canonical_root.as_path(),
+            resolved.canonical_target,
+            resolved.display_path,
             input,
         );
     }
@@ -1061,6 +1086,29 @@ fn canonicalize_workspace_roots(
     Ok(canonical_roots)
 }
 
+fn canonicalize_workspace_file_grants(
+    file_grants: &[PathBuf],
+    tool_name: &str,
+    index_offset: usize,
+) -> Result<Vec<(usize, PathBuf)>, String> {
+    let mut canonical_grants = Vec::with_capacity(file_grants.len());
+    for (grant_index, grant) in file_grants.iter().enumerate() {
+        match fs::canonicalize(grant) {
+            Ok(path) if path.is_file() => {
+                canonical_grants.push((index_offset.saturating_add(grant_index), path));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{tool_name} failed to resolve workspace file grant {grant_index}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(canonical_grants)
+}
+
 /// Resolves an absolute requested path to a canonical in-root file.
 ///
 /// # Errors
@@ -1068,9 +1116,10 @@ fn canonicalize_workspace_roots(
 /// errors for missing or non-regular-file targets.
 fn resolve_absolute_workspace_file(
     canonical_roots: &[(usize, PathBuf)],
+    canonical_file_grants: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceReadFileInput,
-) -> Result<(usize, PathBuf, String), String> {
+) -> Result<ResolvedWorkspaceFile, String> {
     // Reject `..` and check root containment lexically BEFORE touching the
     // filesystem: probing out-of-root paths would leak whether they exist,
     // so the escape error must be identical for existing and missing targets
@@ -1078,10 +1127,14 @@ fn resolve_absolute_workspace_file(
     if requested.components().any(|component| matches!(component, Component::ParentDir)) {
         return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"));
     }
-    let (workspace_root_index, canonical_root) =
-        find_lexical_workspace_root(canonical_roots, requested).ok_or_else(|| {
-            format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots")
-        })?;
+    let Some((workspace_root_index, canonical_root)) =
+        find_lexical_workspace_root(canonical_roots, requested)
+    else {
+        return resolve_absolute_workspace_file_grant(canonical_file_grants, requested, input)?
+            .ok_or_else(|| {
+                format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots")
+            });
+    };
     let canonical_target = fs::canonicalize(requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -1102,7 +1155,51 @@ fn resolve_absolute_workspace_file(
         .strip_prefix(canonical_root)
         .map(normalize_relative_path_display)
         .unwrap_or_else(|_| display_requested_path(input.path.as_str()).to_owned());
-    Ok((workspace_root_index, canonical_target, display_path))
+    Ok(ResolvedWorkspaceFile {
+        workspace_root_index,
+        canonical_root: canonical_root.to_path_buf(),
+        canonical_target,
+        display_path,
+    })
+}
+
+fn resolve_absolute_workspace_file_grant(
+    canonical_file_grants: &[(usize, PathBuf)],
+    requested: &Path,
+    input: &WorkspaceReadFileInput,
+) -> Result<Option<ResolvedWorkspaceFile>, String> {
+    let Some((workspace_root_index, canonical_grant)) =
+        find_lexical_workspace_file_grant(canonical_file_grants, requested)
+    else {
+        return Ok(None);
+    };
+    let canonical_target = fs::canonicalize(requested).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "{WORKSPACE_READ_FILE_TOOL_NAME} file not found in agent workspace roots: {}",
+                display_requested_path(input.path.as_str())
+            )
+        } else {
+            format!("{WORKSPACE_READ_FILE_TOOL_NAME} failed to resolve path: {error}")
+        }
+    })?;
+    if !same_workspace_file_path(canonical_target.as_path(), canonical_grant) {
+        return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"));
+    }
+    if !canonical_target.is_file() {
+        return Err(read_file_not_regular_file_error(input.path.as_str()));
+    }
+    let display_path = canonical_target
+        .file_name()
+        .map(Path::new)
+        .map(normalize_relative_path_display)
+        .unwrap_or_else(|| display_requested_path(input.path.as_str()).to_owned());
+    Ok(Some(ResolvedWorkspaceFile {
+        workspace_root_index,
+        canonical_root: canonical_grant.to_path_buf(),
+        canonical_target,
+        display_path,
+    }))
 }
 
 /// Finds the first root that lexically contains `requested` (alias-aware via
@@ -1117,6 +1214,41 @@ fn find_lexical_workspace_root<'a>(
             path_stays_inside_workspace_root(requested, canonical_root.as_path())
         })
         .map(|(index, canonical_root)| (*index, canonical_root.as_path()))
+}
+
+fn find_lexical_workspace_file_grant<'a>(
+    canonical_file_grants: &'a [(usize, PathBuf)],
+    requested: &Path,
+) -> Option<(usize, &'a Path)> {
+    canonical_file_grants
+        .iter()
+        .find(|(_, canonical_grant)| lexically_same_workspace_file_path(requested, canonical_grant))
+        .map(|(index, canonical_grant)| (*index, canonical_grant.as_path()))
+}
+
+fn lexically_same_workspace_file_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_path_alias_key(left)
+            .is_some_and(|left| macos_path_alias_key(right).is_some_and(|right| left == right))
+    }
+    #[cfg(windows)]
+    {
+        windows_lexical_path_alias_key(left).is_some_and(|left| {
+            windows_lexical_path_alias_key(right).is_some_and(|right| left == right)
+        })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
+}
+
+fn same_workspace_file_path(left: &Path, right: &Path) -> bool {
+    path_stays_inside_workspace_root(left, right) && path_stays_inside_workspace_root(right, left)
 }
 
 fn read_file_not_regular_file_error(path: &str) -> String {
@@ -3052,6 +3184,55 @@ mod tests {
 
         assert_eq!(output.path, "nested/calc.js");
         assert_eq!(output.text.as_deref(), Some("export const add = (a, b) => a + b;\n"));
+    }
+
+    #[test]
+    fn read_workspace_file_grant_allows_exact_absolute_file_but_rejects_sibling() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let watched_dir = tempdir.path().join("home");
+        fs::create_dir_all(watched_dir.as_path()).expect("watched dir should exist");
+        let watched_file = watched_dir.join("watched.md");
+        let sibling_file = watched_dir.join("sibling-secret.txt");
+        fs::write(watched_file.as_path(), "watched\n").expect("watched file should exist");
+        fs::write(sibling_file.as_path(), "secret\n").expect("sibling file should exist");
+
+        let watched_input = WorkspaceReadFileInput {
+            path: watched_file.to_string_lossy().into_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+        let watched_output = read_workspace_file_from_roots_and_file_grants(
+            &[],
+            std::slice::from_ref(&watched_file),
+            &watched_input,
+        )
+        .expect("exact file grant should allow watched file read");
+
+        assert_eq!(watched_output.path, "watched.md");
+        assert_eq!(watched_output.text.as_deref(), Some("watched\n"));
+
+        let sibling_input = WorkspaceReadFileInput {
+            path: sibling_file.to_string_lossy().into_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+        let error = read_workspace_file_from_roots_and_file_grants(
+            &[],
+            std::slice::from_ref(&watched_file),
+            &sibling_input,
+        )
+        .expect_err("file grant must not expose sibling files");
+
+        assert_eq!(
+            error,
+            format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots")
+        );
     }
 
     #[test]

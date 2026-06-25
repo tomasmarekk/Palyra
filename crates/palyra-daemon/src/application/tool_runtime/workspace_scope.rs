@@ -2,10 +2,10 @@
 //!
 //! Workspace tools operate on an ordered list of workspace roots. This module
 //! derives that list from two dynamic sources layered over the agent's
-//! configured roots: the run-launch CLI context (launch cwd, extra roots, and
-//! allowlisted path env keys carried in the run's parameter delta) and the
-//! session's project focus (the directory the operator is currently working
-//! in, resolved from stored focus paths).
+//! configured roots: the run-launch CLI context (launch cwd, extra roots, exact
+//! file grants, and allowlisted path env keys carried in the run's parameter
+//! delta) and the session's project focus (the directory the operator is
+//! currently working in, resolved from stored focus paths).
 //!
 //! Every dynamic root is canonicalized and validated before use: launch roots
 //! must be existing absolute directories outside the OS deny-list in
@@ -46,6 +46,7 @@ struct RunLaunchParameterDelta {
 struct RunLaunchCliContext {
     launch_cwd: Option<String>,
     workspace_roots: Option<Vec<String>>,
+    workspace_file_grants: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
 }
 
@@ -121,6 +122,23 @@ pub(crate) async fn run_launch_context_path_env(
     parameter_delta.cli_context.map(launch_path_env_from_context).unwrap_or_default()
 }
 
+/// Extracts exact read-file grants from the run's launch context.
+pub(crate) async fn run_launch_context_read_file_grants(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Vec<PathBuf> {
+    let Some(parameter_delta_json) = run_launch_parameter_delta_json(runtime_state, run_id).await
+    else {
+        return Vec::new();
+    };
+    let Ok(parameter_delta) =
+        serde_json::from_str::<RunLaunchParameterDelta>(parameter_delta_json.as_str())
+    else {
+        return Vec::new();
+    };
+    parameter_delta.cli_context.map(launch_workspace_file_grants_from_context).unwrap_or_default()
+}
+
 /// Returns the launch-context root that represents generic `/workspace`
 /// process execution for this run, if the run supplied one.
 pub(crate) async fn run_launch_context_primary_workspace_root(
@@ -188,12 +206,29 @@ fn launch_workspace_roots_from_context(context: RunLaunchCliContext) -> RunLaunc
     roots
 }
 
+fn launch_workspace_file_grants_from_context(context: RunLaunchCliContext) -> Vec<PathBuf> {
+    let mut grants = Vec::new();
+    for raw_file in context.workspace_file_grants.unwrap_or_default() {
+        push_launch_workspace_file_grant(&mut grants, raw_file.as_str());
+    }
+    grants
+}
+
 fn push_launch_workspace_root(roots: &mut Vec<PathBuf>, raw_root: &str) {
     let Some(root) = canonical_launch_workspace_root(raw_root) else {
         return;
     };
     if !roots.iter().any(|existing| same_workspace_root(existing.as_path(), root.as_path())) {
         roots.push(root);
+    }
+}
+
+fn push_launch_workspace_file_grant(grants: &mut Vec<PathBuf>, raw_file: &str) {
+    let Some(file) = canonical_launch_workspace_file_grant(raw_file) else {
+        return;
+    };
+    if !grants.iter().any(|existing| same_workspace_root(existing.as_path(), file.as_path())) {
+        grants.push(file);
     }
 }
 
@@ -218,6 +253,32 @@ fn canonical_launch_workspace_root(raw_root: &str) -> Option<PathBuf> {
         return None;
     };
     if !metadata.is_dir() || protected_launch_workspace_root(canonical.as_path()) {
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Validates one raw exact file grant from launch context.
+fn canonical_launch_workspace_file_grant(raw_file: &str) -> Option<PathBuf> {
+    let raw_file = raw_file.trim();
+    if raw_file.is_empty() || raw_file.chars().any(char::is_control) {
+        return None;
+    }
+    let requested = Path::new(raw_file);
+    if !requested.is_absolute() {
+        return None;
+    }
+    let Ok(canonical) = fs::canonicalize(requested) else {
+        return None;
+    };
+    let Ok(metadata) = fs::metadata(canonical.as_path()) else {
+        return None;
+    };
+    if !metadata.is_file() {
+        return None;
+    }
+    let parent = canonical.parent()?;
+    if protected_launch_workspace_root(parent) {
         return None;
     }
     Some(canonical)
@@ -521,11 +582,11 @@ fn normalize_relative_workspace_path(path: &str) -> Option<String> {
 mod tests {
     use super::{
         active_workspace_root_from_focus_paths, canonical_launch_workspace_root,
-        launch_path_env_from_context, launch_workspace_roots_from_context,
-        merge_launch_workspace_roots, relative_path_already_targets_active_root,
-        relative_path_should_use_active_root, same_workspace_root,
-        workspace_focus_path_is_runtime_internal, workspace_root_override_targets_active_root,
-        ActiveWorkspaceRoot, RunLaunchCliContext,
+        launch_path_env_from_context, launch_workspace_file_grants_from_context,
+        launch_workspace_roots_from_context, merge_launch_workspace_roots,
+        relative_path_already_targets_active_root, relative_path_should_use_active_root,
+        same_workspace_root, workspace_focus_path_is_runtime_internal,
+        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, RunLaunchCliContext,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -676,6 +737,7 @@ mod tests {
         let launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
             launch_cwd: Some(canonical_launch.to_string_lossy().into_owned()),
             workspace_roots: None,
+            workspace_file_grants: None,
             env: None,
         });
         let roots = merge_launch_workspace_roots(
@@ -709,6 +771,7 @@ mod tests {
                 explicit_root.to_string_lossy().into_owned(),
                 launch_cwd.to_string_lossy().into_owned(),
             ]),
+            workspace_file_grants: None,
             env: None,
         });
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&default_root), launch_roots);
@@ -732,6 +795,7 @@ mod tests {
         let launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
             launch_cwd: Some(launch_cwd.to_string_lossy().into_owned()),
             workspace_roots: None,
+            workspace_file_grants: None,
             env: None,
         });
         let roots = merge_launch_workspace_roots(std::slice::from_ref(&bound_root), launch_roots);
@@ -739,6 +803,30 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(roots.first(), Some(&launch_cwd));
         assert_eq!(roots.get(1), Some(&bound_root));
+    }
+
+    #[test]
+    fn launch_file_grants_accept_existing_absolute_files_only() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let watched = tempdir.path().join("watched.md");
+        fs::write(watched.as_path(), "ready\n").expect("watched file should exist");
+        let watched =
+            fs::canonicalize(watched.as_path()).expect("watched file should canonicalize");
+
+        let grants = launch_workspace_file_grants_from_context(RunLaunchCliContext {
+            launch_cwd: None,
+            workspace_roots: None,
+            workspace_file_grants: Some(vec![
+                watched.to_string_lossy().into_owned(),
+                watched.to_string_lossy().into_owned(),
+                tempdir.path().to_string_lossy().into_owned(),
+                tempdir.path().join("missing.md").to_string_lossy().into_owned(),
+                "relative.md".to_owned(),
+            ]),
+            env: None,
+        });
+
+        assert_eq!(grants, vec![watched]);
     }
 
     #[test]
@@ -751,6 +839,7 @@ mod tests {
         let env = launch_path_env_from_context(RunLaunchCliContext {
             launch_cwd: None,
             workspace_roots: None,
+            workspace_file_grants: None,
             env: Some(BTreeMap::from([
                 ("PALYRA_E2E_HOME".to_owned(), home.to_string_lossy().into_owned()),
                 ("PALYRA_E2E_OS_ROOT".to_owned(), os_root.to_string_lossy().into_owned()),

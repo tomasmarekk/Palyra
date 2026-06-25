@@ -3085,17 +3085,31 @@ fn routine_parameter_delta_json(record: &RoutineMetadataRecord, job: &CronJobRec
     });
     let mut cli_context = serde_json::Map::new();
     let mut workspace_roots = Vec::new();
+    let mut workspace_file_grants = Vec::new();
     if let Some(workdir) =
         job.workdir.as_deref().map(str::trim).filter(|workdir| !workdir.is_empty())
     {
         cli_context.insert("launch_cwd".to_owned(), json!(workdir));
         push_unique_cli_context_workspace_root(&mut workspace_roots, workdir);
     }
-    if let Some(watched_root) = file_watch_access_root(record) {
-        push_unique_cli_context_workspace_root(&mut workspace_roots, watched_root.as_str());
+    if let Some(grant) = file_watch_workspace_grant(record) {
+        match grant {
+            FileWatchWorkspaceGrant::Directory(root) => {
+                push_unique_cli_context_workspace_root(&mut workspace_roots, root.as_str());
+            }
+            FileWatchWorkspaceGrant::File(file) => {
+                push_unique_cli_context_workspace_file_grant(
+                    &mut workspace_file_grants,
+                    file.as_str(),
+                );
+            }
+        }
     }
     if !workspace_roots.is_empty() {
         cli_context.insert("workspace_roots".to_owned(), Value::Array(workspace_roots));
+    }
+    if !workspace_file_grants.is_empty() {
+        cli_context.insert("workspace_file_grants".to_owned(), Value::Array(workspace_file_grants));
     }
     if !cli_context.is_empty() {
         parameter_delta["cli_context"] = Value::Object(cli_context);
@@ -3153,18 +3167,29 @@ fn push_unique_cli_context_workspace_root(roots: &mut Vec<Value>, root: &str) {
     roots.push(json!(root));
 }
 
-fn file_watch_access_root(record: &RoutineMetadataRecord) -> Option<String> {
+fn push_unique_cli_context_workspace_file_grant(grants: &mut Vec<Value>, file: &str) {
+    if grants.iter().any(|existing| existing.as_str() == Some(file)) {
+        return;
+    }
+    grants.push(json!(file));
+}
+
+enum FileWatchWorkspaceGrant {
+    Directory(String),
+    File(String),
+}
+
+fn file_watch_workspace_grant(record: &RoutineMetadataRecord) -> Option<FileWatchWorkspaceGrant> {
     if record.trigger_kind != RoutineTriggerKind::FileWatch {
         return None;
     }
     let config = parse_file_watch_config(record.trigger_payload_json.as_str()).ok()?;
     let resolved_path = PathBuf::from(config.resolved_path);
-    let access_root = if resolved_path.is_dir() {
-        resolved_path
+    if resolved_path.is_dir() {
+        Some(FileWatchWorkspaceGrant::Directory(resolved_path.to_string_lossy().into_owned()))
     } else {
-        resolved_path.parent().map(Path::to_path_buf)?
-    };
-    Some(access_root.to_string_lossy().into_owned())
+        Some(FileWatchWorkspaceGrant::File(resolved_path.to_string_lossy().into_owned()))
+    }
 }
 
 // Explicit job session keys always win; otherwise FreshSession isolates each
@@ -4466,7 +4491,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_parameter_delta_includes_file_watch_access_root_after_workdir() {
+    fn routine_parameter_delta_includes_file_watch_file_grant_after_workdir() {
         let temp = tempdir().expect("tempdir should be created");
         let workdir = temp.path().join("workspace");
         let watched_dir = temp.path().join("os-root").join("inbox");
@@ -4495,14 +4520,50 @@ mod tests {
             .pointer("/cli_context/workspace_roots")
             .and_then(serde_json::Value::as_array)
             .expect("workspace roots should be present");
+        let file_grants = value
+            .pointer("/cli_context/workspace_file_grants")
+            .and_then(serde_json::Value::as_array)
+            .expect("workspace file grants should be present");
 
         assert_eq!(
             value.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
             Some(workdir.to_string_lossy().as_ref())
         );
-        assert_eq!(roots.len(), 2);
+        assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].as_str(), Some(workdir.to_string_lossy().as_ref()));
-        assert_eq!(roots[1].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
+        assert_eq!(file_grants.len(), 1);
+        assert_eq!(file_grants[0].as_str(), Some(watched_file.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn routine_parameter_delta_includes_file_watch_directory_as_workspace_root() {
+        let temp = tempdir().expect("tempdir should be created");
+        let watched_dir = temp.path().join("os-root").join("inbox");
+        fs::create_dir_all(watched_dir.as_path()).expect("watched directory should exist");
+
+        let job =
+            sample_every_job("01ARZ3NDEKTSV4RRFFQ69G5FAV", Some(1_000), CronMisfirePolicy::Skip);
+        let mut routine = sample_routine_metadata(job.job_id.as_str());
+        routine.trigger_kind = RoutineTriggerKind::FileWatch;
+        routine.trigger_payload_json = json!({
+            "path": watched_dir.to_string_lossy(),
+            "resolved_path": watched_dir.to_string_lossy(),
+            "poll_interval_ms": 30_000_u64,
+            "fire_on_start": false
+        })
+        .to_string();
+
+        let value: serde_json::Value =
+            serde_json::from_str(routine_parameter_delta_json(&routine, &job).as_str())
+                .expect("routine parameter delta should be JSON");
+        let roots = value
+            .pointer("/cli_context/workspace_roots")
+            .and_then(serde_json::Value::as_array)
+            .expect("workspace roots should be present");
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
+        assert!(value.pointer("/cli_context/workspace_file_grants").is_none());
     }
 
     #[test]
@@ -4547,13 +4608,19 @@ mod tests {
             .pointer("/cli_context/workspace_roots")
             .and_then(serde_json::Value::as_array)
             .expect("workspace roots should be preserved");
+        let file_grants = value
+            .pointer("/cli_context/workspace_file_grants")
+            .and_then(serde_json::Value::as_array)
+            .expect("workspace file grants should be preserved");
 
         assert_eq!(
             value.pointer("/cli_context/launch_cwd").and_then(serde_json::Value::as_str),
             Some(workdir.to_string_lossy().as_ref())
         );
         assert_eq!(roots[0].as_str(), Some(workdir.to_string_lossy().as_ref()));
-        assert_eq!(roots[1].as_str(), Some(watched_dir.to_string_lossy().as_ref()));
+        assert_eq!(roots.len(), 1);
+        assert_eq!(file_grants[0].as_str(), Some(watched_file.to_string_lossy().as_ref()));
+        assert_eq!(file_grants.len(), 1);
         assert_eq!(
             value.pointer("/routine/routine_id").and_then(serde_json::Value::as_str),
             Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
