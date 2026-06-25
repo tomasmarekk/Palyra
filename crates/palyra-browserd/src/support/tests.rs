@@ -3573,18 +3573,17 @@ async fn browser_service_reset_state_clears_cookie_jar_for_fixture_domain() {
         .into_inner();
     assert!(second.success, "second navigation should replay cookie and succeed");
 
-    let reset = service
-        .reset_state(Request::new(browser_v1::ResetStateRequest {
-            v: 1,
-            session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
-            clear_cookies: true,
-            clear_storage: false,
-            reset_tabs: false,
-            reset_permissions: false,
-        }))
-        .await
-        .expect("reset_state should execute")
-        .into_inner();
+    let mut reset_request = Request::new(browser_v1::ResetStateRequest {
+        v: 1,
+        session_id: Some(proto::palyra::common::v1::CanonicalId { ulid: session_id.clone() }),
+        clear_cookies: true,
+        clear_storage: false,
+        reset_tabs: false,
+        reset_permissions: false,
+    });
+    insert_principal(&mut reset_request, "user:ops");
+    let reset =
+        service.reset_state(reset_request).await.expect("reset_state should execute").into_inner();
     assert!(reset.success, "reset_state should succeed");
     assert!(reset.cookies_cleared >= 1, "at least one cookie should be removed during reset");
 
@@ -3632,18 +3631,17 @@ async fn browser_service_reset_state_clears_network_log_baseline() {
         });
     }
 
-    let reset = service
-        .reset_state(Request::new(browser_v1::ResetStateRequest {
-            v: 1,
-            session_id: Some(session_id.clone()),
-            clear_cookies: false,
-            clear_storage: false,
-            reset_tabs: false,
-            reset_permissions: false,
-        }))
-        .await
-        .expect("reset_state should execute")
-        .into_inner();
+    let mut reset_request = Request::new(browser_v1::ResetStateRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        clear_cookies: false,
+        clear_storage: false,
+        reset_tabs: false,
+        reset_permissions: false,
+    });
+    insert_principal(&mut reset_request, "user:ops");
+    let reset =
+        service.reset_state(reset_request).await.expect("reset_state should execute").into_inner();
     assert!(reset.success, "reset_state should succeed");
 
     let mut network_request = Request::new(browser_v1::NetworkLogRequest {
@@ -3996,15 +3994,17 @@ async function checkGeo(){
         second_navigate.error
     );
 
+    let mut reset_request = Request::new(browser_v1::ResetStateRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        clear_cookies: false,
+        clear_storage: false,
+        reset_tabs: false,
+        reset_permissions: true,
+    });
+    insert_principal(&mut reset_request, "user:ops");
     let reset = service
-        .reset_state(Request::new(browser_v1::ResetStateRequest {
-            v: 1,
-            session_id: Some(session_id.clone()),
-            clear_cookies: false,
-            clear_storage: false,
-            reset_tabs: false,
-            reset_permissions: true,
-        }))
+        .reset_state(reset_request)
         .await
         .expect("permission reset_state should execute")
         .into_inner();
@@ -6557,6 +6557,71 @@ async fn browser_service_session_diagnostics_require_matching_principal() {
         .await
         .expect_err("inspect_session should reject cross-principal access");
     assert_eq!(mismatched_inspect_status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_reset_state_requires_matching_principal() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:alpha").await;
+    let session_id = created.session_id.expect("session id should be present");
+
+    {
+        let mut sessions = runtime.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id.ulid.as_str())
+            .expect("session should exist for storage seeding");
+        session.storage_entries.insert(
+            "https://example.com".to_owned(),
+            HashMap::from([("theme".to_owned(), "dark".to_owned())]),
+        );
+    }
+
+    let mut mismatched_reset = Request::new(browser_v1::ResetStateRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        clear_cookies: false,
+        clear_storage: true,
+        reset_tabs: false,
+        reset_permissions: false,
+    });
+    insert_principal(&mut mismatched_reset, "user:beta");
+    let mismatched_status = service
+        .reset_state(mismatched_reset)
+        .await
+        .expect_err("reset_state should reject cross-principal access");
+    assert_eq!(mismatched_status.code(), tonic::Code::PermissionDenied);
+    {
+        let sessions = runtime.sessions.lock().await;
+        let session = sessions
+            .get(session_id.ulid.as_str())
+            .expect("session should remain after rejected reset");
+        assert!(
+            session.storage_entries.contains_key("https://example.com"),
+            "rejected reset must not clear victim storage"
+        );
+    }
+
+    let mut owner_reset = Request::new(browser_v1::ResetStateRequest {
+        v: 1,
+        session_id: Some(session_id.clone()),
+        clear_cookies: false,
+        clear_storage: true,
+        reset_tabs: false,
+        reset_permissions: false,
+    });
+    insert_principal(&mut owner_reset, "user:alpha");
+    let response = service
+        .reset_state(owner_reset)
+        .await
+        .expect("owner reset_state should execute")
+        .into_inner();
+    assert!(response.success, "owner reset should succeed: {}", response.error);
+    assert_eq!(response.storage_entries_cleared, 1);
+    let sessions = runtime.sessions.lock().await;
+    let session =
+        sessions.get(session_id.ulid.as_str()).expect("session should remain after owner reset");
+    assert!(session.storage_entries.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

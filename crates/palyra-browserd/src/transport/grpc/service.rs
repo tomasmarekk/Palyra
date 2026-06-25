@@ -3408,6 +3408,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         request: Request<browser_v1::ResetStateRequest>,
     ) -> Result<Response<browser_v1::ResetStateResponse>, Status> {
         self.runtime.authorize(request.metadata()).await?;
+        let caller_principal = request_principal(request.metadata())?.to_owned();
         let mut payload = request.into_inner();
         let session_id = parse_session_id_from_proto(payload.session_id.take())
             .map_err(Status::invalid_argument)?;
@@ -3432,6 +3433,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     error: "session_not_found".to_owned(),
                 }));
             };
+            if session.principal != caller_principal {
+                return Err(Status::permission_denied("session access denied"));
+            }
             session.last_active = Instant::now();
             let mut cookies_cleared = 0_u32;
             let mut storage_entries_cleared = 0_u32;

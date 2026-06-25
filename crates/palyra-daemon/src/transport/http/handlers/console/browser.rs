@@ -1418,6 +1418,10 @@ pub(crate) async fn console_browser_reset_state_handler(
         reset_permissions: payload.reset_permissions.unwrap_or(false),
     });
     apply_browser_service_auth(&state, request.metadata_mut())?;
+    apply_browser_caller_principal_metadata(
+        session.context.principal.as_str(),
+        request.metadata_mut(),
+    )?;
     let response = client.reset_state(request).await.map_err(runtime_status_response)?.into_inner();
     let envelope = control_plane::BrowserResetStateEnvelope {
         contract: contract_descriptor(),
@@ -2878,8 +2882,8 @@ pub(crate) fn apply_browser_service_auth(
 }
 
 /// Forwards the console caller's principal to browserd via
-/// [`BROWSER_CALLER_PRINCIPAL_HEADER`] so principal-scoped reads (downloads,
-/// network log) can be enforced server-side.
+/// [`BROWSER_CALLER_PRINCIPAL_HEADER`] so principal-scoped reads and
+/// destructive session mutations can be enforced server-side.
 ///
 /// # Errors
 /// Returns an unauthenticated response for a blank principal and an

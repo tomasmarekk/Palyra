@@ -3446,6 +3446,15 @@ pub(crate) async fn execute_browser_tool(
                     error,
                 );
             }
+            if let Err(error) = attach_browser_caller_principal_metadata(&mut request, principal) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
             match client.reset_state(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
@@ -4470,7 +4479,7 @@ fn attach_browser_auth_metadata<T>(
 }
 
 /// Forwards the daemon-side caller principal to browserd so sensitive reads
-/// (storage, logs, downloads, pdf) can be attributed and access-checked.
+/// and destructive session mutations can be attributed and access-checked.
 fn attach_browser_caller_principal_metadata<T>(
     request: &mut Request<T>,
     caller_principal: &str,
