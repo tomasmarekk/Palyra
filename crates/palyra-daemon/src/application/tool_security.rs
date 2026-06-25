@@ -638,7 +638,8 @@ pub(crate) async fn evaluate_tool_proposal_security(
         .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime)
         || backend_selection.resolution.approval_required
         || (input_approval_can_apply && input_approval_required);
-    let approval_subject_id = build_tool_approval_subject_id(tool_name, skill_context.as_ref());
+    let approval_subject_id =
+        build_tool_approval_subject_id(tool_name, skill_context.as_ref(), input_json);
     ToolProposalSecurityEvaluation {
         skill_context,
         skill_gate_decision,

@@ -2673,7 +2673,7 @@ pub(crate) fn build_pending_tool_approval(
     input_json: &[u8],
     config: &ToolCallConfig,
 ) -> PendingToolApproval {
-    let subject_id = build_tool_approval_subject_id(tool_name, skill_context);
+    let subject_id = build_tool_approval_subject_id(tool_name, skill_context, input_json);
     let request_summary = build_tool_request_summary(tool_name, skill_context, input_json);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
     let details = serde_json::from_slice::<Value>(input_json)

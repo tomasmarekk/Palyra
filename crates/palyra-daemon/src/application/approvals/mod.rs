@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tonic::Status;
 use tracing::info;
@@ -30,6 +30,7 @@ use crate::{
 };
 
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
 
 /// Fully built approval request ready to be journaled and surfaced to the
 /// approval channel; `approval_id` is freshly generated per request.
@@ -144,7 +145,7 @@ pub(crate) fn build_pending_tool_approval(
     config: &ToolCallConfig,
     execution_context: Option<&ApprovalExecutionContext>,
 ) -> PendingToolApproval {
-    let subject_id = build_tool_approval_subject_id(tool_name, skill_context);
+    let subject_id = build_tool_approval_subject_id(tool_name, skill_context, input_json);
     let request_summary =
         build_tool_request_summary(tool_name, skill_context, input_json, execution_context);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
@@ -206,19 +207,108 @@ pub(crate) fn build_pending_tool_approval(
     }
 }
 
-/// Builds the approval cache key for a tool call.
+/// Builds the approval cache subject for a tool call.
 ///
 /// The skill id is part of the subject so a session-scoped approval granted
 /// to one skill never silently covers the same tool used by another skill.
+/// OS-file calls additionally include a fingerprint of the requested
+/// operation, paths, and content-affecting inputs so a session approval for one
+/// local file operation cannot cover a different OS path or mutation.
 pub(crate) fn build_tool_approval_subject_id(
     tool_name: &str,
     skill_context: Option<&ToolSkillContext>,
+    input_json: &[u8],
 ) -> String {
-    if let Some(skill_context) = skill_context {
-        format!("tool:{tool_name}|skill:{}", skill_context.skill_id())
-    } else {
-        format!("tool:{tool_name}")
+    let mut subject_id = format!("tool:{tool_name}");
+    if tool_name == OS_FILE_TOOL_NAME {
+        subject_id.push_str("|os_file:");
+        subject_id.push_str(os_file_approval_fingerprint(input_json).as_str());
     }
+    if let Some(skill_context) = skill_context {
+        subject_id.push_str("|skill:");
+        subject_id.push_str(skill_context.skill_id());
+    }
+    subject_id
+}
+
+fn os_file_approval_fingerprint(input_json: &[u8]) -> String {
+    let payload = match serde_json::from_slice::<Value>(input_json) {
+        Ok(Value::Object(payload)) => os_file_approval_fingerprint_payload(&payload),
+        _ => json!({ "raw_sha256": sha256_hex(input_json) }),
+    };
+    let operation = payload
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(safe_subject_component)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let payload_json = serde_json::to_vec(&payload).unwrap_or_else(|_| input_json.to_vec());
+    format!("{operation}:{}", sha256_hex(payload_json.as_slice()))
+}
+
+fn os_file_approval_fingerprint_payload(payload: &Map<String, Value>) -> Value {
+    json!({
+        "operation": normalized_string_field(payload, "operation"),
+        "path": normalized_string_field(payload, "path"),
+        "target_path": normalized_string_field(payload, "target_path"),
+        "content": os_file_content_fingerprint(payload),
+        "create_parent_dirs": copied_json_field(payload, "create_parent_dirs"),
+        "overwrite": copied_json_field(payload, "overwrite"),
+        "full_replace": copied_json_field(payload, "full_replace"),
+        "dry_run": copied_json_field(payload, "dry_run"),
+        "offset_bytes": copied_json_field(payload, "offset_bytes"),
+        "max_bytes": copied_json_field(payload, "max_bytes"),
+        "query": normalized_string_field(payload, "query"),
+        "case_sensitive": copied_json_field(payload, "case_sensitive"),
+        "max_entries": copied_json_field(payload, "max_entries"),
+        "max_matches": copied_json_field(payload, "max_matches"),
+    })
+}
+
+fn os_file_content_fingerprint(payload: &Map<String, Value>) -> Value {
+    if let Some(content_text) = payload.get("content_text").and_then(Value::as_str) {
+        return json!({ "kind": "content_text", "sha256": sha256_hex(content_text.as_bytes()) });
+    }
+    if let Some(bytes_base64) = payload.get("bytes_base64").and_then(Value::as_str) {
+        return json!({ "kind": "bytes_base64", "sha256": sha256_hex(bytes_base64.as_bytes()) });
+    }
+    Value::Null
+}
+
+fn normalized_string_field(payload: &Map<String, Value>, field: &str) -> Value {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| json!(value))
+        .unwrap_or(Value::Null)
+}
+
+fn copied_json_field(payload: &Map<String, Value>, field: &str) -> Value {
+    payload.get(field).cloned().unwrap_or(Value::Null)
+}
+
+fn safe_subject_component(raw: &str) -> String {
+    let component = raw
+        .chars()
+        .take(64)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if component.is_empty() {
+        "unknown".to_owned()
+    } else {
+        component
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Classifies the approval subject; browser tools are audited as browser
@@ -705,6 +795,74 @@ mod tests {
             ApprovalSubjectType::BrowserAction
         );
         assert_eq!(approval_subject_type_for_tool("palyra.process.run"), ApprovalSubjectType::Tool);
+    }
+
+    #[test]
+    fn os_file_approval_subject_scopes_cache_to_operation_and_path() {
+        let stat_subject = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"stat","path":"/tmp/palyra/harmless.txt"}"#,
+        );
+        let read_same_path_subject = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"read","path":"/tmp/palyra/harmless.txt"}"#,
+        );
+        let read_other_path_subject = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"read","path":"/tmp/palyra/secrets.txt"}"#,
+        );
+
+        assert!(stat_subject.starts_with("tool:palyra.fs.os_file|os_file:stat:"));
+        assert!(read_same_path_subject.starts_with("tool:palyra.fs.os_file|os_file:read:"));
+        assert_ne!(
+            stat_subject, read_same_path_subject,
+            "approving a harmless stat must not cache approval for a read of the same path"
+        );
+        assert_ne!(
+            read_same_path_subject, read_other_path_subject,
+            "approving one OS file path must not cache approval for another path"
+        );
+        assert!(
+            !read_same_path_subject.contains("harmless.txt"),
+            "subject ids should not expose raw local path components"
+        );
+    }
+
+    #[test]
+    fn os_file_approval_subject_scopes_write_cache_to_content_hash() {
+        let first_write = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"write","path":"/tmp/palyra/config.txt","content_text":"first"}"#,
+        );
+        let second_write = build_tool_approval_subject_id(
+            OS_FILE_TOOL_NAME,
+            None,
+            br#"{"operation":"write","path":"/tmp/palyra/config.txt","content_text":"second"}"#,
+        );
+
+        assert!(first_write.starts_with("tool:palyra.fs.os_file|os_file:write:"));
+        assert_ne!(
+            first_write, second_write,
+            "session-scoped write approval must be bound to the approved content hash"
+        );
+    }
+
+    #[test]
+    fn non_os_file_approval_subjects_remain_tool_and_skill_scoped() {
+        let skill_context =
+            ToolSkillContext::new("acme.audit".to_owned(), Some("1.0.0".to_owned()));
+        assert_eq!(
+            build_tool_approval_subject_id(
+                PROCESS_RUNNER_TOOL_NAME,
+                Some(&skill_context),
+                br#"{"command":"cargo","args":["test"]}"#,
+            ),
+            "tool:palyra.process.run|skill:acme.audit"
+        );
     }
 
     #[test]
