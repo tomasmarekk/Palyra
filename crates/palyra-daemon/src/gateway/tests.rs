@@ -58,12 +58,13 @@ use super::{
     matching_tool_approval_response_id, process_runner_input_should_use_active_root,
     process_runner_input_should_use_launch_root, process_runner_input_with_path_env,
     process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
-    resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
-    workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
-    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig, ProviderRequest, RequestContext, ToolApprovalOutcome,
-    APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL,
-    HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+    process_runner_workspace_roots_within_configured_root, resolve_cron_job_channel_for_create,
+    tool_approval_response_proposal_id, workspace_patch_metrics_from_output,
+    CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
+    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest,
+    RequestContext, ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS,
+    CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
+    MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
 use crate::application::run_stream::orchestration::{
@@ -196,11 +197,6 @@ fn process_runner_input_preserves_explicit_active_root_paths() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspace_cwd() {
-    let mut tool_call = default_test_tool_call_config();
-    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
-    tool_call.process_runner.enabled = true;
-    tool_call.process_runner.workspace_root = PathBuf::from(".");
-    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let tempdir = tempfile::tempdir().expect("workspace root should be created");
     let workspace = tempdir.path().join("workspace");
     let reports = workspace.join("reports");
@@ -210,6 +206,12 @@ async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspac
     let workspace =
         fs::canonicalize(workspace.as_path()).expect("workspace root should canonicalize");
     let reports = fs::canonicalize(reports.as_path()).expect("reports root should canonicalize");
+
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = workspace.clone();
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
 
     state
         .create_agent(AgentCreateRequest {
@@ -280,6 +282,61 @@ async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspac
         workspace,
         "generic /workspace process cwd must use launch root, not reports focus {reports:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() {
+    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let configured = tempdir.path().join("configured-process-root");
+    let agent_workspace = tempdir.path().join("agent-workspace");
+    fs::create_dir_all(configured.as_path()).expect("configured root should exist");
+    fs::create_dir_all(agent_workspace.as_path()).expect("agent root should exist");
+    let configured =
+        fs::canonicalize(configured.as_path()).expect("configured root should canonicalize");
+    let agent_workspace =
+        fs::canonicalize(agent_workspace.as_path()).expect("agent root should canonicalize");
+
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = configured.clone();
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "process-configured-root".to_owned(),
+            display_name: "Process Configured Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![agent_workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FK1",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FK2",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+
+    let config = process_runner_tool_config_for_session(
+        &state,
+        context,
+        br#"{"command":"node","args":["calculator.test.js"]}"#,
+    )
+    .await;
+
+    assert_eq!(config.process_runner.workspace_root, configured);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -439,7 +496,7 @@ fn process_runner_input_keeps_explicit_env_over_launch_path_env() {
 }
 
 #[test]
-fn process_runner_workspace_root_defaults_to_agent_workspace() {
+fn process_runner_workspace_root_does_not_default_to_agent_workspace() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let configured = tempdir.path().join("configured-process-root");
     let agent_workspace = tempdir.path().join("agent-workspace");
@@ -449,10 +506,26 @@ fn process_runner_workspace_root_defaults_to_agent_workspace() {
     let selected = process_runner_workspace_root_for_input(
         br#"{"command":"node","args":["calculator.test.js"]}"#,
         &[agent_workspace.clone(), configured],
-    )
-    .expect("workspace root should be selected");
+    );
 
-    assert_eq!(selected, agent_workspace);
+    assert_eq!(selected, None);
+}
+
+#[test]
+fn process_runner_workspace_roots_stay_inside_configured_root() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let configured = tempdir.path().join("configured-process-root");
+    let nested = configured.join("nested-agent-workspace");
+    let sibling_agent_workspace = tempdir.path().join("agent-workspace");
+    fs::create_dir_all(nested.as_path()).expect("nested root should exist");
+    fs::create_dir_all(sibling_agent_workspace.as_path()).expect("agent root should exist");
+
+    let scoped = process_runner_workspace_roots_within_configured_root(
+        configured.as_path(),
+        &[sibling_agent_workspace, nested.clone()],
+    );
+
+    assert_eq!(scoped, vec![nested, configured]);
 }
 
 #[test]
