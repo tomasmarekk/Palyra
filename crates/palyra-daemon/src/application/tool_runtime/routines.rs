@@ -853,16 +853,14 @@ async fn upsert_routine(
         optional_string_field(payload, "owner_principal").as_deref(),
         context.principal.as_str(),
     )?;
-    let channel = normalize_channel(
-        optional_string_field(payload, "channel").as_deref(),
-        context.channel.as_deref(),
-    );
-    let enabled = optional_bool_field(payload, "enabled")?.unwrap_or(true);
     let existing_job =
         runtime_state.cron_job(routine_id.clone()).await.map_err(sanitize_status_message)?;
     if let Some(job) = existing_job.as_ref() {
         ensure_job_owner(job, context.principal.as_str())?;
     }
+    let channel =
+        resolve_upsert_channel(payload, existing_job.as_ref(), context.channel.as_deref());
+    let enabled = resolve_upsert_enabled(payload, existing_job.as_ref())?;
     let existing_metadata = if existing_job.is_some() {
         Some(
             runtime
@@ -2860,6 +2858,28 @@ fn normalize_channel(requested: Option<&str>, fallback_channel: Option<&str>) ->
         .unwrap_or_else(|| DEFAULT_ROUTINE_CHANNEL.to_owned())
 }
 
+fn resolve_upsert_channel(
+    payload: &Map<String, Value>,
+    existing_job: Option<&CronJobRecord>,
+    fallback_channel: Option<&str>,
+) -> String {
+    match existing_job {
+        Some(job) if !payload.contains_key("channel") => job.channel.clone(),
+        _ => normalize_channel(
+            optional_string_field(payload, "channel").as_deref(),
+            fallback_channel,
+        ),
+    }
+}
+
+fn resolve_upsert_enabled(
+    payload: &Map<String, Value>,
+    existing_job: Option<&CronJobRecord>,
+) -> Result<bool, String> {
+    Ok(optional_bool_field(payload, "enabled")?
+        .unwrap_or_else(|| existing_job.is_none_or(|job| job.enabled)))
+}
+
 fn normalize_optional_workdir(value: Option<String>) -> Result<Option<String>, String> {
     let Some(workdir) =
         value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
@@ -3635,6 +3655,68 @@ mod tests {
         assert_eq!(trigger_kind, RoutineTriggerKind::Schedule);
         assert!(!requested);
         assert!(super::resolve_upsert_trigger_kind(&payload, None).is_err());
+    }
+
+    #[test]
+    fn resolve_upsert_lifecycle_preserves_existing_job_for_partial_update() {
+        let mut existing_job = test_cron_job(false, Some(123_456), false);
+        existing_job.channel = "private:incident-room".to_owned();
+        let payload = json!({
+            "operation": "upsert",
+            "routine_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "prompt": "updated prompt",
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let channel = super::resolve_upsert_channel(&payload, Some(&existing_job), Some("cli"));
+        let enabled = super::resolve_upsert_enabled(&payload, Some(&existing_job))
+            .expect("omitted enabled should preserve existing job state");
+
+        assert_eq!(channel, "private:incident-room");
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn resolve_upsert_lifecycle_honors_explicit_partial_update_values() {
+        let mut existing_job = test_cron_job(false, Some(123_456), false);
+        existing_job.channel = "private:incident-room".to_owned();
+        let payload = json!({
+            "operation": "upsert",
+            "routine_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "channel": "cli",
+            "enabled": true,
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let channel =
+            super::resolve_upsert_channel(&payload, Some(&existing_job), Some("system:context"));
+        let enabled = super::resolve_upsert_enabled(&payload, Some(&existing_job))
+            .expect("explicit enabled should parse");
+
+        assert_eq!(channel, "cli");
+        assert!(enabled);
+    }
+
+    #[test]
+    fn resolve_upsert_lifecycle_uses_create_defaults_for_new_routine() {
+        let payload = json!({
+            "operation": "upsert",
+            "name": "heartbeat",
+        })
+        .as_object()
+        .expect("payload should be an object")
+        .clone();
+
+        let channel = super::resolve_upsert_channel(&payload, None, Some("cli"));
+        let enabled = super::resolve_upsert_enabled(&payload, None)
+            .expect("omitted enabled should default for new routines");
+
+        assert_eq!(channel, "cli");
+        assert!(enabled);
     }
 
     #[test]
