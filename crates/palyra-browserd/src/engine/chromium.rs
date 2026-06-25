@@ -4239,7 +4239,15 @@ pub(crate) async fn click_with_chromium(
 
         match attempt {
             Ok(ClickAttempt::Clicked { download_like, opened_window }) => {
-                let new_tab_count = match chromium_sync_session_tabs(runtime, session_id).await {
+                let new_tab_count = match chromium_sync_session_tabs_after_click(
+                    runtime,
+                    session_id,
+                    opened_window,
+                    started,
+                    timeout_ms,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return ChromiumActionOutcome {
@@ -4312,6 +4320,48 @@ pub(crate) async fn click_with_chromium(
         )
         .await,
         attempts,
+    }
+}
+
+async fn chromium_sync_session_tabs_after_click(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    opened_window: bool,
+    started: Instant,
+    timeout_ms: u64,
+) -> Result<u32, String> {
+    let first_sync_count = chromium_sync_session_tabs(runtime, session_id).await?;
+    if first_sync_count > 0 || !opened_window {
+        return Ok(first_sync_count);
+    }
+
+    let click_timeout = Duration::from_millis(timeout_ms);
+    let popup_sync_max_wait_ms = u64::try_from(CHROMIUM_NEW_TAB_MAX_ATTEMPTS)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(CHROMIUM_NEW_TAB_RETRY_DELAY_MS);
+    let popup_sync_timeout = Duration::from_millis(timeout_ms.min(popup_sync_max_wait_ms));
+    let popup_sync_started = Instant::now();
+    loop {
+        // `window.open` can return before Chromium exposes the new CDP target,
+        // especially on slower Windows runners.
+        if started.elapsed() >= click_timeout || popup_sync_started.elapsed() >= popup_sync_timeout
+        {
+            return Ok(0);
+        }
+        let click_remaining_ms = timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+        let popup_remaining_ms = popup_sync_timeout
+            .saturating_sub(popup_sync_started.elapsed())
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let remaining_ms = click_remaining_ms.min(popup_remaining_ms);
+        let sleep_ms = CHROMIUM_NEW_TAB_RETRY_DELAY_MS.min(remaining_ms.max(1));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+        let new_tab_count = chromium_sync_session_tabs(runtime, session_id).await?;
+        if new_tab_count > 0 {
+            return Ok(new_tab_count);
+        }
     }
 }
 
