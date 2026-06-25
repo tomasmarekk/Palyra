@@ -1472,6 +1472,20 @@ mod tests {
 
     static OS_FILE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    fn os_file_tempdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("os-file-tests");
+        fs::create_dir_all(base.as_path()).expect("os-file temp base should exist");
+        let base = fs::canonicalize(base.as_path()).expect("os-file temp base should canonicalize");
+        tempfile::Builder::new()
+            .prefix("os-file-")
+            .tempdir_in(base)
+            .expect("os-file tempdir should be created")
+    }
+
     struct ScopedEnvVar {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -1529,7 +1543,7 @@ mod tests {
 
     #[test]
     fn os_file_write_and_read_absolute_user_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("os-level").join("reports").join("outside-report.md");
 
@@ -1586,7 +1600,7 @@ mod tests {
 
     #[test]
     fn os_file_write_ignores_empty_bytes_base64_when_content_text_is_present() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("reports").join("text-write.md");
 
@@ -1621,7 +1635,7 @@ mod tests {
 
     #[test]
     fn os_file_write_ignores_empty_content_text_when_bytes_base64_is_present() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("reports").join("binary-write.bin");
 
@@ -1655,7 +1669,7 @@ mod tests {
 
     #[test]
     fn os_file_write_rejects_existing_file_without_full_replace_intent() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("notes").join("customer-note.md");
         fs::create_dir_all(target.parent().expect("target parent")).expect("parent dir");
@@ -1731,7 +1745,7 @@ mod tests {
 
     #[test]
     fn os_file_move_accepts_workspace_relative_target_path() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let workspace = tempdir.path().join("workspace");
         let os_root = tempdir.path().join("os-root");
         let inbox = os_root.join("downloads").join("inbox");
@@ -1783,7 +1797,7 @@ mod tests {
 
     #[test]
     fn os_file_copy_rejects_workspace_relative_symlink_target_escape() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let workspace = tempdir.path().join("workspace");
         let os_root = tempdir.path().join("os-root");
         let inbox = os_root.join("downloads").join("inbox");
@@ -1851,7 +1865,7 @@ mod tests {
 
     #[test]
     fn os_file_read_expands_launch_context_env_path_prefixes() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let os_root = tempdir.path().join("os-root");
         let inbox = os_root.join("downloads").join("inbox");
         fs::create_dir_all(inbox.as_path()).expect("inbox should exist");
@@ -1907,7 +1921,7 @@ mod tests {
 
     #[test]
     fn os_file_env_path_suffix_must_stay_relative_to_expanded_root() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let canonical_root = fs::canonicalize(tempdir.path()).expect("tempdir should canonicalize");
         let mut policy = test_policy(tempdir.path());
         policy.path_env.insert("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root);
@@ -1920,7 +1934,7 @@ mod tests {
     fn os_file_read_rejects_daemon_process_env_path_prefixes() {
         let _guard =
             OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let secret_path = tempdir.path().join("application_default_credentials.json");
         fs::write(secret_path.as_path(), "credential_file_contents=do-not-read\n")
             .expect("credential fixture should exist");
@@ -1959,7 +1973,7 @@ mod tests {
 
     #[test]
     fn os_file_read_expands_launch_context_path_env_without_process_env() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let e2e_home = tempdir.path().join("S090-home");
         let config_dir = e2e_home.join(".config").join("palyra-e2e");
         fs::create_dir_all(config_dir.as_path()).expect("config dir should be created");
@@ -2006,7 +2020,7 @@ mod tests {
 
     #[test]
     fn os_file_read_redacts_provider_key_values() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("settings.toml");
         fs::write(
@@ -2068,7 +2082,7 @@ mod tests {
 
     #[test]
     fn os_file_read_preserves_benign_auth_session_storage_key() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("app.js");
         let contents = "const sessionKey = \"s058-auth-session\";\n\
@@ -2105,7 +2119,7 @@ mod tests {
 
     #[test]
     fn os_file_read_preserves_public_password_fixture_values() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("Dockerfile");
         let contents = "ENV PASSWORD=password1\nRUN echo password\n";
@@ -2140,8 +2154,8 @@ mod tests {
 
     #[test]
     fn os_file_rejects_path_outside_workspace_and_user_roots() {
-        let allowed_root = tempfile::tempdir().expect("allowed root should be created");
-        let outside_root = tempfile::tempdir().expect("outside root should be created");
+        let allowed_root = os_file_tempdir();
+        let outside_root = os_file_tempdir();
         let workspace = allowed_root.path().join("workspace");
         let outside = outside_root.path().join("outside").join("report.md");
         fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
@@ -2182,7 +2196,7 @@ mod tests {
 
     #[test]
     fn os_file_unrestricted_allows_filesystem_root_stat() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let filesystem_root = tempdir
             .path()
             .ancestors()
@@ -2219,7 +2233,7 @@ mod tests {
 
     #[test]
     fn os_file_delete_empty_dir_removes_only_empty_directories() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let non_empty = tempdir.path().join("scratch").join("non-empty");
         fs::create_dir_all(non_empty.as_path()).expect("non-empty dir should exist");
@@ -2281,8 +2295,8 @@ mod tests {
     fn os_file_configured_roots_replace_implicit_user_profile_root() {
         let _guard =
             OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
-        let configured_root = tempfile::tempdir().expect("configured root should be created");
-        let real_home_root = tempfile::tempdir().expect("real home root should be created");
+        let configured_root = os_file_tempdir();
+        let real_home_root = os_file_tempdir();
         let _configured = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_root.path());
         let _userprofile = ScopedEnvVar::set("USERPROFILE", real_home_root.path());
         let _home = ScopedEnvVar::set("HOME", real_home_root.path());
@@ -2308,7 +2322,7 @@ mod tests {
     fn os_file_user_roots_do_not_auto_allow_system_drive_var_tmp() {
         let _guard =
             OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let profile_root = tempdir.path().join("profile");
         let temp_root = tempdir.path().join("temp");
         fs::create_dir_all(profile_root.as_path()).expect("profile root should exist");
@@ -2344,7 +2358,7 @@ mod tests {
 
     #[test]
     fn os_file_dry_run_does_not_write() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let target = tempdir.path().join("reports").join("dry-run.md");
 
@@ -2375,7 +2389,7 @@ mod tests {
 
     #[test]
     fn os_file_lists_and_searches_user_cache_paths() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         let cache_dir = tempdir.path().join(".cache").join("palyra").join("memory");
         fs::create_dir_all(cache_dir.as_path()).expect("cache dir should be created");
@@ -2449,7 +2463,7 @@ mod tests {
 
     #[test]
     fn os_file_search_default_budget_scans_past_one_thousand_files() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = os_file_tempdir();
         let policy = test_policy(tempdir.path());
         for index in 0..1_050 {
             fs::write(tempdir.path().join(format!("noise-{index:04}.txt")), "noise\n")

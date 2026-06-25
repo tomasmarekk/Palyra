@@ -197,7 +197,7 @@ fn process_runner_input_preserves_explicit_active_root_paths() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspace_cwd() {
-    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let workspace = tempdir.path().join("workspace");
     let reports = workspace.join("reports");
     fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
@@ -286,7 +286,7 @@ async fn process_runner_prefers_launch_workspace_over_reports_focus_for_workspac
 
 #[tokio::test(flavor = "multi_thread")]
 async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() {
-    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("configured-process-root");
     let agent_workspace = tempdir.path().join("agent-workspace");
     fs::create_dir_all(configured.as_path()).expect("configured root should exist");
@@ -342,7 +342,7 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_reports_focus() {
     let state = build_test_runtime_state(false);
-    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let workspace = tempdir.path().join("workspace");
     let reports = workspace.join("reports");
     fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
@@ -435,7 +435,7 @@ async fn workspace_list_dir_prefers_launch_root_for_top_level_discovery_over_rep
 
 #[test]
 fn process_runner_input_inherits_launch_path_env_when_missing() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let e2e_home = tempdir.path().join("home");
     let e2e_os_root = tempdir.path().join("os-root");
     fs::create_dir_all(e2e_home.as_path()).expect("home root should exist");
@@ -466,7 +466,7 @@ fn process_runner_input_inherits_launch_path_env_when_missing() {
 
 #[test]
 fn process_runner_input_keeps_explicit_env_over_launch_path_env() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let launch_home = tempdir.path().join("launch-home");
     let explicit_home = tempdir.path().join("explicit-home");
     fs::create_dir_all(launch_home.as_path()).expect("launch home root should exist");
@@ -497,7 +497,7 @@ fn process_runner_input_keeps_explicit_env_over_launch_path_env() {
 
 #[test]
 fn process_runner_workspace_root_does_not_default_to_agent_workspace() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("configured-process-root");
     let agent_workspace = tempdir.path().join("agent-workspace");
     fs::create_dir_all(configured.as_path()).expect("configured root should exist");
@@ -513,7 +513,7 @@ fn process_runner_workspace_root_does_not_default_to_agent_workspace() {
 
 #[test]
 fn process_runner_workspace_roots_stay_inside_configured_root() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let configured = tempdir.path().join("configured-process-root");
     let nested = configured.join("nested-agent-workspace");
     let sibling_agent_workspace = tempdir.path().join("agent-workspace");
@@ -530,7 +530,7 @@ fn process_runner_workspace_roots_stay_inside_configured_root() {
 
 #[test]
 fn process_runner_workspace_root_follows_absolute_cwd_inside_agent_root() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let first_root = tempdir.path().join("first");
     let second_root = tempdir.path().join("second");
     let project = second_root.join("e2e-cli-file-workflow");
@@ -552,7 +552,7 @@ fn process_runner_workspace_root_follows_absolute_cwd_inside_agent_root() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn process_runner_cwd_does_not_persist_focus_for_followup_workspace_tools() {
-    let tempdir = tempfile::tempdir().expect("workspace root should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let app = tempdir.path().join("app");
     let repo = app.join("repo");
     fs::create_dir_all(repo.as_path()).expect("repo dir should exist");
@@ -681,8 +681,25 @@ fn unique_temp_journal_path() -> PathBuf {
         .expect("system time should be after unix epoch")
         .as_nanos();
     let counter = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
+    gateway_test_temp_base()
         .join(format!("palyra-gateway-unit-{nonce}-{}-{counter}.sqlite3", std::process::id()))
+}
+
+fn gateway_test_temp_base() -> PathBuf {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("gateway-tests");
+    fs::create_dir_all(base.as_path()).expect("gateway test temp base should exist");
+    fs::canonicalize(base.as_path()).expect("gateway test temp base should canonicalize")
+}
+
+fn gateway_tempdir(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(gateway_test_temp_base())
+        .expect("gateway tempdir should be created")
 }
 
 fn read_http_request(stream: &mut TcpStream) {
@@ -894,11 +911,7 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
     tool_call: crate::tool_protocol::ToolCallConfig,
 ) -> std::sync::Arc<GatewayRuntimeState> {
     let db_path = unique_temp_journal_path();
-    let state_root = std::env::temp_dir().join(format!(
-        "palyra-gateway-unit-state-{}-{}",
-        std::process::id(),
-        TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let state_root = unique_temp_test_root("palyra-gateway-unit-state");
     let identity_root = state_root.join("identity");
     let agent_registry = crate::agents::AgentRegistry::open(identity_root.as_path())
         .expect("agent registry should initialize");
@@ -1025,7 +1038,7 @@ fn configure_model_provider_replaces_live_status_snapshot() {
 }
 
 fn unique_temp_test_root(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    gateway_test_temp_base().join(format!(
         "{prefix}-{}-{}",
         std::process::id(),
         TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -3072,7 +3085,7 @@ async fn memory_auto_inject_adds_active_project_workspace_memory_to_fresh_sessio
     let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FE6";
     let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FE7";
 
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let project_root = tempdir.path().join("S079-project-A");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
@@ -4464,7 +4477,7 @@ fn cleanup_resource_registry_deduplicates_and_drains_by_run() {
 
 #[test]
 fn cleanup_stale_pid_files_removes_only_matching_pid_artifacts() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let root = tempdir.path().join("os-root");
     let pid_dir = root.join("pids");
     let log_dir = root.join("logs");
@@ -6886,7 +6899,7 @@ async fn memory_search_tool_all_scope_uses_active_project_workspace_prefix() {
     let context = routines_tool_test_context();
     let marker = "PALYRA_ACTIVE_PROJECT_ALL_SCOPE_MARKER";
 
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let project_root = tempdir.path().join("project-a");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
@@ -7145,7 +7158,7 @@ async fn memory_search_tool_workspace_scope_uses_active_project_prefix_by_defaul
     let context = routines_tool_test_context();
     let marker = "PALYRA_ACTIVE_PROJECT_WORKSPACE_SCOPE_MARKER";
 
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let project_root = tempdir.path().join("project-a");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
@@ -7552,8 +7565,7 @@ async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
 
-    let configured_root =
-        tempfile::tempdir().expect("configured OS root fixture should be created");
+    let configured_root = gateway_tempdir("gateway-");
     let _configured_os_roots = ScopedEnvVar::set("PALYRA_OS_FILE_ROOTS", configured_root.path());
 
     let workspace_root = std::env::current_dir()
@@ -7623,7 +7635,7 @@ async fn project_memory_defaults_to_launch_workspace_prefix() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
 
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let tempdir = gateway_tempdir("gateway-");
     let project_root = tempdir.path().join("client-portal");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
@@ -8852,7 +8864,7 @@ async fn workspace_patch_tool_applies_patch_and_emits_attested_hashes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_patch_tool_preserves_subdirectory_path_under_active_scenario_workspace() {
     let state = build_test_runtime_state(false);
-    let harness_root = tempfile::tempdir().expect("harness root should be created");
+    let harness_root = gateway_tempdir("gateway-");
     let scenario_workspace =
         harness_root.path().join("e2e-scenarios").join("S040").join("workspace");
     let reports_dir = scenario_workspace.join("reports");

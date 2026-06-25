@@ -4054,9 +4054,24 @@ mod tests {
         assert_eq!(normalized, Some("/workspace/project".to_owned()));
     }
 
+    fn routine_workdir_tempdir() -> tempfile::TempDir {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("routine-workdir-tests");
+        std::fs::create_dir_all(base.as_path()).expect("routine workdir temp base should exist");
+        let base = std::fs::canonicalize(base.as_path())
+            .expect("routine workdir temp base should canonicalize");
+        tempfile::Builder::new()
+            .prefix("routine-workdir-")
+            .tempdir_in(base)
+            .expect("routine workdir tempdir should be created")
+    }
+
     #[tokio::test]
     async fn schedule_workdir_defaults_to_launch_workspace_for_new_agent_routine_when_omitted() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
@@ -4075,7 +4090,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_empty_schedule_workdir_remains_unset() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
@@ -4094,7 +4109,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_workdir_preserves_existing_job_when_omitted() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
@@ -4113,7 +4128,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_schedule_without_workdir_stays_unset_when_omitted() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
@@ -4132,7 +4147,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_workspace_alias_workdir_maps_to_launch_workspace() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
 
         let workdir = super::resolve_routine_workdir_from_launch_context(
@@ -4151,7 +4166,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_workspace_child_workdir_maps_existing_subdirectory() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let reports = tempdir.path().join("reports");
         std::fs::create_dir_all(reports.as_path()).expect("reports directory should exist");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
@@ -4174,7 +4189,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_relative_workdir_maps_existing_launch_subdirectory() {
-        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let tempdir = routine_workdir_tempdir();
         let project = tempdir.path().join("project");
         std::fs::create_dir_all(project.as_path()).expect("project directory should exist");
         let launch_root = std::fs::canonicalize(tempdir.path()).expect("launch root should exist");
