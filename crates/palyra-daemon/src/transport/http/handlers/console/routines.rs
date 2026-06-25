@@ -1710,6 +1710,27 @@ async fn ensure_routine_approval_requested(
     })
 }
 
+/// Authorizes a console principal to resolve a routine approval before the
+/// approval record is mutated.
+///
+/// # Errors
+/// Returns permission-denied when the approval principal or routine owner does
+/// not match the authenticated console principal, or a mapped runtime error.
+pub(crate) async fn authorize_routine_approval_decision(
+    state: &AppState,
+    approval: &ApprovalRecord,
+    principal: &str,
+) -> Result<(), Response> {
+    if approval.subject_type != ApprovalSubjectType::Tool {
+        return Ok(());
+    }
+    let Some((routine_id, _)) = parse_routine_approval_subject(approval.subject_id.as_str()) else {
+        return Ok(());
+    };
+    ensure_routine_approval_principal(approval, principal)?;
+    ensure_routine_approval_job_owner(state, routine_id.as_str(), principal).await
+}
+
 /// Applies the side effect of an allowed routine approval: re-enables a
 /// before-enable routine or schedules the first run of a before-first-run
 /// routine. Invoked by the approvals handler after a decision is recorded.
@@ -1718,11 +1739,13 @@ async fn ensure_routine_approval_requested(
 /// non-tool subjects, or foreign subject ids).
 ///
 /// # Errors
-/// Returns permission-denied when the routines automation feature flag is
-/// disabled, or a mapped runtime/registry error response.
+/// Returns permission-denied when the approval principal or routine owner does
+/// not match the authenticated console principal, when the routines automation
+/// feature flag is disabled, or when a runtime/registry operation fails.
 pub(crate) async fn apply_routine_approval_decision(
     state: &AppState,
     approval: &ApprovalRecord,
+    principal: &str,
 ) -> Result<Option<Value>, Response> {
     if !matches!(approval.decision, Some(ApprovalDecision::Allow))
         || approval.subject_type != ApprovalSubjectType::Tool
@@ -1733,20 +1756,48 @@ pub(crate) async fn apply_routine_approval_decision(
     else {
         return Ok(None);
     };
+    ensure_routine_approval_principal(approval, principal)?;
     match mode {
         RoutineApprovalMode::BeforeEnable => {
-            apply_before_enable_routine_approval(state, routine_id.as_str()).await
+            apply_before_enable_routine_approval(state, routine_id.as_str(), principal).await
         }
         RoutineApprovalMode::BeforeFirstRun => {
-            apply_before_first_run_routine_approval(state, routine_id.as_str()).await
+            apply_before_first_run_routine_approval(state, routine_id.as_str(), principal).await
         }
         RoutineApprovalMode::None => Ok(None),
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn ensure_routine_approval_principal(
+    approval: &ApprovalRecord,
+    principal: &str,
+) -> Result<(), Response> {
+    if approval.principal != principal {
+        return Err(runtime_status_response(tonic::Status::permission_denied(
+            "routine approval principal mismatch for authenticated principal",
+        )));
+    }
+    Ok(())
+}
+
+async fn ensure_routine_approval_job_owner(
+    state: &AppState,
+    routine_id: &str,
+    principal: &str,
+) -> Result<(), Response> {
+    let Some(job) =
+        state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
+    else {
+        return Ok(());
+    };
+    ensure_job_owner(&job, principal)
+}
+
 async fn apply_before_enable_routine_approval(
     state: &AppState,
     routine_id: &str,
+    principal: &str,
 ) -> Result<Option<Value>, Response> {
     let Some(job) =
         state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
@@ -1756,6 +1807,7 @@ async fn apply_before_enable_routine_approval(
             "routine_id": routine_id,
         })));
     };
+    ensure_job_owner(&job, principal)?;
     require_routines_automation_enabled_for_write(state, true)?;
     let next_run_at_unix_ms = cron::next_run_at_for_enabled_state(
         &job,
@@ -1783,6 +1835,7 @@ async fn apply_before_enable_routine_approval(
 async fn apply_before_first_run_routine_approval(
     state: &AppState,
     routine_id: &str,
+    principal: &str,
 ) -> Result<Option<Value>, Response> {
     let Some(job) =
         state.runtime.cron_job(routine_id.to_owned()).await.map_err(runtime_status_response)?
@@ -1792,6 +1845,7 @@ async fn apply_before_first_run_routine_approval(
             "routine_id": routine_id,
         })));
     };
+    ensure_job_owner(&job, principal)?;
     if !job.enabled {
         return routine_approval_apply_outcome(state, "routine_disabled", &job);
     }

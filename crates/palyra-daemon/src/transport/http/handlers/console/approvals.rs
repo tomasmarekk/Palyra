@@ -102,6 +102,22 @@ pub(crate) async fn console_approval_decision_handler(
                 "denied_by_console".to_owned()
             }
         });
+    let pending = state
+        .runtime
+        .approval_record(approval_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "approval record not found: {approval_id}"
+            )))
+        })?;
+    super::routines::authorize_routine_approval_decision(
+        &state,
+        &pending,
+        session.context.principal.as_str(),
+    )
+    .await?;
     let resolved = state
         .runtime
         .resolve_approval_record(journal::ApprovalResolveRequest {
@@ -153,8 +169,12 @@ pub(crate) async fn console_approval_decision_handler(
     } else {
         None
     };
-    let routine_outcome =
-        super::routines::apply_routine_approval_decision(&state, &resolved).await?;
+    let routine_outcome = super::routines::apply_routine_approval_decision(
+        &state,
+        &resolved,
+        session.context.principal.as_str(),
+    )
+    .await?;
     let forwarded_to_console_chat = sync_console_chat_approval_to_stream(&state, &resolved).await;
     if !forwarded_to_console_chat {
         crate::application::approvals::record_approval_resolved_journal_event(

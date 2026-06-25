@@ -2025,6 +2025,137 @@ fn console_routine_approval_allow_enables_pending_routine() -> Result<()> {
 }
 
 #[test]
+fn console_routine_approval_decision_rejects_non_owner_principal() -> Result<()> {
+    let (child, admin_port) =
+        spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .context("failed to build HTTP client")?;
+    let (owner_cookie, owner_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let (auditor_cookie, auditor_csrf_token) =
+        login_console_session(&client, admin_port, CONSOLE_AUDITOR_PRINCIPAL)?;
+    client
+        .post(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/access/features/routines_automation"
+        ))
+        .header("Cookie", owner_cookie.clone())
+        .header("x-palyra-csrf-token", owner_csrf_token.clone())
+        .json(&serde_json::json!({
+            "enabled": true,
+            "stage": "test",
+        }))
+        .send()
+        .context("failed to enable routines automation for owner-boundary approval test")?
+        .error_for_status()
+        .context("routines automation feature enable returned non-success status")?;
+
+    let created = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/routines"))
+        .header("Cookie", owner_cookie.clone())
+        .header("x-palyra-csrf-token", owner_csrf_token.clone())
+        .json(&serde_json::json!({
+            "name": "approval-owner-boundary-routine",
+            "prompt": "approval owner boundary validation",
+            "trigger_kind": "schedule",
+            "schedule_type": "every",
+            "every_interval_ms": 1000,
+            "enabled": true,
+            "channel": "web",
+        }))
+        .send()
+        .context("failed to create owner-boundary approval routine")?
+        .error_for_status()
+        .context("owner-boundary approval routine create returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary approval routine create response json")?;
+    let routine_id = created
+        .pointer("/routine/routine_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("owner-boundary approval create missing routine id"))?;
+    let approval_id = created
+        .pointer("/approval/approval_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("owner-boundary approval create missing approval id"))?;
+    assert_eq!(
+        created.pointer("/routine/enabled").and_then(Value::as_bool),
+        Some(false),
+        "approval-gated routine should stay disabled until its owner approves it"
+    );
+
+    let forbidden = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/approvals/{approval_id}/decision"))
+        .header("Cookie", auditor_cookie)
+        .header("x-palyra-csrf-token", auditor_csrf_token)
+        .json(&serde_json::json!({
+            "approved": true,
+            "decision_scope": "once",
+        }))
+        .send()
+        .context("failed to decide owner-boundary routine approval as non-owner principal")?;
+    assert_eq!(
+        forbidden.status().as_u16(),
+        403,
+        "routine approval decision must reject a non-owner principal before resolving approval"
+    );
+
+    let approval_after_forbidden = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/approvals/{approval_id}"))
+        .header("Cookie", owner_cookie.clone())
+        .send()
+        .context("failed to fetch owner-boundary approval after forbidden decision")?
+        .error_for_status()
+        .context("owner-boundary approval fetch returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary approval response json")?;
+    assert!(
+        approval_after_forbidden.pointer("/approval/decision").is_none(),
+        "forbidden non-owner decision must not mutate the pending approval"
+    );
+
+    let routine_after_forbidden = client
+        .get(format!("http://127.0.0.1:{admin_port}/console/v1/routines/{routine_id}"))
+        .header("Cookie", owner_cookie.clone())
+        .send()
+        .context("failed to fetch owner-boundary routine after forbidden decision")?
+        .error_for_status()
+        .context("owner-boundary routine fetch returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner-boundary routine response json")?;
+    assert_eq!(
+        routine_after_forbidden.pointer("/routine/enabled").and_then(Value::as_bool),
+        Some(false),
+        "forbidden non-owner decision must not enable the routine"
+    );
+
+    let approved = client
+        .post(format!("http://127.0.0.1:{admin_port}/console/v1/approvals/{approval_id}/decision"))
+        .header("Cookie", owner_cookie)
+        .header("x-palyra-csrf-token", owner_csrf_token)
+        .json(&serde_json::json!({
+            "approved": true,
+            "decision_scope": "once",
+        }))
+        .send()
+        .context("failed to decide owner-boundary routine approval as owner principal")?
+        .error_for_status()
+        .context("owner routine approval decision returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse owner routine approval decision response json")?;
+    assert_eq!(
+        approved.pointer("/routine/action").and_then(Value::as_str),
+        Some("enabled"),
+        "owner decision should still apply the routine approval"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_routine_test_run_preserves_disabled_and_before_first_run_gates() -> Result<()> {
     let (child, admin_port) =
         spawn_palyrad_with_dynamic_ports_with_env(&[("PALYRA_ADMIN_REQUIRE_AUTH", "false")])?;
