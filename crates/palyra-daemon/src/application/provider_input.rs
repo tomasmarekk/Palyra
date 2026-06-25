@@ -255,7 +255,7 @@ pub(crate) async fn build_memory_augmented_prompt(
         return Ok(prompt_input_text.to_owned());
     }
 
-    let query_variants = build_memory_query_variants(memory_query_text);
+    let query_variants = build_memory_auto_inject_query_variants(memory_query_text);
     let search_hits = match search_memory_for_auto_inject(
         runtime_state,
         context,
@@ -345,7 +345,21 @@ pub(crate) fn curated_memory_sources_for_prompt_context() -> Vec<MemorySource> {
     vec![MemorySource::Manual, MemorySource::Import]
 }
 
-/// Expands a memory query into up to [`MAX_MEMORY_QUERY_VARIANTS`] variants.
+/// Builds the memory search variants allowed for automatic prompt injection.
+///
+/// Auto-inject is default-on and sends selected snippets to the model provider,
+/// so it only searches the user's original prompt text. Broader heuristic
+/// expansion remains available to explicit recall flows.
+fn build_memory_auto_inject_query_variants(query: &str) -> Vec<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![trimmed.to_owned()]
+    }
+}
+
+/// Expands an explicit memory query into up to [`MAX_MEMORY_QUERY_VARIANTS`] variants.
 ///
 /// Variants improve lexical recall: the raw query, a normalized form, a
 /// stopword-free keyword form, and domain-specific expansions (UI testing,
