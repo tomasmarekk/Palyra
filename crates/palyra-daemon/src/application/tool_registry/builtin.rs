@@ -1171,6 +1171,13 @@ fn browser_tool_schema(tool_name: &str) -> Value {
         }
         "palyra.browser.reload" => {
             properties.push((
+                "expected_url",
+                json!({
+                    "type":"string",
+                    "description":"Required active tab URL expected to be reloaded. Obtain it from palyra.browser.tabs.list or palyra.browser.session.create output and copy it exactly so approval shows the destination and runtime can fail closed if the active tab changed."
+                }),
+            ));
+            properties.push((
                 "allow_private_targets",
                 json!({
                     "type":"boolean",
@@ -1185,6 +1192,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "max_redirects",
                 json!({"type":"integer","minimum":0,"description":"Maximum redirects for reload navigation. Defaults to 3."}),
             ));
+            required.push("expected_url");
         }
         "palyra.browser.click" | "palyra.browser.highlight" => {
             properties.push((
@@ -1421,6 +1429,27 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("since_unix_ms should explain its boundary usage");
         assert!(description.contains("click/reload/action boundary"));
+    }
+
+    #[test]
+    fn browser_reload_registry_requires_approval_visible_expected_url() {
+        let reload = registry_entry("palyra.browser.reload").expect("reload entry exists");
+        let required = reload
+            .input_schema
+            .pointer("/required")
+            .and_then(serde_json::Value::as_array)
+            .expect("reload required fields should be present");
+
+        assert!(required.iter().any(|value| value.as_str() == Some("session_id")));
+        assert!(required.iter().any(|value| value.as_str() == Some("expected_url")));
+        assert!(reload.input_schema.pointer("/properties/url").is_none());
+        let expected_url_description = reload
+            .input_schema
+            .pointer("/properties/expected_url/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("reload expected_url description should be visible to models");
+        assert!(expected_url_description.contains("approval shows the destination"));
+        assert!(expected_url_description.contains("fail closed"));
     }
 
     #[test]

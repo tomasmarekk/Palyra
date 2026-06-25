@@ -263,6 +263,27 @@ fn browser_url_uses_file_scheme(raw_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn browser_reload_expected_url_from_payload(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<String, String> {
+    let Some(expected_url) = payload.get("expected_url").and_then(Value::as_str).map(str::trim)
+    else {
+        return Err(
+            "palyra.browser.reload requires expected_url so approval shows the reload destination"
+                .to_owned(),
+        );
+    };
+    if expected_url.is_empty() || expected_url.chars().any(char::is_control) {
+        return Err(
+            "palyra.browser.reload expected_url must be a non-empty URL without control characters"
+                .to_owned(),
+        );
+    }
+    Url::parse(expected_url)
+        .map_err(|error| format!("palyra.browser.reload expected_url is invalid: {error}"))?;
+    Ok(expected_url.to_owned())
+}
+
 /// Parses the optional `profile_id` field of `session.create`.
 ///
 /// # Errors
@@ -1604,11 +1625,23 @@ pub(crate) async fn execute_browser_tool(
                 ),
             }
         }
-        // browserd has no native reload RPC: reload reads the active tab URL
-        // via get_session and re-navigates it, re-applying the same file-URL
-        // and private-target checks as a fresh navigation.
+        // browserd has no native reload RPC: reload binds an approval-visible
+        // expected_url to the active tab URL, then re-navigates it with the
+        // same file-URL and private-target checks as a fresh navigation.
         BROWSER_RELOAD_TOOL_NAME => {
             let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let expected_url = match browser_reload_expected_url_from_payload(&payload) {
                 Ok(value) => value,
                 Err(error) => {
                     return browser_tool_execution_outcome(
@@ -1708,6 +1741,23 @@ pub(crate) async fn execute_browser_tool(
                     );
                 }
             };
+            if current_url != expected_url {
+                let output = json!({
+                    "success": false,
+                    "session_id": session_id,
+                    "expected_url": redact_url(expected_url.as_str()),
+                    "active_url": redact_url(current_url.as_str()),
+                    "error": "active_tab_url_mismatch",
+                });
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                    "palyra.browser.reload expected_url does not match the active tab URL"
+                        .to_owned(),
+                );
+            }
             if let Err(error) = validate_browser_file_url_workspace_scope(
                 runtime_state,
                 context,
@@ -5122,17 +5172,18 @@ mod tests {
         browser_cookie_domain_to_json, browser_element_captures_to_json, browser_file_url_to_path,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
-        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
-        browser_session_closed_output_json, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
-        browser_tool_execution_outcome, browser_tool_reports_missing_session,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
-        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, filter_browser_network_log_entries_since,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_workspace_relative_path,
-        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        browser_reload_expected_url_from_payload, browser_screenshot_image_observation_hint,
+        browser_session_closed_error_message, browser_session_closed_output_json,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_storage_origin_to_json, browser_tool_execution_outcome,
+        browser_tool_reports_missing_session, browser_tool_requires_open_session,
+        browser_url_targets_loopback, browser_user_owned_os_roots,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
         BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
@@ -5502,6 +5553,38 @@ mod tests {
             ),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn browser_reload_expected_url_requires_visible_destination() {
+        let missing = json!({});
+        let error = browser_reload_expected_url_from_payload(
+            missing.as_object().expect("payload should be an object"),
+        )
+        .expect_err("reload expected_url should be required");
+        assert!(error.contains("requires expected_url"));
+
+        let control_character = json!({"expected_url": "https://example.test/\u{7}admin"});
+        let error = browser_reload_expected_url_from_payload(
+            control_character.as_object().expect("payload should be an object"),
+        )
+        .expect_err("control characters should be rejected");
+        assert!(error.contains("without control characters"));
+
+        let invalid_url = json!({"expected_url": "not a url"});
+        let error = browser_reload_expected_url_from_payload(
+            invalid_url.as_object().expect("payload should be an object"),
+        )
+        .expect_err("malformed URLs should be rejected");
+        assert!(error.contains("expected_url is invalid"));
+
+        let visible_destination =
+            json!({"expected_url": "https://example.test/dashboard?nonce=approval-visible"});
+        let expected_url = browser_reload_expected_url_from_payload(
+            visible_destination.as_object().expect("payload should be an object"),
+        )
+        .expect("valid expected_url should parse");
+        assert_eq!(expected_url, "https://example.test/dashboard?nonce=approval-visible");
     }
 
     #[test]

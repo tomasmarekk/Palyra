@@ -796,6 +796,24 @@ mod tests {
     }
 
     #[test]
+    fn browser_reload_approval_exposes_expected_url_destination() {
+        let config = test_tool_call_config("palyra.browser.reload");
+        let input = br#"{"session_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_url":"http://127.0.0.1:8080/admin/export?nonce=approval-visible","allow_private_targets":true}"#;
+
+        let pending =
+            build_pending_tool_approval("palyra.browser.reload", None, input, &config, None);
+
+        assert!(pending.request_summary.contains("expected_url"));
+        assert!(pending.request_summary.contains("127.0.0.1:8080/admin/export"));
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        assert_eq!(
+            details_json.pointer("/input_json/expected_url").and_then(Value::as_str),
+            Some("http://127.0.0.1:8080/admin/export?nonce=approval-visible")
+        );
+    }
+
+    #[test]
     fn workspace_patch_approval_embeds_rollback_path_context() {
         let config = test_tool_call_config(WORKSPACE_PATCH_TOOL_NAME);
         let pending = build_pending_tool_approval(
