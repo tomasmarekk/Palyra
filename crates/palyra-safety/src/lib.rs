@@ -835,6 +835,19 @@ fn scan_secret_material(text: &str, normalized: &str, findings: &mut Vec<SafetyF
                 },
             );
         }
+        if let Some(comparison) = detect_sensitive_comparison(trimmed) {
+            push_unique_finding(
+                findings,
+                SafetyFinding {
+                    code: format!("secret_leak.assignment.{}", comparison.classification),
+                    category: SafetyFindingCategory::SecretLeak,
+                    risk_kind: SafetyRiskKind::Exfiltration,
+                    severity: SafetySeverity::High,
+                    message: "content exposes credential-like comparison data".to_owned(),
+                    redacted_evidence: format!("{} comparison", comparison.classification),
+                },
+            );
+        }
         if let Some(token_kind) = detect_prefixed_secret_token(trimmed) {
             push_unique_finding(
                 findings,
@@ -889,6 +902,87 @@ fn detect_sensitive_header(line: &str, lowered: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SensitiveComparison {
+    classification: &'static str,
+    separator_index: usize,
+}
+
+fn detect_sensitive_comparison(line: &str) -> Option<SensitiveComparison> {
+    for (operator_start, operator_len, separator_index) in comparison_operators(line) {
+        let key = assignment_key_identifier(line.get(..operator_start)?)?;
+        let classification = classify_sensitive_assignment_key(key.as_str())?;
+        let value = line.get(operator_start + operator_len..)?.trim();
+        if comparison_value_requires_redaction(classification, value) {
+            return Some(SensitiveComparison { classification, separator_index });
+        }
+    }
+    None
+}
+
+fn comparison_operators(line: &str) -> Vec<(usize, usize, usize)> {
+    let mut operators = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if let Some((operator_len, separator_index)) = comparison_operator_at(line, index) {
+            operators.push((index, operator_len, separator_index));
+        }
+    }
+    operators
+}
+
+fn comparison_operator_at(line: &str, index: usize) -> Option<(usize, usize)> {
+    let rest = line.get(index..)?;
+    if rest.starts_with("===") || rest.starts_with("!==") {
+        Some((3, index + 2))
+    } else if rest.starts_with("==") || rest.starts_with("!=") {
+        Some((2, index + 1))
+    } else {
+        None
+    }
+}
+
+fn comparison_value_requires_redaction(classification: &str, value: &str) -> bool {
+    let Some(literal) = comparison_literal_value(value) else {
+        return false;
+    };
+    if literal.is_empty()
+        || is_benign_mock_credential_fixture_value(literal)
+        || is_obvious_placeholder_secret_value(literal)
+    {
+        return false;
+    }
+    if classification == "token" {
+        return bare_token_assignment_value_requires_redaction(literal);
+    }
+    if classification == "key" {
+        return generic_key_assignment_value_looks_secret(literal);
+    }
+    true
+}
+
+fn comparison_literal_value(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let quote = value.chars().next().filter(|ch| matches!(ch, '"' | '\'' | '`'))?;
+    let (closing_index, _) = find_closing_quote(value, quote)?;
+    Some(&value[quote.len_utf8()..closing_index])
 }
 
 /// Returns the classification of a credential-like `key = value` /
@@ -2235,6 +2329,9 @@ fn redact_sensitive_header_or_assignment(line: &str) -> String {
             return redact_value_after_separator(line, separator);
         }
     }
+    if let Some(comparison) = detect_sensitive_comparison(line) {
+        return redact_value_after_separator(line, comparison.separator_index);
+    }
     line.to_owned()
 }
 
@@ -3371,6 +3468,61 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn credential_comparison_literals_are_redacted_for_export() {
+        let source = "if (password === \"CorrectHorseBatteryStaple\") { login(); }\n\
+                      if (apiKey == \"prod-api-key-value\") { connect(); }\n\
+                      if (token !== \"palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\") { rotate(); }";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("password === \"[REDACTED_SECRET]\""));
+        assert!(outcome.redacted_text.contains("apiKey == \"[REDACTED_SECRET]\""));
+        assert!(outcome.redacted_text.contains("token !== \"[REDACTED_SECRET]\""));
+        assert!(!outcome.redacted_text.contains("CorrectHorseBatteryStaple"));
+        assert!(!outcome.redacted_text.contains("prod-api-key-value"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_access_token"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+    }
+
+    #[test]
+    fn credential_comparison_literals_block_prompt_assembly() {
+        let outcome = transform_text_for_prompt(
+            "if (password === \"CorrectHorseBatteryStaple\") { login(); }",
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.blocked);
+        assert_eq!(outcome.scan.recommended_action, SafetyAction::Block);
+        assert!(!outcome.transformed_text.contains("CorrectHorseBatteryStaple"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
     }
 
     #[test]
