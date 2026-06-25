@@ -547,9 +547,11 @@ async fn read_browser_upload_file(
 /// Resolves an upload `file_path` to a canonical path inside the allowed
 /// roots.
 ///
-/// Resolution order: env-prefixed paths expand first, absolute paths must
-/// fall inside workspace roots, approved user-owned OS roots, or launch env
-/// roots, and relative paths are confined to the first workspace root.
+/// Resolution order: launch-env-prefixed paths expand first, absolute paths
+/// must fall inside workspace roots, approved user-owned OS roots, or launch
+/// env roots, and relative paths are confined to the first workspace root.
+/// Uploads intentionally do not fall back to daemon process env because those
+/// variables commonly point at credential files.
 /// Protected OS locations are denied regardless of root membership.
 fn resolve_browser_upload_path(
     file_path: &str,
@@ -562,6 +564,7 @@ fn resolve_browser_upload_path(
         "file_path",
         file_path,
         path_env,
+        BrowserPathEnvFallback::LaunchOnly,
     )?
     .unwrap_or_else(|| PathBuf::from(file_path));
     let resolved = if requested.is_absolute() {
@@ -707,9 +710,14 @@ fn resolve_browser_output_path(
     path_env: &BTreeMap<String, PathBuf>,
     user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let requested =
-        expand_browser_env_prefixed_path(tool_name, "output_path", output_path, path_env)?
-            .unwrap_or_else(|| PathBuf::from(output_path));
+    let requested = expand_browser_env_prefixed_path(
+        tool_name,
+        "output_path",
+        output_path,
+        path_env,
+        BrowserPathEnvFallback::ProcessEnv,
+    )?
+    .unwrap_or_else(|| PathBuf::from(output_path));
     let allowed_roots = if requested.is_absolute() {
         browser_absolute_path_allowed_roots(workspace_roots, user_owned_roots, path_env)
     } else {
@@ -749,16 +757,25 @@ fn browser_absolute_path_allowed_roots(
     roots
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserPathEnvFallback {
+    LaunchOnly,
+    ProcessEnv,
+}
+
 /// Expands a `%VAR%`, `${VAR}`, or `$VAR` prefix into an absolute base path.
 ///
 /// Run-launch-context variables take precedence over process env so harness
 /// or CLI launches can hand the agent approved roots without baking machine
-/// paths into tool inputs. Returns `Ok(None)` when `path` has no env prefix.
+/// paths into tool inputs. Callers that read local bytes must use
+/// [`BrowserPathEnvFallback::LaunchOnly`] to avoid expanding process-level
+/// secret locator variables. Returns `Ok(None)` when `path` has no env prefix.
 fn expand_browser_env_prefixed_path(
     tool_name: &str,
     field_name: &str,
     path: &str,
     path_env: &BTreeMap<String, PathBuf>,
+    fallback: BrowserPathEnvFallback,
 ) -> Result<Option<PathBuf>, String> {
     let Some((key, suffix)) = browser_path_env_prefix(tool_name, field_name, path)? else {
         return Ok(None);
@@ -766,9 +783,21 @@ fn expand_browser_env_prefixed_path(
     let base = if let Some(value) = path_env.get(key) {
         value.clone()
     } else {
-        std::env::var_os(key).filter(|value| !value.is_empty()).map(PathBuf::from).ok_or_else(
-            || format!("{tool_name} {field_name} references unset environment variable `{key}`"),
-        )?
+        match fallback {
+            BrowserPathEnvFallback::LaunchOnly => {
+                return Err(format!(
+                    "{tool_name} {field_name} references unset launch environment variable `{key}`"
+                ));
+            }
+            BrowserPathEnvFallback::ProcessEnv => std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    format!(
+                        "{tool_name} {field_name} references unset environment variable `{key}`"
+                    )
+                })?,
+        }
     };
     if !base.is_absolute() {
         return Err(format!(
@@ -5573,6 +5602,40 @@ mod tests {
         .expect("env-prefixed upload file should resolve inside launch OS root");
 
         assert_eq!(resolved, canonical_upload);
+    }
+
+    #[test]
+    fn browser_upload_path_rejects_process_env_prefix_without_launch_env_root() {
+        let _guard = BROWSER_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("browser env lock should not be poisoned");
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let home = temp.path().join("home");
+        let credentials_dir = home.join(".aws");
+        std::fs::create_dir_all(credentials_dir.as_path())
+            .expect("credential directory should exist");
+        let credentials_file = credentials_dir.join("credentials");
+        std::fs::write(credentials_file.as_path(), "aws_access_key_id=SECRET\n")
+            .expect("credential file should exist");
+        let _credential_locator =
+            ScopedEnvVar::set("AWS_SHARED_CREDENTIALS_FILE", credentials_file.as_path());
+        let canonical_home = home.canonicalize().expect("home should canonicalize");
+
+        let error = resolve_browser_upload_path(
+            "$AWS_SHARED_CREDENTIALS_FILE",
+            &[],
+            &BTreeMap::new(),
+            &[canonical_home],
+        )
+        .expect_err("browser upload must not expand daemon process env locators");
+
+        assert!(
+            error.contains(
+                "palyra.browser.upload file_path references unset launch environment variable `AWS_SHARED_CREDENTIALS_FILE`"
+            ),
+            "unexpected upload path error: {error}"
+        );
     }
 
     #[test]
