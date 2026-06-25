@@ -51,6 +51,7 @@ use windows_sys::Win32::{
 };
 
 use palyra_common::{
+    default_state_root,
     process_risk::{
         classify_process_run, ProcessRiskClass, ProcessRiskContext, ProcessRiskReport,
         TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS,
@@ -6295,7 +6296,7 @@ fn configure_tier_b_process_environment(
         command,
         process_command,
         policy.workspace_root.as_path(),
-    );
+    )?;
     configure_node_runtime_environment(command);
     Ok(())
 }
@@ -6307,7 +6308,7 @@ fn configure_host_access_process_environment(
     workspace_root: &Path,
 ) -> Result<(), SandboxProcessRunError> {
     configure_host_access_safe_environment(command, workspace_root)?;
-    configure_workspace_python_environment(command, process_command, workspace_root);
+    configure_workspace_python_environment(command, process_command, workspace_root)?;
     if !is_palyra_cli_program(program) {
         return Ok(());
     }
@@ -6433,14 +6434,15 @@ fn configure_workspace_python_environment(
     command: &mut Command,
     process_command: &str,
     workspace_root: &Path,
-) {
-    let Some(environment) = workspace_python_environment(process_command, workspace_root) else {
-        return;
+) -> Result<(), SandboxProcessRunError> {
+    let Some(environment) = workspace_python_environment(process_command, workspace_root)? else {
+        return Ok(());
     };
     command
         .env("PYTHONUSERBASE", environment.user_base)
         .env("PIP_CACHE_DIR", environment.pip_cache)
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1");
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6452,25 +6454,27 @@ struct WorkspacePythonEnvironment {
 fn workspace_python_environment(
     process_command: &str,
     workspace_root: &Path,
-) -> Option<WorkspacePythonEnvironment> {
+) -> Result<Option<WorkspacePythonEnvironment>, SandboxProcessRunError> {
     if !is_python_runtime_command(process_command) {
-        return None;
+        return Ok(None);
     }
 
-    let environment_root = process_runner_python_environment_root(workspace_root);
-    Some(WorkspacePythonEnvironment {
+    let environment_root = process_runner_python_environment_root(workspace_root)?;
+    Ok(Some(WorkspacePythonEnvironment {
         user_base: environment_root.join(PYTHON_USER_BASE_DIR),
         pip_cache: environment_root.join(PIP_CACHE_DIR),
-    })
+    }))
 }
 
-fn process_runner_python_environment_root(workspace_root: &Path) -> PathBuf {
+fn process_runner_python_environment_root(
+    workspace_root: &Path,
+) -> Result<PathBuf, SandboxProcessRunError> {
     let workspace_key = process_runner_workspace_cache_key(workspace_root);
-    join_relative_components(
-        process_runner_runtime_root().as_path(),
+    Ok(join_relative_components(
+        process_runner_runtime_root()?.as_path(),
         PROCESS_RUNNER_PYTHON_ENV_RELATIVE_PATH,
     )
-    .join(workspace_key)
+    .join(workspace_key))
 }
 
 fn process_runner_child_temp_root(
@@ -6478,7 +6482,7 @@ fn process_runner_child_temp_root(
 ) -> Result<PathBuf, SandboxProcessRunError> {
     let workspace_key = process_runner_workspace_cache_key(workspace_root);
     let temp_root = join_relative_components(
-        process_runner_runtime_root().as_path(),
+        process_runner_runtime_root()?.as_path(),
         PROCESS_RUNNER_TEMP_RELATIVE_PATH,
     )
     .join(workspace_key);
@@ -6492,12 +6496,22 @@ fn process_runner_child_temp_root(
     Ok(temp_root)
 }
 
-fn process_runner_runtime_root() -> PathBuf {
-    std::env::var_os(PALYRA_STATE_ROOT_ENV)
+fn process_runner_runtime_root() -> Result<PathBuf, SandboxProcessRunError> {
+    if let Some(state_root) = std::env::var_os(PALYRA_STATE_ROOT_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .map(|path| child_process_path(path.as_path()))
-        .unwrap_or_else(|| std::env::temp_dir().join("palyra-process-runner"))
+    {
+        return Ok(state_root);
+    }
+    default_state_root()
+        .map(|path| child_process_path(path.as_path()))
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.run could not resolve a safe state root for process-runner runtime state: {error}; set {PALYRA_STATE_ROOT_ENV}"
+            ),
+        })
 }
 
 fn process_runner_workspace_cache_key(workspace_root: &Path) -> String {
@@ -9443,6 +9457,7 @@ mod tests {
         let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
 
         let environment = super::workspace_python_environment("python", workspace.as_path())
+            .expect("python environment should resolve under state root")
             .expect("python commands should receive workspace-local Python environment");
 
         let expected_root = super::join_relative_components(
@@ -9490,15 +9505,57 @@ mod tests {
     }
 
     #[test]
+    fn process_runner_runtime_root_falls_back_to_default_state_root_not_shared_temp() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let default_root_base = unique_temp_dir("state-root-fallback-base");
+        fs::create_dir_all(default_root_base.as_path()).expect("default state base should exist");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, "");
+        #[cfg(windows)]
+        let _local_appdata = ScopedEnvVar::set("LOCALAPPDATA", default_root_base.as_os_str());
+        #[cfg(not(windows))]
+        let _xdg_state_home = ScopedEnvVar::set("XDG_STATE_HOME", default_root_base.as_os_str());
+
+        let runtime_root =
+            super::process_runner_runtime_root().expect("default state root should resolve");
+        let shared_temp_fallback = std::env::temp_dir().join("palyra-process-runner");
+
+        assert!(
+            runtime_root.starts_with(default_root_base.as_path()),
+            "runtime_root={}",
+            runtime_root.display()
+        );
+        assert!(
+            !runtime_root.starts_with(shared_temp_fallback.as_path()),
+            "runtime root must not use predictable shared temp fallback: {}",
+            runtime_root.display()
+        );
+        let _ = fs::remove_dir_all(default_root_base.as_path());
+    }
+
+    #[test]
     fn workspace_python_environment_covers_pip_and_versioned_python_commands() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let state_root = unique_temp_dir("state-python-command-detection");
+        let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
+
         for command in ["python", "python3", "python3.14", "py", "pip", "pip3"] {
             assert!(
-                super::workspace_python_environment(command, Path::new("workspace-root")).is_some(),
+                super::workspace_python_environment(command, Path::new("workspace-root"))
+                    .expect("python environment should resolve")
+                    .is_some(),
                 "{command} should be treated as a Python runtime command"
             );
         }
         assert!(
-            super::workspace_python_environment("npm", Path::new("workspace-root")).is_none(),
+            super::workspace_python_environment("npm", Path::new("workspace-root"))
+                .expect("non-Python command should not require state root")
+                .is_none(),
             "non-Python commands should not receive Python-specific environment"
         );
     }
