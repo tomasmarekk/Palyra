@@ -1289,26 +1289,300 @@ fn is_dom_input_value_reference(value: &str) -> bool {
         || normalized.starts_with('\'')
         || normalized.starts_with('`')
         || normalized.is_empty()
+        || has_top_level_reference_operator(normalized)
     {
         return false;
     }
-    let compact = normalized.replace(char::is_whitespace, "");
-    if compact.starts_with("document.querySelector(")
-        || compact.starts_with("document.getElementById(")
-        || compact.starts_with("document.forms[")
-        || compact.starts_with("formData.get(")
-        || compact.starts_with("newFormData(")
-        || compact.starts_with("URLSearchParams(")
-        || compact.starts_with("newURLSearchParams(")
-    {
-        return true;
+    let Some(compact) = compact_reference_expression(normalized) else {
+        return false;
+    };
+    is_document_dom_value_reference(compact.as_str())
+        || is_form_data_get_reference(compact.as_str())
+        || is_url_search_params_get_reference(compact.as_str())
+        || is_simple_dom_value_member_reference(compact.as_str())
+}
+
+fn compact_reference_expression(value: &str) -> Option<String> {
+    let mut compact = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if let Some(active_quote) = quote {
+            compact.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '`' {
+            return None;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            compact.push(ch);
+        } else if !ch.is_whitespace() {
+            compact.push(ch);
+        }
     }
-    compact.ends_with(".value")
-        || compact.ends_with("?.value")
-        || compact.ends_with(".textContent")
-        || compact.ends_with("?.textContent")
-        || compact.ends_with(".innerText")
-        || compact.ends_with("?.innerText")
+    quote.is_none().then_some(compact)
+}
+
+fn has_top_level_reference_operator(value: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '`' {
+            return true;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            ')' => {
+                let Some(next_depth) = paren_depth.checked_sub(1) else {
+                    return true;
+                };
+                paren_depth = next_depth;
+            }
+            ']' => {
+                let Some(next_depth) = bracket_depth.checked_sub(1) else {
+                    return true;
+                };
+                bracket_depth = next_depth;
+            }
+            '}' => {
+                let Some(next_depth) = brace_depth.checked_sub(1) else {
+                    return true;
+                };
+                brace_depth = next_depth;
+            }
+            _ => {}
+        }
+        if paren_depth != 0 || bracket_depth != 0 || brace_depth != 0 {
+            continue;
+        }
+        match ch {
+            '?' if chars.peek().is_some_and(|next| *next != '.') => return true,
+            '|' if chars.peek().is_some_and(|next| *next == '|') => return true,
+            '&' if chars.peek().is_some_and(|next| *next == '&') => return true,
+            '=' | '+' | '-' | '*' | '/' | '%' | '<' | '>' | '!' | ',' | ':' => return true,
+            _ => {}
+        }
+    }
+    quote.is_some() || paren_depth != 0 || bracket_depth != 0 || brace_depth != 0
+}
+
+fn is_document_dom_value_reference(value: &str) -> bool {
+    ["document.querySelector(", "document.getElementById("].iter().any(|prefix| {
+        let Some((argument, suffix)) = split_prefixed_call(value, prefix) else {
+            return false;
+        };
+        is_safe_dom_lookup_argument(argument) && is_dom_value_leaf_suffix(suffix)
+    })
+}
+
+fn is_form_data_get_reference(value: &str) -> bool {
+    if let Some((argument, suffix)) = split_prefixed_call(value, "formData.get(") {
+        return suffix.is_empty() && is_safe_dom_field_argument(argument);
+    }
+    let Some((argument, suffix)) = split_prefixed_call(value, "newFormData(") else {
+        return false;
+    };
+    if !is_safe_dom_source_argument(argument) {
+        return false;
+    }
+    let Some((argument, suffix)) = split_prefixed_call(suffix, ".get(") else {
+        return false;
+    };
+    suffix.is_empty() && is_safe_dom_field_argument(argument)
+}
+
+fn is_url_search_params_get_reference(value: &str) -> bool {
+    ["URLSearchParams(", "newURLSearchParams("].iter().any(|prefix| {
+        let Some((argument, suffix)) = split_prefixed_call(value, prefix) else {
+            return false;
+        };
+        if !is_safe_url_search_params_source_argument(argument) {
+            return false;
+        }
+        let Some((argument, suffix)) = split_prefixed_call(suffix, ".get(") else {
+            return false;
+        };
+        suffix.is_empty() && is_safe_dom_field_argument(argument)
+    })
+}
+
+fn is_simple_dom_value_member_reference(value: &str) -> bool {
+    let Some(base) = strip_dom_value_leaf_suffix(value) else {
+        return false;
+    };
+    if base.is_empty() || base.contains('(') || base.contains(')') {
+        return false;
+    }
+    let literals = quoted_string_literals(base);
+    if base.chars().any(|ch| matches!(ch, '"' | '\'')) && literals.is_empty() {
+        return false;
+    }
+    literals.iter().all(|literal| is_safe_dom_field_literal(literal))
+        && base.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '$' | '.' | '?' | '[' | ']' | '"' | '\'' | '-')
+        })
+        && (base.contains('.') || base.contains(']'))
+}
+
+fn split_prefixed_call<'a>(value: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    if !value.starts_with(prefix) {
+        return None;
+    }
+    let open_index = prefix.len().checked_sub(1)?;
+    let close_index = matching_delimiter_index(value, open_index, '(', ')')?;
+    Some((&value[prefix.len()..close_index], &value[close_index + 1..]))
+}
+
+fn matching_delimiter_index(
+    value: &str,
+    open_index: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices().skip_while(|(index, _)| *index < open_index) {
+        if index == open_index {
+            if ch != open {
+                return None;
+            }
+            depth = 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch == open {
+            depth = depth.saturating_add(1);
+        } else if ch == close {
+            let next_depth = depth.checked_sub(1)?;
+            depth = next_depth;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn is_dom_value_leaf_suffix(value: &str) -> bool {
+    matches!(
+        value,
+        ".value" | "?.value" | ".textContent" | "?.textContent" | ".innerText" | "?.innerText"
+    )
+}
+
+fn strip_dom_value_leaf_suffix(value: &str) -> Option<&str> {
+    ["?.textContent", ".textContent", "?.innerText", ".innerText", "?.value", ".value"]
+        .iter()
+        .find_map(|suffix| value.strip_suffix(suffix))
+}
+
+fn is_safe_dom_lookup_argument(value: &str) -> bool {
+    is_safe_single_dom_argument(value, DomArgumentKind::Lookup)
+}
+
+fn is_safe_dom_field_argument(value: &str) -> bool {
+    is_safe_single_dom_argument(value, DomArgumentKind::FieldName)
+}
+
+fn is_safe_dom_source_argument(value: &str) -> bool {
+    is_safe_single_dom_argument(value, DomArgumentKind::Source)
+}
+
+fn is_safe_url_search_params_source_argument(value: &str) -> bool {
+    is_safe_single_dom_argument(value, DomArgumentKind::UrlSearchParamsSource)
+}
+
+#[derive(Clone, Copy)]
+enum DomArgumentKind {
+    Lookup,
+    FieldName,
+    Source,
+    UrlSearchParamsSource,
+}
+
+fn is_safe_single_dom_argument(value: &str, kind: DomArgumentKind) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || has_top_level_reference_operator(trimmed) {
+        return false;
+    }
+    let literals = quoted_string_literals(trimmed);
+    if trimmed.chars().any(|ch| matches!(ch, '"' | '\'')) && literals.is_empty() {
+        return false;
+    }
+    literals.iter().all(|literal| match kind {
+        DomArgumentKind::Lookup => is_safe_dom_lookup_literal(literal),
+        DomArgumentKind::FieldName => is_safe_dom_field_literal(literal),
+        DomArgumentKind::Source => is_safe_dom_source_literal(literal),
+        DomArgumentKind::UrlSearchParamsSource => literal.is_empty(),
+    })
+}
+
+fn is_safe_dom_lookup_literal(value: &str) -> bool {
+    value.len() <= 256
+        && !contains_secret_like_marker(value)
+        && detect_prefixed_secret_token(value).is_none()
+        && value.chars().all(|ch| !ch.is_control())
+}
+
+fn is_safe_dom_field_literal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('=')
+        && !contains_secret_like_marker(value)
+        && detect_prefixed_secret_token(value).is_none()
+        && value.chars().all(|ch| !ch.is_control())
+}
+
+fn is_safe_dom_source_literal(value: &str) -> bool {
+    value.is_empty()
+        || (value.len() <= 128
+            && !value.contains('=')
+            && !contains_secret_like_marker(value)
+            && detect_prefixed_secret_token(value).is_none()
+            && value.chars().all(|ch| !ch.is_control()))
 }
 
 /// Treats source-shaped values (calls, optional chaining, concatenation) as
@@ -1492,6 +1766,12 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         || looks_like_palyra_e2e_fixture_marker(lowered.as_str())
     {
         return false;
+    }
+    if quoted_string_literals(value).iter().any(|literal| {
+        let literal = literal.trim();
+        !literal.is_empty() && bare_token_assignment_value_looks_secret(literal)
+    }) {
+        return true;
     }
     lowered.contains("secret")
         || lowered.starts_with("bearer")
@@ -2829,6 +3109,55 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn compound_dom_secret_assignments_are_redacted_for_export() {
+        let source =
+            "const password = document.querySelector('#password')?.value || 'prod-password';\n\
+                      const clientSecret = formData.get('client_secret') || 'fallback-secret';\n\
+                      const apiKey = new URLSearchParams('api_key=prod-secret');\n\
+                      const token = input.value ?? 'prod-token-secret';";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        for leaked in ["prod-password", "fallback-secret", "prod-secret", "prod-token-secret"] {
+            assert!(!outcome.redacted_text.contains(leaked));
+        }
+        for code in [
+            "secret_leak.assignment.password",
+            "secret_leak.assignment.client_secret",
+            "secret_leak.assignment.api_key",
+            "secret_leak.assignment.token",
+        ] {
+            assert!(outcome.scan.finding_codes().iter().any(|found| found == code));
+        }
+    }
+
+    #[test]
+    fn compound_dom_secret_assignments_are_blocked_before_prompt() {
+        let source =
+            "const password = document.querySelector('#password')?.value || 'prod-password';";
+        let outcome = transform_text_for_prompt(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.blocked);
+        assert_eq!(outcome.scan.recommended_action, SafetyAction::Block);
+        assert!(!outcome.transformed_text.contains("prod-password"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
     }
 
     #[test]
