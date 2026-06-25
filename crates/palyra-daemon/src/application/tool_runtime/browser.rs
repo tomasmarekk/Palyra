@@ -3965,23 +3965,48 @@ pub(crate) async fn execute_browser_tool(
                     let mut error = response.error.clone();
                     let content_sha256 = hex::encode(Sha256::digest(response.content.as_slice()));
                     let artifact = response.artifact.map(browser_download_artifact_to_json);
+                    let artifact_size_bytes = artifact
+                        .as_ref()
+                        .and_then(|value| value.get("size_bytes"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let mime_type = artifact
                         .as_ref()
                         .and_then(|value| value.get("mime_type"))
                         .and_then(Value::as_str)
                         .unwrap_or("application/octet-stream");
                     let saved_file = if response.success {
-                        match save_browser_output_file_from_payload(
-                            runtime_state,
-                            context,
+                        match browser_output_path_from_payload(
                             &payload,
                             BROWSER_DOWNLOADS_GET_TOOL_NAME,
-                            mime_type,
-                            response.content.as_slice(),
-                        )
-                        .await
-                        {
-                            Ok(saved_file) => saved_file,
+                        ) {
+                            Ok(Some(_)) if response.content_truncated => {
+                                success = false;
+                                error = format!(
+                                    "{BROWSER_DOWNLOADS_GET_TOOL_NAME} cannot write output_path from a truncated download preview (content_bytes={} artifact_size_bytes={} content_limit_bytes={}); increase max_bytes enough to fetch the full artifact, or use the CLI browser downloads save command without a preview cap",
+                                    response.content.len(),
+                                    artifact_size_bytes,
+                                    response.content_limit_bytes
+                                );
+                                None
+                            }
+                            Ok(_) => match save_browser_output_file_from_payload(
+                                runtime_state,
+                                context,
+                                &payload,
+                                BROWSER_DOWNLOADS_GET_TOOL_NAME,
+                                mime_type,
+                                response.content.as_slice(),
+                            )
+                            .await
+                            {
+                                Ok(saved_file) => saved_file,
+                                Err(save_error) => {
+                                    success = false;
+                                    error = save_error;
+                                    None
+                                }
+                            },
                             Err(save_error) => {
                                 success = false;
                                 error = save_error;
@@ -3999,6 +4024,9 @@ pub(crate) async fn execute_browser_tool(
                         "content_base64": STANDARD.encode(response.content.as_slice()),
                         "content_bytes": response.content.len(),
                         "content_sha256": content_sha256,
+                        "content_truncated": response.content_truncated,
+                        "content_offset_bytes": response.content_offset_bytes,
+                        "content_limit_bytes": response.content_limit_bytes,
                     });
                     (
                         success,

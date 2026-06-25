@@ -5,6 +5,7 @@
 //! callers; quarantine is decided by the extension/MIME allowlists at store time.
 
 use crate::*;
+use std::io::Read as _;
 
 /// Metadata for one captured download stored in the session sandbox.
 ///
@@ -24,6 +25,16 @@ pub(crate) struct DownloadArtifactRecord {
     pub(crate) quarantined: bool,
     pub(crate) quarantine_reason: String,
     pub(crate) storage_path: PathBuf,
+}
+
+/// Bounded content read from a stored download artifact.
+#[derive(Debug, Clone)]
+pub(crate) struct DownloadArtifactContent {
+    pub(crate) artifact: DownloadArtifactRecord,
+    pub(crate) content: Vec<u8>,
+    pub(crate) offset_bytes: u64,
+    pub(crate) limit_bytes: u64,
+    pub(crate) truncated: bool,
 }
 
 /// Per-session temp-dir sandbox holding download artifacts under a total byte budget.
@@ -87,20 +98,20 @@ pub(crate) fn download_artifact_to_proto(
     }
 }
 
-/// Loads a stored artifact's bytes, enforcing quarantine and byte caps.
+/// Loads a stored artifact content prefix, enforcing quarantine and byte caps.
 ///
 /// A `max_bytes` of 0 means "use the global cap"; the effective cap never exceeds
 /// `DOWNLOAD_MAX_FILE_BYTES`.
 ///
 /// # Errors
 /// Returns an error string when the sandbox or artifact is missing, the artifact is
-/// quarantined, the content exceeds the cap (before or after reading), or the file read fails.
+/// quarantined, or the file read fails.
 pub(crate) async fn get_download_artifact_content(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     artifact_id: &str,
     max_bytes: u64,
-) -> Result<(DownloadArtifactRecord, Vec<u8>), String> {
+) -> Result<DownloadArtifactContent, String> {
     let max_bytes = if max_bytes == 0 {
         DOWNLOAD_MAX_FILE_BYTES
     } else {
@@ -124,24 +135,29 @@ pub(crate) async fn get_download_artifact_content(
             artifact.artifact_id, artifact.quarantine_reason
         ));
     }
-    if artifact.size_bytes > max_bytes {
-        return Err(format!(
-            "download artifact exceeds max_bytes ({} > {})",
-            artifact.size_bytes, max_bytes
-        ));
-    }
-    let content = fs::read(artifact.storage_path.as_path()).map_err(|error| {
-        format!("failed to read download artifact '{}' from storage: {error}", artifact.artifact_id)
-    })?;
-    // Re-check after the read: the on-disk file is authoritative, not the recorded size.
-    if content.len() as u64 > max_bytes {
-        return Err(format!(
-            "download artifact exceeds max_bytes after read ({} > {})",
-            content.len(),
-            max_bytes
-        ));
-    }
-    Ok((artifact, content))
+    let storage_path = artifact.storage_path.clone();
+    let artifact_id = artifact.artifact_id.clone();
+    let content = tokio::task::spawn_blocking(move || {
+        let file = fs::File::open(storage_path.as_path()).map_err(|error| {
+            format!("failed to read download artifact '{artifact_id}' from storage: {error}")
+        })?;
+        let mut reader = file.take(max_bytes);
+        let mut content = Vec::new();
+        reader.read_to_end(&mut content).map_err(|error| {
+            format!("failed to read download artifact '{artifact_id}' from storage: {error}")
+        })?;
+        Ok::<Vec<u8>, String>(content)
+    })
+    .await
+    .map_err(|error| format!("download artifact read task failed: {error}"))??;
+    let returned_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    Ok(DownloadArtifactContent {
+        truncated: artifact.size_bytes > returned_bytes,
+        artifact,
+        content,
+        offset_bytes: 0,
+        limit_bytes: max_bytes,
+    })
 }
 
 /// Captures the download a click on `selector` would trigger, based on the page snapshot.

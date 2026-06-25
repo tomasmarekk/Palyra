@@ -4270,12 +4270,15 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
         )
         .await
         {
-            Ok((artifact, content)) => Ok(Response::new(browser_v1::GetDownloadArtifactResponse {
+            Ok(artifact_content) => Ok(Response::new(browser_v1::GetDownloadArtifactResponse {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 success: true,
                 error: String::new(),
-                artifact: Some(download_artifact_to_proto(&artifact)),
-                content,
+                artifact: Some(download_artifact_to_proto(&artifact_content.artifact)),
+                content: artifact_content.content,
+                content_truncated: artifact_content.truncated,
+                content_offset_bytes: artifact_content.offset_bytes,
+                content_limit_bytes: artifact_content.limit_bytes,
             })),
             Err(error) => Ok(Response::new(browser_v1::GetDownloadArtifactResponse {
                 v: CANONICAL_PROTOCOL_MAJOR,
@@ -4283,6 +4286,9 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                 error,
                 artifact: None,
                 content: Vec::new(),
+                content_truncated: false,
+                content_offset_bytes: 0,
+                content_limit_bytes: payload.max_bytes,
             })),
         }
     }

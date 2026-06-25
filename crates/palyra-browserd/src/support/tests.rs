@@ -430,6 +430,51 @@ async fn browser_service_get_download_artifact_returns_content() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_get_download_artifact_returns_bounded_prefix_for_large_content() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created.session_id.expect("session id should be present");
+    let content = b"name,score\nalice,9\nbob,8\n";
+    let artifact = store_generated_artifact(
+        runtime.as_ref(),
+        session_id.ulid.as_str(),
+        None,
+        "https://example.test/report.csv",
+        "report.csv",
+        "text/csv",
+        content,
+    )
+    .await
+    .expect("artifact should be stored");
+
+    let mut request = Request::new(browser_v1::GetDownloadArtifactRequest {
+        v: 1,
+        session_id: Some(session_id),
+        artifact_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: artifact.artifact_id.clone(),
+        }),
+        max_bytes: 5,
+    });
+    insert_principal(&mut request, "user:ops");
+    let fetched = service
+        .get_download_artifact(request)
+        .await
+        .expect("get_download_artifact should return")
+        .into_inner();
+
+    assert!(fetched.success, "download artifact prefix should succeed: {}", fetched.error);
+    assert_eq!(fetched.content, b"name,");
+    assert!(fetched.content_truncated);
+    assert_eq!(fetched.content_offset_bytes, 0);
+    assert_eq!(fetched.content_limit_bytes, 5);
+    assert_eq!(
+        fetched.artifact.and_then(|artifact| artifact.artifact_id).map(|id| id.ulid),
+        Some(artifact.artifact_id)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_captures_http_attachment_download_artifact() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };

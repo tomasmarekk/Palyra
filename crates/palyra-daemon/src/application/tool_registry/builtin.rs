@@ -1114,7 +1114,7 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
         "palyra.browser.permissions.set" => "Update browser permission state.",
         "palyra.browser.downloads.list" => "List browser download artifacts.",
         "palyra.browser.downloads.get" => {
-            "Return a bounded browser download artifact payload and optionally save it directly to a workspace or approved user-owned output_path."
+            "Return bounded browser download artifact metadata plus a first-byte content preview. The response marks content_truncated=true when the artifact is larger than max_bytes; output_path writes are allowed only for complete content."
         }
         _ => "Operate a brokered browser session.",
     }
@@ -1320,10 +1320,13 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "artifact_id",
                 json!({"type":"string","description":"Optional artifact id returned by palyra.browser.downloads.list. If omitted, the latest non-quarantined artifact is fetched."}),
             ));
-            properties.push(("max_bytes", json!({"type":"integer","minimum":1})));
+            properties.push((
+                "max_bytes",
+                json!({"type":"integer","minimum":1,"description":"Maximum bytes to return from the start of the artifact for inspection. Larger artifacts return content_truncated=true with metadata instead of failing."}),
+            ));
             properties.push((
                 "output_path",
-                json!({"type":"string","description":"Optional workspace-relative path, or approved user-owned absolute OS path, where the daemon should write the artifact bytes. Use this as the safe artifact-to-file transfer path instead of reading base64 and patching binary files."}),
+                json!({"type":"string","description":"Optional workspace-relative path, or approved user-owned absolute OS path, where the daemon should write artifact bytes. This requires an untruncated response; omit output_path when inspecting a large artifact preview."}),
             ));
         }
         "palyra.browser.storage" => {
@@ -1703,7 +1706,12 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("downloads get artifact_id description should be visible to models");
         assert!(artifact_id_description.contains("If omitted"));
-        assert!(downloads_get.input_schema.pointer("/properties/max_bytes").is_some());
+        let max_bytes_description = downloads_get
+            .input_schema
+            .pointer("/properties/max_bytes/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("downloads get max_bytes description should be visible to models");
+        assert!(max_bytes_description.contains("content_truncated"));
     }
 
     #[test]

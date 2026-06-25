@@ -2968,6 +2968,13 @@ async fn run_browser_download_save(
     if !response.success {
         anyhow::bail!("browser download save failed: {}", empty_as_dash(response.error.as_str()));
     }
+    if response.content_truncated {
+        anyhow::bail!(
+            "browser download save refused truncated content: content_bytes={} content_limit_bytes={}; rerun without --max-bytes or increase it to at least the artifact size",
+            response.content.len(),
+            response.content_limit_bytes
+        );
+    }
     let output_path = PathBuf::from(output.as_str());
     write_artifact_bytes(output_path.as_path(), response.content.as_slice())?;
     let artifact = response.artifact.as_ref().map(download_artifact_proto_value);
