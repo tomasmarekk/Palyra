@@ -2073,12 +2073,7 @@ fn looks_like_segmented_application_identifier(value: &str) -> bool {
 }
 
 fn looks_like_parser_fixture_value(value: &str) -> bool {
-    value.contains('=')
-        && value.len() <= 96
-        && value
-            .split('=')
-            .all(|segment| !segment.is_empty() && segment.chars().all(|ch| ch.is_ascii_lowercase()))
-        && value.split('=').any(|segment| matches!(segment, "value" | "equals" | "expected"))
+    matches!(value, "value=with=equals")
 }
 
 fn looks_like_url_encoded_parser_fixture_value(value: &str) -> bool {
@@ -3579,6 +3574,38 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn parser_fixture_shaped_secret_values_are_redacted() {
+        let source = "token=value=supersecret\n\
+                      TOKEN=EXPECTED=SECRET\n\
+                      key=value=secret\n\
+                      token=value=abcdefghijklmnopqrstuvwxyzabcdef";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("token=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("TOKEN=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("key=[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("value=supersecret"));
+        assert!(!outcome.redacted_text.contains("EXPECTED=SECRET"));
+        assert!(!outcome.redacted_text.contains("abcdefghijklmnopqrstuvwxyzabcdef"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.key"));
     }
 
     #[test]
