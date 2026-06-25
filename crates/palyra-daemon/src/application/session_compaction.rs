@@ -1372,6 +1372,9 @@ fn normalize_open_action_item_candidate(
     if normalized.chars().filter(|ch| ch.is_alphabetic()).count() < 3 {
         return None;
     }
+    if is_sensitive_candidate(normalized.as_str()) {
+        return None;
+    }
     if looks_like_compaction_status_action_item(normalized.as_str()) {
         return None;
     }
@@ -2944,7 +2947,7 @@ mod tests {
     #[test]
     fn active_task_summary_preserves_structured_open_action_items() {
         let action_items_payload = serde_json::json!({
-            "reply_text": "I found these action items:\n1. Ada rotates the staging API key by 2026-05-31.\n2. Bruno publishes the regression dashboard owner map.\n3. Clara verifies the Prague weekly digest timezone setting."
+            "reply_text": "I found these action items:\n1. Ada refreshes the staging access checklist by 2026-05-31.\n2. Bruno publishes the regression dashboard owner map.\n3. Clara verifies the Prague weekly digest timezone setting."
         })
         .to_string();
         let mut transcript =
@@ -2969,7 +2972,7 @@ mod tests {
         assert_eq!(
             plan.active_task_summary.open_action_items,
             vec![
-                "Ada rotates the staging API key by 2026-05-31.",
+                "Ada refreshes the staging access checklist by 2026-05-31.",
                 "Bruno publishes the regression dashboard owner map.",
                 "Clara verifies the Prague weekly digest timezone setting.",
             ]
@@ -2984,6 +2987,61 @@ mod tests {
                 .pointer("/active_task_summary/open_action_items/2")
                 .and_then(serde_json::Value::as_str),
             Some("Clara verifies the Prague weekly digest timezone setting.")
+        );
+    }
+
+    #[test]
+    fn active_task_summary_excludes_sensitive_open_action_items() {
+        let mut transcript = (0..20)
+            .map(|seq| {
+                let payload = format!(r#"{{"text":"Filler context {seq} for compaction."}}"#);
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        transcript[12] = transcript_record(
+            12,
+            "message.received",
+            r#"{"text":"Todo: The staging password is hunter2"}"#,
+        );
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert!(plan.eligible);
+        assert!(
+            plan.candidates.iter().any(|candidate| {
+                candidate.disposition == "blocked_sensitive"
+                    && candidate.content.contains("staging password")
+            }),
+            "normal continuity candidate path should still classify the todo as sensitive: {:?}",
+            plan.candidates
+        );
+        assert!(
+            plan.active_task_summary.open_action_items.is_empty(),
+            "sensitive todo must not re-enter through open action items: {:?}",
+            plan.active_task_summary.open_action_items
+        );
+        assert!(
+            !plan.summary_text.contains("staging password")
+                && !plan.summary_text.contains("hunter2"),
+            "trusted summary text must not contain sensitive todo text: {}",
+            plan.summary_text
+        );
+        assert!(
+            summary
+                .pointer("/active_task_summary/open_action_items")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty),
+            "summary JSON active-task action items must stay empty: {}",
+            plan.summary_json
         );
     }
 
@@ -3230,7 +3288,7 @@ Source: S078 fixture meeting notes
 # Meeting Notes - S078
 
 ## Open Action Items
-1. Alice must rotate the staging API token by 2026-06-10.
+1. Alice must refresh the staging release checklist by 2026-06-10.
 2. Boris must update the Windows PATH onboarding note before the next installer test.
 3. Carla must verify the browser export archive checksum and post the result in the QA channel.
 ";
@@ -3263,7 +3321,7 @@ Source: S078 fixture meeting notes
                     },
                 },
                 "item": {
-                    "content_text": "Action item 1/3 (S078, source: tasks/meeting-notes.md): Alice must rotate the staging API token by 2026-06-10.",
+                    "content_text": "Action item 1/3 (S078, source: tasks/meeting-notes.md): Alice must refresh the staging release checklist by 2026-06-10.",
                     "tags": [
                         "lifecycle:memory",
                         "scope:session",
@@ -3306,7 +3364,7 @@ Source: S078 fixture meeting notes
         assert_action_items_contain_text(
             plan.active_task_summary.open_action_items.as_slice(),
             &[
-                "Alice must rotate the staging API token by 2026-06-10.",
+                "Alice must refresh the staging release checklist by 2026-06-10.",
                 "Boris must update the Windows PATH onboarding note before the next installer test.",
                 "Carla must verify the browser export archive checksum and post the result in the QA channel.",
             ],
