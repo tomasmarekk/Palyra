@@ -5401,7 +5401,7 @@ struct ToolApprovalDecision {
     reason: String,
 }
 
-const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for tool requests; rerun in an interactive terminal, use --approval-mode allow-once for per-request approval, or use --allow-sensitive-tools only after reviewing the requested tool risk";
+const NONINTERACTIVE_APPROVAL_HINT: &str = "noninteractive CLI cannot prompt for tool requests; rerun in an interactive terminal, use --approval-mode allow-once to approve the next request only, or use --allow-sensitive-tools only after reviewing the requested tool risk";
 const PROCESS_RUN_TOOL_NAME: &str = "palyra.process.run";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 
@@ -5562,14 +5562,16 @@ fn normalized_workspace_path(raw: &str) -> String {
     raw.trim().trim_start_matches('/').replace('\\', "/").to_ascii_lowercase()
 }
 
-// Mode is `&mut` so a decision could downgrade it mid-run later; today
-// allow-once deliberately persists for every request in the run, which
-// approval_mode_allow_once_approves_all_requests_in_current_run pins.
 fn prompt_tool_approval_decision_with_mode_state(
     approval: &common_v1::ToolApprovalRequest,
     mode: &mut AgentApprovalMode,
 ) -> Result<ToolApprovalDecision> {
-    prompt_tool_approval_decision(approval, *mode)
+    let current_mode = *mode;
+    let decision = prompt_tool_approval_decision(approval, current_mode)?;
+    if current_mode == AgentApprovalMode::AllowOnce && decision.approved {
+        *mode = AgentApprovalMode::Deny;
+    }
+    Ok(decision)
 }
 
 fn prompt_tool_approval_decision_from_terminal(
@@ -7354,18 +7356,18 @@ mod agent_stream_output_tests {
     }
 
     #[test]
-    fn approval_mode_allow_once_approves_all_requests_in_current_run() {
+    fn approval_mode_allow_once_consumes_after_first_approved_request() {
         let mut mode = AgentApprovalMode::AllowOnce;
         let first = prompt_tool_approval_decision_with_mode_state(&approval_request(), &mut mode)
             .expect("allow-once should approve the first request");
         let second = prompt_tool_approval_decision_with_mode_state(&approval_request(), &mut mode)
-            .expect("allow-once should keep approving requests in this run");
+            .expect("consumed allow-once should deny the second request");
 
         assert!(first.approved);
-        assert!(second.approved);
-        assert_eq!(mode, AgentApprovalMode::AllowOnce);
+        assert!(!second.approved);
+        assert_eq!(mode, AgentApprovalMode::Deny);
         assert_eq!(first.reason, "approved_by_cli_approval_mode_allow_once");
-        assert_eq!(second.reason, "approved_by_cli_approval_mode_allow_once");
+        assert_eq!(second.reason, "denied_by_cli_approval_mode_deny");
     }
 
     #[test]
