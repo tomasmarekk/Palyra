@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use palyra_common::process_runner_input::parse_process_runner_tool_input;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tonic::Status;
@@ -214,6 +215,9 @@ pub(crate) fn build_pending_tool_approval(
 /// OS-file calls additionally include a fingerprint of the requested
 /// operation, paths, and content-affecting inputs so a session approval for one
 /// local file operation cannot cover a different OS path or mutation.
+/// Detached process-runner handoffs include the requested lifetime boundary so
+/// an ordinary run-owned process approval cannot silently cover post-run
+/// process persistence.
 pub(crate) fn build_tool_approval_subject_id(
     tool_name: &str,
     skill_context: Option<&ToolSkillContext>,
@@ -224,11 +228,23 @@ pub(crate) fn build_tool_approval_subject_id(
         subject_id.push_str("|os_file:");
         subject_id.push_str(os_file_approval_fingerprint(input_json).as_str());
     }
+    if tool_name == PROCESS_RUNNER_TOOL_NAME {
+        if let Some(lifetime) = process_runner_lifetime_approval_subject(input_json) {
+            subject_id.push_str("|process_lifetime:");
+            subject_id.push_str(lifetime);
+        }
+    }
     if let Some(skill_context) = skill_context {
         subject_id.push_str("|skill:");
         subject_id.push_str(skill_context.skill_id());
     }
     subject_id
+}
+
+fn process_runner_lifetime_approval_subject(input_json: &[u8]) -> Option<&'static str> {
+    let input = parse_process_runner_tool_input(input_json).ok()?;
+    let lifetime_mode = input.effective_lifetime_mode();
+    lifetime_mode.is_detached_handoff().then_some(lifetime_mode.as_str())
 }
 
 fn os_file_approval_fingerprint(input_json: &[u8]) -> String {
@@ -863,6 +879,35 @@ mod tests {
             ),
             "tool:palyra.process.run|skill:acme.audit"
         );
+    }
+
+    #[test]
+    fn process_runner_detached_lifetimes_use_distinct_approval_subjects() {
+        let run_owned = build_tool_approval_subject_id(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"python","args":["server.py"],"background":true}"#,
+        );
+        let detached = build_tool_approval_subject_id(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"python","args":["server.py"],"background":true,"lifetime_mode":"detached"}"#,
+        );
+        let compatibility_alias = build_tool_approval_subject_id(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"python","args":["server.py"],"background":true,"keep_running_after_run":true}"#,
+        );
+        let until_verifier = build_tool_approval_subject_id(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"python","args":["server.py"],"background":true,"lifetime_mode":"until_verifier"}"#,
+        );
+
+        assert_eq!(run_owned, "tool:palyra.process.run");
+        assert_eq!(detached, "tool:palyra.process.run|process_lifetime:detached");
+        assert_eq!(compatibility_alias, detached);
+        assert_eq!(until_verifier, "tool:palyra.process.run|process_lifetime:until_verifier");
     }
 
     #[test]
