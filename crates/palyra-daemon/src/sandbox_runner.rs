@@ -2512,12 +2512,21 @@ fn validate_interpreter_argument_guardrails(
     }
 
     for (index, argument) in args.iter().enumerate() {
-        if argument_is_non_path_option_assignment(argument.as_str())
-            || index.checked_sub(1).and_then(|previous| args.get(previous)).is_some_and(
-                |previous| command_option_consumes_non_path_value(command, previous.as_str()),
-            )
-        {
+        if argument_is_non_path_option_assignment(argument.as_str()) {
             continue;
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|previous| args.get(previous)) {
+            if node_eval_option_consumes_non_path_value(command, previous.as_str()) {
+                validate_node_inline_source_paths_in_workspace(
+                    workspace_root,
+                    cwd,
+                    argument.as_str(),
+                )?;
+                continue;
+            }
+            if command_option_consumes_non_path_value(command, previous.as_str()) {
+                continue;
+            }
         }
         if !contains_embedded_absolute_path(argument.as_str()) {
             continue;
@@ -2575,12 +2584,22 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     }
 
     for (index, argument) in args.iter().enumerate() {
-        if argument_is_non_path_option_assignment(argument.as_str())
-            || index.checked_sub(1).and_then(|previous| args.get(previous)).is_some_and(
-                |previous| command_option_consumes_non_path_value(command, previous.as_str()),
-            )
-        {
+        if argument_is_non_path_option_assignment(argument.as_str()) {
             continue;
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|previous| args.get(previous)) {
+            if node_eval_option_consumes_non_path_value(command, previous.as_str()) {
+                validate_node_inline_source_paths_in_host_scope(
+                    workspace_root,
+                    cwd,
+                    argument.as_str(),
+                    host_roots,
+                )?;
+                continue;
+            }
+            if command_option_consumes_non_path_value(command, previous.as_str()) {
+                continue;
+            }
         }
         if !contains_embedded_absolute_path(argument.as_str()) {
             continue;
@@ -2602,6 +2621,156 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     }
 
     Ok(())
+}
+
+fn validate_node_inline_source_paths_in_workspace(
+    workspace_root: &Path,
+    cwd: &Path,
+    source: &str,
+) -> Result<(), SandboxProcessRunError> {
+    for literal in node_inline_absolute_filesystem_path_literals(source) {
+        if interpreter_absolute_path_argument_stays_in_workspace(workspace_root, cwd, literal)? {
+            continue;
+        }
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: node inline source contains absolute filesystem path outside workspace: '{literal}'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_node_inline_source_paths_in_host_scope(
+    workspace_root: &Path,
+    cwd: &Path,
+    source: &str,
+    host_roots: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
+    for literal in node_inline_absolute_filesystem_path_literals(source) {
+        if interpreter_absolute_path_argument_stays_in_host_scope(
+            workspace_root,
+            cwd,
+            literal,
+            host_roots,
+        )? {
+            continue;
+        }
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: format!(
+                "sandbox denied: node inline source contains absolute filesystem path outside approved host roots: '{literal}'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn node_inline_absolute_filesystem_path_literals(source: &str) -> Vec<&str> {
+    let mut literals = Vec::new();
+    let mut chars = source.char_indices();
+    while let Some((quote_start, quote)) = chars.next() {
+        if !matches!(quote, '\'' | '"' | '`') {
+            continue;
+        }
+        let literal_start = quote_start + quote.len_utf8();
+        let mut escaped = false;
+        let mut literal_end = None;
+        for (index, ch) in chars.by_ref() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == quote {
+                literal_end = Some(index);
+                break;
+            }
+        }
+        let Some(literal_end) = literal_end else {
+            break;
+        };
+        let literal = &source[literal_start..literal_end];
+        if token_or_path_list_contains_absolute_path(literal)
+            && node_inline_path_literal_has_filesystem_context(source, quote_start)
+        {
+            literals.push(literal);
+        }
+    }
+    literals
+}
+
+fn node_inline_path_literal_has_filesystem_context(
+    source: &str,
+    literal_quote_start: usize,
+) -> bool {
+    const CONTEXT_CHARS: usize = 160;
+    const FILESYSTEM_PATTERNS: &[&str] = &[
+        "require(",
+        "import(",
+        "readfile(",
+        "readfilesync(",
+        "writefile(",
+        "writefilesync(",
+        "appendfile(",
+        "appendfilesync(",
+        "open(",
+        "opensync(",
+        "opendir(",
+        "opendirsync(",
+        "readdir(",
+        "readdirsync(",
+        "stat(",
+        "statsync(",
+        "lstat(",
+        "lstatsync(",
+        "realpath(",
+        "realpathsync(",
+        "mkdir(",
+        "mkdirsync(",
+        "rm(",
+        "rmsync(",
+        "rmdir(",
+        "rmdirsync(",
+        "unlink(",
+        "unlinksync(",
+        "rename(",
+        "renamesync(",
+        "copyfile(",
+        "copyfilesync(",
+        "cp(",
+        "cpsync(",
+        "createreadstream(",
+        "createwritestream(",
+        "readlink(",
+        "readlinksync(",
+        "symlink(",
+        "symlinksync(",
+        "chmod(",
+        "chmodsync(",
+        "chown(",
+        "chownsync(",
+        "utimes(",
+        "utimessync(",
+        "access(",
+        "accesssync(",
+        "watch(",
+        "watchfile(",
+    ];
+
+    let prefix = &source[..literal_quote_start];
+    let context_start =
+        prefix.char_indices().rev().nth(CONTEXT_CHARS).map_or(0, |(index, _)| index);
+    let normalized_context = prefix[context_start..]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    FILESYSTEM_PATTERNS.iter().any(|pattern| normalized_context.ends_with(pattern))
 }
 
 fn interpreter_absolute_path_argument_stays_in_workspace(
@@ -7260,6 +7429,7 @@ mod tests {
         tier_c_plan_inner_path_index, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
         validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
+        validate_host_interpreter_argument_guardrails_with_roots,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
         validate_process_termination_scope, validate_runtime_egress_enforcement,
@@ -7668,6 +7838,36 @@ mod tests {
         .expect("host node inline source should stay a non-path argument");
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_interpreter_guardrails_reject_node_eval_absolute_fs_path_outside_roots() {
+        let workspace = unique_temp_dir("workspace-host-node-inline-path-deny");
+        let outside = unique_temp_dir("outside-host-node-inline-path-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let outside_file = outside.join("secret.txt");
+        fs::write(outside_file.as_path(), b"secret").expect("outside fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let outside_path = outside_file.to_string_lossy().replace('\\', "/");
+        let args =
+            vec!["-p".to_owned(), format!("require('fs').readFileSync('{outside_path}', 'utf8')")];
+
+        let error = validate_host_interpreter_argument_guardrails_with_roots(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "node",
+            args.as_slice(),
+            std::slice::from_ref(&canonical_workspace),
+        )
+        .expect_err("host node inline source must respect approved roots");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("outside approved host roots"), "{}", error.message);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
     }
 
     #[test]
@@ -11940,6 +12140,60 @@ mod tests {
             args.as_slice(),
         )
         .expect("inline node code with relative paths should not be treated as host-absolute");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn interpreter_guardrails_allow_node_eval_workspace_absolute_fs_path() {
+        let workspace = unique_temp_dir("workspace-node-inline-absolute-workspace-path");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let report = workspace.join("report.txt");
+        fs::write(report.as_path(), b"ok").expect("workspace fixture should be written");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let report_path = report.to_string_lossy().replace('\\', "/");
+        let args =
+            vec!["-e".to_owned(), format!("require('fs').readFileSync('{report_path}', 'utf8')")];
+
+        validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "node",
+            args.as_slice(),
+        )
+        .expect("node inline fs paths inside the workspace should be allowed");
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn interpreter_guardrails_reject_node_eval_absolute_fs_path() {
+        #[cfg(windows)]
+        let outside_path = "C:/Windows/win.ini";
+        #[cfg(not(windows))]
+        let outside_path = "/etc/passwd";
+        let workspace = unique_temp_dir("workspace-node-inline-host-path-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let workspace_root = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args =
+            vec!["-e".to_owned(), format!("require('fs').readFileSync('{outside_path}', 'utf8')")];
+
+        let error = validate_interpreter_argument_guardrails(
+            workspace_root.as_path(),
+            workspace_root.as_path(),
+            "node",
+            args.as_slice(),
+        )
+        .expect_err("node inline source must validate filesystem absolute paths");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(
+            error.message.contains("node inline source contains absolute filesystem path"),
+            "{}",
+            error.message
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
