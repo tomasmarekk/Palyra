@@ -710,8 +710,8 @@ fn generate_admin_token() -> String {
 
 const DEFAULT_ADMIN_BOUND_PRINCIPAL: &str = "admin:local";
 const LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS: i64 = 10 * 60_000;
-const LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS: &[&str] =
-    &["global/palyra-e2e-token"];
+// Local init may enable HTTP fetch, but credential binding must stay an explicit operator opt-in.
+const LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS: &[&str] = &[];
 const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.echo",
     "palyra.sleep",
@@ -13462,6 +13462,10 @@ mod init_command_tests {
             "local init should expose approval-gated routine creation for autonomous monitors"
         );
         assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.http.fetch"),
+            "local init should expose credentialless HTTP fetch for documentation research"
+        );
+        assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.delegation.control"),
             "local init should expose approval-gated child-run delegation for orchestration tests"
         );
@@ -13527,7 +13531,7 @@ mod init_command_tests {
         );
         assert_eq!(
             read_string_array(&document, "tool_call.http_fetch.allowed_credential_vault_refs"),
-            vec!["global/palyra-e2e-token".to_owned()]
+            Vec::<String>::new()
         );
         assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));
         assert_eq!(
