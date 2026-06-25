@@ -7783,7 +7783,7 @@ mod tests {
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
         rewrite_host_virtual_workspace_args, run_constrained_process,
         run_constrained_process_with_cancellation, same_path_case_aware,
-        tier_c_plan_inner_path_index, validate_argument_workspace_scope,
+        tier_c_plan_inner_path_index, user_owned_host_roots, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
         validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
         validate_host_interpreter_argument_guardrails_with_roots,
