@@ -1292,8 +1292,12 @@ async fn process_runner_tool_config_for_session(
     let mut config = runtime_state.config.tool_call.clone();
     let workspace_roots =
         process_runner_workspace_roots_for_session(runtime_state, context, &config).await;
-    if let Some(launch_root) =
-        run_launch_context_primary_workspace_root(runtime_state, context.run_id).await
+    if let Some(launch_root) = run_launch_context_primary_workspace_root(
+        runtime_state,
+        context.run_id,
+        workspace_roots.as_slice(),
+    )
+    .await
     {
         if process_runner_input_should_use_launch_root(input_json) {
             config.process_runner.workspace_root = launch_root;

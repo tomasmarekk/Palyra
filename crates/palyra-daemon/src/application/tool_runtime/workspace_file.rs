@@ -289,7 +289,12 @@ pub(crate) async fn execute_workspace_read_file_tool(
     {
         Vec::new()
     } else {
-        run_launch_context_read_file_grants(runtime_state, context.run_id).await
+        run_launch_context_read_file_grants(
+            runtime_state,
+            context.run_id,
+            workspace_roots.as_slice(),
+        )
+        .await
     };
     let read = match read_workspace_file_from_roots_and_file_grants(
         workspace_roots.as_slice(),

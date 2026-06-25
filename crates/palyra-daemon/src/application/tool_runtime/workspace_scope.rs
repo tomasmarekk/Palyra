@@ -9,11 +9,11 @@
 //!
 //! Every dynamic root is canonicalized and validated before use: launch roots
 //! must be existing absolute directories outside the OS deny-list in
-//! `protected_launch_workspace_root`, and focus directories must resolve
-//! (symlinks included) to a strict descendant of a configured root. The
-//! containment decisions made here feed the security checks in
-//! `workspace_file` and `workspace_patch`; treat any semantic change as a
-//! security change.
+//! `protected_launch_workspace_root` and must remain inside configured agent
+//! roots, while focus directories must resolve (symlinks included) to a strict
+//! descendant of a configured root. The containment decisions made here feed
+//! the security checks in `workspace_file` and `workspace_patch`; treat any
+//! semantic change as a security change.
 
 use std::{
     collections::BTreeMap,
@@ -126,6 +126,7 @@ pub(crate) async fn run_launch_context_path_env(
 pub(crate) async fn run_launch_context_read_file_grants(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
+    workspace_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
     let Some(parameter_delta_json) = run_launch_parameter_delta_json(runtime_state, run_id).await
     else {
@@ -136,7 +137,11 @@ pub(crate) async fn run_launch_context_read_file_grants(
     else {
         return Vec::new();
     };
-    parameter_delta.cli_context.map(launch_workspace_file_grants_from_context).unwrap_or_default()
+    let grants = parameter_delta
+        .cli_context
+        .map(launch_workspace_file_grants_from_context)
+        .unwrap_or_default();
+    filter_launch_file_grants_by_workspace_roots(grants, workspace_roots)
 }
 
 /// Returns the launch-context root that represents generic `/workspace`
@@ -144,8 +149,10 @@ pub(crate) async fn run_launch_context_read_file_grants(
 pub(crate) async fn run_launch_context_primary_workspace_root(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
+    workspace_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     let launch_roots = run_launch_context_workspace_roots(runtime_state, run_id).await;
+    let launch_roots = filter_launch_workspace_roots(launch_roots, workspace_roots);
     launch_roots.launch_cwd.or_else(|| launch_roots.extra_roots.into_iter().next())
 }
 
@@ -291,6 +298,7 @@ fn merge_launch_workspace_roots(
     workspace_roots: &[PathBuf],
     launch_roots: RunLaunchWorkspaceRoots,
 ) -> Vec<PathBuf> {
+    let launch_roots = filter_launch_workspace_roots(launch_roots, workspace_roots);
     if launch_roots.extra_roots.is_empty() && launch_roots.launch_cwd.is_none() {
         return workspace_roots.to_vec();
     }
@@ -303,6 +311,52 @@ fn merge_launch_workspace_roots(
     push_unique_workspace_roots(&mut merged, launch_roots.extra_roots);
     push_unique_workspace_roots(&mut merged, workspace_roots.iter().cloned());
     merged
+}
+
+fn filter_launch_workspace_roots(
+    launch_roots: RunLaunchWorkspaceRoots,
+    workspace_roots: &[PathBuf],
+) -> RunLaunchWorkspaceRoots {
+    let canonical_workspace_roots = canonicalize_workspace_roots(workspace_roots);
+    if canonical_workspace_roots.is_empty() {
+        return RunLaunchWorkspaceRoots::default();
+    }
+    RunLaunchWorkspaceRoots {
+        launch_cwd: launch_roots
+            .launch_cwd
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots)),
+        extra_roots: launch_roots
+            .extra_roots
+            .into_iter()
+            .filter(|root| launch_path_is_within_workspace_roots(root, &canonical_workspace_roots))
+            .collect(),
+    }
+}
+
+fn filter_launch_file_grants_by_workspace_roots(
+    grants: Vec<PathBuf>,
+    workspace_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let canonical_workspace_roots = canonicalize_workspace_roots(workspace_roots);
+    if canonical_workspace_roots.is_empty() {
+        return Vec::new();
+    }
+    grants
+        .into_iter()
+        .filter(|grant| launch_path_is_within_workspace_roots(grant, &canonical_workspace_roots))
+        .collect()
+}
+
+fn launch_path_is_within_workspace_roots(
+    path: &Path,
+    canonical_workspace_roots: &[PathBuf],
+) -> bool {
+    let Ok(canonical_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    canonical_workspace_roots
+        .iter()
+        .any(|root| canonical_path == *root || canonical_path.starts_with(root))
 }
 
 fn push_unique_workspace_roots(
@@ -582,11 +636,12 @@ fn normalize_relative_workspace_path(path: &str) -> Option<String> {
 mod tests {
     use super::{
         active_workspace_root_from_focus_paths, canonical_launch_workspace_root,
-        launch_path_env_from_context, launch_workspace_file_grants_from_context,
-        launch_workspace_roots_from_context, merge_launch_workspace_roots,
-        relative_path_already_targets_active_root, relative_path_should_use_active_root,
-        same_workspace_root, workspace_focus_path_is_runtime_internal,
-        workspace_root_override_targets_active_root, ActiveWorkspaceRoot, RunLaunchCliContext,
+        filter_launch_file_grants_by_workspace_roots, launch_path_env_from_context,
+        launch_workspace_file_grants_from_context, launch_workspace_roots_from_context,
+        merge_launch_workspace_roots, relative_path_already_targets_active_root,
+        relative_path_should_use_active_root, same_workspace_root,
+        workspace_focus_path_is_runtime_internal, workspace_root_override_targets_active_root,
+        ActiveWorkspaceRoot, RunLaunchCliContext,
     };
     use std::{collections::BTreeMap, fs};
 
@@ -754,12 +809,14 @@ mod tests {
     #[test]
     fn launch_cwd_precedes_extra_roots_and_agent_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let explicit_root = tempdir.path().join("explicit");
-        let launch_cwd = tempdir.path().join("cwd");
         let default_root = tempdir.path().join("default");
+        let explicit_root = default_root.join("explicit");
+        let launch_cwd = default_root.join("cwd");
         fs::create_dir_all(explicit_root.as_path()).expect("explicit root should exist");
         fs::create_dir_all(launch_cwd.as_path()).expect("launch cwd should exist");
         fs::create_dir_all(default_root.as_path()).expect("default root should exist");
+        let default_root =
+            fs::canonicalize(default_root.as_path()).expect("default root should canonicalize");
         let explicit_root =
             fs::canonicalize(explicit_root.as_path()).expect("explicit root should canonicalize");
         let launch_cwd =
@@ -786,7 +843,7 @@ mod tests {
     fn session_bound_launch_cwd_precedes_agent_roots_without_extra_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let bound_root = tempdir.path().join("bound-agent");
-        let launch_cwd = tempdir.path().join("cwd");
+        let launch_cwd = bound_root.join("cwd");
         fs::create_dir_all(bound_root.as_path()).expect("bound root should exist");
         fs::create_dir_all(launch_cwd.as_path()).expect("launch cwd should exist");
         let bound_root = fs::canonicalize(bound_root.as_path()).expect("bound root canonical");
@@ -803,6 +860,28 @@ mod tests {
         assert_eq!(roots.len(), 2);
         assert_eq!(roots.first(), Some(&launch_cwd));
         assert_eq!(roots.get(1), Some(&bound_root));
+    }
+
+    #[test]
+    fn launch_roots_outside_agent_workspace_roots_are_ignored() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let agent_root = tempdir.path().join("agent");
+        let outside_root = tempdir.path().join("outside");
+        fs::create_dir_all(agent_root.as_path()).expect("agent root should exist");
+        fs::create_dir_all(outside_root.as_path()).expect("outside root should exist");
+        let agent_root = fs::canonicalize(agent_root).expect("agent root should canonicalize");
+        let outside_root =
+            fs::canonicalize(outside_root).expect("outside root should canonicalize");
+
+        let launch_roots = launch_workspace_roots_from_context(RunLaunchCliContext {
+            launch_cwd: Some(outside_root.to_string_lossy().into_owned()),
+            workspace_roots: Some(vec![outside_root.to_string_lossy().into_owned()]),
+            workspace_file_grants: None,
+            env: None,
+        });
+        let roots = merge_launch_workspace_roots(std::slice::from_ref(&agent_root), launch_roots);
+
+        assert_eq!(roots, vec![agent_root]);
     }
 
     #[test]
@@ -827,6 +906,29 @@ mod tests {
         });
 
         assert_eq!(grants, vec![watched]);
+    }
+
+    #[test]
+    fn launch_file_grants_are_limited_to_agent_workspace_roots() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let agent_root = tempdir.path().join("agent");
+        let outside_root = tempdir.path().join("outside");
+        fs::create_dir_all(agent_root.as_path()).expect("agent root should exist");
+        fs::create_dir_all(outside_root.as_path()).expect("outside root should exist");
+        let allowed = agent_root.join("allowed.md");
+        let outside = outside_root.join("secret.txt");
+        fs::write(allowed.as_path(), "ok\n").expect("allowed file should exist");
+        fs::write(outside.as_path(), "secret\n").expect("outside file should exist");
+        let allowed = fs::canonicalize(allowed).expect("allowed file should canonicalize");
+        let outside = fs::canonicalize(outside).expect("outside file should canonicalize");
+        let agent_root = fs::canonicalize(agent_root).expect("agent root should canonicalize");
+
+        let grants = filter_launch_file_grants_by_workspace_roots(
+            vec![outside, allowed.clone()],
+            std::slice::from_ref(&agent_root),
+        );
+
+        assert_eq!(grants, vec![allowed]);
     }
 
     #[test]

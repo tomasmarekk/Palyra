@@ -2997,12 +2997,27 @@ async fn memory_auto_inject_adds_active_project_workspace_memory_to_fresh_sessio
     };
     let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FE6";
     let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FE7";
-    upsert_test_orchestrator_session(&state, &context, session_id);
 
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let project_root = tempdir.path().join("S079-project-A");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "memory-auto-inject-project-agent".to_owned(),
+            display_name: "Memory Auto Inject Project Agent".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![project_root_text.clone()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created with project root");
+    upsert_test_orchestrator_session(&state, &context, session_id);
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: run_id.to_owned(),
@@ -6795,13 +6810,28 @@ async fn memory_search_tool_defaults_to_all_durable_scopes_without_workspace_lea
 async fn memory_search_tool_all_scope_uses_active_project_workspace_prefix() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
-    ensure_tool_context_session(&state, &context);
     let marker = "PALYRA_ACTIVE_PROJECT_ALL_SCOPE_MARKER";
 
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let project_root = tempdir.path().join("project-a");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "memory-active-project-agent".to_owned(),
+            display_name: "Memory Active Project Agent".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![project_root_text.clone()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created with project root");
+    ensure_tool_context_session(&state, &context);
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: context.run_id.to_owned(),
@@ -7039,13 +7069,28 @@ async fn memory_search_tool_workspace_scope_returns_project_prefix_hits() {
 async fn memory_search_tool_workspace_scope_uses_active_project_prefix_by_default() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
-    ensure_tool_context_session(&state, &context);
     let marker = "PALYRA_ACTIVE_PROJECT_WORKSPACE_SCOPE_MARKER";
 
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let project_root = tempdir.path().join("project-a");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "memory-workspace-active-project-agent".to_owned(),
+            display_name: "Memory Workspace Active Project Agent".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![project_root_text.clone()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created with project root");
+    ensure_tool_context_session(&state, &context);
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: context.run_id.to_owned(),
@@ -7431,23 +7476,7 @@ async fn memory_replace_tool_rejects_workspace_document_replace_without_matching
 #[tokio::test(flavor = "multi_thread")]
 async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
     let state = build_test_runtime_state(false);
-    state
-        .create_agent(AgentCreateRequest {
-            agent_id: "os-file-launch-root".to_owned(),
-            display_name: "OS File Launch Root".to_owned(),
-            agent_dir: None,
-            workspace_roots: Vec::new(),
-            default_model_profile: None,
-            execution_backend_preference: None,
-            default_tool_allowlist: Vec::new(),
-            default_skill_allowlist: Vec::new(),
-            set_default: true,
-            allow_absolute_paths: false,
-        })
-        .await
-        .expect("default agent should be created");
     let context = routines_tool_test_context();
-    ensure_tool_context_session(&state, &context);
 
     let configured_root =
         tempfile::tempdir().expect("configured OS root fixture should be created");
@@ -7461,6 +7490,22 @@ async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
     fs::create_dir_all(scenario_dir.as_path()).expect("launch workspace should be created");
     let target_file = scenario_dir.join("agent_math_test.js");
     let workspace_root_text = workspace_root.to_string_lossy().into_owned();
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "os-file-launch-root".to_owned(),
+            display_name: "OS File Launch Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace_root_text.clone()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("default agent should be created");
+    ensure_tool_context_session(&state, &context);
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: context.run_id.to_owned(),
@@ -7503,12 +7548,27 @@ async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
 async fn project_memory_defaults_to_launch_workspace_prefix() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();
-    ensure_tool_context_session(&state, &context);
 
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let project_root = tempdir.path().join("client-portal");
     fs::create_dir_all(project_root.as_path()).expect("project root should be created");
     let project_root_text = project_root.to_string_lossy().into_owned();
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "project-memory-launch-root".to_owned(),
+            display_name: "Project Memory Launch Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![project_root_text.clone()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created with project root");
+    ensure_tool_context_session(&state, &context);
     state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: context.run_id.to_owned(),
