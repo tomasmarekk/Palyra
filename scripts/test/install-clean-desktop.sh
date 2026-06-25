@@ -670,7 +670,7 @@ PALYRA_STATE_ROOT="$state_root" PALYRA_CONFIG="$config_path" "$cli_binary_instal
 "$cli_command_path" browser --help >/dev/null
 "$cli_command_path" docs search gateway >/dev/null
 PALYRA_STATE_ROOT="$state_root" PALYRA_CONFIG="$config_path" "$cli_command_path" doctor --json >/dev/null
-"$cli_command_path" skills seed-e2e-fixtures --allow-outside-harness --json >/dev/null
+"$cli_command_path" skills seed-e2e-fixtures --json >/dev/null
 "$cli_command_path" skills list --json > "$workspace_root/e2e-skills-list.json"
 python3 - "$workspace_root/e2e-skills-list.json" <<'PY'
 import json

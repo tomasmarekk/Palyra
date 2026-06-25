@@ -6,6 +6,8 @@
 //! signature primitives live in `palyra-skills`; this module wires them to the CLI and
 //! the local skills root plus audit log.
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
 use crate::cli::SkillsProcedureCommand;
 use crate::{client::skills as skills_client, output::skills as skills_output, *};
 
@@ -363,18 +365,16 @@ pub(crate) fn run_skills(command: SkillsCommand) -> Result<()> {
             channel,
             json,
         }),
-        SkillsCommand::SeedE2eFixtures { allow_outside_harness, json } => {
-            run_skills_seed_e2e_fixtures(allow_outside_harness, json)
-        }
+        SkillsCommand::SeedE2eFixtures { json } => run_skills_seed_e2e_fixtures(json),
     }
 }
 
-fn run_skills_seed_e2e_fixtures(allow_outside_harness: bool, json_output: bool) -> Result<()> {
+fn run_skills_seed_e2e_fixtures(json_output: bool) -> Result<()> {
     let state_root = app::current_root_context()
         .map(|context| context.state_root().to_path_buf())
         .map(Ok)
         .unwrap_or_else(|| app::resolve_cli_state_root(None))?;
-    let report = seed_e2e_skill_fixtures(state_root.as_path(), allow_outside_harness)?;
+    let report = seed_e2e_skill_fixtures(state_root.as_path())?;
     if json_output {
         return output::print_json_pretty(
             &json!({
@@ -414,15 +414,25 @@ struct E2eSkillFixtureSeedReport {
     status: String,
 }
 
-fn seed_e2e_skill_fixtures(
-    state_root: &Path,
-    allow_outside_harness: bool,
-) -> Result<E2eSkillFixtureSeedReport> {
-    ensure_e2e_harness_state_root(state_root, allow_outside_harness)?;
+#[derive(Debug)]
+struct E2eReporterSkillFixtureArtifact {
+    artifact_bytes: Vec<u8>,
+    payload_sha256: String,
+    public_key_hex: String,
+    signature_key_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum E2eReporterExistingInstallState {
+    Valid,
+    Invalid { reason: String },
+}
+
+fn seed_e2e_skill_fixtures(state_root: &Path) -> Result<E2eSkillFixtureSeedReport> {
+    ensure_e2e_harness_state_root(state_root)?;
     let skills_root = state_root.join("skills");
-    let artifact_bytes = build_e2e_reporter_skill_artifact()?;
-    let installed =
-        ensure_e2e_reporter_skill_installed(state_root, skills_root.as_path(), &artifact_bytes)?;
+    let artifact = build_e2e_reporter_skill_artifact()?;
+    let installed = ensure_e2e_reporter_skill_installed(skills_root.as_path(), &artifact)?;
     let journal_path = state_root.join(DEFAULT_JOURNAL_DB_PATH);
     upsert_e2e_reporter_skill_status(journal_path.as_path())?;
     Ok(E2eSkillFixtureSeedReport {
@@ -434,13 +444,11 @@ fn seed_e2e_skill_fixtures(
     })
 }
 
-fn ensure_e2e_harness_state_root(state_root: &Path, allow_outside_harness: bool) -> Result<()> {
-    if allow_outside_harness || path_has_component(state_root, "Palyra-TestHarness") {
+fn ensure_e2e_harness_state_root(state_root: &Path) -> Result<()> {
+    if path_has_component(state_root, "Palyra-TestHarness") {
         return Ok(());
     }
-    anyhow::bail!(
-        "skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots; pass --allow-outside-harness only for isolated tests"
-    )
+    anyhow::bail!("skills seed-e2e-fixtures is restricted to Palyra-TestHarness state roots")
 }
 
 fn path_has_component(path: &Path, expected: &str) -> bool {
@@ -448,7 +456,7 @@ fn path_has_component(path: &Path, expected: &str) -> bool {
         .any(|component| component.as_os_str().to_string_lossy().eq_ignore_ascii_case(expected))
 }
 
-fn build_e2e_reporter_skill_artifact() -> Result<Vec<u8>> {
+fn build_e2e_reporter_skill_artifact() -> Result<E2eReporterSkillFixtureArtifact> {
     let manifest_toml = format!(
         r#"
 manifest_version = 1
@@ -502,25 +510,28 @@ min_palyra_version = "0.1.0"
             signing_key: [42_u8; 32],
         })
         .context("failed to build e2e.reporter skill fixture artifact")?;
-    Ok(output.artifact_bytes)
+    Ok(E2eReporterSkillFixtureArtifact {
+        artifact_bytes: output.artifact_bytes,
+        payload_sha256: output.payload_sha256,
+        public_key_hex: signature_public_key_hex(&output.signature)?,
+        signature_key_id: output.signature.key_id,
+    })
 }
 
 fn ensure_e2e_reporter_skill_installed(
-    state_root: &Path,
     skills_root: &Path,
-    artifact_bytes: &[u8],
+    artifact: &E2eReporterSkillFixtureArtifact,
 ) -> Result<bool> {
     fs::create_dir_all(skills_root)
         .with_context(|| format!("failed to create skills root {}", skills_root.display()))?;
-    let trust_store_path = skills_root.join("trust-store.json");
-    let mut trust_store =
-        load_trust_store_with_state_root_integrity(trust_store_path.as_path(), state_root)?;
-    let verification_report = verify_skill_artifact(artifact_bytes, &mut trust_store, true)
-        .context("failed to verify e2e.reporter skill fixture artifact")?;
+    let (inspected, verification_report) =
+        verify_e2e_reporter_fixture_artifact(artifact.artifact_bytes.as_slice(), artifact)
+            .context("failed to verify e2e.reporter skill fixture artifact")?;
+    let mut audit_trust_store = e2e_reporter_fixture_trust_store(artifact)?;
     let security_report = audit_skill_artifact_security(
-        artifact_bytes,
-        &mut trust_store,
-        true,
+        artifact.artifact_bytes.as_slice(),
+        &mut audit_trust_store,
+        false,
         &SkillSecurityAuditPolicy::default(),
     )
     .context("failed to audit e2e.reporter skill fixture artifact")?;
@@ -530,36 +541,62 @@ fn ensure_e2e_reporter_skill_installed(
             security_report.quarantine_reasons.join(" | ")
         );
     }
-    save_trust_store_with_state_root_integrity(
-        trust_store_path.as_path(),
-        &trust_store,
-        state_root,
-    )?;
 
     let mut index = load_installed_skills_index(skills_root)?;
-    let existing = index.entries.iter().any(|entry| {
+    let existing = index.entries.iter().position(|entry| {
         entry.skill_id == E2E_REPORTER_SKILL_ID && entry.version == E2E_REPORTER_SKILL_VERSION
     });
-    if existing {
-        append_skills_audit_event(
+    if let Some(position) = existing {
+        match validate_existing_e2e_reporter_fixture_install(
             skills_root,
-            "skill.e2e_fixture_refreshed",
-            json!({
-                "skill_id": E2E_REPORTER_SKILL_ID,
-                "version": E2E_REPORTER_SKILL_VERSION,
-                "publisher": E2E_REPORTER_PUBLISHER,
-            }),
-        )?;
-        return Ok(false);
+            &index.entries[position],
+            artifact,
+        )? {
+            E2eReporterExistingInstallState::Valid => {
+                append_skills_audit_event(
+                    skills_root,
+                    "skill.e2e_fixture_refreshed",
+                    json!({
+                        "skill_id": E2E_REPORTER_SKILL_ID,
+                        "version": E2E_REPORTER_SKILL_VERSION,
+                        "publisher": E2E_REPORTER_PUBLISHER,
+                        "payload_sha256": artifact.payload_sha256,
+                    }),
+                )?;
+                return Ok(false);
+            }
+            E2eReporterExistingInstallState::Invalid { reason } => {
+                let install_dir =
+                    skills_root.join(E2E_REPORTER_SKILL_ID).join(E2E_REPORTER_SKILL_VERSION);
+                if install_dir.exists() {
+                    anyhow::bail!(
+                        "existing e2e.reporter skill fixture at {} failed identity verification ({reason}); remove the isolated Palyra-TestHarness state root before seeding",
+                        install_dir.display()
+                    );
+                }
+                index.entries.retain(|entry| {
+                    !(entry.skill_id == E2E_REPORTER_SKILL_ID
+                        && entry.version == E2E_REPORTER_SKILL_VERSION)
+                });
+                append_skills_audit_event(
+                    skills_root,
+                    "skill.e2e_fixture_preplant_rejected",
+                    json!({
+                        "skill_id": E2E_REPORTER_SKILL_ID,
+                        "version": E2E_REPORTER_SKILL_VERSION,
+                        "publisher": E2E_REPORTER_PUBLISHER,
+                        "reason": reason,
+                    }),
+                )?;
+            }
+        }
     }
 
-    let artifact_sha256 = sha256_hex(artifact_bytes);
-    let inspected = inspect_skill_artifact(artifact_bytes)
-        .context("failed to inspect e2e.reporter skill fixture artifact")?;
+    let artifact_sha256 = sha256_hex(artifact.artifact_bytes.as_slice());
     install_verified_skill_artifact(
         skills_root,
         &mut index,
-        artifact_bytes,
+        artifact.artifact_bytes.as_slice(),
         &inspected,
         &verification_report,
         InstallMetadataContext {
@@ -585,6 +622,126 @@ fn ensure_e2e_reporter_skill_installed(
         }),
     )?;
     Ok(true)
+}
+
+fn e2e_reporter_fixture_trust_store(
+    artifact: &E2eReporterSkillFixtureArtifact,
+) -> Result<SkillTrustStore> {
+    let mut trust_store = SkillTrustStore::default();
+    trust_store
+        .add_trusted_key(E2E_REPORTER_PUBLISHER, artifact.public_key_hex.as_str())
+        .context("failed to allowlist e2e.reporter fixture signing key")?;
+    Ok(trust_store)
+}
+
+fn verify_e2e_reporter_fixture_artifact(
+    artifact_bytes: &[u8],
+    artifact: &E2eReporterSkillFixtureArtifact,
+) -> Result<(palyra_skills::SkillArtifactInspection, SkillVerificationReport)> {
+    let inspected = inspect_skill_artifact(artifact_bytes)
+        .context("failed to inspect e2e.reporter skill fixture artifact")?;
+    let mut trust_store = e2e_reporter_fixture_trust_store(artifact)?;
+    let verification_report = verify_skill_artifact(artifact_bytes, &mut trust_store, false)
+        .context("e2e.reporter fixture artifact failed allowlisted trust verification")?;
+    ensure_e2e_reporter_fixture_identity(&inspected, &verification_report, artifact)?;
+    Ok((inspected, verification_report))
+}
+
+fn ensure_e2e_reporter_fixture_identity(
+    inspected: &palyra_skills::SkillArtifactInspection,
+    verification_report: &SkillVerificationReport,
+    artifact: &E2eReporterSkillFixtureArtifact,
+) -> Result<()> {
+    if verification_report.manifest.skill_id != E2E_REPORTER_SKILL_ID
+        || verification_report.manifest.version != E2E_REPORTER_SKILL_VERSION
+        || verification_report.manifest.publisher != E2E_REPORTER_PUBLISHER
+    {
+        anyhow::bail!(
+            "e2e.reporter fixture identity mismatch: got skill_id={} version={} publisher={}",
+            verification_report.manifest.skill_id,
+            verification_report.manifest.version,
+            verification_report.manifest.publisher
+        );
+    }
+    if verification_report.payload_sha256 != artifact.payload_sha256 {
+        anyhow::bail!(
+            "e2e.reporter fixture payload mismatch: expected {} got {}",
+            artifact.payload_sha256,
+            verification_report.payload_sha256
+        );
+    }
+    if inspected.signature.key_id != artifact.signature_key_id {
+        anyhow::bail!(
+            "e2e.reporter fixture signing key mismatch: expected {} got {}",
+            artifact.signature_key_id,
+            inspected.signature.key_id
+        );
+    }
+    if !matches!(verification_report.trust_decision, TrustDecision::Allowlisted) {
+        anyhow::bail!("e2e.reporter fixture must verify with an allowlisted trust decision");
+    }
+    Ok(())
+}
+
+fn validate_existing_e2e_reporter_fixture_install(
+    skills_root: &Path,
+    record: &InstalledSkillRecord,
+    artifact: &E2eReporterSkillFixtureArtifact,
+) -> Result<E2eReporterExistingInstallState> {
+    let invalid = |reason: String| Ok(E2eReporterExistingInstallState::Invalid { reason });
+    if record.publisher != E2E_REPORTER_PUBLISHER {
+        return invalid("publisher mismatch".to_owned());
+    }
+    if record.payload_sha256 != artifact.payload_sha256 {
+        return invalid("payload hash mismatch".to_owned());
+    }
+    let artifact_path = artifact_path_for_installed_skill(skills_root, record);
+    let existing_artifact = match fs::read(artifact_path.as_path()) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return invalid("cached artifact missing".to_owned());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read existing e2e.reporter artifact {}", artifact_path.display())
+            });
+        }
+    };
+    let observed_artifact_sha256 = sha256_hex(existing_artifact.as_slice());
+    if record.artifact_sha256 != observed_artifact_sha256 {
+        return invalid("cached artifact hash mismatch".to_owned());
+    }
+    let existing_identity =
+        verify_e2e_reporter_fixture_artifact(existing_artifact.as_slice(), artifact);
+    let (inspected, _) = match existing_identity {
+        Ok(identity) => identity,
+        Err(error) => return invalid(format!("artifact verification failed: {error}")),
+    };
+    if record.signature_key_id != inspected.signature.key_id {
+        return invalid("signing key metadata mismatch".to_owned());
+    }
+    Ok(E2eReporterExistingInstallState::Valid)
+}
+
+fn signature_public_key_hex(signature: &SkillArtifactSignature) -> Result<String> {
+    let public_key = BASE64_STANDARD
+        .decode(signature.public_key_base64.as_bytes())
+        .context("failed to decode e2e.reporter fixture public key")?;
+    if public_key.len() != 32 {
+        anyhow::bail!(
+            "e2e.reporter fixture public key decoded to {} bytes; expected 32",
+            public_key.len()
+        );
+    }
+    Ok(lower_hex(public_key.as_slice()))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(format!("{byte:02x}").as_str());
+    }
+    output
 }
 
 fn upsert_e2e_reporter_skill_status(journal_path: &Path) -> Result<()> {
@@ -2365,10 +2522,14 @@ mod tests {
         let tempdir = tempfile::tempdir()?;
         let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
 
-        let report = seed_e2e_skill_fixtures(state_root.as_path(), false)?;
+        let report = seed_e2e_skill_fixtures(state_root.as_path())?;
 
         assert!(report.installed, "first seed should install the e2e.reporter artifact");
         let skills_root = state_root.join("skills");
+        assert!(
+            !skills_root.join("trust-store.json").exists(),
+            "fixture seeding must not persist publisher trust pins"
+        );
         let index = load_installed_skills_index(skills_root.as_path())?;
         let reporter = index
             .entries
@@ -2397,8 +2558,66 @@ mod tests {
         )?;
         assert_eq!(status, "active");
 
-        let second = seed_e2e_skill_fixtures(state_root.as_path(), false)?;
+        let second = seed_e2e_skill_fixtures(state_root.as_path())?;
         assert!(!second.installed, "second seed should be idempotent");
+        Ok(())
+    }
+
+    #[test]
+    fn seed_e2e_skill_fixtures_replaces_preplanted_index_entry() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
+        let skills_root = state_root.join("skills");
+        fs::create_dir_all(skills_root.as_path())?;
+        save_installed_skills_index(
+            skills_root.as_path(),
+            &InstalledSkillsIndex {
+                schema_version: SKILLS_LAYOUT_VERSION,
+                updated_at_unix_ms: unix_now_ms(),
+                entries: vec![InstalledSkillRecord {
+                    skill_id: E2E_REPORTER_SKILL_ID.to_owned(),
+                    version: E2E_REPORTER_SKILL_VERSION.to_owned(),
+                    publisher: E2E_REPORTER_PUBLISHER.to_owned(),
+                    current: true,
+                    installed_at_unix_ms: unix_now_ms(),
+                    artifact_sha256: "bogus-artifact-sha".to_owned(),
+                    payload_sha256: "bogus-payload-sha".to_owned(),
+                    signature_key_id: "bogus-key-id".to_owned(),
+                    trust_decision: "tofu_pinned".to_owned(),
+                    source: InstalledSkillSource {
+                        kind: "preplant".to_owned(),
+                        reference: "test://preplant".to_owned(),
+                    },
+                    missing_secrets: Vec::new(),
+                    security_scan: None,
+                    rollback_snapshot: None,
+                }],
+            },
+        )?;
+
+        let report = seed_e2e_skill_fixtures(state_root.as_path())?;
+
+        assert!(report.installed, "invalid preplanted index entry should be replaced");
+        let index = load_installed_skills_index(skills_root.as_path())?;
+        let reporter = index
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.skill_id == E2E_REPORTER_SKILL_ID
+                    && entry.version == E2E_REPORTER_SKILL_VERSION
+            })
+            .expect("e2e.reporter should be present after replacement");
+        assert_eq!(reporter.trust_decision, "allowlisted");
+        assert_ne!(reporter.artifact_sha256, "bogus-artifact-sha");
+        assert_ne!(reporter.payload_sha256, "bogus-payload-sha");
+        assert!(
+            skills_root
+                .join(E2E_REPORTER_SKILL_ID)
+                .join(E2E_REPORTER_SKILL_VERSION)
+                .join(SKILLS_ARTIFACT_FILE_NAME)
+                .is_file(),
+            "replacement should cache the verified fixture artifact"
+        );
         Ok(())
     }
 
@@ -2407,7 +2626,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
 
-        let error = seed_e2e_skill_fixtures(state_root.as_path(), false)
+        let error = seed_e2e_skill_fixtures(state_root.as_path())
             .expect_err("non-harness state roots must be rejected");
 
         assert!(

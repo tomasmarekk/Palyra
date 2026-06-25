@@ -254,7 +254,6 @@ if ($IsWindows) {
 $seedE2eSkillOutput = & $resolvedCliCommandPath `
     skills `
     seed-e2e-fixtures `
-    --allow-outside-harness `
     --json
 $seedE2eSkillPayload = ($seedE2eSkillOutput -join [Environment]::NewLine) | ConvertFrom-Json
 if ($seedE2eSkillPayload.fixtures[0].skill_id -ne "e2e.reporter" -or $seedE2eSkillPayload.status -ne "active") {

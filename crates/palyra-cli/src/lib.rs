@@ -8758,31 +8758,9 @@ fn load_trust_store_with_integrity(path: &Path) -> Result<SkillTrustStore> {
     Ok(store)
 }
 
-fn load_trust_store_with_state_root_integrity(
-    path: &Path,
-    state_root: &Path,
-) -> Result<SkillTrustStore> {
-    let store = SkillTrustStore::load(path)?;
-    let vault = open_cli_vault_for_state_root(state_root, VaultBackendPreference::EncryptedFile)
-        .context("failed to open state-root vault for trust-store integrity check")?;
-    verify_or_initialize_trust_store_integrity_with_vault(path, &vault)?;
-    Ok(store)
-}
-
 fn save_trust_store_with_integrity(path: &Path, store: &SkillTrustStore) -> Result<()> {
     store.save(path)?;
     update_trust_store_integrity_digest(path)
-}
-
-fn save_trust_store_with_state_root_integrity(
-    path: &Path,
-    store: &SkillTrustStore,
-    state_root: &Path,
-) -> Result<()> {
-    store.save(path)?;
-    let vault = open_cli_vault_for_state_root(state_root, VaultBackendPreference::EncryptedFile)
-        .context("failed to open state-root vault for trust-store integrity update")?;
-    update_trust_store_integrity_digest_with_vault(path, &vault)
 }
 
 fn verify_or_initialize_trust_store_integrity(path: &Path) -> Result<()> {
@@ -10765,19 +10743,6 @@ fn open_cli_vault() -> Result<Vault> {
     Vault::open_with_config(VaultConfigOptions {
         root: vault_root,
         identity_store_root: Some(identity_store_root),
-        backend_preference,
-        ..VaultConfigOptions::default()
-    })
-    .map_err(anyhow::Error::from)
-}
-
-fn open_cli_vault_for_state_root(
-    state_root: &Path,
-    backend_preference: VaultBackendPreference,
-) -> Result<Vault> {
-    Vault::open_with_config(VaultConfigOptions {
-        root: Some(state_root.join("vault")),
-        identity_store_root: Some(state_root.join("identity")),
         backend_preference,
         ..VaultConfigOptions::default()
     })

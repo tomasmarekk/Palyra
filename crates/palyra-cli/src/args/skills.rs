@@ -191,8 +191,6 @@ pub enum SkillsCommand {
     #[command(hide = true)]
     SeedE2eFixtures {
         #[arg(long, default_value_t = false)]
-        allow_outside_harness: bool,
-        #[arg(long, default_value_t = false)]
         json: bool,
     },
 }
