@@ -1913,50 +1913,38 @@ fn read_workspace_file_chunk(
         binary_output_omitted,
         redacted,
         redaction_reasons,
-    ) = if chunk_has_binary_control_bytes(&buffer) {
-        (
-            None,
-            None,
-            workspace_binary_base64_prefix(buffer.as_slice()),
-            true,
-            true,
-            false,
-            Vec::new(),
-        )
-    } else {
-        match String::from_utf8(buffer) {
-            Ok(text) => {
-                let redaction = redact_text_for_export(
-                    text.as_str(),
-                    SafetySourceKind::Workspace,
-                    SafetyContentKind::WorkspaceDocument,
-                    TrustLabel::TrustedLocal,
-                );
-                let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
-                let redaction_reasons = secret_redaction_reason_codes(&redaction);
-                let visible_text = if redacted { redaction.redacted_text } else { text };
-                (
-                    Some(visible_text),
-                    None,
-                    None,
-                    false,
-                    false,
-                    redacted,
-                    if redacted { redaction_reasons } else { Vec::new() },
-                )
-            }
-            Err(error) => {
-                let bytes = error.into_bytes();
-                (
-                    None,
-                    None,
-                    workspace_binary_base64_prefix(bytes.as_slice()),
-                    true,
-                    true,
-                    false,
-                    Vec::new(),
-                )
-            }
+    ) = match String::from_utf8(buffer) {
+        Ok(text) => {
+            let redaction = redact_text_for_export(
+                text.as_str(),
+                SafetySourceKind::Workspace,
+                SafetyContentKind::WorkspaceDocument,
+                TrustLabel::TrustedLocal,
+            );
+            let redacted = redaction.scan.has_category(SafetyFindingCategory::SecretLeak);
+            let redaction_reasons = secret_redaction_reason_codes(&redaction);
+            let visible_text = if redacted { redaction.redacted_text } else { text };
+            (
+                Some(visible_text),
+                None,
+                None,
+                false,
+                false,
+                redacted,
+                if redacted { redaction_reasons } else { Vec::new() },
+            )
+        }
+        Err(error) => {
+            let bytes = error.into_bytes();
+            (
+                None,
+                None,
+                workspace_binary_base64_prefix(bytes.as_slice()),
+                true,
+                true,
+                false,
+                Vec::new(),
+            )
         }
     };
     let text_authoritative = redacted.then_some(false);
@@ -2077,15 +2065,6 @@ fn workspace_binary_base64_prefix(bytes: &[u8]) -> Option<String> {
     }
     let prefix_len = bytes.len().min(WORKSPACE_READ_BINARY_BASE64_PREFIX_BYTES);
     Some(BASE64_STANDARD.encode(&bytes[..prefix_len]))
-}
-
-/// Returns true when the chunk contains control bytes that never appear in
-/// plain text (the C0 set minus tab/LF/CR/ESC, plus DEL); such chunks are
-/// reported as base64 binary even when they happen to be valid UTF-8.
-fn chunk_has_binary_control_bytes(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .any(|byte| matches!(*byte, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1A | 0x1C..=0x1F | 0x7F))
 }
 
 /// Containment check applied to every resolved target: a plain prefix match
@@ -2622,10 +2601,10 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_returns_metadata_for_binary_control_bytes() {
+    fn read_workspace_file_returns_metadata_for_non_utf8_binary() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.wasm");
-        let contents = b"\0asm\x01\0\0\0\x01\x04\x01`\0\0";
+        let contents = b"\0asm\xff\0\0\0\x01\x04\x01`\0\0";
         fs::write(file_path, contents).expect("workspace binary file should be written");
         let input = WorkspaceReadFileInput {
             path: "app.wasm".to_owned(),
@@ -2682,6 +2661,39 @@ mod tests {
         assert!(
             !text.contains("palyra_test_secret_123456"),
             "test harness secret marker should be redacted from tool output: {text}"
+        );
+    }
+
+    #[test]
+    fn read_workspace_file_redacts_secret_like_utf8_with_control_bytes() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("app.js");
+        let contents = "const publicValue = 'visible';\n\
+             const modelToken = 'palyra_test_secret_123456';\n\
+             \0still utf8 text\n";
+        fs::write(file_path, contents.as_bytes()).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "app.js".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+        let text = output.text.as_deref().expect("valid utf8 text should be returned");
+
+        assert!(output.redacted);
+        assert!(!output.binary);
+        assert_eq!(output.bytes_base64, None);
+        assert_eq!(output.bytes_base64_prefix, None);
+        assert!(text.contains("publicValue"));
+        assert!(text.contains("[REDACTED_SECRET]"));
+        assert!(
+            !text.contains("palyra_test_secret_123456"),
+            "control-byte UTF-8 text must still pass through secret redaction: {text}"
         );
     }
 
