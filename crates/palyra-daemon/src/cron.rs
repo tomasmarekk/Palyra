@@ -2971,7 +2971,11 @@ fn scheduler_attempt_failure(error: &Status, attempt: u32) -> SchedulerAttemptFa
     } else {
         "scheduler_internal"
     };
-    let retryable = matches!(error_kind, "provider_unavailable" | "provider_malformed_response");
+    let retryable = match error_kind {
+        "provider_unavailable" => true,
+        "provider_malformed_response" => !normalized.contains("action=fail_closed_no_retry"),
+        _ => false,
+    };
     let sanitized = crate::model_provider::sanitize_remote_error(raw_message);
     SchedulerAttemptFailure {
         error_kind: error_kind.to_owned(),
@@ -4340,10 +4344,24 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_attempt_failure_surfaces_malformed_provider_response() {
+    fn scheduler_attempt_failure_stops_fail_closed_malformed_provider_response() {
         let failure = scheduler_attempt_failure(
             &Status::internal(
                 "model provider response invalid after 0 retries (class=malformed_response, action=fail_closed_no_retry): anthropic response JSON parsing failed",
+            ),
+            1,
+        );
+
+        assert_eq!(failure.error_kind, "provider_malformed_response");
+        assert!(!failure.retryable);
+        assert!(failure.error_message_redacted.contains("malformed_response"));
+    }
+
+    #[test]
+    fn scheduler_attempt_failure_retries_retryable_malformed_provider_response() {
+        let failure = scheduler_attempt_failure(
+            &Status::internal(
+                "model provider response invalid after 0 retries (class=malformed_response, action=retry): upstream response JSON parsing failed",
             ),
             1,
         );
