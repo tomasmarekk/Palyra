@@ -406,11 +406,16 @@ async fn resolve_channel_message_mutation_authorization(
         )))
     })?;
     match evaluation.decision {
-        PolicyDecision::Allow => Ok(ChannelMessageMutationAuthorization {
-            approval_id: resolved_approval.as_ref().map(|record| record.approval_id.clone()),
-            governance,
-            pending_response: None,
-        }),
+        PolicyDecision::Allow => {
+            if let Some(approval) = resolved_approval.as_ref() {
+                consume_channel_message_approval_once(state, approval).await?;
+            }
+            Ok(ChannelMessageMutationAuthorization {
+                approval_id: resolved_approval.as_ref().map(|record| record.approval_id.clone()),
+                governance,
+                pending_response: None,
+            })
+        }
         PolicyDecision::DenyByDefault { reason } => {
             if governance.as_ref().is_some_and(|value| value.approval_required)
                 && evaluation.explanation.is_sensitive_action
@@ -469,6 +474,26 @@ async fn resolve_channel_message_mutation_authorization(
             ))))
         }
     }
+}
+
+async fn consume_channel_message_approval_once(
+    state: &AppState,
+    approval: &ApprovalRecord,
+) -> Result<(), Response> {
+    let consumed = state
+        .runtime
+        .consume_approval_once(
+            approval.approval_id.clone(),
+            "channel_message_mutation_executed".to_owned(),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    if consumed {
+        return Ok(());
+    }
+    Err(runtime_status_response(tonic::Status::permission_denied(
+        "message mutation approval has already been used",
+    )))
 }
 
 async fn load_channel_message_approval(

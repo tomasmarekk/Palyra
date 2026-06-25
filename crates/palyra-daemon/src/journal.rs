@@ -5184,6 +5184,19 @@ const MIGRATIONS: &[Migration] = &[
             DROP TRIGGER IF EXISTS trg_recall_artifacts_prevent_delete;
         "#,
     },
+    Migration {
+        version: 34,
+        name: "create_approval_consumptions_table",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS approval_consumptions (
+                approval_ulid TEXT PRIMARY KEY,
+                consumed_at_unix_ms INTEGER NOT NULL,
+                consume_reason TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_approval_consumptions_consumed_at
+                ON approval_consumptions(consumed_at_unix_ms DESC);
+        "#,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -13693,6 +13706,57 @@ impl JournalStore {
             });
         }
         Ok(record)
+    }
+
+    /// Atomically marks an allowed once-scoped approval as consumed.
+    ///
+    /// Returns `false` when the approval is absent, not an allowed once approval, or
+    /// already consumed.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] on storage failure.
+    pub fn consume_approval_once(
+        &self,
+        approval_id: &str,
+        consume_reason: &str,
+    ) -> Result<bool, JournalError> {
+        let now = current_unix_ms()?;
+        let consume_reason = sanitize_object_text_field("consume_reason", consume_reason)?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let inserted = match guard.execute(
+            r#"
+                INSERT INTO approval_consumptions (
+                    approval_ulid,
+                    consumed_at_unix_ms,
+                    consume_reason
+                )
+                SELECT approval_ulid, ?2, ?3
+                FROM approvals
+                WHERE approval_ulid = ?1
+                    AND decision = 'allow'
+                    AND decision_scope = 'once'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM approval_consumptions
+                        WHERE approval_consumptions.approval_ulid = approvals.approval_ulid
+                    )
+            "#,
+            params![approval_id, now, consume_reason],
+        ) {
+            Ok(count) => count,
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .is_some_and(|value| value.contains("approval_consumptions"))) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(inserted == 1)
     }
 
     /// Returns an approval, or `None` if absent.
@@ -25478,6 +25542,79 @@ mod tests {
 
         assert_eq!(denied.decision, Some(ApprovalDecision::Allow));
         assert_eq!(denied.decision_reason.as_deref(), Some("approved_by_external_console"));
+    }
+
+    #[test]
+    fn approval_once_consumption_is_atomic_and_non_replayable() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let approval_id = "01ARZ3NDEKTSV4RRFFQ69G5FBM";
+        store
+            .create_approval(&sample_approval_request(approval_id))
+            .expect("approval create should persist");
+        store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: approval_id.to_owned(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "approved_by_external_console".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("approval resolve should persist");
+
+        assert!(
+            store
+                .consume_approval_once(approval_id, "discord message edit body=hello")
+                .expect("first approval consumption should persist"),
+            "first once-scoped approval consumption should succeed"
+        );
+        assert!(
+            !store
+                .consume_approval_once(approval_id, "discord message edit body=hello")
+                .expect("replayed approval consumption should not fail storage"),
+            "once-scoped approval must not be consumable twice"
+        );
+
+        let session_scope_id = "01ARZ3NDEKTSV4RRFFQ69G5FBN";
+        store
+            .create_approval(&sample_approval_request(session_scope_id))
+            .expect("session approval create should persist");
+        store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: session_scope_id.to_owned(),
+                decision: ApprovalDecision::Allow,
+                decision_scope: ApprovalDecisionScope::Session,
+                decision_reason: "approved for session".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("session approval resolve should persist");
+        assert!(
+            !store
+                .consume_approval_once(session_scope_id, "discord message edit")
+                .expect("non-once approval consumption should not fail storage"),
+            "non-once approvals must not be consumable through the once guard"
+        );
+
+        let denied_id = "01ARZ3NDEKTSV4RRFFQ69G5FBP";
+        store
+            .create_approval(&sample_approval_request(denied_id))
+            .expect("denied approval create should persist");
+        store
+            .resolve_approval(&ApprovalResolveRequest {
+                approval_id: denied_id.to_owned(),
+                decision: ApprovalDecision::Deny,
+                decision_scope: ApprovalDecisionScope::Once,
+                decision_reason: "denied".to_owned(),
+                decision_scope_ttl_ms: None,
+            })
+            .expect("denied approval resolve should persist");
+        assert!(
+            !store
+                .consume_approval_once(denied_id, "discord message edit")
+                .expect("denied approval consumption should not fail storage"),
+            "denied approvals must not be consumable"
+        );
     }
 
     #[test]

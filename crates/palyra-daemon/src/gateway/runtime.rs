@@ -7875,6 +7875,31 @@ impl GatewayRuntimeState {
         .map_err(|_| Status::internal("approval read worker panicked"))?
     }
 
+    /// Atomically consumes an allowed once-scoped approval.
+    ///
+    /// Returns `false` when the approval was already consumed or is not
+    /// currently an allowed once-scoped approval.
+    ///
+    /// # Errors
+    /// Returns the mapped approval store error, or `internal` if the worker
+    /// panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn consume_approval_once(
+        self: &Arc<Self>,
+        approval_id: String,
+        consume_reason: String,
+    ) -> Result<bool, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state
+                .journal_store
+                .consume_approval_once(approval_id.as_str(), consume_reason.as_str())
+                .map_err(|error| map_approval_store_error("consume approval", error))
+        })
+        .await
+        .map_err(|_| Status::internal("approval consume worker panicked"))?
+    }
+
     /// Lists approvals with cursor pagination and optional time, subject,
     /// principal, decision, and subject-type filters.
     ///
