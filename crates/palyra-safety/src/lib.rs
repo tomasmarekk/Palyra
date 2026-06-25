@@ -1463,6 +1463,9 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         return false;
     }
     let lowered = normalized.to_ascii_lowercase();
+    if looks_like_segmented_auth_secret_value(lowered.as_str()) {
+        return true;
+    }
     if is_env_reference_identifier_literal(normalized)
         || looks_like_application_identifier(lowered.as_str())
         || looks_like_parser_fixture_value(lowered.as_str())
@@ -1477,6 +1480,33 @@ fn bare_token_assignment_value_looks_secret(value: &str) -> bool {
         || lowered.starts_with("github_pat_")
         || lowered.starts_with("xox")
         || normalized.len() >= 16
+}
+
+fn looks_like_segmented_auth_secret_value(value: &str) -> bool {
+    if !value.contains('-') && !value.contains('_') {
+        return false;
+    }
+    let segments = value.split(['-', '_']).filter(|segment| !segment.is_empty());
+    let mut has_auth_context = false;
+    let mut has_random_segment = false;
+    for segment in segments {
+        has_auth_context |= matches!(segment, "app" | "auth" | "session" | "state" | "storage");
+        has_random_segment |= looks_like_random_secret_segment(segment);
+    }
+    has_auth_context && has_random_segment
+}
+
+fn looks_like_random_secret_segment(segment: &str) -> bool {
+    let len = segment.len();
+    if len < 12 {
+        return false;
+    }
+    let has_digit = segment.bytes().any(|byte| byte.is_ascii_digit());
+    let has_alpha = segment.bytes().any(|byte| byte.is_ascii_alphabetic());
+    let all_hex = segment.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let all_token_chars =
+        segment.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    has_digit && has_alpha && (all_hex || (len >= 16 && all_token_chars))
 }
 
 /// Allows `palyra_e2e_*` end-to-end fixture markers — except ones that embed
@@ -2547,6 +2577,47 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn segmented_auth_session_key_values_with_random_segments_are_redacted() {
+        let source = "sessionKey = \"prod-auth-6f4e2d9a0b7c8e1f\";\n\
+                      token = \"live-auth-8b6f3dbd9287c1ea\";\n\
+                      appKey = \"app-session-abcdef1234567890\";\n\
+                      stateKey = \"state_8b6f3dbd9287c1ea\";\n\
+                      storageKey = \"storage-auth-8b6f3dbd9287c1ea\";";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("sessionKey = \"[REDACTED_SECRET]\";"));
+        assert!(outcome.redacted_text.contains("token = \"[REDACTED_SECRET]\";"));
+        assert!(outcome.redacted_text.contains("appKey = \"[REDACTED_SECRET]\";"));
+        assert!(outcome.redacted_text.contains("stateKey = \"[REDACTED_SECRET]\";"));
+        assert!(outcome.redacted_text.contains("storageKey = \"[REDACTED_SECRET]\";"));
+        for leaked in [
+            "prod-auth-6f4e2d9a0b7c8e1f",
+            "live-auth-8b6f3dbd9287c1ea",
+            "app-session-abcdef1234567890",
+            "state_8b6f3dbd9287c1ea",
+            "storage-auth-8b6f3dbd9287c1ea",
+        ] {
+            assert!(!outcome.redacted_text.contains(leaked));
+        }
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
     }
 
     #[test]
