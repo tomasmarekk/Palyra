@@ -3787,13 +3787,19 @@ fn resolve_host_access_path_with_roots(
     must_exist: bool,
     host_roots: &[PathBuf],
 ) -> Result<PathBuf, SandboxProcessRunError> {
-    if let Some(suffix) = virtual_workspace_path_suffix(raw) {
+    if let Some(suffix) = named_virtual_workspace_path_suffix(raw) {
         return resolve_scoped_path(
             workspace_root,
             workspace_root,
             suffix.to_string_lossy().as_ref(),
             must_exist,
         );
+    }
+    if bare_virtual_workspace_root_alias(raw) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "host process runner denied bare workspace-root alias in host-access mode; use '/workspace' for the workspace root".to_owned(),
+        });
     }
     if raw.contains('\0') {
         return Err(SandboxProcessRunError {
@@ -4330,6 +4336,11 @@ fn named_virtual_workspace_path_suffix(raw: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn bare_virtual_workspace_root_alias(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty() && trimmed.replace('\\', "/") == "/"
+}
+
 fn rewrite_host_access_process_args(
     args: &[String],
     workspace_root: &Path,
@@ -4419,6 +4430,12 @@ fn resolve_host_virtual_workspace_arg_path(
     raw: &str,
     workspace_root: &Path,
 ) -> Result<Option<String>, SandboxProcessRunError> {
+    if bare_virtual_workspace_root_alias(raw) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "host process runner denied bare workspace-root alias in host-access mode; use '/workspace' for the workspace root".to_owned(),
+        });
+    }
     if named_virtual_workspace_path_suffix(raw).is_none() {
         return Ok(None);
     }
@@ -8076,6 +8093,30 @@ mod tests {
     }
 
     #[test]
+    fn host_access_argument_validation_rejects_bare_virtual_workspace_root_alias() {
+        let workspace = unique_temp_dir("workspace-host-root-alias-validation-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+
+        for args in [vec!["/".to_owned()], vec!["--root=/".to_owned()]] {
+            let error = validate_host_argument_scope_with_roots(
+                canonical_workspace.as_path(),
+                canonical_workspace.as_path(),
+                "node",
+                args.as_slice(),
+                &[],
+            )
+            .expect_err("bare root aliases must not validate as host-access workspace paths");
+
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+            assert!(error.message.contains("bare workspace-root alias"), "{}", error.message);
+        }
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn host_interpreter_guardrails_reject_node_eval_with_route_literals() {
         let workspace = unique_temp_dir("workspace-host-node-inline-route");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
@@ -8481,6 +8522,28 @@ mod tests {
         assert_eq!(rewritten[0], expected_manifest);
         assert_eq!(rewritten[1], format!("--config={expected_manifest}"));
         assert_eq!(rewritten[2], host_absolute);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_access_rejects_bare_virtual_workspace_root_alias_args() {
+        let workspace = unique_temp_dir("workspace-host-root-alias-arg-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let canonical_workspace = fs::canonicalize(workspace.as_path())
+            .expect("workspace root should canonicalize for host access");
+
+        for args in [vec!["/".to_owned()], vec!["--root=/".to_owned()]] {
+            let error = rewrite_host_access_process_args(
+                args.as_slice(),
+                canonical_workspace.as_path(),
+                &BTreeMap::new(),
+            )
+            .expect_err("bare root aliases must not be forwarded to host-access processes");
+
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+            assert!(error.message.contains("bare workspace-root alias"), "{}", error.message);
+        }
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -9520,6 +9583,44 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
 
         assert_eq!(env.get(NODE_DISABLE_COMPILE_CACHE_ENV).and_then(Option::as_deref), Some("1"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn host_access_process_command_rejects_bare_virtual_workspace_root_alias_args() {
+        let workspace = unique_temp_dir("workspace-host-root-alias-build-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let helper_name = if cfg!(windows) { "palyra-helper.exe" } else { "palyra-helper" };
+        let helper = workspace.join(helper_name);
+        fs::write(helper.as_path(), "fake exe")
+            .expect("helper executable fixture should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let policy = host_access_policy(canonical_workspace.clone());
+        let input = ProcessRunnerInput {
+            command: helper.to_string_lossy().into_owned(),
+            args: vec!["--root=/".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            prepend_path: Vec::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+            lifetime_mode: BackgroundLifetimeMode::RunOwned,
+            keep_running_after_run: false,
+        };
+
+        let error = build_process_command(
+            &policy,
+            &input,
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+        )
+        .expect_err("host-access command builder must reject bare root aliases");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("bare workspace-root alias"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
