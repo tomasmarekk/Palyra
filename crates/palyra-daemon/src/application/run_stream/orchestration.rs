@@ -2769,7 +2769,9 @@ fn tool_result_to_provider_message(
 ) -> Result<ProviderMessage, Status> {
     let output = serde_json::from_slice::<Value>(result.outcome.output_json.as_slice())
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&result.outcome.output_json) }));
-    let content = if result.outcome.error.trim().is_empty() {
+    let content = if result.tool_name == crate::gateway::ARTIFACT_READ_TOOL_NAME {
+        artifact_read_result_to_provider_message_content(result, &output)
+    } else if result.outcome.error.trim().is_empty() {
         output
     } else {
         let mut content = json!({
@@ -2789,6 +2791,35 @@ fn tool_result_to_provider_message(
     })?;
     let redacted = crate::journal::redact_payload_json(serialized.as_bytes()).unwrap_or(serialized);
     Ok(ProviderMessage::tool_result(result.proposal_id.clone(), redacted))
+}
+
+fn artifact_read_result_to_provider_message_content(
+    result: &RunStreamToolResultForModel,
+    output: &Value,
+) -> Value {
+    let artifact = output.get("artifact");
+    json!({
+        "success": false,
+        "tool_name": result.tool_name.as_str(),
+        "artifact_read_success": result.outcome.success,
+        "provider_visibility": "withheld",
+        "reason": "artifact.read content is local-only and is not automatically re-fed to model providers",
+        "artifact": {
+            "artifact_id": artifact.and_then(|value| value.get("artifact_id")).cloned().unwrap_or(Value::Null),
+            "digest_sha256": artifact.and_then(|value| value.get("digest_sha256")).cloned().unwrap_or(Value::Null),
+            "mime_type": artifact.and_then(|value| value.get("mime_type")).cloned().unwrap_or(Value::Null),
+            "size_bytes": artifact.and_then(|value| value.get("size_bytes")).cloned().unwrap_or(Value::Null),
+            "sensitivity": artifact.and_then(|value| value.get("sensitivity")).cloned().unwrap_or(Value::Null),
+            "tool_name": artifact.and_then(|value| value.get("tool_name")).cloned().unwrap_or(Value::Null),
+        },
+        "read_window": {
+            "offset_bytes": output.get("offset_bytes").cloned().unwrap_or(Value::Null),
+            "returned_bytes": output.get("returned_bytes").cloned().unwrap_or(Value::Null),
+            "eof": output.get("eof").cloned().unwrap_or(Value::Null),
+            "visibility": output.get("visibility").cloned().unwrap_or(Value::Null),
+        },
+        "local_error_present": !result.outcome.error.trim().is_empty(),
+    })
 }
 
 fn failed_tool_claim_boundary(tool_name: &str) -> Option<&'static str> {
@@ -4868,6 +4899,67 @@ mod tests {
                 .is_some_and(|boundary| boundary.contains("do not claim the memory was stored")),
             "{value}"
         );
+    }
+
+    #[test]
+    fn artifact_read_tool_result_withholds_content_from_provider_message() {
+        let output = json!({
+            "artifact": {
+                "artifact_id": "01JARTIFACTREADTEST000000000",
+                "digest_sha256": "b".repeat(64),
+                "mime_type": "application/json",
+                "size_bytes": 128,
+                "sensitivity": "stdout_stderr",
+                "tool_name": "palyra.process.run",
+                "redacted_preview": "INTERNAL_PROJECT_CODENAME=BLUEJAY",
+            },
+            "offset_bytes": 0,
+            "returned_bytes": 64,
+            "eof": true,
+            "visibility": "redacted_preview",
+            "text": "{\"stdout\":\"INTERNAL_PROJECT_CODENAME=BLUEJAY\\n\"}",
+            "bytes_base64": "SU5URVJOQUxfUFJPSkVDVF9DT0RFTkFNRT1CTFVFSkFZCg==",
+        });
+        let result = RunStreamToolResultForModel {
+            proposal_id: "toolu_artifact_read_01".to_owned(),
+            tool_name: crate::gateway::ARTIFACT_READ_TOOL_NAME.to_owned(),
+            outcome: crate::tool_protocol::build_tool_execution_outcome(
+                "toolu_artifact_read_01",
+                crate::gateway::ARTIFACT_READ_TOOL_NAME,
+                br#"{"artifact_id":"01JARTIFACTREADTEST000000000"}"#,
+                true,
+                serde_json::to_vec(&output).expect("artifact read fixture should serialize"),
+                String::new(),
+                false,
+                "gateway_artifacts".to_owned(),
+                "artifact_scope".to_owned(),
+            ),
+        };
+
+        let message = tool_result_to_provider_message(&result)
+            .expect("artifact read result should serialize for provider");
+        let content = match message.content.first() {
+            Some(ProviderMessageContentPart::Text { text }) => text,
+            _ => panic!("tool result should be serialized as text content"),
+        };
+        assert!(
+            !content.contains("BLUEJAY"),
+            "provider-visible artifact read message must not contain preview text: {content}"
+        );
+        let value: Value =
+            serde_json::from_str(content).expect("tool result content should be JSON");
+
+        assert_eq!(value.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(value.get("artifact_read_success").and_then(Value::as_bool), Some(true));
+        assert_eq!(value.get("provider_visibility").and_then(Value::as_str), Some("withheld"));
+        assert!(value.get("text").is_none(), "{value}");
+        assert!(value.get("bytes_base64").is_none(), "{value}");
+        assert!(value.pointer("/artifact/redacted_preview").is_none(), "{value}");
+        assert_eq!(
+            value.pointer("/artifact/artifact_id").and_then(Value::as_str),
+            Some("01JARTIFACTREADTEST000000000")
+        );
+        assert_eq!(value.pointer("/read_window/returned_bytes").and_then(Value::as_u64), Some(64));
     }
 
     #[test]
