@@ -714,15 +714,7 @@ async fn fetch_download_artifact_inner(
     // private-target policy and fetched with a freshly pinned client: a redirect must not be
     // able to steer the download into a private address space.
     let response = loop {
-        let allow_current_private_targets = download_request_allows_private_target(
-            runtime,
-            session_id,
-            current_url.as_str(),
-            allow_private_targets,
-        )
-        .await;
-        let validated_target =
-            validate_target_url(&current_url, allow_current_private_targets).await?;
+        let validated_target = validate_target_url(&current_url, allow_private_targets).await?;
         let client = build_pinned_http_client(timeout_ms, &validated_target)
             .map_err(|error| format!("failed to build download HTTP client: {error}"))?;
         let response = client
@@ -855,34 +847,6 @@ async fn fetch_download_artifact_inner(
 
 // Chromium sessions may have retained an allowance for a specific local origin (e.g. a page the
 // browser itself was permitted to reach); downloads from that same origin reuse it.
-async fn download_request_allows_private_target(
-    runtime: &BrowserRuntimeState,
-    session_id: &str,
-    raw_url: &str,
-    explicit_allow_private_targets: bool,
-) -> bool {
-    if explicit_allow_private_targets {
-        return true;
-    }
-    if runtime.engine_mode != BrowserEngineMode::Chromium {
-        return false;
-    }
-    let chromium_sessions = runtime.chromium_sessions.lock().await;
-    download_private_target_policy_allows_url(
-        chromium_sessions.get(session_id).map(|session| session.private_target_policy.as_ref()),
-        raw_url,
-        false,
-    )
-}
-
-fn download_private_target_policy_allows_url(
-    policy: Option<&ChromiumPrivateTargetPolicy>,
-    raw_url: &str,
-    explicit_allow_private_targets: bool,
-) -> bool {
-    explicit_allow_private_targets || policy.is_some_and(|policy| policy.allows_url(raw_url))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,27 +923,25 @@ mod tests {
         assert_eq!(content_disposition_attachment_file_name("inline; filename=x.csv"), None);
     }
 
-    #[test]
-    fn download_private_target_policy_reuses_retained_browser_scope() {
+    #[tokio::test]
+    async fn retained_private_target_policy_does_not_upgrade_download_fetch_permission() {
         let policy = ChromiumPrivateTargetPolicy::new(false);
         policy
             .retain_url_allowance("http://127.0.0.1:43191/")
             .expect("retained local browser scope should be recorded");
+        let download_url =
+            Url::parse("http://127.0.0.1:43191/export.csv").expect("URL should parse");
 
-        assert!(download_private_target_policy_allows_url(
-            Some(&policy),
-            "http://127.0.0.1:43191/export.csv",
-            false
-        ));
-        assert!(!download_private_target_policy_allows_url(
-            Some(&policy),
-            "http://127.0.0.1:43192/export.csv",
-            false
-        ));
-        assert!(download_private_target_policy_allows_url(
-            None,
-            "http://127.0.0.1:43192/export.csv",
-            true
-        ));
+        assert!(
+            policy.allows_url(download_url.as_str()),
+            "setup must prove Chromium retained the same-host private target"
+        );
+        let denied = validate_target_url(&download_url, false)
+            .await
+            .expect_err("download fetch must honor the current explicit private-target denial");
+        assert!(denied.contains("private"), "unexpected validation error: {denied}");
+        validate_target_url(&download_url, true)
+            .await
+            .expect("explicit current allow_private_targets=true should still permit the target");
     }
 }
