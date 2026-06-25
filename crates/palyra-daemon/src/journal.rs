@@ -5662,9 +5662,7 @@ fn can_read_redacted_text_preview(sensitivity: ToolResultSensitivity, text_previ
     text_preview
         && matches!(
             sensitivity,
-            ToolResultSensitivity::StdoutStderr
-                | ToolResultSensitivity::ProviderRawPayload
-                | ToolResultSensitivity::ApprovalRiskData
+            ToolResultSensitivity::ProviderRawPayload | ToolResultSensitivity::ApprovalRiskData
         )
 }
 
@@ -22975,16 +22973,8 @@ mod tests {
                 max_bytes: 4096,
                 text_preview: true,
             })
-            .expect("stdout/stderr artifacts should allow redacted text preview");
-        assert_eq!(stdout_preview.visibility, ToolResultVisibility::RedactedPreview);
-        assert!(
-            stdout_preview
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("INTERNAL_PROJECT_CODENAME")),
-            "stdout/stderr preview should return useful process output"
-        );
-        assert!(stdout_preview.bytes_base64.is_none());
+            .expect_err("stdout/stderr preview should stay gated from artifact.read");
+        assert!(matches!(stdout_preview, JournalError::ToolResultArtifactReadDenied { .. }));
 
         let stdout_full_read = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {
