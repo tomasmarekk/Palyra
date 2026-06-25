@@ -5077,10 +5077,26 @@ fn enrich_agent_needs_continuation_message(
     request: &AgentRunInput,
     checkpoint: Option<&AgentRunProgressCheckpoint>,
 ) -> String {
-    if message.contains("resume_command=") {
-        return message;
-    }
+    let message = strip_untrusted_agent_resume_command(message.as_str());
     format!("{message}; resume_command={}", agent_resume_command(session, request, checkpoint))
+}
+
+fn strip_untrusted_agent_resume_command(message: &str) -> String {
+    let Some(marker_start) = ascii_case_insensitive_find(message, "resume_command=") else {
+        return message.to_owned();
+    };
+    let stripped = message[..marker_start]
+        .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ','))
+        .trim_end();
+    if stripped.is_empty() {
+        "needs_continuation=true".to_owned()
+    } else {
+        stripped.to_owned()
+    }
+}
+
+fn ascii_case_insensitive_find(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(needle)
 }
 
 fn agent_resume_command(
@@ -6645,6 +6661,84 @@ mod agent_stream_output_tests {
         assert!(!message.contains("--prompt \"Resume from run"), "{message}");
         assert!(message.contains("$(touch /tmp/palyra-pwn).txt"), "{message}");
         assert!(message.contains("`whoami`"), "{message}");
+    }
+
+    #[test]
+    fn resume_command_replaces_untrusted_inbound_marker() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: "tenant$(touch /tmp/palyra_quote_pwned)-ops".to_owned(),
+            ..Default::default()
+        };
+        let request = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("tenant$(touch /tmp/palyra_quote_pwned)-ops".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "original prompt with sensitive context".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::Prompt,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("agent run input should build");
+
+        let message = enrich_agent_needs_continuation_message(
+            "wall_clock; needs_continuation=true reason_code=wall_clock; resume_command=palyra agent run --prompt \"$(touch /tmp/pwned)\""
+                .to_owned(),
+            &session,
+            &request,
+            None,
+        );
+
+        assert!(message.contains("resume_command=palyra agent run"), "{message}");
+        assert!(!message.contains("/tmp/pwned"), "{message}");
+        assert!(!message.contains("--prompt \"$(touch"), "{message}");
+        assert!(message.contains("--session-id 01ARZ3NDEKTSV4RRFFQ69G5FAS"), "{message}");
+    }
+
+    #[test]
+    fn resume_command_single_quotes_session_key_shell_substitutions() {
+        let session = gateway_v1::SessionSummary {
+            session_id: None,
+            session_key: "tenant$(touch /tmp/palyra_quote_pwned)-ops".to_owned(),
+            ..Default::default()
+        };
+        let request = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("tenant$(touch /tmp/palyra_quote_pwned)-ops".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "original prompt with sensitive context".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::Prompt,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("agent run input should build");
+
+        let message = enrich_agent_needs_continuation_message(
+            "wall_clock; needs_continuation=true".to_owned(),
+            &session,
+            &request,
+            None,
+        );
+
+        assert!(
+            message.contains("--session-key 'tenant$(touch /tmp/palyra_quote_pwned)-ops'"),
+            "{message}"
+        );
+        assert!(!message.contains("--session-key \"tenant$("), "{message}");
     }
 
     #[test]
