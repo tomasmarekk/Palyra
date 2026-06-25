@@ -1400,7 +1400,7 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                 let callback_input = load_callback_input(
                     callback_url_env,
                     callback_url_stdin,
-                    "xAI callback URL or code: ",
+                    "xAI callback URL or parameters: ",
                 )?;
                 parse_xai_callback_url(callback_input.as_str(), state.as_str())?
             } else {
@@ -2177,7 +2177,7 @@ fn emit_xai_oauth_instructions(
 
 fn xai_oauth_instruction_message(manual_paste: bool) -> &'static str {
     if manual_paste {
-        "Open this URL, authorize Palyra, then paste the displayed code or full 127.0.0.1 callback URL. After the CLI accepts the code, the xAI browser page may keep waiting and is safe to close."
+        "Open this URL, authorize Palyra, then paste the full 127.0.0.1 callback URL or callback query/fragment including state. After the CLI accepts the callback, the xAI browser page may keep waiting and is safe to close."
     } else {
         "Open this URL to authorize Palyra; waiting on http://127.0.0.1:56121/callback."
     }
@@ -2492,12 +2492,14 @@ fn parse_xai_callback_url(raw: &str, expected_state: &str) -> Result<XaiOAuthCal
         return parse_xai_callback_url_parts(&parsed, expected_state);
     }
     if looks_like_xai_callback_parameters(input) {
-        return parse_xai_callback_parameter_payload(input, expected_state, true);
+        return parse_xai_callback_parameter_payload(input, expected_state);
     }
     if input.is_empty() {
         anyhow::bail!("xAI callback input was empty");
     }
-    Ok(XaiOAuthCallback { code: input.to_owned() })
+    anyhow::bail!(
+        "xAI callback input must include the callback URL or callback parameters with matching state"
+    )
 }
 
 fn parse_xai_callback_url_parts(
@@ -2515,7 +2517,7 @@ fn parse_xai_callback_url_parts(
         return Ok(callback);
     }
     if let Some(fragment) = parsed.fragment() {
-        return parse_xai_callback_parameter_payload(fragment, expected_state, false);
+        return parse_xai_callback_parameter_payload(fragment, expected_state);
     }
     anyhow::bail!("xAI OAuth callback did not include code")
 }
@@ -2538,13 +2540,12 @@ fn parse_xai_callback_query(
         .query_pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect::<Vec<_>>();
-    parse_xai_callback_pairs(pairs.as_slice(), expected_state, false)
+    parse_xai_callback_pairs(pairs.as_slice(), expected_state)
 }
 
 fn parse_xai_callback_parameter_payload(
     raw: &str,
     expected_state: &str,
-    allow_missing_state: bool,
 ) -> Result<XaiOAuthCallback> {
     let query = raw.trim().trim_start_matches('?').trim_start_matches('#');
     let parsed = reqwest::Url::parse(
@@ -2555,14 +2556,13 @@ fn parse_xai_callback_parameter_payload(
         .query_pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect::<Vec<_>>();
-    parse_xai_callback_pairs(pairs.as_slice(), expected_state, allow_missing_state)?
+    parse_xai_callback_pairs(pairs.as_slice(), expected_state)?
         .ok_or_else(|| anyhow!("xAI OAuth callback did not include code"))
 }
 
 fn parse_xai_callback_pairs(
     pairs: &[(String, String)],
     expected_state: &str,
-    allow_missing_state: bool,
 ) -> Result<Option<XaiOAuthCallback>> {
     if let Some((_, error)) = pairs.iter().find(|(key, _)| key == "error") {
         anyhow::bail!("xAI OAuth returned error: {error}");
@@ -2577,9 +2577,7 @@ fn parse_xai_callback_pairs(
     };
     let received_state =
         pairs.iter().find(|(key, _)| key == "state").map(|(_, value)| value.to_owned());
-    if received_state.as_deref().is_some_and(|state| state != expected_state)
-        || (!allow_missing_state && received_state.is_none())
-    {
+    if received_state.as_deref() != Some(expected_state) {
         anyhow::bail!("xAI OAuth state mismatch; restart the login flow");
     }
     Ok(Some(XaiOAuthCallback { code }))
@@ -3270,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_callback_input_accepts_loopback_url_query_fragment_and_bare_code() {
+    fn xai_callback_input_accepts_loopback_url_query_and_fragment_with_state() {
         let callback = parse_xai_callback_url(
             "http://127.0.0.1:56121/callback?code=auth-code&state=expected-state",
             "expected-state",
@@ -3288,21 +3286,21 @@ mod tests {
                 .expect("raw callback fragment should be accepted");
         assert_eq!(fragment_callback.code, "fragment-code");
 
-        let bare_callback = parse_xai_callback_url("bare-code-from-xai-page", "expected-state")
-            .expect("bare xAI page code should be accepted");
-        assert_eq!(bare_callback.code, "bare-code-from-xai-page");
+        let bare_error = parse_xai_callback_url("bare-code-from-xai-page", "expected-state")
+            .expect_err("bare xAI page code should not bypass state validation");
+        let code_pair_error = parse_xai_callback_url("code=code-pair", "expected-state")
+            .expect_err("code-only callback parameters should not bypass state validation");
 
-        let code_pair_callback = parse_xai_callback_url("code=code-pair", "expected-state")
-            .expect("code-only callback parameter should be accepted");
-        assert_eq!(code_pair_callback.code, "code-pair");
+        assert!(bare_error.to_string().contains("matching state"), "{bare_error}");
+        assert!(code_pair_error.to_string().contains("state mismatch"), "{code_pair_error}");
     }
 
     #[test]
     fn xai_manual_paste_message_clarifies_browser_close_state() {
         let manual_message = xai_oauth_instruction_message(true);
-        assert!(manual_message.contains("displayed code"), "{manual_message}");
         assert!(manual_message.contains("127.0.0.1 callback URL"), "{manual_message}");
-        assert!(manual_message.contains("After the CLI accepts the code"), "{manual_message}");
+        assert!(manual_message.contains("including state"), "{manual_message}");
+        assert!(manual_message.contains("After the CLI accepts the callback"), "{manual_message}");
         assert!(manual_message.contains("safe to close"), "{manual_message}");
 
         let loopback_message = xai_oauth_instruction_message(false);
