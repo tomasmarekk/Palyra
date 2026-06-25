@@ -947,6 +947,7 @@ async fn upsert_routine(
     let success_visibility =
         parse_success_visibility(optional_string_field(payload, "success_visibility").as_deref())?;
     let delivery_mode_was_requested = optional_string_field(payload, "delivery_mode").is_some();
+    let silent_policy_was_requested = optional_string_field(payload, "silent_policy").is_some();
     let delivery = if !payload_has_any(
         payload,
         &[
@@ -970,6 +971,7 @@ async fn upsert_routine(
             )?,
             success_visibility,
             delivery_mode_was_requested,
+            silent_policy_was_requested,
         )
     };
     let quiet_hours = if !payload_has_any(
@@ -2559,18 +2561,19 @@ enum RoutineSuccessVisibility {
 /// Applies the success-visibility default: a routine whose successes would be
 /// invisible (local_only/logs_only mode or audit_only silence) is upgraded to
 /// same_channel + noisy delivery, unless the caller explicitly requested a
-/// delivery mode or opted into artifact/audit-only visibility.
+/// delivery suppression control or opted into artifact/audit-only visibility.
 fn normalize_delivery_for_success_visibility(
     mut delivery: RoutineDeliveryConfig,
     success_visibility: Option<RoutineSuccessVisibility>,
     delivery_mode_was_requested: bool,
+    silent_policy_was_requested: bool,
 ) -> RoutineDeliveryConfig {
     match success_visibility {
         Some(RoutineSuccessVisibility::ArtifactOnly | RoutineSuccessVisibility::AuditOnly) => {
             return delivery;
         }
         Some(RoutineSuccessVisibility::Announce) => {}
-        None if delivery_mode_was_requested => {
+        None if delivery_mode_was_requested || silent_policy_was_requested => {
             return delivery;
         }
         None if output_delivered_for_outcome(
@@ -3940,11 +3943,33 @@ mod tests {
             silent_policy: RoutineSilentPolicy::AuditOnly,
         };
 
-        let normalized = super::normalize_delivery_for_success_visibility(delivery, None, false);
+        let normalized =
+            super::normalize_delivery_for_success_visibility(delivery, None, false, false);
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
         assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
         assert!(super::output_delivered_for_outcome(
+            &normalized,
+            RoutineRunOutcomeKind::SuccessWithOutput
+        ));
+    }
+
+    #[test]
+    fn explicit_audit_only_policy_is_preserved_without_announce_visibility() {
+        let delivery = RoutineDeliveryConfig {
+            mode: RoutineDeliveryMode::SameChannel,
+            channel: None,
+            failure_mode: None,
+            failure_channel: None,
+            silent_policy: RoutineSilentPolicy::AuditOnly,
+        };
+
+        let normalized =
+            super::normalize_delivery_for_success_visibility(delivery, None, false, true);
+
+        assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
+        assert_eq!(normalized.silent_policy, RoutineSilentPolicy::AuditOnly);
+        assert!(!super::output_delivered_for_outcome(
             &normalized,
             RoutineRunOutcomeKind::SuccessWithOutput
         ));
@@ -3963,6 +3988,7 @@ mod tests {
         let normalized = super::normalize_delivery_for_success_visibility(
             delivery,
             Some(super::RoutineSuccessVisibility::ArtifactOnly),
+            false,
             false,
         );
 
@@ -3984,6 +4010,7 @@ mod tests {
             delivery,
             Some(super::RoutineSuccessVisibility::Announce),
             false,
+            false,
         );
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::SameChannel);
@@ -4000,7 +4027,8 @@ mod tests {
             silent_policy: RoutineSilentPolicy::Noisy,
         };
 
-        let normalized = super::normalize_delivery_for_success_visibility(delivery, None, true);
+        let normalized =
+            super::normalize_delivery_for_success_visibility(delivery, None, true, false);
 
         assert_eq!(normalized.mode, RoutineDeliveryMode::LogsOnly);
         assert_eq!(normalized.silent_policy, RoutineSilentPolicy::Noisy);
