@@ -1892,15 +1892,12 @@ fn looks_like_random_secret_segment(segment: &str) -> bool {
     has_digit && has_alpha && (all_hex || (len >= 16 && all_token_chars))
 }
 
-/// Allows `palyra_e2e_*` end-to-end fixture markers — except ones that embed
-/// "secret", which must keep tripping the canary detection.
+/// Allows only known non-secret end-to-end fixture markers.
 fn looks_like_palyra_e2e_fixture_marker(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("palyra_e2e_") else {
-        return false;
-    };
-    !suffix.is_empty()
-        && !suffix.contains("secret")
-        && suffix.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    const SAFE_MARKERS: &[&str] =
+        &["palyra_e2e_delete_me", "palyra_e2e_keep_me", "palyra_e2e_memory_smoke"];
+
+    SAFE_MARKERS.contains(&value)
 }
 
 /// Allowlists app/storage identifiers assigned to generic key/token names,
@@ -3430,6 +3427,34 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn arbitrary_palyra_e2e_token_values_are_redacted() {
+        let source = "token=palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+                      KEY=palyra_e2e_0123456789abcdef0123456789abcdef";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("token=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("KEY=[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_access_token"));
+        assert!(!outcome.redacted_text.contains("palyra_e2e_0123456789abcdef"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.key"));
     }
 
     #[test]
