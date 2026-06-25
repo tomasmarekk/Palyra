@@ -1101,7 +1101,7 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
             "Observe visible browser state, bounded DOM/accessibility visible text evidence, redacted form/storage metadata, and optional read-only selector geometry/computed-style captures for layout assertions."
         }
         "palyra.browser.storage" => {
-            "Inspect browser cookie/localStorage names and value metadata for diagnostics; secret values are withheld from model-visible output."
+            "Inspect browser cookies/localStorage names and value metadata for diagnostics; secret values are withheld from model-visible output."
         }
         "palyra.browser.network_log" => {
             "Read bounded browser network logs. Entries include entry_id, phase=response, captured_at_unix_ms, status, latency, and request_url; use since_unix_ms after an action boundary to ignore stale entries."

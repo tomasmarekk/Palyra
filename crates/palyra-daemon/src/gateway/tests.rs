@@ -552,15 +552,16 @@ fn process_runner_workspace_root_follows_absolute_cwd_inside_agent_root() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn process_runner_cwd_does_not_persist_focus_for_followup_workspace_tools() {
-    let mut tool_call = default_test_tool_call_config();
-    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
-    tool_call.process_runner.enabled = true;
-    tool_call.process_runner.allowed_executables = vec!["pwd".to_owned()];
-    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     let tempdir = tempfile::tempdir().expect("workspace root should be created");
     let app = tempdir.path().join("app");
     let repo = app.join("repo");
     fs::create_dir_all(repo.as_path()).expect("repo dir should exist");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.allowed_executables = vec!["pwd".to_owned()];
+    tool_call.process_runner.workspace_root = app.clone();
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
     state
         .create_agent(AgentCreateRequest {
             agent_id: "process-cwd-no-focus".to_owned(),

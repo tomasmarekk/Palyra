@@ -620,6 +620,12 @@ fn mark_background_process_stopped(pid: u32) {
     }
 }
 
+fn mark_background_process_stopped_if_inactive(pid: u32) {
+    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true) {
+        mark_background_process_stopped(pid);
+    }
+}
+
 /// Owning wrapper around a Windows job object that tracks a background process tree.
 ///
 /// The job is created with kill-on-close semantics, so dropping the last handle also tears the
@@ -5752,24 +5758,36 @@ fn terminate_background_child(mut child: Child) {
     terminate_child_process_tree(&mut child);
     // Reap the direct child so a failed background startup never leaves a zombie behind.
     let _ = child.wait();
-    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true) {
-        mark_background_process_stopped(pid);
-    }
+    mark_background_process_stopped_if_inactive(pid);
 }
 
 fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration) {
     let pid = child.id();
     let started_at = Instant::now();
+    let mut direct_child_exited = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                mark_background_process_stopped(pid);
-                return;
+        if !direct_child_exited {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    direct_child_exited = true;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    direct_child_exited = true;
+                }
             }
-            Ok(None) => {}
-            Err(_) => {
-                mark_background_process_stopped(pid);
-                return;
+        }
+        if direct_child_exited {
+            match background_process_runtime_status(pid) {
+                Ok(status) if !status.alive() => {
+                    mark_background_process_stopped(pid);
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    mark_background_process_stopped(pid);
+                    return;
+                }
             }
         }
 
@@ -5780,10 +5798,7 @@ fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration)
                 &mut child,
                 Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
             );
-            if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true)
-            {
-                mark_background_process_stopped(pid);
-            }
+            mark_background_process_stopped_if_inactive(pid);
             return;
         }
 
