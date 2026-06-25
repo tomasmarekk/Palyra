@@ -39,14 +39,14 @@ use crate::{
     routines::{
         build_routine_export_bundle, default_outcome_from_cron_status, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
-        routine_approval_policy_with_auto_enable_guard, routine_delivery_preview,
-        routine_templates, shadow_manual_schedule_payload_json, validate_routine_export_bundle,
-        validate_routine_prompt_self_contained, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineDeliveryConfig, RoutineDeliveryMode, RoutineDispatchMode, RoutineExecutionConfig,
-        RoutineExecutionPosture, RoutineExportBundle, RoutineMetadataRecord, RoutineMetadataUpsert,
-        RoutineQuietHours, RoutineRegistryError, RoutineRunMetadataUpsert, RoutineRunMode,
-        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
-        ROUTINE_TEMPLATE_PACK_VERSION,
+        routine_allows_sensitive_tools, routine_approval_policy_with_auto_enable_guard,
+        routine_delivery_preview, routine_templates, shadow_manual_schedule_payload_json,
+        validate_routine_export_bundle, validate_routine_prompt_self_contained,
+        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
+        RoutineDispatchMode, RoutineExecutionConfig, RoutineExecutionPosture, RoutineExportBundle,
+        RoutineMetadataRecord, RoutineMetadataUpsert, RoutineQuietHours, RoutineRegistryError,
+        RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind, RoutineSilentPolicy,
+        RoutineTriggerKind, ROUTINE_TEMPLATE_PACK_VERSION,
     },
     *,
 };
@@ -1625,7 +1625,7 @@ async fn ensure_routine_approval_requested(
         "workdir": job.workdir.as_deref(),
         "run_mode": metadata.execution.run_mode.as_str(),
         "execution_posture": metadata.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": metadata.execution.execution_posture == RoutineExecutionPosture::SensitiveTools,
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&metadata.execution, &metadata.approval_policy),
         "procedure_profile_id": metadata.execution.procedure_profile_id.as_deref(),
         "skill_profile_id": metadata.execution.skill_profile_id.as_deref(),
         "provider_profile_id": metadata.execution.provider_profile_id.as_deref(),
@@ -2145,6 +2145,7 @@ async fn dispatch_single_routine(
         Arc::clone(&state.scheduler_wake),
         build_cron_trigger_options(
             &execution,
+            &routine.metadata.approval_policy,
             request.dispatch_mode,
             request.source_run_id.as_deref(),
             request.safety_note.as_deref(),
@@ -2698,15 +2699,14 @@ fn build_safe_test_delivery() -> RoutineDeliveryConfig {
 
 fn build_cron_trigger_options(
     execution: &RoutineExecutionConfig,
+    approval_policy: &RoutineApprovalPolicy,
     dispatch_mode: RoutineDispatchMode,
     source_run_id: Option<&str>,
     safety_note: Option<&str>,
 ) -> cron::TriggerJobOptions {
     cron::TriggerJobOptions {
         force_run_mode: Some(execution.run_mode),
-        allow_sensitive_tools: Some(
-            execution.execution_posture == RoutineExecutionPosture::SensitiveTools,
-        ),
+        allow_sensitive_tools: Some(routine_allows_sensitive_tools(execution, approval_policy)),
         model_profile_override: execution.provider_profile_id.clone(),
         parameter_delta_json: Some(
             json!({
@@ -3010,11 +3010,10 @@ fn default_approval_policy_for_execution(
     execution: &RoutineExecutionConfig,
     approval_policy: RoutineApprovalPolicy,
     _approval_mode_was_requested: bool,
-    execution_posture_was_requested: bool,
+    _execution_posture_was_requested: bool,
 ) -> RoutineApprovalPolicy {
     if approval_policy.mode == RoutineApprovalMode::None
         && execution.execution_posture == RoutineExecutionPosture::SensitiveTools
-        && !execution_posture_was_requested
     {
         return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
     }
@@ -3712,7 +3711,7 @@ mod tests {
     }
 
     #[test]
-    fn default_approval_policy_does_not_override_explicit_sensitive_tools() {
+    fn default_approval_policy_requires_first_run_for_explicit_sensitive_tools() {
         let execution = RoutineExecutionConfig {
             run_mode: RoutineRunMode::FreshSession,
             execution_posture: RoutineExecutionPosture::SensitiveTools,
@@ -3725,7 +3724,34 @@ mod tests {
             true,
         );
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
+    }
+
+    #[test]
+    fn cron_trigger_options_require_routine_approval_for_sensitive_tools() {
+        let execution = RoutineExecutionConfig {
+            run_mode: RoutineRunMode::FreshSession,
+            execution_posture: RoutineExecutionPosture::SensitiveTools,
+            ..RoutineExecutionConfig::default()
+        };
+
+        let ungated = super::build_cron_trigger_options(
+            &execution,
+            &RoutineApprovalPolicy { mode: RoutineApprovalMode::None },
+            super::RoutineDispatchMode::Normal,
+            None,
+            None,
+        );
+        assert_eq!(ungated.allow_sensitive_tools, Some(false));
+
+        let gated = super::build_cron_trigger_options(
+            &execution,
+            &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
+            super::RoutineDispatchMode::Normal,
+            None,
+            None,
+        );
+        assert_eq!(gated.allow_sensitive_tools, Some(true));
     }
 
     #[test]
