@@ -64,8 +64,8 @@ use crate::{
     },
     objectives::{ObjectiveLifecycleRecord, ObjectiveRecord, ObjectiveState, ObjectiveUpsert},
     routines::{
-        evaluate_file_watch_change, parse_file_watch_config, RoutineApprovalMode,
-        RoutineDispatchMode, RoutineExecutionPosture, RoutineMetadataRecord, RoutineMetadataUpsert,
+        evaluate_file_watch_change, parse_file_watch_config, routine_allows_sensitive_tools,
+        RoutineApprovalMode, RoutineDispatchMode, RoutineMetadataRecord, RoutineMetadataUpsert,
         RoutineRunMetadataUpsert, RoutineRunMode, RoutineTriggerKind,
     },
 };
@@ -2327,7 +2327,7 @@ async fn ensure_scheduled_routine_approval_requested(
         "workdir": job.workdir.as_deref(),
         "run_mode": routine.execution.run_mode.as_str(),
         "execution_posture": routine.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": routine.execution.execution_posture == RoutineExecutionPosture::SensitiveTools,
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&routine.execution, &routine.approval_policy),
         "procedure_profile_id": routine.execution.procedure_profile_id.as_deref(),
         "skill_profile_id": routine.execution.skill_profile_id.as_deref(),
         "provider_profile_id": routine.execution.provider_profile_id.as_deref(),
@@ -3045,8 +3045,8 @@ fn build_effective_cron_execution_request(
         .or_else(|| execution.map(|config| config.run_mode))
         .unwrap_or(RoutineRunMode::SameSession);
     let allow_sensitive_tools = options.allow_sensitive_tools.unwrap_or_else(|| {
-        execution.is_some_and(|config| {
-            config.execution_posture == RoutineExecutionPosture::SensitiveTools
+        routine.as_ref().is_some_and(|record| {
+            routine_allows_sensitive_tools(&record.execution, &record.approval_policy)
         })
     });
     let model_profile_override = options

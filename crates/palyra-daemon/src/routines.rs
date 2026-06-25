@@ -784,6 +784,16 @@ impl Default for RoutineApprovalPolicy {
     }
 }
 
+/// Returns whether routine execution may auto-approve sensitive tool proposals.
+#[must_use]
+pub fn routine_allows_sensitive_tools(
+    execution: &RoutineExecutionConfig,
+    approval_policy: &RoutineApprovalPolicy,
+) -> bool {
+    execution.execution_posture == RoutineExecutionPosture::SensitiveTools
+        && approval_policy.mode != RoutineApprovalMode::None
+}
+
 /// Applies the routine schedule auto-enable guard to an approval policy.
 ///
 /// Inputs are the normalized schedule type and payload produced by the cron
@@ -3166,17 +3176,18 @@ mod tests {
     use super::{
         build_routine_export_bundle, default_outcome_from_cron_status, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
-        resolve_routines_root, routine_approval_policy_with_auto_enable_guard,
-        routine_delivery_contract, routine_delivery_preview, routine_retention_dry_run,
-        routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
-        schedule_requires_auto_enable_guard, shadow_manual_schedule_payload_json,
-        validate_routine_export_bundle, validate_routine_prompt_self_contained,
-        RoutineApprovalGateState, RoutineApprovalMode, RoutineApprovalPolicy,
-        RoutineDeliveryConfig, RoutineDeliveryContractKind, RoutineDeliveryMode,
-        RoutineExecutionConfig, RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy,
-        RoutineRunLeaseState, RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode,
-        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
-        MIN_AUTO_ENABLE_EVERY_INTERVAL_MS, ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
+        resolve_routines_root, routine_allows_sensitive_tools,
+        routine_approval_policy_with_auto_enable_guard, routine_delivery_contract,
+        routine_delivery_preview, routine_retention_dry_run, routine_run_lifecycle_snapshot,
+        routine_runtime_backfill_plan, schedule_requires_auto_enable_guard,
+        shadow_manual_schedule_payload_json, validate_routine_export_bundle,
+        validate_routine_prompt_self_contained, RoutineApprovalGateState, RoutineApprovalMode,
+        RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryContractKind,
+        RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
+        RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
+        RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
+        RoutineSilentPolicy, RoutineTriggerKind, MIN_AUTO_ENABLE_EVERY_INTERVAL_MS,
+        ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
     };
     use crate::{
         cron::CronTimezoneMode,
@@ -3597,6 +3608,28 @@ mod tests {
         );
 
         assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
+    }
+
+    #[test]
+    fn sensitive_tool_auto_approval_requires_routine_approval_policy() {
+        let standard_execution = RoutineExecutionConfig::default();
+        let sensitive_execution = RoutineExecutionConfig {
+            execution_posture: RoutineExecutionPosture::SensitiveTools,
+            ..RoutineExecutionConfig::default()
+        };
+
+        assert!(!routine_allows_sensitive_tools(
+            &standard_execution,
+            &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
+        ));
+        assert!(!routine_allows_sensitive_tools(
+            &sensitive_execution,
+            &RoutineApprovalPolicy::default(),
+        ));
+        assert!(routine_allows_sensitive_tools(
+            &sensitive_execution,
+            &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
+        ));
     }
 
     #[test]
