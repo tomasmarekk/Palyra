@@ -1610,10 +1610,24 @@ fn effective_status_base_urls(
     uses_chatgpt_oauth: bool,
 ) -> (Option<String>, Option<String>) {
     if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND && uses_chatgpt_oauth {
-        let codex_base_url = Some(OPENAI_CODEX_BACKEND_BASE_URL.to_owned());
-        return (codex_base_url.clone(), codex_base_url);
+        let base_url = Some(chatgpt_oauth_status_base_url(
+            endpoint_base_url.as_deref().or(openai_base_url.as_deref()),
+        ));
+        return (base_url.clone(), base_url);
     }
     (endpoint_base_url, openai_base_url)
+}
+
+fn chatgpt_oauth_status_base_url(configured_base_url: Option<&str>) -> String {
+    let configured = configured_base_url
+        .and_then(normalize_optional_text)
+        .unwrap_or(OPENAI_DEFAULT_BASE_URL)
+        .trim_end_matches('/');
+    if configured.to_ascii_lowercase().contains("api.openai.com") {
+        OPENAI_CODEX_BACKEND_BASE_URL.to_owned()
+    } else {
+        configured.to_owned()
+    }
 }
 
 fn ensure_document_default_model_supports_service_tier(
@@ -3584,13 +3598,26 @@ mod tests {
     fn models_status_base_urls_use_codex_backend_for_chatgpt_oauth() {
         let (endpoint_base_url, openai_base_url) = effective_status_base_urls(
             OPENAI_COMPATIBLE_PROVIDER_KIND,
-            Some("https://api.x.ai/v1".to_owned()),
-            Some("https://api.x.ai/v1".to_owned()),
+            Some("https://api.openai.com/v1".to_owned()),
+            Some("https://api.openai.com/v1".to_owned()),
             true,
         );
 
         assert_eq!(endpoint_base_url.as_deref(), Some(OPENAI_CODEX_BACKEND_BASE_URL));
         assert_eq!(openai_base_url.as_deref(), Some(OPENAI_CODEX_BACKEND_BASE_URL));
+    }
+
+    #[test]
+    fn models_status_base_urls_keep_custom_chatgpt_oauth_destination() {
+        let (endpoint_base_url, openai_base_url) = effective_status_base_urls(
+            OPENAI_COMPATIBLE_PROVIDER_KIND,
+            Some("https://proxy.example.test/openai".to_owned()),
+            Some("https://proxy.example.test/openai".to_owned()),
+            true,
+        );
+
+        assert_eq!(endpoint_base_url.as_deref(), Some("https://proxy.example.test/openai"));
+        assert_eq!(openai_base_url.as_deref(), Some("https://proxy.example.test/openai"));
     }
 
     #[test]
