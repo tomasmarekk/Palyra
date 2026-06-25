@@ -23,8 +23,6 @@ use palyra_vault::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const ANTHROPIC_MODELS_RESPONSE: &str = r#"{"data":[{"id":"claude-test-discovered"}]}"#;
-
 fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
     command
         .env("PALYRA_STATE_ROOT", workdir.path().join("state-root"))
@@ -509,8 +507,10 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn_anthropic(ANTHROPIC_MODELS_RESPONSE)?;
-    let anthropic_base_url = model_server.base_url.clone();
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden Anthropic endpoint")?;
+    let forbidden_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
     let output = run_cli(
         &workdir,
         &[
@@ -535,14 +535,10 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
         ],
         &[
             ("ANTHROPIC_API_KEY", "sk-ant-test-setup"),
-            ("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL", anthropic_base_url.as_str()),
+            ("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL", forbidden_base_url.as_str()),
         ],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "setup should discover Anthropic models before writing config: {discovery_request}"
-    );
+    assert_no_pending_connection(&forbidden_listener, "Anthropic API-key env base URL override")?;
     assert!(
         output.status.success(),
         "anthropic quickstart should succeed: {}",
@@ -556,8 +552,20 @@ fn setup_wizard_quickstart_supports_anthropic_api_key() -> Result<()> {
         "expected vault-backed Anthropic auth in onboarding config"
     );
     assert!(
-        written.contains("anthropic_model = \"claude-test-discovered\""),
-        "expected discovered Anthropic model in config"
+        written.contains("anthropic_base_url = \"https://api.anthropic.com\""),
+        "Anthropic API-key onboarding must use the official Anthropic base URL"
+    );
+    assert!(
+        !written.contains(forbidden_base_url.as_str()),
+        "Anthropic API-key onboarding must ignore env-supplied base URLs"
+    );
+    assert!(
+        !written.contains("anthropic_model = "),
+        "Anthropic API-key onboarding must not write a model discovered with a freshly supplied key"
+    );
+    assert!(
+        written.contains("provider_id = \"anthropic-primary\""),
+        "expected Anthropic provider discovery to remain pending after secure API-key setup"
     );
     Ok(())
 }
@@ -1838,25 +1846,8 @@ struct MockProviderServer {
     handle: thread::JoinHandle<Result<String>>,
 }
 
-#[derive(Clone, Copy)]
-enum MockProviderAuth {
-    Bearer,
-    Anthropic,
-}
-
 impl MockProviderServer {
     fn spawn(response_body: &'static str) -> Result<Self> {
-        Self::spawn_with_auth(response_body, MockProviderAuth::Bearer)
-    }
-
-    fn spawn_anthropic(response_body: &'static str) -> Result<Self> {
-        Self::spawn_with_auth(response_body, MockProviderAuth::Anthropic)
-    }
-
-    fn spawn_with_auth(
-        response_body: &'static str,
-        expected_auth: MockProviderAuth,
-    ) -> Result<Self> {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("failed to bind mock provider server")?;
         listener.set_nonblocking(true).context("failed to configure mock provider listener")?;
@@ -1877,23 +1868,10 @@ impl MockProviderServer {
                             anyhow::bail!("unexpected provider request: {request_text}");
                         }
                         let request_lower = request_text.to_ascii_lowercase();
-                        match expected_auth {
-                            MockProviderAuth::Bearer => {
-                                if !request_lower.contains("authorization: bearer ") {
-                                    anyhow::bail!(
-                                        "model discovery request should use bearer auth: {request_text}"
-                                    );
-                                }
-                            }
-                            MockProviderAuth::Anthropic => {
-                                if !request_lower.contains("x-api-key: ")
-                                    || !request_lower.contains("anthropic-version: ")
-                                {
-                                    anyhow::bail!(
-                                        "Anthropic discovery request should use x-api-key and anthropic-version headers: {request_text}"
-                                    );
-                                }
-                            }
+                        if !request_lower.contains("authorization: bearer ") {
+                            anyhow::bail!(
+                                "model discovery request should use bearer auth: {request_text}"
+                            );
                         }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

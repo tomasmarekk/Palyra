@@ -52,12 +52,11 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
 ];
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const ANTHROPIC_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL";
+const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
 const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BASE_URL";
 const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL";
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 #[cfg(test)]
 const OPENAI_API_CURATED_DEFAULT_ORDER: &[&str] =
     &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
@@ -2878,13 +2877,12 @@ fn apply_model_provider_api_key(
     match auth_method {
         "anthropic_api_key" => {
             let base_url = anthropic_base_url_for_config(document)?;
-            let model_id = discover_anthropic_model_selection(base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
             configure_anthropic_provider_with_base_url(
                 document,
                 base_url.as_str(),
-                Some(model_id.as_str()),
+                None,
                 Some(vault_ref),
             )?;
         }
@@ -3064,7 +3062,7 @@ fn configure_anthropic_provider(
 ) -> Result<()> {
     configure_anthropic_provider_with_base_url(
         document,
-        "https://api.anthropic.com",
+        ANTHROPIC_DEFAULT_BASE_URL,
         model_id,
         vault_ref,
     )
@@ -3461,15 +3459,6 @@ fn discover_openai_compatible_models(
     parse_discovered_provider_models(body.as_str())
 }
 
-fn discover_anthropic_model_selection(base_url: &str, api_key: &str) -> Result<String> {
-    let models = discover_anthropic_models(api_key, base_url)?;
-    select_preferred_discovered_model_id(models.as_slice()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Anthropic model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
-        )
-    })
-}
-
 fn openai_base_url_for_config(document: &toml::Value) -> Result<String> {
     openai_base_url_for_config_with_override(document, None)
 }
@@ -3482,25 +3471,14 @@ fn openai_base_url_for_config_with_override(
 }
 
 fn anthropic_base_url_for_config(document: &toml::Value) -> Result<String> {
-    if let Some(base_url) = provider_base_url_from_env(ANTHROPIC_BASE_URL_ENV)? {
-        return Ok(base_url);
-    }
-    let configured_for_anthropic =
-        get_string_value_at_path(document, "model_provider.kind")?.as_deref() == Some("anthropic")
-            && get_string_value_at_path(document, "model_provider.auth_provider_kind")?
-                .as_deref()
-                .is_none_or(|kind| kind.eq_ignore_ascii_case("anthropic"));
-    if configured_for_anthropic {
-        if let Some(base_url) =
-            get_string_value_at_path(document, "model_provider.anthropic_base_url")?
-        {
-            return normalize_provider_discovery_base_url(
-                base_url.as_str(),
-                "model_provider.anthropic_base_url",
-            );
-        }
-    }
-    Ok("https://api.anthropic.com".to_owned())
+    anthropic_base_url_for_config_with_override(document, None)
+}
+
+fn anthropic_base_url_for_config_with_override(
+    _document: &toml::Value,
+    _env_override: Option<String>,
+) -> Result<String> {
+    Ok(ANTHROPIC_DEFAULT_BASE_URL.to_owned())
 }
 
 fn registry_provider_base_url(defaults: &RegistryProviderDefaults) -> Result<String> {
@@ -3530,40 +3508,6 @@ fn provider_base_url_from_env(env_name: &str) -> Result<Option<String>> {
         Err(env::VarError::NotPresent) => Ok(None),
         Err(error) => anyhow::bail!("{env_name} must contain valid Unicode: {error}"),
     }
-}
-
-fn discover_anthropic_models(
-    api_key: &str,
-    base_url: &str,
-) -> Result<Vec<DiscoveredProviderModel>> {
-    let endpoint = provider_models_endpoint(base_url)?;
-    let client = Client::builder()
-        .timeout(PROVIDER_MODEL_DISCOVERY_TIMEOUT)
-        .build()
-        .context("failed to initialize Anthropic model discovery client")?;
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(
-        "x-api-key",
-        HeaderValue::from_str(api_key)
-            .context("Anthropic API key cannot be sent as an x-api-key header")?,
-    );
-    headers.insert("anthropic-version", HeaderValue::from_static(ANTHROPIC_API_VERSION));
-
-    let response = client
-        .get(endpoint)
-        .headers(headers)
-        .send()
-        .context("failed to call Anthropic model discovery endpoint")?;
-    let status = response.status();
-    let body = response.text().unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!(
-            "Anthropic model discovery failed: {}",
-            sanitize_provider_error(body.as_str(), status.as_u16())
-        );
-    }
-    parse_discovered_provider_models(body.as_str())
 }
 
 /// Resolves the MiniMax base URL and chat model, preferring live model discovery
@@ -5035,6 +4979,32 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
             )
             .expect("explicit OpenAI API key base URL override should resolve"),
             OPENAI_DEFAULT_BASE_URL
+        );
+    }
+
+    #[test]
+    fn anthropic_api_key_base_url_ignores_config_and_env_overrides() {
+        let document: toml::Value = toml::from_str(
+            r#"
+[model_provider]
+kind = "anthropic"
+anthropic_base_url = "https://attacker.example/v1"
+"#,
+        )
+        .expect("test config should parse");
+
+        assert_eq!(
+            anthropic_base_url_for_config_with_override(&document, None)
+                .expect("Anthropic API key base URL should resolve"),
+            ANTHROPIC_DEFAULT_BASE_URL
+        );
+        assert_eq!(
+            anthropic_base_url_for_config_with_override(
+                &document,
+                Some("http://127.0.0.1:9876/v1".to_owned())
+            )
+            .expect("explicit Anthropic API key base URL override should resolve"),
+            ANTHROPIC_DEFAULT_BASE_URL
         );
     }
 
