@@ -55,6 +55,54 @@ pub fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEY_MARKERS.iter().any(|marker| normalized.contains(marker))
 }
 
+/// Returns whether a sensitive assignment key denotes a file/path reference
+/// rather than credential material itself.
+#[must_use]
+pub fn is_sensitive_path_reference_key(key: &str) -> bool {
+    let normalized = normalize_key(key);
+    if !is_sensitive_key(normalized.as_str()) {
+        return false;
+    }
+    if normalized.ends_with("_file") || normalized.ends_with("_path") {
+        return true;
+    }
+
+    let compact = normalized.replace('_', "");
+    const COMPACT_PATH_REFERENCE_SUFFIXES: &[&str] = &[
+        "accesstokenfile",
+        "accesstokenpath",
+        "apikeyfile",
+        "apikeypath",
+        "authorizationfile",
+        "authorizationpath",
+        "authtokenfile",
+        "authtokenpath",
+        "clientsecretfile",
+        "clientsecretpath",
+        "cookiefile",
+        "cookiepath",
+        "credentialfile",
+        "credentialpath",
+        "passwordfile",
+        "passwordpath",
+        "privatekeyfile",
+        "privatekeypath",
+        "refreshtokenfile",
+        "refreshtokenpath",
+        "secretfile",
+        "secretpath",
+        "sessionfile",
+        "sessionpath",
+        "signaturefile",
+        "signaturepath",
+        "tokenfile",
+        "tokenpath",
+        "vaultreffile",
+        "vaultrefpath",
+    ];
+    COMPACT_PATH_REFERENCE_SUFFIXES.iter().any(|suffix| compact.ends_with(suffix))
+}
+
 /// Replaces a non-empty token value with the [`REDACTED`] placeholder.
 #[must_use]
 pub fn redact_token(value: &str) -> String {
@@ -392,7 +440,10 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     if value.is_empty() {
         return false;
     }
-    if strictness == RedactionStrictness::Heuristic && is_benign_path_reference_value(value) {
+    if strictness == RedactionStrictness::Heuristic
+        && is_sensitive_path_reference_key(sensitive_key)
+        && is_benign_path_reference_value(value)
+    {
         return false;
     }
     if strictness == RedactionStrictness::Diagnostic {
@@ -713,6 +764,17 @@ mod tests {
             "{redacted}"
         );
         assert!(!redacted.contains(REDACTED), "{redacted}");
+    }
+
+    #[test]
+    fn auth_error_redaction_masks_path_shaped_generic_secret_assignments() {
+        let redacted =
+            redact_auth_error("provider failed: CLIENT_SECRET=abc/def.ghi API_KEY=dir/file.key");
+
+        assert!(redacted.contains("CLIENT_SECRET=<redacted>"), "{redacted}");
+        assert!(redacted.contains("API_KEY=<redacted>"), "{redacted}");
+        assert!(!redacted.contains("abc/def.ghi"), "{redacted}");
+        assert!(!redacted.contains("dir/file.key"), "{redacted}");
     }
 
     #[test]

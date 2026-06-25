@@ -144,9 +144,9 @@ use palyra_common::{
     },
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{
-        is_benign_path_reference_value, is_sensitive_key, redact_auth_error,
-        redact_internal_runtime_paths, redact_url, redact_url_segments_in_text, redact_url_strict,
-        REDACTED,
+        is_benign_path_reference_value, is_sensitive_key, is_sensitive_path_reference_key,
+        redact_auth_error, redact_internal_runtime_paths, redact_url, redact_url_segments_in_text,
+        redact_url_strict, REDACTED,
     },
     replay_bundle::{
         build_replay_bundle, canonical_replay_bundle_bytes, ensure_replay_report_passed,
@@ -2331,7 +2331,7 @@ fn redact_diagnostic_assignment_token(token: &str) -> Option<String> {
     if value.is_empty() || !is_sensitive_key(key) {
         return None;
     }
-    if is_benign_path_reference_value(value) {
+    if is_sensitive_path_reference_key(key) && is_benign_path_reference_value(value) {
         return None;
     }
     Some(format!("{key}{separator}{REDACTED}"))
@@ -6444,6 +6444,19 @@ mod agent_stream_output_tests {
         assert_eq!(value["type"], "run.status");
         assert_eq!(value["kind"], "done");
         assert_eq!(value["message"], "completed with SECRET_FILE=/app/secret.txt");
+    }
+
+    #[test]
+    fn diagnostic_error_redacts_path_shaped_generic_secret_assignments() {
+        let sanitized = sanitize_diagnostic_error(
+            "provider failed CLIENT_SECRET=abc/def.ghi API_KEY=dir/file.key SECRET_FILE=/app/secret.txt",
+        );
+
+        assert!(sanitized.contains("CLIENT_SECRET=<redacted>"), "{sanitized}");
+        assert!(sanitized.contains("API_KEY=<redacted>"), "{sanitized}");
+        assert!(sanitized.contains("SECRET_FILE=/app/secret.txt"), "{sanitized}");
+        assert!(!sanitized.contains("abc/def.ghi"), "{sanitized}");
+        assert!(!sanitized.contains("dir/file.key"), "{sanitized}");
     }
 
     #[test]

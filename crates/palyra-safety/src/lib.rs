@@ -1032,9 +1032,52 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_vault_reference_value(reference)
         || is_obvious_placeholder_secret_value(reference)
         || is_benign_mock_credential_fixture_value(reference)
-        || is_benign_path_reference_value(reference)
+        || (sensitive_assignment_key_allows_path_reference(key)
+            && is_benign_path_reference_value(reference))
         || is_dom_input_value_reference(reference)
         || is_non_literal_source_expression_value(raw_key, normalized)
+}
+
+fn sensitive_assignment_key_allows_path_reference(key: &str) -> bool {
+    let mut normalized = String::with_capacity(key.len());
+    for ch in key.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    if classify_sensitive_assignment_key(normalized.as_str()).is_none() {
+        return false;
+    }
+    if normalized.ends_with("_file") || normalized.ends_with("_path") {
+        return true;
+    }
+
+    let compact = normalized.replace('_', "");
+    const COMPACT_PATH_REFERENCE_SUFFIXES: &[&str] = &[
+        "accesstokenfile",
+        "accesstokenpath",
+        "apikeyfile",
+        "apikeypath",
+        "authtokenfile",
+        "authtokenpath",
+        "clientsecretfile",
+        "clientsecretpath",
+        "credentialfile",
+        "credentialpath",
+        "passwordfile",
+        "passwordpath",
+        "privatekeyfile",
+        "privatekeypath",
+        "refreshtokenfile",
+        "refreshtokenpath",
+        "secretfile",
+        "secretpath",
+        "tokenfile",
+        "tokenpath",
+    ];
+    COMPACT_PATH_REFERENCE_SUFFIXES.iter().any(|suffix| compact.ends_with(suffix))
 }
 
 fn is_vault_reference_value(value: &str) -> bool {
@@ -3035,6 +3078,36 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn path_shaped_generic_secret_assignments_are_redacted() {
+        let source = "SECRET_FILE=/app/secret.txt\n\
+                      CLIENT_SECRET=abc/def.ghi\n\
+                      API_KEY=dir/file.key";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::ToolOutput,
+            SafetyContentKind::PlainText,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("SECRET_FILE=/app/secret.txt"));
+        assert!(outcome.redacted_text.contains("CLIENT_SECRET=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("API_KEY=[REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("abc/def.ghi"));
+        assert!(!outcome.redacted_text.contains("dir/file.key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.client_secret"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
     }
 
     #[test]

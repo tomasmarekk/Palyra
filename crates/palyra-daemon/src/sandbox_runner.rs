@@ -10453,12 +10453,14 @@ mod tests {
     #[test]
     fn process_output_text_redacts_secret_like_values() {
         let redacted = redacted_process_output_text(
-            "MINIMAX_API_KEY=sk-test-secret-value\npublic_setting=true\n",
+            "MINIMAX_API_KEY=sk-test-secret-value\nCLIENT_SECRET=abc/def.ghi\npublic_setting=true\n",
         );
 
         assert!(redacted.redacted, "{redacted:?}");
         assert!(redacted.text.contains("public_setting=true"), "{}", redacted.text);
         assert!(!redacted.text.contains("sk-test-secret-value"), "{}", redacted.text);
+        assert!(!redacted.text.contains("abc/def.ghi"), "{}", redacted.text);
+        assert!(redacted.text.contains("CLIENT_SECRET=[REDACTED_SECRET]"), "{}", redacted.text);
         assert!(redacted.text.contains("REDACTED"), "{}", redacted.text);
         assert!(
             redacted.redaction_reasons.iter().any(|reason| reason == "auth_or_assignment_secret"),
