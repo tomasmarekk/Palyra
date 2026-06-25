@@ -620,14 +620,14 @@ fn setup_wizard_text_summary_surfaces_gateway_start_guidance() -> Result<()> {
 }
 
 #[test]
-fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
+fn setup_wizard_rejects_custom_minimax_discovery_base_url() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(
-        r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"},{"id":"MiniMax-M2.5"}]}"#,
-    )?;
-    let minimax_base_url = model_server.base_url.clone();
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden MiniMax endpoint")?;
+    let minimax_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
     let output = run_cli(
         &workdir,
         &[
@@ -655,60 +655,16 @@ fn setup_wizard_quickstart_supports_minimax_api_key() -> Result<()> {
             ("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str()),
         ],
     )?;
-    let discovery_request = model_server.finish()?;
+    assert_no_pending_connection(&forbidden_listener, "MiniMax API-key discovery base URL")?;
     assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "setup should discover MiniMax models before writing config: {discovery_request}"
+        !output.status.success(),
+        "MiniMax setup must fail before sending a new key to a custom base URL"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "MiniMax quickstart should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let written = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    assert!(written.contains("kind = \"anthropic\""), "expected Anthropic-compatible provider");
-    assert!(
-        written.contains("auth_provider_kind = \"minimax\""),
-        "expected MiniMax auth provider kind"
-    );
-    assert!(
-        written.contains(format!("anthropic_base_url = \"{minimax_base_url}\"").as_str()),
-        "expected MiniMax Anthropic-compatible endpoint"
-    );
-    assert!(
-        written.contains("anthropic_model = \"MiniMax-M3\""),
-        "expected MiniMax model selected from live discovery"
-    );
-    assert!(
-        written.contains("allow_private_base_url = true"),
-        "expected loopback discovery endpoint to opt into private base URLs"
-    );
-    assert!(
-        written.contains("anthropic_api_key_vault_ref = \"global/minimax_api_key\""),
-        "expected vault-backed MiniMax auth in onboarding config"
-    );
-
-    let profile_list = run_cli(&workdir, &["profile", "list", "--json"], &[])?;
-    assert!(
-        profile_list.status.success(),
-        "profile list should succeed after setup: {}",
-        String::from_utf8_lossy(&profile_list.stderr)
-    );
-    let profile_payload: Value = serde_json::from_slice(&profile_list.stdout)
-        .context("profile list stdout should be JSON")?;
-    assert_eq!(profile_payload.get("default_profile").and_then(Value::as_str), Some("local"));
-    assert_eq!(
-        profile_payload.pointer("/profiles/0/config_path").and_then(Value::as_str),
-        Some(config_path_string.as_str()),
-        "setup should register the generated config path in the default profile: {profile_payload}"
-    );
-
-    let profile_show = run_cli(&workdir, &["profile", "show", "--json"], &[])?;
-    assert!(
-        profile_show.status.success(),
-        "profile show should resolve the setup-created default profile: {}",
-        String::from_utf8_lossy(&profile_show.stderr)
+        stderr.contains("official MiniMax endpoints")
+            && stderr.contains("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL"),
+        "expected trusted-endpoint error for MiniMax custom discovery URL: {stderr}"
     );
     Ok(())
 }
@@ -914,13 +870,10 @@ fn onboarding_wizard_without_path_uses_palyra_config_env_path() -> Result<()> {
 }
 
 #[test]
-fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result<()> {
+fn setup_wizard_stores_openai_secret_in_state_root_vault_by_default() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server =
-        MockProviderServer::spawn(r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"}]}"#)?;
-    let minimax_base_url = model_server.base_url.clone();
     let output = run_cli_without_explicit_vault_dir(
         &workdir,
         &[
@@ -936,26 +889,18 @@ fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result
             "--non-interactive",
             "--accept-risk",
             "--auth-method",
-            "minimax-api-key",
+            "api-key",
             "--api-key-env",
-            "MINIMAX_API_KEY",
+            "OPENAI_API_KEY",
             "--skip-channels",
             "--skip-skills",
             "--skip-health",
         ],
-        &[
-            ("MINIMAX_API_KEY", "sk-minimax-state-root"),
-            ("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-openai-state-root")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "setup should discover MiniMax models before storing the generated config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
-        "MiniMax quickstart should succeed without PALYRA_VAULT_DIR: {}",
+        "OpenAI quickstart should succeed without PALYRA_VAULT_DIR: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -969,10 +914,10 @@ fn setup_wizard_stores_minimax_secret_in_state_root_vault_by_default() -> Result
     })
     .context("failed to open state-root vault")?;
     let secret = vault
-        .get_secret(&scope, "minimax_api_key")
-        .context("state-root vault should contain the MiniMax secret")?;
+        .get_secret(&scope, "openai_api_key")
+        .context("state-root vault should contain the OpenAI secret")?;
     let secret = String::from_utf8(secret).context("vault secret should be valid UTF-8")?;
-    assert_eq!(secret, "sk-minimax-state-root");
+    assert_eq!(secret, "sk-openai-state-root");
     Ok(())
 }
 
@@ -1325,23 +1270,19 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
 }
 
 #[test]
-fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()> {
+fn configure_auth_model_rejects_custom_minimax_discovery_base_url() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("configure").join("palyra.toml");
     fs::create_dir_all(config_path.parent().expect("config parent"))
         .context("failed to create config parent")?;
     fs::write(config_path.as_path(), "version = 1\n")
         .with_context(|| format!("failed to write {}", config_path.display()))?;
-    #[cfg(unix)]
-    fs::set_permissions(config_path.as_path(), fs::Permissions::from_mode(0o644)).with_context(
-        || format!("failed to seed broad permissions for {}", config_path.display()),
-    )?;
 
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden MiniMax endpoint")?;
+    let forbidden_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(
-        r#"{"data":[{"id":"MiniMax-M3"},{"id":"MiniMax-M2.7"},{"id":"MiniMax-M2.5"}]}"#,
-    )?;
-    let minimax_base_url = model_server.base_url.clone();
     let output = run_cli_with_stdin(
         &workdir,
         &[
@@ -1357,14 +1298,61 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
             "--api-key-stdin",
             "--json",
         ],
-        &[("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", minimax_base_url.as_str())],
-        Some(b"sk-minimax-resume\n"),
+        &[("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL", forbidden_base_url.as_str())],
+        Some(b"sk-minimax-rejected\n"),
     )?;
-    let discovery_request = model_server.finish()?;
+    assert_no_pending_connection(&forbidden_listener, "MiniMax configure discovery base URL")?;
     assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "configure auth-model should discover MiniMax models before persisting config: {discovery_request}"
+        !output.status.success(),
+        "MiniMax configure must fail before sending a new key to a custom base URL"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("official MiniMax endpoints")
+            && stderr.contains("PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL"),
+        "expected trusted-endpoint error for MiniMax custom discovery URL: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("configure").join("palyra.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent"))
+        .context("failed to create config parent")?;
+    fs::write(config_path.as_path(), "version = 1\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(config_path.as_path(), fs::Permissions::from_mode(0o644)).with_context(
+        || format!("failed to seed broad permissions for {}", config_path.display()),
+    )?;
+
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden OpenAI endpoint")?;
+    let forbidden_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
+    let output = run_cli_with_stdin(
+        &workdir,
+        &[
+            "configure",
+            "--path",
+            &config_path_string,
+            "--section",
+            "auth-model",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "api-key",
+            "--api-key-stdin",
+            "--json",
+        ],
+        &[("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", forbidden_base_url.as_str())],
+        Some(b"sk-openai-resume\n"),
+    );
+    let output = output?;
+    assert_no_pending_connection(&forbidden_listener, "OpenAI API-key env base URL override")?;
     assert!(
         output.status.success(),
         "configure auth-model should complete resume repair: {}",
@@ -1394,22 +1382,22 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
         .context("auth-model change should include after values")?;
     assert_eq!(
         after_values.first().and_then(Value::as_str),
-        Some("provider_display_name=MiniMax"),
-        "MiniMax configure output should lead with the selected provider display name: {payload}"
+        Some("provider_display_name=OpenAI-compatible"),
+        "OpenAI configure output should lead with the selected provider display name: {payload}"
     );
     assert!(
         after_values
             .iter()
-            .any(|value| value.as_str() == Some("protocol_compatibility=anthropic_compatible")),
-        "configure output should expose Anthropic compatibility as a secondary detail: {payload}"
+            .any(|value| value.as_str() == Some("protocol_compatibility=openai_compatible")),
+        "configure output should expose OpenAI-compatible protocol as a secondary detail: {payload}"
     );
     assert!(
-        after_values.iter().any(|value| value.as_str() == Some("provider_kind=anthropic")),
+        after_values.iter().any(|value| value.as_str() == Some("provider_kind=openai_compatible")),
         "configure output should preserve the technical compatibility provider kind: {payload}"
     );
     assert!(
-        after_values.iter().any(|value| value.as_str() == Some("chat_model=MiniMax-M3")),
-        "configure output should expose the MiniMax model selected from live discovery: {payload}"
+        after_values.iter().any(|value| value.as_str() == Some("chat_model=unset")),
+        "secure OpenAI API-key setup should leave model discovery pending: {payload}"
     );
     let follow_up_checks = payload
         .get("follow_up_checks")
@@ -1441,12 +1429,20 @@ fn configure_auth_model_backfills_admin_defaults_for_resume_path() -> Result<()>
     let written = fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     assert!(
-        written.contains("auth_provider_kind = \"minimax\""),
-        "expected MiniMax auth provider after configure: {written}"
+        written.contains("openai_api_key_vault_ref = \"global/openai_api_key\""),
+        "expected vault-backed OpenAI auth after configure: {written}"
     );
     assert!(
-        written.contains("anthropic_model = \"MiniMax-M3\""),
-        "expected discovered MiniMax model after configure: {written}"
+        written.contains("openai_base_url = \"https://api.openai.com/v1\""),
+        "OpenAI API-key onboarding must use the official OpenAI base URL: {written}"
+    );
+    assert!(
+        !written.contains(forbidden_base_url.as_str()),
+        "OpenAI API-key onboarding must ignore env-supplied base URLs: {written}"
+    );
+    assert!(
+        !written.contains("openai_model = "),
+        "OpenAI API-key onboarding must not write a model discovered with a freshly supplied key: {written}"
     );
     assert!(
         written.contains("identity_store_dir = "),

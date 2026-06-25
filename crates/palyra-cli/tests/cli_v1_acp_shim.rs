@@ -22,8 +22,6 @@ const ADMIN_TOKEN: &str = "test-admin-token";
 const DEVICE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_RETRY_ATTEMPTS: usize = 8;
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str =
-    r#"{"data":[{"id":"gpt-5.5","supported_parameters":["tools"]}]}"#;
 
 #[test]
 fn status_reports_http_grpc_and_admin_health() -> Result<()> {
@@ -477,7 +475,10 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().to_string();
-    let model_server = MockOpenAiModelsServer::spawn()?;
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden OpenAI endpoint")?;
+    let forbidden_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .args([
             "onboarding",
@@ -496,14 +497,10 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
             "--skip-skills",
         ])
         .env("OPENAI_API_KEY", "sk-test-quickstart")
-        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", model_server.base_url.as_str())
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", forbidden_base_url.as_str())
         .output()
         .context("failed to execute palyra onboarding wizard")?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "onboarding wizard should discover OpenAI models before writing config: {discovery_request}"
-    );
+    assert_no_pending_connection(&forbidden_listener, "OpenAI API-key env base URL override")?;
     assert!(
         output.status.success(),
         "onboarding wizard should succeed: {}",
@@ -523,70 +520,31 @@ fn onboarding_wizard_writes_config_file() -> Result<()> {
         "expected vault-backed OpenAI auth in onboarding config"
     );
     assert!(
-        written.contains("gpt-5.5"),
-        "expected provider-discovered OpenAI model in onboarding config"
+        written.contains("openai_base_url = \"https://api.openai.com/v1\""),
+        "OpenAI API-key onboarding must use the official OpenAI base URL"
+    );
+    assert!(
+        !written.contains(forbidden_base_url.as_str()),
+        "OpenAI API-key onboarding must ignore env-supplied base URLs"
+    );
+    assert!(
+        !written.contains("openai_model = "),
+        "OpenAI API-key onboarding must not write a model discovered with a freshly supplied key"
     );
     assert!(written.contains("workspace_root"), "expected workspace root in onboarding config");
     Ok(())
 }
 
-struct MockOpenAiModelsServer {
-    base_url: String,
-    handle: thread::JoinHandle<Result<String>>,
-}
-
-impl MockOpenAiModelsServer {
-    fn spawn() -> Result<Self> {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").context("failed to bind mock OpenAI models server")?;
-        listener
-            .set_nonblocking(true)
-            .context("failed to configure mock OpenAI models listener")?;
-        let base_url = format!("http://{}", listener.local_addr().context("listener address")?);
-        let handle = thread::spawn(move || -> Result<String> {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_nonblocking(false)
-                            .context("failed to configure mock OpenAI models stream")?;
-                        let mut buffer = [0_u8; 4096];
-                        let read =
-                            stream.read(&mut buffer).context("failed to read models request")?;
-                        let request_text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                        if !request_text.starts_with("GET /v1/models ") {
-                            anyhow::bail!("unexpected models request: {request_text}");
-                        }
-                        if !request_text.to_ascii_lowercase().contains("authorization: bearer ") {
-                            anyhow::bail!(
-                                "model discovery request should use bearer auth: {request_text}"
-                            );
-                        }
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            OPENAI_COMPATIBLE_MODELS_RESPONSE.len(),
-                            OPENAI_COMPATIBLE_MODELS_RESPONSE
-                        );
-                        stream
-                            .write_all(response.as_bytes())
-                            .context("failed to write models response")?;
-                        return Ok(request_text);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => return Err(error).context("mock OpenAI models accept failed"),
-                }
-            }
-            anyhow::bail!("mock OpenAI models server did not receive a discovery request")
-        });
-
-        Ok(Self { base_url, handle })
-    }
-
-    fn finish(self) -> Result<String> {
-        self.handle.join().map_err(|_| anyhow::anyhow!("mock OpenAI models server panicked"))?
+fn assert_no_pending_connection(listener: &TcpListener, context: &str) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to configure {context} listener"))?;
+    match listener.accept() {
+        Ok((_stream, address)) => {
+            anyhow::bail!("{context} received unexpected connection from {address}")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {context} listener")),
     }
 }
 

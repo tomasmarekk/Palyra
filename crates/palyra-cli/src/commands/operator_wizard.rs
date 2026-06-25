@@ -51,6 +51,7 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.auth_token",
 ];
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
+const TRUSTED_MINIMAX_DISCOVERY_HOSTS: &[&str] = &["api.minimax.io", "api.minimaxi.com"];
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
@@ -3520,7 +3521,7 @@ fn discover_minimax_model_selection(
 ) -> Result<MinimaxModelSelection> {
     let base_url = match base_url_override {
         Some(base_url) => {
-            normalize_provider_discovery_base_url(base_url, "selected MiniMax endpoint")?
+            normalize_minimax_discovery_base_url(base_url, "selected MiniMax endpoint")?
         }
         None => minimax_base_url_for_config(document)?,
     };
@@ -3565,9 +3566,7 @@ fn minimax_secret_key(auth_method: &str) -> &'static str {
 
 fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
     match env::var(MINIMAX_BASE_URL_ENV) {
-        Ok(raw) => {
-            return normalize_provider_discovery_base_url(raw.as_str(), MINIMAX_BASE_URL_ENV)
-        }
+        Ok(raw) => return normalize_minimax_discovery_base_url(raw.as_str(), MINIMAX_BASE_URL_ENV),
         Err(env::VarError::NotPresent) => {}
         Err(error) => anyhow::bail!("{MINIMAX_BASE_URL_ENV} must contain valid Unicode: {error}"),
     }
@@ -3581,7 +3580,7 @@ fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
         if let Some(base_url) =
             get_string_value_at_path(document, "model_provider.anthropic_base_url")?
         {
-            return normalize_provider_discovery_base_url(
+            return normalize_minimax_discovery_base_url(
                 base_url.as_str(),
                 "model_provider.anthropic_base_url",
             );
@@ -3589,6 +3588,29 @@ fn minimax_base_url_for_config(document: &toml::Value) -> Result<String> {
     }
 
     Ok(DEFAULT_MINIMAX_BASE_URL.to_owned())
+}
+
+fn normalize_minimax_discovery_base_url(raw: &str, source: &str) -> Result<String> {
+    let base_url = normalize_provider_discovery_base_url(raw, source)?;
+    validate_minimax_discovery_base_url(base_url.as_str(), source)?;
+    Ok(base_url)
+}
+
+fn validate_minimax_discovery_base_url(base_url: &str, source: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(base_url)
+        .with_context(|| format!("{source} must be a valid absolute URL"))?;
+    let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("{source} must include a host"))?;
+    if TRUSTED_MINIMAX_DISCOVERY_HOSTS
+        .iter()
+        .any(|trusted_host| host.eq_ignore_ascii_case(trusted_host))
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{source} points to unsupported MiniMax discovery host '{host}'; MiniMax API-key onboarding only sends newly supplied keys to official MiniMax endpoints ({})",
+        TRUSTED_MINIMAX_DISCOVERY_HOSTS.join(", ")
+    );
 }
 
 /// Validates and canonicalizes a provider discovery base URL; https is required
@@ -3642,6 +3664,7 @@ fn discover_minimax_models(api_key: &str, base_url: &str) -> Result<Vec<Discover
     let endpoint = provider_models_endpoint(base_url)?;
     let client = Client::builder()
         .timeout(PROVIDER_MODEL_DISCOVERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to initialize MiniMax model discovery client")?;
     let mut headers = HeaderMap::new();
@@ -5006,6 +5029,37 @@ anthropic_base_url = "https://attacker.example/v1"
             .expect("explicit Anthropic API key base URL override should resolve"),
             ANTHROPIC_DEFAULT_BASE_URL
         );
+    }
+
+    #[test]
+    fn minimax_discovery_base_url_allows_only_official_hosts() {
+        assert_eq!(
+            normalize_minimax_discovery_base_url(
+                " https://api.minimax.io/anthropic/ ",
+                "selected MiniMax endpoint"
+            )
+            .expect("global MiniMax endpoint should be trusted"),
+            DEFAULT_MINIMAX_BASE_URL
+        );
+        assert_eq!(
+            normalize_minimax_discovery_base_url(
+                DEFAULT_MINIMAX_CN_BASE_URL,
+                "selected MiniMax endpoint"
+            )
+            .expect("CN MiniMax endpoint should be trusted"),
+            DEFAULT_MINIMAX_CN_BASE_URL
+        );
+
+        for base_url in ["http://127.0.0.1:9876/anthropic", "https://attacker.example/anthropic"] {
+            let error = normalize_minimax_discovery_base_url(base_url, MINIMAX_BASE_URL_ENV)
+                .expect_err("custom MiniMax discovery hosts must be rejected");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("official MiniMax endpoints")
+                    && message.contains(MINIMAX_BASE_URL_ENV),
+                "unexpected MiniMax discovery rejection: {message}"
+            );
+        }
     }
 
     #[test]
