@@ -3452,6 +3452,7 @@ mod tests {
 
     #[test]
     fn resolve_routine_schedule_builds_file_watch_poll_schedule() {
+        let _env_guard = crate::test_env::lock();
         let watched_path =
             std::env::temp_dir().join(format!("palyra-tool-file-watch-{}.txt", Ulid::new()));
         fs::write(watched_path.as_path(), "baseline").expect("watch fixture should write");

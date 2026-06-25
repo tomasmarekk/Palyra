@@ -1468,9 +1468,6 @@ fn os_file_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static OS_FILE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn os_file_tempdir() -> tempfile::TempDir {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1932,8 +1929,7 @@ mod tests {
 
     #[test]
     fn os_file_read_rejects_daemon_process_env_path_prefixes() {
-        let _guard =
-            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let _guard = crate::test_env::lock();
         let tempdir = os_file_tempdir();
         let secret_path = tempdir.path().join("application_default_credentials.json");
         fs::write(secret_path.as_path(), "credential_file_contents=do-not-read\n")
@@ -2293,8 +2289,7 @@ mod tests {
 
     #[test]
     fn os_file_configured_roots_replace_implicit_user_profile_root() {
-        let _guard =
-            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let _guard = crate::test_env::lock();
         let configured_root = os_file_tempdir();
         let real_home_root = os_file_tempdir();
         let _configured = ScopedEnvVar::set(PALYRA_OS_FILE_ROOTS_ENV, configured_root.path());
@@ -2320,8 +2315,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn os_file_user_roots_do_not_auto_allow_system_drive_var_tmp() {
-        let _guard =
-            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let _guard = crate::test_env::lock();
         let tempdir = os_file_tempdir();
         let profile_root = tempdir.path().join("profile");
         let temp_root = tempdir.path().join("temp");
