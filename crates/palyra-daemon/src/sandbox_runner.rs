@@ -4755,7 +4755,7 @@ fn spawn_background_process(
         .unwrap_or(Duration::ZERO);
         let (stdout, stderr) = output_monitor.snapshot_after_startup_drain(startup_output_drain);
         if status.success() {
-            reap_background_launcher_child(child);
+            terminate_background_child(child);
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -4791,7 +4791,7 @@ fn spawn_background_process(
     // die (e.g. an unknown-subcommand banner), which the first probe is too early to see.
     if let Some(status) = wait_for_background_process_exit(&mut child, post_output_exit_check)? {
         if status.success() {
-            reap_background_launcher_child(child);
+            terminate_background_child(child);
             release_background_process_tracking_if_stopped(pid);
             return background_launcher_completed_successfully(
                 BackgroundLauncherCompletedContext {
@@ -5147,7 +5147,7 @@ terminal run cleanup."
         "stderr_redacted": stderr_redacted,
         "stdout_redaction_reasons": stdout_redaction_reasons,
         "stderr_redaction_reasons": stderr_redaction_reasons,
-        "background_output_note": "stdout/stderr are bounded startup snapshots captured before the direct launcher exited successfully; verify any external service separately",
+        "background_output_note": "stdout/stderr are bounded startup snapshots captured before the direct launcher exited successfully; the launcher process tree was terminated because no trackable background process remained",
         "duration_ms": duration.as_millis() as u64,
         "background": true,
         "auto_backgrounded": auto_backgrounded,
@@ -5156,7 +5156,7 @@ terminal run cleanup."
         "lifetime_mode": lifetime_mode.as_str(),
         "run_owned_lifetime": false,
         "durable_handoff": false,
-        "run_lifecycle_note": "The direct background launcher exited successfully and Palyra is not tracking a run-owned child process. Verify any external service separately and stop it with the service-specific cleanup command.",
+        "run_lifecycle_note": "The direct background launcher exited successfully before a trackable process was available. Palyra terminated the launcher process tree and is not tracking a run-owned child process.",
         "started": true,
         "completed": true,
         "launcher_completed_successfully": true,
@@ -5165,7 +5165,7 @@ terminal run cleanup."
         "tracked_pid": Value::Null,
         "pid": Value::Null,
         "cleanup": Value::Null,
-        "note": "direct launcher exited successfully; verify external service separately",
+        "note": "direct launcher exited successfully; launcher process tree was terminated because no trackable background process remained",
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
         "process_risk": process_risk,
@@ -5305,10 +5305,6 @@ fn spawn_background_capture_reader<R>(
 fn terminate_background_child(mut child: Child) {
     terminate_child_process_tree(&mut child);
     // Reap the direct child so a failed background startup never leaves a zombie behind.
-    let _ = child.wait();
-}
-
-fn reap_background_launcher_child(mut child: Child) {
     let _ = child.wait();
 }
 
@@ -10375,6 +10371,79 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .contains("launcher started external service"));
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn successful_background_launcher_terminates_spawned_child_process_tree() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let workspace = unique_temp_dir("workspace-background-success-child-cleanup");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        let child_script = workspace.join("child.py");
+        let launcher_script = workspace.join("launcher.py");
+        let child_pid_path = workspace.join("child.pid");
+        fs::write(
+            child_script.as_path(),
+            format!("import time\ntime.sleep({BACKGROUND_TEST_SCRIPT_SLEEP_SECS})\n"),
+        )
+        .expect("child script should be written");
+        fs::write(
+            launcher_script.as_path(),
+            "import pathlib, subprocess, sys\nroot = pathlib.Path(__file__).resolve().parent\npid_path = root / 'child.pid'\nchild = root / 'child.py'\nprocess = subprocess.Popen([sys.executable, str(child)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\npid_path.write_text(str(process.pid), encoding='utf-8')\nprint('launcher started child', flush=True)\nsys.exit(0)\n",
+        )
+        .expect("launcher script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": [launcher_script.to_string_lossy()],
+            "background": true,
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("successful background launcher should still report success");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+
+        assert_eq!(output.get("background").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
+        assert_eq!(
+            output.get("launcher_completed_successfully").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(output.get("tracked_pid"), Some(&serde_json::Value::Null));
+
+        let child_pid = fs::read_to_string(child_pid_path.as_path())
+            .expect("launcher should write child pid before exiting")
+            .trim()
+            .parse::<u32>()
+            .expect("child pid should be numeric");
+        assert!(
+            super::wait_for_process_not_alive(
+                child_pid,
+                Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS)
+            ),
+            "child pid {child_pid} should be terminated after successful launcher exit"
+        );
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
