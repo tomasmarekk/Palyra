@@ -5672,11 +5672,7 @@ fn utf8_slice_by_byte_range(value: &str, offset: usize, max_bytes: usize) -> (St
 }
 
 fn can_read_redacted_text_preview(sensitivity: ToolResultSensitivity, text_preview: bool) -> bool {
-    text_preview
-        && matches!(
-            sensitivity,
-            ToolResultSensitivity::ProviderRawPayload | ToolResultSensitivity::ApprovalRiskData
-        )
+    text_preview && matches!(sensitivity, ToolResultSensitivity::ProviderRawPayload)
 }
 
 fn redact_artifact_content_for_text_preview(content: &[u8]) -> Result<String, JournalError> {
@@ -23025,16 +23021,8 @@ mod tests {
                 max_bytes: 4096,
                 text_preview: true,
             })
-            .expect("approval-risk artifacts should allow redacted text preview");
-        assert_eq!(approval_preview.visibility, ToolResultVisibility::RedactedPreview);
-        assert!(
-            approval_preview
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("export function safe")),
-            "approval-risk preview should return readable redacted text"
-        );
-        assert!(approval_preview.bytes_base64.is_none());
+            .expect_err("approval-risk text preview should stay gated from artifact.read");
+        assert!(matches!(approval_preview, JournalError::ToolResultArtifactReadDenied { .. }));
 
         let approval_full_read = store
             .read_tool_result_artifact(&ToolResultArtifactReadRequest {

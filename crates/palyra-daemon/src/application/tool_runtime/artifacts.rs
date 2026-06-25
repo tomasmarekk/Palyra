@@ -131,8 +131,8 @@ fn truncate_utf8_lossy(output_json: &[u8], max_bytes: usize) -> String {
 /// The read is scoped to the caller's session/run/principal/device taken from
 /// `context` (never from model input), and the requested byte budget is
 /// clamped to [`ToolTurnBudget::max_artifact_read_bytes`]. When the journal
-/// denies a full read of sensitive content, the call is retried once as a
-/// redacted text preview so the model still receives usable structure.
+/// denies a full read of content whose sensitivity allows redacted previews,
+/// the call is retried once as a bounded text preview.
 /// All failures are reported as unsuccessful [`ToolExecutionOutcome`]s rather
 /// than errors, keeping the tool loop alive.
 pub(crate) async fn execute_artifact_read_tool(
