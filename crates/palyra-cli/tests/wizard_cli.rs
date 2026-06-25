@@ -23,7 +23,6 @@ use palyra_vault::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"text-embedding-test"},{"id":"gpt-realtime-test"},{"id":"chat-latest"},{"id":"gpt-5.5"}]}"#;
 const ANTHROPIC_MODELS_RESPONSE: &str = r#"{"data":[{"id":"claude-test-discovered"}]}"#;
 
 fn configure_cli_env(command: &mut Command, workdir: &TempDir) {
@@ -57,6 +56,19 @@ fn unused_loopback_ports(count: usize) -> Result<Vec<u16>> {
                 .context("failed to read reserved loopback test port")
         })
         .collect()
+}
+
+fn assert_no_pending_connection(listener: &TcpListener, context: &str) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to configure {context} listener"))?;
+    match listener.accept() {
+        Ok((_stream, address)) => {
+            anyhow::bail!("{context} received unexpected connection from {address}")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {context} listener")),
+    }
 }
 
 fn run_cli_without_explicit_vault_dir(
@@ -125,8 +137,6 @@ fn profiles_registry_path(workdir: &TempDir) -> PathBuf {
 
 fn seed_quickstart_config(workdir: &TempDir, config_path: &Path) -> Result<()> {
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         workdir,
         &[
@@ -149,16 +159,8 @@ fn seed_quickstart_config(workdir: &TempDir, config_path: &Path) -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-setup"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-setup")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "quickstart seed should discover OpenAI models before writing config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
         "quickstart seed should succeed: {}",
@@ -180,8 +182,6 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
     let grpc_port_arg = grpc_port.to_string();
     let quic_port_arg = quic_port.to_string();
     let dashboard_url = format!("http://127.0.0.1:{daemon_port}/");
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -210,16 +210,8 @@ fn setup_wizard_quickstart_emits_json_summary() -> Result<()> {
             "--skip-skills",
             "--json",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-setup"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-setup")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "setup should discover OpenAI models before writing config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
         "setup wizard should succeed: {}",
@@ -407,8 +399,6 @@ fn quickstart_defaults_do_not_report_optional_sections_as_explicitly_skipped() -
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -430,16 +420,8 @@ fn quickstart_defaults_do_not_report_optional_sections_as_explicitly_skipped() -
             "--skip-health",
             "--json",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-setup"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-setup")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "quickstart should discover OpenAI models before writing config: {discovery_request}"
-    );
 
     assert!(
         output.status.success(),
@@ -482,8 +464,6 @@ fn setup_wizard_bootstraps_missing_global_config_path() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("global-config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -507,16 +487,8 @@ fn setup_wizard_bootstraps_missing_global_config_path() -> Result<()> {
             "--skip-skills",
             "--json",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-bootstrap-config"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-bootstrap-config")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "bootstrap should discover OpenAI models before writing config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
         "setup wizard should accept a missing global --config bootstrap target: {}",
@@ -595,8 +567,6 @@ fn setup_wizard_text_summary_surfaces_gateway_start_guidance() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("config").join("palyra.toml");
     let config_path_string = config_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -618,16 +588,8 @@ fn setup_wizard_text_summary_surfaces_gateway_start_guidance() -> Result<()> {
             "--skip-channels",
             "--skip-skills",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-runtime-guidance"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-runtime-guidance")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "setup should discover OpenAI models before writing config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
         "setup wizard should succeed in text mode: {}",
@@ -1018,8 +980,6 @@ fn setup_wizard_reuse_backfills_admin_defaults() -> Result<()> {
     )?;
     let config_path_string = config_path.to_string_lossy().into_owned();
 
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -1041,16 +1001,8 @@ fn setup_wizard_reuse_backfills_admin_defaults() -> Result<()> {
             "--skip-skills",
             "--skip-health",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-setup"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-setup")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "reuse setup should discover OpenAI models before writing config: {discovery_request}"
-    );
 
     assert!(
         output.status.success(),
@@ -1084,8 +1036,6 @@ fn onboarding_manual_flow_writes_public_tls_config() -> Result<()> {
     let config_path_string = config_path.to_string_lossy().into_owned();
     let cert_path_string = cert_path.to_string_lossy().into_owned();
     let key_path_string = key_path.to_string_lossy().into_owned();
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
     let output = run_cli(
         &workdir,
         &[
@@ -1119,16 +1069,8 @@ fn onboarding_manual_flow_writes_public_tls_config() -> Result<()> {
             "--skip-channels",
             "--skip-skills",
         ],
-        &[
-            ("OPENAI_API_KEY", "sk-test-manual"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str()),
-        ],
+        &[("OPENAI_API_KEY", "sk-test-manual")],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "manual onboarding should discover OpenAI models before writing config: {discovery_request}"
-    );
     assert!(
         output.status.success(),
         "manual onboarding should succeed: {}",
@@ -1298,8 +1240,10 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
 
     let config_path_string = config_path.to_string_lossy().into_owned();
     let secret_bytes = b"sk-configure-stdin-secret\n";
-    let model_server = MockProviderServer::spawn(OPENAI_COMPATIBLE_MODELS_RESPONSE)?;
-    let openai_base_url = model_server.base_url.clone();
+    let forbidden_listener =
+        TcpListener::bind("127.0.0.1:0").context("failed to bind forbidden OpenAI endpoint")?;
+    let forbidden_base_url =
+        format!("http://{}", forbidden_listener.local_addr().context("listener address")?);
     let output = run_cli_with_stdin(
         &workdir,
         &[
@@ -1315,14 +1259,10 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
             "--api-key-stdin",
             "--json",
         ],
-        &[("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url.as_str())],
+        &[("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", forbidden_base_url.as_str())],
         Some(secret_bytes),
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "configure auth-model should discover OpenAI models before persisting config: {discovery_request}"
-    );
+    assert_no_pending_connection(&forbidden_listener, "OpenAI API-key env base URL override")?;
     assert!(
         output.status.success(),
         "configure auth-model should accept stdin secret: {}",
@@ -1347,8 +1287,20 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
         "expected vault-backed OpenAI auth after configure"
     );
     assert!(
-        written.contains("openai_model = \"gpt-5.5\""),
-        "expected OpenAI API key flow to use a concrete model from discovery"
+        written.contains("openai_base_url = \"https://api.openai.com/v1\""),
+        "OpenAI API-key onboarding must use the official OpenAI base URL"
+    );
+    assert!(
+        !written.contains(forbidden_base_url.as_str()),
+        "OpenAI API-key onboarding must ignore env-supplied base URLs"
+    );
+    assert!(
+        !written.contains("openai_model = "),
+        "OpenAI API-key onboarding must not write a model discovered with a freshly supplied key"
+    );
+    assert!(
+        written.contains("provider_id = \"openai-primary\""),
+        "expected OpenAI provider discovery to remain pending after secure API-key setup"
     );
 
     let revealed =

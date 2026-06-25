@@ -51,7 +51,6 @@ const INLINE_SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.auth_token",
 ];
 const MINIMAX_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_MINIMAX_BASE_URL";
-const OPENAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ANTHROPIC_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL";
 const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
@@ -59,6 +58,7 @@ const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BA
 const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL";
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+#[cfg(test)]
 const OPENAI_API_CURATED_DEFAULT_ORDER: &[&str] =
     &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
 
@@ -2927,13 +2927,12 @@ fn apply_model_provider_api_key(
         }
         "api_key" => {
             let base_url = openai_base_url_for_config(document)?;
-            let model = discover_openai_api_model_selection("OpenAI", base_url.as_str(), api_key)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
             configure_openai_provider_with_base_url(
                 document,
                 base_url.as_str(),
-                model.as_ref().map(|model| model.id.as_str()),
+                None,
                 Some(vault_ref),
             )?;
         }
@@ -3365,15 +3364,7 @@ fn discover_openai_compatible_model_selection(
     })
 }
 
-fn discover_openai_api_model_selection(
-    provider_label: &str,
-    base_url: &str,
-    api_key: &str,
-) -> Result<Option<DiscoveredProviderModel>> {
-    let models = discover_openai_compatible_models(provider_label, api_key, base_url)?;
-    Ok(select_openai_api_preferred_model(models.as_slice()))
-}
-
+#[cfg(test)]
 fn select_openai_api_preferred_model(
     models: &[DiscoveredProviderModel],
 ) -> Option<DiscoveredProviderModel> {
@@ -3392,28 +3383,34 @@ fn select_openai_api_preferred_model(
     })
 }
 
+#[cfg(test)]
 fn is_openai_dynamic_chat_alias(model_id: &str) -> bool {
     let normalized = model_id.trim().to_ascii_lowercase();
     normalized == "chat-latest" || normalized.ends_with("/chat-latest")
 }
 
+#[cfg(test)]
 fn is_openai_expensive_or_snapshot_default(model_id: &str) -> bool {
     let normalized = openai_model_terminal_id(model_id).to_ascii_lowercase();
     is_openai_pro_model(normalized.as_str()) || has_date_snapshot_suffix(normalized.as_str())
 }
 
+#[cfg(test)]
 fn openai_model_id_matches(model_id: &str, expected: &str) -> bool {
     openai_model_terminal_id(model_id).eq_ignore_ascii_case(expected)
 }
 
+#[cfg(test)]
 fn openai_model_terminal_id(model_id: &str) -> &str {
     model_id.trim().rsplit('/').next().unwrap_or_default().trim()
 }
 
+#[cfg(test)]
 fn is_openai_pro_model(model_id: &str) -> bool {
     model_id.split('-').any(|part| part == "pro")
 }
 
+#[cfg(test)]
 fn has_date_snapshot_suffix(model_id: &str) -> bool {
     let bytes = model_id.as_bytes();
     if bytes.len() < 11 || bytes[bytes.len() - 11] != b'-' {
@@ -3474,19 +3471,13 @@ fn discover_anthropic_model_selection(base_url: &str, api_key: &str) -> Result<S
 }
 
 fn openai_base_url_for_config(document: &toml::Value) -> Result<String> {
-    openai_base_url_for_config_with_override(
-        document,
-        provider_base_url_from_env(OPENAI_BASE_URL_ENV)?,
-    )
+    openai_base_url_for_config_with_override(document, None)
 }
 
 fn openai_base_url_for_config_with_override(
     _document: &toml::Value,
-    env_override: Option<String>,
+    _env_override: Option<String>,
 ) -> Result<String> {
-    if let Some(base_url) = env_override {
-        return Ok(base_url);
-    }
     Ok(OPENAI_DEFAULT_BASE_URL.to_owned())
 }
 
@@ -5021,7 +5012,7 @@ role = "chat"
     }
 
     #[test]
-    fn openai_api_key_base_url_ignores_stale_chatgpt_codex_config() {
+    fn openai_api_key_base_url_ignores_config_and_env_overrides() {
         let document: toml::Value = toml::from_str(
             r#"
 [model_provider]
@@ -5043,7 +5034,7 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
                 Some("http://127.0.0.1:9876/v1".to_owned())
             )
             .expect("explicit OpenAI API key base URL override should resolve"),
-            "http://127.0.0.1:9876/v1"
+            OPENAI_DEFAULT_BASE_URL
         );
     }
 
