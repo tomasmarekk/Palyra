@@ -5105,6 +5105,77 @@ async fn tool_program_runtime_can_probe_short_http_cache_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn tool_program_runtime_denies_http_fetch_child_missing_runtime_allowlist() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::TOOL_PROGRAM_RUN_TOOL_NAME.to_owned()];
+    let state = build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        false,
+        true,
+        crate::config::FeatureRolloutsConfig::default(),
+        tool_call,
+    );
+    let session_id = "session-tool-program-http-fetch-not-allowlisted";
+    let run_id = "run-tool-program-http-fetch-not-allowlisted";
+    start_tool_program_test_run(&state, session_id, run_id).await;
+    let input = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "program_id": "http-fetch-not-runtime-allowlisted",
+        "granted_tools": [super::HTTP_FETCH_TOOL_NAME],
+        "budgets": {
+            "max_steps": 1,
+            "max_child_runs": 1,
+            "max_runtime_ms": 5_000,
+            "max_step_output_bytes": 64_000,
+            "max_total_output_bytes": 128_000
+        },
+        "steps": [
+            {
+                "step_id": "fetch",
+                "tool": super::HTTP_FETCH_TOOL_NAME,
+                "input": {
+                    "url": "http://127.0.0.1:9/",
+                    "allowed_content_types": ["text/plain"]
+                }
+            }
+        ]
+    }))
+    .expect("tool program input should serialize");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id,
+            run_id,
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-http-fetch-not-allowlisted",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success, "non-allowlisted child HTTP fetch must fail closed");
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("denied"));
+    assert_eq!(output.pointer("/steps/0/approval_required").and_then(Value::as_bool), Some(false));
+    assert_eq!(output.pointer("/budget/child_runs_used").and_then(Value::as_u64), Some(0));
+    assert_eq!(output.pointer("/budget/nested_approval_requests").and_then(Value::as_u64), Some(0));
+    assert!(
+        output
+            .pointer("/steps/0/error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("daemon allowlist")),
+        "denial should preserve the runtime allowlist failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn tool_program_runtime_denies_sensitive_child_without_nested_approval() {
     let state = build_test_runtime_state(false);
     start_tool_program_test_run(&state, "session-tool-program-denied", "run-tool-program-denied")

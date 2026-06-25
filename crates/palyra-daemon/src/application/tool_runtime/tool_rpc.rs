@@ -220,24 +220,55 @@ pub(crate) async fn execute_granted_tool_rpc_call(
         });
     let child_tool_requires_approval =
         tool_protocol::tool_requires_approval(request.tool_name.as_str());
-    let inherits_parent_approval =
-        child_tool_can_inherit_parent_approval(request.tool_name.as_str(), &decision);
     let mut execution_decision = decision;
-    if inherits_parent_approval {
-        execution_decision.allowed = true;
-        execution_decision.approval_required = false;
-        execution_decision.reason = format!(
-            "parent tool program approval inherited for child tool={}; original_reason={}",
-            request.tool_name, execution_decision.reason
+    let mut inherits_parent_approval = false;
+    let mut inherited_approval_policy_checked = false;
+    if child_tool_may_inherit_parent_approval(request.tool_name.as_str(), &execution_decision) {
+        inherited_approval_policy_checked = true;
+        let mut inherited_approval_budget = 1;
+        let inherited_approval_decision = tool_protocol::decide_tool_call(
+            &runtime_state.config.tool_call,
+            &mut inherited_approval_budget,
+            &tool_protocol::ToolRequestContext {
+                principal: request_context.principal.clone(),
+                device_id: Some(request_context.device_id.clone()),
+                channel: context.channel.map(ToOwned::to_owned),
+                session_id: Some(context.session_id.to_owned()),
+                run_id: Some(context.run_id.to_owned()),
+                skill_id: skill_context
+                    .as_ref()
+                    .map(crate::gateway::ToolSkillContext::skill_id)
+                    .map(ToOwned::to_owned),
+            },
+            request.tool_name.as_str(),
+            true,
         );
+        if inherited_approval_decision.allowed {
+            inherits_parent_approval = true;
+            execution_decision.allowed = true;
+            execution_decision.approval_required = false;
+            execution_decision.reason = format!(
+                "parent tool program approval inherited for child tool={}; original_reason={}; post_approval_reason={}",
+                request.tool_name, execution_decision.reason, inherited_approval_decision.reason
+            );
+        } else {
+            execution_decision = inherited_approval_decision;
+        }
     }
     // A nested call has no operator to prompt, so anything approval-shaped
     // (proposal gate, tool metadata, or resolved decision) fails closed here
     // instead of suspending the program. `palyra.http.fetch` is the one
     // approval-required child allowed to inherit the already-approved parent
-    // program; it still runs through normal fetch egress and content policy.
-    if (proposal_approval_required
-        || child_tool_requires_approval
+    // program, but only after a post-approval policy check proves the child
+    // is runtime-allowlisted; it still runs through normal fetch egress and
+    // content policy.
+    let child_tool_requires_standalone_approval = child_tool_requires_approval
+        && !inherited_approval_policy_checked
+        && (request.tool_name != HTTP_FETCH_TOOL_NAME
+            || execution_decision.allowed
+            || execution_decision.approval_required);
+    if (((proposal_approval_required || child_tool_requires_standalone_approval)
+        && !inherited_approval_policy_checked)
         || execution_decision.approval_required)
         && !inherits_parent_approval
     {
@@ -434,7 +465,7 @@ fn nested_approval_denial_reason(tool_name: &str, original_reason: &str) -> Stri
     )
 }
 
-fn child_tool_can_inherit_parent_approval(
+fn child_tool_may_inherit_parent_approval(
     tool_name: &str,
     decision: &tool_protocol::ToolDecision,
 ) -> bool {
@@ -543,7 +574,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        build_python_tool_rpc_bridge_context, child_tool_can_inherit_parent_approval,
+        build_python_tool_rpc_bridge_context, child_tool_may_inherit_parent_approval,
         python_tool_rpc_sdk_source, TOOL_RPC_SCHEMA_VERSION,
     };
 
@@ -569,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn only_http_fetch_child_can_inherit_parent_approval() {
+    fn only_http_fetch_child_can_request_parent_approval_inheritance() {
         let approval_gate_decision = crate::tool_protocol::ToolDecision {
             allowed: false,
             reason: crate::gateway::APPROVAL_CHANNEL_UNAVAILABLE_REASON.to_owned(),
@@ -577,11 +608,11 @@ mod tests {
             policy_enforced: true,
         };
 
-        assert!(child_tool_can_inherit_parent_approval(
+        assert!(child_tool_may_inherit_parent_approval(
             crate::gateway::HTTP_FETCH_TOOL_NAME,
             &approval_gate_decision
         ));
-        assert!(!child_tool_can_inherit_parent_approval(
+        assert!(!child_tool_may_inherit_parent_approval(
             crate::gateway::PROCESS_RUNNER_TOOL_NAME,
             &approval_gate_decision
         ));
