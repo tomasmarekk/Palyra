@@ -2038,13 +2038,27 @@ mod tests {
 
     #[test]
     fn browser_file_transfer_tools_expose_browser_policy_metadata() {
+        for tool_name in ["palyra.browser.upload", "palyra.browser.downloads.list"] {
+            let metadata = tool_metadata(tool_name).expect("browser file transfer metadata");
+            assert_eq!(metadata.capabilities, &[ToolCapability::Network]);
+        }
+        for tool_name in
+            ["palyra.browser.screenshot", "palyra.browser.pdf", "palyra.browser.downloads.get"]
+        {
+            let metadata = tool_metadata(tool_name).expect("browser artifact write metadata");
+            assert_eq!(
+                metadata.capabilities,
+                &[ToolCapability::Network, ToolCapability::FilesystemWrite]
+            );
+        }
         for tool_name in [
             "palyra.browser.upload",
             "palyra.browser.downloads.list",
+            "palyra.browser.screenshot",
+            "palyra.browser.pdf",
             "palyra.browser.downloads.get",
         ] {
             let metadata = tool_metadata(tool_name).expect("browser file transfer metadata");
-            assert_eq!(metadata.capabilities, &[ToolCapability::Network]);
             assert!(metadata.default_sensitive, "{tool_name} should remain approval-gated");
             assert!(tool_requires_approval(tool_name));
 

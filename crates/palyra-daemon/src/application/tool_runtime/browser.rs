@@ -15,6 +15,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -733,9 +734,7 @@ async fn save_browser_output_file_from_payload(
         &path_env,
         browser_user_owned_os_roots().as_slice(),
     )?;
-    fs::write(target.as_path(), bytes).map_err(|error| {
-        format!("{tool_name} failed to write output_path {output_path}: {error}")
-    })?;
+    write_browser_output_file(tool_name, output_path, target.as_path(), bytes)?;
     let canonical_target = fs::canonicalize(target.as_path()).unwrap_or(target);
     Ok(Some(json!({
         "path": canonical_target.to_string_lossy(),
@@ -1041,14 +1040,59 @@ fn prepare_browser_output_target(
         ));
     }
     let resolved = canonical_parent.join(file_name);
-    if fs::metadata(resolved.as_path()).is_ok_and(|metadata| !metadata.is_file()) {
-        return Err(format!(
-            "{tool_name} output_path is not a regular file: {}",
-            resolved.display()
-        ));
-    }
+    reject_browser_output_final_symlink(tool_name, resolved.as_path())?;
     Ok(resolved)
 }
+
+fn reject_browser_output_final_symlink(tool_name: &str, target: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{tool_name} output_path final component must not be a symlink: {}",
+            target.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => {
+            Err(format!("{tool_name} output_path is not a regular file: {}", target.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "{tool_name} failed to inspect output_path target {}: {error}",
+            target.display()
+        )),
+    }
+}
+
+fn write_browser_output_file(
+    tool_name: &str,
+    output_path: &str,
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    reject_browser_output_final_symlink(tool_name, target)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    configure_browser_output_no_follow(&mut options);
+    let mut file = options.open(target).map_err(|error| {
+        format!("{tool_name} failed to open output_path {output_path}: {error}")
+    })?;
+    file.write_all(bytes)
+        .map_err(|error| format!("{tool_name} failed to write output_path {output_path}: {error}"))
+}
+
+#[cfg(unix)]
+fn configure_browser_output_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn configure_browser_output_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_browser_output_no_follow(_options: &mut fs::OpenOptions) {}
 
 /// Walks up from `path` to the closest ancestor that already exists.
 fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
@@ -5182,8 +5226,8 @@ mod tests {
         filter_browser_network_log_entries_since, normalize_browser_press_key_input,
         parse_browser_download_artifact_id, parse_browser_observe_string_array,
         resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
-        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        validate_browser_workspace_relative_path, write_browser_output_file,
+        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
         BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
@@ -5857,6 +5901,59 @@ mod tests {
         assert!(
             output.parent().is_some_and(|parent| parent.is_dir()),
             "output parent should be created"
+        );
+    }
+
+    #[test]
+    fn browser_output_file_write_overwrites_regular_file() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let target = temp.path().join("artifact.png");
+        std::fs::write(target.as_path(), b"old bytes").expect("target should be created");
+
+        write_browser_output_file(
+            "palyra.browser.screenshot",
+            "artifact.png",
+            target.as_path(),
+            b"new bytes",
+        )
+        .expect("regular browser output target should be writable");
+
+        assert_eq!(
+            std::fs::read(target.as_path()).expect("target should be readable"),
+            b"new bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_output_path_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should be created");
+        let outside_target = temp.path().join("outside-target.txt");
+        std::fs::write(outside_target.as_path(), b"outside").expect("outside target should exist");
+        let output_link = workspace.join("report.pdf");
+        symlink(outside_target.as_path(), output_link.as_path())
+            .expect("symlink should be created");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
+
+        let error = resolve_browser_output_path(
+            BROWSER_DOWNLOADS_GET_TOOL_NAME,
+            "report.pdf",
+            std::slice::from_ref(&canonical_workspace),
+            None,
+            &BTreeMap::new(),
+            &[],
+        )
+        .expect_err("browser output path must reject final symlinks");
+
+        assert!(error.contains("final component must not be a symlink"), "{error}");
+        assert_eq!(
+            std::fs::read(outside_target.as_path()).expect("outside target should be readable"),
+            b"outside",
+            "resolver must not allow writing through the symlink"
         );
     }
 

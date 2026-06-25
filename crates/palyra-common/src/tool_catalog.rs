@@ -44,6 +44,8 @@ const WORKSPACE_PATCH_CAPABILITIES: &[ToolCapability] = &[ToolCapability::Filesy
 const OS_FILE_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::FilesystemRead, ToolCapability::FilesystemWrite];
 const NETWORK_TOOL_CAPABILITIES: &[ToolCapability] = &[ToolCapability::Network];
+const BROWSER_ARTIFACT_WRITE_CAPABILITIES: &[ToolCapability] =
+    &[ToolCapability::Network, ToolCapability::FilesystemWrite];
 const HTTP_FETCH_TOOL_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead];
 const ARTIFACT_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ArtifactsRead];
@@ -177,12 +179,10 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.browser.title" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
-        "palyra.browser.screenshot" => {
-            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
-        }
-        "palyra.browser.pdf" => {
-            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
-        }
+        "palyra.browser.screenshot" | "palyra.browser.pdf" => Some(ToolMetadata {
+            capabilities: BROWSER_ARTIFACT_WRITE_CAPABILITIES,
+            default_sensitive: true,
+        }),
         "palyra.browser.observe" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
@@ -216,9 +216,13 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.browser.permissions.set" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
-        "palyra.browser.downloads.list" | "palyra.browser.downloads.get" => {
+        "palyra.browser.downloads.list" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "palyra.browser.downloads.get" => Some(ToolMetadata {
+            capabilities: BROWSER_ARTIFACT_WRITE_CAPABILITIES,
+            default_sensitive: true,
+        }),
         "palyra.plugin.run" => {
             Some(ToolMetadata { capabilities: WASM_PLUGIN_CAPABILITIES, default_sensitive: true })
         }
@@ -319,5 +323,19 @@ mod tests {
     fn browser_reload_matches_browser_network_sensitivity() {
         assert!(tool_requires_approval("palyra.browser.reload"));
         assert_eq!(tool_policy_capability_names("palyra.browser.reload"), vec!["network"]);
+    }
+
+    #[test]
+    fn browser_artifact_output_tools_include_filesystem_write_capability() {
+        for tool_name in
+            ["palyra.browser.screenshot", "palyra.browser.pdf", "palyra.browser.downloads.get"]
+        {
+            assert!(tool_requires_approval(tool_name));
+            assert_eq!(
+                tool_policy_capability_names(tool_name),
+                vec!["filesystem_write", "network"],
+                "{tool_name} must advertise both browser/network and output_path write effects"
+            );
+        }
     }
 }
