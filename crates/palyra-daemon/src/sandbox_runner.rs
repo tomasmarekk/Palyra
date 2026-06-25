@@ -17,7 +17,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap},
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
@@ -26,7 +26,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -36,11 +36,7 @@ use std::{
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[cfg(windows)]
-use std::{
-    collections::HashMap,
-    os::windows::{io::AsRawHandle, process::CommandExt},
-    sync::OnceLock,
-};
+use std::os::windows::{io::AsRawHandle, process::CommandExt};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -551,6 +547,14 @@ pub(crate) struct BackgroundProcessRuntimeStatus {
     pub(crate) tracked_process_count: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RegisteredBackgroundProcess {
+    active: bool,
+}
+
+static REGISTERED_BACKGROUND_PROCESSES: OnceLock<Mutex<HashMap<u32, RegisteredBackgroundProcess>>> =
+    OnceLock::new();
+
 impl BackgroundProcessRuntimeStatus {
     /// Returns true while either the direct pid or any tracked descendant is alive.
     pub(crate) fn alive(self) -> bool {
@@ -570,6 +574,49 @@ impl BackgroundProcessRuntimeStatus {
     /// Returns the live tracked-process count, when the platform can report one.
     pub(crate) fn tracked_process_count(self) -> Option<u32> {
         self.tracked_process_count
+    }
+}
+
+fn registered_background_processes() -> &'static Mutex<HashMap<u32, RegisteredBackgroundProcess>> {
+    REGISTERED_BACKGROUND_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_background_process_pid(pid: u32) -> Result<(), SandboxProcessRunError> {
+    match registered_background_processes().lock() {
+        Ok(mut processes) => {
+            processes.insert(pid, RegisteredBackgroundProcess { active: true });
+            Ok(())
+        }
+        Err(error) => Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("background process registry lock poisoned for pid {pid}: {error}"),
+        }),
+    }
+}
+
+fn registered_background_process(
+    command: &str,
+    pid: u32,
+) -> Result<RegisteredBackgroundProcess, SandboxProcessRunError> {
+    match registered_background_processes().lock() {
+        Ok(processes) => processes.get(&pid).copied().ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run builtin '{command}' requires a pid returned by a live palyra.process.run background result; pid {pid} is not registered"
+            ),
+        }),
+        Err(error) => Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("background process registry lock poisoned for pid {pid}: {error}"),
+        }),
+    }
+}
+
+fn mark_background_process_stopped(pid: u32) {
+    if let Ok(mut processes) = registered_background_processes().lock() {
+        if let Some(process) = processes.get_mut(&pid) {
+            process.active = false;
+        }
     }
 }
 
@@ -1604,6 +1651,36 @@ fn builtin_stop_process_success(
     args: &[String],
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let pid = parse_builtin_pid_arg(command, args)?;
+    let registration = registered_background_process(command, pid)?;
+    if !registration.active {
+        let output_json = serde_json::to_vec(&json!({
+            "exit_code": 0,
+            "stdout": format!("pid={pid} stopped=true was_running=false\n"),
+            "stderr": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "stdout_redacted": false,
+            "stderr_redacted": false,
+            "duration_ms": 0,
+            "pid": pid,
+            "was_running": false,
+            "stopped": true,
+            "alive": false,
+            "direct_pid_alive_before_stop": false,
+            "process_tree_alive_before_stop": false,
+            "tracked_process_count_before_stop": Option::<u32>::None,
+            "direct_pid_alive": false,
+            "process_tree_alive": false,
+            "tracked_process_count": Option::<u32>::None,
+            "tier": "builtin",
+            "sandbox_backend": "builtin_portable",
+        }))
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("failed to serialize sandbox process stop output JSON: {error}"),
+        })?;
+        return Ok(SandboxProcessRunSuccess { output_json });
+    }
     let before_status =
         background_process_runtime_status(pid).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -1633,6 +1710,9 @@ fn builtin_stop_process_success(
                 "palyra.process.run builtin '{command}' failed to stop pid {pid}: {error}"
             ),
         });
+    }
+    if !alive {
+        mark_background_process_stopped(pid);
     }
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
@@ -1671,6 +1751,31 @@ fn builtin_process_status_success(
     args: &[String],
 ) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
     let pid = parse_builtin_pid_arg(command, args)?;
+    let registration = registered_background_process(command, pid)?;
+    if !registration.active {
+        let output_json = serde_json::to_vec(&json!({
+            "exit_code": 0,
+            "stdout": format!("pid={pid} alive=false direct_pid_alive=false process_tree_alive=false\n"),
+            "stderr": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "stdout_redacted": false,
+            "stderr_redacted": false,
+            "duration_ms": 0,
+            "pid": pid,
+            "alive": false,
+            "direct_pid_alive": false,
+            "process_tree_alive": false,
+            "tracked_process_count": Option::<u32>::None,
+            "tier": "builtin",
+            "sandbox_backend": "builtin_portable",
+        }))
+        .map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("failed to serialize sandbox process status output JSON: {error}"),
+        })?;
+        return Ok(SandboxProcessRunSuccess { output_json });
+    }
     let status =
         background_process_runtime_status(pid).map_err(|error| SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -1679,6 +1784,9 @@ fn builtin_process_status_success(
             ),
         })?;
     let alive = status.alive();
+    if !alive {
+        mark_background_process_stopped(pid);
+    }
     let output_json = serde_json::to_vec(&json!({
         "exit_code": 0,
         "stdout": format!(
@@ -5051,6 +5159,10 @@ fn spawn_background_process(
     let windows_job_bound = bind_child_to_windows_background_job(&child, pid).is_ok();
     #[cfg(not(windows))]
     let windows_job_bound = false;
+    if let Err(error) = register_background_process_pid(pid) {
+        terminate_background_child(child);
+        return Err(error);
+    }
     let started_at = Instant::now();
     let output_monitor =
         match start_background_output_monitor(&mut child, policy.max_output_bytes as usize) {
@@ -5636,18 +5748,29 @@ fn spawn_background_capture_reader<R>(
 }
 
 fn terminate_background_child(mut child: Child) {
+    let pid = child.id();
     terminate_child_process_tree(&mut child);
     // Reap the direct child so a failed background startup never leaves a zombie behind.
     let _ = child.wait();
+    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true) {
+        mark_background_process_stopped(pid);
+    }
 }
 
 fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration) {
+    let pid = child.id();
     let started_at = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                mark_background_process_stopped(pid);
+                return;
+            }
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => {
+                mark_background_process_stopped(pid);
+                return;
+            }
         }
 
         let elapsed = started_at.elapsed();
@@ -5657,6 +5780,10 @@ fn monitor_background_child_until_lifetime(mut child: Child, lifetime: Duration)
                 &mut child,
                 Duration::from_millis(BACKGROUND_TERMINATION_WAIT_MS),
             );
+            if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(true)
+            {
+                mark_background_process_stopped(pid);
+            }
             return;
         }
 
@@ -5776,6 +5903,7 @@ fn remove_windows_background_job(pid: u32) {
 #[cfg(windows)]
 pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
     if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
+        mark_background_process_stopped(pid);
         remove_windows_background_job(pid);
     }
 }
@@ -5783,7 +5911,11 @@ pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
 /// Releases platform-specific process-tree tracking once a caller has verified the tree is
 /// inactive.
 #[cfg(not(windows))]
-pub(crate) fn release_background_process_tracking_if_stopped(_pid: u32) {}
+pub(crate) fn release_background_process_tracking_if_stopped(pid: u32) {
+    if background_process_runtime_status(pid).map(|status| !status.alive()).unwrap_or(false) {
+        mark_background_process_stopped(pid);
+    }
+}
 
 /// Terminates the process tree rooted at `pid` (Windows).
 ///
@@ -9675,6 +9807,30 @@ mod tests {
             &["Stop-Process".to_owned(), "-Id".to_owned(), "12345".to_owned()],
         )
         .expect("PowerShell Stop-Process by id should stay available");
+    }
+
+    #[test]
+    fn run_constrained_process_rejects_unregistered_portable_lifecycle_pid() {
+        let workspace = std::env::current_dir().expect("workspace current_dir should resolve");
+        let policy = sandbox_policy_with_allowed_executables(
+            workspace,
+            vec!["palyra.process.stop".to_owned(), "palyra.process.status".to_owned()],
+        );
+        let unregistered_pid = (u32::MAX - 17).to_string();
+
+        for command in ["palyra.process.status", "palyra.process.stop"] {
+            let input = serde_json::to_vec(&serde_json::json!({
+                "command": command,
+                "args": [unregistered_pid],
+            }))
+            .expect("lifecycle input should serialize");
+            let error =
+                run_constrained_process(&policy, input.as_slice(), Duration::from_millis(1_000))
+                    .expect_err("unregistered host pid must not be accepted");
+
+            assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+            assert!(error.message.contains("not registered"), "{}", error.message);
+        }
     }
 
     #[test]
