@@ -1010,29 +1010,29 @@ fn classify_sensitive_assignment_key(key: &str) -> Option<&'static str> {
 }
 
 /// Recognizes assignment values that mention a secret without containing one:
-/// env/vault indirection, DOM reads, placeholders, fixtures, and non-literal
-/// source expressions.
+/// env/vault indirection, DOM reads, placeholders, fixtures, and narrowly
+/// source-shaped expressions.
 fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool {
     let normalized = value.trim().trim_end_matches(';').trim();
     if normalized.is_empty() {
         return false;
     }
-    let normalized = normalized.trim_matches(['(', ')']).trim();
-    is_env_member_reference(normalized)
-        || is_env_reference_with_safe_fallback(normalized)
-        || is_env_getter_reference(normalized, "Deno.env.get")
-        || is_env_getter_reference(normalized, "std::env::var")
-        || is_env_getter_reference(normalized, "env::var")
-        || is_env_getter_reference(normalized, "os.getenv")
-        || is_os_environ_index_reference(normalized)
-        || is_env_identifier_reference_expression(key, normalized)
-        || is_safe_standalone_env_identifier_literal(raw_key, key, normalized)
-        || is_vault_reference_value(normalized)
-        || is_obvious_placeholder_secret_value(normalized)
-        || is_benign_mock_credential_fixture_value(normalized)
-        || is_benign_path_reference_value(normalized)
-        || is_dom_input_value_reference(normalized)
-        || is_non_literal_source_expression_value(normalized)
+    let reference = normalized.trim_matches(['(', ')']).trim();
+    is_env_member_reference(reference)
+        || is_env_reference_with_safe_fallback(reference)
+        || is_env_getter_reference(reference, "Deno.env.get")
+        || is_env_getter_reference(reference, "std::env::var")
+        || is_env_getter_reference(reference, "env::var")
+        || is_env_getter_reference(reference, "os.getenv")
+        || is_os_environ_index_reference(reference)
+        || is_env_identifier_reference_expression(key, reference)
+        || is_safe_standalone_env_identifier_literal(raw_key, key, reference)
+        || is_vault_reference_value(reference)
+        || is_obvious_placeholder_secret_value(reference)
+        || is_benign_mock_credential_fixture_value(reference)
+        || is_benign_path_reference_value(reference)
+        || is_dom_input_value_reference(reference)
+        || is_non_literal_source_expression_value(raw_key, normalized)
 }
 
 fn is_vault_reference_value(value: &str) -> bool {
@@ -1289,15 +1289,19 @@ fn is_dom_input_value_reference(value: &str) -> bool {
         || compact.ends_with("?.innerText")
 }
 
-/// Treats expression-shaped values (calls, optional chaining, concatenation)
-/// as source code *reading* a secret rather than the secret itself — but never
-/// when the value embeds a known token shape or canary marker.
-fn is_non_literal_source_expression_value(value: &str) -> bool {
+/// Treats source-shaped values (calls, optional chaining, concatenation) as
+/// source code *reading* a secret rather than the secret itself, but only when
+/// the assignment target is also source-shaped.
+fn is_non_literal_source_expression_value(raw_key: &str, value: &str) -> bool {
     let normalized = value.trim().trim_end_matches([',', ';']).trim();
     if normalized.is_empty()
         || normalized.chars().next().is_some_and(|ch| matches!(ch, '"' | '\'' | '`'))
         || contains_secret_like_marker(normalized)
         || detect_prefixed_secret_token(normalized).is_some()
+        || !is_source_expression_assignment_target(raw_key)
+        || !has_source_expression_only_chars(normalized)
+        || has_disallowed_source_expression_literal(normalized)
+        || has_identifier_immediately_after_closing_paren(normalized)
     {
         return false;
     }
@@ -1311,13 +1315,101 @@ fn is_non_literal_source_expression_value(value: &str) -> bool {
     {
         return false;
     }
-    normalized.contains('(')
+    (normalized.contains('(') && has_balanced_parens(normalized))
         || normalized.contains("=>")
         || normalized.contains("?.")
         || normalized.contains("??")
         || normalized.contains("||")
         || normalized.contains("&&")
         || has_whitespace_bounded_source_operator(normalized)
+}
+
+fn is_source_expression_assignment_target(raw_key: &str) -> bool {
+    let target = raw_key.trim();
+    if is_source_declaration_assignment(target) {
+        return true;
+    }
+    !target.is_empty()
+        && !target.chars().any(char::is_whitespace)
+        && (target.contains('.') || (target.contains('[') && target.contains(']')))
+}
+
+fn has_source_expression_only_chars(value: &str) -> bool {
+    value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || ch.is_whitespace()
+            || matches!(
+                ch,
+                '_' | '$'
+                    | '.'
+                    | '?'
+                    | ':'
+                    | '|'
+                    | '&'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '/'
+                    | '%'
+                    | '!'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '"'
+                    | '\''
+                    | '`'
+            )
+    })
+}
+
+fn has_disallowed_source_expression_literal(value: &str) -> bool {
+    let has_quote = value.chars().any(|ch| matches!(ch, '"' | '\'' | '`'));
+    if !has_quote {
+        return false;
+    }
+    let literals = quoted_string_literals(value);
+    literals.is_empty()
+        || literals.iter().any(|literal| {
+            !literal.is_empty()
+                && !is_env_reference_identifier_literal(literal)
+                && !is_benign_mock_credential_fixture_value(literal)
+        })
+}
+
+fn has_identifier_immediately_after_closing_paren(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ')'
+            && chars.peek().is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_balanced_parens(value: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 // Operators must be whitespace-bounded so hyphens, slashes, and dots inside
@@ -2552,6 +2644,54 @@ mod tests {
     }
 
     #[test]
+    fn expression_like_unquoted_sensitive_assignments_are_redacted() {
+        let source = "DB_PASSWORD=p@ss(word)123\n\
+                      API_KEY=abc(def)ghi\n\
+                      CLIENT_SECRET=alpha||omega\n\
+                      ACCESS_TOKEN=left && right\n\
+                      REFRESH_TOKEN=token => result\n\
+                      PRIVATE_KEY=left ?? right\n\
+                      APP_SECRET=left + right";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("DB_PASSWORD=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("API_KEY=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("CLIENT_SECRET=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("ACCESS_TOKEN=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("REFRESH_TOKEN=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("PRIVATE_KEY=[REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("APP_SECRET=[REDACTED_SECRET]"));
+        for leaked in [
+            "p@ss(word)123",
+            "abc(def)ghi",
+            "alpha||omega",
+            "left && right",
+            "token => result",
+            "left ?? right",
+            "left + right",
+        ] {
+            assert!(!outcome.redacted_text.contains(leaked));
+        }
+        for code in [
+            "secret_leak.assignment.password",
+            "secret_leak.assignment.api_key",
+            "secret_leak.assignment.client_secret",
+            "secret_leak.assignment.access_token",
+            "secret_leak.assignment.refresh_token",
+            "secret_leak.assignment.private_key",
+            "secret_leak.assignment.secret",
+        ] {
+            assert!(outcome.scan.finding_codes().iter().any(|found| found == code));
+        }
+    }
+
+    #[test]
     fn source_dom_password_reads_are_not_redacted_as_secret_literals() {
         let source = "const password = document.querySelector('#password').value;\n\
                       const confirmPassword = document.getElementById('confirm-password')?.value;\n\
@@ -2565,6 +2705,30 @@ mod tests {
 
         assert!(!outcome.redacted);
         assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn source_non_literal_secret_assignments_are_not_redacted() {
+        let source = "const password = readPassword(input);\n\
+                      settings.apiKey = credentials.getKey();\n\
+                      map[key] = Math.round((current + amount) * 100) / 100;";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted_text.contains("readPassword(input)"));
+        assert!(outcome.redacted_text.contains("credentials.getKey()"));
+        assert!(outcome.redacted_text.contains("Math.round"));
         assert!(!outcome
             .scan
             .finding_codes()
