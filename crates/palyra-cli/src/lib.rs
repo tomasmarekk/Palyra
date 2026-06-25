@@ -5171,12 +5171,17 @@ fn next_agent_auto_continuation_request(
     auto_resume: AgentAutoResumePolicy,
     completed_continuations: usize,
 ) -> Option<AgentRunInput> {
-    if outcome.needs_continuation_message.is_none()
-        || !auto_resume.allows_continuation(completed_continuations)
+    let message = outcome.needs_continuation_message.as_deref()?;
+    if !auto_resume.allows_continuation(completed_continuations)
+        || !agent_needs_continuation_is_auto_resumable(message)
     {
         return None;
     }
     outcome.continuation_request.clone()
+}
+
+fn agent_needs_continuation_is_auto_resumable(message: &str) -> bool {
+    !matches!(agent_continuation_reason_code(message), Some("tool_followup_timeout"))
 }
 
 fn agent_continuation_blocked_state(
@@ -6775,6 +6780,48 @@ mod agent_stream_output_tests {
             &outcome,
             auto_resume,
             AGENT_AUTO_CONTINUATION_LIMIT
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn auto_continuation_request_stops_for_tool_followup_timeout() {
+        let continuation_request = build_agent_run_input(AgentRunInputArgs {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: None,
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned()),
+            prompt: "Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            allow_sensitive_tools: false,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: Some("cli_auto_resume".to_owned()),
+            origin_run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            parameter_delta_json: None,
+        })
+        .expect("continuation input should build");
+        let outcome = AgentStreamOutcome {
+            completed: false,
+            cancelled: false,
+            needs_continuation_message: Some(
+                "tool follow-up timed out; needs_continuation=true reason_code=tool_followup_timeout"
+                    .to_owned(),
+            ),
+            needs_continuation_checkpoint: None,
+            failed_message: None,
+            continuation_request: Some(continuation_request),
+        };
+
+        assert!(next_agent_auto_continuation_request(
+            &outcome,
+            AgentAutoResumePolicy::OnContinuation {
+                max_continuations: AGENT_AUTO_CONTINUATION_LIMIT,
+            },
+            0
         )
         .is_none());
     }
