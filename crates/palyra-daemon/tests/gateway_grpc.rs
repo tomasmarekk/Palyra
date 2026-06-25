@@ -4040,6 +4040,7 @@ async fn grpc_memory_ingest_search_list_and_purge_requires_elevated_principal() 
         channel: "cli".to_owned(),
         session_id: Some(common_v1::CanonicalId { ulid: SESSION_ID.to_owned() }),
         purge_all_principal: false,
+        user_confirmed: true,
     });
     authorize_metadata(purge_request.metadata_mut())?;
     let purge_error = memory_client
@@ -4337,6 +4338,7 @@ async fn grpc_memory_purge_all_requires_elevated_principal_before_scope_evaluati
         channel: String::new(),
         session_id: None,
         purge_all_principal: true,
+        user_confirmed: true,
     });
     authorize_metadata_with_principal_and_channel(purge_request.metadata_mut(), "user:ops", "cli")?;
     let purge_error = memory_client
@@ -4347,6 +4349,50 @@ async fn grpc_memory_purge_all_requires_elevated_principal_before_scope_evaluati
     assert!(
         purge_error.message().contains("admin/system principal prefix"),
         "permission denied response should explain elevated principal requirement"
+    );
+
+    let mut unconfirmed_admin_purge = tonic::Request::new(memory_v1::PurgeMemoryRequest {
+        v: 1,
+        channel: String::new(),
+        session_id: None,
+        purge_all_principal: true,
+        user_confirmed: false,
+    });
+    authorize_metadata_with_principal_and_channel(
+        unconfirmed_admin_purge.metadata_mut(),
+        "admin:ops",
+        "cli",
+    )?;
+    let unconfirmed_admin_error = memory_client
+        .purge_memory(unconfirmed_admin_purge)
+        .await
+        .expect_err("admin purge should require explicit user confirmation");
+    assert_eq!(unconfirmed_admin_error.code(), Code::PermissionDenied);
+    assert!(
+        unconfirmed_admin_error.message().contains("sensitive action blocked by default"),
+        "permission denied response should explain the missing sensitive-action approval"
+    );
+
+    let mut confirmed_admin_purge = tonic::Request::new(memory_v1::PurgeMemoryRequest {
+        v: 1,
+        channel: String::new(),
+        session_id: None,
+        purge_all_principal: true,
+        user_confirmed: true,
+    });
+    authorize_metadata_with_principal_and_channel(
+        confirmed_admin_purge.metadata_mut(),
+        "admin:ops",
+        "cli",
+    )?;
+    let confirmed_admin_response = memory_client
+        .purge_memory(confirmed_admin_purge)
+        .await
+        .context("confirmed admin purge should pass policy")?
+        .into_inner();
+    assert_eq!(
+        confirmed_admin_response.deleted_count, 0,
+        "confirmed admin purge should run against the admin principal scope"
     );
 
     let mut preserved_cli_get = tonic::Request::new(memory_v1::GetMemoryItemRequest {

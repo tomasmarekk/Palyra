@@ -152,8 +152,10 @@ message PurgeMemoryRequest {
   string channel = 2;
   palyra.common.v1.CanonicalId session_id = 3;
   bool purge_all_principal = 4;
+  // True only after the caller explicitly confirms the destructive purge.
+  bool user_confirmed = 5;
 
-  reserved 5 to 10;
+  reserved 6 to 10;
 }
 
 message PurgeMemoryResponse {

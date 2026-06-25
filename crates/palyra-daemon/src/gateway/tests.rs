@@ -3567,21 +3567,29 @@ fn approvals_authorization_requires_admin_or_system_principal() {
 }
 
 #[test]
-fn memory_purge_authorization_requires_admin_or_system_principal() {
-    let denied = authorize_memory_purge_action("user:ops", "memory.purge", "memory:items")
+fn memory_purge_authorization_requires_admin_or_system_principal_and_confirmation() {
+    let denied = authorize_memory_purge_action("user:ops", "memory.purge", "memory:items", true)
         .expect_err("non-admin principal should be denied");
     assert_eq!(denied.code(), Code::PermissionDenied);
     assert!(
         denied.message().contains("admin/system principal prefix"),
         "denial should explain the elevated principal requirement"
     );
+    let unconfirmed =
+        authorize_memory_purge_action("admin:ops", "memory.purge", "memory:items", false)
+            .expect_err("admin purge without confirmation should be denied by policy");
+    assert_eq!(unconfirmed.code(), Code::PermissionDenied);
     assert!(
-        authorize_memory_purge_action("admin:ops", "memory.purge", "memory:items").is_ok(),
-        "admin principal should pass memory purge guard"
+        unconfirmed.message().contains("sensitive action blocked by default"),
+        "denial should explain the missing sensitive-action approval"
     );
     assert!(
-        authorize_memory_purge_action("system:cron", "memory.purge", "memory:items").is_ok(),
-        "system principal should pass memory purge guard"
+        authorize_memory_purge_action("admin:ops", "memory.purge", "memory:items", true).is_ok(),
+        "confirmed admin principal should pass memory purge guard"
+    );
+    assert!(
+        authorize_memory_purge_action("system:cron", "memory.purge", "memory:items", true).is_ok(),
+        "confirmed system principal should pass memory purge guard"
     );
 }
 

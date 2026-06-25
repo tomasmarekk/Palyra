@@ -261,7 +261,12 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
         let context = self.authorize_rpc(request.metadata(), "PurgeMemory")?;
         let payload = request.into_inner();
         require_supported_version(payload.v)?;
-        authorize_memory_purge_action(context.principal.as_str(), "memory.purge", "memory:items")?;
+        authorize_memory_purge_action(
+            context.principal.as_str(),
+            "memory.purge",
+            "memory:items",
+            payload.user_confirmed,
+        )?;
         let channel =
             resolve_memory_channel_scope(context.channel.as_deref(), non_empty(payload.channel))?;
         let session_id = optional_canonical_id(payload.session_id, "session_id")?;

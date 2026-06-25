@@ -105,30 +105,35 @@ pub(crate) fn authorize_memory_action(
 ///
 /// # Errors
 /// Returns `Status::permission_denied` when the principal lacks an
-/// admin/system prefix and `Status::internal` when policy evaluation fails.
+/// admin/system prefix or sensitive-action approval, and `Status::internal`
+/// when policy evaluation fails.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_memory_purge_action(
     principal: &str,
     action: &str,
     resource: &str,
+    user_confirmed: bool,
 ) -> Result<(), Status> {
-    evaluate_with_config(
+    if !principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOrSystem) {
+        return Err(Status::permission_denied(format!(
+            "policy denied action '{action}' on '{resource}': memory purge requires admin/system principal prefix"
+        )));
+    }
+    let evaluation = evaluate_with_config(
         &PolicyRequest {
             principal: principal.to_owned(),
             action: action.to_owned(),
             resource: resource.to_owned(),
         },
-        &PolicyEvaluationConfig::default(),
+        &PolicyEvaluationConfig {
+            allow_sensitive_tools: user_confirmed,
+            ..PolicyEvaluationConfig::default()
+        },
     )
     .map_err(|error| {
         Status::internal(format!("failed to evaluate memory purge policy: {error}"))
     })?;
-    if principal_has_sensitive_service_role(principal, SensitiveServiceRole::AdminOrSystem) {
-        return Ok(());
-    }
-    Err(Status::permission_denied(format!(
-        "policy denied action '{action}' on '{resource}': memory purge requires admin/system principal prefix"
-    )))
+    map_policy_decision(action, resource, evaluation.decision)
 }
 
 /// Authorizes a vault service action through the default policy.

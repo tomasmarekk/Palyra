@@ -549,6 +549,7 @@ pub(crate) async fn run_memory_async(
                 channel: channel.unwrap_or_default(),
                 session_id,
                 purge_all_principal: principal,
+                user_confirmed: yes,
             });
             inject_run_stream_metadata(request.metadata_mut(), &connection)?;
             let response = client
