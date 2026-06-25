@@ -184,7 +184,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "replaces_terms",
-                        json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Use with category=correction when possible; workspace/project memory applies these terms whenever provided."}),
+                        json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Workspace/project memory applies these terms only with category=correction."}),
                     ),
                     ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
                     (
@@ -230,7 +230,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "replaces_terms",
-                        json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Use with category=correction when possible; workspace/project memory applies these terms whenever provided."}),
+                        json!({"type":"array","items":{"type":"string"},"maxItems":32,"description":"Language-neutral obsolete values and context terms that identify existing memory to replace. Workspace/project memory applies these terms only with category=correction."}),
                     ),
                     ("scope", json!({"type":"string","enum":["principal","session","channel","workspace","project"],"description":"Defaults to principal. Use session only for current-session scratch memory, channel for authenticated channel memory, and workspace or project to write indexed workspace/project memory documents."})),
                     (

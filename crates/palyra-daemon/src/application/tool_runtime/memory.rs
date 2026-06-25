@@ -3907,13 +3907,13 @@ fn workspace_memory_path_has_allowed_extension(path: &str) -> bool {
 /// semantics). Returns the base content and how many entries were removed.
 fn workspace_memory_document_base_content(
     existing_content: Option<&str>,
-    _category_hint: Option<MemoryWriteCategory>,
+    category_hint: Option<MemoryWriteCategory>,
     replaces_terms: &[String],
 ) -> (Option<String>, usize) {
     let Some(existing_content) = existing_content else {
         return (None, 0);
     };
-    if replaces_terms.is_empty() {
+    if replaces_terms.is_empty() || category_hint != Some(MemoryWriteCategory::Correction) {
         return (Some(existing_content.to_owned()), 0);
     }
     let (content, replaced_entries) =
@@ -5363,7 +5363,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_memory_document_base_content_uses_replaces_terms_without_category() {
+    fn workspace_memory_document_base_content_ignores_replaces_terms_without_correction_category() {
         let existing = "# Project Memory\n\n- remembered_at_unix_ms=1 source=manual\n  UI E2E tests prefer Vitest and concise reports.\n\n- remembered_at_unix_ms=2 source=manual\n  Keep reports concise.\n";
         let replaces_terms =
             vec!["Vitest".to_owned(), "Vitest pro E2E".to_owned(), "E2E Vitest".to_owned()];
@@ -5371,8 +5371,9 @@ mod tests {
             workspace_memory_document_base_content(Some(existing), None, replaces_terms.as_slice());
         let base = base.expect("existing content should remain present");
 
-        assert_eq!(replaced_entries, 1);
-        assert!(!base.contains("Vitest"), "{base}");
+        assert_eq!(replaced_entries, 0);
+        assert_eq!(base, existing);
+        assert!(base.contains("Vitest"), "{base}");
         assert!(base.contains("Keep reports concise."), "{base}");
 
         let (updated, appended) = workspace_memory_document_content(
@@ -5387,7 +5388,24 @@ mod tests {
         );
         assert!(appended);
         assert!(updated.contains("Playwright"));
-        assert!(!updated.contains("Vitest"));
+        assert!(updated.contains("Vitest"));
+    }
+
+    #[test]
+    fn workspace_memory_document_base_content_ignores_metadata_terms_for_non_corrections() {
+        let existing = "# Project Memory\n\n- remembered_at_unix_ms=1 source=manual\n  Use Playwright for browser checks.\n\n- remembered_at_unix_ms=2 source=manual\n  Keep reports concise.\n";
+        let replaces_terms = vec!["manual".to_owned()];
+        let (base, replaced_entries) = workspace_memory_document_base_content(
+            Some(existing),
+            Some(MemoryWriteCategory::Fact),
+            replaces_terms.as_slice(),
+        );
+        let base = base.expect("existing content should remain present");
+
+        assert_eq!(replaced_entries, 0);
+        assert_eq!(base, existing);
+        assert!(base.contains("Use Playwright for browser checks."), "{base}");
+        assert!(base.contains("Keep reports concise."), "{base}");
     }
 
     fn workspace_document_record(content_text: &str) -> WorkspaceDocumentRecord {
