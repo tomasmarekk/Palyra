@@ -2759,21 +2759,48 @@ fn chromium_element_capture_script(
     if (raw && typeof raw.baseVal === "string") return raw.baseVal;
     return "";
   }};
-  const elementText = (element) => {{
-    const raw = element ? (element.innerText || element.textContent || "") : "";
+  const sensitiveTags = new Set(["script", "style", "template", "noscript", "head", "meta", "link", "title"]);
+  const isHiddenByAttributes = (element) => (
+    Boolean(element && element.hidden) ||
+    String((element && element.getAttribute("aria-hidden")) || "").toLowerCase() === "true"
+  );
+  const visibleFrom = (element, rect, computed) => {{
+    const tagName = String((element && element.tagName) || "").toLowerCase();
+    if (
+      sensitiveTags.has(tagName) ||
+      (tagName === "input" && String(element.getAttribute("type") || "").toLowerCase() === "hidden") ||
+      isHiddenByAttributes(element) ||
+      rect.width <= 0 ||
+      rect.height <= 0
+    ) {{
+      return false;
+    }}
+    let cursor = element;
+    while (cursor && cursor.nodeType === 1) {{
+      if (isHiddenByAttributes(cursor)) return false;
+      const current = cursor === element ? computed : window.getComputedStyle(cursor);
+      if (
+        current.display === "none" ||
+        current.visibility === "hidden" ||
+        Number(current.opacity || "1") <= 0
+      ) {{
+        return false;
+      }}
+      cursor = cursor.parentElement;
+    }}
+    return true;
+  }};
+  const elementText = (element, visible) => {{
+    if (!element || !visible) {{
+      return {{ text: "", truncated: false }};
+    }}
+    const raw = element.innerText || "";
     const normalized = String(raw).replace(/\s+/g, " ").trim();
     return {{
       text: clamp(normalized, maxTextChars),
       truncated: normalized.length > maxTextChars
     }};
   }};
-  const visibleFrom = (rect, computed) => (
-    rect.width > 0 &&
-    rect.height > 0 &&
-    computed.display !== "none" &&
-    computed.visibility !== "hidden" &&
-    computed.opacity !== "0"
-  );
   const capture = (selector) => {{
     const rawSelector = String(selector || "").trim();
     if (!rawSelector) {{
@@ -2790,7 +2817,8 @@ fn chromium_element_capture_script(
     }}
     const rect = element.getBoundingClientRect();
     const computed = window.getComputedStyle(element);
-    const text = elementText(element);
+    const visible = visibleFrom(element, rect, computed);
+    const text = elementText(element, visible);
     const styles = styleNames.map((name) => {{
       const key = String(name || "").trim();
       return {{ name: key, value: clamp(computed.getPropertyValue(key) || computed[key] || "", 512) }};
@@ -2799,7 +2827,7 @@ fn chromium_element_capture_script(
       selector: rawSelector,
       found: true,
       rect: rectPayload(rect),
-      visible: visibleFrom(rect, computed),
+      visible,
       tag_name: clamp((element.tagName || "").toLowerCase(), 64),
       id: clamp(element.id || "", 128),
       class_name: clamp(className(element), 256),
@@ -5249,7 +5277,8 @@ fn chromium_viewport_metrics_mismatch(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        chromium_cookie_delete_requests, chromium_network_log_headers, chromium_permission_origin,
+        chromium_cookie_delete_requests, chromium_element_capture_script,
+        chromium_network_log_headers, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -5482,6 +5511,22 @@ mod tests {
         assert_eq!(rect.height, 64.0);
         assert_eq!(capture.computed_styles[0].name, "display");
         assert_eq!(capture.computed_styles[0].value, "flex");
+    }
+
+    #[test]
+    fn chromium_element_capture_script_uses_visible_inner_text_only() {
+        let script = chromium_element_capture_script(
+            &["script".to_owned(), "[hidden]".to_owned()],
+            &["display".to_owned()],
+            512,
+        )
+        .expect("element capture script should encode selector input");
+
+        assert!(script.contains("sensitiveTags"));
+        assert!(script.contains("aria-hidden"));
+        assert!(script.contains("getAttribute(\"type\") || \"\").toLowerCase() === \"hidden\""));
+        assert!(script.contains("const raw = element.innerText || \"\""));
+        assert!(!script.contains("textContent"));
     }
 
     #[test]

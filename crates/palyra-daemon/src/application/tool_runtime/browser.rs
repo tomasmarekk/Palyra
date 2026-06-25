@@ -4425,42 +4425,67 @@ fn browser_element_captures_to_json(
     let captures = captures
         .iter()
         .map(|capture| {
-            let text_export =
-                export_browser_text(capture.text.as_str(), SafetyContentKind::BrowserObservation);
-            redacted |= text_export.redacted;
-            scans.push(text_export.scan.clone());
+            let selector =
+                export_browser_capture_field(capture.selector.as_str(), &mut scans, &mut redacted);
+            let tag_name =
+                export_browser_capture_field(capture.tag_name.as_str(), &mut scans, &mut redacted);
+            let id = export_browser_capture_field(capture.id.as_str(), &mut scans, &mut redacted);
+            let class_name = export_browser_capture_field(
+                capture.class_name.as_str(),
+                &mut scans,
+                &mut redacted,
+            );
+            let text =
+                export_browser_capture_field(capture.text.as_str(), &mut scans, &mut redacted);
+            let error =
+                export_browser_capture_field(capture.error.as_str(), &mut scans, &mut redacted);
             let computed_styles = capture
                 .computed_styles
                 .iter()
                 .map(|style| {
-                    let value_export = export_browser_text(
-                        style.value.as_str(),
-                        SafetyContentKind::BrowserObservation,
+                    let name = export_browser_capture_field(
+                        style.name.as_str(),
+                        &mut scans,
+                        &mut redacted,
                     );
-                    redacted |= value_export.redacted;
-                    scans.push(value_export.scan.clone());
+                    let value = export_browser_capture_field(
+                        style.value.as_str(),
+                        &mut scans,
+                        &mut redacted,
+                    );
                     json!({
-                        "name": style.name,
-                        "value": value_export.redacted_text,
+                        "name": name,
+                        "value": value,
                     })
                 })
                 .collect::<Vec<_>>();
             json!({
-                "selector": capture.selector,
+                "selector": selector,
                 "found": capture.found,
                 "bounding_rect": capture.bounding_rect.as_ref().map(browser_rect_to_json),
                 "visible": capture.visible,
-                "tag_name": capture.tag_name,
-                "id": capture.id,
-                "class_name": capture.class_name,
-                "text": text_export.redacted_text,
+                "tag_name": tag_name,
+                "id": id,
+                "class_name": class_name,
+                "text": text,
                 "text_truncated": capture.text_truncated,
                 "computed_styles": computed_styles,
-                "error": capture.error,
+                "error": error,
             })
         })
         .collect::<Vec<_>>();
     (captures, scans, redacted)
+}
+
+fn export_browser_capture_field(
+    value: &str,
+    scans: &mut Vec<SafetyScanResult>,
+    redacted: &mut bool,
+) -> String {
+    let exported = export_browser_text(value, SafetyContentKind::BrowserObservation);
+    *redacted |= exported.redacted;
+    scans.push(exported.scan.clone());
+    exported.redacted_text
 }
 
 fn browser_rect_to_json(rect: &browser_v1::BrowserRect) -> Value {
@@ -5938,8 +5963,8 @@ mod tests {
                 }),
                 visible: true,
                 tag_name: "div".to_owned(),
-                id: "token".to_owned(),
-                class_name: String::new(),
+                id: "token=super-secret-token-value".to_owned(),
+                class_name: "Authorization: Bearer super-secret-token-value".to_owned(),
                 text: "Authorization: Bearer super-secret-token-value".to_owned(),
                 text_truncated: false,
                 computed_styles: vec![browser_v1::BrowserComputedStyle {
@@ -5953,6 +5978,8 @@ mod tests {
         assert!(redacted);
         assert!(!scans.is_empty());
         assert_eq!(captures[0]["bounding_rect"]["width"], 3.0);
+        assert_eq!(captures[0]["id"], "token=[REDACTED_SECRET]");
+        assert_eq!(captures[0]["class_name"], "Authorization: [REDACTED_SECRET]");
         assert_eq!(captures[0]["text"], "Authorization: [REDACTED_SECRET]");
         assert_eq!(captures[0]["computed_styles"][0]["value"], "token=[REDACTED_SECRET]");
     }

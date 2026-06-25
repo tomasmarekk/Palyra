@@ -1361,7 +1361,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             properties.push(("max_visible_text_bytes", json!({"type":"integer","minimum":0})));
             properties.push((
                 "capture_selectors",
-                json!({"type":"array","items":{"type":"string"},"maxItems":8,"description":"Optional CSS selectors to inspect without mutating page code. Returns element_captures with bounding_rect, visible, text preview, and computed_styles; use this for responsive layout, overlap, visibility, and computed-style assertions instead of adding measurement code or console logs to the app."}),
+                json!({"type":"array","items":{"type":"string"},"maxItems":8,"description":"Optional CSS selectors to inspect without mutating page code. Returns element_captures with bounding_rect, visible, visible-safe text preview for rendered non-hidden elements, and computed_styles; hidden/script/style/template text is omitted. Use this for responsive layout, overlap, visibility, and computed-style assertions instead of adding measurement code or console logs to the app."}),
             ));
             properties.push((
                 "computed_style_properties",
