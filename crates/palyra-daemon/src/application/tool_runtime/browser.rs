@@ -986,19 +986,20 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 /// User-owned OS roots where browser tools may read uploads or save outputs
 /// outside agent workspaces.
 ///
-/// Explicitly configured roots (`PALYRA_OS_FILE_ROOTS`) extend the implicit
-/// `USERPROFILE`/`HOME` roots so fixture roots do not disable ordinary
-/// user-owned paths such as Downloads. Temp directories are always allowed.
+/// Explicitly configured roots (`PALYRA_OS_FILE_ROOTS`) replace the implicit
+/// `USERPROFILE`/`HOME` roots so operators can narrow host filesystem access.
+/// Temp directories are always allowed.
 fn browser_user_owned_os_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_browser_user_os_roots() {
         for root in configured_roots {
             push_browser_canonical_root(&mut roots, root);
         }
-    }
-    for key in ["USERPROFILE", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            push_browser_canonical_root(&mut roots, PathBuf::from(value));
+    } else {
+        for key in ["USERPROFILE", "HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                push_browser_canonical_root(&mut roots, PathBuf::from(value));
+            }
         }
     }
     push_browser_canonical_root(&mut roots, std::env::temp_dir());
@@ -5727,7 +5728,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_user_owned_roots_extend_configured_os_file_roots() {
+    fn browser_user_owned_roots_replace_implicit_profile_roots_when_configured() {
         let _guard = BROWSER_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -5752,8 +5753,8 @@ mod tests {
             "configured OS root should be included: {roots:?}"
         );
         assert!(
-            roots.iter().any(|root| root == &canonical_home),
-            "implicit USERPROFILE/HOME roots should remain included when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
+            !roots.iter().any(|root| root == &canonical_home),
+            "implicit USERPROFILE/HOME roots must not be included when PALYRA_OS_FILE_ROOTS is set: {roots:?}"
         );
     }
 
