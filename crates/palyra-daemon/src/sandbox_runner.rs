@@ -2491,7 +2491,7 @@ fn validate_no_embedded_command_line_arg(
     Err(SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::InvalidInput,
         message: format!(
-            "palyra.process.run args must be an array of executable arguments, not a single command-line string; got args=[{arg:?}]. Use command={:?} and split each argument into its own args entry, for example args=[\"-e\", \"console.log('ok')\"] for node eval.",
+            "palyra.process.run args must be an array of executable arguments, not a single command-line string; got args=[{arg:?}]. Use command={:?} and split each argument into its own args entry, for example args=[\"scripts/check.js\"] for a Node script file.",
             input.command
         ),
     })
@@ -2669,14 +2669,6 @@ fn validate_interpreter_argument_guardrails(
             continue;
         }
         if let Some(previous) = index.checked_sub(1).and_then(|previous| args.get(previous)) {
-            if node_eval_option_consumes_non_path_value(command, previous.as_str()) {
-                validate_node_inline_source_paths_in_workspace(
-                    workspace_root,
-                    cwd,
-                    argument.as_str(),
-                )?;
-                continue;
-            }
             if command_option_consumes_non_path_value(command, previous.as_str()) {
                 continue;
             }
@@ -2741,15 +2733,6 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
             continue;
         }
         if let Some(previous) = index.checked_sub(1).and_then(|previous| args.get(previous)) {
-            if node_eval_option_consumes_non_path_value(command, previous.as_str()) {
-                validate_node_inline_source_paths_in_host_scope(
-                    workspace_root,
-                    cwd,
-                    argument.as_str(),
-                    host_roots,
-                )?;
-                continue;
-            }
             if command_option_consumes_non_path_value(command, previous.as_str()) {
                 continue;
             }
@@ -2774,156 +2757,6 @@ fn validate_host_interpreter_argument_guardrails_with_roots(
     }
 
     Ok(())
-}
-
-fn validate_node_inline_source_paths_in_workspace(
-    workspace_root: &Path,
-    cwd: &Path,
-    source: &str,
-) -> Result<(), SandboxProcessRunError> {
-    for literal in node_inline_absolute_filesystem_path_literals(source) {
-        if interpreter_absolute_path_argument_stays_in_workspace(workspace_root, cwd, literal)? {
-            continue;
-        }
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "sandbox denied: node inline source contains absolute filesystem path outside workspace: '{literal}'"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn validate_node_inline_source_paths_in_host_scope(
-    workspace_root: &Path,
-    cwd: &Path,
-    source: &str,
-    host_roots: &[PathBuf],
-) -> Result<(), SandboxProcessRunError> {
-    for literal in node_inline_absolute_filesystem_path_literals(source) {
-        if interpreter_absolute_path_argument_stays_in_host_scope(
-            workspace_root,
-            cwd,
-            literal,
-            host_roots,
-        )? {
-            continue;
-        }
-        return Err(SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
-            message: format!(
-                "sandbox denied: node inline source contains absolute filesystem path outside approved host roots: '{literal}'"
-            ),
-        });
-    }
-    Ok(())
-}
-
-fn node_inline_absolute_filesystem_path_literals(source: &str) -> Vec<&str> {
-    let mut literals = Vec::new();
-    let mut chars = source.char_indices();
-    while let Some((quote_start, quote)) = chars.next() {
-        if !matches!(quote, '\'' | '"' | '`') {
-            continue;
-        }
-        let literal_start = quote_start + quote.len_utf8();
-        let mut escaped = false;
-        let mut literal_end = None;
-        for (index, ch) in chars.by_ref() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == quote {
-                literal_end = Some(index);
-                break;
-            }
-        }
-        let Some(literal_end) = literal_end else {
-            break;
-        };
-        let literal = &source[literal_start..literal_end];
-        if token_or_path_list_contains_absolute_path(literal)
-            && node_inline_path_literal_has_filesystem_context(source, quote_start)
-        {
-            literals.push(literal);
-        }
-    }
-    literals
-}
-
-fn node_inline_path_literal_has_filesystem_context(
-    source: &str,
-    literal_quote_start: usize,
-) -> bool {
-    const CONTEXT_CHARS: usize = 160;
-    const FILESYSTEM_PATTERNS: &[&str] = &[
-        "require(",
-        "import(",
-        "readfile(",
-        "readfilesync(",
-        "writefile(",
-        "writefilesync(",
-        "appendfile(",
-        "appendfilesync(",
-        "open(",
-        "opensync(",
-        "opendir(",
-        "opendirsync(",
-        "readdir(",
-        "readdirsync(",
-        "stat(",
-        "statsync(",
-        "lstat(",
-        "lstatsync(",
-        "realpath(",
-        "realpathsync(",
-        "mkdir(",
-        "mkdirsync(",
-        "rm(",
-        "rmsync(",
-        "rmdir(",
-        "rmdirsync(",
-        "unlink(",
-        "unlinksync(",
-        "rename(",
-        "renamesync(",
-        "copyfile(",
-        "copyfilesync(",
-        "cp(",
-        "cpsync(",
-        "createreadstream(",
-        "createwritestream(",
-        "readlink(",
-        "readlinksync(",
-        "symlink(",
-        "symlinksync(",
-        "chmod(",
-        "chmodsync(",
-        "chown(",
-        "chownsync(",
-        "utimes(",
-        "utimessync(",
-        "access(",
-        "accesssync(",
-        "watch(",
-        "watchfile(",
-    ];
-
-    let prefix = &source[..literal_quote_start];
-    let context_start =
-        prefix.char_indices().rev().nth(CONTEXT_CHARS).map_or(0, |(index, _)| index);
-    let normalized_context = prefix[context_start..]
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    FILESYSTEM_PATTERNS.iter().any(|pattern| normalized_context.ends_with(pattern))
 }
 
 fn interpreter_absolute_path_argument_stays_in_workspace(
@@ -3106,20 +2939,24 @@ fn interpreter_shell_eval_denied_error(command: &str) -> SandboxProcessRunError 
     SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
         message: format!(
-            "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command); write a workspace script and run it as a script file instead, for example command='pwsh', args=['-NoProfile','-File','scripts/check.ps1'] on Windows or command='bash', args=['scripts/check.sh'] when bash is available",
+            "sandbox denied: interpreter command '{}' cannot use shell-eval flags (-c/--command/--eval, or node -e/-p); write a workspace script and run it as a script file instead, for example command='pwsh', args=['-NoProfile','-File','scripts/check.ps1'] on Windows, command='bash', args=['scripts/check.sh'] when bash is available, or command='node', args=['scripts/check.js'] for Node",
             command
         ),
     }
 }
 
-fn is_blocked_eval_flag(arg: &str) -> bool {
+fn is_blocked_eval_flag(command: &str, arg: &str) -> bool {
+    is_generic_blocked_eval_flag(arg) || node_eval_flag_is_blocked(command, arg)
+}
+
+fn is_generic_blocked_eval_flag(arg: &str) -> bool {
     let normalized = arg.trim().to_ascii_lowercase();
     matches!(normalized.as_str(), "-c" | "/c" | "--command" | "-command" | "--eval")
 }
 
 fn interpreter_args_contain_blocked_eval_flag(command: &str, args: &[String]) -> bool {
     args.iter().enumerate().any(|(index, arg)| {
-        is_blocked_eval_flag(arg.as_str())
+        is_blocked_eval_flag(command, arg.as_str())
             && !python_arg_is_after_execution_target(command, args, index)
     })
 }
@@ -3145,7 +2982,7 @@ fn python_execution_target_index(args: &[String]) -> Option<usize> {
         if arg.eq_ignore_ascii_case("-m") {
             return args.get(index.saturating_add(1)).map(|_| index.saturating_add(1));
         }
-        if is_blocked_eval_flag(arg) {
+        if is_generic_blocked_eval_flag(arg) {
             return None;
         }
         if !arg.starts_with('-') {
@@ -3454,8 +3291,8 @@ fn validate_host_argument_path_scope(
     Ok(())
 }
 
-// Walks the argv once, classifying each argument: known non-path values (test patterns, node
-// -e code, python module names, Windows switches, sleep durations) pass through untouched,
+// Walks the argv once, classifying each argument: known non-path values (test patterns,
+// python module names, Windows switches, sleep durations) pass through untouched,
 // while everything path-like (bare paths, file URLs, --opt=path and -Xpath forms, virtual
 // workspace aliases) is resolved through resolve_scoped_path and replaced with the proven
 // in-scope absolute form. Any path that fails scoping aborts the whole run.
@@ -3616,12 +3453,11 @@ fn option_consumes_non_path_value(arg: &str) -> bool {
 
 fn command_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
     option_consumes_non_path_value(arg)
-        || node_eval_option_consumes_non_path_value(command, arg)
         || python_module_option_consumes_non_path_value(command, arg)
         || windows_acl_option_consumes_non_path_value(command, arg)
 }
 
-fn node_eval_option_consumes_non_path_value(command: &str, arg: &str) -> bool {
+fn node_eval_flag_is_blocked(command: &str, arg: &str) -> bool {
     let command = normalize_process_executable_token(command);
     matches!(command.as_str(), "node" | "nodejs")
         && matches!(arg.trim().to_ascii_lowercase().as_str(), "-e" | "-p")
@@ -7771,8 +7607,9 @@ mod tests {
     use super::{
         apply_tier_c_inner_path_prepend, build_process_command, builtin_list_directory_stdout,
         canonical_workspace_root, collect_requested_egress_hosts, command_env_value_os,
-        cpu_rlimit_seconds_from_usage_micros, host_access_roots, is_host_allowlisted,
-        maybe_emit_process_progress, process_failure_message, process_output_diagnostic_summary,
+        command_option_consumes_non_path_value, cpu_rlimit_seconds_from_usage_micros,
+        host_access_roots, is_host_allowlisted, maybe_emit_process_progress,
+        process_failure_message, process_output_diagnostic_summary,
         process_runner_command_with_args_message, process_success_output_json,
         redacted_process_output_preview, redacted_process_output_text,
         resolve_host_executable_path_with_roots, resolve_host_working_directory,
@@ -8239,7 +8076,7 @@ mod tests {
     }
 
     #[test]
-    fn host_interpreter_guardrails_allow_inline_node_code_with_route_literals() {
+    fn host_interpreter_guardrails_reject_node_eval_with_route_literals() {
         let workspace = unique_temp_dir("workspace-host-node-inline-route");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
@@ -8249,20 +8086,16 @@ mod tests {
             "const fs = require('fs'); const route = '/settings'; const t = fs.readFileSync('app.js', 'utf8'); console.log(route, t.length);".to_owned(),
         ];
 
-        validate_host_interpreter_argument_guardrails(
+        let error = validate_host_interpreter_argument_guardrails(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "node",
             args.as_slice(),
         )
-        .expect("host node inline source should not be treated as a host filesystem path");
-        validate_host_argument_scope(
-            canonical_workspace.as_path(),
-            canonical_workspace.as_path(),
-            "node",
-            args.as_slice(),
-        )
-        .expect("host node inline source should stay a non-path argument");
+        .expect_err("host node eval must stay blocked even when route strings look harmless");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -8288,10 +8121,10 @@ mod tests {
             args.as_slice(),
             std::slice::from_ref(&canonical_workspace),
         )
-        .expect_err("host node inline source must respect approved roots");
+        .expect_err("host node eval must be denied before source path heuristics");
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(error.message.contains("outside approved host roots"), "{}", error.message);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
@@ -8504,22 +8337,25 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_arguments_to_scoped_paths_preserves_node_eval_code() {
+    fn node_eval_flags_are_not_non_path_option_exemptions() {
         let workspace = unique_temp_dir("workspace-node-eval-arg-rewrite");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
         let args = vec!["-e".to_owned(), "console.log('PALYRA_PROCESS_OK')".to_owned()];
 
-        let rewritten = rewrite_arguments_to_scoped_paths(
+        assert!(!command_option_consumes_non_path_value("node", "-e"));
+        assert!(!command_option_consumes_non_path_value("nodejs", "-p"));
+        let error = validate_interpreter_argument_guardrails(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "node",
             args.as_slice(),
         )
-        .expect("node eval code should remain a literal argument");
+        .expect_err("node eval flags must be blocked before argument rewriting");
 
-        assert_eq!(rewritten, args);
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -11823,7 +11659,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn run_constrained_process_executes_allowlisted_node_eval_when_available() {
+    fn run_constrained_process_rejects_allowlisted_node_eval_when_available() {
         if Command::new("node").arg("--version").output().is_err() {
             return;
         }
@@ -11835,16 +11671,11 @@ mod tests {
         policy.egress_enforcement_mode = EgressEnforcementMode::None;
         let input = br#"{"command":"node","args":["-e","console.log('PALYRA_PROCESS_OK')"]}"#;
 
-        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
-            .expect("allowlisted node eval should run with the sanitized Windows environment");
-        let output: serde_json::Value =
-            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let error = run_constrained_process(&policy, input, Duration::from_millis(20_000))
+            .expect_err("allowlisted node eval must still be rejected");
 
-        assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
-        assert_eq!(
-            output.get("stdout").and_then(serde_json::Value::as_str),
-            Some("PALYRA_PROCESS_OK\n")
-        );
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -11852,26 +11683,43 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn run_constrained_process_applies_explicit_env_without_shell_wrapper() {
-        if Command::new("node").arg("--version").output().is_err() {
+        let Some(python) = ["python3", "python", "py"]
+            .into_iter()
+            .find(|command| Command::new(command).arg("--version").output().is_ok())
+        else {
             return;
-        }
-        let workspace = unique_temp_dir("workspace-node-env");
+        };
+        let workspace = unique_temp_dir("workspace-python-env");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let mut policy =
-            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["node".to_owned()]);
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
         policy.allow_interpreters = true;
         policy.egress_enforcement_mode = EgressEnforcementMode::None;
-        let input = br#"{"command":"node","args":["-e","console.log(process.env.PALYRA_E2E_HOME || 'missing')"],"env":{"PALYRA_E2E_HOME":"C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100"}}"#;
+        let script = workspace.join("print_env.py");
+        fs::write(
+            script.as_path(),
+            b"import os\nprint(os.environ.get('PALYRA_E2E_HOME', 'missing'))\n",
+        )
+        .expect("python env fixture should be written");
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["print_env.py"],
+            "env": {
+                "PALYRA_E2E_HOME": "C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100"
+            }
+        }))
+        .expect("input should serialize");
 
-        let result = run_constrained_process(&policy, input, Duration::from_millis(20_000))
-            .expect("explicit process env should be applied without shell syntax");
+        let result =
+            run_constrained_process(&policy, input.as_slice(), Duration::from_millis(20_000))
+                .expect("explicit process env should be applied without shell syntax");
         let output: serde_json::Value =
             serde_json::from_slice(&result.output_json).expect("output should parse");
 
         assert_eq!(output.get("exit_code").and_then(serde_json::Value::as_i64), Some(0));
         assert_eq!(
             output.get("stdout").and_then(serde_json::Value::as_str),
-            Some("C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100\n")
+            Some("C:\\Users\\Palo\\AppData\\Local\\Palyra-TestHarness\\home\\S100\r\n")
         );
 
         let _ = fs::remove_dir_all(workspace.as_path());
@@ -11879,23 +11727,31 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn run_constrained_process_timeout_terminates_node_process_tree_when_available() {
-        if Command::new("node").arg("--version").output().is_err() {
+    fn run_constrained_process_timeout_terminates_python_process_tree_when_available() {
+        let Some(python) = ["python3", "python", "py"]
+            .into_iter()
+            .find(|command| Command::new(command).arg("--version").output().is_ok())
+        else {
             return;
-        }
-        let workspace = unique_temp_dir("workspace-node-timeout-tree");
+        };
+        let workspace = unique_temp_dir("workspace-python-timeout-tree");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let mut policy =
-            sandbox_policy_with_allowed_executables(workspace.clone(), vec!["node".to_owned()]);
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
         policy.allow_interpreters = true;
         policy.egress_enforcement_mode = EgressEnforcementMode::None;
-        let script = "const { spawn } = require('child_process'); \
-            const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: ['ignore', 'inherit', 'inherit'] }); \
-            child.unref(); \
-            setInterval(() => {}, 1000);";
+        fs::write(workspace.join("child.py"), b"import time\ntime.sleep(30)\n")
+            .expect("python child fixture should be written");
+        fs::write(
+            workspace.join("parent.py"),
+            b"import subprocess, sys, time\n\
+              child = subprocess.Popen([sys.executable, 'child.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n\
+              time.sleep(30)\n",
+        )
+        .expect("python parent fixture should be written");
         let input = serde_json::to_vec(&serde_json::json!({
-            "command": "node",
-            "args": ["-e", script],
+            "command": python,
+            "args": ["parent.py"],
             "timeout_ms": 200
         }))
         .expect("input should serialize");
@@ -12802,7 +12658,7 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_guardrails_allow_inline_node_code_with_relative_paths_and_newline_escape() {
+    fn interpreter_guardrails_reject_inline_node_code_with_relative_paths() {
         let workspace = unique_temp_dir("workspace-node-inline-relative-paths");
         fs::create_dir_all(workspace.join("src").as_path())
             .expect("workspace src directory should be created");
@@ -12813,19 +12669,22 @@ mod tests {
             "const fs = require('fs'); const route = '/settings'; const lines = fs.readFileSync('src/reporting.ts', 'utf8').split('\\n'); console.log(route, 'reporting.ts line count:', lines.length);".to_owned(),
         ];
 
-        validate_interpreter_argument_guardrails(
+        let error = validate_interpreter_argument_guardrails(
             workspace_root.as_path(),
             workspace_root.as_path(),
             "node",
             args.as_slice(),
         )
-        .expect("inline node code with relative paths should not be treated as host-absolute");
+        .expect_err("node inline eval must be blocked even when it only uses relative paths");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
 
     #[test]
-    fn interpreter_guardrails_allow_node_eval_workspace_absolute_fs_path() {
+    fn interpreter_guardrails_reject_node_eval_workspace_absolute_fs_path() {
         let workspace = unique_temp_dir("workspace-node-inline-absolute-workspace-path");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         let report = workspace.join("report.txt");
@@ -12836,13 +12695,16 @@ mod tests {
         let args =
             vec!["-e".to_owned(), format!("require('fs').readFileSync('{report_path}', 'utf8')")];
 
-        validate_interpreter_argument_guardrails(
+        let error = validate_interpreter_argument_guardrails(
             workspace_root.as_path(),
             workspace_root.as_path(),
             "node",
             args.as_slice(),
         )
-        .expect("node inline fs paths inside the workspace should be allowed");
+        .expect_err("node inline eval must be blocked even for workspace paths");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
@@ -12866,14 +12728,10 @@ mod tests {
             "node",
             args.as_slice(),
         )
-        .expect_err("node inline source must validate filesystem absolute paths");
+        .expect_err("node inline eval must be denied before source path heuristics");
 
         assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
-        assert!(
-            error.message.contains("node inline source contains absolute filesystem path"),
-            "{}",
-            error.message
-        );
+        assert!(error.message.contains("shell-eval flags"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
     }
