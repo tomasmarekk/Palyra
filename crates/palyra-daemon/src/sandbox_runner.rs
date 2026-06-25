@@ -797,8 +797,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
 
     let path_access_mode = process_runner_effective_path_access_mode(policy);
     let workspace_root = canonical_workspace_root(policy.workspace_root.as_path())?;
-    let host_access_roots = process_runner_accepts_host_path_fields(policy)
-        .then(|| host_access_roots_for_input(&input));
+    let host_access_roots = process_runner_accepts_host_path_fields(policy).then(host_access_roots);
     let host_access_path_env = process_runner_accepts_host_path_fields(policy)
         .then(|| host_access_path_env_for_input(&input));
     let working_directory = match path_access_mode {
@@ -3792,14 +3791,8 @@ fn windows_program_files_path(path: &Path) -> bool {
     }
 }
 
-fn host_access_roots_for_input(input: &ProcessRunnerInput) -> Vec<PathBuf> {
-    let mut roots = user_owned_host_roots();
-    for key in HOST_ACCESS_SAFE_PALYRA_ENV_KEYS {
-        if let Some(value) = input.env.get(*key).filter(|value| !value.trim().is_empty()) {
-            push_canonical_host_root(&mut roots, PathBuf::from(value));
-        }
-    }
-    roots
+fn host_access_roots() -> Vec<PathBuf> {
+    user_owned_host_roots()
 }
 
 fn host_access_path_env_for_input(input: &ProcessRunnerInput) -> BTreeMap<String, PathBuf> {
@@ -3844,7 +3837,7 @@ fn resolve_process_prepend_path_entries(
                 .collect();
         }
         PathAccessMode::ApprovedRoots => {
-            let host_roots = host_access_roots_for_input(input);
+            let host_roots = host_access_roots();
             let path_env = host_access_path_env_for_input(input);
             return input
                 .prepend_path
@@ -3891,15 +3884,16 @@ fn require_prepend_path_directory(
     })
 }
 
-// Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS) + the user profile +
-// temp directories. Roots that fail to canonicalize or are not directories are silently
-// dropped: a missing root must narrow the scope, never widen or break it.
+// Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS), or the default user
+// profile/temp roots when no explicit roots are configured. Roots that fail to canonicalize or are
+// not directories are silently dropped: a missing root must narrow the scope, never widen it.
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_host_roots() {
         for root in configured_roots {
             push_canonical_host_root(&mut roots, root);
         }
+        return roots;
     }
     for key in ["USERPROFILE", "HOME"] {
         if let Some(value) = std::env::var_os(key) {
@@ -6006,7 +6000,7 @@ fn build_process_command(
     let prepend_path = resolve_process_prepend_path_entries(policy, input, workspace_root, cwd)?;
     let path_access_mode = process_runner_effective_path_access_mode(policy);
     if process_runner_allows_host_access(policy) {
-        let host_roots = host_access_roots_for_input(input);
+        let host_roots = host_access_roots();
         let trusted_path = host_access_path();
         let require_trusted_resolution = !prepend_path.is_empty();
         let program = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
@@ -7253,7 +7247,7 @@ mod tests {
     use super::{
         apply_tier_c_inner_path_prepend, build_process_command, builtin_list_directory_stdout,
         canonical_workspace_root, collect_requested_egress_hosts, command_env_value_os,
-        cpu_rlimit_seconds_from_usage_micros, host_access_roots_for_input, is_host_allowlisted,
+        cpu_rlimit_seconds_from_usage_micros, host_access_roots, is_host_allowlisted,
         maybe_emit_process_progress, process_failure_message, process_output_diagnostic_summary,
         process_runner_command_with_args_message, process_success_output_json,
         redacted_process_output_preview, redacted_process_output_text,
@@ -8911,7 +8905,7 @@ mod tests {
     }
 
     #[test]
-    fn host_access_path_policy_extends_configured_os_file_roots_with_user_roots() {
+    fn host_access_path_policy_uses_configured_os_file_roots_without_user_or_env_roots() {
         let _guard = PROCESS_ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -8949,13 +8943,14 @@ mod tests {
             &[allowed_target.display().to_string()],
         )
         .expect("configured PALYRA_OS_FILE_ROOTS root should be allowed for host access paths");
-        validate_host_argument_scope(
+        let implicit_error = validate_host_argument_scope(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "pwsh",
             &[implicit_target.display().to_string()],
         )
-        .expect("implicit user roots should remain allowed when PALYRA_OS_FILE_ROOTS adds roots");
+        .expect_err("configured PALYRA_OS_FILE_ROOTS should replace implicit user roots");
+        assert_eq!(implicit_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
 
         let env_root = std::env::current_dir()
             .expect("current dir should resolve")
@@ -8969,29 +8964,23 @@ mod tests {
                     .as_nanos()
             ));
         fs::create_dir_all(env_root.as_path()).expect("safe env root should be created");
-        let mut input = ProcessRunnerInput {
-            command: "pwsh".to_owned(),
-            args: Vec::new(),
-            cwd: None,
-            env: Default::default(),
-            prepend_path: Vec::new(),
-            requested_egress_hosts: Vec::new(),
-            timeout_ms: None,
-            background: false,
-            lifetime_mode: BackgroundLifetimeMode::RunOwned,
-            keep_running_after_run: false,
-        };
-        input.env.insert("PALYRA_E2E_OS_ROOT".to_owned(), env_root.to_string_lossy().into_owned());
-        let host_roots = host_access_roots_for_input(&input);
+        let env = BTreeMap::from([(
+            "PALYRA_E2E_OS_ROOT".to_owned(),
+            env_root.to_string_lossy().into_owned(),
+        )]);
+        validate_process_env_overrides(&env)
+            .expect("fixture env key should remain valid child env");
+        let host_roots = host_access_roots();
         let env_target = env_root.join("provider.toml");
-        validate_host_argument_scope_with_roots(
+        let env_error = validate_host_argument_scope_with_roots(
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
             "pwsh",
             &[env_target.display().to_string()],
             host_roots.as_slice(),
         )
-        .expect("safe launch-context path env roots should be allowed for process args");
+        .expect_err("per-call env roots must not authorize host access paths");
+        assert_eq!(env_error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(configured_root.as_path());
