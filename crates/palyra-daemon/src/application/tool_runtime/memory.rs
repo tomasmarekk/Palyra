@@ -1988,12 +1988,13 @@ async fn maybe_replace_workspace_document_by_id(
     context: ToolRuntimeExecutionContext<'_>,
     request: WorkspaceDocumentReplaceRequest<'_>,
 ) -> Option<ToolExecutionOutcome> {
+    let requested_agent_id = optional_trimmed_string(request.parsed.get("agent_id"));
     let document = match request
         .runtime_state
         .workspace_document_by_id(
             context.principal.to_owned(),
             context.channel.map(str::to_owned),
-            optional_trimmed_string(request.parsed.get("agent_id")),
+            requested_agent_id.clone(),
             request.document_id.to_owned(),
             false,
         )
@@ -2015,6 +2016,21 @@ async fn maybe_replace_workspace_document_by_id(
             ));
         }
     };
+    if let Err(error) = enforce_workspace_document_replace_scope(
+        &document,
+        context.principal,
+        context.channel,
+        requested_agent_id.as_deref(),
+    ) {
+        return Some(memory_tool_execution_outcome(
+            request.namespace,
+            request.proposal_id,
+            request.input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.replace {}", error.message()),
+        ));
+    }
     if let Err(error) = authorize_memory_action(
         context.principal,
         "memory.ingest",
@@ -2087,6 +2103,49 @@ async fn maybe_replace_workspace_document_by_id(
             format!("palyra.memory.replace failed to serialize workspace output: {error}"),
         ),
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn enforce_workspace_document_replace_scope(
+    document: &WorkspaceDocumentRecord,
+    principal: &str,
+    channel: Option<&str>,
+    requested_agent_id: Option<&str>,
+) -> Result<(), Status> {
+    if document.principal != principal {
+        return Err(Status::permission_denied(
+            "workspace document principal does not match context",
+        ));
+    }
+    match (channel, document.channel.as_deref()) {
+        (Some(context_channel), Some(document_channel)) if context_channel != document_channel => {
+            return Err(Status::permission_denied(
+                "workspace document channel does not match context",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(Status::permission_denied(
+                "workspace document is channel-scoped and requires authenticated channel context",
+            ));
+        }
+        _ => {}
+    }
+    match (requested_agent_id, document.agent_id.as_deref()) {
+        (Some(requested_agent_id), Some(document_agent_id))
+            if requested_agent_id != document_agent_id =>
+        {
+            return Err(Status::permission_denied(
+                "workspace document agent_id does not match request",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(Status::permission_denied(
+                "workspace document is agent-scoped and requires matching agent_id",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn workspace_memory_replace_payload(
@@ -5020,6 +5079,33 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("replaced in place"));
+    }
+
+    #[test]
+    fn workspace_document_replace_scope_requires_matching_channel_and_agent() {
+        let document = workspace_document_record("keep workspace memory scoped");
+
+        enforce_workspace_document_replace_scope(
+            &document,
+            "user:ops",
+            Some("console"),
+            Some("agent-1"),
+        )
+        .expect("matching scope should replace workspace document");
+        let missing_channel =
+            enforce_workspace_document_replace_scope(&document, "user:ops", None, Some("agent-1"))
+                .expect_err("channel-scoped document requires channel context");
+        assert_eq!(
+            missing_channel.message(),
+            "workspace document is channel-scoped and requires authenticated channel context"
+        );
+        let missing_agent =
+            enforce_workspace_document_replace_scope(&document, "user:ops", Some("console"), None)
+                .expect_err("agent-scoped document requires agent selector");
+        assert_eq!(
+            missing_agent.message(),
+            "workspace document is agent-scoped and requires matching agent_id"
+        );
     }
 
     #[test]

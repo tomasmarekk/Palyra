@@ -7321,6 +7321,114 @@ async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_replace_tool_rejects_workspace_document_replace_without_matching_scope() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    let channel_document = state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/scope-channel/MEMORY.md".to_owned(),
+            title: Some("Channel memory".to_owned()),
+            content_text: "channel scoped original".to_owned(),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("channel-scoped workspace document should be indexed");
+    let no_channel_context = super::ToolRuntimeExecutionContext { channel: None, ..context };
+    let no_channel_input = serde_json::to_vec(&json!({
+        "memory_id": channel_document.document_id,
+        "content_text": "cross-channel replacement"
+    }))
+    .expect("replace input should serialize");
+    let no_channel_replace = execute_memory_replace_tool(
+        &state,
+        no_channel_context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FEB",
+        no_channel_input.as_slice(),
+    )
+    .await;
+
+    assert!(!no_channel_replace.success, "replace without channel context must fail");
+    assert!(
+        no_channel_replace.error.contains("channel-scoped"),
+        "unexpected error: {}",
+        no_channel_replace.error
+    );
+    let unchanged_channel_document = state
+        .workspace_document_by_path(
+            context.principal.to_owned(),
+            context.channel.map(str::to_owned),
+            None,
+            "projects/scope-channel/MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("workspace document lookup should succeed")
+        .expect("channel-scoped document should remain present");
+    assert!(unchanged_channel_document.content_text.contains("channel scoped original"));
+    assert!(!unchanged_channel_document.content_text.contains("cross-channel replacement"));
+
+    let agent_document = state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: Some("agent-A".to_owned()),
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/scope-agent/MEMORY.md".to_owned(),
+            title: Some("Agent memory".to_owned()),
+            content_text: "agent scoped original".to_owned(),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("agent-scoped workspace document should be indexed");
+    let no_agent_input = serde_json::to_vec(&json!({
+        "memory_id": agent_document.document_id,
+        "content_text": "cross-agent replacement"
+    }))
+    .expect("replace input should serialize");
+    let no_agent_replace = execute_memory_replace_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FEC",
+        no_agent_input.as_slice(),
+    )
+    .await;
+
+    assert!(!no_agent_replace.success, "replace without agent_id must fail");
+    assert!(
+        no_agent_replace.error.contains("agent-scoped"),
+        "unexpected error: {}",
+        no_agent_replace.error
+    );
+    let unchanged_agent_document = state
+        .workspace_document_by_path(
+            context.principal.to_owned(),
+            context.channel.map(str::to_owned),
+            Some("agent-A".to_owned()),
+            "projects/scope-agent/MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("workspace document lookup should succeed")
+        .expect("agent-scoped document should remain present");
+    assert!(unchanged_agent_document.content_text.contains("agent scoped original"));
+    assert!(!unchanged_agent_document.content_text.contains("cross-agent replacement"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn os_file_allows_absolute_path_inside_launch_workspace_root() {
     let state = build_test_runtime_state(false);
     state
