@@ -1017,7 +1017,7 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
     if normalized.is_empty() {
         return false;
     }
-    let reference = normalized.trim_matches(['(', ')']).trim();
+    let reference = trim_wrapping_parentheses(normalized);
     is_env_member_reference(reference)
         || is_env_reference_with_safe_fallback(reference)
         || is_env_getter_reference(reference, "Deno.env.get")
@@ -1061,7 +1061,7 @@ fn is_env_reference_with_safe_fallback(value: &str) -> bool {
         let Some((left, right)) = value.split_once(operator) else {
             continue;
         };
-        let left = left.trim().trim_matches(['(', ')']).trim();
+        let left = trim_wrapping_parentheses(left.trim());
         let right = right.trim().trim_end_matches([',', ';']).trim();
         if is_env_reference_value(left) && is_safe_empty_fallback_value(right) {
             return true;
@@ -1083,6 +1083,18 @@ fn is_safe_empty_fallback_value(value: &str) -> bool {
     matches!(value, "\"\"" | "''" | "``" | "None" | "none" | "null" | "undefined")
 }
 
+fn trim_wrapping_parentheses(value: &str) -> &str {
+    let mut trimmed = value.trim();
+    while let Some(inner) = trimmed.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        let inner = inner.trim();
+        if !has_balanced_parens(inner) {
+            break;
+        }
+        trimmed = inner;
+    }
+    trimmed
+}
+
 fn is_env_getter_reference(value: &str, prefix: &str) -> bool {
     let Some(inner) = value.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('(')) else {
         return false;
@@ -1101,8 +1113,8 @@ fn is_os_environ_index_reference(value: &str) -> bool {
     is_quoted_env_identifier(inner.trim())
 }
 
-/// Allows expressions whose only string literals are env-var-style names,
-/// e.g. `requireEnv("API_KEY")` or `["API_KEY", "CLIENT_SECRET"]`.
+/// Allows narrow expressions whose only string literals are env-var-style names:
+/// trusted env helper calls, or metadata assignments that store env names.
 fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
     let literals = quoted_string_literals(value);
     if literals.is_empty()
@@ -1112,7 +1124,17 @@ fn is_env_identifier_reference_expression(key: &str, value: &str) -> bool {
     {
         return false;
     }
-    value.contains('(') || value.contains('[') || assignment_key_describes_env_identifier(key)
+    is_trusted_env_identifier_helper_call(value) || assignment_key_describes_env_identifier(key)
+}
+
+fn is_trusted_env_identifier_helper_call(value: &str) -> bool {
+    let Some((callee, rest)) = value.trim().split_once('(') else {
+        return false;
+    };
+    if callee.trim() != "requireEnv" {
+        return false;
+    }
+    rest.trim_end().ends_with(')')
 }
 
 fn is_safe_standalone_env_identifier_literal(raw_key: &str, key: &str, value: &str) -> bool {
@@ -1376,11 +1398,9 @@ fn has_disallowed_source_expression_literal(value: &str) -> bool {
     }
     let literals = quoted_string_literals(value);
     literals.is_empty()
-        || literals.iter().any(|literal| {
-            !literal.is_empty()
-                && !is_env_reference_identifier_literal(literal)
-                && !is_benign_mock_credential_fixture_value(literal)
-        })
+        || literals
+            .iter()
+            .any(|literal| !literal.is_empty() && !is_benign_mock_credential_fixture_value(literal))
 }
 
 fn has_identifier_immediately_after_closing_paren(value: &str) -> bool {
@@ -2519,7 +2539,7 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
+        assert!(!outcome.redacted, "unexpected redaction: {}", outcome.redacted_text);
         assert_eq!(outcome.redacted_text, source);
         assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
         assert!(!outcome
@@ -2527,6 +2547,34 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn env_identifier_expressions_do_not_hide_sensitive_assignment_values() {
+        let source = "const apiKey = getKey(\"PROD_SECRET_VALUE\");\n\
+                      const password = [\"CORRECT_HORSE_BATTERY_STAPLE\"];";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted, "expected redaction: {}", outcome.redacted_text);
+        assert!(outcome.redacted_text.contains("const apiKey = [REDACTED_SECRET]"));
+        assert!(outcome.redacted_text.contains("const password = [REDACTED_SECRET]"));
+        assert!(!outcome.redacted_text.contains("PROD_SECRET_VALUE"));
+        assert!(!outcome.redacted_text.contains("CORRECT_HORSE_BATTERY_STAPLE"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
     }
 
     #[test]
