@@ -1205,21 +1205,34 @@ pub(crate) enum ChromiumPrivateTargetScope {
     File(PathBuf),
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ChromiumPrivateTargetRequestScope {
+    tab_target_id: String,
+    url: ChromiumPrivateTargetUrlScope,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+enum ChromiumPrivateTargetUrlScope {
+    Network { scheme: String, host: String, port: u16, path: String, query: Option<String> },
+    File(PathBuf),
+}
+
 /// Tracks which private/local targets a session may reach.
 ///
 /// Deny-by-default: unless the whole session allows private targets, a private
-/// destination is reachable only while a scoped allowance is alive.
+/// destination is reachable only for the tab and URL that owns a scoped allowance.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
-    scoped_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetScope, usize>>,
+    scoped_requests: std::sync::Mutex<HashMap<ChromiumPrivateTargetRequestScope, usize>>,
+    pending_proxy_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetScope, usize>>,
 }
 
 /// RAII allowance for one private target; the allowance is released on drop.
 #[derive(Debug)]
 pub(crate) struct ChromiumScopedPrivateTarget {
     policy: Arc<ChromiumPrivateTargetPolicy>,
-    scope: ChromiumPrivateTargetScope,
+    scope: ChromiumPrivateTargetRequestScope,
 }
 
 impl ChromiumPrivateTargetPolicy {
@@ -1227,25 +1240,53 @@ impl ChromiumPrivateTargetPolicy {
     pub(crate) fn new(allow_session_private_targets: bool) -> Self {
         Self {
             allow_session_private_targets,
-            scoped_targets: std::sync::Mutex::new(HashMap::new()),
+            scoped_requests: std::sync::Mutex::new(HashMap::new()),
+            pending_proxy_targets: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns whether the URL's target is currently allowed.
+    /// Returns whether the URL's target is allowed without a tab-bound scope.
     ///
     /// Unparseable URLs are denied (fail closed) when the session does not
     /// allow private targets wholesale.
-    pub(crate) fn allows_url(&self, raw_url: &str) -> bool {
+    pub(crate) fn allows_url(&self, _raw_url: &str) -> bool {
+        self.allow_session_private_targets
+    }
+
+    pub(crate) fn allows_tab_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
         if self.allow_session_private_targets {
             return true;
         }
-        let Ok(Some(scope)) = ChromiumPrivateTargetScope::from_url(raw_url) else {
+        let Ok(Some(scope)) =
+            ChromiumPrivateTargetRequestScope::from_tab_url(tab_target_id, raw_url)
+        else {
             return false;
         };
-        self.allows_scope(&scope)
+        self.allows_request_scope(&scope)
+    }
+
+    pub(crate) fn authorize_tab_request_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
+        if self.allow_session_private_targets {
+            return true;
+        }
+        let Ok(Some(scope)) =
+            ChromiumPrivateTargetRequestScope::from_tab_url(tab_target_id, raw_url)
+        else {
+            return false;
+        };
+        if !self.allows_request_scope(&scope) {
+            return false;
+        }
+        if let ChromiumPrivateTargetScope::Network { .. } = scope.target_scope() {
+            self.grant_proxy_scope(scope.target_scope());
+        }
+        true
     }
 
     /// Returns whether the host/port pair is currently allowed; invalid hosts are denied.
+    ///
+    /// Scoped allowances are consumed one CONNECT at a time after a tab-bound
+    /// request interceptor authorizes the matching URL.
     pub(crate) fn allows_host_port(&self, host: &str, port: u16) -> bool {
         if self.allow_session_private_targets {
             return true;
@@ -1253,7 +1294,7 @@ impl ChromiumPrivateTargetPolicy {
         let Ok(scope) = ChromiumPrivateTargetScope::network(host, port) else {
             return false;
         };
-        self.allows_scope(&scope)
+        self.consume_proxy_scope(&scope)
     }
 
     /// Grants a temporary allowance for the URL's target, released when the
@@ -1265,38 +1306,68 @@ impl ChromiumPrivateTargetPolicy {
     /// or the policy lock is poisoned.
     pub(crate) fn scoped_url_allowance(
         self: &Arc<Self>,
+        tab_target_id: &str,
         raw_url: &str,
     ) -> Result<Option<ChromiumScopedPrivateTarget>, String> {
         if self.allow_session_private_targets {
             return Ok(None);
         }
-        let Some(scope) = ChromiumPrivateTargetScope::from_url(raw_url)? else {
+        if validate_target_url_blocking(raw_url, false).is_ok() {
+            return Ok(None);
+        }
+        let Some(scope) = ChromiumPrivateTargetRequestScope::from_tab_url(tab_target_id, raw_url)?
+        else {
             return Ok(None);
         };
-        let mut scoped_targets = self
-            .scoped_targets
+        let mut scoped_requests = self
+            .scoped_requests
             .lock()
             .map_err(|_| "private-target policy lock was poisoned".to_owned())?;
-        let count = scoped_targets.entry(scope.clone()).or_insert(0);
+        let count = scoped_requests.entry(scope.clone()).or_insert(0);
         *count = count.saturating_add(1);
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
-    fn allows_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
-        self.scoped_targets
+    fn allows_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
+        self.scoped_requests
             .lock()
-            .map(|scoped_targets| scoped_targets.contains_key(scope))
+            .map(|scoped_requests| scoped_requests.contains_key(scope))
             .unwrap_or(false)
     }
 
-    fn release_scope(&self, scope: &ChromiumPrivateTargetScope) {
-        let Ok(mut scoped_targets) = self.scoped_targets.lock() else {
+    fn grant_proxy_scope(&self, scope: ChromiumPrivateTargetScope) {
+        let Ok(mut pending_proxy_targets) = self.pending_proxy_targets.lock() else {
             return;
         };
-        match scoped_targets.get_mut(scope) {
+        let count = pending_proxy_targets.entry(scope).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    fn consume_proxy_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
+        let Ok(mut pending_proxy_targets) = self.pending_proxy_targets.lock() else {
+            return false;
+        };
+        match pending_proxy_targets.get_mut(scope) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                true
+            }
+            Some(_) => {
+                pending_proxy_targets.remove(scope);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn release_scope(&self, scope: &ChromiumPrivateTargetRequestScope) {
+        let Ok(mut scoped_requests) = self.scoped_requests.lock() else {
+            return;
+        };
+        match scoped_requests.get_mut(scope) {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {
-                scoped_targets.remove(scope);
+                scoped_requests.remove(scope);
             }
             None => {}
         }
@@ -1304,6 +1375,36 @@ impl ChromiumPrivateTargetPolicy {
 }
 
 impl ChromiumPrivateTargetScope {
+    fn network(host: &str, port: u16) -> Result<Self, String> {
+        let normalized_host = if let Some(address) = netguard::parse_host_ip_literal(host)? {
+            address.to_string()
+        } else {
+            normalize_dns_host_cache_key(host)
+        };
+        if normalized_host.is_empty() {
+            return Err("private-target scope host must not be empty".to_owned());
+        }
+        Ok(Self::Network { host: normalized_host, port })
+    }
+}
+
+impl ChromiumPrivateTargetRequestScope {
+    fn from_tab_url(tab_target_id: &str, raw_url: &str) -> Result<Option<Self>, String> {
+        if tab_target_id.trim().is_empty() {
+            return Err("private-target tab scope id must not be empty".to_owned());
+        }
+        let Some(url) = ChromiumPrivateTargetUrlScope::from_url(raw_url)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self { tab_target_id: tab_target_id.to_owned(), url }))
+    }
+
+    fn target_scope(&self) -> ChromiumPrivateTargetScope {
+        self.url.target_scope()
+    }
+}
+
+impl ChromiumPrivateTargetUrlScope {
     fn from_url(raw_url: &str) -> Result<Option<Self>, String> {
         if raw_url.eq_ignore_ascii_case("about:blank") {
             return Ok(None);
@@ -1317,10 +1418,6 @@ impl ChromiumPrivateTargetScope {
             return Ok(Some(Self::File(canonical)));
         }
         let (host, port) = extract_target_host_port(&url)?;
-        Ok(Some(Self::network(host, port)?))
-    }
-
-    fn network(host: &str, port: u16) -> Result<Self, String> {
         let normalized_host = if let Some(address) = netguard::parse_host_ip_literal(host)? {
             address.to_string()
         } else {
@@ -1329,7 +1426,22 @@ impl ChromiumPrivateTargetScope {
         if normalized_host.is_empty() {
             return Err("private-target scope host must not be empty".to_owned());
         }
-        Ok(Self::Network { host: normalized_host, port })
+        Ok(Some(Self::Network {
+            scheme: url.scheme().to_ascii_lowercase(),
+            host: normalized_host,
+            port,
+            path: url.path().to_owned(),
+            query: url.query().map(ToOwned::to_owned),
+        }))
+    }
+
+    fn target_scope(&self) -> ChromiumPrivateTargetScope {
+        match self {
+            Self::Network { host, port, .. } => {
+                ChromiumPrivateTargetScope::Network { host: host.clone(), port: *port }
+            }
+            Self::File(path) => ChromiumPrivateTargetScope::File(path.clone()),
+        }
     }
 }
 
@@ -1664,11 +1776,14 @@ pub(crate) fn configure_chromium_tab(
     tab.set_default_timeout(timeout);
     tab.enable_fetch(None, Some(false))
         .map_err(|error| format!("failed to enable Chromium fetch interception: {error}"))?;
+    let tab_target_id = tab.get_target_id().to_string();
     let request_policy = Arc::clone(&private_target_policy);
+    let request_tab_target_id = tab_target_id.clone();
     let request_interceptor =
         Arc::new(move |_transport, _session_id, intercepted: Fetch::events::RequestPausedEvent| {
             let request_url = intercepted.params.request.url.as_str();
-            let allow_private_targets = request_policy.allows_url(request_url);
+            let allow_private_targets = request_policy
+                .authorize_tab_request_url(request_tab_target_id.as_str(), request_url);
             if validate_target_url_blocking(request_url, allow_private_targets).is_ok() {
                 RequestPausedDecision::Continue(None)
             } else {
@@ -1704,10 +1819,12 @@ pub(crate) fn configure_chromium_tab(
     .map_err(|error| format!("failed to register Chromium page diagnostics hooks: {error}"))?;
     let remote_ip_guard = Arc::clone(&security_incident);
     let response_policy = Arc::clone(&private_target_policy);
+    let response_tab_target_id = tab_target_id;
     tab.register_response_handling(
         CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME,
         Box::new(move |response, _fetch_body| {
-            let allow_private_targets = response_policy.allows_url(response.response.url.as_str());
+            let allow_private_targets = response_policy
+                .allows_tab_url(response_tab_target_id.as_str(), response.response.url.as_str());
             record_chromium_remote_ip_incident(
                 Some(response.response.url.as_str()),
                 response.response.remote_ip_address.as_deref(),
@@ -3866,8 +3983,11 @@ pub(crate) async fn navigate_tab_with_chromium(
                 return outcome;
             }
         };
+    let tab_target_id = tab.get_target_id().to_string();
     let _scoped_private_target = if params.allow_private_targets {
-        match private_target_policy.scoped_url_allowance(outcome.final_url.as_str()) {
+        match private_target_policy
+            .scoped_url_allowance(tab_target_id.as_str(), outcome.final_url.as_str())
+        {
             Ok(value) => value,
             Err(error) => {
                 outcome.success = false;
@@ -5652,7 +5772,7 @@ mod tests {
     }
 
     #[test]
-    fn chromium_sync_tab_url_validation_requires_private_file_allowance() {
+    fn chromium_sync_tab_url_validation_ignores_tab_scoped_private_file_allowance() {
         let policy = std::sync::Arc::new(ChromiumPrivateTargetPolicy::new(false));
         let fixture = tempfile::NamedTempFile::new().expect("file fixture should be created");
         let file_url =
@@ -5666,14 +5786,19 @@ mod tests {
         );
 
         let scoped = policy
-            .scoped_url_allowance(file_url.as_str())
+            .scoped_url_allowance("tab-a", file_url.as_str())
             .expect("scoped file allowance should parse")
             .expect("file URL should create scoped allowance");
 
         assert!(
-            chromium_sync_tab_url_is_allowed(file_url.as_str(), policy.as_ref())
-                .expect("scoped file popup target should validate"),
-            "scoped file popup target should be accepted for sync while the guard is alive"
+            policy.allows_tab_url("tab-a", file_url.as_str()),
+            "owning tab should be allowed for its scoped file URL"
+        );
+        let error = chromium_sync_tab_url_is_allowed(file_url.as_str(), policy.as_ref())
+            .expect_err("popup sync must not reuse another tab's scoped file allowance");
+        assert!(
+            error.contains("local file navigation requires allow_private_targets=true"),
+            "file popup validation should fail despite the tab-scoped guard: {error}"
         );
         assert!(
             !chromium_sync_tab_url_is_allowed("about:blank", policy.as_ref())
@@ -5687,6 +5812,13 @@ mod tests {
         assert!(
             error.contains("local file navigation requires allow_private_targets=true"),
             "file popup validation should fail after the scoped guard drops: {error}"
+        );
+
+        let session_allow_policy = ChromiumPrivateTargetPolicy::new(true);
+        assert!(
+            chromium_sync_tab_url_is_allowed(file_url.as_str(), &session_allow_policy)
+                .expect("session private-target allow should validate private file popup"),
+            "session-wide private-target allow should still permit file popup sync"
         );
     }
 

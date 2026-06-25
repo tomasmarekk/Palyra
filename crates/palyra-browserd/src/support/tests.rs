@@ -1343,16 +1343,36 @@ fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
     );
 
     let scoped = policy
-        .scoped_url_allowance("http://127.0.0.1:7143/status")
+        .scoped_url_allowance("tab-a", "http://127.0.0.1:7143/status")
         .expect("scoped private-target allowance should parse")
         .expect("network URL should create scoped allowance");
     assert!(
-        policy.allows_url("http://127.0.0.1:7143/next"),
-        "same host and port should be allowed during the scoped override"
+        policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/status"),
+        "owning tab should be allowed for the exact scoped URL"
+    );
+    assert!(
+        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/next"),
+        "same host and port must not widen to another URL"
+    );
+    assert!(
+        !policy.allows_tab_url("tab-b", "http://127.0.0.1:7143/status"),
+        "another tab must not inherit the scoped URL"
+    );
+    assert!(
+        !policy.allows_host_port("127.0.0.1", 7143),
+        "SOCKS5 proxy must not allow the target until request interception authorizes it"
+    );
+    assert!(
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/status"),
+        "owning tab request should arm one proxy CONNECT allowance"
     );
     assert!(
         policy.allows_host_port("127.0.0.1", 7143),
-        "SOCKS5 proxy should allow the scoped target"
+        "SOCKS5 proxy should consume the armed target allowance"
+    );
+    assert!(
+        !policy.allows_host_port("127.0.0.1", 7143),
+        "scoped proxy allowances must be one-shot"
     );
     assert!(
         !policy.allows_host_port("127.0.0.1", 7144),
@@ -1361,7 +1381,7 @@ fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
 
     drop(scoped);
     assert!(
-        !policy.allows_host_port("127.0.0.1", 7143),
+        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/status"),
         "dropping the scoped guard should revoke the allowance"
     );
 }
@@ -1386,9 +1406,13 @@ async fn chromium_session_proxy_scoped_private_override_rejects_unrelated_target
     let scoped_url = format!("http://127.0.0.1:{allowed_port}/");
     let _scoped = proxy
         .private_target_policy()
-        .scoped_url_allowance(scoped_url.as_str())
+        .scoped_url_allowance("tab-a", scoped_url.as_str())
         .expect("scoped private-target allowance should parse")
         .expect("network URL should create scoped allowance");
+    assert!(
+        proxy.private_target_policy().authorize_tab_request_url("tab-a", scoped_url.as_str()),
+        "owning tab request should arm only its scoped target"
+    );
 
     let proxy_addr = proxy
         .proxy_uri

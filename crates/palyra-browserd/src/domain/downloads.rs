@@ -927,15 +927,19 @@ mod tests {
     async fn scoped_private_target_policy_does_not_upgrade_download_fetch_permission() {
         let policy = std::sync::Arc::new(ChromiumPrivateTargetPolicy::new(false));
         let _scoped = policy
-            .scoped_url_allowance("http://127.0.0.1:43191/")
+            .scoped_url_allowance("tab-a", "http://127.0.0.1:43191/")
             .expect("scoped local browser allowance should parse")
             .expect("local browser target should create a scoped allowance");
         let download_url =
             Url::parse("http://127.0.0.1:43191/export.csv").expect("URL should parse");
 
         assert!(
-            policy.allows_url(download_url.as_str()),
-            "setup must prove Chromium temporarily allows the same-host private target"
+            policy.allows_tab_url("tab-a", "http://127.0.0.1:43191/"),
+            "setup must prove Chromium temporarily allows the exact scoped browser URL"
+        );
+        assert!(
+            !policy.allows_tab_url("tab-a", download_url.as_str()),
+            "same host private browser allowance must not widen to another URL"
         );
         let denied = validate_target_url(&download_url, false)
             .await
