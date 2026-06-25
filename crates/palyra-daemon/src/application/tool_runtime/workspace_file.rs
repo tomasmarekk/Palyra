@@ -2814,6 +2814,38 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_redacts_safe_looking_secret_literals() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("app.js");
+        let contents = "const clientSecret = 'PRODUCTION_BACKEND_SECRET';\n\
+             const apiKey = 'TENANT_PRIVATE_KEY';\n\
+             tenant_key = \"todo-app:tenant/abcdef0123456789abcdef\";\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "app.js".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+        let text = output.text.as_deref().expect("utf8 text should be returned");
+
+        assert!(output.redacted);
+        assert_eq!(output.text_authoritative, Some(false));
+        assert!(output.redaction_notice.is_some());
+        assert!(text.contains("clientSecret = '[REDACTED_SECRET]'"));
+        assert!(text.contains("apiKey = '[REDACTED_SECRET]'"));
+        assert!(text.contains("tenant_key = \"[REDACTED_SECRET]\""));
+        assert!(!text.contains("PRODUCTION_BACKEND_SECRET"));
+        assert!(!text.contains("TENANT_PRIVATE_KEY"));
+        assert!(!text.contains("abcdef0123456789abcdef"));
+    }
+
+    #[test]
     fn read_workspace_file_redacts_secret_like_utf8_with_control_bytes() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");

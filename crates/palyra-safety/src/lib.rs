@@ -1279,7 +1279,7 @@ fn is_trusted_env_identifier_helper_call(value: &str) -> bool {
 fn is_safe_standalone_env_identifier_literal(raw_key: &str, key: &str, value: &str) -> bool {
     is_standalone_env_identifier_literal(value)
         && (assignment_key_describes_env_identifier(key)
-            || is_source_declaration_assignment(raw_key))
+            || source_declaration_target_is_env_identifier(raw_key))
 }
 
 // Requires SCREAMING_SNAKE shape (underscore, no lowercase) so ordinary words
@@ -1317,6 +1317,19 @@ fn is_source_declaration_assignment(raw_key: &str) -> bool {
         || trimmed.starts_with("static ")
         || trimmed.starts_with("pub const ")
         || trimmed.starts_with("pub static ")
+}
+
+fn source_declaration_target_is_env_identifier(raw_key: &str) -> bool {
+    if !is_source_declaration_assignment(raw_key) {
+        return false;
+    }
+    let Some(target) = raw_key
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .find(|segment| !segment.is_empty())
+    else {
+        return false;
+    };
+    is_env_reference_identifier_literal(target)
 }
 
 fn is_obvious_placeholder_secret_value(value: &str) -> bool {
@@ -2000,6 +2013,7 @@ fn looks_like_palyra_e2e_fixture_marker(value: &str) -> bool {
 fn looks_like_application_identifier(value: &str) -> bool {
     let looks_like_scenario_identifier = looks_like_scenario_application_identifier(value);
     value.len() <= 128
+        && !application_identifier_contains_random_secret_segment(value)
         && (value.contains(':')
             || value.contains('/')
             || value.matches('.').count() >= 2
@@ -2028,6 +2042,10 @@ fn looks_like_application_identifier(value: &str) -> bool {
         && !value.contains("secret")
         && !value.contains("token")
         && !value.contains("password")
+}
+
+fn application_identifier_contains_random_secret_segment(value: &str) -> bool {
+    value.split([':', '/', '.', '-', '_']).any(looks_like_random_secret_segment)
 }
 
 fn looks_like_scenario_application_identifier(value: &str) -> bool {
@@ -3147,6 +3165,34 @@ mod tests {
     }
 
     #[test]
+    fn safe_looking_sensitive_assignment_literals_are_redacted() {
+        let source = "const clientSecret = 'PRODUCTION_BACKEND_SECRET';\n\
+                      const apiKey = 'TENANT_PRIVATE_KEY';";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("const clientSecret = '[REDACTED_SECRET]';"));
+        assert!(outcome.redacted_text.contains("const apiKey = '[REDACTED_SECRET]';"));
+        assert!(!outcome.redacted_text.contains("PRODUCTION_BACKEND_SECRET"));
+        assert!(!outcome.redacted_text.contains("TENANT_PRIVATE_KEY"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.client_secret"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
+    }
+
+    #[test]
     fn secret_file_path_assignments_are_not_redacted_as_secret_values() {
         let source = "SECRET_FILE=/app/secret.txt\n\
                       PRIVATE_KEY_FILE=\"C:\\\\Users\\\\demo\\\\keys\\\\private-key.pem\"\n\
@@ -3167,6 +3213,33 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code.starts_with("secret_leak.assignment.")));
+    }
+
+    #[test]
+    fn colon_delimited_generic_key_tokens_with_random_segments_are_redacted() {
+        let source = "tenant_key = \"todo-app:tenant/abcdef0123456789abcdef\"\n\
+                      token = \"todo-app:tenant/abcdef0123456789abcdef\"";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert!(outcome.redacted_text.contains("tenant_key = \"[REDACTED_SECRET]\""));
+        assert!(outcome.redacted_text.contains("token = \"[REDACTED_SECRET]\""));
+        assert!(!outcome.redacted_text.contains("abcdef0123456789abcdef"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.key"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
     }
 
     #[test]
