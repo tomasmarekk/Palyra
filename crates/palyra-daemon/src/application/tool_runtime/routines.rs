@@ -65,6 +65,7 @@ const DEFAULT_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 1_000;
 const MIN_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 250;
 const MAX_ROUTINE_WAIT_POLL_INTERVAL_MS: u64 = 30_000;
 const ROUTINE_WAIT_RUN_LIMIT: usize = 100;
+const COMPLETION_TOOL_MISSING_ERROR_KIND: &str = "completion_tool_missing";
 const DEFAULT_SCHEDULE_PREVIEW_LIMIT: usize = 1;
 const MAX_SCHEDULE_PREVIEW_LIMIT: usize = 64;
 const DEFAULT_ROUTINE_RETRY_MAX_ATTEMPTS: u32 = 2;
@@ -549,13 +550,13 @@ async fn observe_routine_wait_state(
 
 fn routine_wait_summary(
     job: &CronJobRecord,
-    runs: &[crate::journal::CronRunRecord],
+    runs: &[CronRunRecord],
     expected_successful_runs: Option<u32>,
     has_more_runs: bool,
 ) -> Value {
     let total_runs = runs.len();
-    let active_runs =
-        runs.iter().filter(|run| run.status.is_active()).count().try_into().unwrap_or(u32::MAX);
+    let active_runs = runs.iter().filter(|run| run.status.is_active()).count();
+    let active_runs_u32 = active_runs.try_into().unwrap_or(u32::MAX);
     let terminal_runs =
         runs.iter().filter(|run| !run.status.is_active()).count().try_into().unwrap_or(u32::MAX);
     let succeeded_runs =
@@ -564,14 +565,25 @@ fn routine_wait_summary(
     let skipped_runs =
         runs.iter().filter(|run| matches!(run.status, CronRunStatus::Skipped)).count();
     let denied_runs = runs.iter().filter(|run| matches!(run.status, CronRunStatus::Denied)).count();
-    let terminal = routine_job_is_terminal(job, active_runs);
+    let latest_terminal_run = latest_terminal_run_for_wait(job, runs, active_runs);
+    let routine_terminal = routine_job_is_terminal(job, active_runs_u32);
+    let terminal = routine_terminal || latest_terminal_run.is_some();
     let terminal_success_goal_met = expected_successful_runs
         .map(|expected| succeeded_runs >= expected as usize)
-        .unwrap_or(true);
+        .unwrap_or_else(|| {
+            latest_terminal_run.is_some_and(|run| matches!(run.status, CronRunStatus::Succeeded))
+        });
+    let terminal_reason = routine_wait_terminal_reason(
+        routine_terminal,
+        latest_terminal_run,
+        terminal_success_goal_met,
+    );
+    let terminal_failure =
+        latest_terminal_run.and_then(routine_wait_terminal_failure).unwrap_or(Value::Null);
     json!({
         "total_runs": total_runs,
         "terminal_runs": terminal_runs,
-        "active_runs": active_runs,
+        "active_runs": active_runs_u32,
         "succeeded_runs": succeeded_runs,
         "failed_runs": failed_runs,
         "skipped_runs": skipped_runs,
@@ -579,11 +591,81 @@ fn routine_wait_summary(
         "expected_successful_runs": expected_successful_runs,
         "terminal_success_goal_met": terminal_success_goal_met,
         "terminal": terminal,
+        "terminal_reason": terminal_reason,
+        "terminal_failure": terminal_failure,
         "enabled": cron::visible_cron_job_enabled(job),
         "next_run_at_unix_ms": cron::visible_next_run_at_unix_ms(job),
         "queued_run": job.queued_run,
         "has_more_runs": has_more_runs,
     })
+}
+
+fn latest_terminal_run_for_wait<'a>(
+    job: &CronJobRecord,
+    runs: &'a [CronRunRecord],
+    active_runs: usize,
+) -> Option<&'a CronRunRecord> {
+    if active_runs != 0 || job.queued_run {
+        return None;
+    }
+    runs.iter().rev().find(|run| !run.status.is_active())
+}
+
+fn routine_wait_terminal_reason(
+    routine_terminal: bool,
+    latest_terminal_run: Option<&CronRunRecord>,
+    terminal_success_goal_met: bool,
+) -> &'static str {
+    if terminal_success_goal_met {
+        return "success_goal_met";
+    }
+    match latest_terminal_run.map(|run| run.status) {
+        Some(CronRunStatus::Succeeded) => "latest_run_succeeded",
+        Some(CronRunStatus::Failed) => "latest_run_failed",
+        Some(CronRunStatus::Skipped) => "latest_run_skipped",
+        Some(CronRunStatus::Denied) => "latest_run_denied",
+        Some(CronRunStatus::Accepted | CronRunStatus::Running) | None if routine_terminal => {
+            "routine_inactive"
+        }
+        Some(CronRunStatus::Accepted | CronRunStatus::Running) | None => "waiting",
+    }
+}
+
+fn routine_wait_terminal_failure(run: &CronRunRecord) -> Option<Value> {
+    if run.status.is_active() || matches!(run.status, CronRunStatus::Succeeded) {
+        return None;
+    }
+    Some(json!({
+        "run_id": run.run_id.as_str(),
+        "status": run.status.as_str(),
+        "error_kind": run.error_kind.as_deref(),
+        "message": run.error_message_redacted.as_deref(),
+        "tool_calls": run.tool_calls,
+        "tool_denies": run.tool_denies,
+        "model_tokens_in": run.model_tokens_in,
+        "model_tokens_out": run.model_tokens_out,
+        "retry_guidance": routine_wait_retry_guidance(run),
+    }))
+}
+
+fn routine_wait_retry_guidance(run: &CronRunRecord) -> &'static str {
+    match (run.status, run.error_kind.as_deref()) {
+        (CronRunStatus::Failed, Some(COMPLETION_TOOL_MISSING_ERROR_KIND)) => {
+            "The routine run completed without the required completion tool result. Inspect the returned run details, then retry with a self-contained prompt that produces the expected file or workspace side effect."
+        }
+        (CronRunStatus::Failed, _) => {
+            "Inspect the returned run details, fix the failing prompt or environment, then retry with run_now or test_run."
+        }
+        (CronRunStatus::Denied, _) => {
+            "Review the approval or policy denial, adjust the policy or prompt if appropriate, then retry."
+        }
+        (CronRunStatus::Skipped, _) => {
+            "Inspect the skip reason, schedule, and concurrency settings before retrying."
+        }
+        (CronRunStatus::Accepted | CronRunStatus::Running | CronRunStatus::Succeeded, _) => {
+            "No retry action is required for this routine run."
+        }
+    }
 }
 
 /// A routine is terminal when nothing can run anymore: no active runs, no
@@ -3259,6 +3341,30 @@ mod tests {
     }
 
     #[test]
+    fn routine_wait_summary_returns_failed_run_terminal_for_enabled_schedule() {
+        let job = test_cron_job(true, Some(42), false);
+        let runs = vec![test_cron_run_with_error(
+            "run-01",
+            CronRunStatus::Failed,
+            "completion_tool_missing",
+            "cron attempt 1 completed without a successful completion tool result",
+        )];
+
+        let summary = super::routine_wait_summary(&job, runs.as_slice(), None, false);
+
+        assert_eq!(summary["terminal"], json!(true));
+        assert_eq!(summary["terminal_success_goal_met"], json!(false));
+        assert_eq!(summary["terminal_reason"], json!("latest_run_failed"));
+        assert_eq!(summary["terminal_failure"]["run_id"], json!("run-01"));
+        assert_eq!(summary["terminal_failure"]["status"], json!("failed"));
+        assert_eq!(summary["terminal_failure"]["error_kind"], json!("completion_tool_missing"));
+        assert!(summary["terminal_failure"]["retry_guidance"]
+            .as_str()
+            .expect("retry guidance should be returned")
+            .contains("required completion tool result"));
+    }
+
+    #[test]
     fn latest_cron_run_window_keeps_newest_limit() {
         let mut window = VecDeque::new();
         for index in 0..5 {
@@ -3721,6 +3827,20 @@ mod tests {
             tool_denies: 0,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 2,
+        }
+    }
+
+    fn test_cron_run_with_error(
+        run_id: &str,
+        status: CronRunStatus,
+        error_kind: &str,
+        error_message: &str,
+    ) -> CronRunRecord {
+        CronRunRecord {
+            error_kind: Some(error_kind.to_owned()),
+            error_message_redacted: Some(error_message.to_owned()),
+            tool_calls: 2,
+            ..test_cron_run(run_id, status)
         }
     }
 
