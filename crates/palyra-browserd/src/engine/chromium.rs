@@ -2262,8 +2262,20 @@ pub(crate) async fn chromium_sync_session_tabs(
             }
             let _ = tab.wait_until_navigated();
             let url = tab.get_url();
-            if !chromium_sync_tab_url_is_trackable(url.as_str()) {
-                continue;
+            match chromium_sync_tab_url_is_allowed(url.as_str(), private_target_policy.as_ref()) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    let scheme = Url::parse(url.as_str())
+                        .map(|url| url.scheme().to_owned())
+                        .unwrap_or_else(|_| "invalid".to_owned());
+                    warn!(
+                        scheme = scheme.as_str(),
+                        error = error.as_str(),
+                        "ignored Chromium popup tab that failed target validation"
+                    );
+                    continue;
+                }
             }
             let network_log = Arc::new(std::sync::Mutex::new(VecDeque::new()));
             let download_capture = Arc::new(std::sync::Mutex::new(VecDeque::new()));
@@ -3032,10 +3044,27 @@ fn chromium_permission_origin(raw_url: &str) -> Result<String, String> {
     Ok(origin)
 }
 
+#[cfg(test)]
 fn chromium_sync_tab_url_is_trackable(raw_url: &str) -> bool {
-    Url::parse(raw_url)
-        .map(|url| matches!(url.scheme(), "http" | "https" | "file"))
-        .unwrap_or(false)
+    Url::parse(raw_url).map(|url| chromium_sync_tab_url_scheme_is_trackable(&url)).unwrap_or(false)
+}
+
+fn chromium_sync_tab_url_is_allowed(
+    raw_url: &str,
+    private_target_policy: &ChromiumPrivateTargetPolicy,
+) -> Result<bool, String> {
+    let Ok(url) = Url::parse(raw_url) else {
+        return Ok(false);
+    };
+    if !chromium_sync_tab_url_scheme_is_trackable(&url) {
+        return Ok(false);
+    }
+    validate_target_url_blocking(raw_url, private_target_policy.allows_url(raw_url))?;
+    Ok(true)
+}
+
+fn chromium_sync_tab_url_scheme_is_trackable(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https" | "file")
 }
 
 fn chromium_permission_set_requests(
@@ -5138,9 +5167,9 @@ mod tests {
         chromium_cookie_delete_requests, chromium_network_log_headers, chromium_permission_origin,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
-        chromium_sync_tab_url_is_trackable, chromium_touch_emulation_max_touch_points,
-        chromium_transport_idle_timeout, chromium_upload_staging_path,
-        chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
+        chromium_sync_tab_url_is_allowed, chromium_sync_tab_url_is_trackable,
+        chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
+        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -5150,11 +5179,12 @@ mod tests {
         parse_chromium_local_storage_snapshot, parse_chromium_page_network_entries,
         parse_chromium_viewport_metrics, parse_key_press_spec,
         selector_not_found_error_from_cached_snapshot, ChromiumLayoutMetrics,
-        ChromiumObserveSnapshot, CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT,
-        CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT, CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT,
-        CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT, CHROMIUM_READ_CONSOLE_LOG_SCRIPT,
-        MAX_CHROMIUM_CONSOLE_JSON_BYTES, MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES,
-        MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES, MAX_CHROMIUM_NETWORK_JSON_BYTES,
+        ChromiumObserveSnapshot, ChromiumPrivateTargetPolicy,
+        CHROMIUM_CLEAR_ACTIVE_ORIGIN_STORAGE_SCRIPT, CHROMIUM_CLEAR_NETWORK_LOG_SCRIPT,
+        CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT, CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT,
+        CHROMIUM_READ_CONSOLE_LOG_SCRIPT, MAX_CHROMIUM_CONSOLE_JSON_BYTES,
+        MAX_CHROMIUM_DOCUMENT_COOKIE_JSON_BYTES, MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES,
+        MAX_CHROMIUM_NETWORK_JSON_BYTES,
     };
     use crate::{
         PermissionSettingInternal, SessionPermissionsInternal, DEFAULT_SESSION_IDLE_TTL_MS,
@@ -5647,6 +5677,36 @@ mod tests {
         assert!(!chromium_sync_tab_url_is_trackable("about:blank"));
         assert!(!chromium_sync_tab_url_is_trackable("chrome://newtab/"));
         assert!(!chromium_sync_tab_url_is_trackable(""));
+    }
+
+    #[test]
+    fn chromium_sync_tab_url_validation_requires_private_file_allowance() {
+        let policy = ChromiumPrivateTargetPolicy::new(false);
+        let fixture = tempfile::NamedTempFile::new().expect("file fixture should be created");
+        let file_url =
+            reqwest::Url::from_file_path(fixture.path()).expect("file URL should be built");
+
+        let error = chromium_sync_tab_url_is_allowed(file_url.as_str(), &policy)
+            .expect_err("unapproved file popup candidate must fail validation");
+        assert!(
+            error.contains("local file navigation requires allow_private_targets=true"),
+            "file popup validation should fail through the normal local-file gate: {error}"
+        );
+
+        policy
+            .retain_url_allowance(file_url.as_str())
+            .expect("retained file allowance should parse");
+
+        assert!(
+            chromium_sync_tab_url_is_allowed(file_url.as_str(), &policy)
+                .expect("retained file popup target should validate"),
+            "retained file popup target should be accepted for sync"
+        );
+        assert!(
+            !chromium_sync_tab_url_is_allowed("about:blank", &policy)
+                .expect("browser-internal tabs should be ignored"),
+            "browser-internal tabs are not popup sync candidates"
+        );
     }
 
     #[test]
