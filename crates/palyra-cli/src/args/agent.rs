@@ -88,7 +88,7 @@ pub enum AgentCommand {
             help = "Abort the selected active run, then start this prompt in the same session."
         )]
         interrupt_active_run: bool,
-        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce, help = "Select how tool approval requests are handled")]
+        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::Prompt, help = "Select how tool approval requests are handled")]
         approval_mode: AgentApprovalModeArg,
         #[arg(long, value_enum, default_value_t = AgentAutoResumeArg::Never, help = "Select whether the CLI automatically starts a continuation run")]
         auto_resume: AgentAutoResumeArg,
