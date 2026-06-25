@@ -4008,19 +4008,24 @@ fn should_reset_openai_compatible_defaults(
     previous_auth_provider_kind: Option<ModelProviderAuthProviderKind>,
 ) -> bool {
     previous_auth_provider_kind.is_some_and(|kind| kind != ModelProviderAuthProviderKind::Openai)
-        || openai_base_url_matches_non_openai_provider_default(document)
+        || openai_base_url_matches_stale_provider_default(document)
 }
 
-fn openai_base_url_matches_non_openai_provider_default(document: &toml::Value) -> bool {
+fn openai_base_url_matches_stale_provider_default(document: &toml::Value) -> bool {
     let Some(base_url) = document_string_value_at_path(document, "model_provider.openai_base_url")
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
         return false;
     };
-    [XAI_DEFAULT_BASE_URL, GOOGLE_GEMINI_OPENAI_BASE_URL, OPENROUTER_DEFAULT_BASE_URL]
-        .iter()
-        .any(|known| base_url.eq_ignore_ascii_case(known))
+    [
+        XAI_DEFAULT_BASE_URL,
+        GOOGLE_GEMINI_OPENAI_BASE_URL,
+        OPENROUTER_DEFAULT_BASE_URL,
+        OPENAI_CHATGPT_CODEX_BASE_URL,
+    ]
+    .iter()
+    .any(|known| base_url.eq_ignore_ascii_case(known))
 }
 
 fn model_provider_auth_provider_kind_from_document(
@@ -4999,6 +5004,33 @@ mod tests {
             auth_provider_kind = "openai"
             openai_base_url = "https://api.x.ai/v1"
             openai_model = "stale-provider-model"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_openai_provider_selection_defaults(
+            &mut document,
+            Some(ModelProviderAuthProviderKind::Openai),
+            OpenAiProviderSelectionRuntime::OpenAiCompatible,
+            None,
+        )
+        .expect("OpenAI compatible selection defaults should apply");
+
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_base_url"),
+            Some(OPENAI_DEFAULT_BASE_URL)
+        );
+        assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
+    }
+
+    #[test]
+    fn openai_selection_defaults_reset_chatgpt_codex_endpoint_for_openai_compatible_profile() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "openai"
+            openai_base_url = "https://chatgpt.com/backend-api/codex"
+            openai_model = "stale-chatgpt-model"
             "#,
         )
         .expect("model provider config should parse");
