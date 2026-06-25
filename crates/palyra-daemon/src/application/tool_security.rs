@@ -140,6 +140,44 @@ fn parse_tool_skill_context(
     )))
 }
 
+fn tool_input_requires_proposal_approval(tool_name: &str, input_json: &[u8]) -> bool {
+    if tool_name != "palyra.memory.search" {
+        return false;
+    }
+    memory_search_input_requires_workspace_approval(input_json)
+}
+
+fn memory_search_input_requires_workspace_approval(input_json: &[u8]) -> bool {
+    let Ok(Value::Object(payload)) = serde_json::from_slice::<Value>(input_json) else {
+        return false;
+    };
+    let workspace_prefix_present = trimmed_tool_input_string(&payload, "workspace_prefix")
+        .is_some()
+        || trimmed_tool_input_string(&payload, "prefix").is_some();
+    let scope = if !payload.contains_key("scope") && workspace_prefix_present {
+        "workspace".to_owned()
+    } else {
+        trimmed_tool_input_string(&payload, "scope")
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "all".to_owned())
+    };
+    matches!(scope.as_str(), "all" | "workspace" | "project")
+        || workspace_prefix_present
+        || tool_input_bool(&payload, "include_workspace_historical")
+        || tool_input_bool(&payload, "include_workspace_quarantined")
+}
+
+fn trimmed_tool_input_string<'a>(
+    payload: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<&'a str> {
+    payload.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn tool_input_bool(payload: &serde_json::Map<String, Value>, key: &str) -> bool {
+    payload.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Gates skill-backed plugin runs on installed-skill status and skill policy.
 ///
 /// Returns `Ok(None)` when execution may proceed, `Ok(Some(denial))` when the
@@ -585,16 +623,21 @@ pub(crate) async fn evaluate_tool_proposal_security(
     if skill_gate_decision.is_none() {
         skill_gate_decision = evaluate_backend_capability_gate(tool_name, &backend_selection);
     }
+    let input_approval_required = tool_input_requires_proposal_approval(tool_name, input_json);
+    let input_approval_can_apply =
+        skill_gate_decision.as_ref().is_none_or(|decision| decision.allowed);
     // Ask-each-time posture forces an approval prompt unless a gate already
     // denied the call outright; an approval-requiring backend resolution
-    // forces the prompt independently of posture.
+    // forces the prompt independently of posture. Some tools are sensitive
+    // only for particular arguments, such as workspace-backed memory search.
     let proposal_approval_required = skill_gate_decision
         .as_ref()
         .map(|decision| {
             decision.allowed && effective_posture.effective_state == ToolPostureState::AskEachTime
         })
         .unwrap_or(effective_posture.effective_state == ToolPostureState::AskEachTime)
-        || backend_selection.resolution.approval_required;
+        || backend_selection.resolution.approval_required
+        || (input_approval_can_apply && input_approval_required);
     let approval_subject_id = build_tool_approval_subject_id(tool_name, skill_context.as_ref());
     ToolProposalSecurityEvaluation {
         skill_context,
@@ -615,6 +658,7 @@ fn resolve_tool_proposal_decision(
     policy_request_context: &ToolRequestContext,
     tool_name: &str,
     skill_gate_decision: Option<ToolDecision>,
+    proposal_approval_required: bool,
     effective_posture: &crate::tool_posture::EffectiveToolPosture,
     backend_selection: &ToolProposalBackendSelection,
     approval_outcome: Option<&ToolApprovalOutcome>,
@@ -638,6 +682,13 @@ fn resolve_tool_proposal_decision(
             decision.reason,
             effective_posture.effective_state.as_str(),
             effective_posture.source_scope_label
+        );
+    }
+    if decision.allowed && proposal_approval_required {
+        decision.approval_required = true;
+        decision.reason = format!(
+            "{}; proposal requires explicit approval for tool={tool_name}",
+            decision.reason
         );
     }
     annotate_tool_decision_with_backend_context(
@@ -682,6 +733,7 @@ pub(crate) fn resolve_tool_proposal_decision_for_context(
         &policy_request_context,
         tool_name,
         skill_gate_decision.clone(),
+        proposal_approval_required,
         effective_posture,
         backend_selection,
         approval_state.outcome,
@@ -931,7 +983,8 @@ mod tests {
 
     use super::{
         annotate_tool_decision_with_backend_context, evaluate_backend_capability_gate,
-        evaluate_delegation_scope_gate, ToolProposalBackendSelection,
+        evaluate_delegation_scope_gate, tool_input_requires_proposal_approval,
+        ToolProposalBackendSelection,
     };
 
     fn networked_worker_selection() -> ToolProposalBackendSelection {
@@ -1003,6 +1056,41 @@ mod tests {
             .expect("gateway-context tool should be blocked on networked workers");
         assert!(!decision.allowed);
         assert!(decision.reason.contains("backend.policy.tool_unsupported"));
+    }
+
+    #[test]
+    fn memory_search_workspace_inputs_require_proposal_approval() {
+        for input in [
+            r#"{"query":"project notes"}"#,
+            r#"{"query":"project notes","scope":"all"}"#,
+            r#"{"query":"project notes","scope":"workspace"}"#,
+            r#"{"query":"project notes","scope":"project"}"#,
+            r#"{"query":"project notes","workspace_prefix":"projects/e2e"}"#,
+            r#"{"query":"project notes","scope":"session","include_workspace_quarantined":true}"#,
+        ] {
+            assert!(
+                tool_input_requires_proposal_approval("palyra.memory.search", input.as_bytes()),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_search_lifecycle_inputs_do_not_require_proposal_approval() {
+        for input in [
+            r#"{"query":"rollback checklist","scope":"session"}"#,
+            r#"{"query":"rollback checklist","scope":"principal"}"#,
+            r#"{"query":"rollback checklist","scope":"channel","isolation_probe":true}"#,
+        ] {
+            assert!(
+                !tool_input_requires_proposal_approval("palyra.memory.search", input.as_bytes()),
+                "{input}"
+            );
+        }
+        assert!(!tool_input_requires_proposal_approval(
+            "palyra.echo",
+            br#"{"query":"project notes","scope":"workspace"}"#
+        ));
     }
 
     #[test]
