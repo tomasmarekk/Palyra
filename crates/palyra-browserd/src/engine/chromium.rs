@@ -4033,7 +4033,7 @@ pub(crate) async fn click_with_chromium(
     allow_downloads: bool,
 ) -> ChromiumActionOutcome {
     enum ClickAttempt {
-        Clicked { download_like: bool },
+        Clicked { download_like: bool, opened_window: bool },
         DownloadBlocked,
         Disabled,
         NotFound,
@@ -4072,8 +4072,20 @@ pub(crate) async fn click_with_chromium(
             let status =
                 value.get("status").and_then(serde_json::Value::as_str).unwrap_or_default();
             match status {
-                "clicked" => Ok(ClickAttempt::Clicked { download_like: false }),
-                "download_allowed" => Ok(ClickAttempt::Clicked { download_like: true }),
+                "clicked" => Ok(ClickAttempt::Clicked {
+                    download_like: false,
+                    opened_window: value
+                        .get("opened_window")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                "download_allowed" => Ok(ClickAttempt::Clicked {
+                    download_like: true,
+                    opened_window: value
+                        .get("opened_window")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
                 "download_blocked" => Ok(ClickAttempt::DownloadBlocked),
                 "disabled" => Ok(ClickAttempt::Disabled),
                 "not_found" => Ok(ClickAttempt::NotFound),
@@ -4086,7 +4098,7 @@ pub(crate) async fn click_with_chromium(
         .await;
 
         match attempt {
-            Ok(ClickAttempt::Clicked { download_like }) => {
+            Ok(ClickAttempt::Clicked { download_like, opened_window }) => {
                 let new_tab_count = match chromium_sync_session_tabs(runtime, session_id).await {
                     Ok(value) => value,
                     Err(error) => {
@@ -4103,7 +4115,7 @@ pub(crate) async fn click_with_chromium(
                     success: true,
                     outcome: if download_like {
                         "download_allowed".to_owned()
-                    } else if new_tab_count > 0 {
+                    } else if opened_window || new_tab_count > 0 {
                         "clicked_new_tab".to_owned()
                     } else {
                         "clicked".to_owned()
@@ -4199,8 +4211,26 @@ fn chromium_click_script(selector: &str, allow_downloads: bool) -> Result<String
   if (typeof element.focus === "function") {{
     try {{ element.focus({{ preventScroll: true }}); }} catch (_) {{ element.focus(); }}
   }}
-  element.click();
-  return respond({{ status: downloadLike ? "download_allowed" : "clicked" }});
+  let openedWindow = false;
+  let restoreWindowOpen = null;
+  try {{
+    const originalOpen = window.open;
+    if (typeof originalOpen === "function") {{
+      window.open = function(...args) {{
+        openedWindow = true;
+        return originalOpen.apply(this, args);
+      }};
+      restoreWindowOpen = () => {{ window.open = originalOpen; }};
+    }}
+  }} catch (_) {{}}
+  try {{
+    element.click();
+  }} finally {{
+    if (restoreWindowOpen) {{
+      try {{ restoreWindowOpen(); }} catch (_) {{}}
+    }}
+  }}
+  return respond({{ status: downloadLike ? "download_allowed" : "clicked", opened_window: openedWindow }});
 }})()
 "#
     ))
