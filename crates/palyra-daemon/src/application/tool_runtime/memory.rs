@@ -254,12 +254,10 @@ fn workspace_search_hit_tool_output_payload(hit: &WorkspaceSearchHit) -> Value {
 }
 
 /// Project scope inferred from the active workspace root: candidate
-/// `projects/...` prefixes (identity-hash form first, then plain basename)
-/// plus the raw basename for fuzzy fallback matching.
+/// `projects/...` prefixes (identity-hash form first, then plain basename).
 #[derive(Debug, Clone, Default)]
 struct InferredProjectMemorySearchScope {
     prefixes: Vec<String>,
-    basename: Option<String>,
 }
 
 impl InferredProjectMemorySearchScope {
@@ -268,12 +266,10 @@ impl InferredProjectMemorySearchScope {
     }
 }
 
-/// One fallback search target: a prefix to query and an optional project
-/// basename filter applied to its results.
+/// One fallback search target: an exact workspace-document prefix to query.
 #[derive(Debug, Clone)]
 struct WorkspaceMemorySearchFallback {
     prefix: String,
-    project_basename_filter: Option<String>,
 }
 
 /// Ordered workspace search strategy: the primary prefix first, then
@@ -334,7 +330,6 @@ async fn search_workspace_documents_for_memory(
             runtime_state,
             parameters,
             plan.primary_prefix.as_deref(),
-            None,
             &mut hits,
             &mut seen,
         )
@@ -346,7 +341,6 @@ async fn search_workspace_documents_for_memory(
                 runtime_state,
                 parameters,
                 Some(fallback.prefix.as_str()),
-                fallback.project_basename_filter.as_deref(),
                 &mut hits,
                 &mut seen,
             )
@@ -364,20 +358,12 @@ async fn append_workspace_memory_search_hits(
     runtime_state: &Arc<GatewayRuntimeState>,
     parameters: &WorkspaceMemorySearchParameters,
     prefix: Option<&str>,
-    project_basename_filter: Option<&str>,
     hits: &mut Vec<WorkspaceSearchHit>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), Status> {
-    // When a basename filter will discard hits afterwards, over-fetch so the
-    // post-filter result can still fill top_k.
-    let search_top_k =
-        if project_basename_filter.is_some() { MAX_MEMORY_SEARCH_TOP_K } else { parameters.top_k };
-    let mut found = runtime_state
-        .search_workspace_documents(parameters.request(prefix.map(str::to_owned), search_top_k))
+    let found = runtime_state
+        .search_workspace_documents(parameters.request(prefix.map(str::to_owned), parameters.top_k))
         .await?;
-    if let Some(project_basename) = project_basename_filter {
-        found.retain(|hit| workspace_search_hit_matches_project_basename(hit, project_basename));
-    }
     for hit in found {
         let key = format!("{}:{}:{}", hit.document.document_id, hit.version, hit.chunk_index);
         if seen.insert(key) {
@@ -391,9 +377,8 @@ async fn append_workspace_memory_search_hits(
 }
 
 /// Builds the search plan. Fallbacks exist only for inferred (not explicit)
-/// prefixes: secondary inferred prefixes first, then a `projects/`-wide scan
-/// filtered by project basename -- so launches from renamed or relocated
-/// roots still find their project memory without leaking other projects.
+/// prefixes and are limited to exact candidate prefixes derived from the
+/// active workspace root.
 fn workspace_memory_search_plan(
     primary_prefix: Option<String>,
     search_primary_without_prefix: bool,
@@ -404,58 +389,11 @@ fn workspace_memory_search_plan(
     if !explicit_prefix_present && !inferred_project_scope.prefixes.is_empty() {
         for prefix in inferred_project_scope.prefixes.iter().skip(1) {
             if primary_prefix.as_deref() != Some(prefix.as_str()) {
-                fallbacks.push(WorkspaceMemorySearchFallback {
-                    prefix: prefix.clone(),
-                    project_basename_filter: None,
-                });
+                fallbacks.push(WorkspaceMemorySearchFallback { prefix: prefix.clone() });
             }
-        }
-        if let Some(basename) = inferred_project_scope.basename.as_deref() {
-            fallbacks.push(WorkspaceMemorySearchFallback {
-                prefix: "projects".to_owned(),
-                project_basename_filter: Some(basename.to_owned()),
-            });
         }
     }
     WorkspaceMemorySearchPlan { primary_prefix, search_primary_without_prefix, fallbacks }
-}
-
-fn workspace_search_hit_matches_project_basename(hit: &WorkspaceSearchHit, basename: &str) -> bool {
-    let Some(parent_path) = workspace_search_hit_parent_path(hit) else {
-        return false;
-    };
-    let Some(segment) = parent_path.rsplit('/').next().filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    project_memory_segment_matches_basename(segment, basename)
-}
-
-fn workspace_search_hit_parent_path(hit: &WorkspaceSearchHit) -> Option<&str> {
-    hit.document.parent_path.as_deref().or_else(|| {
-        hit.document
-            .path
-            .rsplit_once('/')
-            .map(|(parent_path, _)| parent_path)
-            .filter(|parent_path| !parent_path.is_empty())
-    })
-}
-
-/// Fuzzy match between a `projects/<segment>` directory and a workspace
-/// basename. Slugs must match exactly or on a `-`-delimited boundary; very
-/// short basenames only match their exact `project-<slug>` form so that e.g.
-/// "a" cannot match every project containing "-a-".
-fn project_memory_segment_matches_basename(segment: &str, basename: &str) -> bool {
-    let basename_slug = project_memory_slug(basename);
-    let segment_slug = project_memory_slug(segment);
-    if segment_slug == basename_slug {
-        return true;
-    }
-    if basename_slug.len() < 3 {
-        return segment_slug == format!("project-{basename_slug}");
-    }
-    segment_slug.starts_with(format!("{basename_slug}-").as_str())
-        || segment_slug.ends_with(format!("-{basename_slug}").as_str())
-        || segment_slug.contains(format!("-{basename_slug}-").as_str())
 }
 
 /// Builds the JSON payload for `palyra.memory.recall`: per-source hit lists,
@@ -3609,10 +3547,7 @@ async fn infer_project_memory_search_scope(
         return InferredProjectMemorySearchScope::default();
     };
     let prefixes = project_memory_prefix_candidates_from_workspace_root(root.as_path()).await;
-    InferredProjectMemorySearchScope {
-        prefixes,
-        basename: last_normal_path_segment(root.as_path()),
-    }
+    InferredProjectMemorySearchScope { prefixes }
 }
 
 /// Resolves the workspace roots for the context's agent, honoring run-launch
@@ -5232,13 +5167,24 @@ mod tests {
     }
 
     #[test]
-    fn project_memory_fallback_matches_launch_basename_without_cross_project_leak() {
-        assert!(project_memory_segment_matches_basename("s033-memory-project", "memory-project"));
-        assert!(project_memory_segment_matches_basename(
-            "project-client-portal-deadbeef00",
-            "client-portal"
-        ));
-        assert!(!project_memory_segment_matches_basename("project-b", "project-a"));
+    fn project_memory_search_plan_uses_only_exact_inferred_prefixes() {
+        let inferred_scope = InferredProjectMemorySearchScope {
+            prefixes: vec!["projects/project-api-deadbeef00".to_owned(), "projects/api".to_owned()],
+        };
+        let plan = workspace_memory_search_plan(
+            Some("projects/project-api-deadbeef00".to_owned()),
+            false,
+            false,
+            &inferred_scope,
+        );
+
+        let fallback_prefixes =
+            plan.fallbacks.iter().map(|fallback| fallback.prefix.as_str()).collect::<Vec<_>>();
+        assert_eq!(fallback_prefixes, vec!["projects/api"]);
+        assert!(
+            !plan.fallbacks.iter().any(|fallback| fallback.prefix == "projects"),
+            "project memory search must not fall back to a broad projects/% scan"
+        );
     }
 
     #[test]
