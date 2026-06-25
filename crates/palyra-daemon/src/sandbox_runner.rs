@@ -3283,7 +3283,7 @@ fn validate_host_argument_path_scope(
             host_roots,
         );
     }
-    if let Some(value) = option_compact_value(arg) {
+    if let Some(value) = option_compact_scoped_value(arg, cwd) {
         return validate_host_argument_path_scope(workspace_root, cwd, command, value, host_roots);
     }
     if !argument_requires_path_validation(arg) {
@@ -3368,7 +3368,7 @@ fn rewrite_arguments_to_scoped_paths(
             index = index.saturating_add(1);
             continue;
         }
-        if let Some(value) = option_compact_value(arg.as_str()) {
+        if let Some(value) = option_compact_scoped_value(arg.as_str(), cwd) {
             if let Some(file_url_path) = parse_file_url_path(value)? {
                 let scoped =
                     resolve_scoped_path(workspace_root, cwd, file_url_path.as_str(), false)?;
@@ -3619,11 +3619,24 @@ fn option_assignment_value(arg: &str) -> Option<&str> {
     Some(value)
 }
 
-// Extracts the value glued onto a short option (e.g. "-Cpath" -> "path"), but only when the
-// value actually looks like a path; otherwise flag clusters like "-la" would be misread.
 fn option_compact_value(arg: &str) -> Option<&str> {
+    let value = raw_option_compact_value(arg)?;
+    compact_option_value_looks_like_path(value).then_some(value)
+}
+
+fn option_compact_scoped_value<'a>(arg: &'a str, cwd: &Path) -> Option<&'a str> {
+    let value = raw_option_compact_value(arg)?;
+    (compact_option_value_looks_like_path(value)
+        || compact_option_value_exists_relative_to(value, cwd))
+    .then_some(value)
+}
+
+// Extracts the value glued onto a short option (e.g. "-Cpath" -> "path"). Classification stays
+// separate because a plain relative value may need filesystem context to distinguish it from a
+// flag cluster.
+fn raw_option_compact_value(arg: &str) -> Option<&str> {
     let trimmed = arg.trim();
-    if !trimmed.starts_with('-') || trimmed.starts_with("--") {
+    if !trimmed.starts_with('-') || trimmed.starts_with("--") || is_builtin_list_flag(trimmed) {
         return None;
     }
 
@@ -3640,8 +3653,7 @@ fn option_compact_value(arg: &str) -> Option<&str> {
         return None;
     }
 
-    let value = &trimmed[value_index..];
-    compact_option_value_looks_like_path(value).then_some(value)
+    Some(&trimmed[value_index..])
 }
 
 fn compact_option_value_looks_like_path(value: &str) -> bool {
@@ -3652,8 +3664,20 @@ fn compact_option_value_looks_like_path(value: &str) -> bool {
     let normalized = trimmed.replace('\\', "/");
     trimmed.starts_with('.')
         || token_looks_like_absolute_path(trimmed)
+        || normalized.contains('/')
         || normalized.starts_with("workspace/")
         || normalized.to_ascii_lowercase().starts_with("file://")
+}
+
+fn compact_option_value_exists_relative_to(value: &str, base: &Path) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('\0') {
+        return true;
+    }
+    Path::new(trimmed).is_relative() && base.join(trimmed).try_exists().unwrap_or(true)
 }
 
 fn argument_requires_path_validation(arg: &str) -> bool {
@@ -8025,6 +8049,29 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_arguments_to_scoped_paths_preserves_builtin_list_flag_cluster() {
+        let workspace = unique_temp_dir("workspace-rewrite-list-flag-cluster");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(workspace.join("a"), b"not an option value")
+            .expect("flag-cluster sentinel file should be created");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-la".to_owned()];
+
+        let rewritten = rewrite_arguments_to_scoped_paths(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "ls",
+            args.as_slice(),
+        )
+        .expect("builtin list flag cluster should not be interpreted as a path value");
+
+        assert_eq!(rewritten, args);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn resolve_scoped_path_collapses_repeated_active_workspace_name() {
         let parent = unique_temp_dir("workspace-virtual-active-parent");
         let workspace = parent.join("S091_shell_profile");
@@ -11531,6 +11578,48 @@ mod tests {
         .expect("compact short option with workspace-relative path should be allowed");
 
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn validate_argument_workspace_scope_rejects_compact_short_option_relative_symlink_escape() {
+        let workspace = unique_temp_dir("workspace-compact-short-option-symlink");
+        let outside = unique_temp_dir("outside-compact-short-option-symlink");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let link_path = workspace.join("backup");
+        if let Err(error) = create_directory_symlink(outside.as_path(), link_path.as_path()) {
+            eprintln!(
+                "skipping compact short option symlink regression because symlink creation failed: {error}"
+            );
+            let _ = fs::remove_dir_all(workspace.as_path());
+            let _ = fs::remove_dir_all(outside.as_path());
+            return;
+        }
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let args = vec!["-Cbackup".to_owned()];
+
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "tar",
+            &args,
+        )
+        .expect_err("compact short option with relative symlink target must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let nested_args = vec!["-Cbackup/new-output".to_owned()];
+        let error = validate_argument_workspace_scope(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "tar",
+            &nested_args,
+        )
+        .expect_err("compact short option under relative symlink parent must be denied");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
     }
 
     #[test]
