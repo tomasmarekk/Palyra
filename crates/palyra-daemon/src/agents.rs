@@ -362,6 +362,23 @@ impl AgentRegistry {
         Ok(Self { registry_path, state_root, state: Mutex::new(document) })
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_for_test_state_root(state_root: &Path) -> Result<Self, AgentRegistryError> {
+        let state_root = ensure_canonical_dir(state_root, "state_root")?;
+        let registry_path = state_root.join(REGISTRY_FILE);
+        if let Some(parent) = registry_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AgentRegistryError::WriteRegistry {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let document =
+            load_and_persist_registry_document(registry_path.as_path(), state_root.as_path())?;
+
+        Ok(Self { registry_path, state_root, state: Mutex::new(document) })
+    }
+
     fn mutate_persisted_document<T>(
         &self,
         guard: &mut MutexGuard<'_, RegistryDocument>,

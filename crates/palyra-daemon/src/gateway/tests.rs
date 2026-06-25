@@ -912,9 +912,9 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
 ) -> std::sync::Arc<GatewayRuntimeState> {
     let db_path = unique_temp_journal_path();
     let state_root = unique_temp_test_root("palyra-gateway-unit-state");
-    let identity_root = state_root.join("identity");
-    let agent_registry = crate::agents::AgentRegistry::open(identity_root.as_path())
-        .expect("agent registry should initialize");
+    let agent_registry =
+        crate::agents::AgentRegistry::open_for_test_state_root(state_root.as_path())
+            .expect("agent registry should initialize");
     let journal_store = JournalStore::open(JournalConfig {
         db_path: db_path.clone(),
         hash_chain_enabled,
