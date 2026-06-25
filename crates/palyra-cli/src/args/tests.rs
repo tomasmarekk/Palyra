@@ -1473,8 +1473,28 @@ fn parse_sessions_retry_branch_search_and_export() {
             command: SessionsCommand::Retry {
                 session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
                 allow_sensitive_tools: false,
-                approval_mode: AgentApprovalModeArg::AllowOnce,
+                approval_mode: AgentApprovalModeArg::Prompt,
                 json: true,
+            }
+        }
+    );
+
+    let retry_allow_once = Cli::parse_from([
+        "palyra",
+        "sessions",
+        "retry",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+        "--approval-mode",
+        "allow-once",
+    ]);
+    assert_eq!(
+        retry_allow_once.command,
+        Command::Sessions {
+            command: SessionsCommand::Retry {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+                allow_sensitive_tools: false,
+                approval_mode: AgentApprovalModeArg::AllowOnce,
+                json: false,
             }
         }
     );

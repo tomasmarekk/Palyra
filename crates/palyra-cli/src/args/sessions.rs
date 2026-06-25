@@ -152,7 +152,7 @@ pub enum SessionsCommand {
         session_id: String,
         #[arg(long, default_value_t = false)]
         allow_sensitive_tools: bool,
-        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::AllowOnce)]
+        #[arg(long, value_enum, default_value_t = AgentApprovalModeArg::Prompt)]
         approval_mode: AgentApprovalModeArg,
         #[arg(long, default_value_t = false)]
         json: bool,

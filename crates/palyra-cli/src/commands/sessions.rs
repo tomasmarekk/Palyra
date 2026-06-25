@@ -1609,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_agent_run_input_restores_payload_context_with_allow_once_default() {
+    fn retry_agent_run_input_restores_payload_context_with_prompt_default() {
         let payload = serde_json::json!({
             "text": "retry the failed workspace task",
             "origin_kind": "retry",
@@ -1626,12 +1626,12 @@ mod tests {
             "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             &payload,
             false,
-            AgentApprovalModeArg::AllowOnce,
+            AgentApprovalModeArg::Prompt,
         )
         .expect("retry run input should build");
 
         assert_eq!(request.prompt, "retry the failed workspace task");
-        assert_eq!(request.approval_mode, AgentApprovalMode::AllowOnce);
+        assert_eq!(request.approval_mode, AgentApprovalMode::Prompt);
         assert!(!request.allow_sensitive_tools);
         assert_eq!(request.origin_kind.as_deref(), Some("retry"));
         assert_eq!(request.origin_run_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAW"));
