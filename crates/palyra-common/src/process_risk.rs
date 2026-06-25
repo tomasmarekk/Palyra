@@ -931,7 +931,8 @@ fn executable_name(command: &str) -> String {
     let trimmed = command.trim().trim_matches('"').trim_matches('\'');
     let file_name =
         trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim_matches('"').trim_matches('\'');
-    strip_known_executable_suffix(file_name).to_ascii_lowercase()
+    let normalized = file_name.to_ascii_lowercase();
+    strip_known_executable_suffix(normalized.as_str()).to_owned()
 }
 
 fn strip_known_executable_suffix(value: &str) -> &str {
@@ -1118,35 +1119,48 @@ mod tests {
         fs::write(workspace.path().join("Dockerfile"), b"FROM debian:bookworm\nWORKDIR /app\n")
             .expect("Dockerfile should be written");
 
-        let report = classify_process_run(
-            &input(
-                "openssl",
-                &[
-                    "req",
-                    "-newkey",
-                    "rsa:2048",
-                    "-nodes",
-                    "-keyout",
-                    "server.key",
-                    "-out",
-                    "server.csr",
-                ],
-            ),
-            ProcessRiskContext {
-                workspace_root: Some(workspace.path()),
-                resolved_cwd: Some(workspace.path()),
-            },
-        );
+        for command in [
+            "openssl",
+            "OpenSSL.exe",
+            "OpenSSL.EXE",
+            r"C:\Tools\OpenSSL.EXE",
+            r#""C:\Tools\OpenSSL.EXE""#,
+        ] {
+            let report = classify_process_run(
+                &input(
+                    command,
+                    &[
+                        "req",
+                        "-newkey",
+                        "rsa:2048",
+                        "-nodes",
+                        "-keyout",
+                        "server.key",
+                        "-out",
+                        "server.csr",
+                    ],
+                ),
+                ProcessRiskContext {
+                    workspace_root: Some(workspace.path()),
+                    resolved_cwd: Some(workspace.path()),
+                },
+            );
 
-        let finding = report
-            .findings
-            .iter()
-            .find(|finding| finding.risk_class == ProcessRiskClass::TargetRuntimeMismatch)
-            .expect("OpenSSL key generation should be flagged for Docker/Linux targets");
-        assert_eq!(finding.severity, ProcessRiskSeverity::High);
-        assert_eq!(
-            finding.target.as_deref(),
-            Some(TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS)
-        );
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.risk_class == ProcessRiskClass::TargetRuntimeMismatch)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "OpenSSL key generation should be flagged for Docker/Linux targets: {command}"
+                    )
+                });
+            assert_eq!(finding.severity, ProcessRiskSeverity::High, "{command}");
+            assert_eq!(
+                finding.target.as_deref(),
+                Some(TARGET_HOST_WINDOWS_VS_DOCKER_POSIX_PERMISSIONS),
+                "{command}"
+            );
+        }
     }
 }
