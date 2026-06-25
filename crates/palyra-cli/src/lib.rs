@@ -5252,7 +5252,17 @@ fn quote_cli_arg(value: &str) -> String {
     if value.chars().all(is_unquoted_cli_arg_char) {
         return value.to_owned();
     }
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    shell_single_quote_cli_arg(value)
+}
+
+#[cfg(windows)]
+fn shell_single_quote_cli_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_single_quote_cli_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn is_unquoted_cli_arg_char(value: char) -> bool {
@@ -6565,6 +6575,61 @@ mod agent_stream_output_tests {
             !rendered.contains("original prompt with sensitive context"),
             "resume command must not echo the original prompt: {rendered}"
         );
+    }
+
+    #[test]
+    fn quote_cli_arg_single_quotes_shell_substitutions() {
+        let quoted = quote_cli_arg("$(touch pwn)'x");
+
+        #[cfg(windows)]
+        assert_eq!(quoted, "'$(touch pwn)''x'");
+        #[cfg(not(windows))]
+        assert_eq!(quoted, "'$(touch pwn)'\\''x'");
+    }
+
+    #[test]
+    fn resume_command_single_quotes_checkpoint_shell_substitutions() {
+        let session = gateway_v1::SessionSummary {
+            session_id: Some(common_v1::CanonicalId {
+                ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            }),
+            session_key: "ops:triage".to_owned(),
+            ..Default::default()
+        };
+        let request = build_agent_run_input(AgentRunInputArgs {
+            session_id: None,
+            session_key: Some("ops:triage".to_owned()),
+            session_label: None,
+            require_existing: true,
+            reset_session: false,
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            prompt: "original prompt with sensitive context".to_owned(),
+            allow_sensitive_tools: true,
+            interrupt_active_run: false,
+            approval_mode: AgentApprovalMode::AllowOnce,
+            origin_kind: None,
+            origin_run_id: None,
+            parameter_delta_json: None,
+        })
+        .expect("agent run input should build");
+        let mut checkpoint = sample_progress_checkpoint();
+        checkpoint.produced_files[0].path = "$(touch /tmp/palyra-pwn).txt".to_owned();
+        checkpoint.recommended_next_action = "verify `whoami` output stays inert".to_owned();
+
+        let message = enrich_agent_needs_continuation_message(
+            "wall_clock; needs_continuation=true".to_owned(),
+            &session,
+            &request,
+            Some(&checkpoint),
+        );
+
+        assert!(
+            message.contains("--prompt 'Resume from run 01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "{message}"
+        );
+        assert!(!message.contains("--prompt \"Resume from run"), "{message}");
+        assert!(message.contains("$(touch /tmp/palyra-pwn).txt"), "{message}");
+        assert!(message.contains("`whoami`"), "{message}");
     }
 
     #[test]
