@@ -2333,6 +2333,12 @@ pub(crate) async fn chromium_sync_session_tabs(
         }
     }
 
+    if let Err(error) = chromium_apply_current_session_permissions(runtime, session_id).await {
+        return Err(format!(
+            "failed to apply Chromium page permissions after syncing tabs: {error}"
+        ));
+    }
+
     for tab_id in &new_tab_ids {
         let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id.as_str()).await;
         let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
@@ -2997,24 +3003,84 @@ fn chromium_cookie_delete_requests(cookies: &[Network::Cookie]) -> Vec<Network::
         .collect()
 }
 
-/// Applies the session permission policy to the active tab's current origin so
-/// page-level `navigator.permissions.query()` observes the same state.
+#[derive(Debug, Clone, Copy)]
+enum ChromiumPermissionOverrideReset {
+    ResetExisting,
+    KeepExisting,
+}
+
+/// Resets stale permission overrides and applies the policy to every open Chromium HTTP(S) origin.
 ///
 /// # Errors
-/// Returns lookup sentinels, invalid active-origin diagnostics, remote-IP guard
-/// incidents, or CDP permission override failures.
-pub(crate) async fn chromium_apply_active_origin_permissions(
+/// Returns lookup sentinels, remote-IP guard incidents, or CDP permission
+/// reset/override failures.
+pub(crate) async fn chromium_apply_session_permissions(
     runtime: &BrowserRuntimeState,
     session_id: &str,
     permissions: SessionPermissionsInternal,
 ) -> Result<(), String> {
+    chromium_apply_open_origin_permissions(
+        runtime,
+        session_id,
+        permissions,
+        ChromiumPermissionOverrideReset::ResetExisting,
+    )
+    .await
+}
+
+async fn chromium_apply_current_session_permissions(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+) -> Result<(), String> {
+    let permissions = {
+        let sessions = runtime.sessions.lock().await;
+        let Some(session) = sessions.get(session_id) else {
+            return Err("session_not_found".to_owned());
+        };
+        session.permissions.clone()
+    };
+    chromium_apply_open_origin_permissions(
+        runtime,
+        session_id,
+        permissions,
+        ChromiumPermissionOverrideReset::KeepExisting,
+    )
+    .await
+}
+
+async fn chromium_apply_open_origin_permissions(
+    runtime: &BrowserRuntimeState,
+    session_id: &str,
+    permissions: SessionPermissionsInternal,
+    reset_existing_overrides: ChromiumPermissionOverrideReset,
+) -> Result<(), String> {
     enforce_chromium_remote_ip_guard(runtime, session_id).await?;
-    let (_tab_id, tab) = chromium_active_tab_for_session(runtime, session_id).await?;
-    run_chromium_blocking("chromium apply active origin permissions", move || {
-        let origin = chromium_permission_origin(tab.get_url().as_str())?;
-        for request in chromium_permission_set_requests(origin.as_str(), permissions) {
-            tab.call_method(request)
-                .map_err(|error| format!("failed to set Chromium page permission: {error}"))?;
+    let (command_tab, tabs) = {
+        let chromium_sessions = runtime.chromium_sessions.lock().await;
+        let Some(chromium_session) = chromium_sessions.get(session_id) else {
+            return Err("chromium_session_not_found".to_owned());
+        };
+        let tabs = chromium_session.tabs.values().cloned().collect::<Vec<_>>();
+        let Some(command_tab) = tabs.first().cloned() else {
+            return Err("chromium_session_has_no_tabs".to_owned());
+        };
+        (command_tab, tabs)
+    };
+    run_chromium_blocking("chromium apply session permissions", move || {
+        if matches!(reset_existing_overrides, ChromiumPermissionOverrideReset::ResetExisting) {
+            // Browser.setPermission is origin-scoped; reset first so closed or
+            // inactive origins cannot retain stale grants after a session change.
+            command_tab
+                .call_method(chromium_permission_reset_request())
+                .map_err(|error| format!("failed to reset Chromium page permissions: {error}"))?;
+        }
+        let tab_urls = tabs.iter().map(|tab| tab.get_url()).collect::<Vec<_>>();
+        for origin in chromium_permission_origins_for_urls(tab_urls.as_slice()) {
+            for request in chromium_permission_set_requests(origin.as_str(), &permissions) {
+                command_tab.call_method(request).map_err(|error| {
+                    format!("failed to set Chromium page permission for {origin}: {error}")
+                })?;
+            }
         }
         Ok(())
     })
@@ -3044,6 +3110,19 @@ fn chromium_permission_origin(raw_url: &str) -> Result<String, String> {
     Ok(origin)
 }
 
+fn chromium_permission_origins_for_urls(raw_urls: &[String]) -> Vec<String> {
+    raw_urls
+        .iter()
+        .filter_map(|raw_url| chromium_permission_origin(raw_url.as_str()).ok())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn chromium_permission_reset_request() -> Browser::ResetPermissions {
+    Browser::ResetPermissions { browser_context_id: None }
+}
+
 #[cfg(test)]
 fn chromium_sync_tab_url_is_trackable(raw_url: &str) -> bool {
     Url::parse(raw_url).map(|url| chromium_sync_tab_url_scheme_is_trackable(&url)).unwrap_or(false)
@@ -3069,7 +3148,7 @@ fn chromium_sync_tab_url_scheme_is_trackable(url: &Url) -> bool {
 
 fn chromium_permission_set_requests(
     origin: &str,
-    permissions: SessionPermissionsInternal,
+    permissions: &SessionPermissionsInternal,
 ) -> Vec<Browser::SetPermission> {
     [
         ("camera", permissions.camera),
@@ -4082,6 +4161,12 @@ pub(crate) async fn navigate_tab_with_chromium(
             outcome.error = format!("failed to retain navigated private-target scope: {error}");
             return outcome;
         }
+    }
+    if let Err(error) = chromium_apply_current_session_permissions(runtime, session_id).await {
+        outcome.success = false;
+        outcome.error =
+            format!("failed to apply Chromium page permissions after navigation: {error}");
+        return outcome;
     }
     let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id).await;
     let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id).await;
@@ -5165,6 +5250,7 @@ fn chromium_viewport_metrics_mismatch(
 mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_network_log_headers, chromium_permission_origin,
+        chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
         chromium_sync_tab_url_is_allowed, chromium_sync_tab_url_is_trackable,
@@ -5670,6 +5756,22 @@ mod tests {
     }
 
     #[test]
+    fn chromium_permission_origins_deduplicate_open_http_origins() {
+        let origins = chromium_permission_origins_for_urls(&[
+            "https://example.test/app".to_owned(),
+            "https://example.test/other".to_owned(),
+            "http://127.0.0.1:5175/".to_owned(),
+            "file:///tmp/local.html".to_owned(),
+            "about:blank".to_owned(),
+        ]);
+
+        assert_eq!(
+            origins,
+            vec!["http://127.0.0.1:5175".to_owned(), "https://example.test".to_owned()]
+        );
+    }
+
+    #[test]
     fn chromium_sync_tab_url_filter_ignores_browser_internal_tabs() {
         assert!(chromium_sync_tab_url_is_trackable("http://127.0.0.1:5175/callback.html"));
         assert!(chromium_sync_tab_url_is_trackable("https://example.test/callback"));
@@ -5713,7 +5815,7 @@ mod tests {
     fn chromium_permission_set_requests_match_session_policy() {
         let requests = chromium_permission_set_requests(
             "http://127.0.0.1:5175",
-            SessionPermissionsInternal {
+            &SessionPermissionsInternal {
                 camera: PermissionSettingInternal::Deny,
                 microphone: PermissionSettingInternal::Deny,
                 location: PermissionSettingInternal::Allow,
@@ -5729,6 +5831,17 @@ mod tests {
         assert_eq!(encoded[2]["permission"]["name"], "geolocation");
         assert_eq!(encoded[2]["setting"], "granted");
         assert_eq!(encoded[2]["origin"], "http://127.0.0.1:5175");
+    }
+
+    #[test]
+    fn chromium_permission_reset_request_targets_default_browser_context() {
+        let encoded =
+            serde_json::to_value(chromium_permission_reset_request()).expect("request encodes");
+
+        assert!(
+            encoded.get("browserContextId").is_none(),
+            "session permission reset should clear the default Chromium browser context"
+        );
     }
 
     #[test]

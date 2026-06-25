@@ -3853,6 +3853,161 @@ async function checkGeo(){
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_reset_permissions_revokes_prior_origin_grants() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let permission_fixture = r#"<html><head><title>Permission Fixture</title><script>
+async function checkGeo(){
+  const status = await navigator.permissions.query({ name: 'geolocation' });
+  document.getElementById('status').textContent = 'Permission: ' + status.state;
+}
+</script></head><body onload="checkGeo()"><button id="check" onclick="checkGeo()">Check</button><div id="status">loading</div></body></html>"#;
+    let (first_origin_url, first_origin_handle) =
+        spawn_static_http_server_with_request_budget(200, permission_fixture, 32);
+    let (second_origin_url, second_origin_handle) =
+        spawn_static_http_server_with_request_budget(200, permission_fixture, 32);
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 128 * 1024,
+            max_response_bytes: 128 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: true,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium permissions mode");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let first_navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url: first_origin_url.clone(),
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("first-origin navigate should execute")
+        .into_inner();
+    assert!(
+        first_navigate.success,
+        "first-origin navigate should succeed: {}",
+        first_navigate.error
+    );
+
+    let allowed = service
+        .set_permissions(Request::new(browser_v1::SetPermissionsRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            camera: 0,
+            microphone: 0,
+            location: 2,
+            reset_to_default: false,
+        }))
+        .await
+        .expect("allow permission update should execute")
+        .into_inner();
+    assert!(allowed.success, "allow should apply to Chromium: {}", allowed.error);
+    click_permission_check_and_wait_for_text(&service, session_id.clone(), "Permission: granted")
+        .await;
+
+    let second_navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url: second_origin_url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("second-origin navigate should execute")
+        .into_inner();
+    assert!(
+        second_navigate.success,
+        "second-origin navigate should succeed: {}",
+        second_navigate.error
+    );
+
+    let reset = service
+        .reset_state(Request::new(browser_v1::ResetStateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            clear_cookies: false,
+            clear_storage: false,
+            reset_tabs: false,
+            reset_permissions: true,
+        }))
+        .await
+        .expect("permission reset_state should execute")
+        .into_inner();
+    assert!(reset.success, "reset should revoke Chromium permissions: {}", reset.error);
+    let permissions = reset.permissions.expect("reset permissions should be returned");
+    assert_eq!(permissions.location, 1, "reset should report denied location");
+    click_permission_check_and_wait_for_text(&service, session_id.clone(), "Permission: denied")
+        .await;
+
+    let return_to_first = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url: first_origin_url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("return to first origin should execute")
+        .into_inner();
+    assert!(
+        return_to_first.success,
+        "return to first origin should succeed: {}",
+        return_to_first.error
+    );
+    click_permission_check_and_wait_for_text(&service, session_id, "Permission: denied").await;
+
+    drop(first_origin_handle);
+    drop(second_origin_handle);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_chromium_click_registers_window_open_tab() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;

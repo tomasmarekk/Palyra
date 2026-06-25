@@ -3461,9 +3461,6 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     .insert(active_tab_id.clone(), BrowserTabRecord::new(active_tab_id.clone()));
                 session.tab_order = vec![active_tab_id];
             }
-            if payload.reset_permissions {
-                session.permissions = SessionPermissionsInternal::default();
-            }
             session.clear_network_logs();
             if session.persistence.enabled {
                 session_for_persist = Some(session.clone());
@@ -3507,6 +3504,45 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
                     append_reset_state_error(
                         &mut response.error,
                         format!("failed to clear active Chromium cookies: {error}"),
+                    );
+                }
+            }
+        }
+        if payload.reset_permissions {
+            let permissions = SessionPermissionsInternal::default();
+            let apply_result = if matches!(self.runtime.engine_mode, BrowserEngineMode::Chromium) {
+                chromium_apply_session_permissions(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    permissions.clone(),
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            match apply_result {
+                Ok(()) => {
+                    let mut sessions = self.runtime.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(session_id.as_str()) {
+                        session.last_active = Instant::now();
+                        session.permissions = permissions;
+                        response.permissions = Some(session.permissions.to_proto());
+                        if session.persistence.enabled {
+                            session_for_persist = Some(session.clone());
+                        }
+                    } else {
+                        response.success = false;
+                        append_reset_state_error(
+                            &mut response.error,
+                            "session_not_found while resetting permissions",
+                        );
+                    }
+                }
+                Err(error) => {
+                    response.success = false;
+                    append_reset_state_error(
+                        &mut response.error,
+                        format!("failed to reset Chromium page permissions: {error}"),
                     );
                 }
             }
@@ -3935,7 +3971,7 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             error: String::new(),
         };
         if self.runtime.engine_mode == BrowserEngineMode::Chromium {
-            if let Err(error) = chromium_apply_active_origin_permissions(
+            if let Err(error) = chromium_apply_session_permissions(
                 self.runtime.as_ref(),
                 session_id.as_str(),
                 updated_permissions.clone(),
