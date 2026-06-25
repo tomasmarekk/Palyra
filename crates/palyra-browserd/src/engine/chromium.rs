@@ -1208,13 +1208,11 @@ pub(crate) enum ChromiumPrivateTargetScope {
 /// Tracks which private/local targets a session may reach.
 ///
 /// Deny-by-default: unless the whole session allows private targets, a private
-/// destination is reachable only while a scoped allowance is alive or after it
-/// has been retained for the rest of the session.
+/// destination is reachable only while a scoped allowance is alive.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
     scoped_targets: std::sync::Mutex<HashMap<ChromiumPrivateTargetScope, usize>>,
-    retained_targets: std::sync::Mutex<HashSet<ChromiumPrivateTargetScope>>,
 }
 
 /// RAII allowance for one private target; the allowance is released on drop.
@@ -1230,7 +1228,6 @@ impl ChromiumPrivateTargetPolicy {
         Self {
             allow_session_private_targets,
             scoped_targets: std::sync::Mutex::new(HashMap::new()),
-            retained_targets: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -1285,35 +1282,7 @@ impl ChromiumPrivateTargetPolicy {
         Ok(Some(ChromiumScopedPrivateTarget { policy: Arc::clone(self), scope }))
     }
 
-    /// Permanently retains an allowance for the URL's target for the rest of
-    /// the session, e.g. after a navigation has already been approved.
-    ///
-    /// # Errors
-    /// Returns an error string when the URL cannot be normalized into a scope
-    /// or the policy lock is poisoned.
-    pub(crate) fn retain_url_allowance(&self, raw_url: &str) -> Result<(), String> {
-        if self.allow_session_private_targets {
-            return Ok(());
-        }
-        let Some(scope) = ChromiumPrivateTargetScope::from_url(raw_url)? else {
-            return Ok(());
-        };
-        self.retained_targets
-            .lock()
-            .map_err(|_| "private-target policy lock was poisoned".to_owned())?
-            .insert(scope);
-        Ok(())
-    }
-
     fn allows_scope(&self, scope: &ChromiumPrivateTargetScope) -> bool {
-        if self
-            .retained_targets
-            .lock()
-            .map(|retained_targets| retained_targets.contains(scope))
-            .unwrap_or(false)
-        {
-            return true;
-        }
         self.scoped_targets
             .lock()
             .map(|scoped_targets| scoped_targets.contains_key(scope))
@@ -4002,13 +3971,6 @@ pub(crate) async fn navigate_tab_with_chromium(
     outcome.title = snapshot.title;
     outcome.page_body = page_body;
     outcome.body_bytes = body_bytes;
-    if params.allow_private_targets {
-        if let Err(error) = private_target_policy.retain_url_allowance(outcome.final_url.as_str()) {
-            outcome.success = false;
-            outcome.error = format!("failed to retain navigated private-target scope: {error}");
-            return outcome;
-        }
-    }
     if let Err(error) = chromium_apply_current_session_permissions(runtime, session_id).await {
         outcome.success = false;
         outcome.error =
@@ -5691,31 +5653,40 @@ mod tests {
 
     #[test]
     fn chromium_sync_tab_url_validation_requires_private_file_allowance() {
-        let policy = ChromiumPrivateTargetPolicy::new(false);
+        let policy = std::sync::Arc::new(ChromiumPrivateTargetPolicy::new(false));
         let fixture = tempfile::NamedTempFile::new().expect("file fixture should be created");
         let file_url =
             reqwest::Url::from_file_path(fixture.path()).expect("file URL should be built");
 
-        let error = chromium_sync_tab_url_is_allowed(file_url.as_str(), &policy)
+        let error = chromium_sync_tab_url_is_allowed(file_url.as_str(), policy.as_ref())
             .expect_err("unapproved file popup candidate must fail validation");
         assert!(
             error.contains("local file navigation requires allow_private_targets=true"),
             "file popup validation should fail through the normal local-file gate: {error}"
         );
 
-        policy
-            .retain_url_allowance(file_url.as_str())
-            .expect("retained file allowance should parse");
+        let scoped = policy
+            .scoped_url_allowance(file_url.as_str())
+            .expect("scoped file allowance should parse")
+            .expect("file URL should create scoped allowance");
 
         assert!(
-            chromium_sync_tab_url_is_allowed(file_url.as_str(), &policy)
-                .expect("retained file popup target should validate"),
-            "retained file popup target should be accepted for sync"
+            chromium_sync_tab_url_is_allowed(file_url.as_str(), policy.as_ref())
+                .expect("scoped file popup target should validate"),
+            "scoped file popup target should be accepted for sync while the guard is alive"
         );
         assert!(
-            !chromium_sync_tab_url_is_allowed("about:blank", &policy)
+            !chromium_sync_tab_url_is_allowed("about:blank", policy.as_ref())
                 .expect("browser-internal tabs should be ignored"),
             "browser-internal tabs are not popup sync candidates"
+        );
+        drop(scoped);
+
+        let error = chromium_sync_tab_url_is_allowed(file_url.as_str(), policy.as_ref())
+            .expect_err("dropped file popup allowance must fail validation again");
+        assert!(
+            error.contains("local file navigation requires allow_private_targets=true"),
+            "file popup validation should fail after the scoped guard drops: {error}"
         );
     }
 
