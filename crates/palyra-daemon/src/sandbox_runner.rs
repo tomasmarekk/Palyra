@@ -12244,6 +12244,18 @@ mod tests {
     }
 
     #[test]
+    fn process_stderr_preview_redacts_private_key_blocks() {
+        let preview = redacted_process_output_preview(
+            b"-----BEGIN PRIVATE KEY-----\nMIICUNIQUEPROCESSFAILURESECRET\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("preview should be present");
+
+        assert!(preview.contains("[REDACTED_SECRET]"), "{preview}");
+        assert!(!preview.contains("MIICUNIQUEPROCESSFAILURESECRET"), "{preview}");
+        assert!(!preview.contains("PRIVATE KEY"), "{preview}");
+    }
+
+    #[test]
     fn process_success_output_summarizes_large_stdout() {
         let stdout = StreamCapture {
             bytes: b"package manager progress line\n".repeat(10_000),
