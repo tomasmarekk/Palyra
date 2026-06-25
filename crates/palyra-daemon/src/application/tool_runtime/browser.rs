@@ -553,13 +553,7 @@ async fn read_browser_upload_file(
     )
     .await?;
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
-    let user_owned_roots = browser_user_owned_os_roots();
-    let canonical = resolve_browser_upload_path(
-        file_path,
-        workspace_roots.as_slice(),
-        &path_env,
-        user_owned_roots.as_slice(),
-    )?;
+    let canonical = resolve_browser_upload_path(file_path, workspace_roots.as_slice(), &path_env)?;
     let metadata = fs::metadata(canonical.as_path()).map_err(|error| {
         format!(
             "{BROWSER_UPLOAD_TOOL_NAME} failed to inspect upload file {}: {error}",
@@ -598,8 +592,8 @@ async fn read_browser_upload_file(
 /// roots.
 ///
 /// Resolution order: launch-env-prefixed paths expand first, absolute paths
-/// must fall inside workspace roots, approved user-owned OS roots, or launch
-/// env roots, and relative paths are confined to the first workspace root.
+/// must fall inside workspace roots or explicit launch env roots, and
+/// relative paths are confined to the first workspace root.
 /// Uploads intentionally do not fall back to daemon process env because those
 /// variables commonly point at credential files.
 /// Protected OS locations are denied regardless of root membership.
@@ -607,7 +601,6 @@ fn resolve_browser_upload_path(
     file_path: &str,
     workspace_roots: &[PathBuf],
     path_env: &BTreeMap<String, PathBuf>,
-    user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let requested = expand_browser_env_prefixed_path(
         BROWSER_UPLOAD_TOOL_NAME,
@@ -635,11 +628,10 @@ fn resolve_browser_upload_path(
             canonical.display()
         ));
     }
-    let allowed_roots =
-        browser_absolute_path_allowed_roots(workspace_roots, user_owned_roots, path_env);
+    let allowed_roots = browser_absolute_path_allowed_roots(workspace_roots, &[], path_env);
     if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), &allowed_roots) {
         return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved user-owned OS roots",
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved launch environment roots",
             canonical.display()
         ));
     }
@@ -5792,7 +5784,6 @@ mod tests {
             "$PALYRA_E2E_OS_ROOT/downloads/upload-input.csv",
             &[],
             &path_env,
-            &[],
         )
         .expect("env-prefixed upload file should resolve inside launch OS root");
 
@@ -5815,15 +5806,10 @@ mod tests {
             .expect("credential file should exist");
         let _credential_locator =
             ScopedEnvVar::set("AWS_SHARED_CREDENTIALS_FILE", credentials_file.as_path());
-        let canonical_home = home.canonicalize().expect("home should canonicalize");
 
-        let error = resolve_browser_upload_path(
-            "$AWS_SHARED_CREDENTIALS_FILE",
-            &[],
-            &BTreeMap::new(),
-            &[canonical_home],
-        )
-        .expect_err("browser upload must not expand daemon process env locators");
+        let error =
+            resolve_browser_upload_path("$AWS_SHARED_CREDENTIALS_FILE", &[], &BTreeMap::new())
+                .expect_err("browser upload must not expand daemon process env locators");
 
         assert!(
             error.contains(
@@ -5849,7 +5835,6 @@ mod tests {
             canonical_upload.to_string_lossy().as_ref(),
             &[],
             &path_env,
-            &[],
         )
         .expect("absolute upload file should resolve inside launch OS root");
 
@@ -5872,11 +5857,35 @@ mod tests {
             upload.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_agent),
             &BTreeMap::new(),
-            &[],
         )
         .expect_err("launch cwd must not implicitly authorize browser upload reads");
 
         assert!(error.contains("outside agent workspace roots"), "{error}");
+    }
+
+    #[test]
+    fn browser_upload_path_rejects_absolute_user_owned_path_without_launch_env_root() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home");
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        std::fs::create_dir_all(ssh_dir.as_path()).expect("ssh dir should exist");
+        let key_file = ssh_dir.join("id_rsa");
+        std::fs::write(key_file.as_path(), "test-private-key").expect("key fixture should exist");
+        let canonical_workspace = workspace.canonicalize().expect("workspace should canonicalize");
+
+        let error = resolve_browser_upload_path(
+            key_file.to_string_lossy().as_ref(),
+            std::slice::from_ref(&canonical_workspace),
+            &BTreeMap::new(),
+        )
+        .expect_err("ambient user-owned roots must not authorize browser upload reads");
+
+        assert!(
+            error.contains("outside agent workspace roots and approved launch environment roots"),
+            "{error}"
+        );
     }
 
     #[test]

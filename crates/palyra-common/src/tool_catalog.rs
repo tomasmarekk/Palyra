@@ -46,6 +46,8 @@ const OS_FILE_CAPABILITIES: &[ToolCapability] =
 const NETWORK_TOOL_CAPABILITIES: &[ToolCapability] = &[ToolCapability::Network];
 const BROWSER_ARTIFACT_WRITE_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::FilesystemWrite];
+const BROWSER_UPLOAD_CAPABILITIES: &[ToolCapability] =
+    &[ToolCapability::Network, ToolCapability::FilesystemRead, ToolCapability::SecretsRead];
 const HTTP_FETCH_TOOL_CAPABILITIES: &[ToolCapability] =
     &[ToolCapability::Network, ToolCapability::SecretsRead];
 const ARTIFACT_READ_CAPABILITIES: &[ToolCapability] = &[ToolCapability::ArtifactsRead];
@@ -155,9 +157,13 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.browser.click" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
-        "palyra.browser.type" | "palyra.browser.fill" | "palyra.browser.upload" => {
+        "palyra.browser.type" | "palyra.browser.fill" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "palyra.browser.upload" => Some(ToolMetadata {
+            capabilities: BROWSER_UPLOAD_CAPABILITIES,
+            default_sensitive: true,
+        }),
         "palyra.browser.press" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
@@ -323,6 +329,15 @@ mod tests {
     fn browser_reload_matches_browser_network_sensitivity() {
         assert!(tool_requires_approval("palyra.browser.reload"));
         assert_eq!(tool_policy_capability_names("palyra.browser.reload"), vec!["network"]);
+    }
+
+    #[test]
+    fn browser_upload_exposes_network_filesystem_and_secret_read_capabilities() {
+        assert!(tool_requires_approval("palyra.browser.upload"));
+        assert_eq!(
+            tool_policy_capability_names("palyra.browser.upload"),
+            vec!["filesystem_read", "network", "secrets_read"]
+        );
     }
 
     #[test]

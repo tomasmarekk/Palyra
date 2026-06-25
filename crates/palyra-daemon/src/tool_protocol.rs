@@ -2038,10 +2038,15 @@ mod tests {
 
     #[test]
     fn browser_file_transfer_tools_expose_browser_policy_metadata() {
-        for tool_name in ["palyra.browser.upload", "palyra.browser.downloads.list"] {
-            let metadata = tool_metadata(tool_name).expect("browser file transfer metadata");
-            assert_eq!(metadata.capabilities, &[ToolCapability::Network]);
-        }
+        let metadata = tool_metadata("palyra.browser.upload").expect("browser upload metadata");
+        assert_eq!(
+            metadata.capabilities,
+            &[ToolCapability::Network, ToolCapability::FilesystemRead, ToolCapability::SecretsRead,]
+        );
+        let metadata =
+            tool_metadata("palyra.browser.downloads.list").expect("browser downloads metadata");
+        assert_eq!(metadata.capabilities, &[ToolCapability::Network]);
+
         for tool_name in
             ["palyra.browser.screenshot", "palyra.browser.pdf", "palyra.browser.downloads.get"]
         {

@@ -1083,7 +1083,9 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
         "palyra.browser.click" => "Click an element in a brokered browser session.",
         "palyra.browser.type" => "Type text in a brokered browser session.",
         "palyra.browser.fill" => "Replace an element value in a brokered browser session.",
-        "palyra.browser.upload" => "Set a file input from an audited local file path.",
+        "palyra.browser.upload" => {
+            "Set a file input from an audited workspace or launch-context file path."
+        }
         "palyra.browser.press" => "Press a key in a brokered browser session.",
         "palyra.browser.select" => "Select an option in a brokered browser session.",
         "palyra.browser.viewport" => "Set the active browser viewport dimensions.",
@@ -1222,7 +1224,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "file_path",
-                json!({"type":"string","description":"Absolute user-owned OS path or workspace path to upload. The daemon resolves and audits the path; protected system paths are denied."}),
+                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, or explicit launch environment path prefix to upload. The daemon resolves and audits the path; protected system paths are denied."}),
             ));
             properties
                 .push(("capture_failure_screenshot", json!({"type":"boolean","default":true})));
@@ -1716,8 +1718,8 @@ mod tests {
             .pointer("/properties/file_path/description")
             .and_then(serde_json::Value::as_str)
             .expect("upload file_path description should be visible to models");
-        assert!(file_path_description.contains("Absolute user-owned OS path"));
-        assert!(file_path_description.contains("workspace path"));
+        assert!(file_path_description.contains("Workspace-relative path"));
+        assert!(file_path_description.contains("launch environment path prefix"));
 
         let downloads_list =
             registry_entry("palyra.browser.downloads.list").expect("downloads list entry exists");
