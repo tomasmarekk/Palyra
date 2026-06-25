@@ -3177,7 +3177,7 @@ async fn browser_service_observe_returns_stable_sanitized_snapshot() {
 }
 
 #[test]
-fn dom_snapshot_exposes_safe_form_values_and_state_flags() {
+fn dom_snapshot_redacts_form_values_and_preserves_state_flags() {
     let html = r#"
 <html><body>
   <input id="project" name="project" type="text" value="Palyra Portal">
@@ -3191,8 +3191,12 @@ fn dom_snapshot_exposes_safe_form_values_and_state_flags() {
 
     assert!(!truncated);
     assert!(
-        snapshot.contains("id=\"owner\"") && snapshot.contains("value=\"owner@example.test\""),
-        "safe current input values should be visible in observe snapshots: {snapshot}"
+        snapshot.contains("id=\"owner\"") && snapshot.contains("value=\"<redacted>\""),
+        "form values should be redacted in observe snapshots: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains("owner@example.test") && !snapshot.contains("Palyra Portal"),
+        "form values must not leak in observe snapshots: {snapshot}"
     );
     assert!(
         snapshot.contains("checked=\"true\"") && snapshot.contains("selected=\"true\""),
@@ -3214,14 +3218,17 @@ fn dom_snapshot_redacts_sensitive_form_values() {
 
     assert!(!truncated);
     assert!(
-        snapshot.contains("id=\"query\"") && snapshot.contains("value=\"safe text\""),
-        "non-sensitive form values should remain useful: {snapshot}"
+        snapshot.contains("id=\"query\"") && snapshot.contains("value=\"<redacted>\""),
+        "form values should be redacted even when the field name is not sensitive: {snapshot}"
     );
     assert!(
         snapshot.contains("id=\"password\"") && snapshot.contains("value=\"<redacted>\""),
         "password values should be redacted: {snapshot}"
     );
-    assert!(!snapshot.contains("supersecret"), "sensitive form values must not leak: {snapshot}");
+    assert!(
+        !snapshot.contains("supersecret") && !snapshot.contains("safe text"),
+        "form values must not leak: {snapshot}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

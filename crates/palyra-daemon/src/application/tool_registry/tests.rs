@@ -409,15 +409,15 @@ fn browser_observe_schema_exposes_visible_text_default() {
     assert_eq!(entry.input_schema["properties"]["include_visible_text"]["type"], "boolean");
     assert_eq!(entry.input_schema["properties"]["include_visible_text"]["default"], true);
     assert!(
-        entry.description.contains("form/storage"),
-        "observe tool description should advertise form/storage evidence"
+        entry.description.contains("redacted form/storage metadata"),
+        "observe tool description should advertise redacted form/storage evidence"
     );
     assert!(
         entry.input_schema["properties"]["include_visible_text"]["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("local/session storage"),
-        "visible text schema should mention storage summaries"
+            .contains("local/session storage key names"),
+        "visible text schema should mention redacted storage key summaries"
     );
     assert_eq!(entry.input_schema["properties"]["max_visible_text_bytes"]["minimum"], 0);
 }

@@ -536,7 +536,7 @@ fn build_dom_line(index: usize, tag: &str) -> String {
     }
 }
 
-fn sanitize_snapshot_attribute(tag: &str, attr_name: &str, raw_value: &str) -> String {
+fn sanitize_snapshot_attribute(_tag: &str, attr_name: &str, raw_value: &str) -> String {
     if raw_value.trim().is_empty() {
         return String::new();
     }
@@ -547,29 +547,13 @@ fn sanitize_snapshot_attribute(tag: &str, attr_name: &str, raw_value: &str) -> S
     if lower == "href" || lower == "src" || lower == "action" {
         return normalize_url_with_redaction(raw_value);
     }
-    if lower == "value" && snapshot_form_value_is_sensitive(tag) {
+    if lower == "value" {
         return "<redacted>".to_owned();
     }
     if contains_sensitive_material(raw_value) {
         return "<redacted>".to_owned();
     }
     truncate_utf8_bytes(raw_value, 128)
-}
-
-fn snapshot_form_value_is_sensitive(tag: &str) -> bool {
-    let tag_lower = tag.to_ascii_lowercase();
-    if html_tag_name(tag_lower.as_str()) == Some("input") {
-        let input_type = extract_attr_value(tag_lower.as_str(), "type")
-            .unwrap_or_else(|| "text".to_owned())
-            .to_ascii_lowercase();
-        if matches!(input_type.as_str(), "password" | "hidden" | "file") {
-            return true;
-        }
-    }
-    ["name", "id", "autocomplete", "placeholder", "aria-label", "title"]
-        .iter()
-        .filter_map(|attr_name| extract_attr_value_case_insensitive(tag, attr_name))
-        .any(|value| is_sensitive_debug_key(value.as_str()))
 }
 
 /// Renders a flat accessibility outline (role, name, tag, selector per line) of the page.

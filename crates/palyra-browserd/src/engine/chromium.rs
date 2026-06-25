@@ -707,7 +707,6 @@ const MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES: usize =
     (MAX_STORAGE_ENTRY_VALUE_BYTES * MAX_STORAGE_ENTRIES_PER_ORIGIN * 2) + 4096;
 const MAX_CHROMIUM_ELEMENT_CAPTURE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CHROMIUM_OBSERVE_FORM_CONTROLS: usize = 128;
-const MAX_CHROMIUM_OBSERVE_FORM_VALUE_CHARS: usize = 1024;
 const MAX_CHROMIUM_OBSERVE_STATE_TEXT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
@@ -772,19 +771,16 @@ struct ChromiumObservedStorage {
     error: String,
 }
 
-/// Builds the observe-state script: clones the DOM with live form values
-/// (sensitive controls redacted) and collects bounded form-control,
-/// hidden-state, and storage summaries alongside the serialized HTML.
+/// Builds the observe-state script: clones the DOM with form/storage values
+/// withheld and collects bounded state metadata alongside the serialized HTML.
 fn chromium_observe_state_script() -> String {
     format!(
         r#"
 (() => {{
   const MAX_FORM_CONTROLS = {max_form_controls};
   const MAX_STATE_ELEMENTS = {max_state_elements};
-  const MAX_FORM_VALUE_CHARS = {max_form_value_chars};
   const MAX_STORAGE_ENTRIES = {max_storage_entries};
   const MAX_STORAGE_KEY_CHARS = 512;
-  const MAX_STORAGE_VALUE_CHARS = {max_storage_value_chars};
   const MAX_STORAGE_JSON_CHARS = {max_storage_json_chars};
   const clampScalar = (value, maxChars) => {{
     if (value === null || value === undefined) {{
@@ -815,22 +811,6 @@ fn chromium_observe_state_script() -> String {
     }}
     return tag || "element";
   }};
-  const sensitiveHint = (value) => {{
-    const text = clampScalar(value, 256).toLowerCase();
-    return ["auth", "cookie", "csrf", "jwt", "password", "passwd", "secret", "session", "token"].some((needle) => text.includes(needle));
-  }};
-  const sensitiveControl = (element, type) => {{
-    if (type === "password" || type === "hidden" || type === "file") {{
-      return true;
-    }}
-    return ["name", "id", "autocomplete", "placeholder", "aria-label", "title"].some((attr) => {{
-      try {{
-        return sensitiveHint(element && element.getAttribute && element.getAttribute(attr));
-      }} catch (_) {{
-        return false;
-      }}
-    }});
-  }};
   const cloneRoot = document.documentElement ? document.documentElement.cloneNode(true) : null;
   const liveControls = Array.prototype.slice.call(
     document.querySelectorAll("input, textarea, select"),
@@ -847,8 +827,8 @@ fn chromium_observe_state_script() -> String {
     const type = tag === "input"
       ? clampScalar((element.getAttribute("type") || "text").toLowerCase(), 64)
       : tag;
-    const value = clampScalar(element.value, MAX_FORM_VALUE_CHARS);
-    const clonedValue = sensitiveControl(element, type) ? "<redacted>" : value;
+    const valuePresent = Boolean(element.value);
+    const clonedValue = valuePresent ? "<redacted>" : "";
     if (cloned) {{
       try {{
         cloned.setAttribute("value", clonedValue);
@@ -880,8 +860,7 @@ fn chromium_observe_state_script() -> String {
       }} catch (_) {{}}
     }}
     const selectedOptions = tag === "select"
-      ? Array.prototype.slice.call(element.selectedOptions || [], 0, 16)
-          .map((option) => clampScalar(option.value || option.textContent, MAX_FORM_VALUE_CHARS))
+      ? Array.prototype.slice.call(element.selectedOptions || [], 0, 16).map(() => "<redacted>")
       : [];
     formControls.push({{
       tag,
@@ -889,7 +868,7 @@ fn chromium_observe_state_script() -> String {
       id: clampScalar(element.id, 128),
       name: clampScalar(element.getAttribute("name"), 128),
       selector: selectorFor(element, tag),
-      value,
+      value: clonedValue,
       checked: tag === "input" && (type === "checkbox" || type === "radio") ? Boolean(element.checked) : null,
       selected_options: selectedOptions
     }});
@@ -958,15 +937,14 @@ fn chromium_observe_state_script() -> String {
         if (!key || Object.prototype.hasOwnProperty.call(entries, key)) {{
           continue;
         }}
-        const value = clampScalar(storage.getItem(rawKey), MAX_STORAGE_VALUE_CHARS);
-        const entryChars = JSON.stringify(key).length + JSON.stringify(value).length + 4;
+        const entryChars = JSON.stringify(key).length + 4;
         if (count > 0 && totalChars + entryChars > MAX_STORAGE_JSON_CHARS) {{
           break;
         }}
         if (totalChars + entryChars > MAX_STORAGE_JSON_CHARS) {{
           continue;
         }}
-        entries[key] = value;
+        entries[key] = "";
         totalChars += entryChars;
         count += 1;
         if (count >= MAX_STORAGE_ENTRIES) {{
@@ -995,9 +973,7 @@ fn chromium_observe_state_script() -> String {
 "#,
         max_form_controls = MAX_CHROMIUM_OBSERVE_FORM_CONTROLS,
         max_state_elements = MAX_CHROMIUM_OBSERVE_FORM_CONTROLS,
-        max_form_value_chars = MAX_CHROMIUM_OBSERVE_FORM_VALUE_CHARS,
         max_storage_entries = MAX_STORAGE_ENTRIES_PER_ORIGIN,
-        max_storage_value_chars = MAX_STORAGE_ENTRY_VALUE_BYTES,
         max_storage_json_chars = MAX_CHROMIUM_LOCAL_STORAGE_JSON_BYTES
     )
 }
@@ -1045,19 +1021,13 @@ fn chromium_observed_form_control_line(control: &ChromiumObservedFormControl) ->
         parts.push(format!("checked={checked}"));
     }
     if !control.selected_options.is_empty() {
-        let selected = control
-            .selected_options
-            .iter()
-            .take(16)
-            .map(|value| line_quote(sanitize_chromium_observed_form_value(control, value).as_str()))
-            .collect::<Vec<_>>()
-            .join(",");
-        parts.push(format!("selected_options=[{selected}]"));
+        parts.push(format!(
+            "selected_options_count={}",
+            control.selected_options.iter().take(16).count()
+        ));
     }
-    parts.push(format!(
-        "value={}",
-        line_quote(sanitize_chromium_observed_form_value(control, control.value.as_str()).as_str())
-    ));
+    let value_display = if control.value.trim().is_empty() { "" } else { "<redacted>" };
+    parts.push(format!("value={}", line_quote(value_display)));
     parts.join(" ")
 }
 
@@ -1070,28 +1040,6 @@ fn chromium_observed_state_element_line(element: &ChromiumObservedStateElement) 
     parts.push(format!("visible={}", element.visible));
     append_observe_part(&mut parts, "reason", element.reason.as_str(), 64);
     parts.join(" ")
-}
-
-fn sanitize_chromium_observed_form_value(
-    control: &ChromiumObservedFormControl,
-    raw_value: &str,
-) -> String {
-    let control_type = control.control_type.to_ascii_lowercase();
-    if matches!(control_type.as_str(), "password" | "hidden" | "file") {
-        return "<redacted>".to_owned();
-    }
-    let key = [
-        control.name.as_str(),
-        control.id.as_str(),
-        control.selector.as_str(),
-        control.tag.as_str(),
-        control.control_type.as_str(),
-    ]
-    .into_iter()
-    .filter(|value| !value.trim().is_empty())
-    .collect::<Vec<_>>()
-    .join(" ");
-    sanitize_debug_map_value(key.as_str(), raw_value, MAX_CHROMIUM_OBSERVE_FORM_VALUE_CHARS)
 }
 
 fn append_chromium_observed_storage_lines(
@@ -1119,16 +1067,14 @@ fn append_chromium_observed_storage_lines(
     };
     let mut entries = storage.entries.iter().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(right.0));
-    for (key, value) in entries.into_iter().take(MAX_STORAGE_ENTRIES_PER_ORIGIN) {
+    for (key, _value) in entries.into_iter().take(MAX_STORAGE_ENTRIES_PER_ORIGIN) {
         let key_display = sanitize_debug_text(key.as_str(), 128);
-        let value_display =
-            sanitize_debug_map_value(key.as_str(), value.as_str(), MAX_STORAGE_ENTRY_VALUE_BYTES);
         lines.push(format!(
             "browser_storage kind={} origin={} key={} value={}",
             storage_kind,
             line_quote(origin.as_str()),
             line_quote(key_display.as_str()),
-            line_quote(value_display.as_str())
+            line_quote("<redacted>")
         ));
     }
 }
@@ -5151,7 +5097,7 @@ fn chromium_viewport_metrics_mismatch(
 mod tests {
     use super::{
         chromium_cookie_delete_requests, chromium_element_capture_script,
-        chromium_network_log_headers, chromium_permission_origin,
+        chromium_network_log_headers, chromium_observe_state_script, chromium_permission_origin,
         chromium_permission_origins_for_urls, chromium_permission_reset_request,
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
@@ -5202,9 +5148,9 @@ mod tests {
     }
 
     #[test]
-    fn chromium_observe_state_summary_exposes_safe_form_and_storage_values() {
+    fn chromium_observe_state_summary_withholds_form_and_storage_values() {
         let raw = serde_json::json!({
-            "html": "<html><body><input id=\"owner\" name=\"owner\" value=\"owner@example.test\"></body></html>",
+            "html": "<html><body><input id=\"owner\" name=\"owner\" value=\"<redacted>\"></body></html>",
             "origin": "http://127.0.0.1:8786",
             "form_controls": [{
                 "tag": "input",
@@ -5214,17 +5160,17 @@ mod tests {
                 "selector": "#owner",
                 "value": "owner@example.test",
                 "checked": null,
-                "selected_options": []
+                "selected_options": ["owner@example.test"]
             }],
             "local_storage": {
                 "ok": true,
                 "origin": "http://127.0.0.1:8786",
-                "entries": {"wizard": "{\"owner\":\"owner@example.test\"}"}
+                "entries": {"wizard": "{\"access_token\":\"eyJhbGciOiJIUzI1NiJ9.payload.signature\"}"}
             },
             "session_storage": {
                 "ok": true,
                 "origin": "http://127.0.0.1:8786",
-                "entries": {"step": "2"}
+                "entries": {"step": "secret session note"}
             }
         });
 
@@ -5233,13 +5179,27 @@ mod tests {
                 .expect("observe state should parse");
         let page_body = page_body_with_chromium_observe_state(payload);
 
+        assert!(page_body.contains("browser_form_control"), "{page_body}");
+        assert!(page_body.contains("selected_options_count=1"), "{page_body}");
+        assert!(page_body.contains("localStorage") && page_body.contains("sessionStorage"));
+        assert!(page_body.contains("key=\"wizard\""), "{page_body}");
+        assert!(page_body.contains("value=\"&lt;redacted&gt;\""), "{page_body}");
         assert!(
-            page_body.contains("browser_form_control") && page_body.contains("owner@example.test"),
-            "form state summary should expose safe current values: {page_body}"
+            !page_body.contains("owner@example.test")
+                && !page_body.contains("eyJhbGci")
+                && !page_body.contains("secret session note"),
+            "observe state summary must not leak form or storage values: {page_body}"
         );
+    }
+
+    #[test]
+    fn chromium_observe_state_script_does_not_read_storage_values() {
+        let script = chromium_observe_state_script();
+
+        assert!(script.contains("storage.key(index)"), "{script}");
         assert!(
-            page_body.contains("localStorage") && page_body.contains("sessionStorage"),
-            "storage summary should expose bounded storage state: {page_body}"
+            !script.contains("storage.getItem(rawKey)"),
+            "observe must enumerate storage keys without reading values: {script}"
         );
     }
 

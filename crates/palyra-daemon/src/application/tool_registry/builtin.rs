@@ -1098,7 +1098,7 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
             "Capture a bounded browser PDF and optionally save it directly to a workspace or approved user-owned output_path."
         }
         "palyra.browser.observe" => {
-            "Observe visible browser state, bounded DOM/accessibility visible text evidence, safe current form/storage state, and optional read-only selector geometry/computed-style captures for layout assertions."
+            "Observe visible browser state, bounded DOM/accessibility visible text evidence, redacted form/storage metadata, and optional read-only selector geometry/computed-style captures for layout assertions."
         }
         "palyra.browser.storage" => {
             "Inspect browser cookie/localStorage names and value metadata for diagnostics; secret values are withheld from model-visible output."
@@ -1355,7 +1355,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
         "palyra.browser.observe" => {
             properties.push((
                 "include_dom_snapshot",
-                json!({"type":"boolean","default":true,"description":"Include bounded DOM evidence with safe current form values when available."}),
+                json!({"type":"boolean","default":true,"description":"Include bounded DOM evidence with form value attributes redacted when available."}),
             ));
             properties.push((
                 "include_accessibility_tree",
@@ -1363,7 +1363,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "include_visible_text",
-                json!({"type":"boolean","default":true,"description":"Include visible text plus safe browser state summaries, including current form and local/session storage state when available."}),
+                json!({"type":"boolean","default":true,"description":"Include visible text plus redacted browser state summaries, including form metadata and local/session storage key names when available."}),
             ));
             properties.push(("max_dom_snapshot_bytes", json!({"type":"integer","minimum":0})));
             properties
