@@ -1156,9 +1156,7 @@ fn redacted_process_output_single_line(output: &[u8]) -> Option<String> {
     if collapsed.is_empty() {
         return None;
     }
-    let redacted_urls = redact_url_segments_in_text(collapsed.as_str());
-    let redacted = redact_auth_error(redacted_urls.as_str());
-    let redacted = redact_sensitive_url_path_segments_in_text(redacted.as_str());
+    let redacted = redacted_process_output_text(collapsed.as_str()).text;
     if redacted.trim().is_empty() {
         None
     } else {
@@ -12377,13 +12375,15 @@ mod tests {
     #[test]
     fn process_stderr_preview_redacts_secret_like_values() {
         let preview = redacted_process_output_preview(
-            b"wc: token=abc123: No such file or directory\nnode failed for https://example.com/token/abc123?api_key=qwerty\nnext",
+            b"wc: token=abc123: No such file or directory\nnode failed for https://example.com/token/abc123?api_key=qwerty\nfatal: GitHub PAT ghp_12345678901234567890abcdefABCDEF\nnext",
         )
         .expect("preview should be present");
 
         assert!(preview.contains("<redacted>"), "{preview}");
         assert!(!preview.contains("abc123"), "{preview}");
         assert!(!preview.contains("qwerty"), "{preview}");
+        assert!(!preview.contains("ghp_12345678901234567890abcdefABCDEF"), "{preview}");
+        assert!(preview.contains("[REDACTED_SECRET]"), "{preview}");
         assert!(preview.contains("node failed"), "{preview}");
     }
 
