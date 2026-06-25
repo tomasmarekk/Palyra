@@ -577,7 +577,11 @@ fn memory_search_schema_defaults_to_all_scope() {
     assert!(entry.input_schema["properties"]["channel"]["description"]
         .as_str()
         .unwrap_or_default()
-        .contains("isolation_probe=true"));
+        .contains("different channels are rejected"));
+    assert!(entry.input_schema["properties"]["isolation_probe"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("does not permit cross-channel probes"));
     assert_eq!(
         entry.input_schema["properties"]["isolation_probe"]["type"],
         serde_json::json!("boolean")

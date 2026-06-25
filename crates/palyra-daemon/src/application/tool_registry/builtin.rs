@@ -64,11 +64,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "channel",
-                        json!({"type":"string","description":"Only valid with scope=channel. Omit or use current/default sentinels for the authenticated run channel. To verify that a marker is absent in a different channel, set isolation_probe=true; the result returns only hit_count/isolated metadata and never memory content."}),
+                        json!({"type":"string","description":"Only valid with scope=channel. Omit or use current/default sentinels for the authenticated run channel; explicit different channels are rejected."}),
                     ),
                     (
                         "isolation_probe",
-                        json!({"type":"boolean","description":"Only valid with scope=channel. When true, permits a read-only negative probe against channel and redacts all hit content from the output."}),
+                        json!({"type":"boolean","description":"Only valid with scope=channel. When true, redacts same-channel hit content and returns bounded hit_count/isolated metadata for the authenticated channel only; it does not permit cross-channel probes."}),
                     ),
                     ("top_k", json!({"type":"integer","minimum":1,"maximum":20})),
                     ("min_score", json!({"type":"number","minimum":0.0,"maximum":1.0})),

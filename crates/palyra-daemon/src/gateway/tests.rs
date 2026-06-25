@@ -6378,7 +6378,7 @@ async fn memory_search_tool_channel_scope_requires_authenticated_channel_context
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_search_tool_cross_channel_isolation_probe_redacts_content() {
+async fn memory_search_tool_cross_channel_isolation_probe_is_denied() {
     let state = build_test_runtime_state(false);
     let context = super::ToolRuntimeExecutionContext {
         channel: Some("staging"),
@@ -6424,47 +6424,51 @@ async fn memory_search_tool_cross_channel_isolation_probe_redacts_content() {
         br#"{"query":"PALYRA_PROD_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod"}"#,
     )
     .await;
+    assert!(!denied.success, "cross-channel content search should remain fail-closed");
     assert!(
-        !denied.success,
-        "cross-channel content search should remain fail-closed without probe"
-    );
-    assert!(
-        denied.error.contains("isolation_probe=true"),
-        "error should identify the safe probe mode: {}",
+        denied.error.contains("authenticated channel"),
+        "error should identify the authenticated channel boundary: {}",
         denied.error
     );
 
-    let absent_probe = execute_memory_search_tool(
+    let denied_probe = execute_memory_search_tool(
         &state,
         context,
         "01ARZ3NDEKTSV4RRFFQ69G5FBF",
         br#"{"query":"PALYRA_STAGING_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod","isolation_probe":true,"top_k":20}"#,
     )
     .await;
-    assert!(absent_probe.success, "absent probe should succeed: {}", absent_probe.error);
-    let absent_payload = parse_tool_output_json(&absent_probe);
-    assert_eq!(absent_payload["probe"], "channel_isolation");
-    assert_eq!(absent_payload["authenticated_channel"], "staging");
-    assert_eq!(absent_payload["target_channel"], "prod");
-    assert_eq!(absent_payload["isolated"], true);
-    assert_eq!(absent_payload["hit_count"], 0);
-    assert!(absent_payload.get("hits").is_none(), "probe output must not include hit content");
+    assert!(
+        !denied_probe.success,
+        "isolation_probe must not authorize cross-channel metadata reads"
+    );
+    assert!(
+        denied_probe.error.contains("cross-channel memory probes are not authorized"),
+        "error should explain probe denial: {}",
+        denied_probe.error
+    );
 
-    let present_probe = execute_memory_search_tool(
+    let same_channel_probe = execute_memory_search_tool(
         &state,
         context,
         "01ARZ3NDEKTSV4RRFFQ69G5FC0",
-        br#"{"query":"PALYRA_PROD_ONLY_ISOLATION_MARKER","scope":"channel","channel":"prod","isolation_probe":true,"top_k":20}"#,
+        br#"{"query":"PALYRA_STAGING_ONLY_ISOLATION_MARKER","scope":"channel","channel":"staging","isolation_probe":true,"top_k":20}"#,
     )
     .await;
-    assert!(present_probe.success, "present probe should succeed: {}", present_probe.error);
-    let present_payload = parse_tool_output_json(&present_probe);
+    assert!(
+        same_channel_probe.success,
+        "same-channel probe should remain available: {}",
+        same_channel_probe.error
+    );
+    let present_payload = parse_tool_output_json(&same_channel_probe);
+    assert_eq!(present_payload["authenticated_channel"], "staging");
+    assert_eq!(present_payload["target_channel"], "staging");
     assert_eq!(present_payload["isolated"], false);
     assert_eq!(present_payload["hit_count"], 1);
     assert_eq!(present_payload["content_redacted"], true);
     assert!(
-        !present_payload.to_string().contains("Prod-only billing rule"),
-        "present probe must reveal existence only, never memory content: {present_payload}"
+        !present_payload.to_string().contains("Staging-only billing rule"),
+        "same-channel probe must reveal bounded metadata only, never memory content: {present_payload}"
     );
 }
 

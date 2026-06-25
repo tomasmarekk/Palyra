@@ -2801,25 +2801,17 @@ fn resolve_memory_search_channel_scope(
         },
         None => current_channel.clone(),
     };
-    if requested_channel == current_channel {
-        let probe = isolation_probe_enabled.then(|| MemorySearchIsolationProbe {
-            authenticated_channel: current_channel,
-            target_channel: requested_channel.clone(),
-        });
-        return Ok((requested_channel, probe));
-    }
-    if !isolation_probe_enabled {
+    if requested_channel != current_channel {
         return Err(
-            "palyra.memory.search cross-channel reads require isolation_probe=true".to_owned()
+            "palyra.memory.search scope=channel is bound to the authenticated channel; cross-channel memory probes are not authorized"
+                .to_owned(),
         );
     }
-    Ok((
-        requested_channel.clone(),
-        Some(MemorySearchIsolationProbe {
-            authenticated_channel: current_channel,
-            target_channel: requested_channel,
-        }),
-    ))
+    let probe = isolation_probe_enabled.then(|| MemorySearchIsolationProbe {
+        authenticated_channel: current_channel,
+        target_channel: requested_channel.clone(),
+    });
+    Ok((requested_channel, probe))
 }
 
 fn parse_memory_search_tags(parsed: &Map<String, Value>) -> Result<Vec<String>, String> {
@@ -4768,23 +4760,30 @@ mod tests {
         let mut parsed = Map::new();
         parsed.insert("channel".to_owned(), Value::String("prod".to_owned()));
         let error = resolve_memory_search_channel_scope(&parsed, Some("staging"), false)
-            .expect_err("cross-channel search should require isolation probe opt-in");
+            .expect_err("cross-channel search should be denied");
         assert!(
-            error.contains("isolation_probe=true"),
-            "error should point callers at the bounded probe mode: {error}"
+            error.contains("authenticated channel"),
+            "error should preserve the authenticated channel boundary: {error}"
+        );
+        let error = resolve_memory_search_channel_scope(&parsed, Some("staging"), true)
+            .expect_err("cross-channel isolation probes should be denied");
+        assert!(
+            error.contains("cross-channel memory probes are not authorized"),
+            "error should explain that isolation_probe is not a cross-channel grant: {error}"
         );
 
+        parsed.insert("channel".to_owned(), Value::String("staging".to_owned()));
         let (target_channel, probe) =
             resolve_memory_search_channel_scope(&parsed, Some("staging"), true)
-                .expect("explicit isolation probe should resolve target channel");
-        let probe = probe.expect("cross-channel probe metadata should be present");
-        assert_eq!(target_channel, "prod");
+                .expect("same-channel isolation probe should resolve");
+        let probe = probe.expect("same-channel probe metadata should be present");
+        assert_eq!(target_channel, "staging");
         assert_eq!(probe.authenticated_channel, "staging");
-        assert_eq!(probe.target_channel, "prod");
+        assert_eq!(probe.target_channel, "staging");
 
         let payload = memory_channel_isolation_probe_output_payload(&probe, &[]);
         assert_eq!(payload["probe"], "channel_isolation");
-        assert_eq!(payload["target_channel"], "prod");
+        assert_eq!(payload["target_channel"], "staging");
         assert_eq!(payload["isolated"], true);
         assert_eq!(payload["content_redacted"], true);
         assert!(payload.get("hits").is_none(), "isolation probes must not expose hit content");
