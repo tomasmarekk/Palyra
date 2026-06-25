@@ -1316,8 +1316,6 @@ fn user_owned_os_roots() -> Vec<PathBuf> {
         }
     }
     push_canonical_root(&mut roots, std::env::temp_dir());
-    #[cfg(windows)]
-    push_windows_drive_temp_roots(&mut roots);
     #[cfg(unix)]
     {
         push_canonical_root(&mut roots, PathBuf::from("/var/tmp"));
@@ -1335,28 +1333,6 @@ fn configured_user_os_roots() -> Option<Vec<PathBuf>> {
     } else {
         Some(roots)
     }
-}
-
-#[cfg(windows)]
-fn push_windows_drive_temp_roots(roots: &mut Vec<PathBuf>) {
-    let Some(system_drive) = std::env::var_os("SystemDrive") else {
-        return;
-    };
-    for candidate in windows_drive_temp_root_candidates(system_drive.to_string_lossy().as_ref()) {
-        push_canonical_root(roots, candidate);
-    }
-}
-
-/// Allows `<drive>:\var\tmp` as a Windows analogue of Unix `/var/tmp`, so
-/// cross-platform agent workflows can use one scratch path convention.
-#[cfg(windows)]
-fn windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf> {
-    let drive = system_drive.trim().trim_end_matches(['\\', '/']);
-    let bytes = drive.as_bytes();
-    if bytes.len() != 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
-        return Vec::new();
-    }
-    vec![PathBuf::from(format!("{drive}\\var\\tmp"))]
 }
 
 fn push_canonical_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
@@ -1505,6 +1481,20 @@ mod tests {
         fn set(key: &'static str, value: &Path) -> Self {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        #[cfg(windows)]
+        fn set_raw(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        #[cfg(windows)]
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -2314,6 +2304,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn os_file_user_roots_do_not_auto_allow_system_drive_var_tmp() {
+        let _guard =
+            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let profile_root = tempdir.path().join("profile");
+        let temp_root = tempdir.path().join("temp");
+        fs::create_dir_all(profile_root.as_path()).expect("profile root should exist");
+        fs::create_dir_all(temp_root.as_path()).expect("temp root should exist");
+        let _configured = ScopedEnvVar::remove(PALYRA_OS_FILE_ROOTS_ENV);
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", profile_root.as_path());
+        let _home = ScopedEnvVar::set("HOME", profile_root.as_path());
+        let _temp = ScopedEnvVar::set("TEMP", temp_root.as_path());
+        let _tmp = ScopedEnvVar::set("TMP", temp_root.as_path());
+        let _system_drive = ScopedEnvVar::set_raw("SystemDrive", "C:");
+
+        let roots = user_owned_os_roots();
+        let canonical_temp = fs::canonicalize(temp_root).expect("temp root should canonicalize");
+
+        assert!(
+            roots.iter().any(|root| same_path(root.as_path(), canonical_temp.as_path())),
+            "Windows TEMP should remain an approved user-owned OS root: {roots:?}"
+        );
+        assert!(
+            roots.iter().all(|root| !is_windows_drive_var_tmp(root.as_path())),
+            "SystemDrive must not auto-approve machine-wide var tmp roots: {roots:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn is_windows_drive_var_tmp(path: &Path) -> bool {
+        let normalized = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let mut chars = normalized.chars();
+        matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic())
+            && chars.next() == Some(':')
+            && chars.as_str() == "/var/tmp"
+    }
+
+    #[test]
     fn os_file_dry_run_does_not_write() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let policy = test_policy(tempdir.path());
@@ -2469,14 +2498,5 @@ mod tests {
             }),
             "search should find the target file path: {searched}"
         );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn windows_drive_temp_root_candidates_include_drive_var_tmp() {
-        assert_eq!(windows_drive_temp_root_candidates("C:"), vec![PathBuf::from(r"C:\var\tmp")]);
-        assert_eq!(windows_drive_temp_root_candidates(r"C:\"), vec![PathBuf::from(r"C:\var\tmp")]);
-        assert!(windows_drive_temp_root_candidates("").is_empty());
-        assert!(windows_drive_temp_root_candidates(r"\\server\share").is_empty());
     }
 }
