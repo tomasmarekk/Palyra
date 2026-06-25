@@ -47,7 +47,10 @@ use crate::{
         ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
         ToolCallRejection, ToolResultProjectionPolicy,
     },
-    application::tool_runtime::artifacts::bounded_tool_result_artifact_content,
+    application::tool_runtime::{
+        artifacts::bounded_tool_result_artifact_content,
+        workspace_patch::normalized_workspace_patch_approval_input_json,
+    },
     application::tool_security::{
         approval_execution_context_for_backend_selection, evaluate_tool_proposal_security,
         record_tool_proposal_decision_audit_trail, resolve_tool_proposal_decision_for_context,
@@ -1094,10 +1097,24 @@ async fn resolve_run_stream_tool_approval_outcome(
         return Ok(None);
     }
 
+    let approval_input_json_override = if tool_name == "palyra.fs.apply_patch" {
+        normalized_workspace_patch_approval_input_json(
+            runtime_state,
+            request_context.principal.as_str(),
+            request_context.channel.as_deref(),
+            session_id,
+            run_id,
+            input_json,
+        )
+        .await
+    } else {
+        None
+    };
+    let approval_input_json = approval_input_json_override.as_deref().unwrap_or(input_json);
     let pending_approval = build_pending_tool_approval(
         tool_name,
         skill_context,
-        input_json,
+        approval_input_json,
         &runtime_state.config.tool_call,
         approval_execution_context_for_backend_selection(backend_selection).as_ref(),
     );
@@ -1132,7 +1149,7 @@ async fn resolve_run_stream_tool_approval_outcome(
         proposal_id,
         pending_approval.approval_id.as_str(),
         tool_name,
-        input_json,
+        approval_input_json,
         true,
         pending_approval.request_summary.as_str(),
         &pending_approval.prompt,

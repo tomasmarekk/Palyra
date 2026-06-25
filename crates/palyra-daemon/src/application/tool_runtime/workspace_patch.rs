@@ -24,7 +24,7 @@ use palyra_common::workspace_patch::{
     compute_patch_sha256, redact_patch_preview, WorkspacePatchError, WorkspacePatchLimits,
     WorkspacePatchOutcome, WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
 };
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use ulid::Ulid;
@@ -62,6 +62,47 @@ pub(crate) struct WorkspacePatchToolRequest<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) proposal_id: &'a str,
     pub(crate) input_json: &'a [u8],
+}
+
+/// Builds the approval-visible input payload from the same normalized patch
+/// paths used by dry-run planning and mutation.
+pub(crate) async fn normalized_workspace_patch_approval_input_json(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    input_json: &[u8],
+) -> Option<Vec<u8>> {
+    let parsed = serde_json::from_slice::<Value>(input_json).ok()?;
+    let parsed = parsed.as_object()?;
+    let patch = parsed.get("patch").and_then(Value::as_str)?;
+    let dry_run = parsed.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+    let resolved_workspace_roots =
+        resolve_workspace_patch_roots_for_context(WorkspacePatchRootResolveRequest {
+            runtime_state,
+            principal,
+            channel,
+            session_id,
+            run_id,
+            parsed,
+            patch,
+            dry_run,
+        })
+        .await
+        .ok()?;
+    normalize_workspace_patch_input_json(parsed, resolved_workspace_roots.roots.as_slice())
+}
+
+struct WorkspacePatchRootResolveRequest<'a> {
+    runtime_state: &'a Arc<GatewayRuntimeState>,
+    principal: &'a str,
+    channel: Option<&'a str>,
+    session_id: &'a str,
+    run_id: &'a str,
+    parsed: &'a Map<String, Value>,
+    patch: &'a str,
+    dry_run: bool,
 }
 
 /// Scoping decision for one patch application.
@@ -230,60 +271,30 @@ pub(crate) async fn execute_workspace_patch_tool(
         }
     }
 
-    let agent_outcome = match runtime_state
-        .resolve_agent_for_context(AgentResolveRequest {
-            principal: principal.to_owned(),
-            channel: channel.map(str::to_owned),
-            session_id: Some(session_id.to_owned()),
-            preferred_agent_id: None,
-            persist_session_binding: false,
+    let resolved_workspace_roots =
+        match resolve_workspace_patch_roots_for_context(WorkspacePatchRootResolveRequest {
+            runtime_state,
+            principal,
+            channel,
+            session_id,
+            run_id,
+            parsed: &parsed,
+            patch: patch.as_str(),
+            dry_run,
         })
         .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return workspace_patch_tool_execution_outcome(
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                format!(
-                    "palyra.fs.apply_patch failed to resolve agent workspace: {}",
-                    error.message()
-                ),
-            );
-        }
-    };
-    let agent_workspace_roots =
-        agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
-    let agent_workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
-        runtime_state,
-        run_id,
-        agent_workspace_roots.as_slice(),
-        agent_outcome.source,
-    )
-    .await;
-    let resolved_workspace_roots = match resolve_workspace_patch_roots(
-        runtime_state,
-        session_id,
-        &parsed,
-        patch.as_str(),
-        dry_run,
-        agent_workspace_roots.as_slice(),
-    )
-    .await
-    {
-        Ok(workspace_roots) => workspace_roots,
-        Err(message) => {
-            return workspace_patch_tool_execution_outcome(
-                proposal_id,
-                input_json,
-                false,
-                b"{}".to_vec(),
-                message,
-            );
-        }
-    };
+        {
+            Ok(workspace_roots) => workspace_roots,
+            Err(message) => {
+                return workspace_patch_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    message,
+                );
+            }
+        };
     let workspace_roots = resolved_workspace_roots.roots;
     let canonical_constraint_roots = resolved_workspace_roots.canonical_constraint_roots;
     let risk_path_prefixes = resolved_workspace_roots.risk_path_prefixes;
@@ -357,6 +368,56 @@ fn workspace_patch_planning_request(
         redaction_policy: redaction_policy.clone(),
     };
     (normalized_patch, request)
+}
+
+async fn resolve_workspace_patch_roots_for_context(
+    request: WorkspacePatchRootResolveRequest<'_>,
+) -> Result<ResolvedWorkspacePatchRoots, String> {
+    let agent_outcome = request
+        .runtime_state
+        .resolve_agent_for_context(AgentResolveRequest {
+            principal: request.principal.to_owned(),
+            channel: request.channel.map(str::to_owned),
+            session_id: Some(request.session_id.to_owned()),
+            preferred_agent_id: None,
+            persist_session_binding: false,
+        })
+        .await
+        .map_err(|error| {
+            format!("palyra.fs.apply_patch failed to resolve agent workspace: {}", error.message())
+        })?;
+    let agent_workspace_roots =
+        agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let agent_workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        request.runtime_state,
+        request.run_id,
+        agent_workspace_roots.as_slice(),
+        agent_outcome.source,
+    )
+    .await;
+    resolve_workspace_patch_roots(
+        request.runtime_state,
+        request.session_id,
+        request.parsed,
+        request.patch,
+        request.dry_run,
+        agent_workspace_roots.as_slice(),
+    )
+    .await
+}
+
+fn normalize_workspace_patch_input_json(
+    parsed: &Map<String, Value>,
+    workspace_roots: &[PathBuf],
+) -> Option<Vec<u8>> {
+    let patch = parsed.get("patch").and_then(Value::as_str)?;
+    let normalized_patch = normalize_workspace_patch_header_paths(patch, workspace_roots);
+    if normalized_patch == patch {
+        return None;
+    }
+    let mut normalized_input = parsed.clone();
+    normalized_input.insert("patch".to_owned(), Value::String(normalized_patch));
+    serde_json::to_vec(&Value::Object(normalized_input)).ok()
 }
 
 /// Dispatches to the constrained engine entry point when canonical
@@ -1309,12 +1370,12 @@ fn workspace_patch_tool_execution_outcome(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_workspace_patch_header_paths, patch_operation_paths,
-        patch_should_use_active_root, reject_env_prefixed_workspace_patch_paths,
-        resolve_workspace_root_override, serialize_workspace_patch_success,
-        workspace_patch_error_outcome, workspace_patch_planning_request,
-        workspace_patch_recovery_hint, workspace_patch_tool_execution_outcome,
-        WORKSPACE_PATCH_GRAMMAR_HINT,
+        normalize_workspace_patch_header_paths, normalize_workspace_patch_input_json,
+        patch_operation_paths, patch_should_use_active_root,
+        reject_env_prefixed_workspace_patch_paths, resolve_workspace_root_override,
+        serialize_workspace_patch_success, workspace_patch_error_outcome,
+        workspace_patch_planning_request, workspace_patch_recovery_hint,
+        workspace_patch_tool_execution_outcome, WORKSPACE_PATCH_GRAMMAR_HINT,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use palyra_common::workspace_patch::{
@@ -1322,7 +1383,7 @@ mod tests {
         WorkspacePatchError, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
         WorkspacePatchRequest,
     };
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     #[test]
     fn workspace_patch_validation_failures_return_diagnostic_payload() {
@@ -1686,6 +1747,41 @@ mod tests {
         assert_eq!(request.patch, normalized);
         assert!(request.patch.contains("*** Add File: feature_flag.test.ts"));
         assert!(!request.patch.contains("S036_session_recall/feature_flag.test.ts"));
+    }
+
+    #[test]
+    fn workspace_patch_approval_input_json_uses_normalized_patch_paths() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let active_root = tempdir
+            .path()
+            .join("workspace")
+            .join("scenario-runs")
+            .join("S037_context_rules_project");
+        std::fs::create_dir_all(active_root.as_path()).expect("active root should exist");
+        let raw_patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: scenario-runs/S037_context_rules_project/Cargo.toml\n",
+            "+[package]\n",
+            "*** End Patch\n",
+        );
+        let input = json!({
+            "dry_run": false,
+            "patch": raw_patch,
+        });
+
+        let normalized = normalize_workspace_patch_input_json(
+            input.as_object().expect("test input is an object"),
+            &[active_root],
+        )
+        .expect("duplicated active-root prefix should normalize approval input");
+        let normalized: Value =
+            serde_json::from_slice(normalized.as_slice()).expect("normalized input is JSON");
+        let normalized_patch =
+            normalized.get("patch").and_then(Value::as_str).expect("normalized input keeps patch");
+
+        assert!(normalized_patch.contains("*** Add File: Cargo.toml"));
+        assert!(!normalized_patch.contains("scenario-runs/S037_context_rules_project/Cargo.toml"));
+        assert_eq!(normalized.get("dry_run").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
