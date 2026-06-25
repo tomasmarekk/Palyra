@@ -4630,11 +4630,18 @@ fn resolve_host_process_program_with_roots(
     host_roots: &[PathBuf],
     trusted_path: &OsStr,
     require_trusted_resolution: bool,
+    allow_cwd_resolution: bool,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     if command_has_path_separator(command) {
         return resolve_host_executable_path_with_roots(workspace_root, cwd, command, host_roots);
     }
-    resolve_tier_b_process_program(command, cwd, trusted_path, require_trusted_resolution)
+    resolve_tier_b_process_program(
+        command,
+        cwd,
+        trusted_path,
+        require_trusted_resolution,
+        allow_cwd_resolution,
+    )
 }
 
 fn host_executable_path_candidates(
@@ -6238,6 +6245,7 @@ fn build_process_command(
 ) -> Result<Command, SandboxProcessRunError> {
     let prepend_path = resolve_process_prepend_path_entries(policy, input, workspace_root, cwd)?;
     let path_access_mode = process_runner_effective_path_access_mode(policy);
+    let allow_cwd_resolution = process_runner_allows_cwd_process_resolution(policy);
     if process_runner_allows_host_access(policy) {
         let host_roots = host_access_roots();
         let trusted_path = host_access_path();
@@ -6248,6 +6256,7 @@ fn build_process_command(
                 cwd,
                 OsStr::new(&trusted_path),
                 require_trusted_resolution,
+                allow_cwd_resolution,
             )?
         } else {
             resolve_host_process_program_with_roots(
@@ -6257,6 +6266,7 @@ fn build_process_command(
                 host_roots.as_slice(),
                 OsStr::new(&trusted_path),
                 require_trusted_resolution,
+                allow_cwd_resolution,
             )?
         };
         let args = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
@@ -6319,6 +6329,7 @@ fn build_process_command(
         cwd,
         OsStr::new(sandbox_process_path()),
         !prepend_path.is_empty(),
+        allow_cwd_resolution,
     )?;
     let mut command = build_tier_b_process_command(program.as_path(), scoped_args.as_slice(), cwd)?;
     configure_tier_b_process_environment(
@@ -6331,6 +6342,10 @@ fn build_process_command(
     apply_process_env_overrides(&mut command, input);
     configure_wsl_path_env_bridge(&mut command, input.command.as_str(), program.as_path());
     Ok(command)
+}
+
+fn process_runner_allows_cwd_process_resolution(policy: &SandboxProcessRunnerPolicy) -> bool {
+    policy.allowed_executables.iter().any(|allowed| allowed.trim() == "*")
 }
 
 fn apply_process_path_prepend(
@@ -6796,6 +6811,7 @@ fn resolve_tier_b_process_program(
     cwd: &Path,
     trusted_path: &OsStr,
     require_trusted_resolution: bool,
+    allow_cwd_resolution: bool,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     if command_has_path_separator(command) {
         return Ok(PathBuf::from(command));
@@ -6803,9 +6819,14 @@ fn resolve_tier_b_process_program(
 
     #[cfg(windows)]
     {
-        let resolved = resolve_windows_process_program(command, cwd, trusted_path)
-            .map(canonicalize_trusted_process_program)
-            .transpose()?;
+        let resolved = resolve_windows_process_program(
+            command,
+            cwd,
+            trusted_path,
+            allow_cwd_resolution && !require_trusted_resolution,
+        )?
+        .map(canonicalize_trusted_process_program)
+        .transpose()?;
         if require_trusted_resolution {
             resolved.ok_or_else(|| trusted_process_program_not_found_error(command))
         } else {
@@ -6815,6 +6836,7 @@ fn resolve_tier_b_process_program(
     #[cfg(not(windows))]
     {
         let _ = cwd;
+        let _ = allow_cwd_resolution;
         if !require_trusted_resolution {
             return Ok(PathBuf::from(command));
         }
@@ -6860,26 +6882,53 @@ fn process_program_candidates_from_path(command: &str, path: &OsStr) -> Vec<Path
         .collect()
 }
 
-// Resolves a bare command on Windows: workspace-cwd candidates first so project-local shims
-// (e.g. node_modules/.bin) win over globally installed tools, then trusted PATH candidates.
+// Resolves a bare command on Windows. Restrictive allowlists prefer trusted PATH
+// candidates and reject current-directory shims; wildcard policies keep
+// workspace-cwd lookup for intentionally broad host-access workflows.
 #[cfg(windows)]
 fn resolve_windows_process_program(
     command: &str,
     cwd: &Path,
     trusted_path: &OsStr,
-) -> Option<PathBuf> {
+    allow_cwd_resolution: bool,
+) -> Result<Option<PathBuf>, SandboxProcessRunError> {
     let command_path = Path::new(command);
     if command_path.components().count() != 1 {
-        return None;
+        return Ok(None);
     }
 
-    windows_command_candidates(command)
+    let cwd_candidate = windows_command_candidates(command)
         .into_iter()
         .map(|candidate| cwd.join(candidate))
-        .find(|candidate| candidate.is_file())
-        .or_else(|| {
+        .find(|candidate| candidate.is_file());
+    if allow_cwd_resolution {
+        return Ok(cwd_candidate.or_else(|| {
             windows_program_candidates_from_path_env(command, trusted_path).into_iter().next()
-        })
+        }));
+    }
+    if let Some(trusted_candidate) =
+        windows_program_candidates_from_path_env(command, trusted_path).into_iter().next()
+    {
+        return Ok(Some(trusted_candidate));
+    }
+    if let Some(cwd_candidate) = cwd_candidate {
+        return Err(windows_cwd_process_program_denied_error(command, cwd_candidate.as_path()));
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn windows_cwd_process_program_denied_error(
+    command: &str,
+    candidate: &Path,
+) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "sandbox denied: Windows command '{command}' resolved to current-directory shim '{}'; use an exact executable path allowed by process_runner.allowed_executables or configure a trusted PATH executable",
+            candidate.display()
+        ),
+    }
 }
 
 #[cfg(windows)]
@@ -9579,6 +9628,116 @@ mod tests {
                 "npm".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_restrictive_resolution_prefers_trusted_path_over_cwd_shim() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let _pathext = ScopedEnvVar::set("PATHEXT", ".EXE;.CMD");
+        let workspace = unique_temp_dir("workspace-command-shim");
+        let trusted_bin = unique_temp_dir("trusted-command-bin");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(trusted_bin.as_path()).expect("trusted bin should be created");
+        fs::write(workspace.join("git.CMD"), b"@echo off\r\necho shim\r\n")
+            .expect("workspace shim should be written");
+        fs::write(trusted_bin.join("git.EXE"), b"trusted executable placeholder")
+            .expect("trusted executable placeholder should be written");
+        let trusted_path =
+            std::env::join_paths([trusted_bin.as_path()]).expect("trusted PATH should join");
+
+        let resolved = super::resolve_tier_b_process_program(
+            "git",
+            workspace.as_path(),
+            trusted_path.as_os_str(),
+            false,
+            false,
+        )
+        .expect("restrictive resolution should pick the trusted executable");
+        let expected =
+            fs::canonicalize(trusted_bin.join("git.EXE")).expect("trusted executable should exist");
+
+        assert!(
+            same_path_case_aware(resolved.as_path(), expected.as_path()),
+            "resolved={} expected={}",
+            resolved.display(),
+            expected.display()
+        );
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(trusted_bin.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_restrictive_resolution_denies_cwd_shim_without_trusted_path() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let _pathext = ScopedEnvVar::set("PATHEXT", ".EXE;.CMD");
+        let workspace = unique_temp_dir("workspace-command-shim-denied");
+        let trusted_bin = unique_temp_dir("empty-trusted-command-bin");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(trusted_bin.as_path()).expect("trusted bin should be created");
+        fs::write(workspace.join("git.CMD"), b"@echo off\r\necho shim\r\n")
+            .expect("workspace shim should be written");
+        let trusted_path =
+            std::env::join_paths([trusted_bin.as_path()]).expect("trusted PATH should join");
+
+        let error = super::resolve_tier_b_process_program(
+            "git",
+            workspace.as_path(),
+            trusted_path.as_os_str(),
+            false,
+            false,
+        )
+        .expect_err("restrictive resolution should reject current-directory shims");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("current-directory shim"), "{}", error.message);
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(trusted_bin.as_path());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_wildcard_resolution_allows_cwd_shim() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let _pathext = ScopedEnvVar::set("PATHEXT", ".EXE;.CMD");
+        let workspace = unique_temp_dir("workspace-command-shim-wildcard");
+        let trusted_bin = unique_temp_dir("wildcard-empty-trusted-command-bin");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(trusted_bin.as_path()).expect("trusted bin should be created");
+        fs::write(workspace.join("git.CMD"), b"@echo off\r\necho shim\r\n")
+            .expect("workspace shim should be written");
+        let trusted_path =
+            std::env::join_paths([trusted_bin.as_path()]).expect("trusted PATH should join");
+
+        let resolved = super::resolve_tier_b_process_program(
+            "git",
+            workspace.as_path(),
+            trusted_path.as_os_str(),
+            false,
+            true,
+        )
+        .expect("wildcard resolution should preserve cwd shims");
+        let expected =
+            fs::canonicalize(workspace.join("git.CMD")).expect("workspace shim should exist");
+
+        assert!(
+            same_path_case_aware(resolved.as_path(), expected.as_path()),
+            "resolved={} expected={}",
+            resolved.display(),
+            expected.display()
+        );
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(trusted_bin.as_path());
     }
 
     #[test]
