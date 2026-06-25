@@ -65,7 +65,7 @@ use palyra_safety::{
 };
 use palyra_sandbox::{
     build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
-    current_backend_kind, TierCBackendError, TierCCommandRequest, TierCPolicy,
+    current_backend_kind, TierCBackendError, TierCCommandPlan, TierCCommandRequest, TierCPolicy,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -4399,12 +4399,13 @@ fn resolve_host_process_program_with_roots(
     cwd: &Path,
     command: &str,
     host_roots: &[PathBuf],
-    prepend_path: &[PathBuf],
+    trusted_path: &OsStr,
+    require_trusted_resolution: bool,
 ) -> Result<PathBuf, SandboxProcessRunError> {
     if command_has_path_separator(command) {
         return resolve_host_executable_path_with_roots(workspace_root, cwd, command, host_roots);
     }
-    Ok(resolve_tier_b_process_program(command, cwd, prepend_path))
+    resolve_tier_b_process_program(command, cwd, trusted_path, require_trusted_resolution)
 }
 
 fn host_executable_path_candidates(
@@ -4659,9 +4660,9 @@ fn process_spawn_failed_message(
         if input.prepend_path.is_empty() { "not_provided" } else { "provided" };
     format!(
         "sandbox process spawn failed for command '{}': {error}. Runtime={}. \
-Lookup used cwd='{}', prepend_path={prepend_path_state}, and the daemon sanitized PATH, \
-not the interactive shell PATH. Add the executable directory via prepend_path or use an exact \
-executable path allowed by process_runner.allowed_executables.",
+        Lookup used cwd='{}', prepend_path={prepend_path_state}, and the daemon sanitized PATH, \
+        not the interactive shell PATH. Install the executable on the trusted process-runner PATH \
+        or use an exact executable path allowed by process_runner.allowed_executables.",
         input.command,
         process_runner_executor_name(policy),
         cwd.display()
@@ -6005,15 +6006,23 @@ fn build_process_command(
     let path_access_mode = process_runner_effective_path_access_mode(policy);
     if process_runner_allows_host_access(policy) {
         let host_roots = host_access_roots_for_input(input);
+        let trusted_path = host_access_path();
+        let require_trusted_resolution = !prepend_path.is_empty();
         let program = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
-            resolve_tier_b_process_program(input.command.as_str(), cwd, prepend_path.as_slice())
+            resolve_tier_b_process_program(
+                input.command.as_str(),
+                cwd,
+                OsStr::new(&trusted_path),
+                require_trusted_resolution,
+            )?
         } else {
             resolve_host_process_program_with_roots(
                 workspace_root,
                 cwd,
                 input.command.as_str(),
                 host_roots.as_slice(),
-                prepend_path.as_slice(),
+                OsStr::new(&trusted_path),
+                require_trusted_resolution,
             )?
         };
         let args = if matches!(path_access_mode, PathAccessMode::UnrestrictedOs) {
@@ -6054,8 +6063,9 @@ fn build_process_command(
         };
         let tier_c_request =
             TierCCommandRequest { command: input.command.clone(), args: scoped_args };
-        let plan = build_tier_c_command_plan(&tier_c_policy, &tier_c_request)
+        let mut plan = build_tier_c_command_plan(&tier_c_policy, &tier_c_request)
             .map_err(map_tier_c_backend_error)?;
+        apply_tier_c_inner_path_prepend(&mut plan, prepend_path.as_slice())?;
         let mut command = Command::new(plan.program);
         let current_dir = child_process_path(cwd);
         command
@@ -6066,13 +6076,16 @@ fn build_process_command(
             .env("LANG", "C")
             .env("LC_ALL", "C");
         configure_node_runtime_environment(&mut command);
-        apply_process_path_prepend(&mut command, prepend_path.as_slice())?;
         apply_process_env_overrides(&mut command, input);
         return Ok(command);
     }
 
-    let program =
-        resolve_tier_b_process_program(input.command.as_str(), cwd, prepend_path.as_slice());
+    let program = resolve_tier_b_process_program(
+        input.command.as_str(),
+        cwd,
+        OsStr::new(sandbox_process_path()),
+        !prepend_path.is_empty(),
+    )?;
     let mut command = build_tier_b_process_command(program.as_path(), scoped_args.as_slice(), cwd)?;
     configure_tier_b_process_environment(
         &mut command,
@@ -6094,16 +6107,51 @@ fn apply_process_path_prepend(
         return Ok(());
     }
     let existing_path = command_env_value_os(command, "PATH");
-    let mut entries = prepend_path.to_vec();
-    if let Some(existing_path) = existing_path.as_ref().filter(|value| !value.is_empty()) {
-        entries.extend(std::env::split_paths(existing_path));
-    }
-    let joined = std::env::join_paths(entries).map_err(|error| SandboxProcessRunError {
-        kind: SandboxProcessRunErrorKind::InvalidInput,
-        message: format!("palyra.process.run prepend_path could not be joined into PATH: {error}"),
-    })?;
+    let joined = join_process_path_prepend(prepend_path, existing_path.as_deref())?;
     command.env("PATH", joined);
     Ok(())
+}
+
+fn join_process_path_prepend(
+    prepend_path: &[PathBuf],
+    existing_path: Option<&OsStr>,
+) -> Result<OsString, SandboxProcessRunError> {
+    let mut entries = prepend_path.to_vec();
+    if let Some(existing_path) = existing_path.filter(|value| !value.is_empty()) {
+        entries.extend(std::env::split_paths(existing_path));
+    }
+    std::env::join_paths(entries).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: format!("palyra.process.run prepend_path could not be joined into PATH: {error}"),
+    })
+}
+
+fn apply_tier_c_inner_path_prepend(
+    plan: &mut TierCCommandPlan,
+    prepend_path: &[PathBuf],
+) -> Result<(), SandboxProcessRunError> {
+    if prepend_path.is_empty() {
+        return Ok(());
+    }
+    let Some(path_value_index) = tier_c_plan_inner_path_index(plan.args.as_slice()) else {
+        return Ok(());
+    };
+    let existing_path = OsStr::new(plan.args[path_value_index].as_str());
+    let joined = join_process_path_prepend(prepend_path, Some(existing_path))?;
+    plan.args[path_value_index] = joined.to_string_lossy().into_owned();
+    Ok(())
+}
+
+fn tier_c_plan_inner_path_index(args: &[String]) -> Option<usize> {
+    let command_separator = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+    let mut index = 0;
+    while index + 2 < command_separator {
+        if args[index] == "--setenv" && args[index + 1] == "PATH" {
+            return Some(index + 2);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn command_env_value_os(command: &Command, requested_key: &str) -> Option<OsString> {
@@ -6496,27 +6544,82 @@ fn infer_desktop_cli_profiles_path(state_root: &Path) -> Option<PathBuf> {
     state_root.parent()?.parent().map(|root| root.join(CLI_PROFILES_RELATIVE_PATH))
 }
 
-fn resolve_tier_b_process_program(command: &str, cwd: &Path, prepend_path: &[PathBuf]) -> PathBuf {
+fn resolve_tier_b_process_program(
+    command: &str,
+    cwd: &Path,
+    trusted_path: &OsStr,
+    require_trusted_resolution: bool,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    if command_has_path_separator(command) {
+        return Ok(PathBuf::from(command));
+    }
+
     #[cfg(windows)]
     {
-        resolve_windows_process_program(command, cwd, prepend_path)
-            .unwrap_or_else(|| PathBuf::from(command))
+        let resolved = resolve_windows_process_program(command, cwd, trusted_path)
+            .map(canonicalize_trusted_process_program)
+            .transpose()?;
+        if require_trusted_resolution {
+            resolved.ok_or_else(|| trusted_process_program_not_found_error(command))
+        } else {
+            Ok(resolved.unwrap_or_else(|| PathBuf::from(command)))
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = cwd;
-        let _ = prepend_path;
-        PathBuf::from(command)
+        if !require_trusted_resolution {
+            return Ok(PathBuf::from(command));
+        }
+        process_program_candidates_from_path(command, trusted_path)
+            .into_iter()
+            .next()
+            .map(canonicalize_trusted_process_program)
+            .transpose()?
+            .ok_or_else(|| trusted_process_program_not_found_error(command))
     }
 }
 
+fn canonicalize_trusted_process_program(
+    candidate: PathBuf,
+) -> Result<PathBuf, SandboxProcessRunError> {
+    fs::canonicalize(candidate.as_path()).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "sandbox denied: trusted process-runner executable '{}' could not be resolved: {error}",
+            candidate.display()
+        ),
+    })
+}
+
+fn trusted_process_program_not_found_error(command: &str) -> SandboxProcessRunError {
+    SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "sandbox denied: executable '{command}' was not found on the trusted process-runner PATH; prepend_path only affects the child environment and cannot select the executable"
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn process_program_candidates_from_path(command: &str, path: &OsStr) -> Vec<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() != 1 {
+        return Vec::new();
+    }
+    std::env::split_paths(path)
+        .map(|directory| directory.join(command))
+        .filter(|candidate| candidate.is_file())
+        .collect()
+}
+
 // Resolves a bare command on Windows: workspace-cwd candidates first so project-local shims
-// (e.g. node_modules/.bin) win over globally installed tools, then PATH candidates.
+// (e.g. node_modules/.bin) win over globally installed tools, then trusted PATH candidates.
 #[cfg(windows)]
 fn resolve_windows_process_program(
     command: &str,
     cwd: &Path,
-    prepend_path: &[PathBuf],
+    trusted_path: &OsStr,
 ) -> Option<PathBuf> {
     let command_path = Path::new(command);
     if command_path.components().count() != 1 {
@@ -6528,24 +6631,19 @@ fn resolve_windows_process_program(
         .map(|candidate| cwd.join(candidate))
         .find(|candidate| candidate.is_file())
         .or_else(|| {
-            windows_program_candidates_from_path_entries(command, prepend_path).into_iter().next()
+            windows_program_candidates_from_path_env(command, trusted_path).into_iter().next()
         })
-        .or_else(|| windows_path_program_candidates(command).into_iter().next())
 }
 
 #[cfg(windows)]
-fn windows_program_candidates_from_path_entries(
-    command: &str,
-    path_entries: &[PathBuf],
-) -> Vec<PathBuf> {
+fn windows_program_candidates_from_path_env(command: &str, path: &OsStr) -> Vec<PathBuf> {
     let command_path = Path::new(command);
     if command_path.components().count() != 1 {
         return Vec::new();
     }
 
     let candidates = windows_command_candidates(command);
-    path_entries
-        .iter()
+    std::env::split_paths(path)
         .flat_map(|directory| candidates.iter().map(move |candidate| directory.join(candidate)))
         .filter(|candidate| candidate.is_file())
         .collect()
@@ -6553,20 +6651,10 @@ fn windows_program_candidates_from_path_entries(
 
 #[cfg(windows)]
 fn windows_path_program_candidates(command: &str) -> Vec<PathBuf> {
-    let command_path = Path::new(command);
-    if command_path.components().count() != 1 {
-        return Vec::new();
-    }
-
-    let candidates = windows_command_candidates(command);
     let Some(path) = std::env::var_os("PATH") else {
         return Vec::new();
     };
-
-    std::env::split_paths(&path)
-        .flat_map(|directory| candidates.iter().map(move |candidate| directory.join(candidate)))
-        .filter(|candidate| candidate.is_file())
-        .collect()
+    windows_program_candidates_from_path_env(command, path.as_os_str())
 }
 
 // Expands a bare command name into the PATHEXT candidate list (npm -> npm.COM, npm.EXE, ...)
@@ -7145,12 +7233,14 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use palyra_sandbox::TierCCommandPlan;
+
     use super::unix_pid_i32_from_u32;
     use super::{
-        build_process_command, builtin_list_directory_stdout, canonical_workspace_root,
-        collect_requested_egress_hosts, command_env_value_os, cpu_rlimit_seconds_from_usage_micros,
-        host_access_roots_for_input, is_host_allowlisted, maybe_emit_process_progress,
-        process_failure_message, process_output_diagnostic_summary,
+        apply_tier_c_inner_path_prepend, build_process_command, builtin_list_directory_stdout,
+        canonical_workspace_root, collect_requested_egress_hosts, command_env_value_os,
+        cpu_rlimit_seconds_from_usage_micros, host_access_roots_for_input, is_host_allowlisted,
+        maybe_emit_process_progress, process_failure_message, process_output_diagnostic_summary,
         process_runner_command_with_args_message, process_success_output_json,
         redacted_process_output_preview, redacted_process_output_text,
         resolve_host_executable_path_with_roots, resolve_host_working_directory,
@@ -7159,17 +7249,17 @@ mod tests {
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
         rewrite_host_virtual_workspace_args, run_constrained_process,
         run_constrained_process_with_cancellation, same_path_case_aware,
-        validate_argument_workspace_scope, validate_cmd_invocation_shape,
-        validate_host_argument_scope, validate_host_argument_scope_with_roots,
-        validate_host_interpreter_argument_guardrails, validate_interpreter_argument_guardrails,
-        validate_no_embedded_command_line_arg, validate_process_env_overrides,
-        validate_process_prepend_path_shape, validate_process_termination_scope,
-        validate_runtime_egress_enforcement, BackgroundLifetimeMode, EgressEnforcementMode,
-        PathAccessMode, ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
-        SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
-        StreamCapture, BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS,
-        MAX_PREPEND_PATH_COUNT, NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV,
-        PROCESS_PROGRESS_MIN_ELAPSED_MS,
+        tier_c_plan_inner_path_index, validate_argument_workspace_scope,
+        validate_cmd_invocation_shape, validate_host_argument_scope,
+        validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
+        validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
+        validate_process_env_overrides, validate_process_prepend_path_shape,
+        validate_process_termination_scope, validate_runtime_egress_enforcement,
+        BackgroundLifetimeMode, EgressEnforcementMode, PathAccessMode, ProcessProgressMonitor,
+        ProcessProgressSink, ProcessRunnerInput, SandboxProcessRunErrorKind,
+        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
+        BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT,
+        NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV, PROCESS_PROGRESS_MIN_ELAPSED_MS,
     };
     #[cfg(windows)]
     use super::{
@@ -8488,6 +8578,57 @@ mod tests {
     }
 
     #[test]
+    fn tier_c_prepend_path_updates_inner_path_only() {
+        let workspace = unique_temp_dir("workspace-tier-c-inner-prepend-path");
+        let toolchain_bin = workspace.join("toolchain").join("bin");
+        let trusted_bin = workspace.join("trusted").join("bin");
+        fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
+        fs::create_dir_all(trusted_bin.as_path()).expect("trusted bin should exist");
+        let canonical_toolchain_bin =
+            fs::canonicalize(toolchain_bin.as_path()).expect("toolchain bin should canonicalize");
+        let canonical_trusted_bin =
+            fs::canonicalize(trusted_bin.as_path()).expect("trusted bin should canonicalize");
+        let original_path = std::env::join_paths([canonical_trusted_bin.as_path()])
+            .expect("test PATH should join")
+            .to_string_lossy()
+            .into_owned();
+        let mut plan = TierCCommandPlan {
+            backend: palyra_sandbox::TierCBackendKind::LinuxBubblewrap,
+            program: "bwrap".to_owned(),
+            args: vec![
+                "--clearenv".to_owned(),
+                "--setenv".to_owned(),
+                "PATH".to_owned(),
+                original_path,
+                "--".to_owned(),
+                "node".to_owned(),
+            ],
+        };
+
+        apply_tier_c_inner_path_prepend(&mut plan, std::slice::from_ref(&canonical_toolchain_bin))
+            .expect("tier C inner PATH should accept validated prepend_path entries");
+        let path_index =
+            tier_c_plan_inner_path_index(plan.args.as_slice()).expect("PATH setenv should remain");
+        let entries =
+            std::env::split_paths(&OsString::from(&plan.args[path_index])).collect::<Vec<_>>();
+
+        assert_eq!(plan.program, "bwrap");
+        assert!(
+            entries.first().is_some_and(|entry| {
+                same_path_case_aware(entry.as_path(), canonical_toolchain_bin.as_path())
+            }),
+            "prepend_path entry should lead the inner sandbox PATH: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|entry| {
+                same_path_case_aware(entry.as_path(), canonical_trusted_bin.as_path())
+            }),
+            "original trusted PATH entry should be preserved: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
     fn sandbox_prepend_path_must_stay_inside_workspace() {
         let workspace = unique_temp_dir("workspace-prepend-path-sandbox");
         let outside = unique_temp_dir("outside-prepend-path-sandbox");
@@ -8534,13 +8675,17 @@ mod tests {
         let workspace = unique_temp_dir("workspace-host-prepend-path");
         let toolchain_bin = workspace.join("toolchain").join("bin");
         fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
+        let helper_name = if cfg!(windows) { "palyra-helper.exe" } else { "palyra-helper" };
+        let helper = toolchain_bin.join(helper_name);
+        fs::write(helper.as_path(), "fake exe")
+            .expect("helper executable fixture should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
         let canonical_toolchain_bin =
             fs::canonicalize(toolchain_bin.as_path()).expect("toolchain bin should canonicalize");
         let policy = host_access_policy(canonical_workspace.clone());
         let input = ProcessRunnerInput {
-            command: "palyra-helper".to_owned(),
+            command: helper.to_string_lossy().into_owned(),
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
@@ -8572,20 +8717,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn host_access_prepend_path_resolves_bare_windows_command() {
-        let workspace = unique_temp_dir("workspace-host-prepend-command");
+    fn host_access_prepend_path_does_not_resolve_selected_bare_command() {
+        let workspace = unique_temp_dir("workspace-host-prepend-command-shadow");
         let toolchain_bin = workspace.join("toolchain").join("bin");
         fs::create_dir_all(toolchain_bin.as_path()).expect("toolchain bin should exist");
-        let node = toolchain_bin.join("node.exe");
-        fs::write(node.as_path(), "fake exe").expect("node executable fixture should be written");
+        let command_name = "palyra-prepend-only-tool";
+        let executable_name =
+            if cfg!(windows) { format!("{command_name}.exe") } else { command_name.to_owned() };
+        let shadow = toolchain_bin.join(executable_name);
+        fs::write(shadow.as_path(), "fake exe")
+            .expect("shadow executable fixture should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
             .expect("workspace root should canonicalize");
-        let expected = fs::canonicalize(node.as_path()).expect("node should canonicalize");
         let policy = host_access_policy(canonical_workspace.clone());
         let input = ProcessRunnerInput {
-            command: "node".to_owned(),
-            args: vec!["--version".to_owned()],
+            command: command_name.to_owned(),
+            args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
             prepend_path: vec![toolchain_bin.to_string_lossy().into_owned()],
@@ -8596,15 +8743,20 @@ mod tests {
             keep_running_after_run: false,
         };
 
-        let command = build_process_command(
+        let error = build_process_command(
             &policy,
             &input,
             canonical_workspace.as_path(),
             canonical_workspace.as_path(),
         )
-        .expect("host access command should resolve prepended node");
+        .expect_err("prepend_path must not select the executable spawned by the daemon");
 
-        assert!(same_path_case_aware(Path::new(command.get_program()), expected.as_path()));
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(
+            error.message.contains("prepend_path only affects the child environment"),
+            "{}",
+            error.message
+        );
         let _ = fs::remove_dir_all(workspace.as_path());
     }
 
