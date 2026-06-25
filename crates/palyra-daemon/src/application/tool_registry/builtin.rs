@@ -566,11 +566,11 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     ),
                     (
                         "path",
-                        json!({"type":"string","description":"Absolute OS path to inspect or modify. A leading environment prefix such as $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, or %PALYRA_E2E_OS_ROOT% is expanded before validation. Use this only for user-owned paths such as profile, temp, Downloads, or configured harness OS roots; protected system paths are denied."}),
+                        json!({"type":"string","description":"Absolute OS path to inspect or modify. A leading launch-context path prefix such as $PALYRA_E2E_OS_ROOT, ${PALYRA_E2E_OS_ROOT}, or %PALYRA_E2E_OS_ROOT% is accepted only when that alias was explicitly provided by the CLI/tool context for this run. Do not invent env aliases or use credential-bearing process env names; protected system paths are denied."}),
                     ),
                     (
                         "target_path",
-                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path, optionally with a leading environment prefix such as %PALYRA_E2E_OS_ROOT%, for OS-to-OS moves. Use a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
+                        json!({"type":"string","description":"Destination path for copy or move operations. Use an absolute OS path, optionally with a launch-context path prefix such as %PALYRA_E2E_OS_ROOT% only when that alias was explicitly provided for this run, for OS-to-OS moves. Use a workspace-relative path such as data/imported/file.csv or /workspace/data/imported/file.csv to import an allowed OS file into the active workspace without guessing the workspace's absolute root."}),
                     ),
                     (
                         "content_text",

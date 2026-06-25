@@ -1120,7 +1120,7 @@ fn resolve_target_os_path(policy: &OsFilePolicy, path: &str) -> Result<ResolvedO
 }
 
 /// Parses a model-supplied path into an absolute [`PathBuf`], expanding a
-/// leading `%VAR%`/`$VAR`/`${VAR}` prefix from the policy or process env.
+/// leading `%VAR%`/`$VAR`/`${VAR}` prefix only from policy-bound launch context.
 ///
 /// `.`/`..` components and control characters are rejected up front, before
 /// any canonicalization, so traversal cannot hide behind a not-yet-existing
@@ -1151,16 +1151,12 @@ fn expand_env_prefixed_os_path(policy: &OsFilePolicy, path: &str) -> Result<Path
     let Some((key, suffix)) = path_env_prefix(path)? else {
         return Ok(PathBuf::from(path));
     };
-    // Run-launch context bindings win over the daemon's process environment,
-    // so CLI-launched runs resolve env-prefixed paths against the operator's
-    // shell view rather than the daemon's.
-    if let Some(value) = policy.path_env.get(key) {
-        return append_env_path_suffix(value.clone(), suffix);
-    }
-    let value = std::env::var_os(key).filter(|value| !value.is_empty()).ok_or_else(|| {
-        format!("{OS_FILE_TOOL_NAME} path references unset environment variable `{key}`")
+    let value = policy.path_env.get(key).ok_or_else(|| {
+        format!(
+            "{OS_FILE_TOOL_NAME} path references environment variable `{key}` that is not available in this run's launch context"
+        )
     })?;
-    append_env_path_suffix(PathBuf::from(value), suffix)
+    append_env_path_suffix(value.clone(), suffix)
 }
 
 fn path_env_prefix(path: &str) -> Result<Option<(&str, &str)>, String> {
@@ -1269,10 +1265,7 @@ fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Resul
         return Ok(());
     }
     if protected_os_path(path.resolved_path.as_path()) {
-        return Err(format!(
-            "{OS_FILE_TOOL_NAME} denied protected OS path {}",
-            display_path(path.resolved_path.as_path())
-        ));
+        return Err(format!("{OS_FILE_TOOL_NAME} denied protected OS path"));
     }
     if policy
         .workspace_roots
@@ -1289,8 +1282,7 @@ fn ensure_os_path_allowed(policy: &OsFilePolicy, path: &ResolvedOsPath) -> Resul
         return Ok(());
     }
     Err(format!(
-        "{OS_FILE_TOOL_NAME} path {} is outside agent workspace roots and approved user-owned OS roots",
-        display_path(path.resolved_path.as_path())
+        "{OS_FILE_TOOL_NAME} path is outside agent workspace roots and approved user-owned OS roots"
     ))
 }
 
@@ -1787,27 +1779,26 @@ mod tests {
     }
 
     #[test]
-    fn os_file_read_expands_leading_env_path_prefixes() {
-        let _guard =
-            OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
+    fn os_file_read_expands_launch_context_env_path_prefixes() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let os_root = tempdir.path().join("os-root");
         let inbox = os_root.join("downloads").join("inbox");
         fs::create_dir_all(inbox.as_path()).expect("inbox should exist");
         let target = inbox.join("orders-valid.csv");
         fs::write(target.as_path(), "id,name,total\n1,Ada,42\n").expect("fixture should exist");
+        let canonical_os_root =
+            fs::canonicalize(os_root.as_path()).expect("os root should canonicalize");
         let policy = OsFilePolicy {
             path_access_mode: PathAccessMode::ApprovedRoots,
             workspace_roots: vec![fs::canonicalize(tempdir.path()).expect("workspace root")],
-            user_os_roots: vec![fs::canonicalize(os_root.as_path()).expect("os root")],
-            path_env: BTreeMap::new(),
+            user_os_roots: vec![canonical_os_root.clone()],
+            path_env: BTreeMap::from([("PALYRA_E2E_OS_ROOT".to_owned(), canonical_os_root)]),
         };
-        let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", os_root.as_path());
 
         for env_path in [
-            "%PALYRA_TEST_OS_ROOT%/downloads/inbox/orders-valid.csv",
-            "$PALYRA_TEST_OS_ROOT/downloads/inbox/orders-valid.csv",
-            "${PALYRA_TEST_OS_ROOT}/downloads/inbox/orders-valid.csv",
+            "%PALYRA_E2E_OS_ROOT%/downloads/inbox/orders-valid.csv",
+            "$PALYRA_E2E_OS_ROOT/downloads/inbox/orders-valid.csv",
+            "${PALYRA_E2E_OS_ROOT}/downloads/inbox/orders-valid.csv",
         ] {
             let read = execute_os_file_operation(
                 &policy,
@@ -1845,15 +1836,54 @@ mod tests {
 
     #[test]
     fn os_file_env_path_suffix_must_stay_relative_to_expanded_root() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let canonical_root = fs::canonicalize(tempdir.path()).expect("tempdir should canonicalize");
+        let mut policy = test_policy(tempdir.path());
+        policy.path_env.insert("PALYRA_E2E_OS_ROOT".to_owned(), canonical_root);
+        let error = parse_absolute_os_path(&policy, "%PALYRA_E2E_OS_ROOT%/../escape.txt")
+            .expect_err("environment path suffix must not contain parent traversal");
+        assert!(error.contains("must stay relative to the expanded root"));
+    }
+
+    #[test]
+    fn os_file_read_rejects_daemon_process_env_path_prefixes() {
         let _guard =
             OS_FILE_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock poisoned");
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
-        let _root = ScopedEnvVar::set("PALYRA_TEST_OS_ROOT", tempdir.path());
-
+        let secret_path = tempdir.path().join("application_default_credentials.json");
+        fs::write(secret_path.as_path(), "credential_file_contents=do-not-read\n")
+            .expect("credential fixture should exist");
         let policy = test_policy(tempdir.path());
-        let error = parse_absolute_os_path(&policy, "%PALYRA_TEST_OS_ROOT%/../escape.txt")
-            .expect_err("environment path suffix must not contain parent traversal");
-        assert!(error.contains("must stay relative to the expanded root"));
+        let _root = ScopedEnvVar::set("GOOGLE_APPLICATION_CREDENTIALS", secret_path.as_path());
+
+        let error = execute_os_file_operation(
+            &policy,
+            &OsFileInput {
+                operation: OsFileOperation::Read,
+                path: "$GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                target_path: None,
+                content_text: None,
+                bytes_base64: None,
+                create_parent_dirs: None,
+                overwrite: None,
+                full_replace: None,
+                dry_run: None,
+                offset_bytes: None,
+                max_bytes: None,
+                query: None,
+                case_sensitive: None,
+                max_entries: None,
+                max_matches: None,
+            },
+        )
+        .expect_err("daemon process env path prefixes must not expand");
+
+        assert!(error.contains("not available in this run's launch context"));
+        assert!(error.contains("GOOGLE_APPLICATION_CREDENTIALS"));
+        assert!(
+            !error.contains(display_path(secret_path.as_path()).as_str()),
+            "error must not disclose the daemon env value: {error}"
+        );
     }
 
     #[test]
