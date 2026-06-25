@@ -12,10 +12,12 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Write,
+    ops::Range,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::redaction::is_sensitive_key;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -440,7 +442,7 @@ pub fn redact_patch_preview(
             continue;
         }
 
-        rendered.push(line.to_owned());
+        rendered.push(redact_patch_preview_body_line(line).into_owned());
     }
 
     let mut preview = rendered.join("\n");
@@ -453,6 +455,254 @@ pub fn redact_patch_preview(
     }
 
     truncate_utf8(preview, max_preview_bytes)
+}
+
+fn redact_patch_preview_body_line(line: &str) -> Cow<'_, str> {
+    let Some(&prefix) = line.as_bytes().first() else {
+        return Cow::Borrowed(line);
+    };
+    if !matches!(prefix, b'+' | b'-' | b' ') {
+        return Cow::Borrowed(line);
+    }
+    let body = &line[1..];
+
+    match redact_sensitive_patch_preview_values(body) {
+        Cow::Borrowed(_) => Cow::Borrowed(line),
+        Cow::Owned(redacted_body) => {
+            let mut redacted = String::with_capacity(line.len());
+            redacted.push(prefix as char);
+            redacted.push_str(redacted_body.as_str());
+            Cow::Owned(redacted)
+        }
+    }
+}
+
+fn redact_sensitive_patch_preview_values(body: &str) -> Cow<'_, str> {
+    let mut replacements = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut skip_until = 0usize;
+
+    for (index, ch) in body.char_indices() {
+        if index < skip_until {
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+            continue;
+        }
+        if !matches!(ch, '=' | ':') {
+            continue;
+        }
+        if !is_patch_preview_assignment_separator(body, index, ch) {
+            continue;
+        }
+        if !patch_preview_key_before_separator_is_sensitive(body, index) {
+            continue;
+        }
+        let Some(value) = patch_preview_assignment_value_span(body, index + ch.len_utf8()) else {
+            continue;
+        };
+        skip_until = value.skip_until;
+        if should_redact_patch_preview_value(&body[value.replacement.clone()]) {
+            replacements.push(value.replacement);
+        }
+    }
+
+    if replacements.is_empty() {
+        return Cow::Borrowed(body);
+    }
+
+    let mut redacted = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    for range in replacements {
+        redacted.push_str(&body[cursor..range.start]);
+        redacted.push_str("[REDACTED]");
+        cursor = range.end;
+    }
+    redacted.push_str(&body[cursor..]);
+    Cow::Owned(redacted)
+}
+
+fn is_patch_preview_assignment_separator(body: &str, index: usize, separator: char) -> bool {
+    let before = body[..index].chars().rev().find(|ch| !ch.is_whitespace());
+    let after_start = index + separator.len_utf8();
+    let after = body[after_start..].chars().find(|ch| !ch.is_whitespace());
+
+    match separator {
+        '=' => {
+            !matches!(before, Some('=' | '!' | '<' | '>' | ':'))
+                && !matches!(after, Some('=' | '>'))
+        }
+        ':' => !matches!(before, Some(':')) && !matches!(after, Some(':')) && after.is_some(),
+        _ => false,
+    }
+}
+
+fn patch_preview_key_before_separator_is_sensitive(body: &str, separator_index: usize) -> bool {
+    let prefix = body[..separator_index].trim_end_matches(char::is_whitespace);
+    let end = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .map(|(index, ch)| index + ch.len_utf8());
+    let Some(end) = end else {
+        return false;
+    };
+    let start = prefix[..end]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let key = &prefix[start..end];
+    if key.is_empty() {
+        return false;
+    }
+    let previous = (start > 0).then(|| prefix[..start].chars().next_back()).flatten();
+    !matches!(previous, Some('?' | '&' | '#')) && is_sensitive_key(key)
+}
+
+struct PatchPreviewValueSpan {
+    replacement: Range<usize>,
+    skip_until: usize,
+}
+
+fn patch_preview_assignment_value_span(
+    body: &str,
+    value_search_start: usize,
+) -> Option<PatchPreviewValueSpan> {
+    let value_start = skip_ascii_whitespace(body, value_search_start);
+    let quote = body[value_start..].chars().next()?;
+    if matches!(quote, '"' | '\'' | '`') {
+        return quoted_patch_preview_value_span(body, value_start, quote);
+    }
+
+    let mut end = body.len();
+    let mut previous_was_whitespace = false;
+    for (offset, ch) in body[value_start..].char_indices() {
+        let index = value_start + offset;
+        if matches!(ch, ',' | ';' | ')' | ']' | '}') {
+            end = index;
+            break;
+        }
+        if ch == '#' && previous_was_whitespace {
+            end = index;
+            break;
+        }
+        if ch == '/' && previous_was_whitespace && body[index + ch.len_utf8()..].starts_with('/') {
+            end = index;
+            break;
+        }
+        previous_was_whitespace = ch.is_whitespace();
+    }
+
+    let replacement_end = trim_ascii_whitespace_end(body, value_start, end);
+    (value_start < replacement_end).then_some(PatchPreviewValueSpan {
+        replacement: value_start..replacement_end,
+        skip_until: end,
+    })
+}
+
+fn quoted_patch_preview_value_span(
+    body: &str,
+    value_start: usize,
+    quote: char,
+) -> Option<PatchPreviewValueSpan> {
+    let inner_start = value_start + quote.len_utf8();
+    let mut escaped = false;
+    for (offset, ch) in body[inner_start..].char_indices() {
+        let index = inner_start + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return (inner_start < index).then_some(PatchPreviewValueSpan {
+                replacement: inner_start..index,
+                skip_until: index + ch.len_utf8(),
+            });
+        }
+    }
+
+    (inner_start < body.len()).then_some(PatchPreviewValueSpan {
+        replacement: inner_start..body.len(),
+        skip_until: body.len(),
+    })
+}
+
+fn skip_ascii_whitespace(value: &str, start: usize) -> usize {
+    value[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_ascii_whitespace()).then_some(start + offset))
+        .unwrap_or(value.len())
+}
+
+fn trim_ascii_whitespace_end(value: &str, start: usize, end: usize) -> usize {
+    value[start..end]
+        .char_indices()
+        .rev()
+        .find_map(|(offset, ch)| {
+            (!ch.is_ascii_whitespace()).then_some(start + offset + ch.len_utf8())
+        })
+        .unwrap_or(start)
+}
+
+fn should_redact_patch_preview_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || is_redaction_placeholder(trimmed) {
+        return false;
+    }
+    if looks_like_patch_preview_secret_value(trimmed) {
+        return true;
+    }
+    !is_symbolic_patch_preview_identifier(trimmed)
+}
+
+fn is_redaction_placeholder(value: &str) -> bool {
+    REDACTION_PLACEHOLDER_MARKERS.iter().any(|marker| value.eq_ignore_ascii_case(marker))
+}
+
+fn looks_like_patch_preview_secret_value(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.starts_with("sk_")
+        || lowered.starts_with("sk-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
+        || lowered.starts_with("xox")
+        || lowered.starts_with("ya29.")
+        || lowered.starts_with("eyj")
+        || lowered.starts_with("akia")
+        || lowered.starts_with("asia")
+        || lowered.contains("-----begin")
+        || lowered.contains("correct-horse")
+        || lowered.contains("palyra-regression")
+        || lowered.contains("should_not_leak")
+        || lowered.contains("secret_should_not_appear")
+}
+
+fn is_symbolic_patch_preview_identifier(value: &str) -> bool {
+    value.len() <= 96
+        && value.contains('_')
+        && value.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
@@ -2962,6 +3212,41 @@ mod tests {
             !preview.contains("Bearer "),
             "bearer marker should be redacted case-insensitively"
         );
+    }
+
+    #[test]
+    fn redact_patch_preview_masks_sensitive_source_assignment_values() {
+        let patch = "*** Begin Patch\n*** Add File: src/settings.ts\n+const API_TOKEN = \"ghp_REAL_TOKEN_456\";\n+const PASSWORD = \"correct-horse-battery-staple\";\n+const API_KEY = 'palyra-regression-api-key';\n+const SECRET_KEY = \"sk_live_REAL_SECRET_123\";\n+const SAFE_LABEL = \"public\";\n+const SYMBOLIC_SECRET = \"SERVER_PRIVATE_KEY\";\n*** End Patch\n";
+        let preview =
+            redact_patch_preview(patch, &WorkspacePatchRedactionPolicy::default(), 16 * 1024);
+
+        assert!(preview.contains("+const API_TOKEN = \"[REDACTED]\";"), "{preview}");
+        assert!(preview.contains("+const PASSWORD = \"[REDACTED]\";"), "{preview}");
+        assert!(preview.contains("+const API_KEY = '[REDACTED]';"), "{preview}");
+        assert!(preview.contains("+const SECRET_KEY = \"[REDACTED]\";"), "{preview}");
+        assert!(preview.contains("+const SAFE_LABEL = \"public\";"), "{preview}");
+        assert!(preview.contains("+const SYMBOLIC_SECRET = \"SERVER_PRIVATE_KEY\";"), "{preview}");
+        assert!(!preview.contains("ghp_REAL_TOKEN_456"), "{preview}");
+        assert!(!preview.contains("correct-horse-battery-staple"), "{preview}");
+        assert!(!preview.contains("palyra-regression-api-key"), "{preview}");
+        assert!(!preview.contains("sk_live_REAL_SECRET_123"), "{preview}");
+    }
+
+    #[test]
+    fn redact_patch_preview_masks_sensitive_json_and_yaml_values() {
+        let patch = "*** Begin Patch\n*** Add File: config/app.yml\n+api_key: palyra-regression-api-key\n+password: correct-horse-battery-staple # generated fixture\n*** Add File: config/app.json\n+  \"client_secret\": \"sk_live_REAL_SECRET_123\",\n+  \"private_key\": \"-----BEGIN PRIVATE KEY-----\"\n+  \"label\": \"public\"\n*** End Patch\n";
+        let preview =
+            redact_patch_preview(patch, &WorkspacePatchRedactionPolicy::default(), 16 * 1024);
+
+        assert!(preview.contains("+api_key: [REDACTED]"), "{preview}");
+        assert!(preview.contains("+password: [REDACTED] # generated fixture"), "{preview}");
+        assert!(preview.contains("+  \"client_secret\": \"[REDACTED]\","), "{preview}");
+        assert!(preview.contains("+  \"private_key\": \"[REDACTED]\""), "{preview}");
+        assert!(preview.contains("+  \"label\": \"public\""), "{preview}");
+        assert!(!preview.contains("palyra-regression-api-key"), "{preview}");
+        assert!(!preview.contains("correct-horse-battery-staple"), "{preview}");
+        assert!(!preview.contains("sk_live_REAL_SECRET_123"), "{preview}");
+        assert!(!preview.contains("-----BEGIN PRIVATE KEY-----"), "{preview}");
     }
 
     #[test]
