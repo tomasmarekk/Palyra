@@ -1288,6 +1288,14 @@ fn mentions_negative_action_item_context(lower: &str) -> bool {
         && contains_any(
             lower,
             &[
+                "closed action item",
+                "closed action-item",
+                "completed action item",
+                "completed action-item",
+                "done action item",
+                "done action-item",
+                "resolved action item",
+                "resolved action-item",
                 "not action item",
                 "not an action item",
                 "not meeting action item",
@@ -1329,9 +1337,17 @@ fn is_action_item_heading(lower: &str) -> bool {
 
 fn looks_like_section_break(line: &str) -> bool {
     let trimmed = line.trim();
-    (trimmed.trim_start().starts_with('#') || trimmed.ends_with(':'))
-        && strip_list_marker(trimmed).is_none()
-        && !mentions_action_item_context(trimmed.to_ascii_lowercase().as_str())
+    if strip_list_marker(trimmed).is_some() {
+        return false;
+    }
+    if trimmed.trim_start().starts_with('#') {
+        return true;
+    }
+    trimmed.ends_with(':') && {
+        let lower = trimmed.to_ascii_lowercase();
+        !mentions_action_item_context(lower.as_str())
+            || mentions_negative_action_item_context(lower.as_str())
+    }
 }
 
 fn extract_explicit_action_item(line: &str) -> Option<String> {
@@ -3279,6 +3295,73 @@ Source: S078 fixture meeting notes
                 .pointer("/active_task_summary/open_action_items/0")
                 .and_then(serde_json::Value::as_str),
             plan.active_task_summary.open_action_items.first().map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn active_task_summary_stops_at_closed_action_items_heading() {
+        let notes = "\
+# Customer Readiness Notes
+
+## Open action items
+
+- Jana must finalize the billing migration checklist by 2026-06-12.
+## Closed action items
+
+- Ondrej already uploaded the May support metrics.
+- Marta already closed the mobile tooltip audit.
+";
+        let tool_result_payload = serde_json::json!({
+            "proposal_id": "proposal-closed-action-items",
+            "success": true,
+            "output_json": {
+                "path": "tasks/closed-action-items.md",
+                "content": notes,
+            },
+            "error": "",
+        })
+        .to_string();
+        let mut transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Extract only the open action items from the customer notes."}"#,
+            ),
+            transcript_record(1, "tool_result", tool_result_payload.as_str()),
+        ];
+        transcript.extend((2..14).map(|seq| {
+            let payload = format!(r#"{{"text":"Reference filler context {seq} for compaction."}}"#);
+            transcript_record(seq, "message.received", payload.as_str())
+        }));
+
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("test_compaction"),
+            Some("test_policy"),
+        );
+
+        assert!(plan.eligible);
+        assert_action_items_contain_text(
+            plan.active_task_summary.open_action_items.as_slice(),
+            &["Jana must finalize the billing migration checklist by 2026-06-12."],
+        );
+        assert_untrusted_tool_output_items(plan.active_task_summary.open_action_items.as_slice());
+        assert!(
+            plan.active_task_summary
+                .open_action_items
+                .iter()
+                .all(|item| !item.contains("Closed action items") && !item.contains("already")),
+            "closed action-item section must not be captured as open action items: {:?}",
+            plan.active_task_summary.open_action_items
+        );
+        assert!(
+            !plan.summary_text.contains("already uploaded")
+                && !plan.summary_text.contains("mobile tooltip audit"),
+            "trusted summary text must not preserve closed action-item bullets: {}",
+            plan.summary_text
         );
     }
 
