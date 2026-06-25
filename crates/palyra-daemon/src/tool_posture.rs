@@ -1022,10 +1022,10 @@ pub const TOOL_CATALOG: &[ToolCatalogEntry] = &[
         tool_name: "palyra.browser.storage",
         title: "Browser storage",
         description:
-            "Reads bounded visible cookies and localStorage from the active browser session.",
+            "Reads browser cookie/localStorage names and value metadata with secret values withheld.",
         category: "browser",
         risk_level: ApprovalRiskLevel::Medium,
-        recommend_always_allow: true,
+        recommend_always_allow: false,
     },
     ToolCatalogEntry {
         tool_name: "palyra.browser.network_log",
@@ -2004,5 +2004,12 @@ mod tests {
                 preset.preset_id
             );
         }
+    }
+
+    #[test]
+    fn browser_storage_catalog_does_not_recommend_always_allow() {
+        let catalog = tool_catalog_entry("palyra.browser.storage").expect("catalog entry exists");
+        assert!(!catalog.recommend_always_allow);
+        assert!(catalog.description.contains("withheld"));
     }
 }

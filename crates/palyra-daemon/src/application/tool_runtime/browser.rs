@@ -4588,72 +4588,66 @@ fn merge_browser_value_scans(
     )
 }
 
+const BROWSER_COOKIE_VALUE_WITHHELD: &str = "[WITHHELD_BROWSER_COOKIE_VALUE]";
+const BROWSER_STORAGE_VALUE_WITHHELD: &str = "[WITHHELD_BROWSER_STORAGE_VALUE]";
+
 fn browser_cookie_domain_to_json(domain: browser_v1::SessionCookieDomain) -> BrowserValueExport {
-    let mut redacted = false;
-    // Scan the raw name=value pairs as one block so secret patterns spanning
-    // the key/value boundary are caught; displayed values are still redacted
-    // individually.
     let mut scan_input = format!("domain={}", domain.domain);
     let cookies = domain
         .cookies
         .into_iter()
         .map(|cookie| {
-            let value_export =
-                export_browser_text(cookie.value.as_str(), SafetyContentKind::BrowserObservation);
+            let value_length_bytes = cookie.value.len();
             scan_input.push('\n');
             scan_input.push_str(cookie.name.as_str());
-            scan_input.push('=');
-            scan_input.push_str(cookie.value.as_str());
-            redacted |= value_export.redacted;
             json!({
                 "name": cookie.name,
-                "value": value_export.redacted_text,
+                "value": BROWSER_COOKIE_VALUE_WITHHELD,
+                "value_withheld": true,
+                "value_length_bytes": value_length_bytes,
             })
         })
         .collect::<Vec<_>>();
     let scan = export_browser_text(scan_input.as_str(), SafetyContentKind::BrowserObservation);
+    let withheld = !cookies.is_empty();
     BrowserValueExport {
         value: json!({
             "domain": domain.domain,
             "cookies": cookies,
-            "safety": browser_safety_json(&scan.scan, scan.redacted || redacted),
+            "safety": browser_safety_json(&scan.scan, scan.redacted || withheld),
         }),
         scan: scan.scan,
-        redacted: scan.redacted || redacted,
+        redacted: scan.redacted || withheld,
     }
 }
 
 fn browser_storage_origin_to_json(origin: browser_v1::SessionStorageOrigin) -> BrowserValueExport {
-    let mut redacted = false;
-    // Same scan strategy as cookies: scan raw key=value pairs as one block,
-    // redact displayed values individually.
     let mut scan_input = format!("origin={}", origin.origin);
     let entries = origin
         .entries
         .into_iter()
         .map(|entry| {
-            let value_export =
-                export_browser_text(entry.value.as_str(), SafetyContentKind::BrowserObservation);
+            let value_length_bytes = entry.value.len();
             scan_input.push('\n');
             scan_input.push_str(entry.key.as_str());
-            scan_input.push('=');
-            scan_input.push_str(entry.value.as_str());
-            redacted |= value_export.redacted;
             json!({
                 "key": entry.key,
-                "value": value_export.redacted_text,
+                "value": BROWSER_STORAGE_VALUE_WITHHELD,
+                "value_withheld": true,
+                "value_length_bytes": value_length_bytes,
             })
         })
         .collect::<Vec<_>>();
     let scan = export_browser_text(scan_input.as_str(), SafetyContentKind::BrowserObservation);
+    let withheld = !entries.is_empty();
     BrowserValueExport {
         value: json!({
             "origin": origin.origin,
             "entries": entries,
-            "safety": browser_safety_json(&scan.scan, scan.redacted || redacted),
+            "safety": browser_safety_json(&scan.scan, scan.redacted || withheld),
         }),
         scan: scan.scan,
-        redacted: scan.redacted || redacted,
+        redacted: scan.redacted || withheld,
     }
 }
 
@@ -5097,20 +5091,21 @@ mod tests {
 
     use super::{
         attach_browser_caller_principal_metadata, browser_console_entry_to_json,
-        browser_element_captures_to_json, browser_file_url_to_path,
+        browser_cookie_domain_to_json, browser_element_captures_to_json, browser_file_url_to_path,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
         browser_screenshot_image_observation_hint, browser_session_closed_error_message,
         browser_session_closed_output_json, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_tool_execution_outcome,
-        browser_tool_reports_missing_session, browser_tool_requires_open_session,
-        browser_url_targets_loopback, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, BrowserRuntimeCapabilities,
-        BROWSER_CALLER_PRINCIPAL_HEADER, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
+        browser_tool_execution_outcome, browser_tool_reports_missing_session,
+        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, filter_browser_network_log_entries_since,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_workspace_relative_path,
+        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -5166,6 +5161,51 @@ mod tests {
         assert_eq!(exported.value["message"], "Authorization: [REDACTED_SECRET]");
         assert_eq!(exported.value["safety"]["action"], "redact");
         assert!(exported.redacted);
+    }
+
+    #[test]
+    fn browser_storage_exports_withhold_cookie_and_local_storage_values() {
+        let cookies = browser_cookie_domain_to_json(browser_v1::SessionCookieDomain {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            domain: "accounts.example.test".to_owned(),
+            cookies: vec![
+                browser_v1::SessionCookieEntry {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    name: "sid".to_owned(),
+                    value: "opaque-random-browser-session-1234567890".to_owned(),
+                },
+                browser_v1::SessionCookieEntry {
+                    v: CANONICAL_PROTOCOL_MAJOR,
+                    name: "__Secure-1PSID".to_owned(),
+                    value: "securepsidvalue-1234567890abcdef".to_owned(),
+                },
+            ],
+        });
+        let storage = browser_storage_origin_to_json(browser_v1::SessionStorageOrigin {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            origin: "https://accounts.example.test".to_owned(),
+            entries: vec![browser_v1::SessionStorageEntry {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                key: "sid".to_owned(),
+                value: "local-storage-session-abcdef123456".to_owned(),
+            }],
+        });
+
+        assert_eq!(cookies.value["cookies"][0]["value"], BROWSER_COOKIE_VALUE_WITHHELD);
+        assert_eq!(cookies.value["cookies"][0]["value_withheld"], true);
+        assert_eq!(storage.value["entries"][0]["value"], BROWSER_STORAGE_VALUE_WITHHELD);
+        assert_eq!(storage.value["entries"][0]["value_withheld"], true);
+        assert!(cookies.redacted);
+        assert!(storage.redacted);
+
+        let exported = serde_json::to_string(&json!({
+            "cookies": cookies.value,
+            "storage": storage.value,
+        }))
+        .expect("storage export should serialize");
+        assert!(!exported.contains("opaque-random-browser-session"));
+        assert!(!exported.contains("securepsidvalue"));
+        assert!(!exported.contains("local-storage-session"));
     }
 
     #[test]

@@ -1100,7 +1100,9 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
         "palyra.browser.observe" => {
             "Observe visible browser state, bounded DOM/accessibility visible text evidence, safe current form/storage state, and optional read-only selector geometry/computed-style captures for layout assertions."
         }
-        "palyra.browser.storage" => "Inspect bounded visible cookies and localStorage for diagnostics.",
+        "palyra.browser.storage" => {
+            "Inspect browser cookie/localStorage names and value metadata for diagnostics; secret values are withheld from model-visible output."
+        }
         "palyra.browser.network_log" => {
             "Read bounded browser network logs. Entries include entry_id, phase=response, captured_at_unix_ms, status, latency, and request_url; use since_unix_ms after an action boundary to ignore stale entries."
         }
@@ -1736,6 +1738,7 @@ mod tests {
         assert_eq!(observe.input_schema["properties"]["computed_style_properties"]["maxItems"], 16);
         let storage = registry_entry("palyra.browser.storage").expect("storage entry exists");
         assert!(storage.description.contains("cookies"));
+        assert!(storage.description.contains("withheld"));
         assert_eq!(
             storage.input_schema.pointer("/required/0").and_then(serde_json::Value::as_str),
             Some("session_id")
