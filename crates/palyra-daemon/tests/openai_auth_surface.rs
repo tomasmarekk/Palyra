@@ -1279,6 +1279,20 @@ fn console_openai_provider_mutations_require_console_session_and_csrf() -> Resul
 
     let (cookie, _csrf_token) =
         login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    let callback_state_without_csrf = client
+        .get(console_url(
+            admin_port,
+            "/console/v1/auth/providers/openai/callback-state?attempt_id=missing",
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to call OpenAI callback-state without CSRF")?;
+    assert_eq!(
+        callback_state_without_csrf.status().as_u16(),
+        403,
+        "OpenAI callback-state can poll device OAuth and must enforce CSRF on authenticated sessions"
+    );
+
     let bootstrap_without_csrf = client
         .post(console_url(admin_port, "/console/v1/auth/providers/openai/bootstrap"))
         .header("Cookie", cookie.clone())
@@ -1383,12 +1397,13 @@ fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() 
         "oauth bootstrap should issue a usable authorization URL: {authorization_url}"
     );
 
-    let pending = get_console_json(
+    let pending = get_console_json_with_csrf(
         &client,
         admin_port,
         format!("/console/v1/auth/providers/openai/callback-state?attempt_id={attempt_id}")
             .as_str(),
         &cookie,
+        &csrf_token,
     )?;
     assert_eq!(
         pending.get("state").and_then(Value::as_str),
@@ -1416,12 +1431,13 @@ fn console_openai_oauth_flow_supports_happy_path_refresh_reconnect_and_revoke() 
         "oauth callback should render a success page after a valid callback: {callback_html}; mock={callback_mock_snapshot:?}"
     );
 
-    let callback_state = get_console_json(
+    let callback_state = get_console_json_with_csrf(
         &client,
         admin_port,
         format!("/console/v1/auth/providers/openai/callback-state?attempt_id={attempt_id}")
             .as_str(),
         &cookie,
+        &csrf_token,
     )?;
     assert_eq!(
         callback_state.get("state").and_then(Value::as_str),
@@ -1778,12 +1794,13 @@ fn console_openai_oauth_callback_rejects_malformed_token_response_without_persis
         "failure page must not leak the raw token response: {callback_html}"
     );
 
-    let callback_state = get_console_json(
+    let callback_state = get_console_json_with_csrf(
         &client,
         admin_port,
         format!("/console/v1/auth/providers/openai/callback-state?attempt_id={attempt_id}")
             .as_str(),
         &cookie,
+        &csrf_token,
     )?;
     assert_eq!(
         callback_state.get("state").and_then(Value::as_str),
@@ -1881,12 +1898,13 @@ fn console_openai_oauth_callback_denial_persists_failed_attempt_state() -> Resul
         "denied callback page should escape the callback payload before embedding it in a script tag: {denied_html}"
     );
 
-    let callback_state = get_console_json(
+    let callback_state = get_console_json_with_csrf(
         &client,
         admin_port,
         format!("/console/v1/auth/providers/openai/callback-state?attempt_id={attempt_id}")
             .as_str(),
         &cookie,
+        &csrf_token,
     )?;
     assert_eq!(
         callback_state.get("state").and_then(Value::as_str),
@@ -2282,6 +2300,25 @@ fn get_console_json(client: &Client, admin_port: u16, path: &str, cookie: &str) 
     client
         .get(console_url(admin_port, path))
         .header("Cookie", cookie)
+        .send()
+        .with_context(|| format!("failed to GET console path {path}"))?
+        .error_for_status()
+        .with_context(|| format!("console GET {path} returned non-success status"))?
+        .json::<Value>()
+        .with_context(|| format!("failed to parse console GET {path} response json"))
+}
+
+fn get_console_json_with_csrf(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    cookie: &str,
+    csrf_token: &str,
+) -> Result<Value> {
+    client
+        .get(console_url(admin_port, path))
+        .header("Cookie", cookie)
+        .header("x-palyra-csrf-token", csrf_token)
         .send()
         .with_context(|| format!("failed to GET console path {path}"))?
         .error_for_status()

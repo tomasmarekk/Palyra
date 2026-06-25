@@ -1893,7 +1893,7 @@ impl ControlPlaneClient {
                 urlencoding(attempt_id)
             ),
             None::<&Value>,
-            false,
+            true,
         )
         .await
     }

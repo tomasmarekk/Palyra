@@ -72,7 +72,7 @@ describe("ConsoleApiClient MiniMax auth routes", () => {
     expect(requestUrl(calls[4]?.input)).toBe("/console/v1/auth/providers/minimax/default-profile");
     expect(requestUrl(calls[5]?.input)).toBe("/console/v1/auth/providers/minimax/revoke");
     expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
-    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+    expect(new Headers(calls[3]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
     expect(requestBody(calls[2]?.init?.body)).toContain(
       '"scopes":["group_id","profile","model.completion"]',
     );

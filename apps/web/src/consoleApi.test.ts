@@ -2792,7 +2792,7 @@ describe("ConsoleApiClient", () => {
     expect(connectBody).toContain('"set_default":true');
   });
 
-  it("queries OpenAI callback state with attempt_id and keeps GET requests CSRF-free", async () => {
+  it("queries OpenAI callback state with attempt_id and sends CSRF", async () => {
     const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
     const responses = [
       jsonResponse({
@@ -2842,7 +2842,7 @@ describe("ConsoleApiClient", () => {
     expect(requestUrl(calls[1]?.input)).toBe(
       "/console/v1/auth/providers/openai/callback-state?attempt_id=attempt-1",
     );
-    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
+    expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
 
     expect(requestUrl(calls[2]?.input)).toBe("/console/v1/auth/providers/openai/refresh");
     expect(calls[2]?.init?.method).toBe("POST");

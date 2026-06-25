@@ -1208,7 +1208,9 @@ pub(crate) async fn console_openai_provider_callback_state_handler(
     headers: HeaderMap,
     Query(query): Query<ConsoleOpenAiCallbackStateQuery>,
 ) -> Result<Json<control_plane::OpenAiOAuthCallbackStateEnvelope>, Response> {
-    let _session = authorize_console_session(&state, &headers, false)?;
+    // Requires CSRF despite being a GET: ChatGPT device-flow polling can
+    // advance the attempt and persist OAuth credentials on success.
+    let _session = authorize_console_session(&state, &headers, true)?;
     load_openai_oauth_callback_state(&state, query.attempt_id.as_str()).await.map(Json)
 }
 

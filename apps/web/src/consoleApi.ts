@@ -3815,7 +3815,11 @@ export class ConsoleApiClient {
   ): Promise<OpenAiOAuthCallbackStateEnvelope> {
     const params = new URLSearchParams();
     params.set("attempt_id", attemptId);
-    return this.request(buildPathWithQuery(providerAuthPath(provider, "callback-state"), params));
+    return this.request(
+      buildPathWithQuery(providerAuthPath(provider, "callback-state"), params),
+      {},
+      { csrf: true },
+    );
   }
 
   async reconnectOpenAiProvider(
