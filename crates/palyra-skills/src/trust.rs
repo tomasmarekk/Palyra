@@ -14,9 +14,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use crate::error::SkillPackagingError;
 use crate::manifest::{normalize_identifier, normalize_public_key_hex};
 use crate::models::{SkillManifest, SkillTrustStore};
+
+#[cfg(unix)]
+const TRUST_STORE_FILE_MODE: u32 = 0o600;
 
 impl SkillTrustStore {
     /// Loads and normalizes a trust store from a JSON file.
@@ -168,15 +174,7 @@ fn write_trust_store_atomically(path: &Path, payload: &[u8]) -> Result<(), Skill
     let temp_path = trust_store_temp_path(path)?;
     let mut created_temp = false;
     let result = (|| {
-        let mut temp_file =
-            OpenOptions::new().write(true).create_new(true).open(temp_path.as_path()).map_err(
-                |error| {
-                    SkillPackagingError::Io(format!(
-                        "failed to create temporary trust store {}: {error}",
-                        temp_path.display()
-                    ))
-                },
-            )?;
+        let mut temp_file = create_trust_store_temp_file(temp_path.as_path())?;
         created_temp = true;
         temp_file.write_all(payload).map_err(|error| {
             SkillPackagingError::Io(format!(
@@ -197,12 +195,43 @@ fn write_trust_store_atomically(path: &Path, payload: &[u8]) -> Result<(), Skill
                 path.display(),
                 temp_path.display()
             ))
-        })
+        })?;
+        harden_trust_store_file_permissions(path)
     })();
     if result.is_err() && created_temp {
         let _ = fs::remove_file(temp_path);
     }
     result
+}
+
+fn create_trust_store_temp_file(path: &Path) -> Result<fs::File, SkillPackagingError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(TRUST_STORE_FILE_MODE);
+    }
+    options.open(path).map_err(|error| {
+        SkillPackagingError::Io(format!(
+            "failed to create temporary trust store {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn harden_trust_store_file_permissions(path: &Path) -> Result<(), SkillPackagingError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(TRUST_STORE_FILE_MODE)).map_err(|error| {
+        SkillPackagingError::Io(format!(
+            "failed to set secure permissions on trust store {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_trust_store_file_permissions(_path: &Path) -> Result<(), SkillPackagingError> {
+    Ok(())
 }
 
 fn trust_store_temp_path(path: &Path) -> Result<PathBuf, SkillPackagingError> {

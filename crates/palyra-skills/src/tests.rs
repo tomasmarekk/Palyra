@@ -662,6 +662,36 @@ fn trust_store_save_replaces_existing_file_without_temp_artifact() {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(unix)]
+#[test]
+fn trust_store_save_hardens_atomic_replacement_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = unique_temp_trust_store_path();
+    let old_payload = serde_json::json!({
+        "trusted_publishers": { "old": [hex::encode([1_u8; 32])] },
+        "tofu_publishers": {}
+    });
+    std::fs::write(&path, serde_json::to_vec(&old_payload).expect("json payload"))
+        .expect("old trust store should be written");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("old trust store should be hardened");
+
+    let trusted_key = hex::encode([7_u8; 32]);
+    let mut store = SkillTrustStore::default();
+    store.add_trusted_key("acme", trusted_key.as_str()).expect("trusted key should be accepted");
+
+    store.save(path.as_path()).expect("trust store should save atomically");
+
+    let mode = std::fs::metadata(&path)
+        .expect("saved trust store metadata should load")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "atomic save must keep trust store owner-only");
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn mapping_to_runtime_grants_and_policy_requests() {
     let manifest = parse_manifest_toml(sample_manifest().as_str()).expect("manifest");
