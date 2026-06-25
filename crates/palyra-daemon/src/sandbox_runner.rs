@@ -32,6 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 #[cfg(windows)]
 use std::{
     collections::HashMap,
@@ -3973,9 +3976,13 @@ fn ensure_host_access_path_allowed(
             ),
         });
     }
-    if path_starts_with_case_aware(inspected, workspace_root)
-        || host_roots.iter().any(|root| path_starts_with_case_aware(inspected, root.as_path()))
+    if path_starts_with_case_aware(inspected, workspace_root) {
+        return Ok(());
+    }
+    if let Some(root) =
+        host_roots.iter().find(|root| path_starts_with_case_aware(inspected, root.as_path()))
     {
+        ensure_host_access_path_components_private(root.as_path(), inspected)?;
         return Ok(());
     }
     Err(SandboxProcessRunError {
@@ -3985,6 +3992,91 @@ fn ensure_host_access_path_allowed(
             inspected.display()
         ),
     })
+}
+
+fn ensure_host_access_path_components_private(
+    root: &Path,
+    inspected: &Path,
+) -> Result<(), SandboxProcessRunError> {
+    #[cfg(unix)]
+    {
+        ensure_unix_host_access_path_component_private(root, "approved OS root")?;
+        let Ok(relative) = inspected.strip_prefix(root) else {
+            return Ok(());
+        };
+        let mut current = root.to_path_buf();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(name) => {
+                    current.push(name);
+                    ensure_unix_host_access_path_component_private(
+                        current.as_path(),
+                        "approved OS path component",
+                    )?;
+                }
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(SandboxProcessRunError {
+                        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+                        message: format!(
+                            "host process runner denied invalid approved OS path component '{}'",
+                            inspected.display()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        let _ = inspected;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_unix_host_access_path_component_private(
+    path: &Path,
+    label: &str,
+) -> Result<(), SandboxProcessRunError> {
+    let metadata = fs::metadata(path).map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "host process runner denied {label} '{}' because metadata could not be inspected: {error}",
+            path.display()
+        ),
+    })?;
+    if unix_host_access_metadata_is_private(&metadata) {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+        message: format!(
+            "host process runner denied {label} '{}' because it is not owned by the current user or is writable by group/other",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn unix_host_access_metadata_is_private(metadata: &fs::Metadata) -> bool {
+    const UNSAFE_WRITE_BITS: u32 = 0o022;
+    // SAFETY: `geteuid` reads the current process credentials and has no preconditions.
+    let current_uid = unsafe { libc::geteuid() };
+    metadata.uid() == current_uid && metadata.permissions().mode() & UNSAFE_WRITE_BITS == 0
+}
+
+fn host_access_root_is_private(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        fs::metadata(path).is_ok_and(|metadata| unix_host_access_metadata_is_private(&metadata))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 // Executables (unlike data paths) may additionally live under Program Files, so installed
@@ -4116,8 +4208,9 @@ fn require_prepend_path_directory(
 }
 
 // Host-access scope = operator-configured roots (PALYRA_OS_FILE_ROOTS), or the default user
-// profile/temp roots when no explicit roots are configured. Roots that fail to canonicalize or are
-// not directories are silently dropped: a missing root must narrow the scope, never widen it.
+// profile roots when no explicit roots are configured. Roots that fail to canonicalize, are not
+// directories, or have unsafe ownership/permissions are silently dropped: a missing or unsafe root
+// must narrow the scope, never widen it.
 fn user_owned_host_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(configured_roots) = configured_user_host_roots() {
@@ -4130,11 +4223,6 @@ fn user_owned_host_roots() -> Vec<PathBuf> {
         if let Some(value) = std::env::var_os(key) {
             push_canonical_host_root(&mut roots, PathBuf::from(value));
         }
-    }
-    push_canonical_host_root(&mut roots, std::env::temp_dir());
-    #[cfg(unix)]
-    {
-        push_canonical_host_root(&mut roots, PathBuf::from("/var/tmp"));
     }
     roots
 }
@@ -4156,6 +4244,9 @@ fn push_canonical_host_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
         return;
     };
     if !canonical.is_dir() {
+        return;
+    }
+    if !host_access_root_is_private(canonical.as_path()) {
         return;
     }
     if !roots.iter().any(|existing| same_path_case_aware(existing.as_path(), canonical.as_path())) {
@@ -7770,10 +7861,16 @@ mod tests {
 
     #[test]
     fn resolve_host_working_directory_allows_user_owned_os_roots() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-host-cwd");
         let outside = unique_temp_dir("outside-host-cwd");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", outside.as_os_str());
+        let _home = ScopedEnvVar::set("HOME", outside.as_os_str());
         let canonical_workspace = fs::canonicalize(workspace.as_path())
             .expect("workspace root should canonicalize for host access");
         let canonical_outside =
@@ -7789,6 +7886,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_host_access_roots_exclude_shared_temp_directories() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
+        let home = unique_temp_dir("safe-home-host-roots");
+        fs::create_dir_all(home.as_path()).expect("home fixture should be created");
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", home.as_os_str());
+        let _home = ScopedEnvVar::set("HOME", home.as_os_str());
+        let roots = user_owned_host_roots();
+        let canonical_temp =
+            fs::canonicalize(std::env::temp_dir()).expect("temp dir should canonicalize");
+        let canonical_var_tmp = fs::canonicalize("/var/tmp").ok();
+
+        assert!(!roots.iter().any(|root| same_path_case_aware(root, canonical_temp.as_path())));
+        if let Some(var_tmp) = canonical_var_tmp {
+            assert!(!roots.iter().any(|root| same_path_case_aware(root, var_tmp.as_path())));
+        }
+
+        let _ = fs::remove_dir_all(home.as_path());
     }
 
     #[test]
@@ -7817,6 +7938,42 @@ mod tests {
         .expect("host access cwd should expand safe launch-context path env roots");
 
         assert_eq!(resolved, canonical_nested);
+
+        let _ = fs::remove_dir_all(workspace.as_path());
+        let _ = fs::remove_dir_all(outside.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_access_rejects_writable_approved_root_components() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = unique_temp_dir("workspace-host-writable-root-deny");
+        let outside = unique_temp_dir("outside-host-writable-root-deny");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        fs::set_permissions(outside.as_path(), fs::Permissions::from_mode(0o777))
+            .expect("outside directory permissions should be set");
+        let script = outside.join("helper.py");
+        fs::write(script.as_path(), b"print('unsafe')\n").expect("helper should be written");
+        let canonical_workspace = canonical_workspace_root(workspace.as_path())
+            .expect("workspace root should canonicalize");
+        let canonical_outside =
+            fs::canonicalize(outside.as_path()).expect("outside root should canonicalize");
+        let canonical_script =
+            fs::canonicalize(script.as_path()).expect("outside script should canonicalize");
+
+        let error = validate_host_argument_scope_with_roots(
+            canonical_workspace.as_path(),
+            canonical_workspace.as_path(),
+            "python",
+            &[canonical_script.display().to_string()],
+            &[canonical_outside],
+        )
+        .expect_err("group/other-writable approved root must be denied");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::WorkspaceScopeDenied);
+        assert!(error.message.contains("writable by group/other"), "{}", error.message);
 
         let _ = fs::remove_dir_all(workspace.as_path());
         let _ = fs::remove_dir_all(outside.as_path());
@@ -7897,10 +8054,16 @@ mod tests {
 
     #[test]
     fn host_access_allows_user_owned_script_argument() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-host-script-arg");
         let outside = unique_temp_dir("outside-host-script-arg");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", outside.as_os_str());
+        let _home = ScopedEnvVar::set("HOME", outside.as_os_str());
         let script = outside.join("slow-preview.cjs");
         fs::write(script.as_path(), b"console.log('ok');\n").expect("helper should be written");
         let canonical_workspace = canonical_workspace_root(workspace.as_path())
@@ -10321,10 +10484,16 @@ mod tests {
 
     #[test]
     fn host_access_process_runner_rejects_builtin_mkdir_outside_workspace() {
+        let _guard = PROCESS_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-host-mkdir");
         let outside = unique_temp_dir("outside-host-mkdir");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
         fs::create_dir_all(outside.as_path()).expect("outside directory should be created");
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", outside.as_os_str());
+        let _home = ScopedEnvVar::set("HOME", outside.as_os_str());
         let policy = host_access_policy(workspace.clone());
         let target = outside.join("child");
         let input = format!(
