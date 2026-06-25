@@ -526,8 +526,10 @@ fn provider_waiting_status_message(
 fn provider_model_override_for_routing(
     routing_mode: &str,
     actual_model_id: &str,
+    reason_codes: &[String],
 ) -> Option<String> {
-    (routing_mode == "enforced").then(|| actual_model_id.to_owned())
+    (routing_mode == "enforced" || reason_codes.iter().any(|code| code == "session_model_override"))
+        .then(|| actual_model_id.to_owned())
 }
 
 fn background_run_budget_tokens(parameter_delta_json: Option<&str>) -> Option<u64> {
@@ -1637,6 +1639,7 @@ pub(crate) async fn process_run_stream_message(
     let provider_model_override = provider_model_override_for_routing(
         routing_decision.mode.as_str(),
         routing_decision.actual_model_id.as_str(),
+        routing_decision.reason_codes.as_slice(),
     );
     let lease_provider_id = routing_decision.provider_id.clone();
     let lease_provider_kind = routing_decision.provider_kind.clone();
@@ -4149,14 +4152,38 @@ mod tests {
 
     #[test]
     fn provider_model_override_is_unset_for_publish_only_routing() {
-        assert_eq!(provider_model_override_for_routing("suggest", "MiniMax-M3"), None);
-        assert_eq!(provider_model_override_for_routing("dry_run", "MiniMax-M3"), None);
+        let reason_codes = Vec::new();
+
+        assert_eq!(
+            provider_model_override_for_routing("suggest", "MiniMax-M3", reason_codes.as_slice()),
+            None
+        );
+        assert_eq!(
+            provider_model_override_for_routing("dry_run", "MiniMax-M3", reason_codes.as_slice()),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_model_override_is_set_for_session_override_routing() {
+        let reason_codes = vec!["session_model_override".to_owned()];
+
+        assert_eq!(
+            provider_model_override_for_routing("suggest", "MiniMax-M3", reason_codes.as_slice()),
+            Some("MiniMax-M3".to_owned())
+        );
+        assert_eq!(
+            provider_model_override_for_routing("dry_run", "MiniMax-M3", reason_codes.as_slice()),
+            Some("MiniMax-M3".to_owned())
+        );
     }
 
     #[test]
     fn provider_model_override_is_set_for_enforced_routing() {
+        let reason_codes = Vec::new();
+
         assert_eq!(
-            provider_model_override_for_routing("enforced", "MiniMax-M3"),
+            provider_model_override_for_routing("enforced", "MiniMax-M3", reason_codes.as_slice()),
             Some("MiniMax-M3".to_owned())
         );
     }
