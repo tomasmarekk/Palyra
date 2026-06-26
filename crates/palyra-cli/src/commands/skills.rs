@@ -853,6 +853,8 @@ struct ProcedureSkillInventoryEntry {
     stored_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quarantine_path: Option<String>,
+    #[serde(skip)]
+    body: String,
 }
 
 /// Saves a markdown procedure skill, routing bodies with destructive commands through
@@ -1262,9 +1264,11 @@ fn parse_procedure_skill_document(
     }
 
     let mut fields = BTreeMap::new();
-    for line in lines {
+    let mut frontmatter_closed = false;
+    for line in &mut lines {
         let trimmed = line.trim();
         if trimmed == "---" {
+            frontmatter_closed = true;
             break;
         }
         let Some((key, value)) = trimmed.split_once(':') else {
@@ -1274,6 +1278,9 @@ fn parse_procedure_skill_document(
     }
     if fields.get("schema").map(String::as_str) != Some("palyra.procedural_skill.v1") {
         return Ok(None);
+    }
+    if !frontmatter_closed {
+        anyhow::bail!("procedure skill {} has unterminated frontmatter", path.display());
     }
 
     let slug = fields
@@ -1288,6 +1295,7 @@ fn parse_procedure_skill_document(
         .remove("status")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
 
     Ok(Some(ProcedureSkillInventoryEntry {
         entry_kind: "procedure",
@@ -1299,6 +1307,7 @@ fn parse_procedure_skill_document(
         raw_sha256: fields.remove("raw_sha256").filter(|value| !value.trim().is_empty()),
         stored_sha256: fields.remove("stored_sha256").filter(|value| !value.trim().is_empty()),
         quarantine_path: fields.remove("quarantine_path").filter(|value| !value.trim().is_empty()),
+        body,
     }))
 }
 
@@ -2045,19 +2054,47 @@ fn emit_procedure_check_results(
     Ok(())
 }
 
-/// Maps a procedure skill's frontmatter status onto the shared check-result shape;
-/// procedures carry no signature, so trust is reported as accepted by definition.
+/// Revalidates a procedure skill's editable markdown body before projecting it
+/// onto the shared check-result shape.
 fn procedure_check_result_value(entry: &ProcedureSkillInventoryEntry) -> Value {
     let mut reasons = Vec::new();
-    let check_status = if entry.status == "active" {
-        "ready"
-    } else if entry.status.contains("quarantined") {
+    let actual_stored_sha256 = sha256_hex(entry.body.as_bytes());
+    let stored_sha256_verified = match entry.stored_sha256.as_deref() {
+        Some(expected) if !is_sha256_hex(expected) => {
+            reasons.push("procedure stored_sha256 is malformed".to_owned());
+            false
+        }
+        Some(expected) if expected.eq_ignore_ascii_case(actual_stored_sha256.as_str()) => true,
+        Some(_) => {
+            reasons.push("procedure stored_sha256 does not match stored body".to_owned());
+            false
+        }
+        None => {
+            reasons.push("procedure stored_sha256 is missing".to_owned());
+            false
+        }
+    };
+    let unsafe_findings = scan_procedure_skill_body(entry.body.as_str());
+    if !unsafe_findings.is_empty() {
+        reasons
+            .push(format!("procedure body contains {} unsafe finding(s)", unsafe_findings.len()));
+    }
+    let status_is_quarantined = entry.status.contains("quarantined");
+    if status_is_quarantined {
         reasons.push("procedure raw recipe is quarantined or dry-run only".to_owned());
+    } else if entry.status != "active" {
+        reasons.push(format!("procedure status is {}", entry.status));
+    }
+    let ready = entry.status == "active" && stored_sha256_verified && unsafe_findings.is_empty();
+    let check_status = if ready {
+        "ready"
+    } else if status_is_quarantined || !stored_sha256_verified || !unsafe_findings.is_empty() {
         "blocked"
     } else {
-        reasons.push(format!("procedure status is {}", entry.status));
         "unknown"
     };
+    let quarantine_required =
+        status_is_quarantined || !stored_sha256_verified || !unsafe_findings.is_empty();
 
     json!({
         "entry_kind": "procedure",
@@ -2067,11 +2104,23 @@ fn procedure_check_result_value(entry: &ProcedureSkillInventoryEntry) -> Value {
         "status": entry.status,
         "path": entry.path,
         "check_status": check_status,
-        "trust_accepted": true,
-        "audit_passed": check_status == "ready",
-        "quarantine_required": entry.status.contains("quarantined"),
+        "trust_accepted": ready,
+        "audit_passed": ready,
+        "quarantine_required": quarantine_required,
+        "stored_sha256_verified": stored_sha256_verified,
+        "stored_sha256_actual": actual_stored_sha256,
+        "unsafe_finding_count": unsafe_findings.len(),
+        "unsafe_findings": unsafe_findings.iter().map(|finding| json!({
+            "pattern": finding.pattern,
+            "line_number": finding.line_number,
+            "line_sha256": finding.line_sha256,
+        })).collect::<Vec<_>>(),
         "reasons": reasons,
     })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Re-verifies one installed artifact against the trust store and refreshes the
