@@ -1498,6 +1498,26 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_override_basename_targets_canonical_subdirectory() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let requested_project = workspace.join("app");
+        let active_like_project = workspace.join("secret").join("app");
+        std::fs::create_dir_all(&requested_project).expect("requested app dir should exist");
+        std::fs::create_dir_all(&active_like_project).expect("nested app dir should exist");
+
+        let roots = resolve_workspace_root_override(std::slice::from_ref(&workspace), "app", false)
+            .expect("workspace_root basename should resolve canonically");
+
+        assert_eq!(
+            roots.roots,
+            vec![std::fs::canonicalize(&requested_project)
+                .expect("requested app should canonicalize")]
+        );
+        assert_eq!(roots.risk_path_prefixes, vec!["app"]);
+    }
+
+    #[test]
     fn workspace_root_override_accepts_virtual_workspace_root_alias() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");

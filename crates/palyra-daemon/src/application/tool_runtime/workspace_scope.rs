@@ -525,9 +525,8 @@ pub(crate) fn relative_path_should_use_active_root(
 /// Returns true when an explicit `workspace_root` override refers to the
 /// active focus directory itself.
 ///
-/// Accepted spellings: the canonicalized absolute path of the focus, its full
-/// root-relative path, or its bare basename (operators commonly pass just the
-/// project directory name).
+/// Accepted spellings: the canonicalized absolute path of the focus or its
+/// full root-relative path.
 pub(crate) fn workspace_root_override_targets_active_root(
     workspace_root: &str,
     active: &ActiveWorkspaceRoot,
@@ -548,13 +547,7 @@ pub(crate) fn workspace_root_override_targets_active_root(
     if normalized == "." {
         return false;
     }
-    if normalized == active.relative_path {
-        return true;
-    }
-    Path::new(active.relative_path.as_str())
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|basename| normalized == basename)
+    normalized == active.relative_path
 }
 
 pub(crate) fn workspace_focus_path_is_runtime_internal(path: &str) -> bool {
@@ -735,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_override_accepts_active_root_relative_path_or_basename() {
+    fn workspace_root_override_accepts_only_exact_active_root_paths() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let active_dir = tempdir.path().join("agent-workspaces").join("harness-smoke-20260525");
         fs::create_dir_all(active_dir.as_path()).expect("active directory should exist");
@@ -748,11 +741,14 @@ mod tests {
             "agent-workspaces/harness-smoke-20260525",
             &active
         ));
-        assert!(workspace_root_override_targets_active_root("harness-smoke-20260525", &active));
         assert!(workspace_root_override_targets_active_root(
             active.root.to_string_lossy().as_ref(),
             &active
         ));
+        assert!(
+            !workspace_root_override_targets_active_root("harness-smoke-20260525", &active),
+            "bare basenames are ambiguous when another workspace subdirectory has the same name"
+        );
         assert!(!workspace_root_override_targets_active_root(
             "other/harness-smoke-20260525",
             &active

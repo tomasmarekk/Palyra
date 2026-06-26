@@ -3386,6 +3386,34 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_workspace_root_basename_targets_canonical_subdirectory() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let requested_project = workspace.join("app");
+        let active_like_project = workspace.join("secret").join("app");
+        fs::create_dir_all(&requested_project).expect("requested app dir should exist");
+        fs::create_dir_all(&active_like_project).expect("nested app dir should exist");
+        fs::write(requested_project.join("marker.txt"), "requested\n")
+            .expect("requested marker should be written");
+        fs::write(active_like_project.join("marker.txt"), "nested\n")
+            .expect("nested marker should be written");
+        let input =
+            parse_workspace_read_file_input(br#"{"path":"marker.txt","workspace_root":"app"}"#)
+                .expect("workspace_root override should parse");
+        let roots = resolve_workspace_file_roots_for_override(
+            WORKSPACE_READ_FILE_TOOL_NAME,
+            std::slice::from_ref(&workspace),
+            input.workspace_root.as_deref(),
+        )
+        .expect("workspace_root basename should resolve canonically");
+
+        let output =
+            read_workspace_file_from_roots(roots.as_slice(), &input).expect("file should read");
+
+        assert_eq!(output.text.as_deref(), Some("requested\n"));
+    }
+
+    #[test]
     fn workspace_file_tools_accept_virtual_workspace_root_override_alias() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");
