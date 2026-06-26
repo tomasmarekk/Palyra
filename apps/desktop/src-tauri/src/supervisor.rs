@@ -1059,6 +1059,12 @@ impl ControlCenter {
 
     /// Requests all enabled supervised services to start.
     pub(crate) fn start_all(&mut self) {
+        let refresh_result = self.refresh_runtime_tokens_from_active_config();
+        self.append_runtime_refresh_result(
+            refresh_result,
+            "active config runtime settings refreshed before supervised runtime start",
+            "active config runtime refresh failed before supervised runtime start",
+        );
         self.gateway.desired_running = true;
         self.browserd.desired_running = self.persisted.browser_service_enabled;
         self.node_host.desired_running = self.node_host_installed();
@@ -1189,6 +1195,12 @@ impl ControlCenter {
                 )
                 .as_str(),
             );
+            let refresh_result = self.refresh_runtime_tokens_from_config_path(Some(path.as_path()));
+            self.append_runtime_refresh_result(
+                refresh_result,
+                "watched config runtime settings refreshed while runtime is stopped",
+                "watched config runtime refresh failed while runtime is stopped",
+            );
             return;
         }
         self.append_supervisor_log(
@@ -1196,21 +1208,12 @@ impl ControlCenter {
             format!("watched config changed at {}; restarting supervised runtime", path.display())
                 .as_str(),
         );
-        match self.refresh_runtime_tokens_from_config_path(Some(path.as_path())) {
-            Ok(true) => self.append_supervisor_log(
-                ServiceKind::Gateway,
-                "watched config runtime settings refreshed for supervised runtime",
-            ),
-            Ok(false) => {}
-            Err(error) => self.append_supervisor_log(
-                ServiceKind::Gateway,
-                format!(
-                    "watched config runtime refresh failed: {}",
-                    sanitize_log_line(error.to_string().as_str())
-                )
-                .as_str(),
-            ),
-        }
+        let refresh_result = self.refresh_runtime_tokens_from_config_path(Some(path.as_path()));
+        self.append_runtime_refresh_result(
+            refresh_result,
+            "watched config runtime settings refreshed for supervised runtime",
+            "watched config runtime refresh failed",
+        );
         self.restart_all();
     }
 
@@ -1628,6 +1631,23 @@ impl ControlCenter {
             self.sync_service_bound_ports();
         }
         Ok(auth_changed || runtime_changed)
+    }
+
+    fn append_runtime_refresh_result(
+        &mut self,
+        result: Result<bool>,
+        refreshed_message: &str,
+        failed_prefix: &str,
+    ) {
+        match result {
+            Ok(true) => self.append_supervisor_log(ServiceKind::Gateway, refreshed_message),
+            Ok(false) => {}
+            Err(error) => self.append_supervisor_log(
+                ServiceKind::Gateway,
+                format!("{}: {}", failed_prefix, sanitize_log_line(error.to_string().as_str()))
+                    .as_str(),
+            ),
+        }
     }
 
     fn sync_service_bound_ports(&mut self) {

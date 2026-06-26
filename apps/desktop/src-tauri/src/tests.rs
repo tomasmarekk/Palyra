@@ -175,6 +175,62 @@ fn config_reload_watch_restarts_desired_runtime_on_config_change() {
 }
 
 #[test]
+fn config_reload_watch_refreshes_runtime_tokens_while_stopped() {
+    let fixture = TempFixtureDir::new();
+    let config_path = write_config_file(
+        fixture.path(),
+        r#"
+version = 1
+
+[admin]
+auth_token = "old-admin-token"
+
+[tool_call.browser_service]
+auth_token = "old-browser-token"
+"#,
+    );
+    let mut control_center = build_test_control_center(fixture.path());
+    control_center.active_profile.config_path = Some(config_path.clone());
+    control_center.config_reload_watch =
+        DesktopConfigReloadWatchState::from_profile(&control_center.active_profile);
+    control_center.gateway.desired_running = false;
+    control_center.browserd.desired_running = false;
+    control_center.admin_token = "old-admin-token".to_owned();
+    control_center.browser_auth_token = "old-browser-token".to_owned();
+
+    std::thread::sleep(Duration::from_millis(100));
+    write_file(
+        config_path.as_path(),
+        r#"
+version = 1
+
+[admin]
+auth_token = "new-admin-token"
+
+[tool_call.browser_service]
+auth_token = "new-browser-token"
+"#,
+    );
+    control_center.reconcile_config_reload_watch();
+
+    assert_eq!(control_center.admin_token, "new-admin-token");
+    assert_eq!(control_center.browser_auth_token, "new-browser-token");
+    assert!(!control_center.gateway.desired_running);
+    assert!(!control_center.browserd.desired_running);
+    assert!(control_center.gateway.logs.iter().any(|line| {
+        line.line.contains("runtime settings refreshed while runtime is stopped")
+    }));
+
+    control_center.admin_token = "stale-admin-token".to_owned();
+    control_center.browser_auth_token = "stale-browser-token".to_owned();
+    control_center.start_all();
+
+    assert_eq!(control_center.admin_token, "new-admin-token");
+    assert_eq!(control_center.browser_auth_token, "new-browser-token");
+    assert!(control_center.gateway.desired_running);
+}
+
+#[test]
 fn browserd_port_fallback_restarts_gateway_for_new_endpoint() {
     let fixture = TempFixtureDir::new();
     let health_listener =
