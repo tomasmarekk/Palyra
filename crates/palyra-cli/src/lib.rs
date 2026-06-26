@@ -5628,7 +5628,7 @@ fn tool_approval_prompt_line(approval: &common_v1::ToolApprovalRequest) -> Strin
     format!(
         "agent.approval.required tool={} summary={}",
         safe_stream_label_for_output(approval.tool_name.as_str()),
-        sanitized_optional_text_field(approval.request_summary.as_str())
+        sanitized_optional_approval_summary_text_field(approval.request_summary.as_str())
     )
 }
 
@@ -5857,7 +5857,9 @@ fn agent_text_event_line(event: &common_v1::RunStreamEvent) -> Option<String> {
         common_v1::run_stream_event::Body::ToolApprovalRequest(approval_request) => Some(format!(
             "agent.tool.approval.request tool_name={} summary={}",
             safe_stream_label_for_output(approval_request.tool_name.as_str()),
-            sanitized_optional_text_field(approval_request.request_summary.as_str())
+            sanitized_optional_approval_summary_text_field(
+                approval_request.request_summary.as_str()
+            )
         )),
         _ => None,
     }
@@ -5985,6 +5987,31 @@ fn sanitized_optional_text_field(value: &str) -> String {
     } else {
         quoted_text_field(sanitized.as_str())
     }
+}
+
+fn sanitized_optional_approval_summary_text_field(value: &str) -> String {
+    if let Some(sanitized) = sanitize_json_approval_summary_text(value) {
+        return if sanitized.is_empty() {
+            "none".to_owned()
+        } else {
+            quoted_text_field(sanitized.as_str())
+        };
+    }
+    sanitized_optional_text_field(value)
+}
+
+fn sanitize_json_approval_summary_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    if !matches!(parsed, Value::Object(_) | Value::Array(_)) {
+        return None;
+    }
+    let redacted = redact_stream_json_value(parsed, None, 0);
+    let serialized = serde_json::to_string(&redacted).unwrap_or_else(|_| REDACTED.to_owned());
+    Some(sanitize_diagnostic_error(serialized.as_str()).trim().to_owned())
 }
 
 fn sanitized_optional_json_text(value: &str) -> Value {
@@ -7230,6 +7257,18 @@ mod agent_stream_output_tests {
 
     #[test]
     fn text_stream_renders_tool_approval_request_details() {
+        let request_summary = json!({
+            "tool_name": "palyra.process.run",
+            "input_json": {
+                "cmd": "palyra doctor",
+                "token": "summary-token",
+                "headers": {
+                    "authorization": "Bearer summary-auth"
+                },
+                "args": ["--api-key", "summary-api-key", "--verbose"]
+            }
+        })
+        .to_string();
         let event = common_v1::RunStreamEvent {
             v: CANONICAL_PROTOCOL_MAJOR,
             run_id: None,
@@ -7240,7 +7279,7 @@ mod agent_stream_output_tests {
                     tool_name: "palyra.process.run".to_owned(),
                     input_json: br#"{"cmd":"palyra doctor","token":"raw-token"}"#.to_vec(),
                     approval_required: true,
-                    request_summary: "run a command with access_token=browser-secret".to_owned(),
+                    request_summary,
                     prompt: None,
                 },
             )),
@@ -7249,29 +7288,44 @@ mod agent_stream_output_tests {
         let line = agent_text_event_line(&event).expect("approval request should render");
 
         assert!(line.contains("tool_name=palyra.process.run"), "{line}");
-        assert!(line.contains("summary=\"run a command with access_token=<redacted>\""), "{line}");
-        assert!(!line.contains("browser-secret"), "{line}");
+        assert!(line.contains("summary=\""), "{line}");
+        assert!(line.contains("palyra doctor"), "{line}");
+        assert!(line.contains(REDACTED), "{line}");
+        assert!(!line.contains("summary-token"), "{line}");
+        assert!(!line.contains("summary-auth"), "{line}");
+        assert!(!line.contains("summary-api-key"), "{line}");
         assert!(!line.contains("raw-token"), "{line}");
-        assert!(!line.contains("input_json"), "{line}");
     }
 
     #[test]
     fn terminal_approval_prompt_renders_decision_details() {
+        let request_summary = json!({
+            "tool_name": "palyra.process.run",
+            "input_json": {
+                "cmd": "palyra doctor",
+                "token": "summary-token",
+                "authorization": "Bearer summary-auth"
+            }
+        })
+        .to_string();
         let approval = common_v1::ToolApprovalRequest {
             proposal_id: None,
             approval_id: None,
             tool_name: "palyra.process.run".to_owned(),
             input_json: br#"{"cmd":"palyra doctor","token":"raw-token"}"#.to_vec(),
             approval_required: true,
-            request_summary: "run a command with access_token=browser-secret".to_owned(),
+            request_summary,
             prompt: None,
         };
 
         let line = tool_approval_prompt_line(&approval);
 
         assert!(line.contains("tool=palyra.process.run"), "{line}");
-        assert!(line.contains("summary=\"run a command with access_token=<redacted>\""), "{line}");
-        assert!(!line.contains("browser-secret"), "{line}");
+        assert!(line.contains("summary=\""), "{line}");
+        assert!(line.contains("palyra doctor"), "{line}");
+        assert!(line.contains(REDACTED), "{line}");
+        assert!(!line.contains("summary-token"), "{line}");
+        assert!(!line.contains("summary-auth"), "{line}");
         assert!(!line.contains("raw-token"), "{line}");
     }
 
