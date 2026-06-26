@@ -2429,8 +2429,17 @@ async fn build_previous_run_context_prompt_includes_recent_turns_when_available(
         .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
             run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
             seq: 1,
+            event_type: "provider_turn_output".to_owned(),
+            payload_json: r#"{"full_text":"first assistant reply"}"#.to_owned(),
+        })
+        .expect("provider_turn_output tape event should persist");
+    state
+        .journal_store
+        .append_orchestrator_tape_event(&OrchestratorTapeAppendRequest {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned(),
+            seq: 2,
             event_type: "message.replied".to_owned(),
-            payload_json: r#"{"reply_text":"first assistant reply"}"#.to_owned(),
+            payload_json: r#"{"reply_text":"<redacted>"}"#.to_owned(),
         })
         .expect("message.replied tape event should persist");
 

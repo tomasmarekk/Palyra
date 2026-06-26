@@ -74,6 +74,7 @@ use crate::{
     },
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
+use palyra_common::redaction::REDACTED;
 use palyra_common::runtime_preview::{
     RuntimeDecisionActorKind, RuntimeDecisionEventType, RuntimeDecisionPayload,
     RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
@@ -1086,15 +1087,28 @@ fn extract_previous_run_turn_from_tape_event(
         "message.replied" => ("assistant", payload.get("reply_text").and_then(Value::as_str)?),
         _ => return None,
     };
+    normalize_previous_run_context_text(raw_text).map(|text| (speaker, text))
+}
+
+fn provider_turn_output_text_from_tape_event(event: &OrchestratorTapeRecord) -> Option<String> {
+    if event.event_type != "provider_turn_output" {
+        return None;
+    }
+    let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+    let text = payload.get("full_text").and_then(Value::as_str)?;
+    normalize_previous_run_context_text(text)
+}
+
+fn normalize_previous_run_context_text(raw_text: &str) -> Option<String> {
+    if raw_text == REDACTED {
+        return None;
+    }
     let normalized = raw_text.replace(['\r', '\n'], " ");
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return None;
     }
-    Some((
-        speaker,
-        truncate_with_ellipsis(trimmed.to_owned(), MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS),
-    ))
+    Some(truncate_with_ellipsis(trimmed.to_owned(), MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1118,11 +1132,36 @@ async fn load_previous_run_context_turns(
         Err(error) => return Err(error),
     };
 
-    let mut turns = tape_snapshot
-        .events
-        .iter()
-        .filter_map(extract_previous_run_turn_from_tape_event)
-        .collect::<Vec<_>>();
+    let mut turns = Vec::new();
+    let mut provider_turn_output_assistant_fallback = None;
+    for event in &tape_snapshot.events {
+        if let Some(text) = provider_turn_output_text_from_tape_event(event) {
+            provider_turn_output_assistant_fallback = Some(text);
+            continue;
+        }
+        match extract_previous_run_turn_from_tape_event(event) {
+            Some(("assistant", text)) => {
+                provider_turn_output_assistant_fallback = None;
+                turns.push(("assistant", text));
+            }
+            Some(("user", text)) => {
+                if let Some(text) = provider_turn_output_assistant_fallback.take() {
+                    turns.push(("assistant", text));
+                }
+                turns.push(("user", text));
+            }
+            Some((speaker, text)) => turns.push((speaker, text)),
+            None if event.event_type == "message.replied" => {
+                if let Some(text) = provider_turn_output_assistant_fallback.take() {
+                    turns.push(("assistant", text));
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some(text) = provider_turn_output_assistant_fallback.take() {
+        turns.push(("assistant", text));
+    }
     if turns.is_empty() {
         return Ok(Vec::new());
     }
