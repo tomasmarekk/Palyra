@@ -6719,6 +6719,20 @@ fn is_python_runtime_command(process_command: &str) -> bool {
         || command == "python"
         || command == "python3"
         || command.starts_with("python3.")
+        || is_versioned_pip_command(command.as_str())
+}
+
+fn is_versioned_pip_command(command: &str) -> bool {
+    let Some(version) = command.strip_prefix("pip") else {
+        return false;
+    };
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|ch| ch.is_ascii_digit())
+        && minor.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn is_palyra_cli_program(program: &Path) -> bool {
@@ -10067,7 +10081,17 @@ mod tests {
         let state_root = unique_temp_dir("state-python-command-detection");
         let _state_root = ScopedEnvVar::set(super::PALYRA_STATE_ROOT_ENV, state_root.as_os_str());
 
-        for command in ["python", "python3", "python3.14", "py", "pip", "pip3"] {
+        for command in [
+            "python",
+            "python3",
+            "python3.14",
+            "py",
+            "pip",
+            "pip3",
+            "pip3.11",
+            "pip3.12",
+            "pip3.14.exe",
+        ] {
             assert!(
                 super::workspace_python_environment(command, Path::new("workspace-root"))
                     .expect("python environment should resolve")
@@ -10075,12 +10099,14 @@ mod tests {
                 "{command} should be treated as a Python runtime command"
             );
         }
-        assert!(
-            super::workspace_python_environment("npm", Path::new("workspace-root"))
-                .expect("non-Python command should not require state root")
-                .is_none(),
-            "non-Python commands should not receive Python-specific environment"
-        );
+        for command in ["npm", "pipx", "pip3.local", "pip3.", "pip.11"] {
+            assert!(
+                super::workspace_python_environment(command, Path::new("workspace-root"))
+                    .expect("non-Python command should not require state root")
+                    .is_none(),
+                "{command} should not receive Python-specific environment"
+            );
+        }
     }
 
     #[test]
