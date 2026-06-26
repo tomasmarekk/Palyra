@@ -5088,6 +5088,7 @@ mod tests {
     use std::{process::Command, time::Duration};
     use tonic::{Code, Status};
 
+    #[cfg(windows)]
     fn decode_powershell_encoded_cli_command(command: &str) -> String {
         let prefix = "powershell.exe -NoProfile -NonInteractive -EncodedCommand \"";
         let encoded = command
