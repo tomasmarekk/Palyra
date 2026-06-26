@@ -565,11 +565,10 @@ impl AgentRegistry {
     }
 
     /// Startup helper that guarantees a usable default agent: keeps an
-    /// existing default (re-syncing the managed `local-default` agent's
-    /// workspace root to the current checkout), creates `local-default` for
-    /// an empty registry, promotes a sole agent, and deliberately does
-    /// nothing when several agents exist but none is default - that is an
-    /// operator decision.
+    /// existing default (only narrowing the managed `local-default` agent's
+    /// workspace root), creates `local-default` for an empty registry,
+    /// promotes a sole agent, and deliberately does nothing when several
+    /// agents exist but none is default - that is an operator decision.
     ///
     /// # Errors
     /// Propagates the underlying list/create/set-default/persist failures.
@@ -627,7 +626,7 @@ impl AgentRegistry {
         }
     }
 
-    /// Repoints the managed `local-default` agent at `workspace_root`,
+    /// Narrows the managed `local-default` agent to `workspace_root`,
     /// returning whether anything changed; any other agent id is left
     /// untouched (operator-created agents own their workspace roots).
     fn sync_local_default_agent_workspace_root(
@@ -648,12 +647,18 @@ impl AgentRegistry {
             }
 
             let agent_dir = PathBuf::from(agent.agent_dir.as_str());
-            let workspace_roots = resolve_workspace_roots(
+            let resolved_workspace_roots = resolve_workspace_roots(
                 &[workspace_root.to_string_lossy().into_owned()],
                 agent_dir.as_path(),
                 true,
             )?;
-            let workspace_roots = workspace_roots
+            if !workspace_root_update_is_no_wider(
+                agent.workspace_roots.as_slice(),
+                resolved_workspace_roots.as_slice(),
+            ) {
+                return Ok(RegistryMutation::unchanged(false));
+            }
+            let workspace_roots = resolved_workspace_roots
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
@@ -1173,6 +1178,28 @@ fn persist_registry_locked(
         .map_err(|source| AgentRegistryError::WriteRegistry { path: path.to_path_buf(), source })
 }
 
+fn workspace_root_update_is_no_wider(
+    current_roots: &[String],
+    replacement_roots: &[PathBuf],
+) -> bool {
+    if current_roots.is_empty() || replacement_roots.is_empty() {
+        return false;
+    }
+    let mut canonical_current_roots = Vec::with_capacity(current_roots.len());
+    for root in current_roots {
+        let Ok(canonical) = fs::canonicalize(root) else {
+            return false;
+        };
+        if !canonical.is_dir() {
+            return false;
+        }
+        canonical_current_roots.push(canonical);
+    }
+    replacement_roots.iter().all(|replacement| {
+        canonical_current_roots.iter().any(|current| replacement.starts_with(current.as_path()))
+    })
+}
+
 /// RAII guard for the cross-process lock file; dropping removes the file
 /// (best effort - a leaked file is reclaimed as stale by later writers).
 struct RegistryLock {
@@ -1660,11 +1687,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_local_default_agent_updates_stale_local_default_workspace_root() {
+    fn ensure_local_default_agent_narrows_existing_workspace_root() {
         let temp = tempdir().expect("tempdir should be created");
         let identity_root = temp.path().join("state").join("identity");
-        let old_workspace = temp.path().join("state").join("workspace");
-        let new_workspace = temp.path().join("workspace");
+        let old_workspace = temp.path().join("workspace");
+        let new_workspace = old_workspace.join("project");
         fs::create_dir_all(old_workspace.as_path()).expect("old workspace should exist");
         fs::create_dir_all(new_workspace.as_path()).expect("new workspace should exist");
         let registry =
@@ -1683,11 +1710,11 @@ mod tests {
                 set_default: true,
                 allow_absolute_paths: true,
             })
-            .expect("stale local default agent should be created");
+            .expect("local default agent should be created");
 
         let outcome = registry
             .ensure_local_default_agent(new_workspace.as_path(), Some("MiniMax-M2.7".to_owned()))
-            .expect("local default agent should synchronize");
+            .expect("local default agent should narrow");
 
         assert_eq!(
             outcome,
@@ -1696,6 +1723,48 @@ mod tests {
         let page = registry.list_agents(None, Some(10)).expect("agents should list");
         let canonical_workspace =
             fs::canonicalize(new_workspace.as_path()).expect("new workspace should canonicalize");
+        assert_eq!(
+            page.agents[0].workspace_roots,
+            vec![canonical_workspace.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn ensure_local_default_agent_preserves_narrow_workspace_when_startup_root_is_broader() {
+        let temp = tempdir().expect("tempdir should be created");
+        let identity_root = temp.path().join("state").join("identity");
+        let broad_workspace = temp.path().join("workspace");
+        let narrow_workspace = broad_workspace.join("project");
+        fs::create_dir_all(narrow_workspace.as_path()).expect("narrow workspace should exist");
+        let registry =
+            AgentRegistry::open(identity_root.as_path()).expect("registry should initialize");
+
+        registry
+            .create_agent(AgentCreateRequest {
+                agent_id: "local-default".to_owned(),
+                display_name: "LocalDefaultAgent".to_owned(),
+                agent_dir: None,
+                workspace_roots: vec![narrow_workspace.to_string_lossy().into_owned()],
+                default_model_profile: None,
+                execution_backend_preference: None,
+                default_tool_allowlist: Vec::new(),
+                default_skill_allowlist: Vec::new(),
+                set_default: true,
+                allow_absolute_paths: true,
+            })
+            .expect("narrow local default agent should be created");
+
+        let outcome = registry
+            .ensure_local_default_agent(broad_workspace.as_path(), Some("MiniMax-M2.7".to_owned()))
+            .expect("local default agent should preserve narrower root");
+
+        assert_eq!(
+            outcome,
+            AgentDefaultEnsureOutcome::AlreadyConfigured { agent_id: "local-default".to_owned() }
+        );
+        let page = registry.list_agents(None, Some(10)).expect("agents should list");
+        let canonical_workspace = fs::canonicalize(narrow_workspace.as_path())
+            .expect("narrow workspace should canonicalize");
         assert_eq!(
             page.agents[0].workspace_roots,
             vec![canonical_workspace.to_string_lossy().into_owned()]
