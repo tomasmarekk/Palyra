@@ -15880,14 +15880,14 @@ impl JournalStore {
                     principal = ?1 AND
                     (?2 IS NULL OR channel = ?2) AND
                     (?3 IS NULL OR agent_id = ?3) AND
-                    (?4 IS NULL OR path = ?4 OR path LIKE ?5) AND
+                    (?4 IS NULL OR path = ?4 OR path LIKE ?5 ESCAPE '\') AND
                     (?6 = 1 OR state = 'active')
                 ORDER BY path ASC
                 LIMIT ?7
             "#,
         )?;
         let prefix = filter.prefix.as_deref().map(normalize_workspace_prefix).transpose()?;
-        let prefix_like = prefix.as_deref().map(|value| format!("{value}/%"));
+        let prefix_like = prefix.as_deref().map(workspace_prefix_like_pattern);
         let mut rows = statement.query(params![
             filter.principal.as_str(),
             filter.channel.as_deref(),
@@ -16314,7 +16314,7 @@ impl JournalStore {
             });
         }
         let prefix = request.prefix.as_deref().map(normalize_workspace_prefix).transpose()?;
-        let prefix_like = prefix.as_deref().map(|value| format!("{value}/%"));
+        let prefix_like = prefix.as_deref().map(workspace_prefix_like_pattern);
         let embedding_model_id = self.memory_embedding_provider.model_name().to_owned();
         let embedding_dims = self.memory_embedding_provider.dimensions();
         let now = current_unix_ms()?;
@@ -16388,7 +16388,7 @@ impl JournalStore {
                         documents.principal = ?2 AND
                         (?3 IS NULL OR documents.channel = ?3) AND
                         (?4 IS NULL OR documents.agent_id = ?4) AND
-                        (?5 IS NULL OR documents.path = ?5 OR documents.path LIKE ?6) AND
+                        (?5 IS NULL OR documents.path = ?5 OR documents.path LIKE ?6 ESCAPE '\') AND
                         (?7 = 1 OR chunks.is_latest = 1) AND
                         documents.state = 'active' AND
                         (?8 = 1 OR documents.risk_state != 'quarantined')
@@ -16507,7 +16507,7 @@ impl JournalStore {
                     documents.principal = ?1 AND
                     (?2 IS NULL OR documents.channel = ?2) AND
                     (?3 IS NULL OR documents.agent_id = ?3) AND
-                    (?4 IS NULL OR documents.path = ?4 OR documents.path LIKE ?5) AND
+                    (?4 IS NULL OR documents.path = ?4 OR documents.path LIKE ?5 ESCAPE '\') AND
                     (?6 = 1 OR chunks.is_latest = 1) AND
                     documents.state = 'active' AND
                     (?7 = 1 OR documents.risk_state != 'quarantined') AND
@@ -16851,6 +16851,10 @@ fn enforce_owner_only_permissions(_path: &Path, _mode: u32) -> Result<(), Journa
 fn normalize_workspace_prefix(raw: &str) -> Result<String, JournalError> {
     normalize_workspace_path_prefix(raw)
         .map_err(|error| JournalError::InvalidWorkspacePath { reason: error.to_string() })
+}
+
+fn workspace_prefix_like_pattern(prefix: &str) -> String {
+    format!("{}/%", escape_sql_like(prefix))
 }
 
 fn workspace_title_from_path(path: &str) -> String {
@@ -21727,9 +21731,9 @@ mod tests {
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
         ToolResultArtifactReadRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
-        WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
-        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
-        MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
+        WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest,
+        WorkspaceSearchRequest, CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS,
+        MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
         RECALL_ARTIFACT_KIND_SESSION_SEARCH,
     };
 
@@ -28003,6 +28007,93 @@ mod tests {
         assert!(
             hits.iter().all(|hit| hit.document.path != "projects/client-b/build-target.md"),
             "directory prefix must not leak sibling project documents"
+        );
+    }
+
+    #[test]
+    fn workspace_prefix_filters_treat_like_wildcards_as_literals() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        for (path, content) in [
+            ("projects/%/literal.md", "Wildcard literal workspace sentinel build target alpha."),
+            (
+                "projects/s079-a/build-target.md",
+                "Wildcard sibling workspace sentinel build target beta.",
+            ),
+            (
+                "projects/s079_/literal.md",
+                "Underscore literal workspace sentinel release target alpha.",
+            ),
+            (
+                "projects/s079-a/release-target.md",
+                "Underscore sibling workspace sentinel release target beta.",
+            ),
+        ] {
+            store
+                .upsert_workspace_document(&sample_workspace_write_request(path, content))
+                .expect("workspace document should be created");
+        }
+
+        let percent_list = store
+            .list_workspace_documents(&WorkspaceDocumentListFilter {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                agent_id: Some("agent:writer".to_owned()),
+                prefix: Some("projects/%/".to_owned()),
+                include_deleted: false,
+                limit: 10,
+            })
+            .expect("workspace list should treat percent as a literal path segment");
+        let percent_paths =
+            percent_list.iter().map(|document| document.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(percent_paths, vec!["projects/%/literal.md"]);
+
+        let percent_hits = store
+            .search_workspace_documents(&WorkspaceSearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                agent_id: Some("agent:writer".to_owned()),
+                query: "wildcard workspace sentinel".to_owned(),
+                prefix: Some("projects/%/".to_owned()),
+                top_k: 8,
+                min_score: 0.0,
+                include_historical: false,
+                include_quarantined: false,
+            })
+            .expect("workspace search should treat percent as a literal path segment");
+        assert!(
+            percent_hits.iter().any(|hit| hit.document.path == "projects/%/literal.md"),
+            "literal percent prefix should match the literal percent directory"
+        );
+        assert!(
+            percent_hits.iter().all(|hit| hit.document.path != "projects/s079-a/build-target.md"),
+            "literal percent prefix must not expand to sibling project directories"
+        );
+
+        let underscore_hits = store
+            .search_workspace_documents(&WorkspaceSearchRequest {
+                principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                agent_id: Some("agent:writer".to_owned()),
+                query: "underscore workspace sentinel".to_owned(),
+                prefix: Some("projects/s079_/".to_owned()),
+                top_k: 8,
+                min_score: 0.0,
+                include_historical: false,
+                include_quarantined: false,
+            })
+            .expect("workspace search should treat underscore as a literal path segment");
+        assert!(
+            underscore_hits.iter().any(|hit| hit.document.path == "projects/s079_/literal.md"),
+            "literal underscore prefix should match the literal underscore directory"
+        );
+        assert!(
+            underscore_hits
+                .iter()
+                .all(|hit| hit.document.path != "projects/s079-a/release-target.md"),
+            "literal underscore prefix must not expand to sibling project directories"
         );
     }
 
