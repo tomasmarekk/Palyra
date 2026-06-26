@@ -9426,6 +9426,7 @@ async fn routines_tool_flow_supports_upsert_listing_pause_resume_and_schedule_pr
         "delivery_failure_mode": "specific_channel",
         "delivery_failure_channel": "ops:alerts",
         "silent_policy": "failure_only",
+        "success_visibility": "audit_only",
         "cooldown_ms": 60_000,
         "session_key": "ops:heartbeat",
         "session_label": "Ops heartbeat",
