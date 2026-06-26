@@ -1708,7 +1708,11 @@ fn should_project_tool_result_for_model(
     outcome: &ToolExecutionOutcome,
     budget: &ToolTurnBudget,
 ) -> bool {
-    if os_file_result_can_stay_inline(tool_name, outcome.output_json.as_slice(), budget) {
+    if os_file_redacted_read_result_can_stay_inline(
+        tool_name,
+        outcome.output_json.as_slice(),
+        budget,
+    ) {
         return false;
     }
     match projection_policy_for_tool(tool_name) {
@@ -1720,11 +1724,10 @@ fn should_project_tool_result_for_model(
     }
 }
 
-// Small OS-file list_dir and redacted text-only read results bypass artifact
-// projection: cleanup and config-audit workflows need the full payload
-// model-visible, but read text can stay inline only after the runtime marks it
-// non-authoritative redacted placeholder text.
-fn os_file_result_can_stay_inline(
+// Small OS-file redacted text-only read results bypass artifact projection:
+// config-audit workflows need the full payload model-visible, but only after
+// the runtime marks it non-authoritative redacted placeholder text.
+fn os_file_redacted_read_result_can_stay_inline(
     tool_name: &str,
     output_json: &[u8],
     budget: &ToolTurnBudget,
@@ -1737,11 +1740,8 @@ fn os_file_result_can_stay_inline(
     let Ok(value) = serde_json::from_slice::<Value>(output_json) else {
         return false;
     };
-    match value.get("operation").and_then(Value::as_str) {
-        Some("list_dir") => true,
-        Some("read") => os_file_read_result_has_model_visible_text(&value),
-        _ => false,
-    }
+    value.get("operation").and_then(Value::as_str) == Some("read")
+        && os_file_read_result_has_model_visible_text(&value)
 }
 
 fn os_file_read_result_has_model_visible_text(value: &Value) -> bool {
@@ -2417,20 +2417,23 @@ mod tests {
     }
 
     #[test]
-    fn os_file_list_dir_results_stay_inline_when_under_model_budget() {
+    fn os_file_list_dir_results_use_redacted_projection_when_under_model_budget() {
         let output_json = serde_json::to_vec(&json!({
             "operation": "list_dir",
             "path": "/home/example/.cache/palyra/os-cache",
+            "resolved_path": "/home/example/.cache/palyra/os-cache",
             "entries": [
                 {
                     "name": "zero-a.tmp",
                     "path": "/home/example/.cache/palyra/os-cache/zero-a.tmp",
+                    "resolved_path": "/home/example/.cache/palyra/os-cache/zero-a.tmp",
                     "kind": "file",
                     "size_bytes": 0
                 },
                 {
                     "name": "f-newest.cache",
                     "path": "/home/example/.cache/palyra/os-cache/f-newest.cache",
+                    "resolved_path": "/home/example/.cache/palyra/os-cache/f-newest.cache",
                     "kind": "file",
                     "size_bytes": 32
                 }
@@ -2455,12 +2458,12 @@ mod tests {
         };
 
         assert!(
-            !super::should_project_tool_result_for_model(
+            super::should_project_tool_result_for_model(
                 crate::gateway::OS_FILE_TOOL_NAME,
                 &outcome,
                 &ToolTurnBudget::default()
             ),
-            "small OS list_dir metadata must remain fully model-visible for cleanup workflows"
+            "small OS list_dir metadata must use RedactedPreviewAndArtifact projection"
         );
     }
 
