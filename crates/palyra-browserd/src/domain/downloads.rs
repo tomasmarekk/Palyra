@@ -538,18 +538,10 @@ pub(crate) fn extension_is_allowed(file_name: &str) -> bool {
 
 /// Reports whether a MIME type is allowlisted for downloads.
 ///
-/// Whole media families (audio, font, image, text, video) are allowed; application types must
-/// be individually allowlisted.
+/// MIME types are exact-match allowlisted so active content does not bypass quarantine through
+/// broad `text/*` or `image/*` families.
 pub(crate) fn mime_type_is_allowed(mime_type: &str) -> bool {
     let normalized = normalize_mime_type(mime_type);
-    if normalized.starts_with("audio/")
-        || normalized.starts_with("font/")
-        || normalized.starts_with("image/")
-        || normalized.starts_with("text/")
-        || normalized.starts_with("video/")
-    {
-        return true;
-    }
     DOWNLOAD_ALLOWED_MIME_TYPES.contains(&normalized.as_str())
 }
 
@@ -588,7 +580,6 @@ fn mime_type_for_download_extension(extension: &str) -> Option<&'static str> {
         "bmp" => Some("image/bmp"),
         "br" => Some("application/x-brotli"),
         "bz2" | "tbz2" => Some("application/x-bzip2"),
-        "cjs" | "js" | "mjs" => Some("text/javascript"),
         "conf" | "ini" | "log" | "txt" => Some("text/plain"),
         "css" => Some("text/css"),
         "csv" => Some("text/csv"),
@@ -600,7 +591,6 @@ fn mime_type_for_download_extension(extension: &str) -> Option<&'static str> {
         "gz" | "tgz" => Some("application/gzip"),
         "heic" => Some("image/heic"),
         "heif" => Some("image/heif"),
-        "htm" | "html" => Some("text/html"),
         "ico" => Some("image/x-icon"),
         "jpeg" | "jpg" => Some("image/jpeg"),
         "json" | "map" => Some("application/json"),
@@ -624,13 +614,11 @@ fn mime_type_for_download_extension(extension: &str) -> Option<&'static str> {
         "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         "rar" => Some("application/vnd.rar"),
         "rtf" => Some("application/rtf"),
-        "svg" => Some("image/svg+xml"),
         "tar" => Some("application/x-tar"),
         "tif" | "tiff" => Some("image/tiff"),
         "toml" => Some("application/toml"),
         "tsv" => Some("text/tab-separated-values"),
         "ttf" => Some("font/ttf"),
-        "wasm" => Some("application/wasm"),
         "wav" => Some("audio/wav"),
         "webm" => Some("video/webm"),
         "webp" => Some("image/webp"),
@@ -638,7 +626,6 @@ fn mime_type_for_download_extension(extension: &str) -> Option<&'static str> {
         "woff2" => Some("font/woff2"),
         "xls" => Some("application/vnd.ms-excel"),
         "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        "xml" => Some("application/xml"),
         "xz" => Some("application/x-xz"),
         "yaml" | "yml" => Some("application/x-yaml"),
         "zip" => Some("application/zip"),
@@ -855,7 +842,6 @@ mod tests {
     fn download_allowlist_accepts_common_user_file_types() {
         for file_name in [
             "photo.png",
-            "diagram.svg",
             "report.docx",
             "spreadsheet.xlsx",
             "slides.pptx",
@@ -863,13 +849,13 @@ mod tests {
             "clip.mp4",
             "font.woff2",
             "notes.md",
+            "style.css",
         ] {
             assert!(extension_is_allowed(file_name), "{file_name} should be extension-allowed");
         }
 
         for mime_type in [
             "image/png",
-            "image/svg+xml",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -877,8 +863,53 @@ mod tests {
             "video/mp4",
             "font/woff2",
             "text/markdown",
+            "text/plain",
+            "text/css",
         ] {
             assert!(mime_type_is_allowed(mime_type), "{mime_type} should be MIME-allowed");
+        }
+    }
+
+    #[test]
+    fn active_download_content_is_quarantined_by_default() {
+        for (file_name, mime_type) in [
+            ("payload.html", "text/html"),
+            ("payload.htm", "text/html"),
+            ("payload.js", "text/javascript"),
+            ("payload.cjs", "application/javascript"),
+            ("payload.mjs", "text/javascript"),
+            ("payload.svg", "image/svg+xml"),
+            ("payload.xml", "application/xml"),
+            ("payload.wasm", "application/wasm"),
+        ] {
+            assert!(!extension_is_allowed(file_name), "{file_name} must not be extension-allowed");
+            assert!(!mime_type_is_allowed(mime_type), "{mime_type} must not be MIME-allowed");
+            let reason = download_quarantine_reason(file_name, mime_type)
+                .expect("active content should be quarantined");
+            assert!(
+                reason.contains("extension_not_allowlisted"),
+                "active extension should be rejected for {file_name}: {reason}"
+            );
+            assert!(
+                reason.contains("mime_type_not_allowlisted"),
+                "active MIME should be rejected for {mime_type}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_mime_type_quarantines_even_safe_extension_names() {
+        for (file_name, mime_type) in [
+            ("payload.txt", "text/html"),
+            ("payload.png", "image/svg+xml"),
+            ("payload.json", "application/xml"),
+            ("payload.csv", "application/wasm"),
+        ] {
+            assert!(extension_is_allowed(file_name), "{file_name} setup should use safe extension");
+            assert_eq!(
+                download_quarantine_reason(file_name, mime_type).as_deref(),
+                Some("mime_type_not_allowlisted")
+            );
         }
     }
 
@@ -902,6 +933,26 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
         assert_eq!(sniff_download_mime_type(None, "notes.md", b"# Notes"), "text/markdown");
+    }
+
+    #[test]
+    fn download_sniffing_does_not_promote_active_extensions() {
+        for file_name in [
+            "payload.html",
+            "payload.htm",
+            "payload.js",
+            "payload.cjs",
+            "payload.mjs",
+            "payload.svg",
+            "payload.xml",
+            "payload.wasm",
+        ] {
+            assert_eq!(
+                sniff_download_mime_type(None, file_name, b""),
+                "application/octet-stream",
+                "{file_name} should not be inferred as a non-quarantined active MIME type"
+            );
+        }
     }
 
     #[test]

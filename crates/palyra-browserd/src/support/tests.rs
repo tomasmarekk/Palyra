@@ -430,6 +430,59 @@ async fn browser_service_get_download_artifact_returns_content() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_get_download_artifact_refuses_active_quarantined_content() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created.session_id.expect("session id should be present");
+    let artifact = store_generated_artifact(
+        runtime.as_ref(),
+        session_id.ulid.as_str(),
+        None,
+        "https://example.test/payload.html",
+        "payload.html",
+        "text/html",
+        b"<script>alert(1)</script>",
+    )
+    .await
+    .expect("active artifact should be stored in quarantine");
+    assert!(artifact.quarantined, "active HTML artifact must be quarantined");
+    assert!(
+        artifact.quarantine_reason.contains("extension_not_allowlisted"),
+        "active artifact should carry extension quarantine reason: {}",
+        artifact.quarantine_reason
+    );
+    assert!(
+        artifact.quarantine_reason.contains("mime_type_not_allowlisted"),
+        "active artifact should carry MIME quarantine reason: {}",
+        artifact.quarantine_reason
+    );
+
+    let mut request = Request::new(browser_v1::GetDownloadArtifactRequest {
+        v: 1,
+        session_id: Some(session_id),
+        artifact_id: Some(proto::palyra::common::v1::CanonicalId {
+            ulid: artifact.artifact_id.clone(),
+        }),
+        max_bytes: DOWNLOAD_MAX_FILE_BYTES,
+    });
+    insert_principal(&mut request, "user:ops");
+    let fetched = service
+        .get_download_artifact(request)
+        .await
+        .expect("get_download_artifact should return a denial response")
+        .into_inner();
+
+    assert!(!fetched.success, "quarantined active artifact must not be released");
+    assert!(
+        fetched.error.contains("quarantined"),
+        "denial should identify quarantine boundary: {}",
+        fetched.error
+    );
+    assert!(fetched.content.is_empty(), "quarantined content bytes must not be returned");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_get_download_artifact_returns_bounded_prefix_for_large_content() {
     let runtime = simulated_runtime_for_tests();
     let service = BrowserServiceImpl { runtime: Arc::clone(&runtime) };
