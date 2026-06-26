@@ -1057,34 +1057,50 @@ fn normalize_procedure_skill_slug(value: &str) -> Result<String> {
 }
 
 /// Scans a procedure body line by line for destructive-command patterns; at most one
-/// finding is recorded per line (the first matching pattern wins).
+/// finding is recorded per physical line (the first matching pattern wins).
 fn scan_procedure_skill_body(body: &str) -> Vec<ProcedureUnsafeFinding> {
-    body.lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            unsafe_procedure_pattern(line).map(|pattern| ProcedureUnsafeFinding {
-                pattern,
-                line_number: index + 1,
-                line_sha256: sha256_hex(line.trim().as_bytes()),
-            })
-        })
-        .collect()
+    let mut findings = Vec::new();
+    let mut logical_line = String::new();
+    let mut physical_lines = Vec::new();
+
+    for (index, line) in body.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed_end = line.trim_end();
+        let (line_fragment, continued) = trimmed_end
+            .strip_suffix('\\')
+            .map(|fragment| (fragment.trim_end(), true))
+            .unwrap_or((line, false));
+        if !logical_line.is_empty() {
+            logical_line.push(' ');
+        }
+        logical_line.push_str(line_fragment);
+        physical_lines.push((line_number, line));
+        if !continued {
+            push_procedure_scan_findings(&mut findings, logical_line.as_str(), &physical_lines);
+            logical_line.clear();
+            physical_lines.clear();
+        }
+    }
+
+    if !physical_lines.is_empty() {
+        push_procedure_scan_findings(&mut findings, logical_line.as_str(), &physical_lines);
+    }
+
+    findings
 }
 
 /// Classifies one line against the destructive-pattern denylist (shell, PowerShell,
 /// cmd, and natural-language phrasings), returning the matched pattern id.
 fn unsafe_procedure_pattern(line: &str) -> Option<&'static str> {
     let normalized = line.trim().to_ascii_lowercase();
-    if normalized.contains("rm -rf") || normalized.contains("rm -fr") {
+    let tokens = shell_like_tokens(normalized.as_str());
+    if contains_rm_recursive_force(tokens.as_slice()) {
         return Some("rm_recursive_force");
     }
-    if normalized.contains("remove-item")
-        && normalized.contains("-recurse")
-        && normalized.contains("-force")
-    {
+    if contains_powershell_recursive_force_delete(tokens.as_slice()) {
         return Some("powershell_recursive_force_delete");
     }
-    if normalized.contains("del /s") || normalized.contains("rmdir /s") {
+    if contains_windows_recursive_delete(tokens.as_slice()) {
         return Some("windows_recursive_delete");
     }
     if contains_any(&normalized, &["delete", "remove"])
@@ -1107,13 +1123,124 @@ fn unsafe_procedure_pattern(line: &str) -> Option<&'static str> {
     ) {
         return Some("safety_bypass_instruction");
     }
-    if normalized.starts_with("format ") || normalized.contains(" mkfs") {
+    if contains_filesystem_format(tokens.as_slice(), normalized.as_str()) {
         return Some("filesystem_format");
     }
-    if normalized.starts_with("dd ") && normalized.contains(" of=") {
+    if contains_raw_block_write(tokens.as_slice()) {
         return Some("raw_block_write");
     }
+    if contains_find_delete(tokens.as_slice()) {
+        return Some("find_delete");
+    }
     None
+}
+
+fn push_procedure_scan_findings(
+    findings: &mut Vec<ProcedureUnsafeFinding>,
+    logical_line: &str,
+    physical_lines: &[(usize, &str)],
+) {
+    if let Some(pattern) = unsafe_procedure_pattern(logical_line) {
+        findings.extend(physical_lines.iter().map(|(line_number, line)| ProcedureUnsafeFinding {
+            pattern,
+            line_number: *line_number,
+            line_sha256: sha256_hex(line.trim().as_bytes()),
+        }));
+    }
+}
+
+fn shell_like_tokens(line: &str) -> Vec<String> {
+    line.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | '/' | '\\' | '=' | ':')
+            {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn contains_rm_recursive_force(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        command_basename(token) == "rm"
+            && tokens[index + 1..].iter().any(|candidate| rm_option_is_recursive(candidate))
+            && tokens[index + 1..].iter().any(|candidate| rm_option_is_force(candidate))
+    })
+}
+
+fn contains_powershell_recursive_force_delete(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        matches!(command_basename(token), "remove-item" | "ri")
+            && tokens[index + 1..].iter().any(|candidate| powershell_option_is_recursive(candidate))
+            && tokens[index + 1..].iter().any(|candidate| powershell_option_is_force(candidate))
+    })
+}
+
+fn contains_windows_recursive_delete(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        matches!(command_basename(token), "del" | "erase" | "rmdir" | "rd")
+            && tokens[index + 1..].iter().any(|candidate| candidate == "/s")
+    })
+}
+
+fn contains_filesystem_format(tokens: &[String], normalized_line: &str) -> bool {
+    normalized_line.starts_with("format ")
+        || tokens.iter().any(|token| {
+            let command = command_basename(token);
+            command == "mkfs" || command.starts_with("mkfs.")
+        })
+}
+
+fn contains_raw_block_write(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        command_basename(token) == "dd"
+            && tokens[index + 1..].iter().any(|candidate| candidate.starts_with("of="))
+    })
+}
+
+fn contains_find_delete(tokens: &[String]) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        command_basename(token) == "find"
+            && tokens[index + 1..].iter().any(|candidate| candidate == "-delete")
+    })
+}
+
+fn command_basename(token: &str) -> &str {
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    for suffix in [".exe", ".cmd", ".bat", ".ps1"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    name
+}
+
+fn rm_option_is_recursive(token: &str) -> bool {
+    token == "--recursive" || short_option_contains(token, 'r')
+}
+
+fn rm_option_is_force(token: &str) -> bool {
+    token == "--force" || short_option_contains(token, 'f')
+}
+
+fn powershell_option_is_recursive(token: &str) -> bool {
+    matches!(token, "-recurse" | "-recursive") || short_option_contains(token, 'r')
+}
+
+fn powershell_option_is_force(token: &str) -> bool {
+    token == "-force" || short_option_contains(token, 'f')
+}
+
+fn short_option_contains(token: &str, flag: char) -> bool {
+    token.starts_with('-')
+        && !token.starts_with("--")
+        && token[1..].chars().any(|character| character == flag)
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -2540,6 +2667,46 @@ mod tests {
     }
 
     #[test]
+    fn procedure_skill_save_quarantines_destructive_variants() {
+        let root = temp_procedure_root();
+        let target = root.join("destructive-variants.md");
+
+        run_skills_procedure_save(SkillsProcedureSaveCommand {
+            path: Some(target.to_string_lossy().into_owned()),
+            skills_dir: Some(root.to_string_lossy().into_owned()),
+            slug: Some("destructive-variants".to_owned()),
+            name: "Destructive variants".to_owned(),
+            summary: None,
+            body: Some(
+                "Prepare workspace\nrm -r -f ./tmp\nsudo dd if=/dev/zero of=/dev/sdz\n".to_owned(),
+            ),
+            body_file: None,
+            force: false,
+            json: false,
+        })
+        .expect("destructive variants should save dry-run variant");
+
+        let saved = fs::read_to_string(target.as_path()).expect("procedure skill should exist");
+        assert!(saved.contains("status: quarantined_raw_dry_run_saved"));
+        assert!(saved.contains("rm_recursive_force"));
+        assert!(saved.contains("raw_block_write"));
+        assert!(!saved.contains("rm -r -f"));
+        assert!(!saved.contains("sudo dd"));
+
+        let quarantine_entries = fs::read_dir(root.join(".quarantine"))
+            .expect("quarantine directory should exist")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("quarantine entries should read");
+        assert_eq!(quarantine_entries.len(), 1);
+        let raw = fs::read_to_string(quarantine_entries[0].path())
+            .expect("quarantined raw recipe should be readable");
+        assert!(raw.contains("rm -r -f"));
+        assert!(raw.contains("sudo dd"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn procedure_skill_save_is_idempotent_for_same_safe_body() {
         let root = temp_procedure_root();
 
@@ -2691,6 +2858,47 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].pattern, "rm_recursive_force");
         assert_eq!(findings[0].line_number, 2);
+    }
+
+    #[test]
+    fn unsafe_procedure_scan_detects_destructive_command_variants() {
+        let findings = scan_procedure_skill_body(
+            [
+                "rm -r -f /tmp/palyra-e2e",
+                "rm -R --force /tmp/palyra-e2e",
+                "mkfs.ext4 /dev/sdz",
+                "sudo dd if=/dev/zero of=/dev/sdz",
+                "find /tmp/palyra-e2e -delete",
+                r"Remove-Item C:\tmp\palyra-e2e -Recurse -Force",
+                r"rmdir /s C:\tmp\palyra-e2e",
+            ]
+            .join("\n")
+            .as_str(),
+        );
+        let patterns = findings.iter().map(|finding| finding.pattern).collect::<Vec<_>>();
+
+        assert_eq!(
+            patterns,
+            vec![
+                "rm_recursive_force",
+                "rm_recursive_force",
+                "filesystem_format",
+                "raw_block_write",
+                "find_delete",
+                "powershell_recursive_force_delete",
+                "windows_recursive_delete",
+            ]
+        );
+    }
+
+    #[test]
+    fn unsafe_procedure_scan_detects_shell_line_continuation() {
+        let findings = scan_procedure_skill_body("rm -r \\\n  -f /tmp/palyra-e2e");
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|finding| finding.pattern == "rm_recursive_force"));
+        assert_eq!(findings[0].line_number, 1);
+        assert_eq!(findings[1].line_number, 2);
     }
 
     #[test]
