@@ -285,8 +285,8 @@ pub struct GatewayConfig {
     /// Identity/pairing store location; also used to derive the runtime
     /// state root when `PALYRA_STATE_ROOT` is unset.
     pub identity_store_dir: Option<PathBuf>,
-    /// Vault refs (`<scope>/<key>`, lowercase) whose reads require explicit
-    /// operator approval through the gateway.
+    /// Vault refs (`<scope>/<key>`, case-sensitive key preserved) whose
+    /// reads require explicit operator approval through the gateway.
     pub vault_get_approval_required_refs: Vec<String>,
     pub max_tape_entries_per_response: usize,
     pub max_tape_bytes_per_response: usize,

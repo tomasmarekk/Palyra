@@ -2425,7 +2425,8 @@ fn parse_optional_browser_state_dir(raw: &str, source_name: &str) -> Result<Opti
 }
 
 /// Parses a single-value vault ref field: blank clears the value, anything
-/// else must normalize to exactly one lowercase `<scope>/<key>` entry.
+/// else must normalize to exactly one `<scope>/<key>` entry with the
+/// case-sensitive secret key preserved.
 fn parse_optional_vault_ref_field(raw: &str, source_name: &str) -> Result<Option<String>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -3384,29 +3385,10 @@ fn push_unique_string(values: &mut Vec<String>, seen: &mut HashSet<String>, valu
     }
 }
 
-/// Parses a comma-separated vault ref allowlist, lowercasing each
-/// `<scope>/<key>` entry for case-insensitive matching and dropping
-/// duplicates while preserving order.
+/// Parses a comma-separated vault ref allowlist, canonicalizing the scope
+/// while preserving the case-sensitive secret key and dropping duplicates in
+/// order.
 fn parse_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
-    let mut refs = Vec::new();
-    let mut seen_refs = HashSet::new();
-    for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-        let parsed = VaultRef::parse(candidate).map_err(|error| {
-            anyhow::anyhow!("{source_name} contains invalid vault ref '{candidate}': {error}")
-        })?;
-        let normalized = format!("{}/{}", parsed.scope, parsed.key).to_ascii_lowercase();
-        push_unique_string(&mut refs, &mut seen_refs, normalized);
-    }
-    if refs.is_empty() {
-        anyhow::bail!("{source_name} must include at least one <scope>/<key> entry");
-    }
-    Ok(refs)
-}
-
-/// Like [`parse_vault_ref_allowlist`] but preserves the original casing:
-/// principal-scoped refs (e.g. `principal:UserA/...`) are case-sensitive
-/// and must match the stored scope exactly.
-fn parse_exact_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     let mut seen_refs = HashSet::new();
     for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
@@ -3420,6 +3402,13 @@ fn parse_exact_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<S
         anyhow::bail!("{source_name} must include at least one <scope>/<key> entry");
     }
     Ok(refs)
+}
+
+/// Wrapper for config fields whose semantics require exact vault-ref
+/// matching. The shared parser already preserves case-sensitive scope
+/// segments and secret keys.
+fn parse_exact_vault_ref_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    parse_vault_ref_allowlist(raw, source_name)
 }
 
 fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
@@ -4087,13 +4076,14 @@ mod tests {
         parse_positive_usize, parse_process_executable_allowlist,
         parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
         parse_process_runner_tier, parse_provider_reasoning_effort, parse_provider_service_tier,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
-        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
-        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
-        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
-        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_structured_secret_ref_field,
+        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
+        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
+        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
+        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
+        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
         RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
@@ -4111,6 +4101,7 @@ mod tests {
             SESSION_QUEUE_POLICY_ROLLOUT_ENV,
         },
         runtime_preview::RuntimePreviewMode,
+        secret_refs::{SecretRef, SecretSource},
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -5129,6 +5120,46 @@ state_key_vault_ref = "global/browser_state_key"
     }
 
     #[test]
+    fn load_config_preserves_uppercase_admin_vault_ref_key() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[admin]
+require_auth = true
+
+[admin.auth_token_secret_ref]
+kind = "vault"
+vault_ref = "GLOBAL/PALYRA_ADMIN_TOKEN"
+"#,
+        )
+        .expect("admin secret-ref config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _admin_token = ScopedEnvVar::unset("PALYRA_ADMIN_TOKEN");
+        let _admin_require_auth = ScopedEnvVar::unset("PALYRA_ADMIN_REQUIRE_AUTH");
+        let _connector_token = ScopedEnvVar::unset("PALYRA_CONNECTOR_TOKEN");
+
+        let loaded = super::load_config().expect("admin secret-ref config should load");
+        let secret_ref = loaded
+            .admin
+            .auth_token_secret_ref
+            .expect("admin auth token secret ref should be configured");
+
+        assert_eq!(
+            secret_ref.source,
+            SecretSource::Vault { vault_ref: "global/PALYRA_ADMIN_TOKEN".to_owned() }
+        );
+    }
+
+    #[test]
     fn load_config_accepts_legacy_tool_call_max_calls_without_enforcing_step_limit() {
         let _guard = env_lock().lock().expect("env lock poisoned");
         for configured_limit in [0_u32, 96_u32] {
@@ -6003,13 +6034,17 @@ state_dir = "browserd-state"
     #[test]
     fn parse_vault_ref_allowlist_normalizes_and_deduplicates_values() {
         let parsed = parse_vault_ref_allowlist(
-            "GLOBAL/openai_api_key,global/openai_api_key,principal:user/openai_api_key",
+            "GLOBAL/OpenAI_API_KEY,global/OpenAI_API_KEY,global/openai_api_key,principal:user/OpenAI_API_KEY",
             "gateway.vault_get_approval_required_refs",
         )
         .expect("vault ref allowlist should parse");
         assert_eq!(
             parsed,
-            vec!["global/openai_api_key".to_owned(), "principal:user/openai_api_key".to_owned(),]
+            vec![
+                "global/OpenAI_API_KEY".to_owned(),
+                "global/openai_api_key".to_owned(),
+                "principal:user/OpenAI_API_KEY".to_owned(),
+            ]
         );
     }
 
@@ -6038,11 +6073,11 @@ state_dir = "browserd-state"
     #[test]
     fn parse_optional_vault_ref_field_requires_single_entry_when_set() {
         let parsed = parse_optional_vault_ref_field(
-            "GLOBAL/browserd_state_key",
+            "GLOBAL/BrowserD_State_Key",
             "tool_call.browser_service.state_key_vault_ref",
         )
         .expect("single optional vault ref should parse");
-        assert_eq!(parsed, Some("global/browserd_state_key".to_owned()));
+        assert_eq!(parsed, Some("global/BrowserD_State_Key".to_owned()));
 
         let empty =
             parse_optional_vault_ref_field("   ", "tool_call.browser_service.state_key_vault_ref")
@@ -6054,6 +6089,20 @@ state_dir = "browserd-state"
             "tool_call.browser_service.state_key_vault_ref",
         );
         assert!(multiple.is_err(), "multiple refs must be rejected for single-value field");
+    }
+
+    #[test]
+    fn parse_structured_secret_ref_field_preserves_case_sensitive_vault_key() {
+        let parsed = parse_structured_secret_ref_field(
+            SecretRef::from_legacy_vault_ref("GLOBAL/PALYRA_ADMIN_TOKEN"),
+            "admin.auth_token_secret_ref",
+        )
+        .expect("structured vault ref should parse");
+
+        assert_eq!(
+            parsed.source,
+            SecretSource::Vault { vault_ref: "global/PALYRA_ADMIN_TOKEN".to_owned() }
+        );
     }
 
     #[test]
