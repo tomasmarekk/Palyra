@@ -15,6 +15,7 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
+use palyra_common::redaction::REDACTED;
 use serde_json::{json, Value};
 use tokio::{
     sync::mpsc,
@@ -3791,7 +3792,7 @@ async fn persist_run_stream_reply_text(
             seq: *tape_seq,
             event_type: "message.replied".to_owned(),
             payload_json: json!({
-                "reply_text": reply_text,
+                "reply_text": REDACTED,
             })
             .to_string(),
         })
@@ -3806,7 +3807,7 @@ async fn persist_run_stream_reply_text(
         "message.replied",
         common_v1::journal_event::EventActor::System as i32,
         json!({
-            "reply_preview": truncate_with_ellipsis(reply_text.to_owned(), 256),
+            "reply_preview": REDACTED,
         }),
     )
     .await;

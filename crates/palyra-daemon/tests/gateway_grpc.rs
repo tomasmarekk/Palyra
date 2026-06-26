@@ -10481,7 +10481,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .get("payload_json")
             .and_then(Value::as_str)
             .context("message.replied tape event missing payload_json")?,
-        r#"{"reply_text":"alpha beta gamma"}"#,
+        r#"{"reply_text":"<redacted>"}"#,
     );
     let comparable_tape_events = tape_events
         .iter()
