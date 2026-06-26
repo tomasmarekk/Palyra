@@ -36,12 +36,13 @@ use crate::{
     agents::AgentResolveRequest,
     application::{
         memory::{
-            enforce_memory_item_scope, normalize_lifecycle_content, redact_memory_text_for_output,
-            reflect_memory_candidates, ttl_unix_ms_from_input, MemoryLifecycleProvider,
-            MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest, MemoryLifecycleScope,
-            MemoryLifecycleStatus, MemoryReflectionCategory, MemoryReflectionOutcome,
-            MemoryReflectionRequest, MemoryWriteCategory, MEMORY_CONTEXT_FENCE_VERSION,
-            MEMORY_TRUST_LABEL_RETRIEVED,
+            classify_memory_write, enforce_memory_item_scope, lifecycle_tags,
+            normalize_lifecycle_content, redact_memory_text_for_output, reflect_memory_candidates,
+            ttl_unix_ms_from_input, MemoryLifecycleProvider, MemoryLifecycleRetainOutcome,
+            MemoryLifecycleRetainRequest, MemoryLifecycleScope, MemoryLifecycleStatus,
+            MemoryReflectionCategory, MemoryReflectionOutcome, MemoryReflectionRequest,
+            MemoryWriteApprovalState, MemoryWriteCategory, MemoryWriteClassificationInput,
+            MEMORY_CONTEXT_FENCE_VERSION, MEMORY_TRUST_LABEL_RETRIEVED,
         },
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
@@ -1847,8 +1848,56 @@ pub(crate) async fn execute_memory_replace_tool(
             format!("palyra.memory.replace {}", error.message()),
         );
     }
+    let scope = memory_item_lifecycle_scope(&existing_item);
+    let provenance = replace_tool_provenance(context, proposal_id, &existing_item);
+    let effective_confidence = confidence.unwrap_or(existing_item.confidence.unwrap_or(0.75));
+    let classification = classify_memory_write(MemoryWriteClassificationInput {
+        principal: context.principal.to_owned(),
+        channel: existing_item.channel.clone(),
+        session_id: existing_item
+            .session_id
+            .clone()
+            .unwrap_or_else(|| context.session_id.to_owned()),
+        scope,
+        content_text: content_text.clone(),
+        category_hint: memory_write_category_from_lifecycle_tags(existing_item.tags.as_slice()),
+        confidence: effective_confidence,
+        ttl_unix_ms,
+        provenance: provenance.clone(),
+        now_unix_ms: current_unix_ms(),
+    });
+    if classification.approval_state == MemoryWriteApprovalState::Required {
+        let outcome = MemoryLifecycleRetainOutcome {
+            status: MemoryLifecycleStatus::NeedsReview,
+            reason: format!(
+                "memory replacement requires review: {}",
+                classification.reason_codes.join(",")
+            ),
+            scope,
+            trust_label: MEMORY_TRUST_LABEL_RETRIEVED.to_owned(),
+            durable_memory_write: false,
+            item: None,
+            matched_memory_id: Some(memory_id.clone()),
+            write_classification: Some(classification),
+            provenance,
+        };
+        return serialize_memory_replace_lifecycle_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            &outcome,
+        );
+    }
     // Omitted/empty tags keep the existing tag set; replace only swaps text.
-    let tags = if parsed_tags.is_empty() { existing_item.tags.clone() } else { parsed_tags };
+    let mut requested_tags =
+        if parsed_tags.is_empty() { existing_item.tags.clone() } else { parsed_tags };
+    requested_tags
+        .retain(|tag| !tag.starts_with("memory_write:") && !tag.starts_with("source_hash:"));
+    requested_tags.push(format!("memory_write:{}", classification.category.as_str()));
+    requested_tags
+        .push(format!("source_hash:{}", classification.source_hash.get(..16).unwrap_or("short")));
+    let tags = lifecycle_tags(requested_tags.as_slice(), scope);
+    let ttl_unix_ms = classification.ttl_unix_ms;
     let updated = match runtime_state
         .update_memory_item_lifecycle(MemoryItemLifecycleUpdateRequest {
             memory_id: memory_id.clone(),
@@ -1889,6 +1938,10 @@ pub(crate) async fn execute_memory_replace_tool(
         "status": "replaced",
         "durable_memory_write": true,
         "previous_content_hash": existing_item.content_hash,
+        "review_state": "written",
+        "approval_required": false,
+        "scope": scope.as_str(),
+        "write_classification": classification,
         "item": memory_item_output_payload(&updated),
         "claim_boundary": "memory item content was replaced in place; use the returned item as the current durable value",
     });
@@ -1910,6 +1963,43 @@ pub(crate) async fn execute_memory_replace_tool(
             format!("palyra.memory.replace failed to serialize output: {error}"),
         ),
     }
+}
+
+fn memory_item_lifecycle_scope(item: &MemoryItemRecord) -> MemoryLifecycleScope {
+    if item.session_id.is_some() {
+        MemoryLifecycleScope::Session
+    } else if item.channel.is_some() {
+        MemoryLifecycleScope::Channel
+    } else {
+        MemoryLifecycleScope::Principal
+    }
+}
+
+fn memory_write_category_from_lifecycle_tags(tags: &[String]) -> Option<MemoryWriteCategory> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix("memory_write:"))
+        .and_then(MemoryWriteCategory::parse)
+}
+
+fn replace_tool_provenance(
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    existing_item: &MemoryItemRecord,
+) -> Value {
+    json!({
+        "tool_proposal_id": proposal_id,
+        "run_id": context.run_id,
+        "session_id": context.session_id,
+        "principal": context.principal,
+        "channel": context.channel,
+        "source": "tool_call",
+        "operation": "replace",
+        "target_memory_id": existing_item.memory_id.as_str(),
+        "target_scope": memory_item_scope_label(existing_item),
+        "target_channel": existing_item.channel.as_deref(),
+        "target_session_id": existing_item.session_id.as_deref(),
+        "previous_content_hash": existing_item.content_hash.as_str(),
+    })
 }
 
 fn replace_ttl_unix_ms_from_input(parsed: &Map<String, Value>) -> Result<Option<i64>, Status> {
@@ -4178,6 +4268,43 @@ fn serialize_memory_lifecycle_outcome(
     outcome: &MemoryLifecycleRetainOutcome,
     source_normalization: Option<Value>,
 ) -> ToolExecutionOutcome {
+    serialize_memory_lifecycle_outcome_for_tool(
+        namespace,
+        proposal_id,
+        input_json,
+        outcome,
+        source_normalization,
+        "palyra.memory.retain",
+        "do not claim this memory is stored or available for future recall",
+    )
+}
+
+fn serialize_memory_replace_lifecycle_outcome(
+    namespace: &'static [u8],
+    proposal_id: &str,
+    input_json: &[u8],
+    outcome: &MemoryLifecycleRetainOutcome,
+) -> ToolExecutionOutcome {
+    serialize_memory_lifecycle_outcome_for_tool(
+        namespace,
+        proposal_id,
+        input_json,
+        outcome,
+        None,
+        "palyra.memory.replace",
+        "do not claim this memory was replaced or is available for future recall",
+    )
+}
+
+fn serialize_memory_lifecycle_outcome_for_tool(
+    namespace: &'static [u8],
+    proposal_id: &str,
+    input_json: &[u8],
+    outcome: &MemoryLifecycleRetainOutcome,
+    source_normalization: Option<Value>,
+    tool_name: &str,
+    unwritten_guidance: &str,
+) -> ToolExecutionOutcome {
     let review_state = memory_lifecycle_review_state(outcome);
     let review_required = review_state == "not_written_requires_review";
     let mut payload = json!({
@@ -4209,7 +4336,7 @@ fn serialize_memory_lifecycle_outcome(
         String::new()
     } else {
         format!(
-            "palyra.memory.retain did not write memory: status={} review_state={} durable_memory_write=false reason={}; do not claim this memory is stored or available for future recall",
+            "{tool_name} did not write memory: status={} review_state={} durable_memory_write=false reason={}; {unwritten_guidance}",
             outcome.status.as_str(),
             review_state,
             outcome.reason
@@ -4230,7 +4357,7 @@ fn serialize_memory_lifecycle_outcome(
             input_json,
             false,
             b"{}".to_vec(),
-            format!("palyra.memory.retain failed to serialize output: {error}"),
+            format!("{tool_name} failed to serialize output: {error}"),
         ),
     }
 }
@@ -4275,7 +4402,7 @@ fn memory_lifecycle_review_payload(outcome: &MemoryLifecycleRetainOutcome) -> Op
         "review_identifier": Value::Null,
         "completion_kind": "manual_memory_ingest",
         "completion_commands": [memory_lifecycle_review_command(outcome)],
-        "operator_note": "No durable memory was written. Review the original retained content, then either run the ingest command with approved content or leave the memory unwritten.",
+        "operator_note": "No durable memory was written. Review the proposed memory content, then either run the ingest command with approved content or leave the memory unwritten.",
     }))
 }
 
