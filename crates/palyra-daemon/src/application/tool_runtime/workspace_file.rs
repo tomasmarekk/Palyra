@@ -2281,14 +2281,19 @@ fn path_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
 /// to their symlinked `/var`-style spellings.
 #[cfg(target_os = "macos")]
 fn macos_path_alias_key(path: &Path) -> Option<String> {
-    let normalized = path.to_string_lossy().replace('\\', "/");
+    macos_path_alias_key_from_str(path.to_string_lossy().as_ref())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_path_alias_key_from_str(path: &str) -> Option<String> {
+    let normalized = path;
     if normalized.is_empty() {
         return None;
     }
     let normalized = normalized
         .strip_prefix("/System/Volumes/Data")
         .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-        .unwrap_or(normalized.as_str());
+        .unwrap_or(normalized);
     if normalized.is_empty() {
         return None;
     }
@@ -2707,6 +2712,23 @@ mod tests {
     fn normalized_path_key_scope_check_rejects_empty_root() {
         assert!(!normalized_path_key_starts_with("/etc/passwd", ""));
         assert!(!normalized_path_key_starts_with("", ""));
+    }
+
+    #[test]
+    fn macos_path_alias_key_rejects_exact_data_volume_root() {
+        assert_eq!(macos_path_alias_key_from_str("/System/Volumes/Data"), None);
+    }
+
+    #[test]
+    fn macos_path_alias_key_preserves_literal_backslash_boundaries() {
+        let candidate = macos_path_alias_key_from_str("/tmp/workspace\\evil/file")
+            .expect("non-empty path should produce an alias key");
+
+        assert_eq!(candidate, "/tmp/workspace\\evil/file");
+        assert!(
+            !candidate.strip_prefix("/tmp/workspace").is_some_and(|suffix| suffix.starts_with('/')),
+            "literal backslash must not become a containment separator"
+        );
     }
 
     #[test]
