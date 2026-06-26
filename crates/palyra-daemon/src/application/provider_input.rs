@@ -54,6 +54,7 @@ use crate::{
             workspace_roots_with_run_launch_context_for_agent_source,
         },
     },
+    domain::workspace::WorkspaceRiskState,
     gateway::{
         ingest_memory_best_effort, non_empty, truncate_with_ellipsis, GatewayRuntimeState,
         MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS, MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS,
@@ -672,6 +673,9 @@ async fn workspace_memory_document_auto_inject_hit(
     else {
         return Ok(None);
     };
+    if document.risk_state == WorkspaceRiskState::Quarantined.as_str() {
+        return Ok(None);
+    }
     Ok(Some(workspace_memory_document_hit(document, query)))
 }
 
