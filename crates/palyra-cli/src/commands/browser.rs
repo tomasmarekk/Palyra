@@ -3560,15 +3560,19 @@ fn browser_setup_gateway_reload_warning(config_path: &str) -> String {
 }
 
 fn browser_service_auth_token_command(config_path: Option<&str>) -> String {
-    let mut command = "palyra config set".to_owned();
-    if let Some(path) = config_path.and_then(normalize_optional_text) {
-        command.push_str(" --path ");
-        command.push_str(&quote_cli_argument(path));
+    let normalized_config_path = config_path.and_then(normalize_optional_text);
+    let mut args = vec!["palyra".to_owned(), "config".to_owned(), "set".to_owned()];
+    if let Some(path) = normalized_config_path {
+        args.push("--path".to_owned());
+        args.push(path.to_owned());
     }
-    command.push_str(
-        " --key tool_call.browser_service.auth_token --value '\"<shared-browser-token>\"'",
-    );
-    command
+    args.extend([
+        "--key".to_owned(),
+        "tool_call.browser_service.auth_token".to_owned(),
+        "--value".to_owned(),
+        "\"<shared-browser-token>\"".to_owned(),
+    ]);
+    render_cli_command(args.as_slice(), normalized_config_path)
 }
 
 fn ensure_browser_service_enabled(
@@ -3763,14 +3767,21 @@ fn browser_profile_state_key_guidance(config_path: Option<&str>) -> String {
 }
 
 fn browser_state_key_configure_command(config_path: Option<&str>) -> String {
-    let mut command =
-        "palyra secrets configure browser-state-key global browser_state_key --value-stdin"
-            .to_owned();
-    if let Some(path) = config_path.and_then(normalize_optional_text) {
-        command.push_str(" --path ");
-        command.push_str(&quote_cli_argument(path));
+    let normalized_config_path = config_path.and_then(normalize_optional_text);
+    let mut args = vec![
+        "palyra".to_owned(),
+        "secrets".to_owned(),
+        "configure".to_owned(),
+        "browser-state-key".to_owned(),
+        "global".to_owned(),
+        "browser_state_key".to_owned(),
+        "--value-stdin".to_owned(),
+    ];
+    if let Some(path) = normalized_config_path {
+        args.push("--path".to_owned());
+        args.push(path.to_owned());
     }
-    command
+    render_cli_command(args.as_slice(), normalized_config_path)
 }
 
 fn resolve_browserd_state_encryption_key_for_start(
@@ -3825,13 +3836,19 @@ pub(crate) fn validate_browserd_state_encryption_key(value: &str, source: &str) 
 }
 
 fn browser_service_enable_command(config_path: Option<&str>) -> String {
-    let mut command = "palyra config set".to_owned();
-    if let Some(path) = config_path.and_then(normalize_optional_text) {
-        command.push_str(" --path ");
-        command.push_str(&quote_cli_argument(path));
+    let normalized_config_path = config_path.and_then(normalize_optional_text);
+    let mut args = vec!["palyra".to_owned(), "config".to_owned(), "set".to_owned()];
+    if let Some(path) = normalized_config_path {
+        args.push("--path".to_owned());
+        args.push(path.to_owned());
     }
-    command.push_str(" --key tool_call.browser_service.enabled --value true");
-    command
+    args.extend([
+        "--key".to_owned(),
+        "tool_call.browser_service.enabled".to_owned(),
+        "--value".to_owned(),
+        "true".to_owned(),
+    ]);
+    render_cli_command(args.as_slice(), normalized_config_path)
 }
 
 fn missing_browser_gateway_tools(allowed_tools: &[String]) -> Vec<String> {
@@ -3861,13 +3878,26 @@ fn browser_missing_tools_summary(missing_tools: &[String]) -> String {
     )
 }
 
+fn render_cli_command(args: &[String], config_path: Option<&str>) -> String {
+    if cfg!(windows) && config_path.is_some_and(|path| !is_unquoted_cli_arg(path)) {
+        return powershell_encoded_cli_command(args);
+    }
+    args.iter().map(|arg| quote_cli_argument(arg.as_str())).collect::<Vec<_>>().join(" ")
+}
+
 fn quote_cli_argument(value: &str) -> String {
-    if value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/' | '\\')
-    }) {
+    if is_unquoted_cli_arg(value) {
         return value.to_owned();
     }
     shell_single_quote(value)
+}
+
+fn is_unquoted_cli_arg(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | ':' | '/' | '\\')
+        })
 }
 
 #[cfg(windows)]
@@ -3878,6 +3908,32 @@ fn shell_single_quote(value: &str) -> String {
 #[cfg(not(windows))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_encoded_cli_command(args: &[String]) -> String {
+    let script = powershell_invocation_script(args);
+    let encoded = BASE64_STANDARD.encode(utf16le_bytes(script.as_str()));
+    format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand \"{encoded}\"")
+}
+
+fn powershell_invocation_script(args: &[String]) -> String {
+    let Some((program, rest)) = args.split_first() else {
+        return String::new();
+    };
+    let mut script = format!("& {}", quote_powershell_single_quoted_arg(program));
+    for arg in rest {
+        script.push(' ');
+        script.push_str(quote_powershell_single_quoted_arg(arg).as_str());
+    }
+    script
+}
+
+fn quote_powershell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn utf16le_bytes(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 fn current_config_path() -> Option<PathBuf> {
@@ -5026,10 +5082,25 @@ mod tests {
         BrowserServiceMetadata,
     };
     use crate::{args::BrowserCommand, browser_v1, common_v1};
+    use base64::Engine as _;
     use palyra_control_plane as control_plane;
     use serde_json::{json, Value};
     use std::{process::Command, time::Duration};
     use tonic::{Code, Status};
+
+    fn decode_powershell_encoded_cli_command(command: &str) -> String {
+        let prefix = "powershell.exe -NoProfile -NonInteractive -EncodedCommand \"";
+        let encoded = command
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("command should use the encoded PowerShell wrapper");
+        let bytes = super::BASE64_STANDARD.decode(encoded).expect("encoded command should decode");
+        let code_units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(code_units.as_slice()).expect("encoded command should be UTF-16LE")
+    }
 
     fn disabled_policy() -> BrowserPolicySnapshot {
         BrowserPolicySnapshot {
@@ -5178,13 +5249,57 @@ mod tests {
     fn browser_enable_command_single_quotes_shell_substitutions() {
         let command = browser_service_enable_command(Some("/tmp/palyra$(touch pwn).toml"));
 
+        #[cfg(windows)]
+        {
+            assert!(
+                command.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand \""),
+                "Windows unsafe paths should use encoded PowerShell guidance: {command}"
+            );
+            assert!(
+                !command.contains("$(touch pwn)"),
+                "unsafe shell payload should not appear in the copy/paste command: {command}"
+            );
+            assert_eq!(
+                decode_powershell_encoded_cli_command(command.as_str()),
+                "& 'palyra' 'config' 'set' '--path' '/tmp/palyra$(touch pwn).toml' '--key' 'tool_call.browser_service.enabled' '--value' 'true'"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                command,
+                "palyra config set --path '/tmp/palyra$(touch pwn).toml' --key tool_call.browser_service.enabled --value true"
+            );
+            assert!(
+                !command.contains("\"/tmp/palyra$("),
+                "browser enable command must not use double quotes around shell-substitution paths: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_enable_command_uses_encoded_powershell_for_windows_cmd_metacharacters() {
+        let command = browser_service_enable_command(Some(r"C:\tmp & calc & rem\palyra.toml"));
+
+        #[cfg(windows)]
+        {
+            assert!(
+                command.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand \""),
+                "Windows cmd metacharacter paths should use encoded PowerShell guidance: {command}"
+            );
+            assert!(
+                !command.contains("calc"),
+                "injected command text should not be visible in the cmd.exe copy/paste line: {command}"
+            );
+            assert_eq!(
+                decode_powershell_encoded_cli_command(command.as_str()),
+                r"& 'palyra' 'config' 'set' '--path' 'C:\tmp & calc & rem\palyra.toml' '--key' 'tool_call.browser_service.enabled' '--value' 'true'"
+            );
+        }
+        #[cfg(not(windows))]
         assert_eq!(
             command,
-            "palyra config set --path '/tmp/palyra$(touch pwn).toml' --key tool_call.browser_service.enabled --value true"
-        );
-        assert!(
-            !command.contains("\"/tmp/palyra$("),
-            "browser enable command must not use double quotes around shell-substitution paths: {command}"
+            r"palyra config set --path 'C:\tmp & calc & rem\palyra.toml' --key tool_call.browser_service.enabled --value true"
         );
     }
 
@@ -5193,10 +5308,16 @@ mod tests {
         let command = browser_service_enable_command(Some("/tmp/palyra'$(touch pwn).toml"));
 
         #[cfg(windows)]
-        assert_eq!(
-            command,
-            "palyra config set --path '/tmp/palyra''$(touch pwn).toml' --key tool_call.browser_service.enabled --value true"
-        );
+        {
+            assert!(
+                command.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand \""),
+                "Windows paths with quotes should use encoded PowerShell guidance: {command}"
+            );
+            assert_eq!(
+                decode_powershell_encoded_cli_command(command.as_str()),
+                "& 'palyra' 'config' 'set' '--path' '/tmp/palyra''$(touch pwn).toml' '--key' 'tool_call.browser_service.enabled' '--value' 'true'"
+            );
+        }
         #[cfg(not(windows))]
         assert_eq!(
             command,
