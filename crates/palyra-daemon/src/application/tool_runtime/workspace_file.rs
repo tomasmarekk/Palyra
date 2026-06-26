@@ -1206,8 +1206,8 @@ fn resolve_absolute_workspace_file_grant(
     }))
 }
 
-/// Finds the first root that lexically contains `requested` (alias-aware via
-/// [`path_stays_inside_workspace_root`]) without touching the filesystem.
+/// Finds the first root that lexically contains `requested` without touching
+/// the requested path through filesystem-resolving platform APIs.
 fn find_lexical_workspace_root<'a>(
     canonical_roots: &'a [(usize, PathBuf)],
     requested: &Path,
@@ -1215,7 +1215,7 @@ fn find_lexical_workspace_root<'a>(
     canonical_roots
         .iter()
         .find(|(_, canonical_root)| {
-            path_stays_inside_workspace_root(requested, canonical_root.as_path())
+            path_lexically_stays_inside_workspace_root(requested, canonical_root.as_path())
         })
         .map(|(index, canonical_root)| (*index, canonical_root.as_path()))
 }
@@ -2215,10 +2215,41 @@ fn workspace_binary_base64_prefix(bytes: &[u8]) -> Option<String> {
     Some(BASE64_STANDARD.encode(&bytes[..prefix_len]))
 }
 
-/// Containment check applied to every resolved target: a plain prefix match
-/// first, then platform alias normalization -- macOS `/private` and Data
-/// volume prefixes, Windows verbatim/8.3/long-name forms -- so equivalent
-/// spellings of the same location cannot bypass the root boundary.
+/// Pre-canonicalization containment check for untrusted requested paths.
+///
+/// This deliberately keeps the candidate side lexical-only. On Windows,
+/// filesystem-resolving APIs such as `GetLongPathNameW` can probe UNC paths,
+/// so they are reserved for trusted roots and post-canonical containment.
+fn path_lexically_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
+    if candidate.starts_with(root) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_path_alias_key(candidate).is_some_and(|candidate| {
+            macos_path_alias_key(root).is_some_and(|root| {
+                normalized_path_key_starts_with(candidate.as_str(), root.as_str())
+            })
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows_lexical_path_alias_key(candidate).is_some_and(|candidate| {
+            windows_trusted_path_alias_keys(root)
+                .into_iter()
+                .any(|root| normalized_path_key_starts_with(candidate.as_str(), root.as_str()))
+        })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
+}
+
+/// Containment check applied to resolved targets: a plain prefix match first,
+/// then platform alias normalization -- macOS `/private` and Data volume
+/// prefixes, Windows verbatim/8.3/long-name forms -- so equivalent spellings
+/// of the same location cannot bypass the root boundary.
 fn path_stays_inside_workspace_root(candidate: &Path, root: &Path) -> bool {
     if candidate.starts_with(root) {
         return true;
@@ -2288,6 +2319,29 @@ fn windows_path_alias_key(path: &Path) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn windows_trusted_path_alias_keys(path: &Path) -> Vec<String> {
+    let mut keys = Vec::new();
+    push_unique_windows_path_alias_key(&mut keys, windows_lexical_path_alias_key(path));
+    push_unique_windows_path_alias_key(&mut keys, windows_existing_path_alias_key(path));
+    push_unique_windows_path_alias_key(
+        &mut keys,
+        windows_short_path_name(path)
+            .as_deref()
+            .and_then(|path| windows_normalized_path_alias_key(path.to_string_lossy().as_ref())),
+    );
+    keys
+}
+
+#[cfg(windows)]
+fn push_unique_windows_path_alias_key(keys: &mut Vec<String>, key: Option<String>) {
+    if let Some(key) = key {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    }
+}
+
+#[cfg(windows)]
 fn windows_existing_path_alias_key(path: &Path) -> Option<String> {
     if let Some(long_path) = windows_long_path_name(path) {
         if let Some(key) = windows_normalized_path_alias_key(long_path.as_str()) {
@@ -2328,6 +2382,39 @@ fn windows_long_path_name(path: &Path) -> Option<String> {
         if length < buffer.len() {
             buffer.truncate(length);
             return Some(String::from_utf16_lossy(buffer.as_slice()));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+#[cfg(windows)]
+fn windows_short_path_name(path: &Path) -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let mut source = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if source.is_empty() {
+        return None;
+    }
+    source.push(0);
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let length = unsafe {
+            // SAFETY: Both buffers are valid nul-terminated UTF-16 buffers. The destination size
+            // passed to Win32 matches the allocated buffer length.
+            GetShortPathNameW(
+                source.as_ptr(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).ok()?,
+            )
+        };
+        if length == 0 {
+            return None;
+        }
+        let length = usize::try_from(length).ok()?;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Some(PathBuf::from(String::from_utf16_lossy(buffer.as_slice())));
         }
         buffer.resize(length.saturating_add(1), 0);
     }
@@ -2568,36 +2655,37 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
-    fn windows_short_path_name(path: &Path) -> Option<PathBuf> {
-        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    #[test]
+    fn lexical_workspace_root_check_rejects_unc_candidate() {
+        let canonical_roots = vec![(0, PathBuf::from("C:/workspace"))];
 
-        let mut source = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        if source.is_empty() {
-            return None;
-        }
-        source.push(0);
+        assert_eq!(
+            find_lexical_workspace_root(
+                canonical_roots.as_slice(),
+                Path::new("//attacker.example/share/x")
+            ),
+            None
+        );
+    }
 
-        let mut buffer = vec![0_u16; 260];
-        loop {
-            let length = unsafe {
-                // SAFETY: Both buffers are valid nul-terminated UTF-16 buffers. The destination
-                // size passed to Win32 matches the allocated buffer length.
-                GetShortPathNameW(
-                    source.as_ptr(),
-                    buffer.as_mut_ptr(),
-                    u32::try_from(buffer.len()).ok()?,
-                )
-            };
-            if length == 0 {
-                return None;
-            }
-            let length = usize::try_from(length).ok()?;
-            if length < buffer.len() {
-                buffer.truncate(length);
-                return Some(PathBuf::from(String::from_utf16_lossy(buffer.as_slice())));
-            }
-            buffer.resize(length.saturating_add(1), 0);
-        }
+    #[test]
+    #[cfg(windows)]
+    fn lexical_workspace_root_check_accepts_trusted_root_short_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
+        let file_path = workspace.join("nested").join("calc.js");
+        fs::write(file_path.as_path(), "export const add = (a, b) => a + b;\n")
+            .expect("workspace file should be written");
+        let short_workspace =
+            windows_short_path_name(workspace.as_path()).unwrap_or_else(|| workspace.clone());
+        let requested = short_workspace.join("nested").join("calc.js");
+        let canonical_roots = vec![(0, workspace)];
+
+        let root = find_lexical_workspace_root(canonical_roots.as_slice(), requested.as_path())
+            .expect("trusted root short alias should resolve lexically");
+
+        assert_eq!(root.0, 0);
     }
 
     #[test]
