@@ -499,9 +499,10 @@ async fn resolve_workspace_patch_roots(
     })
 }
 
-/// The focus root applies only when every operation path in the patch
-/// re-roots cleanly under it; a single top-level path keeps the patch at the
-/// agent roots so files are never silently nested under the focus.
+/// The focus root applies only when every operation path in the patch re-roots
+/// cleanly under it. Paths already expressed with the active root's
+/// root-relative prefix keep their original meaning instead of being nested
+/// twice under the focus.
 fn patch_should_use_active_root(
     patch: &str,
     active_root: &crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot,
@@ -1693,12 +1694,13 @@ mod tests {
     }
 
     #[test]
-    fn active_workspace_patch_scope_requires_existing_active_parent() {
+    fn active_workspace_patch_scope_anchors_missing_active_parents() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");
         let reports = workspace.join("reports");
+        let reports_src = reports.join("src");
         let audit_fixture = workspace.join("audit-fixture");
-        std::fs::create_dir_all(reports.as_path()).expect("reports should exist");
+        std::fs::create_dir_all(reports_src.as_path()).expect("reports src should exist");
         std::fs::create_dir_all(audit_fixture.as_path()).expect("fixture should exist");
         let active = ActiveWorkspaceRoot {
             root: std::fs::canonicalize(reports.as_path()).expect("reports should canonicalize"),
@@ -1711,6 +1713,12 @@ mod tests {
             "+alpha\n",
             "*** End Patch\n",
         );
+        let nested_patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: src/generated/file.rs\n",
+            "+pub fn generated() {}\n",
+            "*** End Patch\n",
+        );
         let report_patch = concat!(
             "*** Begin Patch\n",
             "*** Add File: summary.md\n",
@@ -1719,8 +1727,12 @@ mod tests {
         );
 
         assert!(
-            !patch_should_use_active_root(audit_patch, &active),
-            "top-level workspace paths must not be silently nested under the active focus"
+            patch_should_use_active_root(audit_patch, &active),
+            "same-looking relative paths must remain anchored to the active focus"
+        );
+        assert!(
+            patch_should_use_active_root(nested_patch, &active),
+            "missing nested active-root parents must not fall back to the broader workspace"
         );
         assert!(
             patch_should_use_active_root(report_patch, &active),

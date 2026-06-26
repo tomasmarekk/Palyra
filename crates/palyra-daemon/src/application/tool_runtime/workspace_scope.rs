@@ -494,10 +494,10 @@ pub(crate) fn relative_path_already_targets_active_root(
 /// Heuristic deciding whether a bare relative path should be re-rooted under
 /// the active focus directory.
 ///
-/// A path qualifies only when its parent directory already exists inside the
-/// (canonicalized) active root. Paths that already target the focus keep
-/// their original meaning, and top-level workspace paths whose parent exists
-/// only at the outer root are never silently nested under the focus.
+/// A path qualifies when its nearest existing parent remains inside the
+/// (canonicalized) active root. Missing descendants therefore stay anchored to
+/// the active focus, while symlinked parents that escape it are rejected. Paths
+/// that already target the focus keep their original root-relative meaning.
 pub(crate) fn relative_path_should_use_active_root(
     path: &str,
     active: &ActiveWorkspaceRoot,
@@ -516,10 +516,17 @@ pub(crate) fn relative_path_should_use_active_root(
     let Ok(canonical_active_root) = fs::canonicalize(active.root.as_path()) else {
         return false;
     };
-    let Ok(canonical_parent) = fs::canonicalize(candidate_parent.as_path()) else {
+    let Some(existing_parent) =
+        nearest_existing_directory(candidate_parent.as_path(), active.root.as_path())
+    else {
         return false;
     };
-    canonical_parent.is_dir() && canonical_parent.starts_with(canonical_active_root.as_path())
+    let Ok(canonical_parent) = fs::canonicalize(existing_parent.as_path()) else {
+        return false;
+    };
+    canonical_parent.is_dir()
+        && (canonical_parent == canonical_active_root
+            || canonical_parent.starts_with(canonical_active_root.as_path()))
 }
 
 /// Returns true when an explicit `workspace_root` override refers to the
@@ -657,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn active_workspace_root_only_handles_paths_with_existing_active_parent() {
+    fn active_workspace_root_anchors_missing_descendants_to_existing_ancestor() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let workspace = tempdir.path().join("workspace");
         let reports = workspace.join("reports");
@@ -672,8 +679,31 @@ mod tests {
 
         assert!(relative_path_should_use_active_root("summary.md", &active));
         assert!(relative_path_should_use_active_root("daily/report.md", &active));
-        assert!(!relative_path_should_use_active_root("audit-fixture/alpha.txt", &active));
+        assert!(relative_path_should_use_active_root("daily/generated/report.md", &active));
+        assert!(relative_path_should_use_active_root("generated/report.md", &active));
+        assert!(relative_path_should_use_active_root("audit-fixture/alpha.txt", &active));
         assert!(!relative_path_should_use_active_root("reports/journal-replay.md", &active));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_workspace_root_rejects_symlinked_active_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let reports = workspace.join("reports");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir_all(reports.as_path()).expect("reports should exist");
+        fs::create_dir_all(outside.as_path()).expect("outside should exist");
+        symlink(outside.as_path(), reports.join("linked").as_path())
+            .expect("symlink should be created");
+        let active = ActiveWorkspaceRoot {
+            root: fs::canonicalize(reports.as_path()).expect("reports should canonicalize"),
+            relative_path: "reports".to_owned(),
+        };
+
+        assert!(!relative_path_should_use_active_root("linked/secret.txt", &active));
     }
 
     #[cfg(unix)]

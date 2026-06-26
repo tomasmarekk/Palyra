@@ -682,7 +682,7 @@ fn looks_like_palyra_env_prefixed_os_path(path: &str) -> bool {
 /// Precedence: an explicit `workspace_root` override narrows the scope to a
 /// single root (resolved against the session's active focus first, then the
 /// agent roots); otherwise the session focus directory, when it applies to
-/// `requested_path`, is placed ahead of the agent roots.
+/// `requested_path`, narrows the operation to that active root.
 ///
 /// # Errors
 /// Returns an error when session state cannot be loaded or the override does
@@ -720,16 +720,14 @@ async fn resolve_workspace_file_roots(
             session_active_workspace_root(runtime_state, session_id, agent_workspace_roots).await?
         {
             if relative_path_should_use_active_root(requested_path, &active_root) {
-                return Ok(workspace_roots_with_active_first(
-                    active_root.root,
-                    agent_workspace_roots,
-                ));
+                return Ok(vec![active_root.root]);
             }
         }
     }
     Ok(agent_workspace_roots.to_vec())
 }
 
+#[cfg(test)]
 fn workspace_roots_with_active_first(
     active_root: PathBuf,
     workspace_roots: &[PathBuf],
@@ -748,6 +746,7 @@ fn workspace_roots_with_active_first(
 /// Root equality for deduplication: canonicalization unifies symlinked
 /// aliases, and Windows additionally compares case-insensitively with
 /// normalized separators for roots that cannot be canonicalized.
+#[cfg(test)]
 fn same_workspace_file_root(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -3798,7 +3797,7 @@ mod tests {
     }
 
     #[test]
-    fn list_workspace_dir_falls_back_after_active_root_miss() {
+    fn list_workspace_dir_uses_later_ordered_root_after_first_root_miss() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let launch_root = tempdir.path().join("S097_cross_boundary_audit");
         let active_root = tempdir.path().join("home").join("S097").join(".config");
