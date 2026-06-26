@@ -3196,23 +3196,23 @@ fn file_watch_workspace_grant(record: &RoutineMetadataRecord) -> Option<FileWatc
     }
 }
 
-// Explicit job session keys always win; otherwise FreshSession isolates each
-// run in its own session while SameSession reuses one session per job.
+// FreshSession isolates each run before explicit job session keys are
+// considered; SameSession may reuse an explicitly configured key or fall back
+// to one session per job.
 fn effective_cron_session_key(
     job: &CronJobRecord,
     run_id: &str,
     run_mode: RoutineRunMode,
 ) -> String {
+    if run_mode == RoutineRunMode::FreshSession {
+        return format!("cron:{}:{run_id}", job.job_id);
+    }
     if let Some(session_key) =
         job.session_key.as_deref().map(str::trim).filter(|key| !key.is_empty())
     {
         return session_key.to_owned();
     }
-    if run_mode == RoutineRunMode::FreshSession {
-        format!("cron:{}:{run_id}", job.job_id)
-    } else {
-        format!("cron:{}", job.job_id)
-    }
+    format!("cron:{}", job.job_id)
 }
 
 fn effective_cron_session_label(
@@ -4240,7 +4240,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cron_session_key_overrides_fresh_session_key_generation() {
+    fn fresh_session_key_generation_overrides_explicit_cron_session_key() {
         let mut job = sample_every_job("job-direct", Some(1_000), CronMisfirePolicy::Skip);
         job.session_key = Some("cron-direct-20260527".to_owned());
         job.session_label = Some("Direct cron".to_owned());
@@ -4251,6 +4251,14 @@ mod tests {
 
         assert_eq!(
             effective_cron_session_key(&job, "run-1", RoutineRunMode::FreshSession),
+            "cron:job-direct:run-1"
+        );
+        assert_eq!(
+            effective_cron_session_key(&job, "run-2", RoutineRunMode::FreshSession),
+            "cron:job-direct:run-2"
+        );
+        assert_eq!(
+            effective_cron_session_key(&job, "run-1", RoutineRunMode::SameSession),
             "cron-direct-20260527"
         );
         assert_eq!(
