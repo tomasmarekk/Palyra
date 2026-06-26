@@ -2983,10 +2983,11 @@ mod tests {
     }
 
     #[test]
-    fn read_workspace_file_preserves_obvious_api_key_placeholders() {
+    fn read_workspace_file_redacts_obvious_api_key_placeholders() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join(".env.example");
-        let contents = "PORT=3000\nPALYRA_API_KEY=TODO\nSERVICE_API_KEY=your_api_key_here\n";
+        let contents =
+            "PORT=3000\nPASSWORD=TODO\nCLIENT_SECRET=TODO\nSERVICE_API_KEY=your_api_key_here\n";
         fs::write(file_path, contents).expect("workspace file should be written");
         let input = WorkspaceReadFileInput {
             path: ".env.example".to_owned(),
@@ -3000,8 +3001,23 @@ mod tests {
         let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
             .expect("workspace file should be readable");
 
-        assert!(!output.redacted);
-        assert_eq!(output.text.as_deref(), Some(contents));
+        assert!(output.redacted);
+        assert_eq!(output.text_authoritative, Some(false));
+        assert_eq!(
+            output.text.as_deref(),
+            Some(
+                "PORT=3000\nPASSWORD=[REDACTED_SECRET]\nCLIENT_SECRET=[REDACTED_SECRET]\nSERVICE_API_KEY=[REDACTED_SECRET]\n"
+            )
+        );
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| reason == "secret_leak.assignment.password")));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| reason == "secret_leak.assignment.client_secret")));
+        assert!(output.redaction_reasons.as_ref().is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| reason == "secret_leak.assignment.api_key")));
     }
 
     #[test]

@@ -987,7 +987,7 @@ fn comparison_literal_value(value: &str) -> Option<&str> {
 
 /// Returns the classification of a credential-like `key = value` /
 /// `key: value` line, or `None` when the value is a sanctioned reference
-/// (env/vault indirection, placeholder, fixture) rather than secret material.
+/// (env/vault indirection, fixture) rather than secret material.
 fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     let separator_index = sensitive_assignment_separator_index(line)?;
     let raw_key = line.get(..separator_index)?;
@@ -1106,8 +1106,8 @@ fn classify_sensitive_assignment_key(key: &str) -> Option<&'static str> {
 }
 
 /// Recognizes assignment values that mention a secret without containing one:
-/// env/vault indirection, DOM reads, placeholders, fixtures, and narrowly
-/// source-shaped expressions.
+/// env/vault indirection, DOM reads, fixtures, and narrowly source-shaped
+/// expressions.
 fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool {
     let normalized = value.trim().trim_end_matches(';').trim();
     if normalized.is_empty() {
@@ -1124,7 +1124,6 @@ fn is_safe_secret_reference_value(raw_key: &str, key: &str, value: &str) -> bool
         || is_env_identifier_reference_expression(key, reference)
         || is_safe_standalone_env_identifier_literal(raw_key, key, reference)
         || is_vault_reference_value(reference)
-        || is_obvious_placeholder_secret_value(reference)
         || is_benign_mock_credential_fixture_value(reference)
         || (sensitive_assignment_key_allows_path_reference(key)
             && is_benign_path_reference_value(reference))
@@ -2988,8 +2987,8 @@ mod tests {
     }
 
     #[test]
-    fn obvious_api_key_placeholders_are_not_redacted_as_secret_values() {
-        let source = "PALYRA_API_KEY=TODO\nSERVICE_API_KEY=your_api_key_here";
+    fn placeholder_sensitive_assignments_are_redacted_as_secret_values() {
+        let source = "PASSWORD=TODO\nCLIENT_SECRET=TODO\nSERVICE_API_KEY=your_api_key_here";
         let outcome = redact_text_for_export(
             source,
             SafetySourceKind::Workspace,
@@ -2997,8 +2996,28 @@ mod tests {
             TrustLabel::TrustedLocal,
         );
 
-        assert!(!outcome.redacted);
-        assert_eq!(outcome.redacted_text, source);
+        assert!(outcome.redacted, "expected redaction: {}", outcome.redacted_text);
+        assert_eq!(
+            outcome.redacted_text,
+            "PASSWORD=[REDACTED_SECRET]\nCLIENT_SECRET=[REDACTED_SECRET]\nSERVICE_API_KEY=[REDACTED_SECRET]"
+        );
+        assert!(!outcome.redacted_text.contains("TODO"));
+        assert!(!outcome.redacted_text.contains("your_api_key_here"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.password"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.client_secret"));
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.api_key"));
     }
 
     #[test]
