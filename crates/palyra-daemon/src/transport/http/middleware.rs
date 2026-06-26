@@ -146,6 +146,14 @@ fn consume_admin_auth_failure_rate_limit(state: &AppState, remote_addr: SocketAd
     )
 }
 
+fn admin_auth_failure_rate_limit_has_capacity(state: &AppState, remote_addr: SocketAddr) -> bool {
+    admin_auth_failure_rate_limit_has_capacity_with_now(
+        &state.admin_auth_failure_rate_limit,
+        remote_addr.ip(),
+        Instant::now(),
+    )
+}
+
 fn admin_rate_limit_budget(remote_ip: IpAddr) -> u32 {
     if remote_ip.is_loopback() {
         return ADMIN_RATE_LIMIT_LOOPBACK_MAX_REQUESTS_PER_WINDOW;
@@ -240,6 +248,44 @@ pub(crate) fn consume_admin_auth_failure_rate_limit_with_now(
     true
 }
 
+/// Checks whether failed admin auth attempts may still reach downstream auth.
+///
+/// This is a non-consuming pre-auth check. The bucket is consumed only when a
+/// downstream handler returns unauthorized/forbidden, but once exhausted every
+/// admin request from that remote is blocked before token comparison.
+pub(crate) fn admin_auth_failure_rate_limit_has_capacity_with_now(
+    buckets: &Mutex<HashMap<IpAddr, AdminRateLimitEntry>>,
+    remote_ip: IpAddr,
+    now: Instant,
+) -> bool {
+    let mut buckets = match buckets.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    if !buckets.contains_key(&remote_ip) && buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
+        buckets.retain(|_, entry| {
+            elapsed_millis_since(now, entry.window_started_at) <= ADMIN_RATE_LIMIT_WINDOW_MS
+        });
+        if buckets.len() >= ADMIN_RATE_LIMIT_MAX_IP_BUCKETS {
+            let evicted_ip =
+                buckets.iter().min_by_key(|(_, entry)| entry.window_started_at).map(|(ip, _)| *ip);
+            let Some(evicted_ip) = evicted_ip else {
+                return false;
+            };
+            buckets.remove(&evicted_ip);
+        }
+    }
+    let Some(entry) = buckets.get_mut(&remote_ip) else {
+        return true;
+    };
+    if elapsed_millis_since(now, entry.window_started_at) > ADMIN_RATE_LIMIT_WINDOW_MS {
+        entry.window_started_at = now;
+        entry.requests_in_window = 0;
+        return true;
+    }
+    entry.requests_in_window < ADMIN_AUTH_FAILURE_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW
+}
+
 /// Enforces remote admin rate limits and records non-loopback access attempts.
 pub(crate) async fn admin_rate_limit_middleware(
     State(state): State<AppState>,
@@ -253,6 +299,21 @@ pub(crate) async fn admin_rate_limit_middleware(
         state.runtime.record_denied();
         let response = runtime_status_response(tonic::Status::resource_exhausted(format!(
             "admin API rate limit exceeded for {}",
+            remote_addr.ip()
+        )));
+        record_remote_admin_access_attempt(
+            &state,
+            remote_addr,
+            method.as_str(),
+            path.as_str(),
+            response.status(),
+        );
+        return response;
+    }
+    if !admin_auth_failure_rate_limit_has_capacity(&state, remote_addr) {
+        state.runtime.record_denied();
+        let response = runtime_status_response(tonic::Status::resource_exhausted(format!(
+            "admin auth failure rate limit exceeded for {}",
             remote_addr.ip()
         )));
         record_remote_admin_access_attempt(

@@ -260,6 +260,21 @@ fn admin_status_bruteforce_attempts_are_rate_limited() -> Result<()> {
         )
     })?;
     assert_admin_console_security_headers(rate_limited_response.headers())?;
+
+    let valid_after_limit = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to call admin status with valid token after auth limit")?;
+    assert_eq!(
+        valid_after_limit.status().as_u16(),
+        429,
+        "exhausted auth-failure bucket must block even correct tokens before validation"
+    );
+    assert_admin_console_security_headers(valid_after_limit.headers())?;
     Ok(())
 }
 
