@@ -239,13 +239,12 @@ async fn process_background_task(
         == Some(AuxiliaryTaskState::CancelRequested)
     {
         if let Some(target_run_id) = task.target_run_id.as_deref() {
-            // The run cancel was already requested; finalize only once the
-            // run is terminal. A missing snapshot counts as terminal because
-            // nothing else can ever resolve the cancellation.
             let snapshot =
                 runtime.orchestrator_run_status_snapshot(target_run_id.to_owned()).await?;
             if snapshot.as_ref().is_none_or(|run| is_terminal_run_state(run.state.as_str())) {
                 finalize_task_from_run(runtime, task, snapshot.as_ref(), "cancelled").await?;
+            } else if let Some(reason) = pending_child_cancel_reason(task) {
+                request_background_child_cancel(runtime, target_run_id, reason).await?;
             }
         } else {
             if task_has_in_flight_work_without_target(task) {
@@ -881,6 +880,11 @@ fn task_has_in_flight_work_without_target(task: &OrchestratorBackgroundTaskRecor
         )
 }
 
+fn pending_child_cancel_reason(task: &OrchestratorBackgroundTaskRecord) -> Option<&'static str> {
+    (AuxiliaryTaskState::from_str(task.state.as_str()) == Some(AuxiliaryTaskState::CancelRequested))
+        .then_some("background_task_cancel_requested")
+}
+
 /// Deterministic FIFO order (created_at, then task id as tiebreaker);
 /// includes `task` itself so filtered counts behave as 1-based ranks.
 fn task_precedes_or_equals(
@@ -1014,12 +1018,7 @@ async fn request_delegated_child_timeout_cancel(
     target_run_id: &str,
     message: String,
 ) -> Result<(), Status> {
-    runtime
-        .request_orchestrator_cancel(crate::journal::OrchestratorCancelRequest {
-            run_id: target_run_id.to_owned(),
-            reason: "delegated_child_timeout".to_owned(),
-        })
-        .await?;
+    request_background_child_cancel(runtime, target_run_id, "delegated_child_timeout").await?;
     runtime
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task.task_id.clone(),
@@ -1054,6 +1053,20 @@ async fn request_delegated_child_timeout_cancel(
         }),
     )
     .await
+}
+
+async fn request_background_child_cancel(
+    runtime: &Arc<GatewayRuntimeState>,
+    target_run_id: &str,
+    reason: &str,
+) -> Result<(), Status> {
+    runtime
+        .request_orchestrator_cancel(crate::journal::OrchestratorCancelRequest {
+            run_id: target_run_id.to_owned(),
+            reason: reason.to_owned(),
+        })
+        .await?;
+    Ok(())
 }
 
 /// Supervises one child gateway run end to end: opens the RunStream, attaches
@@ -1373,8 +1386,23 @@ async fn attach_background_task_child_run(
             run_id,
         ))
         .await?;
+    deliver_pending_child_cancel_after_attach(runtime, task.task_id.as_str(), run_id).await?;
     append_parent_spawned_event(runtime, task, run_id).await?;
     create_delegated_child_binding(runtime, task, run_id).await
+}
+
+async fn deliver_pending_child_cancel_after_attach(
+    runtime: &Arc<GatewayRuntimeState>,
+    task_id: &str,
+    run_id: &str,
+) -> Result<(), Status> {
+    let Some(task) = runtime.get_orchestrator_background_task(task_id.to_owned()).await? else {
+        return Ok(());
+    };
+    if let Some(reason) = pending_child_cancel_reason(&task) {
+        request_background_child_cancel(runtime, run_id, reason).await?;
+    }
+    Ok(())
 }
 
 /// Polls until the child run row is persisted or the attach timeout elapses;
@@ -3135,11 +3163,11 @@ mod tests {
         categorize_child_failure, child_merge_lifecycle_details, delegated_child_timeout_message,
         evaluate_delegation_scheduler_limits, inject_background_metadata,
         parent_merge_event_payload, parent_tape_accepts_background_event,
-        replace_background_task_snapshot, running_delegated_children_for_parent,
-        running_task_should_wait_for_in_flight_work, should_emit_child_stream_progress,
-        task_has_in_flight_work_without_target, ChildLifecycleTapeBudget,
-        ChildLifecycleTapeDecision, ChildStreamProgress, DelegationSchedulerDecision,
-        MergeDeliveryPayloadContext,
+        pending_child_cancel_reason, replace_background_task_snapshot,
+        running_delegated_children_for_parent, running_task_should_wait_for_in_flight_work,
+        should_emit_child_stream_progress, task_has_in_flight_work_without_target,
+        ChildLifecycleTapeBudget, ChildLifecycleTapeDecision, ChildStreamProgress,
+        DelegationSchedulerDecision, MergeDeliveryPayloadContext,
     };
     use crate::{
         application::delivery_arbitration::{DeliveryDecision, DeliveryDecisionAction},
@@ -3894,6 +3922,33 @@ mod tests {
         let mut queued = running;
         queued.state = AuxiliaryTaskState::Queued.as_str().to_owned();
         assert!(!task_has_in_flight_work_without_target(&queued));
+    }
+
+    #[test]
+    fn cancel_requested_attached_task_requires_child_cancel_delivery() {
+        let limits = DelegationRuntimeLimits {
+            max_concurrent_children: 1,
+            max_children_per_parent: 8,
+            max_total_children: 16,
+            max_parallel_groups: 1,
+            max_depth: 3,
+            max_budget_share_bps: 10_000,
+            child_budget_override: None,
+            child_timeout_ms: 60_000,
+        };
+        let mut task = sample_task(
+            "task-cancel",
+            AuxiliaryTaskState::CancelRequested.as_str(),
+            10,
+            "group-a",
+            limits,
+        );
+        task.target_run_id = Some("run-1".to_owned());
+
+        assert_eq!(pending_child_cancel_reason(&task), Some("background_task_cancel_requested"));
+
+        task.state = AuxiliaryTaskState::Running.as_str().to_owned();
+        assert_eq!(pending_child_cancel_reason(&task), None);
     }
 
     #[test]

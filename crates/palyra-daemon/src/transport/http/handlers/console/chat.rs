@@ -2804,7 +2804,9 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
     let session = authorize_console_session(&state, &headers, true)?;
     ensure_console_runtime_preview_capability(&state, RuntimePreviewCapability::AuxiliaryExecutor)?;
     let task = load_console_background_task(&state, &session.context, task_id.as_str()).await?;
-    if AuxiliaryTaskState::from_str(task.state.as_str()) == Some(AuxiliaryTaskState::Running) {
+    let task_state = AuxiliaryTaskState::from_str(task.state.as_str());
+    if matches!(task_state, Some(AuxiliaryTaskState::Running | AuxiliaryTaskState::CancelRequested))
+    {
         if let Some(target_run_id) = task.target_run_id.clone() {
             state
                 .runtime
@@ -2816,51 +2818,38 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
                 .map_err(runtime_status_response)?;
             state
                 .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
-                        state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
-                        result_json: Some(Some(
-                            build_background_task_cancel_requested_result_json(
-                                task.task_id.as_str(),
-                            ),
-                        )),
-                        ..Default::default()
-                    },
-                )
+                .update_orchestrator_background_task(build_background_task_cancel_requested_update(
+                    task.task_id.as_str(),
+                ))
                 .await
                 .map_err(runtime_status_response)?;
         } else {
-            state
-                .runtime
-                .update_orchestrator_background_task(
-                    journal::OrchestratorBackgroundTaskUpdateRequest {
-                        task_id: task.task_id.clone(),
-                        state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
-                        result_json: Some(Some(
-                            build_background_task_cancel_requested_result_json(
-                                task.task_id.as_str(),
-                            ),
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(runtime_status_response)?;
+            let has_attach_pending_work = task_state == Some(AuxiliaryTaskState::CancelRequested)
+                && task.started_at_unix_ms.is_some();
+            if task_state == Some(AuxiliaryTaskState::Running) || has_attach_pending_work {
+                state
+                    .runtime
+                    .update_orchestrator_background_task(
+                        build_background_task_cancel_requested_update(task.task_id.as_str()),
+                    )
+                    .await
+                    .map_err(runtime_status_response)?;
+            } else {
+                state
+                    .runtime
+                    .update_orchestrator_background_task(build_background_task_cancelled_update(
+                        task.task_id.as_str(),
+                    ))
+                    .await
+                    .map_err(runtime_status_response)?;
+            }
         }
     } else {
         state
             .runtime
-            .update_orchestrator_background_task(journal::OrchestratorBackgroundTaskUpdateRequest {
-                task_id: task.task_id.clone(),
-                state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
-                completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
-                last_error: Some(Some("cancelled_by_operator".to_owned())),
-                result_json: Some(Some(build_background_task_cancelled_result_json(
-                    task.task_id.as_str(),
-                ))),
-                ..Default::default()
-            })
+            .update_orchestrator_background_task(build_background_task_cancelled_update(
+                task.task_id.as_str(),
+            ))
             .await
             .map_err(runtime_status_response)?;
     }
@@ -2879,6 +2868,30 @@ pub(crate) async fn console_chat_background_task_cancel_handler(
         "action": "cancel",
         "contract": contract_descriptor(),
     })))
+}
+
+fn build_background_task_cancel_requested_update(
+    task_id: &str,
+) -> journal::OrchestratorBackgroundTaskUpdateRequest {
+    journal::OrchestratorBackgroundTaskUpdateRequest {
+        task_id: task_id.to_owned(),
+        state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+        result_json: Some(Some(build_background_task_cancel_requested_result_json(task_id))),
+        ..Default::default()
+    }
+}
+
+fn build_background_task_cancelled_update(
+    task_id: &str,
+) -> journal::OrchestratorBackgroundTaskUpdateRequest {
+    journal::OrchestratorBackgroundTaskUpdateRequest {
+        task_id: task_id.to_owned(),
+        state: Some(AuxiliaryTaskState::Cancelled.as_str().to_owned()),
+        completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+        last_error: Some(Some("cancelled_by_operator".to_owned())),
+        result_json: Some(Some(build_background_task_cancelled_result_json(task_id))),
+        ..Default::default()
+    }
 }
 
 fn build_background_task_cancel_requested_result_json(task_id: &str) -> String {
@@ -6461,13 +6474,15 @@ fn build_console_run_lineage_payload(
 mod tests {
     use super::{
         build_background_task_cancel_requested_result_json,
-        build_background_task_cancelled_result_json, console_attachment_workspace_path,
+        build_background_task_cancel_requested_update, build_background_task_cancelled_result_json,
+        build_background_task_cancelled_update, console_attachment_workspace_path,
         console_background_task_budget_tokens, derive_canvas_transcript_reference,
         derived_artifact_index_content, derived_artifact_matches_console_context,
         extract_canvas_id_from_frame_reference, retry_parameter_delta_from_payload_or_run,
         run_matches_console_context,
     };
     use crate::{domain::workspace::normalize_workspace_path, gateway, journal, media};
+    use palyra_common::runtime_contracts::AuxiliaryTaskState;
 
     #[test]
     fn run_matches_console_context_rejects_mismatched_principal() {
@@ -6707,6 +6722,24 @@ mod tests {
         assert_eq!(cancelled.get("task_id").and_then(serde_json::Value::as_str), Some("task-1"));
         assert_eq!(
             cancelled.get("reason").and_then(serde_json::Value::as_str),
+            Some("cancelled_by_operator")
+        );
+    }
+
+    #[test]
+    fn background_task_cancel_updates_keep_pending_and_terminal_states_distinct() {
+        let pending = build_background_task_cancel_requested_update("task-1");
+        assert_eq!(pending.task_id, "task-1");
+        assert_eq!(pending.state.as_deref(), Some(AuxiliaryTaskState::CancelRequested.as_str()));
+        assert_eq!(pending.completed_at_unix_ms, None);
+        assert_eq!(pending.last_error, None);
+
+        let cancelled = build_background_task_cancelled_update("task-1");
+        assert_eq!(cancelled.task_id, "task-1");
+        assert_eq!(cancelled.state.as_deref(), Some(AuxiliaryTaskState::Cancelled.as_str()));
+        assert!(cancelled.completed_at_unix_ms.is_some());
+        assert_eq!(
+            cancelled.last_error.as_ref().and_then(|value| value.as_deref()),
             Some("cancelled_by_operator")
         );
     }
