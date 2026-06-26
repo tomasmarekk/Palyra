@@ -1480,27 +1480,6 @@ fn provider_credential_attribution_for_provider(
     })
 }
 
-/// True when registry failover could route this request to another enabled
-/// chat provider, which makes per-credential failure attribution ambiguous.
-fn request_may_failover_to_other_provider(
-    snapshot: &ProviderStatusSnapshot,
-    model_override_requested: bool,
-    lease_context: &ProviderLeaseExecutionContext,
-) -> bool {
-    !model_override_requested
-        && snapshot.registry.failover_enabled
-        && snapshot.registry.models.iter().any(|model| {
-            model.enabled
-                && model.role == "chat"
-                && model.provider_id != lease_context.provider_id
-                && snapshot
-                    .registry
-                    .providers
-                    .iter()
-                    .any(|provider| provider.enabled && provider.provider_id == model.provider_id)
-        })
-}
-
 fn auth_profile_failure_kind_for_provider_error(
     error: &ProviderError,
 ) -> Option<AuthProfileFailureKind> {
@@ -3846,7 +3825,6 @@ impl GatewayRuntimeState {
         request: ProviderRequest,
         lease_context: ProviderLeaseExecutionContext,
     ) -> Result<crate::model_provider::ProviderResponse, Status> {
-        let model_override_requested = request.model_override.is_some();
         let model_provider = self.current_model_provider();
         let _lease = self
             .provider_leases
@@ -3906,19 +3884,8 @@ impl GatewayRuntimeState {
                         .model_provider_circuit_open_rejections
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                // When registry failover could have routed the request to a
-                // different provider, the final error cannot be attributed to
-                // the leased credential, so failure feedback is suppressed to
-                // avoid cooling down (or flagging) a healthy credential.
-                let provider_status = model_provider.status_snapshot();
-                if !request_may_failover_to_other_provider(
-                    &provider_status,
-                    model_override_requested,
-                    &lease_context,
-                ) {
-                    self.record_auth_profile_failure_for_lease(&lease_context, &error);
-                    self.record_provider_lease_feedback_for_error(&lease_context, &error);
-                }
+                self.record_auth_profile_failure_for_lease(&lease_context, &error);
+                self.record_provider_lease_feedback_for_error(&lease_context, &error);
                 Err(map_provider_error(error))
             }
         }
@@ -10110,24 +10077,33 @@ fn normalize_optional_agent_model_profile(value: &str) -> Option<String> {
 mod tests {
     use super::{
         fallback_workspace_document_search_hits, provider_credential_attribution_for_provider,
-        provider_lease_timeout_status, request_may_failover_to_other_provider,
-        select_default_agent_model_profile, sign_canvas_hmac_sha256,
-        validate_memory_item_content_limits, GatewayRuntimeState, MemoryRuntimeConfig,
+        provider_lease_timeout_status, select_default_agent_model_profile, sign_canvas_hmac_sha256,
+        validate_memory_item_content_limits, BrowserServiceRuntimeConfig, CanvasHostRuntimeConfig,
+        GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+        HttpFetchRuntimeConfig, MemoryRuntimeConfig,
     };
+    use crate::agents::AgentRegistry;
     use crate::gateway::RUN_PARAMETER_DELTA_CACHE_CAPACITY;
-    use crate::journal::{CanvasStatePatchRecord, WorkspaceDocumentRecord, WorkspaceSearchRequest};
+    use crate::journal::{
+        CanvasStatePatchRecord, JournalConfig, JournalStore, WorkspaceDocumentRecord,
+        WorkspaceSearchRequest,
+    };
+    use crate::media::MediaRuntimeConfig;
     use crate::model_provider::{
+        AudioTranscriptionRequest, AudioTranscriptionResponse, ModelProvider,
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
-        ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
-        ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
-        ProviderRetryPolicySnapshot, ProviderRouteSelectionTrace, ProviderRuntimeMetricsSnapshot,
-        ProviderStatusSnapshot,
+        ProviderError, ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
+        ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderRequest,
+        ProviderResponse, ProviderResponseCacheSnapshot, ProviderRetryPolicySnapshot,
+        ProviderRouteSelectionTrace, ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
     };
     use crate::provider_leases::{
         LeasePreviewState, LeasePriority, ProviderLeaseExecutionContext,
         ProviderLeasePreviewSnapshot,
     };
     use crate::retrieval::RetrievalRuntimeConfig;
+    use palyra_model_providers::classify_http_provider_failure;
+    use std::{future::Future, pin::Pin, sync::Arc};
     use tonic::Code;
 
     #[test]
@@ -10276,25 +10252,37 @@ mod tests {
         assert_eq!(attribution.auth_profile_id.as_deref(), Some("fallback-profile"));
     }
 
-    #[test]
-    fn failover_failure_feedback_is_suppressed_for_cross_provider_candidates() {
+    #[tokio::test]
+    async fn failover_provider_errors_still_record_credential_feedback() {
+        let state = test_runtime_state();
+        let _ = state.configure_model_provider(Arc::new(RateLimitedFailoverModelProvider));
         let lease_context =
             provider_lease_context("openai-primary", "auth-profile:openai-primary:primary-profile");
-        let snapshot = provider_status_snapshot(true);
 
-        assert!(
-            request_may_failover_to_other_provider(&snapshot, false, &lease_context),
-            "no model override plus enabled fallback provider can make the final error ambiguous"
-        );
-        assert!(
-            !request_may_failover_to_other_provider(&snapshot, true, &lease_context),
-            "explicit model override disables registry failover attribution ambiguity"
-        );
+        let result = state
+            .execute_model_provider_with_lease(
+                ProviderRequest::from_input_text(
+                    "exercise rate-limit feedback".to_owned(),
+                    false,
+                    Vec::new(),
+                    None,
+                ),
+                lease_context,
+            )
+            .await;
 
-        let failover_disabled = provider_status_snapshot(false);
+        assert!(result.is_err(), "fake provider should return the configured rate-limit error");
+        let snapshot = state.provider_lease_snapshot();
+        let feedback = snapshot
+            .credential_feedback
+            .iter()
+            .find(|entry| entry.credential_id == "auth-profile:openai-primary:primary-profile")
+            .expect("provider error should record credential feedback even when failover exists");
+        assert_eq!(feedback.provider_id, "openai-primary");
+        assert_eq!(feedback.state, "rate_limited");
         assert!(
-            !request_may_failover_to_other_provider(&failover_disabled, false, &lease_context),
-            "disabled failover keeps failure attribution bound to the lease provider"
+            feedback.reason.contains("category=rate_limit"),
+            "feedback should preserve the provider recovery category"
         );
     }
 
@@ -10401,6 +10389,195 @@ mod tests {
             max_wait_ms: 30_000,
             session_id: Some("session-1".to_owned()),
             run_id: Some("run-1".to_owned()),
+        }
+    }
+
+    struct RateLimitedFailoverModelProvider;
+
+    impl ModelProvider for RateLimitedFailoverModelProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: ProviderRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ProviderResponse, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async { Err(rate_limit_provider_error()) })
+        }
+
+        fn transcribe_audio<'a>(
+            &'a self,
+            _request: AudioTranscriptionRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AudioTranscriptionResponse, ProviderError>> + Send + 'a>,
+        > {
+            Box::pin(async { Err(ProviderError::MissingApiKey) })
+        }
+
+        fn status_snapshot(&self) -> ProviderStatusSnapshot {
+            provider_status_snapshot(true)
+        }
+    }
+
+    fn rate_limit_provider_error() -> ProviderError {
+        ProviderError::RequestFailed {
+            message: "rate limit exceeded".to_owned(),
+            retryable: true,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                429,
+                true,
+                "openai_chat_http",
+                "rate limit exceeded",
+            ),
+        }
+    }
+
+    fn test_runtime_state() -> Arc<GatewayRuntimeState> {
+        let db_path =
+            unique_runtime_test_root("palyra-runtime-feedback-journal").join("events.sqlite3");
+        let state_root = unique_runtime_test_root("palyra-runtime-feedback-state");
+        let agent_registry = AgentRegistry::open_for_test_state_root(state_root.as_path())
+            .expect("test agent registry should initialize");
+        let journal_store = JournalStore::open(JournalConfig {
+            db_path: db_path.clone(),
+            hash_chain_enabled: false,
+            max_payload_bytes: 256 * 1024,
+            max_events: 10_000,
+        })
+        .expect("test journal store should initialize");
+
+        GatewayRuntimeState::new(
+            test_runtime_config(),
+            GatewayJournalConfigSnapshot { db_path, hash_chain_enabled: false },
+            journal_store,
+            0,
+            agent_registry,
+        )
+        .expect("test runtime state should initialize")
+    }
+
+    fn unique_runtime_test_root(prefix: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(root.as_path()).expect("test runtime temp root should exist");
+        root
+    }
+
+    fn test_runtime_config() -> GatewayRuntimeConfigSnapshot {
+        let model_provider_request_timeout_ms =
+            crate::model_provider::ModelProviderConfig::default().request_timeout_ms;
+
+        GatewayRuntimeConfigSnapshot {
+            grpc_bind_addr: "127.0.0.1".to_owned(),
+            grpc_port: 7443,
+            quic_bind_addr: "127.0.0.1".to_owned(),
+            quic_port: 7444,
+            quic_enabled: true,
+            orchestrator_runloop_v1_enabled: true,
+            model_provider_request_timeout_ms,
+            node_rpc_mtls_required: true,
+            admin_auth_required: true,
+            vault_get_approval_required_refs: vec!["global/openai_api_key".to_owned()],
+            max_tape_entries_per_response: 1_000,
+            max_tape_bytes_per_response: 2 * 1024 * 1024,
+            feature_rollouts: crate::config::FeatureRolloutsConfig::default(),
+            session_queue_policy: crate::config::SessionQueuePolicyConfig::default(),
+            pruning_policy_matrix: crate::config::PruningPolicyMatrixConfig::default(),
+            retrieval_dual_path: crate::config::RetrievalDualPathConfig::default(),
+            auxiliary_executor: crate::config::AuxiliaryExecutorConfig::default(),
+            flow_orchestration: crate::config::FlowOrchestrationConfig::default(),
+            delivery_arbitration: crate::config::DeliveryArbitrationConfig::default(),
+            replay_capture: crate::config::ReplayCaptureConfig::default(),
+            networked_workers: crate::config::NetworkedWorkersConfig::default(),
+            channel_router: crate::channel_router::ChannelRouterConfig::default(),
+            media: MediaRuntimeConfig::default(),
+            tool_call: test_tool_call_config(),
+            http_fetch: HttpFetchRuntimeConfig {
+                allow_private_targets: false,
+                connect_timeout_ms: 1_500,
+                request_timeout_ms: 10_000,
+                max_response_bytes: 512 * 1024,
+                allow_redirects: true,
+                max_redirects: 3,
+                allowed_content_types: vec![
+                    "text/html".to_owned(),
+                    "text/plain".to_owned(),
+                    "application/json".to_owned(),
+                ],
+                allowed_request_headers: vec![
+                    "accept".to_owned(),
+                    "accept-language".to_owned(),
+                    "content-type".to_owned(),
+                    "if-none-match".to_owned(),
+                    "if-modified-since".to_owned(),
+                    "user-agent".to_owned(),
+                    "x-client-version".to_owned(),
+                ],
+                allowed_credential_vault_refs: Vec::new(),
+                cache_enabled: true,
+                cache_ttl_ms: 30_000,
+                max_cache_entries: 256,
+            },
+            browser_service: BrowserServiceRuntimeConfig {
+                enabled: false,
+                endpoint: "http://127.0.0.1:7543".to_owned(),
+                auth_token: None,
+                connect_timeout_ms: 1_500,
+                request_timeout_ms: 15_000,
+                max_screenshot_bytes: 256 * 1024,
+                max_title_bytes: 4 * 1024,
+            },
+            canvas_host: CanvasHostRuntimeConfig {
+                enabled: true,
+                public_base_url: "http://127.0.0.1:7142".to_owned(),
+                token_ttl_ms: 15 * 60 * 1_000,
+                max_state_bytes: 64 * 1024,
+                max_bundle_bytes: 512 * 1024,
+                max_assets_per_bundle: 32,
+                max_updates_per_minute: 120,
+            },
+            smart_routing: crate::usage_governance::SmartRoutingRuntimeConfig {
+                enabled: true,
+                default_mode: "suggest".to_owned(),
+                auxiliary_routing_enabled: true,
+            },
+        }
+    }
+
+    fn test_tool_call_config() -> crate::tool_protocol::ToolCallConfig {
+        crate::tool_protocol::ToolCallConfig {
+            allowed_tools: vec!["palyra.echo".to_owned()],
+            max_calls_per_run: 4,
+            execution_timeout_ms: 250,
+            process_runner: crate::sandbox_runner::SandboxProcessRunnerPolicy {
+                enabled: false,
+                tier: crate::sandbox_runner::SandboxProcessRunnerTier::B,
+                workspace_root: std::path::PathBuf::from("."),
+                path_access_mode: crate::sandbox_runner::PathAccessMode::WorkspaceOnly,
+                allowed_executables: Vec::new(),
+                allow_interpreters: false,
+                egress_enforcement_mode: crate::sandbox_runner::EgressEnforcementMode::Strict,
+                allowed_egress_hosts: Vec::new(),
+                allowed_dns_suffixes: Vec::new(),
+                cpu_time_limit_ms: 2_000,
+                memory_limit_bytes: 256 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            wasm_runtime: crate::wasm_plugin_runner::WasmPluginRunnerPolicy {
+                enabled: false,
+                allow_inline_modules: false,
+                max_module_size_bytes: 256 * 1024,
+                fuel_budget: 10_000_000,
+                max_memory_bytes: 64 * 1024 * 1024,
+                max_table_elements: 100_000,
+                max_instances: 256,
+                allowed_http_hosts: Vec::new(),
+                allowed_secrets: Vec::new(),
+                allowed_storage_prefixes: Vec::new(),
+                allowed_channels: Vec::new(),
+            },
         }
     }
 
