@@ -2289,6 +2289,9 @@ fn macos_path_alias_key(path: &Path) -> Option<String> {
         .strip_prefix("/System/Volumes/Data")
         .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
         .unwrap_or(normalized.as_str());
+    if normalized.is_empty() {
+        return None;
+    }
     for alias_prefix in ["/private/var", "/private/tmp", "/private/etc"] {
         if normalized == alias_prefix {
             return Some(alias_prefix.trim_start_matches("/private").to_owned());
@@ -2304,6 +2307,9 @@ fn macos_path_alias_key(path: &Path) -> Option<String> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn normalized_path_key_starts_with(candidate: &str, root: &str) -> bool {
+    if root.is_empty() {
+        return false;
+    }
     if candidate == root {
         return true;
     }
@@ -2697,6 +2703,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn normalized_path_key_scope_check_rejects_empty_root() {
+        assert!(!normalized_path_key_starts_with("/etc/passwd", ""));
+        assert!(!normalized_path_key_starts_with("", ""));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn workspace_root_scope_check_accepts_windows_short_and_opened_long_aliases() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
@@ -2734,6 +2747,16 @@ mod tests {
         assert!(path_stays_inside_workspace_root(
             Path::new("/System/Volumes/Data/private/var/folders/palyra/workspace/file.txt"),
             Path::new("/var/folders/palyra/workspace")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn workspace_root_scope_check_rejects_exact_data_volume_root_fail_open() {
+        assert_eq!(macos_path_alias_key(Path::new("/System/Volumes/Data")), None);
+        assert!(!path_stays_inside_workspace_root(
+            Path::new("/etc/passwd"),
+            Path::new("/System/Volumes/Data")
         ));
     }
 
