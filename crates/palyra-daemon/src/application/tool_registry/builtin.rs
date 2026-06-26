@@ -1310,11 +1310,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "persistence_enabled",
-                json!({"type":"boolean","description":"Defaults to true for ordinary sessions so close/recreate recovery preserves browser state. Set false only for explicit ephemeral sessions."}),
-            ));
-            properties.push((
-                "persistence_id",
-                json!({"type":"string","description":"Optional advanced stable persistence id. Omit for ordinary sessions; the runtime uses the current agent session id."}),
+                json!({"type":"boolean","description":"Defaults to true for ordinary sessions so close/recreate recovery preserves browser state within the current agent session. Set false only for explicit ephemeral sessions."}),
             ));
             properties.push(("allow_private_targets", json!({"type":"boolean"})));
             properties.push(("allow_downloads", json!({"type":"boolean"})));

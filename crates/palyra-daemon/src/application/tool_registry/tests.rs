@@ -375,6 +375,10 @@ fn browser_session_create_schema_discourages_invented_profile_ids() {
         .as_str()
         .unwrap_or_default()
         .contains("do not invent labels"));
+    assert!(
+        entry.input_schema["properties"].get("persistence_id").is_none(),
+        "browser persistence ids are runtime-scoped and must not be model-callable"
+    );
 }
 
 #[test]

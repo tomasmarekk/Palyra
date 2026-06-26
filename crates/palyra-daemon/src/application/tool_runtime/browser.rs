@@ -317,49 +317,38 @@ fn browser_session_profile_id_from_payload(
 
 /// Resolves `(persistence_enabled, persistence_id)` for `session.create`.
 ///
-/// `private_profile: true` always wins and forces an ephemeral session.
-/// Otherwise persistence defaults to on, keyed by the caller-supplied
-/// `persistence_id` or an id derived from the agent session, so browser state
-/// survives daemon/browserd restarts within the same agent session.
+/// Persistence defaults to on and is keyed by a daemon-derived id for the
+/// current agent session, so browser state survives daemon/browserd restarts
+/// without allowing callers to pick another session's persistence namespace.
 fn browser_session_persistence_from_payload(
     payload: &serde_json::Map<String, Value>,
     agent_session_id: &str,
-) -> (bool, String) {
+) -> Result<(bool, String), String> {
+    if payload.contains_key("persistence_id") {
+        return Err(
+            "palyra.browser.session.create field 'persistence_id' is reserved for the runtime"
+                .to_owned(),
+        );
+    }
     if payload.get("private_profile").and_then(Value::as_bool).unwrap_or(false) {
-        return (false, String::new());
+        return Ok((false, String::new()));
     }
     let persistence_enabled =
         payload.get("persistence_enabled").and_then(Value::as_bool).unwrap_or(true);
     if !persistence_enabled {
-        return (false, String::new());
+        return Ok((false, String::new()));
     }
-    let persistence_id = payload
-        .get("persistence_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_browser_session_persistence_id(agent_session_id));
-    (true, persistence_id)
+    Ok((true, default_browser_session_persistence_id(agent_session_id)))
 }
 
-/// Derives a deterministic persistence id from the agent session id.
+/// Derives a deterministic, collision-resistant persistence id from the agent
+/// session id without exposing the raw session id in browserd storage keys.
 fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
-    const PREFIX: &str = "agent-session-";
-    const MAX_PERSISTENCE_ID_BYTES: usize = 128;
-
-    // Restrict to a filesystem- and id-safe charset and a bounded length so
-    // browserd can use the value directly as a profile storage key.
-    let mut suffix = agent_session_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-        .collect::<String>();
-    if suffix.is_empty() {
-        suffix.push_str("default");
-    }
-    let max_suffix_len = MAX_PERSISTENCE_ID_BYTES.saturating_sub(PREFIX.len());
-    suffix.truncate(max_suffix_len);
-    format!("{PREFIX}{suffix}")
+    const PREFIX: &str = "agent-session-sha256-";
+    let mut digest = Sha256::new();
+    digest.update(b"palyra.browser.session.persistence.v1\0");
+    digest.update(agent_session_id.as_bytes());
+    format!("{PREFIX}{}", hex::encode(digest.finalize()))
 }
 
 /// Confines `file://` navigation targets to the agent's workspace roots.
@@ -1404,7 +1393,18 @@ pub(crate) async fn execute_browser_tool(
                 }
             });
             let (persistence_enabled, persistence_id) =
-                browser_session_persistence_from_payload(&payload, context.session_id);
+                match browser_session_persistence_from_payload(&payload, context.session_id) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return browser_tool_execution_outcome(
+                            proposal_id,
+                            input_json,
+                            false,
+                            b"{}".to_vec(),
+                            error,
+                        );
+                    }
+                };
             let mut request = Request::new(browser_v1::CreateSessionRequest {
                 v: CANONICAL_PROTOCOL_MAJOR,
                 principal: principal.to_owned(),
@@ -5224,12 +5224,12 @@ mod tests {
         browser_tool_reports_missing_session, browser_tool_requires_open_session,
         browser_url_targets_loopback, browser_user_owned_os_roots,
         browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
-        parse_browser_download_artifact_id, parse_browser_observe_string_array,
-        resolve_browser_output_path, resolve_browser_upload_path,
-        validate_browser_workspace_relative_path, write_browser_output_file,
-        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
-        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        default_browser_session_persistence_id, filter_browser_network_log_entries_since,
+        normalize_browser_press_key_input, parse_browser_download_artifact_id,
+        parse_browser_observe_string_array, resolve_browser_output_path,
+        resolve_browser_upload_path, validate_browser_workspace_relative_path,
+        write_browser_output_file, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
+        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -5679,10 +5679,20 @@ mod tests {
         let (enabled, persistence_id) = browser_session_persistence_from_payload(
             payload.as_object().expect("payload must be an object"),
             "browser-recovery-export-20260527",
-        );
+        )
+        .expect("default persistence should be accepted");
 
         assert!(enabled);
-        assert_eq!(persistence_id, "agent-session-browser-recovery-export-20260527");
+        assert!(persistence_id.starts_with("agent-session-sha256-"));
+        assert_eq!(persistence_id.len(), "agent-session-sha256-".len() + 64);
+        assert_eq!(
+            persistence_id,
+            default_browser_session_persistence_id("browser-recovery-export-20260527")
+        );
+        assert_ne!(
+            default_browser_session_persistence_id("abc/def"),
+            default_browser_session_persistence_id("abcdef")
+        );
     }
 
     #[test]
@@ -5694,29 +5704,31 @@ mod tests {
             browser_session_persistence_from_payload(
                 explicit_ephemeral.as_object().expect("payload must be an object"),
                 "agent-session"
-            ),
+            )
+            .expect("explicit persistence disable should be accepted"),
             (false, String::new())
         );
         assert_eq!(
             browser_session_persistence_from_payload(
                 private_profile.as_object().expect("payload must be an object"),
                 "agent-session"
-            ),
+            )
+            .expect("private profile should be accepted"),
             (false, String::new())
         );
     }
 
     #[test]
-    fn browser_session_create_respects_explicit_persistence_id() {
+    fn browser_session_create_rejects_explicit_persistence_id() {
         let payload = json!({"persistence_id": "profile.recovery-1"});
 
-        let (enabled, persistence_id) = browser_session_persistence_from_payload(
+        let error = browser_session_persistence_from_payload(
             payload.as_object().expect("payload must be an object"),
             "ignored-session",
-        );
+        )
+        .expect_err("caller-supplied persistence id should fail");
 
-        assert!(enabled);
-        assert_eq!(persistence_id, "profile.recovery-1");
+        assert!(error.contains("field 'persistence_id' is reserved"));
     }
 
     #[test]
