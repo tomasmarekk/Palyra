@@ -4575,6 +4575,49 @@ async fn networked_worker_runtime_rejects_unsupported_context_tools() {
     assert_eq!(outcome.attestation.executor, "networked_worker");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn process_lifecycle_tools_reject_unregistered_run_pid() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: "session-process-lifecycle-owner",
+        run_id: "run-process-lifecycle-owner",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    let pid = std::process::id();
+    let input = serde_json::to_vec(&json!({ "pid": pid })).expect("status input should serialize");
+
+    let unowned = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "proposal-process-status-unowned",
+        super::PROCESS_STATUS_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(!unowned.success, "unregistered process status must fail");
+    assert!(
+        unowned.error.contains("not registered as a run-owned background process"),
+        "unexpected error: {}",
+        unowned.error
+    );
+
+    state.record_run_background_process(context.run_id, pid);
+    assert!(super::process_lifecycle_pid_is_run_owned(&state, context.run_id, pid));
+    assert!(
+        !super::process_lifecycle_pid_is_run_owned(&state, "run-process-lifecycle-other", pid),
+        "PID ownership must stay bound to the active run id"
+    );
+}
+
 #[test]
 fn cleanup_resource_parsers_extract_run_owned_handles() {
     let session_id = Ulid::new().to_string();

@@ -1028,6 +1028,19 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
     } else if matches!(tool_name, PROCESS_STOP_TOOL_NAME | PROCESS_STATUS_TOOL_NAME) {
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
+        if config.process_runner.enabled {
+            if let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) {
+                if !process_lifecycle_pid_is_run_owned(runtime_state, context.run_id, pid) {
+                    return process_lifecycle_unowned_pid_outcome(
+                        &config,
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        pid,
+                    );
+                }
+            }
+        }
         let outcome = execute_tool_call(&config, proposal_id, tool_name, input_json).await;
         if tool_name == PROCESS_STOP_TOOL_NAME
             && outcome.success
@@ -1241,6 +1254,34 @@ fn process_lifecycle_pid_from_tool_input(input_json: &[u8]) -> Option<u32> {
         .get("pid")
         .and_then(|value| value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok()))?;
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn process_lifecycle_pid_is_run_owned(
+    runtime_state: &GatewayRuntimeState,
+    run_id: &str,
+    pid: u32,
+) -> bool {
+    runtime_state.list_run_background_processes(run_id).contains(&pid)
+}
+
+fn process_lifecycle_unowned_pid_outcome(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    pid: u32,
+) -> ToolExecutionOutcome {
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        b"{}".to_vec(),
+        format!("{tool_name} pid {pid} is not registered as a run-owned background process"),
+        false,
+        crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+        crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+    )
 }
 
 fn process_stop_outcome_verifies_tree_stopped(output_json: &[u8]) -> bool {
