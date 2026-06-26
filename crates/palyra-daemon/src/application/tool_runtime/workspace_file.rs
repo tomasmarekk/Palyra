@@ -1002,6 +1002,7 @@ fn read_workspace_file_from_roots_and_file_grants(
     let requested = Path::new(input.path.as_str());
     if requested.is_absolute() {
         let resolved = resolve_absolute_workspace_file(
+            workspace_roots,
             canonical_roots.as_slice(),
             canonical_file_grants.as_slice(),
             requested,
@@ -1119,6 +1120,7 @@ fn canonicalize_workspace_file_grants(
 /// Returns the uniform escape error for out-of-root paths and tool-facing
 /// errors for missing or non-regular-file targets.
 fn resolve_absolute_workspace_file(
+    workspace_roots: &[PathBuf],
     canonical_roots: &[(usize, PathBuf)],
     canonical_file_grants: &[(usize, PathBuf)],
     requested: &Path,
@@ -1132,7 +1134,7 @@ fn resolve_absolute_workspace_file(
         return Err(format!("{WORKSPACE_READ_FILE_TOOL_NAME} path escapes agent workspace roots"));
     }
     let Some((workspace_root_index, canonical_root)) =
-        find_lexical_workspace_root(canonical_roots, requested)
+        find_lexical_workspace_root(workspace_roots, canonical_roots, requested)
     else {
         return resolve_absolute_workspace_file_grant(canonical_file_grants, requested, input)?
             .ok_or_else(|| {
@@ -1209,13 +1211,17 @@ fn resolve_absolute_workspace_file_grant(
 /// Finds the first root that lexically contains `requested` without touching
 /// the requested path through filesystem-resolving platform APIs.
 fn find_lexical_workspace_root<'a>(
+    workspace_roots: &[PathBuf],
     canonical_roots: &'a [(usize, PathBuf)],
     requested: &Path,
 ) -> Option<(usize, &'a Path)> {
     canonical_roots
         .iter()
-        .find(|(_, canonical_root)| {
+        .find(|(index, canonical_root)| {
             path_lexically_stays_inside_workspace_root(requested, canonical_root.as_path())
+                || workspace_roots.get(*index).is_some_and(|workspace_root| {
+                    path_lexically_stays_inside_workspace_root(requested, workspace_root.as_path())
+                })
         })
         .map(|(index, canonical_root)| (*index, canonical_root.as_path()))
 }
@@ -1277,7 +1283,12 @@ fn list_workspace_dir_from_roots(
     let requested = Path::new(input.path.as_str());
     if requested.is_absolute() {
         let (workspace_root_index, canonical_target, display_path) =
-            resolve_absolute_workspace_dir(canonical_roots.as_slice(), requested, input)?;
+            resolve_absolute_workspace_dir(
+                workspace_roots,
+                canonical_roots.as_slice(),
+                requested,
+                input,
+            )?;
         return list_workspace_directory(
             workspace_root_index,
             canonical_roots
@@ -1347,6 +1358,7 @@ fn list_workspace_dir_from_roots(
 
 /// Resolves an absolute requested path to a canonical in-root directory.
 fn resolve_absolute_workspace_dir(
+    workspace_roots: &[PathBuf],
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceListDirInput,
@@ -1355,9 +1367,9 @@ fn resolve_absolute_workspace_dir(
         return Err(format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"));
     }
     let (workspace_root_index, canonical_root) =
-        find_lexical_workspace_root(canonical_roots, requested).ok_or_else(|| {
-            format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots")
-        })?;
+        find_lexical_workspace_root(workspace_roots, canonical_roots, requested).ok_or_else(
+            || format!("{WORKSPACE_LIST_DIR_TOOL_NAME} path escapes agent workspace roots"),
+        )?;
     let canonical_target = fs::canonicalize(requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -1491,7 +1503,12 @@ fn search_workspace_from_roots(
     let requested = Path::new(input.path.as_str());
     if requested.is_absolute() {
         let (workspace_root_index, canonical_target, display_path) =
-            resolve_absolute_workspace_search_path(canonical_roots.as_slice(), requested, input)?;
+            resolve_absolute_workspace_search_path(
+                workspace_roots,
+                canonical_roots.as_slice(),
+                requested,
+                input,
+            )?;
         let canonical_root = canonical_roots
             .iter()
             .find_map(|(index, root)| (*index == workspace_root_index).then_some(root.as_path()))
@@ -1558,6 +1575,7 @@ fn search_workspace_from_roots(
 
 /// Resolves an absolute requested path to a canonical in-root search target.
 fn resolve_absolute_workspace_search_path(
+    workspace_roots: &[PathBuf],
     canonical_roots: &[(usize, PathBuf)],
     requested: &Path,
     input: &WorkspaceSearchInput,
@@ -1566,9 +1584,9 @@ fn resolve_absolute_workspace_search_path(
         return Err(format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"));
     }
     let (workspace_root_index, canonical_root) =
-        find_lexical_workspace_root(canonical_roots, requested).ok_or_else(|| {
-            format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots")
-        })?;
+        find_lexical_workspace_root(workspace_roots, canonical_roots, requested).ok_or_else(
+            || format!("{WORKSPACE_SEARCH_TOOL_NAME} path escapes agent workspace roots"),
+        )?;
     let canonical_target = fs::canonicalize(requested).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -2668,10 +2686,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn lexical_workspace_root_check_rejects_unc_candidate() {
+        let workspace_roots = vec![PathBuf::from("C:/workspace")];
         let canonical_roots = vec![(0, PathBuf::from("C:/workspace"))];
 
         assert_eq!(
             find_lexical_workspace_root(
+                workspace_roots.as_slice(),
                 canonical_roots.as_slice(),
                 Path::new("//attacker.example/share/x")
             ),
@@ -2691,12 +2711,36 @@ mod tests {
         let short_workspace =
             windows_short_path_name(workspace.as_path()).unwrap_or_else(|| workspace.clone());
         let requested = short_workspace.join("nested").join("calc.js");
+        let workspace_roots = vec![workspace.clone()];
         let canonical_roots = vec![(0, workspace)];
 
-        let root = find_lexical_workspace_root(canonical_roots.as_slice(), requested.as_path())
-            .expect("trusted root short alias should resolve lexically");
+        let root = find_lexical_workspace_root(
+            workspace_roots.as_slice(),
+            canonical_roots.as_slice(),
+            requested.as_path(),
+        )
+        .expect("trusted root short alias should resolve lexically");
 
         assert_eq!(root.0, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn lexical_workspace_root_check_accepts_original_root_alias() {
+        let original_root = PathBuf::from("C:/Users/RUNNER~1/AppData/Local/Temp/workspace");
+        let canonical_root = PathBuf::from("C:/Users/runneradmin/AppData/Local/Temp/workspace");
+        let requested = Path::new("C:/Users/RUNNER~1/AppData/Local/Temp/workspace/nested/calc.js");
+        let workspace_roots = vec![original_root];
+        let canonical_roots = vec![(0, canonical_root.clone())];
+
+        let root = find_lexical_workspace_root(
+            workspace_roots.as_slice(),
+            canonical_roots.as_slice(),
+            requested,
+        )
+        .expect("trusted original root alias should resolve to canonical root");
+
+        assert_eq!(root, (0, canonical_root.as_path()));
     }
 
     #[test]
