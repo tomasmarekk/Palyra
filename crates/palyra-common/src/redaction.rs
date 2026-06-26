@@ -643,6 +643,11 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
     {
         return false;
     }
+    if strictness == RedactionStrictness::Heuristic
+        && is_sensitive_key_name_reference(sensitive_key, value)
+    {
+        return false;
+    }
     if strictness == RedactionStrictness::Diagnostic {
         return true;
     }
@@ -653,6 +658,37 @@ fn should_redact_assignment_value(key: &str, value: &str, strictness: RedactionS
         return !is_benign_bare_token_fixture_value(value);
     }
     true
+}
+
+fn is_sensitive_key_name_reference(key: &str, value: &str) -> bool {
+    let normalized_key = normalize_key(key);
+    if !normalized_key.ends_with("_name") {
+        return false;
+    }
+
+    let normalized_value =
+        value.trim().trim_end_matches([',', ';']).trim().trim_matches(['"', '\'', '`']).trim();
+    if normalized_value.is_empty() || normalized_value.len() > 128 {
+        return false;
+    }
+    let lowered = normalized_value.to_ascii_lowercase();
+    if lowered.starts_with("http://")
+        || lowered.starts_with("https://")
+        || lowered.starts_with("bearer ")
+        || lowered.starts_with("sk-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
+        || lowered.starts_with("xox")
+        || normalized_value.contains('/')
+        || normalized_value.contains('\\')
+    {
+        return false;
+    }
+
+    normalized_value.chars().any(|ch| ch.is_ascii_alphabetic())
+        && normalized_value.chars().all(|ch| {
+            ch.is_ascii_uppercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.')
+        })
 }
 
 fn assignment_key_is_sensitive(key: &str) -> bool {
@@ -1096,6 +1132,17 @@ mod tests {
         assert!(redacted.contains("SECRET_FILE = /app/secret.txt"), "{redacted}");
         assert!(!redacted.contains("sk-POC-123"), "{redacted}");
         assert!(!redacted.contains("Bearer hidden"), "{redacted}");
+    }
+
+    #[test]
+    fn auth_error_preserves_sensitive_key_name_references() {
+        let source = r#"Use api_key_name = "PALYRA_E2E_API_KEY" for lookup."#;
+
+        assert_eq!(redact_auth_error(source), source);
+
+        let strict = redact_diagnostic_text(source);
+        assert!(strict.contains(r#"api_key_name = "<redacted>""#), "{strict}");
+        assert!(!strict.contains("PALYRA_E2E_API_KEY"), "{strict}");
     }
 
     #[test]
