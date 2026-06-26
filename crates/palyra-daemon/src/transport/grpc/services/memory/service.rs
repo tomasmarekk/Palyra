@@ -13,8 +13,8 @@ use ulid::Ulid;
 use crate::{
     application::{
         memory::{
-            enforce_memory_item_scope, memory_item_message, memory_search_hit_message,
-            memory_source_from_proto, resolve_memory_channel_scope,
+            enforce_memory_item_delete_scope, enforce_memory_item_scope, memory_item_message,
+            memory_search_hit_message, memory_source_from_proto, resolve_memory_channel_scope,
         },
         service_authorization::{authorize_memory_action, authorize_memory_purge_action},
     },
@@ -199,7 +199,7 @@ impl memory_v1::memory_service_server::MemoryService for MemoryServiceImpl {
             format!("memory:{memory_id}").as_str(),
         )?;
         if let Some(item) = self.state.memory_item(memory_id.clone()).await? {
-            enforce_memory_item_scope(
+            enforce_memory_item_delete_scope(
                 &item,
                 context.principal.as_str(),
                 context.channel.as_deref(),

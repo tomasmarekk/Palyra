@@ -7639,6 +7639,67 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_delete_tool_rejects_channel_context_for_principal_scoped_memory() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FDF";
+    state
+        .ingest_memory_item(MemoryItemCreateRequest {
+            memory_id: memory_id.to_owned(),
+            principal: context.principal.to_owned(),
+            channel: None,
+            session_id: None,
+            source: MemorySource::Manual,
+            content_text: "Principal-scoped preference must survive channel delete".to_owned(),
+            tags: vec!["memory_write:preference".to_owned()],
+            confidence: Some(0.9),
+            ttl_unix_ms: None,
+        })
+        .await
+        .expect("principal memory should be indexed");
+
+    let input_json =
+        serde_json::to_vec(&json!({ "memory_id": memory_id })).expect("delete input serializes");
+    let channel_delete = execute_memory_delete_tool(
+        &state,
+        context,
+        "01ARZ3NDEKTSV4RRFFQ69G5FE0",
+        input_json.as_slice(),
+    )
+    .await;
+
+    assert!(!channel_delete.success, "channel delete should fail for principal memory");
+    assert!(
+        channel_delete.error.contains("principal-scoped"),
+        "unexpected delete error: {}",
+        channel_delete.error
+    );
+    assert!(
+        state
+            .memory_item(memory_id.to_owned())
+            .await
+            .expect("memory lookup should succeed")
+            .is_some(),
+        "channel-scoped delete must leave principal memory intact"
+    );
+
+    let principal_delete = execute_memory_delete_tool(
+        &state,
+        super::ToolRuntimeExecutionContext { channel: None, ..context },
+        "01ARZ3NDEKTSV4RRFFQ69G5FE1",
+        input_json.as_slice(),
+    )
+    .await;
+    assert!(
+        principal_delete.success,
+        "principal delete should succeed: {}",
+        principal_delete.error
+    );
+    let principal_payload = parse_tool_output_json(&principal_delete);
+    assert_eq!(principal_payload.get("deleted").and_then(Value::as_bool), Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_delete_tool_rejects_workspace_document_delete_without_matching_scope() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();

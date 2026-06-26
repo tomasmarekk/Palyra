@@ -36,13 +36,14 @@ use crate::{
     agents::AgentResolveRequest,
     application::{
         memory::{
-            classify_memory_write, enforce_memory_item_scope, lifecycle_tags,
-            normalize_lifecycle_content, redact_memory_text_for_output, reflect_memory_candidates,
-            ttl_unix_ms_from_input, MemoryLifecycleProvider, MemoryLifecycleRetainOutcome,
-            MemoryLifecycleRetainRequest, MemoryLifecycleScope, MemoryLifecycleStatus,
-            MemoryReflectionCategory, MemoryReflectionOutcome, MemoryReflectionRequest,
-            MemoryWriteApprovalState, MemoryWriteCategory, MemoryWriteClassificationInput,
-            MEMORY_CONTEXT_FENCE_VERSION, MEMORY_TRUST_LABEL_RETRIEVED,
+            classify_memory_write, enforce_memory_item_delete_scope, enforce_memory_item_scope,
+            lifecycle_tags, normalize_lifecycle_content, redact_memory_text_for_output,
+            reflect_memory_candidates, ttl_unix_ms_from_input, MemoryLifecycleProvider,
+            MemoryLifecycleRetainOutcome, MemoryLifecycleRetainRequest, MemoryLifecycleScope,
+            MemoryLifecycleStatus, MemoryReflectionCategory, MemoryReflectionOutcome,
+            MemoryReflectionRequest, MemoryWriteApprovalState, MemoryWriteCategory,
+            MemoryWriteClassificationInput, MEMORY_CONTEXT_FENCE_VERSION,
+            MEMORY_TRUST_LABEL_RETRIEVED,
         },
         recall::{preview_recall, RecallPreviewEnvelope, RecallRequest},
         service_authorization::authorize_memory_action,
@@ -1452,7 +1453,8 @@ pub(crate) async fn execute_memory_delete_tool(
     match runtime_state.memory_item(memory_id.clone()).await {
         Ok(Some(item)) => {
             memory_item_exists = true;
-            if let Err(error) = enforce_memory_item_scope(&item, context.principal, context.channel)
+            if let Err(error) =
+                enforce_memory_item_delete_scope(&item, context.principal, context.channel)
             {
                 return memory_tool_execution_outcome(
                     namespace,

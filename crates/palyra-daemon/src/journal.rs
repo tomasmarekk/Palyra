@@ -14626,7 +14626,7 @@ impl JournalStore {
                 DELETE FROM memory_items
                 WHERE memory_ulid = ?1
                   AND principal = ?2
-                  AND (channel IS NULL OR ?3 IS NULL OR channel = ?3)
+                  AND ((?3 IS NULL AND channel IS NULL) OR channel = ?3)
             "#,
             params![memory_id, principal, channel],
         )?;
@@ -27217,7 +27217,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_delete_with_channel_filter_can_remove_principal_scoped_items() {
+    fn memory_delete_with_channel_filter_preserves_principal_scoped_items() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))
             .expect("journal store should open");
@@ -27236,14 +27236,19 @@ mod tests {
         let deleted = store
             .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDE", "user:ops", Some("cli"))
             .expect("channel-filtered delete should complete without storage error");
-        assert!(deleted, "channel-filtered delete should still remove principal-scoped memory");
+        assert!(!deleted, "channel-filtered delete must not remove principal-scoped memory");
 
         let remaining =
             store.memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDE").expect("memory lookup should succeed");
         assert!(
-            remaining.is_none(),
-            "principal-scoped memory should be removed after channel-filtered delete"
+            remaining.is_some(),
+            "principal-scoped memory should remain after channel-filtered delete"
         );
+
+        let principal_delete = store
+            .delete_memory_item("01ARZ3NDEKTSV4RRFFQ69G5FDE", "user:ops", None)
+            .expect("principal delete should complete without storage error");
+        assert!(principal_delete, "principal context should remove principal-scoped memory");
     }
 
     #[test]
