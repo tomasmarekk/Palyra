@@ -21060,13 +21060,8 @@ fn build_sparse_memory_fts_queries(query: &str) -> Vec<String> {
     }
 
     for term in terms {
-        if is_distinctive_memory_fts_term(term.as_str()) {
-            let query = if term.contains('_') || term.chars().any(|ch| ch.is_ascii_digit()) {
-                term
-            } else {
-                format!("{term}*")
-            };
-            push_unique_fts_query(&mut queries, query);
+        if is_standalone_sparse_memory_fts_term(term.as_str()) {
+            push_unique_fts_query(&mut queries, term);
         }
     }
     queries
@@ -21082,6 +21077,11 @@ fn is_distinctive_memory_fts_term(term: &str) -> bool {
     len >= MEMORY_FTS_SPARSE_SINGLE_MIN_CHARS
         || (len >= MEMORY_FTS_SPARSE_PAIR_MIN_CHARS
             && (term.contains('_') || term.chars().any(|ch| ch.is_ascii_digit())))
+}
+
+fn is_standalone_sparse_memory_fts_term(term: &str) -> bool {
+    term.chars().count() >= MEMORY_FTS_SPARSE_PAIR_MIN_CHARS
+        && (term.contains('_') || term.chars().any(|ch| ch.is_ascii_digit()))
 }
 
 fn push_unique_fts_query(queries: &mut Vec<String>, query: String) {
@@ -26635,12 +26635,16 @@ mod tests {
     }
 
     #[test]
-    fn build_memory_fts_queries_adds_sparse_prefix_fallbacks() {
+    fn build_memory_fts_queries_omits_standalone_prefix_for_ordinary_terms() {
         let queries = build_memory_fts_queries("Create a small regression-testing utility.");
 
         assert!(
-            queries.iter().any(|query| query == "regression*"),
-            "distinctive terms should get standalone prefix fallback queries: {queries:?}"
+            !queries.iter().any(|query| query == "regression*"),
+            "ordinary long terms must not get broad standalone prefix fallback queries: {queries:?}"
+        );
+        assert!(
+            queries.iter().any(|query| query == "regression testing"),
+            "adjacent sparse pairs should remain available for follow-up recall: {queries:?}"
         );
     }
 
