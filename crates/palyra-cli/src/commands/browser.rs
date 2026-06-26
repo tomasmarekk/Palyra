@@ -5082,6 +5082,7 @@ mod tests {
         BrowserServiceMetadata,
     };
     use crate::{args::BrowserCommand, browser_v1, common_v1};
+    #[cfg(windows)]
     use base64::Engine as _;
     use palyra_control_plane as control_plane;
     use serde_json::{json, Value};
