@@ -211,6 +211,7 @@ pub fn redact_internal_runtime_paths(message: &str) -> String {
 }
 
 fn redact_auth_error_with_strictness(message: &str, strictness: RedactionStrictness) -> String {
+    let message = redact_spaced_assignment_values(message, strictness);
     let mut output = String::with_capacity(message.len());
     let mut token = String::new();
     let mut redact_next_bearer = false;
@@ -239,6 +240,202 @@ fn redact_auth_error_with_strictness(message: &str, strictness: RedactionStrictn
         &mut redact_next_bearer,
     );
     output
+}
+
+fn redact_spaced_assignment_values(message: &str, strictness: RedactionStrictness) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        if let Some(redaction) = parse_spaced_assignment_redaction(message, cursor, strictness) {
+            output.push_str(&message[cursor..redaction.replacement_start]);
+            match redaction.quote {
+                Some(quote) => {
+                    output.push(quote);
+                    output.push_str(REDACTED);
+                    output.push(quote);
+                }
+                None => output.push_str(REDACTED),
+            }
+            cursor = redaction.value_end;
+            continue;
+        }
+
+        let ch = message[cursor..].chars().next().expect("cursor is in bounds");
+        output.push(ch);
+        cursor += ch.len_utf8();
+    }
+
+    output
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SpacedAssignmentRedaction {
+    replacement_start: usize,
+    value_end: usize,
+    quote: Option<char>,
+}
+
+fn parse_spaced_assignment_redaction(
+    message: &str,
+    start: usize,
+    strictness: RedactionStrictness,
+) -> Option<SpacedAssignmentRedaction> {
+    let bytes = message.as_bytes();
+    if start > 0 && is_assignment_key_body_byte(bytes[start - 1]) {
+        return None;
+    }
+
+    let key_end = parse_assignment_key_end(message, start)?;
+    let key = &message[start..key_end];
+    let separator_index = skip_horizontal_whitespace(bytes, key_end);
+    if separator_index >= bytes.len() || !matches!(bytes[separator_index], b'=' | b':') {
+        return None;
+    }
+
+    let value_start = skip_horizontal_whitespace(bytes, separator_index + 1);
+    if separator_index == key_end && value_start == separator_index + 1 {
+        return None;
+    }
+    if value_start >= bytes.len() || is_line_break_byte(bytes[value_start]) {
+        return None;
+    }
+
+    let value_span = parse_assignment_value_span(message, value_start)?;
+    let value = &message[value_start..value_span.end];
+    if !should_redact_assignment_value(key, value, strictness) {
+        return None;
+    }
+
+    Some(SpacedAssignmentRedaction {
+        replacement_start: value_span.replacement_start,
+        value_end: value_span.end,
+        quote: value_span.quote,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssignmentValueSpan {
+    end: usize,
+    replacement_start: usize,
+    quote: Option<char>,
+}
+
+fn parse_assignment_key_end(message: &str, start: usize) -> Option<usize> {
+    let bytes = message.as_bytes();
+    let first = *bytes.get(start)?;
+    if matches!(first, b'"' | b'\'') {
+        let quote = first;
+        let mut index = start + 1;
+        while index < bytes.len() {
+            if bytes[index] == quote {
+                return Some(index + 1);
+            }
+            if is_line_break_byte(bytes[index]) {
+                return None;
+            }
+            index += 1;
+        }
+        return None;
+    }
+
+    if !is_assignment_key_start_byte(first) {
+        return None;
+    }
+
+    let mut index = start + 1;
+    while index < bytes.len() && is_assignment_key_body_byte(bytes[index]) {
+        index += 1;
+    }
+    Some(index)
+}
+
+fn parse_assignment_value_span(message: &str, value_start: usize) -> Option<AssignmentValueSpan> {
+    let bytes = message.as_bytes();
+    let first = *bytes.get(value_start)?;
+    if matches!(first, b'"' | b'\'' | b'`') {
+        let end = quoted_assignment_value_end(bytes, value_start, first);
+        return Some(AssignmentValueSpan {
+            end,
+            replacement_start: value_start,
+            quote: Some(first as char),
+        });
+    }
+
+    let first_token_end = unquoted_assignment_value_token_end(bytes, value_start);
+    if first_token_end == value_start {
+        return None;
+    }
+
+    let mut end = first_token_end;
+    let mut replacement_start = value_start;
+    if message[value_start..first_token_end].eq_ignore_ascii_case("bearer") {
+        let credential_start = skip_horizontal_whitespace(bytes, first_token_end);
+        if credential_start < bytes.len()
+            && !is_line_break_byte(bytes[credential_start])
+            && !is_unquoted_assignment_value_delimiter(bytes[credential_start])
+        {
+            end = unquoted_assignment_value_token_end(bytes, credential_start);
+            replacement_start = credential_start;
+        }
+    }
+
+    Some(AssignmentValueSpan { end, replacement_start, quote: None })
+}
+
+fn quoted_assignment_value_end(bytes: &[u8], value_start: usize, quote: u8) -> usize {
+    let mut index = value_start + 1;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let value = bytes[index];
+        if is_line_break_byte(value) {
+            return index;
+        }
+        if value == quote && !escaped {
+            return index + 1;
+        }
+        escaped = value == b'\\' && !escaped;
+        if value != b'\\' {
+            escaped = false;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn unquoted_assignment_value_token_end(bytes: &[u8], value_start: usize) -> usize {
+    let mut index = value_start;
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !is_unquoted_assignment_value_delimiter(bytes[index])
+    {
+        index += 1;
+    }
+    index
+}
+
+fn skip_horizontal_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut index = start;
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    index
+}
+
+fn is_assignment_key_start_byte(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-')
+}
+
+fn is_assignment_key_body_byte(value: u8) -> bool {
+    is_assignment_key_start_byte(value) || value == b'.'
+}
+
+fn is_line_break_byte(value: u8) -> bool {
+    matches!(value, b'\r' | b'\n')
+}
+
+fn is_unquoted_assignment_value_delimiter(value: u8) -> bool {
+    matches!(value, b',' | b';' | b':' | b')' | b']' | b'}')
 }
 
 fn internal_runtime_path_marker(message: &str) -> Option<(usize, usize)> {
@@ -886,6 +1083,30 @@ mod tests {
         assert!(redacted.contains("token=<redacted>"), "{redacted}");
         assert!(!redacted.contains("token=abc"), "{redacted}");
         assert!(!redacted.contains("token=alpha"), "{redacted}");
+    }
+
+    #[test]
+    fn auth_error_redacts_spaced_sensitive_assignments() {
+        let redacted = redact_auth_error(
+            r#"provider openai_api_key_secret = "sk-POC-123" authorization: Bearer hidden SECRET_FILE = /app/secret.txt"#,
+        );
+
+        assert!(redacted.contains(r#"openai_api_key_secret = "<redacted>""#), "{redacted}");
+        assert!(redacted.contains("authorization: Bearer <redacted>"), "{redacted}");
+        assert!(redacted.contains("SECRET_FILE = /app/secret.txt"), "{redacted}");
+        assert!(!redacted.contains("sk-POC-123"), "{redacted}");
+        assert!(!redacted.contains("Bearer hidden"), "{redacted}");
+    }
+
+    #[test]
+    fn diagnostic_text_redacts_unterminated_spaced_sensitive_assignment() {
+        let redacted = redact_diagnostic_text(
+            "config parse failed\n  openai_api_key = \"sk-UNTERMINATED-123\nnext line",
+        );
+
+        assert!(redacted.contains("openai_api_key = \"<redacted>\""), "{redacted}");
+        assert!(!redacted.contains("sk-UNTERMINATED-123"), "{redacted}");
+        assert!(redacted.contains("next line"), "{redacted}");
     }
 
     #[test]

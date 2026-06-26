@@ -6476,6 +6476,29 @@ mod agent_stream_output_tests {
     }
 
     #[test]
+    fn diagnostic_error_redacts_spaced_model_config_secret_assignments() {
+        let sanitized = sanitize_diagnostic_error(
+            "model provider config invalid\n  openai_api_key_secret = \"sk-POC-AGENTS-LEAK-123456\"\n  authorization = \"Bearer hidden\"",
+        );
+
+        assert!(sanitized.contains("openai_api_key_secret = \"<redacted>\""), "{sanitized}");
+        assert!(sanitized.contains("authorization = \"<redacted>\""), "{sanitized}");
+        assert!(!sanitized.contains("sk-POC-AGENTS-LEAK-123456"), "{sanitized}");
+        assert!(!sanitized.contains("Bearer hidden"), "{sanitized}");
+    }
+
+    #[test]
+    fn diagnostic_error_redacts_unterminated_spaced_model_config_secret_assignment() {
+        let sanitized = sanitize_diagnostic_error(
+            "model provider config invalid\n  openai_api_key = \"sk-UNTERMINATED-AGENTS-LEAK\nnext line",
+        );
+
+        assert!(sanitized.contains("openai_api_key = \"<redacted>\""), "{sanitized}");
+        assert!(!sanitized.contains("sk-UNTERMINATED-AGENTS-LEAK"), "{sanitized}");
+        assert!(sanitized.contains("next line"), "{sanitized}");
+    }
+
+    #[test]
     fn ndjson_progress_status_exposes_safe_progress_label() {
         let event = common_v1::RunStreamEvent {
             v: CANONICAL_PROTOCOL_MAJOR,
