@@ -2,13 +2,7 @@
 //! the PALYRA_INSTALL_* / *_UNDER_TEST paths; every test no-ops when that install context
 //! is not configured.
 
-use std::{
-    fs,
-    io::{Read, Write},
-    net::TcpListener,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fs, net::TcpListener};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -21,7 +15,6 @@ use support::cli_harness::{
     run_cli_with_stdin, temp_workdir,
 };
 
-const OPENAI_COMPATIBLE_MODELS_RESPONSE: &str = r#"{"data":[{"id":"gpt-5.5"}]}"#;
 const SERVER_CERT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GATEWAY_CA_PIN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -44,6 +37,19 @@ fn install_smoke_context() -> Result<Option<InstallSmokeContext>> {
         config_path: required_env_path("PALYRA_CONFIG_UNDER_TEST")?,
         state_root: required_env_path("PALYRA_STATE_ROOT_UNDER_TEST")?,
     }))
+}
+
+fn assert_no_pending_connection(listener: &TcpListener, context: &str) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to configure {context} listener"))?;
+    match listener.accept() {
+        Ok((_stream, address)) => {
+            anyhow::bail!("{context} received unexpected connection from {address}")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {context} listener")),
+    }
 }
 
 #[test]
@@ -175,7 +181,12 @@ fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()
     let cert_path_string = cert_path.display().to_string();
     let key_path_string = key_path.display().to_string();
 
-    let model_server = MockOpenAiModelsServer::spawn()?;
+    let forbidden_openai_listener =
+        TcpListener::bind("127.0.0.1:0").context("bind forbidden OpenAI endpoint")?;
+    let forbidden_openai_base_url = format!(
+        "http://{}",
+        forbidden_openai_listener.local_addr().context("read forbidden OpenAI endpoint address")?
+    );
     let setup_output = run_cli(
         workdir_path,
         &[
@@ -201,14 +212,13 @@ fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()
         ],
         &[
             ("OPENAI_API_KEY", "sk-installed-smoke"),
-            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", model_server.base_url.as_str()),
+            ("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", forbidden_openai_base_url.as_str()),
         ],
     )?;
-    let discovery_request = model_server.finish()?;
-    assert!(
-        discovery_request.starts_with("GET /v1/models "),
-        "expected OpenAI model discovery request, got {discovery_request:?}",
-    );
+    assert_no_pending_connection(
+        &forbidden_openai_listener,
+        "OpenAI API-key env base URL override",
+    )?;
 
     let setup_payload = assert_json_success(setup_output, "palyra setup wizard")?;
     assert_eq!(setup_payload.get("status").and_then(Value::as_str), Some("next_step_required"));
@@ -217,6 +227,20 @@ fn installed_binary_runs_noninteractive_setup_and_configure_flows() -> Result<()
         Some("onboarding_status")
     );
     assert!(local_config.is_file(), "setup should create {}", local_config.display());
+    let local_config_raw = fs::read_to_string(&local_config)
+        .with_context(|| format!("failed to read {}", local_config.display()))?;
+    assert!(
+        local_config_raw.contains("openai_base_url = \"https://api.openai.com/v1\""),
+        "OpenAI API-key setup must use the official base URL: {local_config_raw}"
+    );
+    assert!(
+        !local_config_raw.contains(forbidden_openai_base_url.as_str()),
+        "OpenAI API-key setup must ignore env-supplied base URLs: {local_config_raw}"
+    );
+    assert!(
+        !local_config_raw.contains("openai_model = "),
+        "OpenAI API-key setup must not write a model discovered with a freshly supplied key: {local_config_raw}"
+    );
 
     let remote_payload = assert_json_success(
         run_cli(
@@ -372,69 +396,4 @@ fn installed_smoke_requires_explicit_binary_override_in_install_context() -> Res
     );
 
     Ok(())
-}
-
-struct MockOpenAiModelsServer {
-    base_url: String,
-    handle: thread::JoinHandle<Result<String>>,
-}
-
-impl MockOpenAiModelsServer {
-    fn spawn() -> Result<Self> {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").context("bind OpenAI-compatible model fixture")?;
-        listener.set_nonblocking(true).context("configure OpenAI-compatible fixture listener")?;
-        let port = listener.local_addr().context("read OpenAI-compatible fixture address")?.port();
-        let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 4096];
-                        let read = stream
-                            .read(&mut buffer)
-                            .context("read OpenAI-compatible fixture request")?;
-                        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                        let request_line = request.lines().next().unwrap_or_default().to_owned();
-                        let has_bearer = request.lines().any(|line| {
-                            line.to_ascii_lowercase().starts_with("authorization: bearer ")
-                        });
-
-                        let (status, body) = if !request_line.starts_with("GET /v1/models ") {
-                            ("404 Not Found", r#"{"error":"not found"}"#)
-                        } else if !has_bearer {
-                            ("401 Unauthorized", r#"{"error":"missing bearer"}"#)
-                        } else {
-                            ("200 OK", OPENAI_COMPATIBLE_MODELS_RESPONSE)
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                            body.len(),
-                        );
-                        stream
-                            .write_all(response.as_bytes())
-                            .context("write OpenAI-compatible fixture response")?;
-                        return Ok(request_line);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            anyhow::bail!("timed out waiting for OpenAI model discovery request");
-                        }
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                    Err(error) => {
-                        return Err(error).context("accept OpenAI-compatible fixture request");
-                    }
-                }
-            }
-        });
-
-        Ok(Self { base_url: format!("http://127.0.0.1:{port}"), handle })
-    }
-
-    fn finish(self) -> Result<String> {
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("OpenAI-compatible fixture thread panicked"))?
-    }
 }
