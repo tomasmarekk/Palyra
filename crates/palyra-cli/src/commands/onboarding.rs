@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_control_plane as control_plane;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1324,6 +1325,11 @@ fn run_cli_action(label: &str, command: String) -> control_plane::OnboardingStep
 }
 
 fn default_agent_create_command(signals: &OnboardingSignals) -> String {
+    let args = default_agent_create_args(signals);
+    render_cli_command(args.as_slice())
+}
+
+fn default_agent_create_args(signals: &OnboardingSignals) -> Vec<String> {
     let mut parts = vec![
         "palyra".to_owned(),
         "agents".to_owned(),
@@ -1335,16 +1341,23 @@ fn default_agent_create_command(signals: &OnboardingSignals) -> String {
     ];
     if let Some(workspace_root) = signals.workspace_root.as_deref() {
         parts.push("--workspace-root".to_owned());
-        parts.push(quote_cli_arg(workspace_root));
+        parts.push(workspace_root.to_owned());
         if looks_absolute_path(workspace_root) {
             parts.push("--allow-absolute-paths".to_owned());
         }
     }
     if let Some(model) = signals.chat_model.as_deref() {
         parts.push("--model-profile".to_owned());
-        parts.push(quote_cli_arg(model));
+        parts.push(model.to_owned());
     }
-    parts.join(" ")
+    parts
+}
+
+fn render_cli_command(args: &[String]) -> String {
+    if cfg!(windows) && args.iter().any(|arg| !is_unquoted_cli_arg(arg.as_str())) {
+        return powershell_encoded_cli_command(args);
+    }
+    args.iter().map(|arg| quote_cli_arg(arg.as_str())).collect::<Vec<_>>().join(" ")
 }
 
 fn looks_absolute_path(value: &str) -> bool {
@@ -1358,14 +1371,11 @@ fn looks_absolute_path(value: &str) -> bool {
 
 /// Quotes a config-derived value for inclusion in a suggested shell command.
 ///
-/// Single quotes (never double quotes) are used so `$()`, backticks, and variable
-/// expansion cannot execute if the operator pastes the command into a POSIX shell.
+/// POSIX single quotes are used so `$()`, backticks, and variable expansion cannot execute if
+/// the operator pastes the command into a POSIX shell. Windows commands with unsafe
+/// characters are rendered via [`powershell_encoded_cli_command`] instead.
 fn quote_cli_arg(value: &str) -> String {
-    let safe = !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | '\\' | ':')
-        });
-    if safe {
+    if is_unquoted_cli_arg(value) {
         value.to_owned()
     } else {
         quote_single_quoted_cli_arg(value)
@@ -1384,6 +1394,39 @@ fn quote_single_quoted_cli_arg(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+fn is_unquoted_cli_arg(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | '\\' | ':')
+        })
+}
+
+fn powershell_encoded_cli_command(args: &[String]) -> String {
+    let script = powershell_invocation_script(args);
+    let encoded = BASE64_STANDARD.encode(utf16le_bytes(script.as_str()));
+    format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand \"{encoded}\"")
+}
+
+fn powershell_invocation_script(args: &[String]) -> String {
+    let Some((program, rest)) = args.split_first() else {
+        return String::new();
+    };
+    let mut script = format!("& {}", quote_powershell_single_quoted_arg(program));
+    for arg in rest {
+        script.push(' ');
+        script.push_str(quote_powershell_single_quoted_arg(arg).as_str());
+    }
+    script
+}
+
+fn quote_powershell_single_quoted_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn utf16le_bytes(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 fn get_string_at_path(document: &toml::Value, key: &str) -> Option<String> {
@@ -1488,8 +1531,8 @@ mod tests {
         cli_contract_descriptor, collect_onboarding_signals, default_agent_create_command,
         default_agent_status_from_agent_ids, derive_posture_status, diagnostic_endpoint_url,
         load_onboarding_document, onboarding_prerequisites_ready, onboarding_status_summary_line,
-        quote_cli_arg, recommended_onboarding_step_id, record_cli_first_success, tcp_url_reachable,
-        OnboardingSignals, OnboardingVariant,
+        powershell_invocation_script, quote_cli_arg, recommended_onboarding_step_id,
+        record_cli_first_success, tcp_url_reachable, OnboardingSignals, OnboardingVariant,
     };
     use crate::{app, args::RootOptions};
 
@@ -1682,8 +1725,8 @@ kind = "anthropic"
             gateway_runtime_message: "reachable".to_owned(),
             default_agent_configured: false,
             default_agent_message: "agent registry does not define a default agent".to_owned(),
-            workspace_root: Some("/tmp/ws$(touch /tmp/palyra-pwn-workspace)".to_owned()),
-            chat_model: Some("x`touch /tmp/palyra-pwn-model`".to_owned()),
+            workspace_root: Some("C:/safe & calc & rem".to_owned()),
+            chat_model: Some("x'; calc; #".to_owned()),
             memory_embeddings_configured: false,
             memory_embeddings_message: "memory fallback".to_owned(),
             browser_prerequisites_configured: true,
@@ -1693,11 +1736,37 @@ kind = "anthropic"
             first_success_completed: false,
         });
 
-        assert!(
-            command.contains("--workspace-root '/tmp/ws$(touch /tmp/palyra-pwn-workspace)'"),
-            "{command}"
+        if cfg!(windows) {
+            assert!(
+                command.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand \""),
+                "{command}"
+            );
+            assert!(!command.contains("C:/safe & calc & rem"), "{command}");
+            assert!(!command.contains("x'; calc; #"), "{command}");
+        } else {
+            assert!(command.contains("--workspace-root 'C:/safe & calc & rem'"), "{command}");
+            assert!(command.contains("--model-profile 'x'\\''; calc; #'"), "{command}");
+        }
+    }
+
+    #[test]
+    fn powershell_invocation_script_quotes_config_values_as_arguments() {
+        let args = vec![
+            "palyra".to_owned(),
+            "agents".to_owned(),
+            "create".to_owned(),
+            "local-default".to_owned(),
+            "--workspace-root".to_owned(),
+            "C:/safe & calc & rem".to_owned(),
+            "--model-profile".to_owned(),
+            "x'; calc; #".to_owned(),
+        ];
+        let script = powershell_invocation_script(args.as_slice());
+
+        assert_eq!(
+            script,
+            "& 'palyra' 'agents' 'create' 'local-default' '--workspace-root' 'C:/safe & calc & rem' '--model-profile' 'x''; calc; #'"
         );
-        assert!(command.contains("--model-profile 'x`touch /tmp/palyra-pwn-model`'"), "{command}");
     }
 
     #[test]
