@@ -55,10 +55,10 @@ use crate::{
     },
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
-        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRiskLevel, ApprovalSubjectType,
-        CronConcurrencyPolicy, CronJobRecord, CronJobUpdatePatch, CronMisfirePolicy,
-        CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest, CronRunStatus,
-        CronScheduleType, MemoryRetentionPolicy, OrchestratorCancelRequest,
+        ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalRiskLevel,
+        ApprovalSubjectType, CronConcurrencyPolicy, CronJobRecord, CronJobUpdatePatch,
+        CronMisfirePolicy, CronRunFinalizeRequest, CronRunRecord, CronRunStartRequest,
+        CronRunStatus, CronScheduleType, MemoryRetentionPolicy, OrchestratorCancelRequest,
         OrchestratorRunStatusSnapshot, OrchestratorSessionQuickControlsUpdateRequest,
         SkillExecutionStatus, SkillStatusUpsertRequest,
     },
@@ -108,6 +108,7 @@ pub(crate) const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required
 const OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND: &str = "objective_budget_exhausted";
 const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
 const OBJECTIVE_LIFECYCLE_DENIED_ERROR_KIND: &str = "objective_lifecycle_denied";
+const ROUTINE_APPROVAL_POLICY_ID: &str = "routine.approval.v1";
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 
@@ -2320,6 +2321,8 @@ fn scheduled_routine_requires_first_run_approval(routine: &RoutineMetadataRecord
 async fn scheduled_routine_approval_granted(
     state: &Arc<GatewayRuntimeState>,
     subject_id: &str,
+    owner_principal: &str,
+    expected_policy_hash: &str,
 ) -> Result<bool, Status> {
     let (approvals, _) = state
         .list_approval_records(
@@ -2328,14 +2331,62 @@ async fn scheduled_routine_approval_granted(
             None,
             None,
             Some(subject_id.to_owned()),
-            None,
+            Some(owner_principal.to_owned()),
             Some(ApprovalDecision::Allow),
             Some(ApprovalSubjectType::Tool),
         )
         .await?;
-    Ok(approvals
-        .into_iter()
-        .any(|approval| matches!(approval.decision, Some(ApprovalDecision::Allow))))
+    Ok(approvals.into_iter().any(|approval| {
+        scheduled_routine_approval_matches(
+            &approval,
+            subject_id,
+            owner_principal,
+            expected_policy_hash,
+        )
+    }))
+}
+
+fn scheduled_routine_approval_matches(
+    approval: &ApprovalRecord,
+    subject_id: &str,
+    owner_principal: &str,
+    expected_policy_hash: &str,
+) -> bool {
+    approval.principal == owner_principal
+        && approval.subject_id == subject_id
+        && approval.prompt.subject_id == subject_id
+        && approval.subject_type == ApprovalSubjectType::Tool
+        && matches!(approval.decision, Some(ApprovalDecision::Allow))
+        && approval.policy_snapshot.policy_id == ROUTINE_APPROVAL_POLICY_ID
+        && approval.policy_snapshot.policy_hash == expected_policy_hash
+}
+
+fn scheduled_routine_approval_details_json(
+    job: &CronJobRecord,
+    routine: &RoutineMetadataRecord,
+    mode: RoutineApprovalMode,
+) -> String {
+    json!({
+        "routine_id": routine.routine_id.as_str(),
+        "name": job.name.as_str(),
+        "approval_mode": mode.as_str(),
+        "trigger_kind": routine.trigger_kind.as_str(),
+        "workdir": job.workdir.as_deref(),
+        "run_mode": routine.execution.run_mode.as_str(),
+        "execution_posture": routine.execution.execution_posture.as_str(),
+        "allow_sensitive_tools": routine_allows_sensitive_tools(&routine.execution, &routine.approval_policy),
+        "procedure_profile_id": routine.execution.procedure_profile_id.as_deref(),
+        "skill_profile_id": routine.execution.skill_profile_id.as_deref(),
+        "provider_profile_id": routine.execution.provider_profile_id.as_deref(),
+        "delivery_mode": routine.delivery.mode.as_str(),
+        "channel": job.channel.as_str(),
+        "template_id": routine.template_id.as_deref(),
+    })
+    .to_string()
+}
+
+fn scheduled_routine_approval_policy_hash(details_json: &str) -> String {
+    hex::encode(Sha256::digest(details_json.as_bytes()))
 }
 
 async fn ensure_scheduled_routine_approval_requested(
@@ -2365,23 +2416,7 @@ async fn ensure_scheduled_routine_approval_requested(
         return Ok(());
     }
 
-    let details_json = json!({
-        "routine_id": routine.routine_id.as_str(),
-        "name": job.name.as_str(),
-        "approval_mode": mode.as_str(),
-        "trigger_kind": routine.trigger_kind.as_str(),
-        "workdir": job.workdir.as_deref(),
-        "run_mode": routine.execution.run_mode.as_str(),
-        "execution_posture": routine.execution.execution_posture.as_str(),
-        "allow_sensitive_tools": routine_allows_sensitive_tools(&routine.execution, &routine.approval_policy),
-        "procedure_profile_id": routine.execution.procedure_profile_id.as_deref(),
-        "skill_profile_id": routine.execution.skill_profile_id.as_deref(),
-        "provider_profile_id": routine.execution.provider_profile_id.as_deref(),
-        "delivery_mode": routine.delivery.mode.as_str(),
-        "channel": job.channel.as_str(),
-        "template_id": routine.template_id.as_deref(),
-    })
-    .to_string();
+    let details_json = scheduled_routine_approval_details_json(job, routine, mode);
     let prompt = ApprovalPromptRecord {
         title: format!("Approve routine {}", job.name),
         risk_level: ApprovalRiskLevel::High,
@@ -2417,7 +2452,7 @@ async fn ensure_scheduled_routine_approval_requested(
             "Routine approvals are explicit operator gates for sensitive automation activation."
                 .to_owned(),
     };
-    let policy_hash = hex::encode(Sha256::digest(details_json.as_bytes()));
+    let policy_hash = scheduled_routine_approval_policy_hash(details_json.as_str());
     state
         .create_approval_record(ApprovalCreateRequest {
             approval_id: Ulid::new().to_string(),
@@ -2436,7 +2471,7 @@ async fn ensure_scheduled_routine_approval_requested(
                 routine.execution.execution_posture.as_str()
             ),
             policy_snapshot: ApprovalPolicySnapshot {
-                policy_id: "routine.approval.v1".to_owned(),
+                policy_id: ROUTINE_APPROVAL_POLICY_ID.to_owned(),
                 policy_hash,
                 evaluation_summary: format!(
                     "routine approval required mode={} trigger={} execution_posture={} delivery={}",
@@ -2471,7 +2506,17 @@ async fn enforce_scheduled_routine_approval(
     }
     let mode = RoutineApprovalMode::BeforeFirstRun;
     let subject_id = routine_approval_subject_id(routine.routine_id.as_str(), mode);
-    if scheduled_routine_approval_granted(&state, subject_id.as_str()).await? {
+    let approval_details_json = scheduled_routine_approval_details_json(job, &routine, mode);
+    let expected_policy_hash =
+        scheduled_routine_approval_policy_hash(approval_details_json.as_str());
+    if scheduled_routine_approval_granted(
+        &state,
+        subject_id.as_str(),
+        job.owner_principal.as_str(),
+        expected_policy_hash.as_str(),
+    )
+    .await?
+    {
         return Ok(None);
     }
     ensure_scheduled_routine_approval_requested(&state, job, &routine, mode).await?;
@@ -4133,22 +4178,24 @@ mod tests {
         merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
         parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
         routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
-        routines_automation_enabled, scheduled_routine_requires_first_run_approval,
-        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
-        scheduler_retry_backoff_delay_ms, should_disable_exhausted_scheduled_one_shot,
+        routines_automation_enabled, scheduled_routine_approval_matches,
+        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
+        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
+        should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
         TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND, MAX_RETRY_BACKOFF_MS,
-        OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_REQUIRED_ERROR_KIND,
-        ROUTINE_GATE_ERROR_KIND, SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME,
-        SKILLS_LAYOUT_VERSION,
+        OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_POLICY_ID,
+        ROUTINE_APPROVAL_REQUIRED_ERROR_KIND, ROUTINE_GATE_ERROR_KIND,
+        SCHEDULER_STALE_RUN_AFTER_MS, SKILLS_INDEX_FILE_NAME, SKILLS_LAYOUT_VERSION,
     };
     use crate::access_control::{AccessRegistry, FEATURE_ROUTINES_AUTOMATION};
     use crate::gateway::proto::palyra::cron::v1 as cron_v1;
     use crate::journal::{
-        CronConcurrencyPolicy, CronJobRecord, CronMisfirePolicy, CronRetryPolicy, CronRunRecord,
-        CronRunStatus, CronScheduleType,
+        ApprovalDecision, ApprovalPolicySnapshot, ApprovalPromptRecord, ApprovalRecord,
+        ApprovalRiskLevel, ApprovalSubjectType, CronConcurrencyPolicy, CronJobRecord,
+        CronMisfirePolicy, CronRetryPolicy, CronRunRecord, CronRunStatus, CronScheduleType,
     };
     use crate::routines::{
         RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryMode,
@@ -4206,6 +4253,84 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms,
         }
+    }
+
+    fn sample_scheduled_routine_approval(
+        principal: &str,
+        subject_id: &str,
+        policy_hash: &str,
+    ) -> ApprovalRecord {
+        ApprovalRecord {
+            approval_id: "approval-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            principal: principal.to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: Some("cli".to_owned()),
+            requested_at_unix_ms: 1,
+            resolved_at_unix_ms: Some(2),
+            subject_type: ApprovalSubjectType::Tool,
+            subject_id: subject_id.to_owned(),
+            request_summary: "scheduled routine approval".to_owned(),
+            decision: Some(ApprovalDecision::Allow),
+            decision_scope: None,
+            decision_reason: Some("approved".to_owned()),
+            decision_scope_ttl_ms: None,
+            policy_snapshot: ApprovalPolicySnapshot {
+                policy_id: ROUTINE_APPROVAL_POLICY_ID.to_owned(),
+                policy_hash: policy_hash.to_owned(),
+                evaluation_summary: "routine approval required".to_owned(),
+            },
+            prompt: ApprovalPromptRecord {
+                title: "Approve routine".to_owned(),
+                risk_level: ApprovalRiskLevel::High,
+                subject_id: subject_id.to_owned(),
+                summary: "Routine requires approval.".to_owned(),
+                options: Vec::new(),
+                timeout_seconds: 900,
+                details_json: "{}".to_owned(),
+                policy_explanation: "Routine approval test.".to_owned(),
+            },
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        }
+    }
+
+    #[test]
+    fn scheduled_routine_approval_match_is_owner_subject_and_policy_bound() {
+        let subject_id = "routine:01ARZ3NDEKTSV4RRFFQ69G5FAV:before_first_run";
+        let policy_hash = "current-policy-hash";
+        let approval = sample_scheduled_routine_approval("user:ops", subject_id, policy_hash);
+
+        assert!(scheduled_routine_approval_matches(&approval, subject_id, "user:ops", policy_hash));
+
+        let mut other_principal = approval.clone();
+        other_principal.principal = "user:other".to_owned();
+        assert!(!scheduled_routine_approval_matches(
+            &other_principal,
+            subject_id,
+            "user:ops",
+            policy_hash
+        ));
+
+        let mut stale_policy = approval.clone();
+        stale_policy.policy_snapshot.policy_hash = "stale-policy-hash".to_owned();
+        assert!(!scheduled_routine_approval_matches(
+            &stale_policy,
+            subject_id,
+            "user:ops",
+            policy_hash
+        ));
+
+        let mut mismatched_prompt_subject = approval.clone();
+        mismatched_prompt_subject.prompt.subject_id =
+            "routine:01ARZ3NDEKTSV4RRFFQ69G5FAW:before_first_run".to_owned();
+        assert!(!scheduled_routine_approval_matches(
+            &mismatched_prompt_subject,
+            subject_id,
+            "user:ops",
+            policy_hash
+        ));
     }
 
     #[test]
