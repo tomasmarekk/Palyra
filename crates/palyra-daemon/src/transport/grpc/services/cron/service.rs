@@ -13,7 +13,10 @@ use ulid::Ulid;
 
 use crate::{
     application::service_authorization::authorize_cron_action,
-    cron::{normalize_schedule, trigger_job_now, CronTimezoneMode},
+    cron::{
+        ensure_archived_objective_allows_cron_job_enable, normalize_schedule, trigger_job_now,
+        CronTimezoneMode,
+    },
     gateway::{
         canonical_id, cron_concurrency_from_proto, cron_job_message, cron_misfire_from_proto,
         cron_retry_from_proto, cron_run_message, cron_run_status_to_proto, current_unix_ms_status,
@@ -174,6 +177,10 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
         if let Some(enabled) = payload.enabled {
             patch.enabled = Some(enabled);
             if enabled {
+                ensure_archived_objective_allows_cron_job_enable(
+                    self.state.as_ref(),
+                    existing_job.job_id.as_str(),
+                )?;
                 if patch.next_run_at_unix_ms.is_none() {
                     patch.next_run_at_unix_ms = Some(crate::cron::next_run_at_for_enabled_state(
                         &existing_job,
@@ -308,6 +315,9 @@ impl cron_v1::cron_service_server::CronService for CronServiceImpl {
             .await?
             .ok_or_else(|| Status::not_found(format!("cron job not found: {job_id}")))?;
         enforce_cron_job_owner(context.principal.as_str(), job.owner_principal.as_str())?;
+        if !job.enabled {
+            return Err(Status::failed_precondition("disabled cron jobs cannot be run manually"));
+        }
         let outcome = trigger_job_now(
             Arc::clone(&self.state),
             self.auth.clone(),

@@ -107,6 +107,7 @@ const ROUTINE_GATE_ERROR_KIND: &str = "routine_gate";
 pub(crate) const ROUTINE_APPROVAL_REQUIRED_ERROR_KIND: &str = "approval_required";
 const OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND: &str = "objective_budget_exhausted";
 const OBJECTIVE_BUDGET_EXHAUSTED_ACTION: &str = "budget_exhausted";
+const OBJECTIVE_LIFECYCLE_DENIED_ERROR_KIND: &str = "objective_lifecycle_denied";
 const ROUTINE_APPROVAL_TIMEOUT_SECONDS: u32 = 900;
 const ROUTINE_APPROVAL_DEVICE_ID: &str = "system:routines";
 
@@ -2153,13 +2154,58 @@ fn linked_objective_for_job(
         .objectives
         .list_objectives()
         .map_err(|error| {
-            Status::internal(format!("failed to list objectives for budget check: {error}"))
+            Status::internal(format!(
+                "failed to list objectives for cron job binding check: {error}"
+            ))
         })
         .map(|objectives| {
             objectives
                 .into_iter()
                 .find(|objective| objective.automation.routine_id.as_deref() == Some(job_id))
         })
+}
+
+const fn objective_lifecycle_blocks_dispatch(state: ObjectiveState) -> bool {
+    matches!(state, ObjectiveState::Archived | ObjectiveState::Cancelled)
+}
+
+fn terminal_objective_for_job(
+    state: &GatewayRuntimeState,
+    job_id: &str,
+) -> Result<Option<ObjectiveRecord>, Status> {
+    Ok(linked_objective_for_job(state, job_id)?
+        .filter(|objective| objective_lifecycle_blocks_dispatch(objective.state)))
+}
+
+fn objective_lifecycle_denied_message(objective: &ObjectiveRecord) -> String {
+    format!(
+        "{} objective {} cannot be dispatched through cron or routine APIs",
+        objective.state.as_str(),
+        objective.objective_id
+    )
+}
+
+/// Rejects attempts to re-enable a cron job still linked to an archived
+/// objective.
+///
+/// # Errors
+/// Returns `failed_precondition` when the objective registry shows that the
+/// job belongs to an archived objective, or `internal` if the registry cannot
+/// be listed.
+pub(crate) fn ensure_archived_objective_allows_cron_job_enable(
+    state: &GatewayRuntimeState,
+    job_id: &str,
+) -> Result<(), Status> {
+    let Some(objective) = linked_objective_for_job(state, job_id)? else {
+        return Ok(());
+    };
+    if objective.state == ObjectiveState::Archived {
+        return Err(Status::failed_precondition(format!(
+            "archived objective {} cannot be re-enabled through cron or routine APIs",
+            objective.objective_id
+        )));
+    }
+    Ok(())
 }
 
 async fn count_budgeted_objective_runs_for_job(
@@ -2553,6 +2599,18 @@ async fn dispatch_job(
     manual_trigger: bool,
     mut options: TriggerJobOptions,
 ) -> Result<DispatchOutcome, Status> {
+    if let Some(objective) = terminal_objective_for_job(state.as_ref(), job.job_id.as_str())? {
+        let message = objective_lifecycle_denied_message(&objective);
+        return register_terminal(
+            Arc::clone(&state),
+            job.job_id.as_str(),
+            CronRunStatus::Denied,
+            OBJECTIVE_LIFECYCLE_DENIED_ERROR_KIND,
+            message.as_str(),
+        )
+        .await;
+    }
+
     if let Some(exhaustion) =
         disable_cron_if_max_run_slots_exhausted(Arc::clone(&state), &job).await?
     {

@@ -7404,6 +7404,12 @@ impl GatewayRuntimeState {
         self: &Arc<Self>,
         request: CronJobCreateRequest,
     ) -> Result<CronJobRecord, Status> {
+        if request.enabled {
+            crate::cron::ensure_archived_objective_allows_cron_job_enable(
+                self.as_ref(),
+                request.job_id.as_str(),
+            )?;
+        }
         let state = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || state.create_cron_job_blocking(&request))
             .await
@@ -7433,6 +7439,12 @@ impl GatewayRuntimeState {
         job_id: String,
         patch: CronJobUpdatePatch,
     ) -> Result<CronJobRecord, Status> {
+        if patch.enabled == Some(true) {
+            crate::cron::ensure_archived_objective_allows_cron_job_enable(
+                self.as_ref(),
+                job_id.as_str(),
+            )?;
+        }
         let state = Arc::clone(self);
         let result = tokio::task::spawn_blocking(move || {
             state.update_cron_job_blocking(job_id.as_str(), &patch)

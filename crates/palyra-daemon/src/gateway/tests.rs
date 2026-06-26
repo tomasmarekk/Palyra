@@ -37,15 +37,22 @@ use crate::agents::AgentCreateRequest;
 use crate::journal::{
     ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
     ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
-    ApprovalSubjectType, CronConcurrencyPolicy, CronJobCreateRequest, CronMisfirePolicy,
-    CronRetryPolicy, CronRunStartRequest, CronRunStatus, CronScheduleType, JournalAppendRequest,
-    JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
+    ApprovalSubjectType, CronConcurrencyPolicy, CronJobCreateRequest, CronJobUpdatePatch,
+    CronMisfirePolicy, CronRetryPolicy, CronRunStartRequest, CronRunStatus, CronScheduleType,
+    JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
     MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
     MemorySearchRequest, MemorySource, OrchestratorBackgroundTaskCreateRequest,
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
     OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
     OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
     SessionProjectContextStateUpsertRequest, WorkspaceDocumentWriteRequest,
+};
+use crate::objectives::{
+    ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveKind, ObjectivePriority, ObjectiveRecord,
+    ObjectiveState, ObjectiveUpsert, ObjectiveWorkspaceBinding,
+};
+use crate::routines::{
+    RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineExecutionConfig, RoutineTriggerKind,
 };
 use tonic::{transport::Server as TonicServer, Code};
 use ulid::Ulid;
@@ -1077,6 +1084,80 @@ fn configure_test_routines_runtime(
         timezone_mode: crate::cron::CronTimezoneMode::Utc,
     });
     registry
+}
+
+fn seed_archived_objective_for_job(state: &std::sync::Arc<GatewayRuntimeState>, job_id: &str) {
+    let runtime = state
+        .routines_runtime_config()
+        .expect("routines runtime should be configured for objective tests");
+    runtime
+        .objectives
+        .upsert_objective(ObjectiveUpsert {
+            record: ObjectiveRecord {
+                objective_id: Ulid::new().to_string(),
+                kind: ObjectiveKind::Objective,
+                state: ObjectiveState::Archived,
+                name: "Archived automation".to_owned(),
+                prompt: "This objective has already been archived.".to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                channel: Some("cli".to_owned()),
+                priority: ObjectivePriority::Normal,
+                budget: ObjectiveBudget::default(),
+                current_focus: None,
+                success_criteria: None,
+                exit_condition: None,
+                next_recommended_step: None,
+                standing_order: None,
+                workspace: ObjectiveWorkspaceBinding {
+                    workspace_document_path: "projects/objectives/archived.md".to_owned(),
+                    ..ObjectiveWorkspaceBinding::default()
+                },
+                automation: ObjectiveAutomationBinding {
+                    routine_id: Some(job_id.to_owned()),
+                    enabled: false,
+                    trigger_kind: RoutineTriggerKind::Schedule,
+                    schedule_type: "every".to_owned(),
+                    schedule_payload_json: json!({ "interval_ms": 60_000_i64 }).to_string(),
+                    execution: RoutineExecutionConfig::default(),
+                    delivery: RoutineDeliveryConfig::default(),
+                    quiet_hours: None,
+                    cooldown_ms: 0,
+                    approval_policy: RoutineApprovalPolicy::default(),
+                    template_id: None,
+                },
+                last_attempt: None,
+                attempt_history: Vec::new(),
+                approach_history: Vec::new(),
+                lifecycle_history: Vec::new(),
+                linked_run_ids: Vec::new(),
+                linked_artifact_paths: Vec::new(),
+                created_at_unix_ms: 1,
+                updated_at_unix_ms: 2,
+                archived_at_unix_ms: Some(2),
+            },
+        })
+        .expect("archived objective should be persisted");
+}
+
+fn test_cron_job_create_request(job_id: &str, enabled: bool) -> CronJobCreateRequest {
+    CronJobCreateRequest {
+        job_id: job_id.to_owned(),
+        name: "Lifecycle guard job".to_owned(),
+        prompt: "Verify objective lifecycle gates.".to_owned(),
+        owner_principal: "user:ops".to_owned(),
+        channel: "system:cron".to_owned(),
+        session_key: None,
+        session_label: None,
+        workdir: None,
+        schedule_type: CronScheduleType::Every,
+        schedule_payload_json: json!({ "interval_ms": 60_000_i64 }).to_string(),
+        enabled,
+        concurrency_policy: CronConcurrencyPolicy::Forbid,
+        retry_policy: CronRetryPolicy { max_attempts: 1, backoff_ms: 1 },
+        misfire_policy: CronMisfirePolicy::Skip,
+        jitter_ms: 0,
+        next_run_at_unix_ms: enabled.then_some(1_000),
+    }
 }
 
 fn routines_tool_test_context() -> super::ToolRuntimeExecutionContext<'static> {
@@ -9991,6 +10072,90 @@ async fn routines_tool_flow_supports_upsert_listing_pause_resume_and_schedule_pr
         list_runs_json.get("runs").and_then(Value::as_array).map(Vec::len),
         Some(0),
         "new routines should not report phantom runs"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_objective_bound_cron_jobs_cannot_be_reenabled_or_created_enabled() {
+    let state = build_test_runtime_state(false);
+    let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
+
+    let update_job_id = Ulid::new().to_string();
+    state
+        .create_cron_job(test_cron_job_create_request(update_job_id.as_str(), false))
+        .await
+        .expect("disabled job should be created before objective archive binding exists");
+    seed_archived_objective_for_job(&state, update_job_id.as_str());
+
+    let update_error = state
+        .update_cron_job(
+            update_job_id,
+            CronJobUpdatePatch {
+                enabled: Some(true),
+                next_run_at_unix_ms: Some(Some(1_000)),
+                ..CronJobUpdatePatch::default()
+            },
+        )
+        .await
+        .expect_err("archived objective-bound jobs must not be re-enabled");
+    assert_eq!(update_error.code(), Code::FailedPrecondition);
+    assert!(
+        update_error.message().contains("archived objective"),
+        "error should identify the objective lifecycle guard: {update_error}"
+    );
+
+    let create_job_id = Ulid::new().to_string();
+    seed_archived_objective_for_job(&state, create_job_id.as_str());
+    let create_error = state
+        .create_cron_job(test_cron_job_create_request(create_job_id.as_str(), true))
+        .await
+        .expect_err("enabled job creation must respect retained archived objective bindings");
+    assert_eq!(create_error.code(), Code::FailedPrecondition);
+    assert!(
+        create_error.message().contains("archived objective"),
+        "create error should identify the retained archived binding: {create_error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_objective_bound_dispatch_is_denied_before_orchestrator() {
+    let state = build_test_runtime_state(false);
+    let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
+    let job_id = Ulid::new().to_string();
+    let job = state
+        .create_cron_job(test_cron_job_create_request(job_id.as_str(), true))
+        .await
+        .expect("job should be created before objective is archived");
+    seed_archived_objective_for_job(&state, job_id.as_str());
+
+    let outcome = crate::cron::trigger_job_now_with_options(
+        std::sync::Arc::clone(&state),
+        routines_tool_test_auth(),
+        "http://127.0.0.1:9".to_owned(),
+        job,
+        std::sync::Arc::new(Notify::new()),
+        crate::cron::TriggerJobOptions::default(),
+    )
+    .await
+    .expect("lifecycle denial should be journaled, not returned as a transport failure");
+
+    assert_eq!(outcome.status, CronRunStatus::Denied);
+    assert!(
+        outcome.message.contains("archived objective"),
+        "dispatch denial should identify the objective lifecycle guard: {}",
+        outcome.message
+    );
+    let run_id = outcome.run_id.expect("denied dispatch should create an audit run");
+    let run = state
+        .cron_run(run_id)
+        .await
+        .expect("cron run lookup should succeed")
+        .expect("denied dispatch should persist a run record");
+    assert_eq!(run.status, CronRunStatus::Denied);
+    assert_eq!(run.error_kind.as_deref(), Some("objective_lifecycle_denied"));
+    assert!(
+        run.orchestrator_run_id.is_none(),
+        "lifecycle denial must not reach orchestrator dispatch"
     );
 }
 
