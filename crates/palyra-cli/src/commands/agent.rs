@@ -573,6 +573,126 @@ struct InteractiveAgentStreamOutcome {
     exit_requested: bool,
 }
 
+async fn handle_active_run_interactive_prompt(
+    runtime: &client::operator::OperatorRuntime,
+    run_id: &str,
+    prompt: String,
+    pending_prompts: &mut VecDeque<String>,
+    abort_requested: &mut bool,
+    exit_requested: &mut bool,
+) -> Result<()> {
+    if prompt.eq_ignore_ascii_case("/help") {
+        eprintln!(
+            "agent.interactive.commands /help /session /reset /abort [run_id] /exit | active run input interrupts the current run and queues the new prompt"
+        );
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+    if prompt.eq_ignore_ascii_case("/session") {
+        eprintln!(
+            "agent.interactive.session active_run=true run_id={} queued_prompt_count={}",
+            REDACTED,
+            pending_prompts.len()
+        );
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+    if prompt.eq_ignore_ascii_case("/reset") {
+        eprintln!(
+            "agent.interactive.reset active_run=true deferred=false message=reset_requires_idle_session"
+        );
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+    if prompt.eq_ignore_ascii_case("/fast") || prompt.to_ascii_lowercase().starts_with("/fast ") {
+        eprintln!(
+            "agent.interactive.fast active_run=true deferred=false message=fast_requires_idle_session"
+        );
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+    if let Some(target_run_id) = prompt.strip_prefix("/abort").map(str::trim) {
+        let target_run_id = if target_run_id.is_empty() {
+            run_id.to_owned()
+        } else {
+            resolve_or_generate_canonical_id(Some(target_run_id.to_owned()))?
+        };
+        let response =
+            runtime.abort_run(target_run_id, Some("interactive_abort".to_owned())).await?;
+        if response.run_id.as_ref().is_some_and(|value| value.ulid == run_id) {
+            *abort_requested = true;
+        }
+        eprintln!(
+            "agent.interactive.abort run_id={} cancel_requested={} reason={}",
+            REDACTED,
+            response.cancel_requested,
+            redacted_text_presence(response.reason.as_str())
+        );
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+    if prompt.eq_ignore_ascii_case("/exit") {
+        let response =
+            runtime.abort_run(run_id.to_owned(), Some("interactive_exit".to_owned())).await?;
+        *abort_requested = true;
+        *exit_requested = true;
+        eprintln!("{}", interactive_exit_after_interrupt_message(response.cancel_requested));
+        std::io::stderr().flush().context("stderr flush failed")?;
+        return Ok(());
+    }
+
+    pending_prompts.push_back(prompt);
+    if *abort_requested {
+        eprintln!("{}", interactive_queue_message(pending_prompts.len()));
+    } else {
+        let response =
+            runtime.abort_run(run_id.to_owned(), Some("interactive_interrupt".to_owned())).await?;
+        *abort_requested = true;
+        eprintln!(
+            "{}",
+            interactive_interrupt_message(response.cancel_requested, pending_prompts.len())
+        );
+    }
+    std::io::stderr().flush().context("stderr flush failed")?;
+    Ok(())
+}
+
+struct DrainedInteractivePrompts {
+    prompts: Vec<String>,
+    input_closed: bool,
+}
+
+fn drain_ready_interactive_prompts(
+    input_rx: &mut mpsc::UnboundedReceiver<Result<String, String>>,
+) -> Result<DrainedInteractivePrompts> {
+    let mut prompts = Vec::new();
+    loop {
+        match input_rx.try_recv() {
+            Ok(line) => {
+                let line = line.map_err(|error| {
+                    anyhow!("failed to read interactive prompt from stdin: {error}")
+                })?;
+                if let Some(prompt) = normalize_interactive_prompt_line(line.as_str()) {
+                    prompts.push(prompt);
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                return Ok(DrainedInteractivePrompts { prompts, input_closed: false });
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Ok(DrainedInteractivePrompts { prompts, input_closed: true });
+            }
+        }
+    }
+}
+
+fn deny_tool_approval_due_to_pending_interactive_input() -> ToolApprovalDecision {
+    ToolApprovalDecision {
+        approved: false,
+        reason: "denied_due_to_pending_interactive_input".to_owned(),
+    }
+}
+
 async fn execute_interactive_agent_stream(
     runtime: &client::operator::OperatorRuntime,
     request: AgentRunInput,
@@ -604,83 +724,15 @@ async fn execute_interactive_agent_stream(
             maybe_prompt = read_next_interactive_prompt(input_rx), if !input_closed => {
                 match maybe_prompt? {
                     Some(prompt) => {
-                        if prompt.eq_ignore_ascii_case("/help") {
-                            eprintln!(
-                                "agent.interactive.commands /help /session /reset /abort [run_id] /exit | active run input interrupts the current run and queues the new prompt"
-                            );
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-                        if prompt.eq_ignore_ascii_case("/session") {
-                            eprintln!(
-                                "agent.interactive.session active_run=true run_id={} queued_prompt_count={}",
-                                REDACTED,
-                                pending_prompts.len()
-                            );
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-                        if prompt.eq_ignore_ascii_case("/reset") {
-                            eprintln!("agent.interactive.reset active_run=true deferred=false message=reset_requires_idle_session");
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-                        if prompt.eq_ignore_ascii_case("/fast")
-                            || prompt.to_ascii_lowercase().starts_with("/fast ")
-                        {
-                            eprintln!("agent.interactive.fast active_run=true deferred=false message=fast_requires_idle_session");
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-                        if let Some(target_run_id) = prompt.strip_prefix("/abort").map(str::trim) {
-                            let target_run_id = if target_run_id.is_empty() {
-                                run_id.clone()
-                            } else {
-                                resolve_or_generate_canonical_id(Some(target_run_id.to_owned()))?
-                            };
-                            let response = runtime
-                                .abort_run(target_run_id, Some("interactive_abort".to_owned()))
-                                .await?;
-                            if response.run_id.as_ref().is_some_and(|value| value.ulid == run_id) {
-                                abort_requested = true;
-                            }
-                            eprintln!(
-                                "agent.interactive.abort run_id={} cancel_requested={} reason={}",
-                                REDACTED,
-                                response.cancel_requested,
-                                redacted_text_presence(response.reason.as_str())
-                            );
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-                        if prompt.eq_ignore_ascii_case("/exit") {
-                            let response = runtime
-                                .abort_run(run_id.clone(), Some("interactive_exit".to_owned()))
-                                .await?;
-                            abort_requested = true;
-                            exit_requested = true;
-                            eprintln!("{}", interactive_exit_after_interrupt_message(response.cancel_requested));
-                            std::io::stderr().flush().context("stderr flush failed")?;
-                            continue;
-                        }
-
-                        pending_prompts.push_back(prompt);
-                        if abort_requested {
-                            eprintln!("{}", interactive_queue_message(pending_prompts.len()));
-                        } else {
-                            let response = runtime
-                                .abort_run(run_id.clone(), Some("interactive_interrupt".to_owned()))
-                                .await?;
-                            abort_requested = true;
-                            eprintln!(
-                                "{}",
-                                interactive_interrupt_message(
-                                    response.cancel_requested,
-                                    pending_prompts.len()
-                                )
-                            );
-                        }
-                        std::io::stderr().flush().context("stderr flush failed")?;
+                        handle_active_run_interactive_prompt(
+                            runtime,
+                            run_id.as_str(),
+                            prompt,
+                            pending_prompts,
+                            &mut abort_requested,
+                            &mut exit_requested,
+                        )
+                        .await?;
                     }
                     None => {
                         input_closed = true;
@@ -721,12 +773,29 @@ async fn execute_interactive_agent_stream(
                 if let Some(common_v1::run_stream_event::Body::ToolApprovalRequest(approval)) =
                     event.body.as_ref()
                 {
-                    let decision = prompt_tool_approval_decision_from_interactive_input(
-                        approval,
-                        &mut approval_mode,
-                        input_rx,
-                    )
-                    .await?;
+                    let drained = drain_ready_interactive_prompts(input_rx)?;
+                    input_closed = input_closed || drained.input_closed;
+                    for prompt in drained.prompts {
+                        handle_active_run_interactive_prompt(
+                            runtime,
+                            run_id.as_str(),
+                            prompt,
+                            pending_prompts,
+                            &mut abort_requested,
+                            &mut exit_requested,
+                        )
+                        .await?;
+                    }
+                    let decision = if abort_requested {
+                        deny_tool_approval_due_to_pending_interactive_input()
+                    } else {
+                        prompt_tool_approval_decision_from_interactive_input(
+                            approval,
+                            &mut approval_mode,
+                            input_rx,
+                        )
+                        .await?
+                    };
                     stream.send_tool_approval_decision(
                         approval,
                         decision.approved,
@@ -858,10 +927,11 @@ async fn ensure_interactive_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_launch_parameter_delta_json_for_cwd, ensure_agent_run_approval_flags,
-        interactive_interrupt_message, interactive_session_started_message,
-        normalize_interactive_prompt_line, normalize_reasoning_effort_arg,
-        normalize_service_tier_arg,
+        cli_launch_parameter_delta_json_for_cwd,
+        deny_tool_approval_due_to_pending_interactive_input, drain_ready_interactive_prompts,
+        ensure_agent_run_approval_flags, interactive_interrupt_message,
+        interactive_session_started_message, normalize_interactive_prompt_line,
+        normalize_reasoning_effort_arg, normalize_service_tier_arg,
     };
     use crate::args::AgentApprovalModeArg;
     use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
@@ -871,6 +941,7 @@ mod tests {
         fs,
         sync::{Mutex, OnceLock},
     };
+    use tokio::sync::mpsc;
 
     static CLI_CONTEXT_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -927,6 +998,22 @@ mod tests {
             Some("redirect active run".to_owned())
         );
         assert_eq!(normalize_interactive_prompt_line(" \t "), None);
+    }
+
+    #[test]
+    fn prequeued_yes_is_drained_before_tool_approval_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Ok("yes".to_owned())).expect("test input should enqueue");
+        tx.send(Ok(" \t ".to_owned())).expect("blank input should enqueue");
+
+        let drained =
+            drain_ready_interactive_prompts(&mut rx).expect("drain should read queued stdin");
+        let decision = deny_tool_approval_due_to_pending_interactive_input();
+
+        assert_eq!(drained.prompts, vec!["yes".to_owned()]);
+        assert!(!drained.input_closed);
+        assert!(!decision.approved);
+        assert_eq!(decision.reason, "denied_due_to_pending_interactive_input");
     }
 
     #[test]
