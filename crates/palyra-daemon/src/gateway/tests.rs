@@ -7494,6 +7494,76 @@ async fn memory_delete_tool_deletes_workspace_document_id_from_search() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_delete_tool_rejects_workspace_document_delete_without_matching_scope() {
+    let state = build_test_runtime_state(false);
+    let context = routines_tool_test_context();
+    let document = state
+        .upsert_workspace_document(WorkspaceDocumentWriteRequest {
+            document_id: None,
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            agent_id: None,
+            session_id: Some(context.session_id.to_owned()),
+            path: "projects/scope-delete/MEMORY.md".to_owned(),
+            title: Some("Scoped Delete Memory".to_owned()),
+            content_text: "channel scoped delete target".to_owned(),
+            template_id: None,
+            template_version: None,
+            template_content_hash: None,
+            source_memory_id: None,
+            manual_override: false,
+        })
+        .await
+        .expect("channel-scoped workspace document should be indexed");
+    let input_json = serde_json::to_vec(&json!({ "memory_id": document.document_id }))
+        .expect("delete input should serialize");
+
+    let no_channel_delete = execute_memory_delete_tool(
+        &state,
+        super::ToolRuntimeExecutionContext { channel: None, ..context },
+        "01ARZ3NDEKTSV4RRFFQ69G5FEE",
+        input_json.as_slice(),
+    )
+    .await;
+
+    assert!(!no_channel_delete.success, "channel-less delete must fail");
+    assert!(
+        no_channel_delete.error.contains("channel-scoped"),
+        "unexpected error: {}",
+        no_channel_delete.error
+    );
+
+    let wrong_channel_delete = execute_memory_delete_tool(
+        &state,
+        super::ToolRuntimeExecutionContext { channel: Some("slack:ops"), ..context },
+        "01ARZ3NDEKTSV4RRFFQ69G5FEF",
+        input_json.as_slice(),
+    )
+    .await;
+
+    assert!(!wrong_channel_delete.success, "wrong-channel delete must fail");
+    assert!(
+        wrong_channel_delete.error.contains("channel does not match context"),
+        "unexpected error: {}",
+        wrong_channel_delete.error
+    );
+
+    let active_document = state
+        .workspace_document_by_path(
+            context.principal.to_owned(),
+            context.channel.map(str::to_owned),
+            None,
+            "projects/scope-delete/MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("workspace document lookup should succeed")
+        .expect("scoped document should remain active");
+    assert_eq!(active_document.state, "active");
+    assert!(active_document.content_text.contains("channel scoped delete target"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_replace_tool_accepts_zero_ttl_defaults_for_workspace_document_replace() {
     let state = build_test_runtime_state(false);
     let context = routines_tool_test_context();

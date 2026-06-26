@@ -1553,7 +1553,7 @@ async fn maybe_delete_workspace_document_by_id(
     let document = match runtime_state
         .workspace_document_by_id(
             context.principal.to_owned(),
-            context.channel.map(str::to_owned),
+            None,
             None,
             document_id.to_owned(),
             false,
@@ -1576,6 +1576,21 @@ async fn maybe_delete_workspace_document_by_id(
             ));
         }
     };
+    if let Err(error) = enforce_workspace_document_mutation_scope(
+        &document,
+        context.principal,
+        context.channel,
+        None,
+    ) {
+        return Some(memory_tool_execution_outcome(
+            namespace,
+            proposal_id,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.memory.delete {}", error.message()),
+        ));
+    }
     if let Err(error) = authorize_memory_action(
         context.principal,
         "memory.delete",
@@ -1954,7 +1969,7 @@ async fn maybe_replace_workspace_document_by_id(
             ));
         }
     };
-    if let Err(error) = enforce_workspace_document_replace_scope(
+    if let Err(error) = enforce_workspace_document_mutation_scope(
         &document,
         context.principal,
         context.channel,
@@ -2044,7 +2059,7 @@ async fn maybe_replace_workspace_document_by_id(
 }
 
 #[allow(clippy::result_large_err)]
-fn enforce_workspace_document_replace_scope(
+fn enforce_workspace_document_mutation_scope(
     document: &WorkspaceDocumentRecord,
     principal: &str,
     channel: Option<&str>,
@@ -5016,10 +5031,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_document_replace_scope_requires_matching_channel_and_agent() {
+    fn workspace_document_mutation_scope_requires_matching_channel_and_agent() {
         let document = workspace_document_record("keep workspace memory scoped");
 
-        enforce_workspace_document_replace_scope(
+        enforce_workspace_document_mutation_scope(
             &document,
             "user:ops",
             Some("console"),
@@ -5027,14 +5042,14 @@ mod tests {
         )
         .expect("matching scope should replace workspace document");
         let missing_channel =
-            enforce_workspace_document_replace_scope(&document, "user:ops", None, Some("agent-1"))
+            enforce_workspace_document_mutation_scope(&document, "user:ops", None, Some("agent-1"))
                 .expect_err("channel-scoped document requires channel context");
         assert_eq!(
             missing_channel.message(),
             "workspace document is channel-scoped and requires authenticated channel context"
         );
         let missing_agent =
-            enforce_workspace_document_replace_scope(&document, "user:ops", Some("console"), None)
+            enforce_workspace_document_mutation_scope(&document, "user:ops", Some("console"), None)
                 .expect_err("agent-scoped document requires agent selector");
         assert_eq!(
             missing_agent.message(),
