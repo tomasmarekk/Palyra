@@ -271,10 +271,17 @@ struct ProbeableProvider {
     allow_private_base_url: bool,
     auth_profile_id: Option<String>,
     auth_state_roots: Vec<PathBuf>,
+    auth_vault_candidates: Vec<ProbeAuthVaultCandidate>,
     auth_provider_kind: Option<String>,
     inline_api_key: Option<String>,
     vault_ref: Option<String>,
     configured_model_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProbeAuthVaultCandidate {
+    vault_root: PathBuf,
+    identity_store_root: PathBuf,
 }
 
 /// API credential resolved from an auth profile, inline config, or vault reference.
@@ -1465,6 +1472,8 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
         .with_context(|| format!("failed to parse {}", path_ref.display()))?;
     let root_config = parse_root_file_config(&document)?;
     let auth_state_roots = status_auth_profile_state_roots(&root_config, path_ref);
+    let auth_vault_candidates =
+        status_auth_vault_candidates(&root_config, path_ref, auth_state_roots.as_slice());
     let model_provider = root_config.model_provider.unwrap_or_default();
     let provider_kind =
         model_provider.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
@@ -1507,6 +1516,7 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
                         inherit_globals.then(|| model_provider.auth_profile_id.clone()).flatten()
                     }),
                     auth_state_roots: auth_state_roots.clone(),
+                    auth_vault_candidates: auth_vault_candidates.clone(),
                     auth_provider_kind: entry.auth_provider_kind.clone().or_else(|| {
                         inherit_globals.then(|| model_provider.auth_provider_kind.clone()).flatten()
                     }),
@@ -1541,6 +1551,7 @@ fn build_probeable_providers(overview: &ModelsOverview) -> Result<Vec<ProbeableP
         allow_private_base_url: global_allow_private_base_url,
         auth_profile_id: model_provider.auth_profile_id.clone(),
         auth_state_roots,
+        auth_vault_candidates,
         auth_provider_kind: model_provider.auth_provider_kind.clone(),
         inline_api_key: inline_api_key_for_kind(provider_kind.as_str(), &model_provider),
         vault_ref: vault_ref_for_kind(provider_kind.as_str(), &model_provider),
@@ -1700,6 +1711,84 @@ fn status_auth_profile_state_roots(
         );
     }
     roots
+}
+
+fn status_auth_vault_candidates(
+    config: &palyra_common::daemon_config_schema::RootFileConfig,
+    config_path: &Path,
+    auth_state_roots: &[PathBuf],
+) -> Vec<ProbeAuthVaultCandidate> {
+    let mut candidates = Vec::new();
+    let configured_identity_store_root = config
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.identity_store_dir.as_deref())
+        .and_then(normalize_optional_text)
+        .map(PathBuf::from);
+    let base_state_root = configured_identity_store_root
+        .as_ref()
+        .map(|identity_store_root| state_root_for_identity_store(identity_store_root.clone()))
+        .or_else(|| status_state_root(config_path))
+        .or_else(|| auth_state_roots.first().cloned());
+    let configured_identity_store_root = configured_identity_store_root
+        .or_else(|| base_state_root.as_ref().map(|state_root| state_root.join("identity")));
+
+    // Desktop-managed daemons can keep auth profiles in a runtime state root
+    // while using the parent configured vault for the actual token objects.
+    if let Some(configured_vault_root) =
+        configured_auth_vault_root(config, base_state_root.as_deref())
+    {
+        if let Some(identity_store_root) = configured_identity_store_root {
+            push_unique_auth_vault_candidate(
+                &mut candidates,
+                configured_vault_root,
+                identity_store_root,
+            );
+        }
+    }
+
+    for state_root in auth_state_roots {
+        push_unique_auth_vault_candidate(
+            &mut candidates,
+            state_root.join("vault"),
+            state_root.join("identity"),
+        );
+    }
+
+    candidates
+}
+
+fn configured_auth_vault_root(
+    config: &palyra_common::daemon_config_schema::RootFileConfig,
+    base_state_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let env_vault_dir = std::env::var("PALYRA_VAULT_DIR").ok();
+    let raw = env_vault_dir.as_deref().and_then(normalize_optional_text).or_else(|| {
+        config
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.vault_dir.as_deref())
+            .and_then(normalize_optional_text)
+    })?;
+    Some(resolve_state_relative_path(base_state_root, PathBuf::from(raw)))
+}
+
+fn resolve_state_relative_path(base_state_root: Option<&Path>, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    base_state_root.map(|state_root| state_root.join(path.as_path())).unwrap_or(path)
+}
+
+fn push_unique_auth_vault_candidate(
+    candidates: &mut Vec<ProbeAuthVaultCandidate>,
+    vault_root: PathBuf,
+    identity_store_root: PathBuf,
+) {
+    let candidate = ProbeAuthVaultCandidate { vault_root, identity_store_root };
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn state_root_for_identity_store(identity_store_root: PathBuf) -> PathBuf {
@@ -2412,6 +2501,7 @@ fn provider_check_cache_key(mode: &str, provider: &ProbeableProvider) -> String 
     provider.endpoint_base_url.hash(&mut hasher);
     provider.allow_private_base_url.hash(&mut hasher);
     provider.auth_profile_id.hash(&mut hasher);
+    provider.auth_vault_candidates.hash(&mut hasher);
     provider.auth_provider_kind.hash(&mut hasher);
     provider.vault_ref.hash(&mut hasher);
     provider.configured_model_ids.hash(&mut hasher);
@@ -2813,14 +2903,19 @@ fn resolve_provider_credential(
         }
         return match profile.credential {
             AuthCredential::ApiKey { api_key_vault_ref } => {
-                let vault_instance = open_vault_at_state_root(state_root.as_path())?;
-                let token = load_vault_secret_utf8(&vault_instance, api_key_vault_ref.as_str())?;
+                let token = load_auth_profile_secret_utf8(
+                    target,
+                    state_root.as_path(),
+                    api_key_vault_ref.as_str(),
+                )?;
                 Ok(Some(ResolvedCredential::ApiKey { token, source: "auth_profile".to_owned() }))
             }
             AuthCredential::Oauth { access_token_vault_ref, client_id, .. } => {
-                let vault_instance = open_vault_at_state_root(state_root.as_path())?;
-                let token =
-                    load_vault_secret_utf8(&vault_instance, access_token_vault_ref.as_str())?;
+                let token = load_auth_profile_secret_utf8(
+                    target,
+                    state_root.as_path(),
+                    access_token_vault_ref.as_str(),
+                )?;
                 Ok(Some(ResolvedCredential::Bearer {
                     token,
                     source: "auth_profile".to_owned(),
@@ -2874,14 +2969,43 @@ fn find_auth_profile_for_probe(
     );
 }
 
-fn open_vault_at_state_root(state_root: &Path) -> Result<Vault> {
-    let identity_store_root = state_root.join("identity");
-    // Auth profiles are state-root scoped, so their vault refs must resolve
-    // against the matching state root rather than any process-wide CLI vault.
-    let vault_root = Some(state_root.join("vault"));
+fn load_auth_profile_secret_utf8(
+    target: &ProbeableProvider,
+    profile_state_root: &Path,
+    vault_ref: &str,
+) -> Result<String> {
+    let mut candidates = target.auth_vault_candidates.clone();
+    push_unique_auth_vault_candidate(
+        &mut candidates,
+        profile_state_root.join("vault"),
+        profile_state_root.join("identity"),
+    );
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "no auth-profile vault roots configured for profile state root {}",
+            profile_state_root.display()
+        );
+    }
+
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        let loaded = open_auth_vault_candidate(&candidate)
+            .and_then(|vault_instance| load_vault_secret_utf8(&vault_instance, vault_ref));
+        match loaded {
+            Ok(token) => return Ok(token),
+            Err(error) => errors.push(format!("{} ({error:#})", candidate.vault_root.display())),
+        }
+    }
+    anyhow::bail!(
+        "failed to load auth profile secret from candidate vault roots: {}",
+        errors.join("; ")
+    )
+}
+
+fn open_auth_vault_candidate(candidate: &ProbeAuthVaultCandidate) -> Result<Vault> {
     Vault::open_with_config(VaultConfigOptions {
-        root: vault_root,
-        identity_store_root: Some(identity_store_root),
+        root: Some(candidate.vault_root.clone()),
+        identity_store_root: Some(candidate.identity_store_root.clone()),
         backend_preference: parse_cli_vault_backend_preference()?,
         ..VaultConfigOptions::default()
     })
@@ -3003,7 +3127,9 @@ fn get_string_value_at_path(document: &toml::Value, key: &str) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use palyra_common::daemon_config_schema::FileModelProviderRegistryEntry;
+    use palyra_common::daemon_config_schema::{
+        FileGatewayConfig, FileModelProviderRegistryEntry, FileStorageConfig, RootFileConfig,
+    };
     use palyra_model_providers::{
         parse_discovered_provider_models, provider_models_endpoint,
         select_preferred_discovered_model_id, ProviderModelsResponseFormat,
@@ -3019,6 +3145,7 @@ mod tests {
             allow_private_base_url,
             auth_profile_id: Some("missing-auth-profile".to_owned()),
             auth_state_roots: Vec::new(),
+            auth_vault_candidates: Vec::new(),
             auth_provider_kind: None,
             inline_api_key: None,
             vault_ref: None,
@@ -3326,12 +3453,46 @@ mod tests {
     }
 
     #[test]
-    fn auth_profile_probe_resolves_desktop_runtime_vault_secret() {
+    fn auth_vault_candidates_include_configured_storage_vault_with_gateway_identity() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let state_root = tempdir.path().join("state");
+        let identity_store_root = state_root.join("identity");
+        let configured_vault_root = state_root.join("vault");
+        let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
+        let config_path = state_root.join("config").join("palyra.toml");
+        let config = RootFileConfig {
+            gateway: Some(FileGatewayConfig {
+                identity_store_dir: Some(identity_store_root.display().to_string()),
+                ..FileGatewayConfig::default()
+            }),
+            storage: Some(FileStorageConfig {
+                vault_dir: Some(configured_vault_root.display().to_string()),
+                ..FileStorageConfig::default()
+            }),
+            ..RootFileConfig::default()
+        };
+
+        let candidates =
+            status_auth_vault_candidates(&config, config_path.as_path(), &[desktop_runtime]);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.vault_root == configured_vault_root
+                    && candidate.identity_store_root == identity_store_root
+            }),
+            "configured daemon vault must be available for desktop runtime auth profiles"
+        );
+    }
+
+    #[test]
+    fn auth_profile_probe_resolves_desktop_runtime_profile_from_configured_parent_vault() {
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
+        let parent_identity = state_root.join("identity");
+        let parent_vault = state_root.join("vault");
         let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
         let desktop_identity = desktop_runtime.join("identity");
         let registry =
@@ -3356,8 +3517,8 @@ mod tests {
             .expect("profile should persist");
         let scope = "global".parse::<palyra_vault::VaultScope>().expect("scope should parse");
         let vault = Vault::open_with_config(VaultConfigOptions {
-            root: Some(desktop_runtime.join("vault")),
-            identity_store_root: Some(desktop_identity),
+            root: Some(parent_vault.clone()),
+            identity_store_root: Some(parent_identity.clone()),
             backend_preference: palyra_vault::BackendPreference::EncryptedFile,
             ..VaultConfigOptions::default()
         })
@@ -3369,6 +3530,10 @@ mod tests {
         let mut target = sample_probe_target("https://api.openai.com/v1", true);
         target.auth_profile_id = Some("chatgpt-login-test".to_owned());
         target.auth_state_roots = vec![state_root, desktop_runtime];
+        target.auth_vault_candidates = vec![ProbeAuthVaultCandidate {
+            vault_root: parent_vault,
+            identity_store_root: parent_identity,
+        }];
         let mut auth_registry = None;
         let mut vault = None;
         let credential = resolve_provider_credential(&target, &mut auth_registry, &mut vault)
@@ -3387,12 +3552,14 @@ mod tests {
     }
 
     #[test]
-    fn auth_profile_probe_resolves_xai_oauth_runtime_vault_secret() {
+    fn auth_profile_probe_resolves_xai_runtime_profile_from_configured_parent_vault() {
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
+        let parent_identity = state_root.join("identity");
+        let parent_vault = state_root.join("vault");
         let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
         let desktop_identity = desktop_runtime.join("identity");
         let registry =
@@ -3420,8 +3587,8 @@ mod tests {
             .expect("profile should persist");
         let scope = "global".parse::<palyra_vault::VaultScope>().expect("scope should parse");
         let vault = Vault::open_with_config(VaultConfigOptions {
-            root: Some(desktop_runtime.join("vault")),
-            identity_store_root: Some(desktop_identity),
+            root: Some(parent_vault.clone()),
+            identity_store_root: Some(parent_identity.clone()),
             backend_preference: palyra_vault::BackendPreference::EncryptedFile,
             ..VaultConfigOptions::default()
         })
@@ -3435,6 +3602,10 @@ mod tests {
         target.auth_provider_kind = Some("xai".to_owned());
         target.auth_profile_id = Some("xai-oauth-test".to_owned());
         target.auth_state_roots = vec![state_root, desktop_runtime];
+        target.auth_vault_candidates = vec![ProbeAuthVaultCandidate {
+            vault_root: parent_vault,
+            identity_store_root: parent_identity,
+        }];
         let mut auth_registry = None;
         let mut vault = None;
         let credential = resolve_provider_credential(&target, &mut auth_registry, &mut vault)
