@@ -1404,8 +1404,12 @@ fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
         "owning tab should be allowed for the exact scoped URL"
     );
     assert!(
-        policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/next"),
-        "same tab should allow same host and port subresources during navigation"
+        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/next"),
+        "passive URL checks must not widen the scoped navigation URL"
+    );
+    assert!(
+        policy.allows_tab_request_target("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "response guard should allow same-target subresources during active navigation"
     );
     assert!(
         !policy.allows_tab_url("tab-b", "http://127.0.0.1:7143/status"),

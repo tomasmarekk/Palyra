@@ -1254,7 +1254,7 @@ enum ChromiumPrivateTargetUrlScope {
 /// Tracks which private/local targets a session may reach.
 ///
 /// Deny-by-default: unless the whole session allows private targets, a private
-/// destination is reachable only for the tab and target that owns a scoped allowance.
+/// destination is reachable only for the tab and URL that owns a scoped allowance.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
@@ -1289,6 +1289,7 @@ impl ChromiumPrivateTargetPolicy {
         self.allow_session_private_targets
     }
 
+    #[cfg(test)]
     pub(crate) fn allows_tab_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
         if self.allow_session_private_targets {
             return true;
@@ -1298,7 +1299,19 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return false;
         };
-        self.allows_request_scope(&scope)
+        self.allows_exact_request_scope(&scope)
+    }
+
+    pub(crate) fn allows_tab_request_target(&self, tab_target_id: &str, raw_url: &str) -> bool {
+        if self.allow_session_private_targets {
+            return true;
+        }
+        let Ok(Some(scope)) =
+            ChromiumPrivateTargetRequestScope::from_tab_url(tab_target_id, raw_url)
+        else {
+            return false;
+        };
+        self.allows_request_target_scope(&scope)
     }
 
     pub(crate) fn authorize_tab_request_url(&self, tab_target_id: &str, raw_url: &str) -> bool {
@@ -1310,7 +1323,7 @@ impl ChromiumPrivateTargetPolicy {
         else {
             return false;
         };
-        if !self.allows_request_scope(&scope) {
+        if !self.allows_request_target_scope(&scope) {
             return false;
         }
         if let ChromiumPrivateTargetScope::Network { .. } = scope.target_scope() {
@@ -1392,7 +1405,20 @@ impl ChromiumPrivateTargetPolicy {
         Ok(())
     }
 
-    fn allows_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
+    #[cfg(test)]
+    fn allows_exact_request_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
+        if self
+            .scoped_requests
+            .lock()
+            .map(|scoped_requests| scoped_requests.contains_key(scope))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.allows_retained_tab_target(scope)
+    }
+
+    fn allows_request_target_scope(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
         if self
             .scoped_requests
             .lock()
@@ -1407,6 +1433,10 @@ impl ChromiumPrivateTargetPolicy {
         {
             return true;
         }
+        self.allows_retained_tab_target(scope)
+    }
+
+    fn allows_retained_tab_target(&self, scope: &ChromiumPrivateTargetRequestScope) -> bool {
         self.tab_targets
             .lock()
             .map(|tab_targets| {
@@ -1906,8 +1936,10 @@ pub(crate) fn configure_chromium_tab(
     tab.register_response_handling(
         CHROMIUM_REMOTE_IP_GUARD_HANDLER_NAME,
         Box::new(move |response, _fetch_body| {
-            let allow_private_targets = response_policy
-                .allows_tab_url(response_tab_target_id.as_str(), response.response.url.as_str());
+            let allow_private_targets = response_policy.allows_tab_request_target(
+                response_tab_target_id.as_str(),
+                response.response.url.as_str(),
+            );
             record_chromium_remote_ip_incident(
                 Some(response.response.url.as_str()),
                 response.response.remote_ip_address.as_deref(),
