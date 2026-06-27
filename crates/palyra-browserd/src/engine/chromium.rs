@@ -200,18 +200,46 @@ const CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT: &str = r#"
     const text = String(value || "");
     return text.length > maxChars ? text.slice(0, maxChars) : text;
   };
+  const jsonPreview = (value) => {
+    const seen = new WeakSet();
+    return JSON.stringify(value, (_key, nested) => {
+      if (typeof nested === "bigint") return `${nested}n`;
+      if (typeof nested === "function") return `[Function ${nested.name || "anonymous"}]`;
+      if (typeof nested === "symbol") return String(nested);
+      if (nested instanceof Error) {
+        return {
+          name: nested.name || "Error",
+          message: nested.message || "",
+          stack: nested.stack || ""
+        };
+      }
+      if (nested && typeof nested === "object") {
+        if (seen.has(nested)) return "[Circular]";
+        seen.add(nested);
+      }
+      return nested;
+    });
+  };
   const stringify = (value) => {
     try {
       if (typeof value === "string") return clampString(value, MAX_CONSOLE_MESSAGE_CHARS);
+      if (typeof value === "bigint") return clampString(`${value}n`, MAX_CONSOLE_MESSAGE_CHARS);
+      if (typeof value === "symbol") return clampString(String(value), MAX_CONSOLE_MESSAGE_CHARS);
       if (value && typeof value === "object") {
         if (value instanceof Error) {
           return clampString(value.stack || value.message || "Error", MAX_CONSOLE_MESSAGE_CHARS);
         }
+        const preview = jsonPreview(value);
+        if (preview && preview !== "{}") return clampString(preview, MAX_CONSOLE_MESSAGE_CHARS);
         return clampString(Object.prototype.toString.call(value), MAX_CONSOLE_MESSAGE_CHARS);
       }
       return clampString(value, MAX_CONSOLE_MESSAGE_CHARS);
     } catch (_) {
-      return "";
+      try {
+        return clampString(Object.prototype.toString.call(value), MAX_CONSOLE_MESSAGE_CHARS);
+      } catch (_) {
+        return "";
+      }
     }
   };
   const normalizeEntry = (severity, kind, message, source, stackTrace) => ({
@@ -5648,6 +5676,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_chromium_console_entries_preserves_structured_object_preview() {
+        let raw = serde_json::json!([{
+            "severity": "info",
+            "kind": "console",
+            "message": "wizard-ready {\"restoredFromStorage\":true,\"step\":\"confirm\"}",
+            "captured_at_unix_ms": 42_u64,
+            "source": "console.info",
+            "stack_trace": "",
+            "page_url": "http://127.0.0.1/",
+        }]);
+
+        let entries = parse_chromium_console_entries(raw);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].message.contains("\"restoredFromStorage\":true"));
+        assert!(entries[0].message.contains("\"step\":\"confirm\""));
+        assert!(!entries[0].message.contains("[object Object]"));
+    }
+
+    #[test]
     fn decode_chromium_console_entries_rejects_oversized_string_payload() {
         let raw = serde_json::Value::String(format!(
             "[{}]",
@@ -5694,6 +5742,11 @@ mod tests {
             CHROMIUM_READ_CONSOLE_LOG_SCRIPT.contains("Array.prototype.slice.call")
                 && CHROMIUM_DRAIN_NETWORK_LOG_SCRIPT.contains("Array.prototype.slice.call"),
             "diagnostics reads should not call page-overridable array slice methods"
+        );
+        assert!(
+            CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("JSON.stringify(value")
+                && CHROMIUM_PAGE_DIAGNOSTICS_SCRIPT.contains("\"[Circular]\""),
+            "console hook should preserve object arguments as bounded JSON previews"
         );
     }
 
