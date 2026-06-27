@@ -720,14 +720,16 @@ async fn resolve_workspace_file_roots(
             session_active_workspace_root(runtime_state, session_id, agent_workspace_roots).await?
         {
             if relative_path_should_use_active_root(requested_path, &active_root) {
-                return Ok(vec![active_root.root]);
+                return Ok(workspace_roots_with_active_first(
+                    active_root.root,
+                    agent_workspace_roots,
+                ));
             }
         }
     }
     Ok(agent_workspace_roots.to_vec())
 }
 
-#[cfg(test)]
 fn workspace_roots_with_active_first(
     active_root: PathBuf,
     workspace_roots: &[PathBuf],
@@ -746,7 +748,6 @@ fn workspace_roots_with_active_first(
 /// Root equality for deduplication: canonicalization unifies symlinked
 /// aliases, and Windows additionally compares case-insensitively with
 /// normalized separators for roots that cannot be canonicalized.
-#[cfg(test)]
 fn same_workspace_file_root(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
@@ -4023,6 +4024,30 @@ mod tests {
         assert_eq!(
             output.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
             vec!["config/app.toml"]
+        );
+    }
+
+    #[test]
+    fn list_workspace_dir_falls_back_to_parent_workspace_after_active_root_miss() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = tempdir.path().join("workspace");
+        let active_root = workspace.join("reports");
+        fs::create_dir_all(active_root.as_path()).expect("active root should exist");
+        fs::create_dir_all(workspace.join("scenario-runs").join("20260626"))
+            .expect("scenario runs should exist");
+
+        let roots =
+            workspace_roots_with_active_first(active_root, std::slice::from_ref(&workspace));
+        let input = parse_workspace_list_dir_input(br#"{"path":"scenario-runs","max_entries":10}"#)
+            .expect("list input should parse");
+        let output = list_workspace_dir_from_roots(roots.as_slice(), &input)
+            .expect("list_dir should fall back to parent workspace root");
+
+        assert_eq!(output.path, "scenario-runs");
+        assert_eq!(output.workspace_root_index, 1);
+        assert_eq!(
+            output.entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
+            vec!["scenario-runs/20260626"]
         );
     }
 
