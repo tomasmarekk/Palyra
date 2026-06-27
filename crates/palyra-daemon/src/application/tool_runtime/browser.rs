@@ -542,7 +542,13 @@ async fn read_browser_upload_file(
     )
     .await?;
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
-    let canonical = resolve_browser_upload_path(file_path, workspace_roots.as_slice(), &path_env)?;
+    let user_owned_roots = browser_user_owned_os_roots();
+    let canonical = resolve_browser_upload_path(
+        file_path,
+        workspace_roots.as_slice(),
+        &path_env,
+        user_owned_roots.as_slice(),
+    )?;
     let metadata = fs::metadata(canonical.as_path()).map_err(|error| {
         format!(
             "{BROWSER_UPLOAD_TOOL_NAME} failed to inspect upload file {}: {error}",
@@ -581,7 +587,7 @@ async fn read_browser_upload_file(
 /// roots.
 ///
 /// Resolution order: launch-env-prefixed paths expand first, absolute paths
-/// must fall inside workspace roots or explicit launch env roots, and
+/// must fall inside workspace, explicit launch env, or user-owned OS roots, and
 /// relative paths are confined to the first workspace root.
 /// Uploads intentionally do not fall back to daemon process env because those
 /// variables commonly point at credential files.
@@ -590,6 +596,7 @@ fn resolve_browser_upload_path(
     file_path: &str,
     workspace_roots: &[PathBuf],
     path_env: &BTreeMap<String, PathBuf>,
+    user_owned_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let requested = expand_browser_env_prefixed_path(
         BROWSER_UPLOAD_TOOL_NAME,
@@ -617,10 +624,11 @@ fn resolve_browser_upload_path(
             canonical.display()
         ));
     }
-    let allowed_roots = browser_absolute_path_allowed_roots(workspace_roots, &[], path_env);
+    let allowed_roots =
+        browser_absolute_path_allowed_roots(workspace_roots, user_owned_roots, path_env);
     if !canonical_file_path_is_inside_workspace_roots(canonical.as_path(), &allowed_roots) {
         return Err(format!(
-            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots and approved launch environment roots",
+            "{BROWSER_UPLOAD_TOOL_NAME} upload file {} is outside agent workspace roots, approved launch environment roots, and approved user-owned OS roots",
             canonical.display()
         ));
     }
@@ -1107,7 +1115,7 @@ fn browser_user_owned_os_roots() -> Vec<PathBuf> {
     }
     push_browser_canonical_root(&mut roots, std::env::temp_dir());
     #[cfg(windows)]
-    push_browser_windows_drive_temp_roots(&mut roots);
+    push_browser_windows_drive_user_artifact_roots(&mut roots);
     #[cfg(unix)]
     {
         push_browser_canonical_root(&mut roots, PathBuf::from("/var/tmp"));
@@ -1128,27 +1136,31 @@ fn configured_browser_user_os_roots() -> Option<Vec<PathBuf>> {
 }
 
 #[cfg(windows)]
-fn push_browser_windows_drive_temp_roots(roots: &mut Vec<PathBuf>) {
+fn push_browser_windows_drive_user_artifact_roots(roots: &mut Vec<PathBuf>) {
     let Some(system_drive) = std::env::var_os("SystemDrive") else {
         return;
     };
     for candidate in
-        browser_windows_drive_temp_root_candidates(system_drive.to_string_lossy().as_ref())
+        browser_windows_drive_user_artifact_root_candidates(system_drive.to_string_lossy().as_ref())
     {
         push_browser_canonical_root(roots, candidate);
     }
 }
 
-// Mirrors the unix /var/tmp allowance for harnesses that lay out POSIX-style
-// temp paths on the Windows system drive.
+// Mirrors the unix /var/tmp allowance and accepts the common harness/user
+// exchange directory C:\downloads when it exists.
 #[cfg(windows)]
-fn browser_windows_drive_temp_root_candidates(system_drive: &str) -> Vec<PathBuf> {
+fn browser_windows_drive_user_artifact_root_candidates(system_drive: &str) -> Vec<PathBuf> {
     let drive = system_drive.trim().trim_end_matches(['\\', '/']);
     let bytes = drive.as_bytes();
     if bytes.len() != 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
         return Vec::new();
     }
-    vec![PathBuf::from(format!("{drive}\\var\\tmp"))]
+    vec![
+        PathBuf::from(format!("{drive}\\var\\tmp")),
+        PathBuf::from(format!("{drive}\\downloads")),
+        PathBuf::from(format!("{drive}\\Downloads")),
+    ]
 }
 
 /// Adds `root` if it canonicalizes to an existing directory not already
@@ -5805,6 +5817,7 @@ mod tests {
             "$PALYRA_E2E_OS_ROOT/downloads/upload-input.csv",
             &[],
             &path_env,
+            &[],
         )
         .expect("env-prefixed upload file should resolve inside launch OS root");
 
@@ -5829,7 +5842,7 @@ mod tests {
             ScopedEnvVar::set("AWS_SHARED_CREDENTIALS_FILE", credentials_file.as_path());
 
         let error =
-            resolve_browser_upload_path("$AWS_SHARED_CREDENTIALS_FILE", &[], &BTreeMap::new())
+            resolve_browser_upload_path("$AWS_SHARED_CREDENTIALS_FILE", &[], &BTreeMap::new(), &[])
                 .expect_err("browser upload must not expand daemon process env locators");
 
         assert!(
@@ -5856,8 +5869,30 @@ mod tests {
             canonical_upload.to_string_lossy().as_ref(),
             &[],
             &path_env,
+            &[],
         )
         .expect("absolute upload file should resolve inside launch OS root");
+
+        assert_eq!(resolved, canonical_upload);
+    }
+
+    #[test]
+    fn browser_upload_path_accepts_absolute_path_inside_user_owned_os_root() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let os_root = temp.path().join("downloads");
+        std::fs::create_dir_all(os_root.as_path()).expect("OS root should exist");
+        let upload = os_root.join("upload-input.csv");
+        std::fs::write(upload.as_path(), "sku,qty\nE2E-WIDGET,1\n").expect("upload should exist");
+        let canonical_root = os_root.canonicalize().expect("OS root should canonicalize");
+        let canonical_upload = upload.canonicalize().expect("upload should canonicalize");
+
+        let resolved = resolve_browser_upload_path(
+            canonical_upload.to_string_lossy().as_ref(),
+            &[],
+            &BTreeMap::new(),
+            std::slice::from_ref(&canonical_root),
+        )
+        .expect("absolute upload file should resolve inside approved user-owned OS root");
 
         assert_eq!(resolved, canonical_upload);
     }
@@ -5878,6 +5913,7 @@ mod tests {
             upload.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_agent),
             &BTreeMap::new(),
+            &[],
         )
         .expect_err("launch cwd must not implicitly authorize browser upload reads");
 
@@ -5900,11 +5936,14 @@ mod tests {
             key_file.to_string_lossy().as_ref(),
             std::slice::from_ref(&canonical_workspace),
             &BTreeMap::new(),
+            &[],
         )
-        .expect_err("ambient user-owned roots must not authorize browser upload reads");
+        .expect_err("unapproved user-owned roots must not authorize browser upload reads");
 
         assert!(
-            error.contains("outside agent workspace roots and approved launch environment roots"),
+            error.contains(
+                "outside agent workspace roots, approved launch environment roots, and approved user-owned OS roots"
+            ),
             "{error}"
         );
     }
