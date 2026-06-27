@@ -507,6 +507,9 @@ desktop_package_output="$artifacts_root/desktop"
 cargo_target_root="$artifacts_root/cargo-target"
 install_root="$workspace_root/install"
 state_root="$workspace_root/state"
+e2e_home_root="$workspace_root/home"
+e2e_os_root="$workspace_root/os-root"
+os_file_roots="$e2e_home_root:$e2e_os_root"
 cli_command_root="$workspace_root/cli-bin"
 desktop_executable="palyra-desktop-control-center"
 daemon_executable="palyrad"
@@ -514,6 +517,70 @@ browser_executable="palyra-browserd"
 cli_executable="palyra"
 
 mkdir -p "$workspace_root"
+
+initialize_clean_desktop_e2e_fixtures() {
+  local home_root="$1"
+  local os_root="$2"
+  mkdir -p \
+    "$home_root/.local/bin" \
+    "$home_root/Desktop" \
+    "$home_root/.ssh" \
+    "$home_root/.cache/palyra-e2e" \
+    "$home_root/.cache/palyra/memory" \
+    "$home_root/.config/palyra-e2e" \
+    "$os_root/downloads/inbox" \
+    "$os_root/downloads/quarantine" \
+    "$os_root/var/tmp/palyra-e2e/logs" \
+    "$os_root/var/tmp/palyra-e2e/archive"
+
+  cat > "$home_root/.zshrc" <<'EOF'
+# Palyra E2E shell profile fixture
+export PALYRA_E2E_ORIGINAL=1
+EOF
+  cat > "$home_root/.ssh/config" <<'EOF'
+Host existing-fixture
+    HostName existing.example.invalid
+    User fixture
+EOF
+  printf '%s\n' 'dummy private key fixture - do not read' > "$home_root/.ssh/palyra_e2e_fixture"
+
+  for name in new-1.cache new-2.cache new-3.cache old-1.cache old-2.cache; do
+    printf 'cache fixture %s\n' "$name" > "$home_root/.cache/palyra-e2e/$name"
+  done
+  : > "$home_root/.cache/palyra-e2e/zero-byte.tmp"
+  printf '%s\n' 'preserve this non-cache file' > "$home_root/.cache/palyra-e2e/notes.txt"
+
+  printf '%s\n' 'token=palyra_e2e_delete_me' > "$home_root/.cache/palyra/memory/palyra_e2e_delete_me.context"
+  printf '%s\n' 'token=keep_me' > "$home_root/.cache/palyra/memory/unrelated.context"
+
+  cat > "$home_root/.config/palyra-e2e/settings.toml" <<'EOF'
+telemetry = true
+mode = "fixture"
+EOF
+  cat > "$home_root/.config/palyra-e2e/settings.toml.tmp" <<'EOF'
+telemetry = false
+mode = "fixture"
+EOF
+  cat > "$home_root/.config/palyra-e2e/settings.toml.bak" <<'EOF'
+telemetry = true
+mode = "backup"
+EOF
+
+  printf 'id,name,total\n1,Ada,42.50\n' > "$os_root/downloads/inbox/orders-valid.csv"
+  printf 'id,total,name\n2,13.00,Bob\n' > "$os_root/downloads/inbox/orders-invalid.csv"
+  printf '%s\n' 'ignore this non-csv fixture' > "$os_root/downloads/inbox/readme.txt"
+
+  for i in $(seq 1 30); do
+    printf 'line %s\n' "$i"
+  done > "$os_root/var/tmp/palyra-e2e/logs/app.log"
+  printf '%s\n' 'old log 1' > "$os_root/var/tmp/palyra-e2e/logs/app-2026-06-25.old.log"
+  printf '%s\n' 'old log 2' > "$os_root/var/tmp/palyra-e2e/logs/app-2026-06-26.old.log"
+}
+
+initialize_clean_desktop_e2e_fixtures "$e2e_home_root" "$e2e_os_root"
+export PALYRA_E2E_HOME="$e2e_home_root"
+export PALYRA_E2E_OS_ROOT="$e2e_os_root"
+export PALYRA_OS_FILE_ROOTS="$os_file_roots"
 
 if [[ "$skip_build" == false ]]; then
   require_tool cargo
@@ -632,6 +699,9 @@ cat > "$cli_command_path" <<EOF
 set -eu
 export PALYRA_STATE_ROOT=$(shell_quote "$state_root")
 export PALYRA_CONFIG=$(shell_quote "$config_path")
+export PALYRA_E2E_HOME=$(shell_quote "$e2e_home_root")
+export PALYRA_E2E_OS_ROOT=$(shell_quote "$e2e_os_root")
+export PALYRA_OS_FILE_ROOTS=$(shell_quote "$os_file_roots")
 exec $(shell_quote "$cli_binary_installed") "\$@"
 EOF
 chmod 755 "$cli_command_path"
@@ -698,10 +768,16 @@ set -euo pipefail
 install_root="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
 state_root=$(shell_quote "$state_root")
 config_path=$(shell_quote "$config_path")
-mkdir -p "\$state_root"
+e2e_home_root=$(shell_quote "$e2e_home_root")
+e2e_os_root=$(shell_quote "$e2e_os_root")
+os_file_roots=$(shell_quote "$os_file_roots")
+mkdir -p "\$state_root" "\$e2e_home_root" "\$e2e_os_root"
 
 export PALYRA_STATE_ROOT="\$state_root"
 export PALYRA_CONFIG="\$config_path"
+export PALYRA_E2E_HOME="\$e2e_home_root"
+export PALYRA_E2E_OS_ROOT="\$e2e_os_root"
+export PALYRA_OS_FILE_ROOTS="\$os_file_roots"
 export PALYRA_DESKTOP_PALYRAD_BIN="\$install_root/$daemon_executable"
 export PALYRA_DESKTOP_BROWSERD_BIN="\$install_root/$browser_executable"
 export PALYRA_DESKTOP_PALYRA_BIN="\$install_root/$cli_executable"
@@ -738,6 +814,9 @@ write_json_metadata "$install_root/install-metadata.json" \
   "install_root=$install_root" \
   "config_path=$config_path" \
   "state_root=$state_root" \
+  "e2e_home_root=$e2e_home_root" \
+  "e2e_os_root=$e2e_os_root" \
+  "os_file_roots=$os_file_roots" \
   "cli_command_root=$cli_command_root" \
   "cli_command_path=$cli_command_path" \
   "cli_target_binary_path=$cli_binary_installed" \
@@ -756,6 +835,9 @@ write_json_metadata "$workspace_root/clean-install-metadata.json" \
   "install_root=$install_root" \
   "config_path=$config_path" \
   "state_root=$state_root" \
+  "e2e_home_root=$e2e_home_root" \
+  "e2e_os_root=$e2e_os_root" \
+  "os_file_roots=$os_file_roots" \
   "cli_command_root=$cli_command_root" \
   "cli_command_path=$cli_command_path" \
   "cli_persistence_strategy=$cli_persistence_strategy" \
@@ -780,6 +862,9 @@ echo "archive_path=$archive_path"
 echo "install_root=$install_root"
 echo "config_path=$config_path"
 echo "state_root=$state_root"
+echo "e2e_home_root=$e2e_home_root"
+echo "e2e_os_root=$e2e_os_root"
+echo "os_file_roots=$os_file_roots"
 echo "cli_command_root=$cli_command_root"
 echo "cli_command_path=$cli_command_path"
 echo "cli_persistence_strategy=$cli_persistence_strategy"

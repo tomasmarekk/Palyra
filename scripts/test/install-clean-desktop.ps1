@@ -68,14 +68,182 @@ $cargoTargetRoot = Join-Path $artifactsRoot "cargo-target"
 $installRoot = Join-Path $workspaceRoot "install"
 $stateRoot = Join-Path $workspaceRoot "state"
 $osFileRoot = Join-Path $workspaceRoot "home"
+$e2eHomeRoot = $osFileRoot
+$e2eOsRoot = Join-Path $workspaceRoot "os-root"
+$osFileRoots = @($e2eHomeRoot, $e2eOsRoot) -join [IO.Path]::PathSeparator
 $cliCommandRoot = Join-Path $workspaceRoot "cli-bin"
 $desktopExecutable = Resolve-ExecutableName -BaseName "palyra-desktop-control-center"
 $daemonExecutable = Resolve-ExecutableName -BaseName "palyrad"
 $browserExecutable = Resolve-ExecutableName -BaseName "palyra-browserd"
 $cliExecutable = Resolve-ExecutableName -BaseName "palyra"
 
+function Set-Utf8File {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Set-Content -LiteralPath $Path -Value $Value -NoNewline -Encoding UTF8
+}
+
+function Initialize-CleanDesktopE2EFixtures {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HomeRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$OsRoot
+    )
+
+    New-Item -ItemType Directory -Path $HomeRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $OsRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $HomeRoot ".local/bin") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $HomeRoot "Desktop") -Force | Out-Null
+
+    Set-Utf8File -Path (Join-Path $HomeRoot ".zshrc") -Value @"
+# Palyra E2E shell profile fixture
+export PALYRA_E2E_ORIGINAL=1
+"@
+
+    $sshRoot = Join-Path $HomeRoot ".ssh"
+    New-Item -ItemType Directory -Path $sshRoot -Force | Out-Null
+    Set-Utf8File -Path (Join-Path $sshRoot "config") -Value @"
+Host existing-fixture
+    HostName existing.example.invalid
+    User fixture
+"@
+    Set-Utf8File -Path (Join-Path $sshRoot "palyra_e2e_fixture") -Value "dummy private key fixture - do not read`n"
+
+    $cacheRoot = Join-Path $HomeRoot ".cache/palyra-e2e"
+    New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+    foreach ($name in @("new-1.cache", "new-2.cache", "new-3.cache", "old-1.cache", "old-2.cache")) {
+        Set-Utf8File -Path (Join-Path $cacheRoot $name) -Value "cache fixture $name`n"
+    }
+    Set-Utf8File -Path (Join-Path $cacheRoot "notes.txt") -Value "preserve this non-cache file`n"
+    Set-Content -LiteralPath (Join-Path $cacheRoot "zero-byte.tmp") -Value "" -NoNewline
+
+    $memoryCacheRoot = Join-Path $HomeRoot ".cache/palyra/memory"
+    New-Item -ItemType Directory -Path $memoryCacheRoot -Force | Out-Null
+    Set-Utf8File -Path (Join-Path $memoryCacheRoot "palyra_e2e_delete_me.context") -Value "token=palyra_e2e_delete_me`n"
+    Set-Utf8File -Path (Join-Path $memoryCacheRoot "unrelated.context") -Value "token=keep_me`n"
+
+    $configRoot = Join-Path $HomeRoot ".config/palyra-e2e"
+    New-Item -ItemType Directory -Path $configRoot -Force | Out-Null
+    Set-Utf8File -Path (Join-Path $configRoot "settings.toml") -Value "telemetry = true`nmode = `"fixture`"`n"
+    Set-Utf8File -Path (Join-Path $configRoot "settings.toml.tmp") -Value "telemetry = false`nmode = `"fixture`"`n"
+    Set-Utf8File -Path (Join-Path $configRoot "settings.toml.bak") -Value "telemetry = true`nmode = `"backup`"`n"
+
+    $downloadsRoot = Join-Path $OsRoot "downloads"
+    $inboxRoot = Join-Path $downloadsRoot "inbox"
+    $quarantineRoot = Join-Path $downloadsRoot "quarantine"
+    New-Item -ItemType Directory -Path $inboxRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $quarantineRoot -Force | Out-Null
+    Set-Utf8File -Path (Join-Path $inboxRoot "orders-valid.csv") -Value "id,name,total`n1,Ada,42.50`n"
+    Set-Utf8File -Path (Join-Path $inboxRoot "orders-invalid.csv") -Value "id,total,name`n2,13.00,Bob`n"
+    Set-Utf8File -Path (Join-Path $inboxRoot "readme.txt") -Value "ignore this non-csv fixture`n"
+
+    $logRoot = Join-Path $OsRoot "var/tmp/palyra-e2e/logs"
+    $archiveRoot = Join-Path $OsRoot "var/tmp/palyra-e2e/archive"
+    New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $archiveRoot -Force | Out-Null
+    $appLog = (1..30 | ForEach-Object { "line $_" }) -join "`n"
+    Set-Utf8File -Path (Join-Path $logRoot "app.log") -Value "$appLog`n"
+    Set-Utf8File -Path (Join-Path $logRoot "app-2026-06-25.old.log") -Value "old log 1`n"
+    Set-Utf8File -Path (Join-Path $logRoot "app-2026-06-26.old.log") -Value "old log 2`n"
+}
+
+function Write-CleanDesktopCliE2EShim {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetBinaryPath,
+        [Parameter(Mandatory = $true)]
+        [string]$StateRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath,
+        [Parameter(Mandatory = $true)]
+        [string]$E2EHomeRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$E2EOsRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$OsFileRoots
+    )
+
+    New-Item -ItemType Directory -Path $CommandRoot -Force | Out-Null
+    if ($IsWindows) {
+        $cmdTargetBinary = ConvertTo-CmdShimLiteral -Value $TargetBinaryPath
+        $cmdStateRoot = ConvertTo-CmdShimLiteral -Value $StateRoot
+        $cmdConfigPath = ConvertTo-CmdShimLiteral -Value $ConfigPath
+        $cmdE2EHomeRoot = ConvertTo-CmdShimLiteral -Value $E2EHomeRoot
+        $cmdE2EOsRoot = ConvertTo-CmdShimLiteral -Value $E2EOsRoot
+        $cmdOsFileRoots = ConvertTo-CmdShimLiteral -Value $OsFileRoots
+        Set-Content -LiteralPath (Join-Path $CommandRoot "palyra.cmd") -Value @"
+@echo off
+setlocal DisableDelayedExpansion
+set "PALYRA_STATE_ROOT=$cmdStateRoot"
+set "PALYRA_CONFIG=$cmdConfigPath"
+set "PALYRA_E2E_HOME=$cmdE2EHomeRoot"
+set "PALYRA_E2E_OS_ROOT=$cmdE2EOsRoot"
+set "PALYRA_OS_FILE_ROOTS=$cmdOsFileRoots"
+"$cmdTargetBinary" %*
+"@ -NoNewline
+
+        $psTargetBinary = ConvertTo-PowerShellSingleQuotedLiteral -Value $TargetBinaryPath
+        $psStateRoot = ConvertTo-PowerShellSingleQuotedLiteral -Value $StateRoot
+        $psConfigPath = ConvertTo-PowerShellSingleQuotedLiteral -Value $ConfigPath
+        $psE2EHomeRoot = ConvertTo-PowerShellSingleQuotedLiteral -Value $E2EHomeRoot
+        $psE2EOsRoot = ConvertTo-PowerShellSingleQuotedLiteral -Value $E2EOsRoot
+        $psOsFileRoots = ConvertTo-PowerShellSingleQuotedLiteral -Value $OsFileRoots
+        Set-Content -LiteralPath (Join-Path $CommandRoot "palyra-pwsh.ps1") -Value @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = "Stop"
+`$ProgressPreference = "SilentlyContinue"
+`$InformationPreference = "SilentlyContinue"
+`$env:PALYRA_STATE_ROOT = $psStateRoot
+`$env:PALYRA_CONFIG = $psConfigPath
+`$env:PALYRA_E2E_HOME = $psE2EHomeRoot
+`$env:PALYRA_E2E_OS_ROOT = $psE2EOsRoot
+`$env:PALYRA_OS_FILE_ROOTS = $psOsFileRoots
+if (`$MyInvocation.ExpectingInput) {
+    `$input | & $psTargetBinary @args
+} else {
+    & $psTargetBinary @args
+}
+exit `$LASTEXITCODE
+"@ -NoNewline
+    } else {
+        $shTargetBinary = ConvertTo-PosixSingleQuotedLiteral -Value $TargetBinaryPath
+        $shStateRoot = ConvertTo-PosixSingleQuotedLiteral -Value $StateRoot
+        $shConfigPath = ConvertTo-PosixSingleQuotedLiteral -Value $ConfigPath
+        $shE2EHomeRoot = ConvertTo-PosixSingleQuotedLiteral -Value $E2EHomeRoot
+        $shE2EOsRoot = ConvertTo-PosixSingleQuotedLiteral -Value $E2EOsRoot
+        $shOsFileRoots = ConvertTo-PosixSingleQuotedLiteral -Value $OsFileRoots
+        $shimPath = Join-Path $CommandRoot "palyra"
+        Set-Content -LiteralPath $shimPath -Value @"
+#!/usr/bin/env sh
+set -eu
+export PALYRA_STATE_ROOT=$shStateRoot
+export PALYRA_CONFIG=$shConfigPath
+export PALYRA_E2E_HOME=$shE2EHomeRoot
+export PALYRA_E2E_OS_ROOT=$shE2EOsRoot
+export PALYRA_OS_FILE_ROOTS=$shOsFileRoots
+exec $shTargetBinary "`$@"
+"@ -NoNewline
+        Set-ExecutablePermissions -Path $shimPath
+    }
+}
+
 New-Item -ItemType Directory -Path $workspaceRoot -Force | Out-Null
-New-Item -ItemType Directory -Path $osFileRoot -Force | Out-Null
+Initialize-CleanDesktopE2EFixtures -HomeRoot $e2eHomeRoot -OsRoot $e2eOsRoot
+$env:PALYRA_E2E_HOME = $e2eHomeRoot
+$env:PALYRA_E2E_OS_ROOT = $e2eOsRoot
+$env:PALYRA_OS_FILE_ROOTS = $osFileRoots
 
 if (-not $SkipBuild) {
     Push-Location $repoRoot
@@ -251,6 +419,16 @@ if ($IsWindows) {
     }
 }
 
+$resolvedCliTargetBinary = Join-Path $resolvedInstallRoot $cliExecutable
+Write-CleanDesktopCliE2EShim `
+    -CommandRoot $resolvedCliCommandRoot `
+    -TargetBinaryPath $resolvedCliTargetBinary `
+    -StateRoot $stateRoot `
+    -ConfigPath $configPath `
+    -E2EHomeRoot $e2eHomeRoot `
+    -E2EOsRoot $e2eOsRoot `
+    -OsFileRoots $osFileRoots
+
 $seedE2eSkillOutput = & $resolvedCliCommandPath `
     skills `
     seed-e2e-fixtures `
@@ -289,13 +467,19 @@ Set-StrictMode -Version Latest
 
 `$installRoot = Split-Path -Parent `$MyInvocation.MyCommand.Path
 `$stateRoot = "$stateRoot"
+`$e2eHomeRoot = "$e2eHomeRoot"
+`$e2eOsRoot = "$e2eOsRoot"
+`$osFileRoots = "$osFileRoots"
 `$configPath = "$configPath"
 New-Item -ItemType Directory -Path `$stateRoot -Force | Out-Null
-New-Item -ItemType Directory -Path "$osFileRoot" -Force | Out-Null
+New-Item -ItemType Directory -Path `$e2eHomeRoot -Force | Out-Null
+New-Item -ItemType Directory -Path `$e2eOsRoot -Force | Out-Null
 
 `$env:PALYRA_STATE_ROOT = `$stateRoot
 `$env:PALYRA_CONFIG = `$configPath
-`$env:PALYRA_OS_FILE_ROOTS = "$osFileRoot"
+`$env:PALYRA_E2E_HOME = `$e2eHomeRoot
+`$env:PALYRA_E2E_OS_ROOT = `$e2eOsRoot
+`$env:PALYRA_OS_FILE_ROOTS = `$osFileRoots
 `$env:PALYRA_DESKTOP_PALYRAD_BIN = Join-Path `$installRoot "$daemonExecutable"
 `$env:PALYRA_DESKTOP_BROWSERD_BIN = Join-Path `$installRoot "$browserExecutable"
 `$env:PALYRA_DESKTOP_PALYRA_BIN = Join-Path `$installRoot "$cliExecutable"
@@ -317,7 +501,9 @@ if (`$Wait) {
 } else {
     $shStateRoot = ConvertTo-PosixSingleQuotedLiteral -Value $stateRoot
     $shConfigPath = ConvertTo-PosixSingleQuotedLiteral -Value $configPath
-    $shOsFileRoot = ConvertTo-PosixSingleQuotedLiteral -Value $osFileRoot
+    $shE2EHomeRoot = ConvertTo-PosixSingleQuotedLiteral -Value $e2eHomeRoot
+    $shE2EOsRoot = ConvertTo-PosixSingleQuotedLiteral -Value $e2eOsRoot
+    $shOsFileRoots = ConvertTo-PosixSingleQuotedLiteral -Value $osFileRoots
     $launcherBody =
 @'
 #!/usr/bin/env bash
@@ -326,13 +512,17 @@ set -euo pipefail
 install_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 state_root=__PALYRA_STATE_ROOT__
 config_path=__PALYRA_CONFIG_PATH__
-os_file_root=__PALYRA_OS_FILE_ROOT__
+e2e_home_root=__PALYRA_E2E_HOME__
+e2e_os_root=__PALYRA_E2E_OS_ROOT__
+os_file_roots=__PALYRA_OS_FILE_ROOTS__
 mkdir -p "$state_root"
-mkdir -p "$os_file_root"
+mkdir -p "$e2e_home_root" "$e2e_os_root"
 
 export PALYRA_STATE_ROOT="$state_root"
 export PALYRA_CONFIG="$config_path"
-export PALYRA_OS_FILE_ROOTS="$os_file_root"
+export PALYRA_E2E_HOME="$e2e_home_root"
+export PALYRA_E2E_OS_ROOT="$e2e_os_root"
+export PALYRA_OS_FILE_ROOTS="$os_file_roots"
 export PALYRA_DESKTOP_PALYRAD_BIN="$install_root/__PALYRA_DAEMON_EXECUTABLE__"
 export PALYRA_DESKTOP_BROWSERD_BIN="$install_root/__PALYRA_BROWSER_EXECUTABLE__"
 export PALYRA_DESKTOP_PALYRA_BIN="$install_root/__PALYRA_CLI_EXECUTABLE__"
@@ -359,7 +549,9 @@ echo "Palyra desktop launched with pid=$desktop_pid"
 '@
     $launcherBody = $launcherBody.Replace("__PALYRA_STATE_ROOT__", $shStateRoot)
     $launcherBody = $launcherBody.Replace("__PALYRA_CONFIG_PATH__", $shConfigPath)
-    $launcherBody = $launcherBody.Replace("__PALYRA_OS_FILE_ROOT__", $shOsFileRoot)
+    $launcherBody = $launcherBody.Replace("__PALYRA_E2E_HOME__", $shE2EHomeRoot)
+    $launcherBody = $launcherBody.Replace("__PALYRA_E2E_OS_ROOT__", $shE2EOsRoot)
+    $launcherBody = $launcherBody.Replace("__PALYRA_OS_FILE_ROOTS__", $shOsFileRoots)
     $launcherBody = $launcherBody.Replace("__PALYRA_DAEMON_EXECUTABLE__", $daemonExecutable)
     $launcherBody = $launcherBody.Replace("__PALYRA_BROWSER_EXECUTABLE__", $browserExecutable)
     $launcherBody = $launcherBody.Replace("__PALYRA_CLI_EXECUTABLE__", $cliExecutable)
@@ -381,6 +573,9 @@ $installSummary = [ordered]@{
     config_path = $configPath
     state_root = $stateRoot
     os_file_root = $osFileRoot
+    e2e_home_root = $e2eHomeRoot
+    e2e_os_root = $e2eOsRoot
+    os_file_roots = $osFileRoots
     cli_command_root = $resolvedCliCommandRoot
     cli_command_path = $resolvedCliCommandPath
     cli_persistence_strategy = $cliPersistenceStrategy
@@ -412,6 +607,9 @@ Write-Output "install_root=$resolvedInstallRoot"
 Write-Output "config_path=$configPath"
 Write-Output "state_root=$stateRoot"
 Write-Output "os_file_root=$osFileRoot"
+Write-Output "e2e_home_root=$e2eHomeRoot"
+Write-Output "e2e_os_root=$e2eOsRoot"
+Write-Output "os_file_roots=$osFileRoots"
 Write-Output "cli_command_root=$resolvedCliCommandRoot"
 Write-Output "cli_command_path=$resolvedCliCommandPath"
 Write-Output "cli_persistence_strategy=$cliPersistenceStrategy"
