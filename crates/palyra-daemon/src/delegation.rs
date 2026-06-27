@@ -534,9 +534,8 @@ pub struct DelegatedScopeBuildRequest {
 ///
 /// # Errors
 /// Returns `Status::invalid_argument` for an empty objective, empty
-/// reference fields, or allowlist entries outside the parent's, and
-/// `Status::failed_precondition` when a child requests tools or skills
-/// while the parent allowlist is empty.
+/// reference fields, or allowlist entries outside a non-empty parent
+/// allowlist.
 pub fn build_delegated_scope(
     request: DelegatedScopeBuildRequest,
 ) -> Result<DelegatedRunScope, Status> {
@@ -1275,16 +1274,10 @@ fn validate_allowlist_subset(
     requested: &[String],
     parent_allowlist: &[String],
 ) -> Result<(), Status> {
-    // Deny-by-default: an empty parent allowlist means the parent itself has
-    // no grants, so any child entry would be an escalation -- it is never
-    // treated as "allow everything".
+    // Empty parent allowlists are the default unrestricted harness mode; a
+    // non-empty list opts into subset containment for delegated children.
     if parent_allowlist.is_empty() {
-        if requested.is_empty() {
-            return Ok(());
-        }
-        return Err(Status::failed_precondition(format!(
-            "{field} cannot grant entries when the parent allowlist is empty"
-        )));
+        return Ok(());
     }
     if let Some(disallowed) = requested
         .iter()
@@ -1614,19 +1607,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_delegation_request_treats_empty_parent_allowlist_as_deny_all() {
+    fn resolve_delegation_request_treats_empty_parent_allowlist_as_unrestricted() {
         let mut parent = parent_context();
         parent.parent_tool_allowlist.clear();
-        let error = resolve_delegation_request(
+        let delegated = resolve_delegation_request(
             &DelegationRequestInput {
                 profile_id: Some("research".to_owned()),
                 ..Default::default()
             },
             &parent,
         )
-        .expect_err("child tools must not exceed an empty parent allowlist");
+        .expect("empty parent allowlist should not block default harness tools");
 
-        assert!(error.message().contains("parent allowlist is empty"));
+        assert!(delegated.tool_allowlist.contains(&"palyra.http.fetch".to_owned()));
         let no_tools = resolve_delegation_request(
             &DelegationRequestInput {
                 profile_id: Some("synthesis".to_owned()),
@@ -1800,6 +1793,35 @@ mod tests {
         })
         .expect_err("wider tool scope should fail");
         assert!(error.message().contains("scope.tool_allowlist"));
+    }
+
+    #[test]
+    fn delegated_scope_builder_accepts_empty_parent_allowlist_default() {
+        let delegation = resolve_delegation_request(
+            &DelegationRequestInput {
+                manifest: Some(DelegationManifestInput {
+                    budget_tokens: Some(1_000),
+                    tool_allowlist: vec!["palyra.http.fetch".to_owned()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("delegation should resolve");
+
+        let scope = build_delegated_scope(DelegatedScopeBuildRequest {
+            objective: "Fetch docs and summarize".to_owned(),
+            delegation,
+            parent_tool_allowlist: Vec::new(),
+            parent_skill_allowlist: Vec::new(),
+            context_refs: Vec::new(),
+            memory_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+        })
+        .expect("empty parent allowlist should not block default harness tools");
+
+        assert_eq!(scope.tool_allowlist, vec!["palyra.http.fetch"]);
     }
 
     #[test]
