@@ -3931,7 +3931,19 @@ fn configured_embeddings_model(document: &toml::Value) -> Result<Option<String>>
     get_string_value_at_path(document, "model_provider.openai_embeddings_model")
 }
 
+fn registry_vault_ref_auth_configured(document: &toml::Value) -> bool {
+    registry_auth_field_configured(document, "api_key_vault_ref")
+}
+
+fn registry_auth_profile_configured(document: &toml::Value) -> bool {
+    registry_auth_field_configured(document, "auth_profile_id")
+}
+
 fn registry_auth_configured(document: &toml::Value) -> bool {
+    registry_vault_ref_auth_configured(document) || registry_auth_profile_configured(document)
+}
+
+fn registry_auth_field_configured(document: &toml::Value, field: &str) -> bool {
     let providers = get_value_at_path(document, "model_provider.providers")
         .ok()
         .flatten()
@@ -3942,13 +3954,9 @@ fn registry_auth_configured(document: &toml::Value) -> bool {
                 return false;
             };
             table
-                .get("api_key_vault_ref")
+                .get(field)
                 .and_then(toml::Value::as_str)
                 .is_some_and(|value| !value.trim().is_empty())
-                || table
-                    .get("auth_profile_id")
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
         })
     })
 }
@@ -4016,10 +4024,12 @@ fn describe_configure_section(
                         "model_provider.anthropic_api_key_vault_ref",
                     )?
                     .is_some()
+                    || registry_vault_ref_auth_configured(document)
                 {
                     "vault_ref".to_owned()
                 } else if get_string_value_at_path(document, "model_provider.auth_profile_id")?
                     .is_some()
+                    || registry_auth_profile_configured(document)
                 {
                     "auth_profile".to_owned()
                 } else {

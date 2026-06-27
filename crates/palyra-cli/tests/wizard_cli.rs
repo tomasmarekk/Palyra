@@ -1274,6 +1274,66 @@ fn configure_auth_model_accepts_api_key_from_stdin() -> Result<()> {
 }
 
 #[test]
+fn configure_auth_model_reports_openrouter_registry_vault_ref() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("configure").join("palyra.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent"))
+        .context("failed to create config parent")?;
+    fs::write(config_path.as_path(), "version = 1\n")
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let output = run_cli_with_stdin(
+        &workdir,
+        &[
+            "configure",
+            "--path",
+            &config_path_string,
+            "--section",
+            "auth-model",
+            "--non-interactive",
+            "--accept-risk",
+            "--auth-method",
+            "openrouter-api-key",
+            "--api-key-stdin",
+            "--skip-health",
+            "--json",
+        ],
+        &[],
+        Some(b"sk-openrouter-configure\n"),
+    )?;
+    assert!(
+        output.status.success(),
+        "OpenRouter configure should succeed without health probing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).context("configure stdout should be JSON")?;
+    let auth_model_after = payload
+        .get("section_changes")
+        .and_then(Value::as_array)
+        .and_then(|changes| {
+            changes
+                .iter()
+                .find(|change| change.get("section").and_then(Value::as_str) == Some("auth-model"))
+        })
+        .and_then(|change| change.get("after"))
+        .and_then(Value::as_array)
+        .context("OpenRouter configure summary should include auth-model after values")?;
+    assert!(
+        auth_model_after.iter().any(|value| value.as_str() == Some("auth_source=vault_ref")),
+        "OpenRouter configure should report registry vault auth in the section summary: {payload}"
+    );
+
+    let written = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    assert!(
+        written.contains("api_key_vault_ref = \"global/openrouter_api_key\""),
+        "OpenRouter configure should store the key as a registry vault ref: {written}"
+    );
+    Ok(())
+}
+
+#[test]
 fn configure_auth_model_rejects_custom_minimax_discovery_base_url() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("configure").join("palyra.toml");

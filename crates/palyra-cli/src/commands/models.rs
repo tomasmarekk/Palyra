@@ -1980,9 +1980,6 @@ fn apply_global_auth_to_registry_provider_views(
     models: &[RegistryModelEntry],
     config: &FileModelProviderConfig,
 ) {
-    if config.auth_profile_id.is_none() && config.auth_provider_kind.is_none() {
-        return;
-    }
     let default_provider_id = default_provider_id(models, config);
     let has_single_provider = providers.len() == 1;
     for provider in providers.iter_mut() {
@@ -2000,6 +1997,10 @@ fn apply_global_auth_to_registry_provider_views(
         }
         if provider.auth_provider_kind.is_none() {
             provider.auth_provider_kind = config.auth_provider_kind.clone();
+        }
+        if !provider.api_key_configured {
+            provider.api_key_configured =
+                credential_configured_for_kind(provider.kind.as_str(), config);
         }
     }
 }

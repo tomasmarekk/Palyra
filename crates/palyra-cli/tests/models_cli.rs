@@ -403,6 +403,53 @@ tool_calls = false
 }
 
 #[test]
+fn models_status_reports_global_vault_ref_inherited_by_registry_provider() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+[model_provider]
+kind = "openai_compatible"
+openai_api_key_vault_ref = "global/openai_api_key"
+default_chat_model_id = "gpt-4o-mini"
+
+[[model_provider.providers]]
+provider_id = "openai-primary"
+display_name = "OpenAI"
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+enabled = true
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_path_string = config_path.to_string_lossy().into_owned();
+
+    let output = run_cli(&workdir, &["models", "status", "--path", &config_path_string, "--json"])?;
+    assert!(
+        output.status.success(),
+        "models status should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("status stdout was not valid UTF-8")?;
+    let payload: Value =
+        serde_json::from_str(stdout.as_str()).context("status stdout was not JSON")?;
+
+    assert_eq!(
+        payload.get("provider_id").and_then(Value::as_str),
+        Some("openai-primary"),
+        "status should report the registry provider serving the default model: {payload}"
+    );
+    assert_eq!(
+        payload.get("api_key_configured").and_then(Value::as_bool),
+        Some(true),
+        "registry provider should inherit the top-level OpenAI vault credential state: {payload}"
+    );
+    Ok(())
+}
+
+#[test]
 fn models_set_accepts_chat_model_absent_from_live_discovery_cache() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let state_root = workdir.path().join("state");
