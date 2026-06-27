@@ -993,6 +993,9 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
     let raw_key = line.get(..separator_index)?;
     let key = assignment_key_identifier(raw_key)?;
     let value = line.get(separator_index + 1..)?.trim();
+    if is_scenario_completion_marker_assignment(raw_key, key.as_str()) {
+        return None;
+    }
     if value.is_empty()
         || key.ends_with("_ref")
         || is_safe_secret_reference_value(raw_key, key.as_str(), value)
@@ -1009,6 +1012,14 @@ fn detect_sensitive_assignment(line: &str) -> Option<&'static str> {
         return None;
     }
     Some(classification)
+}
+
+fn is_scenario_completion_marker_assignment(raw_key: &str, key: &str) -> bool {
+    if key != "token" {
+        return false;
+    }
+    let trimmed = raw_key.trim();
+    trimmed.starts_with("**") && trimmed.trim_matches('*').eq_ignore_ascii_case("token")
 }
 
 fn sensitive_assignment_separator_index(line: &str) -> Option<usize> {
@@ -3745,6 +3756,45 @@ mod tests {
             .finding_codes()
             .iter()
             .any(|code| code == "secret_leak.assignment.key"));
+    }
+
+    #[test]
+    fn scenario_completion_markdown_token_marker_is_not_redacted() {
+        let source = "**Token:palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::ToolOutput,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome.redacted_text.contains("[REDACTED_SECRET]"));
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+    }
+
+    #[test]
+    fn plain_token_label_values_are_still_redacted() {
+        let source = "Token:palyra_e2e_access_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::ToolOutput,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(outcome.redacted);
+        assert_eq!(outcome.redacted_text, "Token:[REDACTED_SECRET]");
+        assert!(outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
     }
 
     #[test]
