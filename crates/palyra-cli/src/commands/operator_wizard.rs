@@ -58,6 +58,8 @@ const XAI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
 const GOOGLE_GEMINI_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_GOOGLE_GEMINI_BASE_URL";
 const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL";
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH: &str =
+    "tool_call.http_fetch.allowed_credential_vault_refs";
 #[cfg(test)]
 const OPENAI_API_CURATED_DEFAULT_ORDER: &[&str] =
     &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
@@ -2880,6 +2882,7 @@ fn apply_model_provider_api_key(
             let base_url = anthropic_base_url_for_config(document)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "anthropic_api_key", api_key)?;
+            ensure_http_fetch_credential_vault_ref(document, vault_ref.as_str())?;
             configure_anthropic_provider_with_base_url(
                 document,
                 base_url.as_str(),
@@ -2898,6 +2901,7 @@ fn apply_model_provider_api_key(
             clear_model_provider_auth(document)?;
             let vault_ref =
                 store_secret_in_vault("global", minimax_secret_key(auth_method), api_key)?;
+            ensure_http_fetch_credential_vault_ref(document, vault_ref.as_str())?;
             configure_minimax_provider(
                 document,
                 selection.base_url.as_str(),
@@ -2916,6 +2920,7 @@ fn apply_model_provider_api_key(
             )?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", defaults.secret_key, api_key)?;
+            ensure_http_fetch_credential_vault_ref(document, vault_ref.as_str())?;
             configure_registry_provider(
                 document,
                 defaults,
@@ -2928,6 +2933,7 @@ fn apply_model_provider_api_key(
             let base_url = openai_base_url_for_config(document)?;
             clear_model_provider_auth(document)?;
             let vault_ref = store_secret_in_vault("global", "openai_api_key", api_key)?;
+            ensure_http_fetch_credential_vault_ref(document, vault_ref.as_str())?;
             configure_openai_provider_with_base_url(
                 document,
                 base_url.as_str(),
@@ -2937,6 +2943,44 @@ fn apply_model_provider_api_key(
         }
         _ => anyhow::bail!("unsupported model-provider auth method: {auth_method}"),
     }
+    Ok(())
+}
+
+fn ensure_http_fetch_credential_vault_ref(
+    document: &mut toml::Value,
+    vault_ref: &str,
+) -> Result<()> {
+    let mut refs = match get_value_at_path(document, HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH)
+        .ok()
+        .flatten()
+    {
+        Some(value) => {
+            let values = value.as_array().ok_or_else(|| {
+                anyhow::anyhow!("{HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH} must be an array")
+            })?;
+            let mut refs = Vec::with_capacity(values.len() + 1);
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    anyhow::bail!("{HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH} must contain strings");
+                };
+                let trimmed = value.trim();
+                if !trimmed.is_empty() && !refs.iter().any(|existing| existing == trimmed) {
+                    refs.push(trimmed.to_owned());
+                }
+            }
+            refs
+        }
+        None => Vec::new(),
+    };
+
+    if !refs.iter().any(|existing| existing == vault_ref) {
+        refs.push(vault_ref.to_owned());
+    }
+    set_value_at_path(
+        document,
+        HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH,
+        toml::Value::Array(refs.into_iter().map(toml::Value::String).collect()),
+    )?;
     Ok(())
 }
 
@@ -4620,6 +4664,39 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn http_fetch_credential_ref_backfill_preserves_existing_refs_without_duplicates() -> Result<()>
+    {
+        let (mut document, _) = parse_document_with_migration(
+            r#"
+version = 1
+
+[tool_call.http_fetch]
+allowed_credential_vault_refs = ["global/github_token", "global/github_token"]
+"#,
+        )?;
+
+        ensure_http_fetch_credential_vault_ref(&mut document, "global/minimax_api_key")?;
+        ensure_http_fetch_credential_vault_ref(&mut document, "global/minimax_api_key")?;
+
+        let refs = get_value_at_path(&document, HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH)?
+            .and_then(toml::Value::as_array)
+            .context("HTTP fetch credential refs should be an array")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("HTTP fetch credential ref should be a string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            refs,
+            vec!["global/github_token".to_owned(), "global/minimax_api_key".to_owned()]
+        );
+        Ok(())
+    }
 
     #[test]
     fn build_onboarding_answers_prefills_skip_flags() {

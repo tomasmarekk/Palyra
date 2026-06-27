@@ -10965,6 +10965,7 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
     validate_model_provider_registry_domains(&parsed)?;
     validate_browser_service_secret_sources(&parsed)?;
     validate_admin_secret_sources(&parsed)?;
+    validate_http_fetch_credential_allowlist(&parsed)?;
     let bind_addr = parsed
         .daemon
         .as_ref()
@@ -11007,6 +11008,32 @@ fn validate_daemon_compatible_document(document: &toml::Value) -> Result<()> {
             .context("invalid gateway QUIC bind address or port")?;
     }
 
+    Ok(())
+}
+
+fn validate_http_fetch_credential_allowlist(parsed: &RootFileConfig) -> Result<()> {
+    let Some(refs) = parsed
+        .tool_call
+        .as_ref()
+        .and_then(|tool_call| tool_call.http_fetch.as_ref())
+        .and_then(|http_fetch| http_fetch.allowed_credential_vault_refs.as_ref())
+    else {
+        return Ok(());
+    };
+
+    if refs.is_empty() {
+        anyhow::bail!(
+            "tool_call.http_fetch.allowed_credential_vault_refs must include at least one <scope>/<key> entry"
+        );
+    }
+    for candidate in refs {
+        let trimmed = candidate.trim();
+        VaultRef::parse(trimmed).map_err(|error| {
+            anyhow::anyhow!(
+                "tool_call.http_fetch.allowed_credential_vault_refs contains invalid vault ref '{trimmed}': {error}"
+            )
+        })?;
+    }
     Ok(())
 }
 

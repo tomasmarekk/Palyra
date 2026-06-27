@@ -203,6 +203,37 @@ variable = "PALYRA_OPENAI_API_KEY"
 }
 
 #[test]
+fn config_validate_rejects_empty_http_fetch_credential_vault_ref_allowlist() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("empty-http-fetch-credential-refs.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
+
+[tool_call.http_fetch]
+allowed_credential_vault_refs = []
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let output = run_cli(
+        &workdir,
+        &["config", "validate", "--path", "empty-http-fetch-credential-refs.toml"],
+    )?;
+
+    assert!(!output.status.success(), "empty HTTP fetch credential refs must fail");
+    let stderr = String::from_utf8(output.stderr).context("stderr was not UTF-8")?;
+    assert!(
+        stderr.contains(
+            "tool_call.http_fetch.allowed_credential_vault_refs must include at least one <scope>/<key> entry"
+        ),
+        "validation should match the daemon loader invariant: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn config_validate_json_warns_when_runtime_model_auth_is_missing() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
     let config_path = workdir.path().join("missing-model-auth.toml");
