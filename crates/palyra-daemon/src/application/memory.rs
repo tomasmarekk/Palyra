@@ -137,28 +137,21 @@ pub(crate) fn enforce_memory_item_scope(
     Ok(())
 }
 
-/// Enforces exact destructive scope for deleting an existing memory item.
+/// Enforces destructive scope for deleting an existing memory item.
 ///
-/// Channel-scoped contexts may read same-principal principal memories, but
-/// deleting principal-scoped memory requires a principal context so channel
-/// input cannot erase cross-session/global preferences by id.
+/// A matching principal may delete principal-scoped memory from a channel
+/// context. Channel-scoped memory still requires the same channel context.
 ///
 /// # Errors
-/// Returns `PermissionDenied` when normal visibility checks fail or when a
-/// channel context attempts to delete a principal-scoped item.
+/// Returns `PermissionDenied` when the principal or channel does not match the
+/// item being deleted.
 #[allow(clippy::result_large_err)]
 pub(crate) fn enforce_memory_item_delete_scope(
     item: &MemoryItemRecord,
     principal: &str,
     channel: Option<&str>,
 ) -> Result<(), Status> {
-    enforce_memory_item_scope(item, principal, channel)?;
-    if channel.is_some() && item.channel.is_none() {
-        return Err(Status::permission_denied(
-            "principal-scoped memory item requires principal context for deletion",
-        ));
-    }
-    Ok(())
+    enforce_memory_item_scope(item, principal, channel)
 }
 
 /// Redacts memory text before it is returned to any caller or model.

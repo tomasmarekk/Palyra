@@ -1450,6 +1450,7 @@ pub(crate) async fn execute_memory_delete_tool(
         );
     }
     let mut memory_item_exists = false;
+    let mut delete_channel = context.channel.map(str::to_owned);
     match runtime_state.memory_item(memory_id.clone()).await {
         Ok(Some(item)) => {
             memory_item_exists = true;
@@ -1465,6 +1466,7 @@ pub(crate) async fn execute_memory_delete_tool(
                     format!("palyra.memory.delete {}", error.message()),
                 );
             }
+            delete_channel = item.channel.clone();
         }
         Ok(None) => {}
         Err(error) => {
@@ -1493,11 +1495,7 @@ pub(crate) async fn execute_memory_delete_tool(
         }
     }
     let deleted = match runtime_state
-        .delete_memory_item(
-            memory_id.clone(),
-            context.principal.to_owned(),
-            context.channel.map(str::to_owned),
-        )
+        .delete_memory_item(memory_id.clone(), context.principal.to_owned(), delete_channel)
         .await
     {
         Ok(deleted) => deleted,
