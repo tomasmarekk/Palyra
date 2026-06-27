@@ -1498,8 +1498,7 @@ fn ansi_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
 
 fn csi_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
     let max_len = bytes.len().min(64);
-    for index in 2..max_len {
-        let byte = bytes[index];
+    for (index, byte) in bytes.iter().copied().enumerate().take(max_len).skip(2) {
         if (0x40..=0x7e).contains(&byte) {
             return Some(index + 1);
         }
