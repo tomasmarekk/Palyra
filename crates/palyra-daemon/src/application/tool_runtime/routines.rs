@@ -2812,16 +2812,11 @@ fn parse_approval_policy(value: Option<&str>) -> Result<RoutineApprovalPolicy, S
 }
 
 fn default_approval_policy_for_execution(
-    execution: &RoutineExecutionConfig,
+    _execution: &RoutineExecutionConfig,
     approval_policy: RoutineApprovalPolicy,
     _approval_mode_was_requested: bool,
     _execution_posture_was_requested: bool,
 ) -> RoutineApprovalPolicy {
-    if approval_policy.mode == RoutineApprovalMode::None
-        && execution.execution_posture == RoutineExecutionPosture::SensitiveTools
-    {
-        return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
-    }
     approval_policy
 }
 
@@ -3872,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    fn default_approval_policy_requires_first_run_for_implicit_sensitive_tools() {
+    fn default_approval_policy_preserves_none_for_implicit_sensitive_tools() {
         let execution = RoutineExecutionConfig {
             run_mode: RoutineRunMode::FreshSession,
             execution_posture: RoutineExecutionPosture::SensitiveTools,
@@ -3885,11 +3880,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
     }
 
     #[test]
-    fn default_approval_policy_requires_first_run_for_explicit_sensitive_tools() {
+    fn default_approval_policy_preserves_none_for_explicit_sensitive_tools() {
         let execution = RoutineExecutionConfig {
             run_mode: RoutineRunMode::FreshSession,
             execution_posture: RoutineExecutionPosture::SensitiveTools,
@@ -3902,7 +3897,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(approval_policy.mode, RoutineApprovalMode::BeforeFirstRun);
+        assert_eq!(approval_policy.mode, RoutineApprovalMode::None);
     }
 
     fn test_cron_job(

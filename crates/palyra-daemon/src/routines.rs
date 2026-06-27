@@ -770,8 +770,9 @@ pub struct RoutineQuietHours {
     pub timezone: Option<String>,
 }
 
-/// Approval policy wrapper; high-frequency schedules may force the mode up to `BeforeEnable`
-/// via [`routine_approval_policy_with_auto_enable_guard`].
+/// Approval policy wrapper. Explicit approval policies may be tightened to
+/// `BeforeEnable` for high-frequency schedules via
+/// [`routine_approval_policy_with_auto_enable_guard`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineApprovalPolicy {
@@ -788,18 +789,18 @@ impl Default for RoutineApprovalPolicy {
 #[must_use]
 pub fn routine_allows_sensitive_tools(
     execution: &RoutineExecutionConfig,
-    approval_policy: &RoutineApprovalPolicy,
+    _approval_policy: &RoutineApprovalPolicy,
 ) -> bool {
     execution.execution_posture == RoutineExecutionPosture::SensitiveTools
-        && approval_policy.mode != RoutineApprovalMode::None
 }
 
 /// Applies the routine schedule auto-enable guard to an approval policy.
 ///
 /// Inputs are the normalized schedule type and payload produced by the cron
 /// normalization layer. The returned policy preserves normal schedules and
-/// fail-closes high-frequency recurring schedules to `before_enable`; malformed
-/// `every` payloads are treated as high-frequency for this guard.
+/// tightens explicit approval policies on high-frequency recurring schedules
+/// to `before_enable`; malformed `every` payloads are treated as
+/// high-frequency for this guard.
 #[must_use]
 pub fn routine_approval_policy_with_auto_enable_guard(
     schedule_type: CronScheduleType,
@@ -807,6 +808,7 @@ pub fn routine_approval_policy_with_auto_enable_guard(
     approval_policy: RoutineApprovalPolicy,
 ) -> RoutineApprovalPolicy {
     if schedule_requires_auto_enable_guard(schedule_type, schedule_payload_json)
+        && approval_policy.mode != RoutineApprovalMode::None
         && approval_policy.mode != RoutineApprovalMode::BeforeEnable
     {
         return RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeEnable };
@@ -3558,7 +3560,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_auto_enable_guard_requires_before_enable_for_fast_every_schedules() {
+    fn schedule_auto_enable_guard_preserves_default_none_for_fast_every_schedules() {
         let payload = json!({ "interval_ms": MIN_AUTO_ENABLE_EVERY_INTERVAL_MS - 1 }).to_string();
 
         assert!(schedule_requires_auto_enable_guard(CronScheduleType::Every, payload.as_str()));
@@ -3567,6 +3569,18 @@ mod tests {
             CronScheduleType::Every,
             payload.as_str(),
             RoutineApprovalPolicy::default(),
+        );
+        assert_eq!(guarded.mode, RoutineApprovalMode::None);
+    }
+
+    #[test]
+    fn schedule_auto_enable_guard_tightens_explicit_fast_every_approval() {
+        let payload = json!({ "interval_ms": MIN_AUTO_ENABLE_EVERY_INTERVAL_MS - 1 }).to_string();
+
+        let guarded = routine_approval_policy_with_auto_enable_guard(
+            CronScheduleType::Every,
+            payload.as_str(),
+            RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
         );
         assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
     }
@@ -3611,7 +3625,7 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_tool_auto_approval_requires_routine_approval_policy() {
+    fn sensitive_tool_auto_approval_follows_execution_posture() {
         let standard_execution = RoutineExecutionConfig::default();
         let sensitive_execution = RoutineExecutionConfig {
             execution_posture: RoutineExecutionPosture::SensitiveTools,
@@ -3622,7 +3636,7 @@ mod tests {
             &standard_execution,
             &RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun },
         ));
-        assert!(!routine_allows_sensitive_tools(
+        assert!(routine_allows_sensitive_tools(
             &sensitive_execution,
             &RoutineApprovalPolicy::default(),
         ));
