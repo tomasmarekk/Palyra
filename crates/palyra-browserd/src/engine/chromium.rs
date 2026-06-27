@@ -4286,6 +4286,8 @@ pub(crate) async fn click_with_chromium(
                         };
                     }
                 };
+                let settle_ms = DEFAULT_ACTION_RETRY_INTERVAL_MS.min(timeout_ms.max(1));
+                tokio::time::sleep(Duration::from_millis(settle_ms)).await;
                 let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
                 return ChromiumActionOutcome {
                     success: true,

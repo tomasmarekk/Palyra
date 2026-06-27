@@ -1743,7 +1743,10 @@ async fn browser_service_chromium_engine_executes_real_dom_actions() {
     let (url, handle) = spawn_static_http_server_with_request_budget(
         200,
         r#"<html><head><title>Chromium Fixture</title><script>
-function markClicked(){document.getElementById('status').textContent='clicked';}
+function markClicked(){
+  document.getElementById('status').textContent='clicked';
+  setTimeout(() => { throw new Error('late click diagnostic'); }, 50);
+}
 function markTyped(value){document.getElementById('typed-status').textContent=value;}
 function markFiltered(){document.getElementById('filter-status').textContent='filtered:active';}
 </script></head><body>
@@ -1940,6 +1943,17 @@ function markFiltered(){document.getElementById('filter-status').textContent='fi
         .expect("click should execute")
         .into_inner();
     assert!(click.success, "chromium click should succeed: {}", click.error);
+    {
+        let sessions = service.runtime.sessions.lock().await;
+        let session = sessions.get(session_id.ulid.as_str()).expect("session should remain active");
+        let active_tab = session.active_tab().expect("active tab should remain available");
+        assert!(
+            active_tab.console_log.iter().any(|entry| entry.kind == "page_error"
+                && entry.message.contains("late click diagnostic")),
+            "chromium click should return after late click diagnostics settle: {:?}",
+            active_tab.console_log
+        );
+    }
 
     let waited = service
         .wait_for(Request::new(browser_v1::WaitForRequest {
