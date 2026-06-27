@@ -18,6 +18,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     fs,
     hash::{Hash, Hasher},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,6 +26,7 @@ use std::{
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
+use futures::FutureExt;
 use palyra_common::{
     default_identity_store_root, default_state_root,
     versioned_json::{
@@ -2820,18 +2822,30 @@ async fn dispatch_job(
 
     let dispatch_run_id = run_id.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_job_with_retries(
+        let run_result = AssertUnwindSafe(run_job_with_retries(
             Arc::clone(&state),
             auth,
             grpc_url,
             job,
-            run_id,
+            run_id.clone(),
             Arc::clone(&wake_signal),
             options,
-        )
-        .await
-        {
-            warn!(error = %error, "cron execution task failed");
+        ))
+        .catch_unwind()
+        .await;
+        match run_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(error = %error, "cron execution task failed");
+            }
+            Err(_) => {
+                warn!(run_id = %run_id, "cron execution task panicked");
+                if let Err(error) =
+                    finalize_panicked_cron_run(Arc::clone(&state), run_id.as_str()).await
+                {
+                    warn!(run_id = %run_id, error = %error, "failed to finalize panicked cron run");
+                }
+            }
         }
     });
 
@@ -2845,6 +2859,40 @@ async fn dispatch_job(
         },
         session_key: Some(effective_preview.session_key),
         session_label: Some(effective_preview.session_label),
+    })
+}
+
+async fn finalize_panicked_cron_run(
+    state: Arc<GatewayRuntimeState>,
+    run_id: &str,
+) -> Result<(), Status> {
+    let Some(run) = state.cron_run(run_id.to_owned()).await? else {
+        return Ok(());
+    };
+    let Some(request) = panicked_cron_run_finalize_request(&run) else {
+        return Ok(());
+    };
+    state.finalize_cron_run(request).await
+}
+
+fn panicked_cron_run_finalize_request(run: &CronRunRecord) -> Option<CronRunFinalizeRequest> {
+    if !run.status.is_active() {
+        return None;
+    }
+    Some(CronRunFinalizeRequest {
+        run_id: run.run_id.clone(),
+        status: CronRunStatus::Failed,
+        error_kind: Some("scheduler_task_panic".to_owned()),
+        error_message_redacted: Some(
+            "cron execution task panicked before completion; active run slot was released"
+                .to_owned(),
+        ),
+        model_tokens_in: run.model_tokens_in,
+        model_tokens_out: run.model_tokens_out,
+        tool_calls: run.tool_calls,
+        tool_denies: run.tool_denies,
+        orchestrator_run_id: run.orchestrator_run_id.clone(),
+        session_id: run.session_id.clone(),
     })
 }
 
@@ -4176,12 +4224,12 @@ mod tests {
         cron_terminal_status_from_stream, decide_concurrency_policy, effective_cron_session_key,
         effective_cron_session_label, load_periodic_reaudit_skills_index, max_runs_for_job,
         merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
-        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
-        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
-        routines_automation_enabled, scheduled_routine_approval_matches,
-        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
-        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
-        should_disable_exhausted_scheduled_one_shot,
+        panicked_cron_run_finalize_request, parse_skill_reaudit_interval, periodic_reaudit_targets,
+        reserved_cron_run_slot_count, routine_approval_subject_id, routine_gate_error_kind,
+        routine_parameter_delta_json, routines_automation_enabled,
+        scheduled_routine_approval_matches, scheduled_routine_requires_first_run_approval,
+        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
+        scheduler_retry_backoff_delay_ms, should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
@@ -5535,6 +5583,36 @@ mod tests {
             &stale_finished,
             SCHEDULER_STALE_RUN_AFTER_MS + 1_000
         ));
+    }
+
+    #[test]
+    fn panicked_cron_task_finalization_releases_active_run_slot() {
+        let mut active = sample_cron_run(CronRunStatus::Running, 1_000);
+        active.orchestrator_run_id = Some("orch-1".to_owned());
+        active.session_id = Some("session-1".to_owned());
+        active.model_tokens_in = 13;
+        active.model_tokens_out = 21;
+        active.tool_calls = 2;
+        active.tool_denies = 1;
+
+        let request =
+            panicked_cron_run_finalize_request(&active).expect("active run should finalize");
+
+        assert_eq!(request.run_id, active.run_id);
+        assert_eq!(request.status, CronRunStatus::Failed);
+        assert_eq!(request.error_kind.as_deref(), Some("scheduler_task_panic"));
+        assert_eq!(request.model_tokens_in, 13);
+        assert_eq!(request.model_tokens_out, 21);
+        assert_eq!(request.tool_calls, 2);
+        assert_eq!(request.tool_denies, 1);
+        assert_eq!(request.orchestrator_run_id.as_deref(), Some("orch-1"));
+        assert_eq!(request.session_id.as_deref(), Some("session-1"));
+
+        let terminal = sample_cron_run(CronRunStatus::Succeeded, 2_000);
+        assert!(
+            panicked_cron_run_finalize_request(&terminal).is_none(),
+            "terminal runs must not be overwritten by panic cleanup"
+        );
     }
 
     #[test]
