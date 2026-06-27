@@ -1254,7 +1254,7 @@ enum ChromiumPrivateTargetUrlScope {
 /// Tracks which private/local targets a session may reach.
 ///
 /// Deny-by-default: unless the whole session allows private targets, a private
-/// destination is reachable only for the tab and URL that owns a scoped allowance.
+/// destination is reachable only for the tab and target that owns a scoped allowance.
 #[derive(Debug)]
 pub(crate) struct ChromiumPrivateTargetPolicy {
     allow_session_private_targets: bool,
@@ -1396,7 +1396,13 @@ impl ChromiumPrivateTargetPolicy {
         if self
             .scoped_requests
             .lock()
-            .map(|scoped_requests| scoped_requests.contains_key(scope))
+            .map(|scoped_requests| {
+                let requested_target = scope.target_scope();
+                scoped_requests.keys().any(|scoped| {
+                    scoped.tab_target_id == scope.tab_target_id
+                        && scoped.target_scope() == requested_target
+                })
+            })
             .unwrap_or(false)
         {
             return true;

@@ -1388,7 +1388,7 @@ async fn chromium_session_proxy_allows_private_targets_after_session_opt_in() {
 }
 
 #[test]
-fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
+fn chromium_private_target_policy_scopes_navigation_override_to_tab_target() {
     let policy = Arc::new(ChromiumPrivateTargetPolicy::new(false));
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1404,12 +1404,12 @@ fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
         "owning tab should be allowed for the exact scoped URL"
     );
     assert!(
-        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/next"),
-        "same host and port must not widen to another URL"
+        policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/next"),
+        "same tab should allow same host and port subresources during navigation"
     );
     assert!(
         !policy.allows_tab_url("tab-b", "http://127.0.0.1:7143/status"),
-        "another tab must not inherit the scoped URL"
+        "another tab must not inherit the scoped target"
     );
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1420,8 +1420,16 @@ fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
         "owning tab request should arm one proxy CONNECT allowance"
     );
     assert!(
+        policy.authorize_tab_request_url("tab-a", "http://127.0.0.1:7143/styles.css"),
+        "same-origin subresource should be authorized while the navigation scope is active"
+    );
+    assert!(
         policy.allows_host_port("127.0.0.1", 7143),
         "SOCKS5 proxy should consume the armed target allowance"
+    );
+    assert!(
+        policy.allows_host_port("127.0.0.1", 7143),
+        "second same-target request should arm its own one-shot proxy allowance"
     );
     assert!(
         !policy.allows_host_port("127.0.0.1", 7143),
@@ -1434,7 +1442,7 @@ fn chromium_private_target_policy_scopes_request_override_to_exact_target() {
 
     drop(scoped);
     assert!(
-        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/status"),
+        !policy.allows_tab_url("tab-a", "http://127.0.0.1:7143/styles.css"),
         "dropping the scoped guard should revoke the allowance"
     );
 }
@@ -2847,6 +2855,136 @@ async fn browser_service_chromium_preserves_navigated_private_origin_for_user_fe
                 && (entry.status_code == 200 || entry.status_code == 0)
         }),
         "network log should include same-origin JSON fetch entries: {:?}",
+        network_log.entries
+    );
+
+    handle.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_allows_initial_private_css_subresource() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 256 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: false,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium CSS subresource test");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let (url, handle) = spawn_css_subresource_http_server();
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 8_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(
+        navigate.success,
+        "chromium navigate should allow initial stylesheet load: {}",
+        navigate.error
+    );
+
+    let observed = service
+        .observe(Request::new(browser_v1::ObserveRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            include_dom_snapshot: false,
+            include_accessibility_tree: false,
+            include_visible_text: false,
+            max_dom_snapshot_bytes: 0,
+            max_accessibility_tree_bytes: 0,
+            max_visible_text_bytes: 0,
+            capture_selectors: vec![".cta".to_owned()],
+            computed_style_properties: vec![
+                "display".to_owned(),
+                "padding-top".to_owned(),
+                "background-color".to_owned(),
+            ],
+            max_capture_text_bytes: 128,
+        }))
+        .await
+        .expect("observe should execute")
+        .into_inner();
+    assert!(observed.success, "observe should succeed: {}", observed.error);
+    let capture = observed
+        .element_captures
+        .iter()
+        .find(|capture| capture.selector == ".cta")
+        .expect("observe should return .cta capture");
+    assert!(capture.found, "capture should find the styled CTA: {capture:?}");
+    let style_value = |name: &str| {
+        capture
+            .computed_styles
+            .iter()
+            .find(|style| style.name == name)
+            .map(|style| style.value.as_str())
+    };
+    assert_eq!(style_value("display"), Some("block"));
+    assert_eq!(style_value("padding-top"), Some("14px"));
+    assert_eq!(style_value("background-color"), Some("rgb(31, 77, 255)"));
+
+    let mut network_log_request = Request::new(browser_v1::NetworkLogRequest {
+        v: 1,
+        session_id: Some(session_id),
+        limit: 20,
+        include_headers: false,
+        max_payload_bytes: 32 * 1024,
+    });
+    insert_principal(&mut network_log_request, "user:ops");
+    let network_log = service
+        .network_log(network_log_request)
+        .await
+        .expect("network_log should execute")
+        .into_inner();
+    assert!(
+        network_log.entries.iter().any(|entry| entry.request_url.ends_with("/styles.css")),
+        "network log should include the initial stylesheet request: {:?}",
         network_log.entries
     );
 
@@ -7388,6 +7526,68 @@ document.getElementById("loadData").addEventListener("click", async () => {
         );
     });
     (format!("http://{address}/"), handle)
+}
+
+fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    listener.set_nonblocking(true).expect("listener should become nonblocking");
+    let address = listener.local_addr().expect("listener local address should resolve");
+    let handle = thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let mut root_requests = 0usize;
+        let mut css_seen = false;
+        while started_at.elapsed() < Duration::from_secs(20) && !(css_seen && root_requests >= 2) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("accepted stream should become blocking");
+                    let request = read_http_request(&mut stream);
+                    if request.trim().is_empty() {
+                        continue;
+                    }
+                    let path = http_request_path(request.as_str());
+                    if path.starts_with("/styles.css") {
+                        css_seen = true;
+                        let body = ".cta { display: block; padding: 14px 28px; background-color: rgb(31, 77, 255); }";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("server should write CSS response");
+                        stream.flush().expect("server should flush CSS response");
+                        continue;
+                    }
+                    if path == "/" || path.starts_with("/index.html") {
+                        root_requests = root_requests.saturating_add(1);
+                        let body = r##"<html><head><title>Styled CTA</title><link rel="stylesheet" href="/styles.css" /></head><body><a class="cta" href="#">Continue</a></body></html>"##;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("server should write page response");
+                        stream.flush().expect("server should flush page response");
+                        continue;
+                    }
+                    let body = "not found";
+                    let response = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).expect("server should write fallback");
+                    stream.flush().expect("server should flush fallback");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+        assert!(css_seen, "fixture should receive the initial stylesheet request before shutdown");
+    });
+    (format!("http://{address}/index.html"), handle)
 }
 
 fn spawn_static_http_server_with_headers(
