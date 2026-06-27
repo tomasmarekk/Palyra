@@ -1,7 +1,8 @@
 //! `palyra backup`: create and verify portable ZIP archives of config, state,
 //! optional workspace, and an embedded support bundle.
-//! Safety rules: the archive must live outside the live state root, symlinked
-//! sources are rejected, and every entry is hash-pinned in `manifest.json`.
+//! Safety rules: the archive must live outside the live state root, unsupported
+//! symlinked sources are rejected, and every entry is hash-pinned in
+//! `manifest.json`.
 
 use std::{
     env, fs,
@@ -22,6 +23,8 @@ use crate::cli::{BackupCommand, BackupComponentArg};
 use crate::*;
 
 const BACKUP_MANIFEST_PATH: &str = "manifest.json";
+const SKILL_CURRENT_LINK_NAME: &str = "current";
+const SKILLS_STATE_DIR: &str = "skills";
 const VAULT_METADATA_LOCK_FILE: &str = "metadata.lock";
 const VAULT_METADATA_TEMP_PREFIX: &str = "metadata.tmp.";
 
@@ -412,12 +415,12 @@ fn add_directory_to_zip(
             if path == output_path {
                 continue;
             }
-            if should_skip_state_backup_entry(path.as_path(), archive_prefix) {
-                continue;
-            }
             let file_type = child
                 .file_type()
                 .with_context(|| format!("failed to inspect backup entry {}", path.display()))?;
+            if should_skip_state_backup_entry(path.as_path(), archive_prefix, &file_type) {
+                continue;
+            }
             // Symlinks are rejected outright (not followed) so a planted link
             // cannot pull files from outside the selected source root into the
             // archive; a unit test pins this behavior.
@@ -460,14 +463,47 @@ fn add_directory_to_zip(
 // Vault metadata lock and temp files are transient and may be mid-write while
 // the daemon runs; capturing them would embed torn or stale vault metadata in
 // the archive.
-fn should_skip_state_backup_entry(path: &Path, archive_prefix: &str) -> bool {
+fn should_skip_state_backup_entry(
+    path: &Path,
+    archive_prefix: &str,
+    file_type: &fs::FileType,
+) -> bool {
     if archive_prefix != "state" {
         return false;
+    }
+    if file_type.is_symlink() && is_managed_skill_current_link(path) {
+        return true;
     }
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
     file_name == VAULT_METADATA_LOCK_FILE || file_name.starts_with(VAULT_METADATA_TEMP_PREFIX)
+}
+
+// Skill installs maintain `skills/<id>/current` as a convenience pointer; the
+// pointed-to version directories are archived directly, so the pointer itself
+// should not make a default state backup fail.
+fn is_managed_skill_current_link(path: &Path) -> bool {
+    let mut normal_components = path.components().rev().filter_map(|component| {
+        if let std::path::Component::Normal(value) = component {
+            value.to_str()
+        } else {
+            None
+        }
+    });
+    let Some(file_name) = normal_components.next() else {
+        return false;
+    };
+    if file_name != SKILL_CURRENT_LINK_NAME {
+        return false;
+    }
+    let Some(skill_id) = normal_components.next() else {
+        return false;
+    };
+    if skill_id.is_empty() {
+        return false;
+    }
+    normal_components.next() == Some(SKILLS_STATE_DIR)
 }
 
 fn add_file_to_zip(
@@ -627,9 +663,43 @@ fn normalize_backup_path_components(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_directory_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory symlinks are unsupported on this platform",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_file_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file symlinks are unsupported on this platform",
+        ))
+    }
 
     #[test]
     fn backup_manifest_round_trips() -> Result<()> {
@@ -734,6 +804,42 @@ mod tests {
     }
 
     #[test]
+    fn add_directory_to_zip_skips_managed_skill_current_symlink() -> Result<()> {
+        let temp = tempdir()?;
+        let source_root = temp.path().join("state");
+        let skill_root = source_root.join(SKILLS_STATE_DIR).join("e2e.reporter");
+        let version_root = skill_root.join("1.0.0");
+        fs::create_dir_all(version_root.as_path())?;
+        fs::write(version_root.join("manifest.json").as_path(), b"{}")?;
+        let current_link = skill_root.join(SKILL_CURRENT_LINK_NAME);
+        if let Err(error) = create_directory_symlink(version_root.as_path(), current_link.as_path())
+        {
+            eprintln!("skipping managed skill current symlink backup test: {error}");
+            return Ok(());
+        }
+
+        let archive_path = temp.path().join("backup.zip");
+        let file = fs::File::create(archive_path.as_path())?;
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let mut entries = Vec::new();
+
+        add_directory_to_zip(
+            &mut writer,
+            options,
+            source_root.as_path(),
+            "state",
+            archive_path.as_path(),
+            &mut entries,
+        )?;
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_path, "state/skills/e2e.reporter/1.0.0/manifest.json");
+        assert!(entries.iter().all(|entry| !entry.archive_path.contains("/current")));
+        Ok(())
+    }
+
+    #[test]
     fn reject_live_state_root_backup_output_blocks_archives_inside_state_root() -> Result<()> {
         let temp = tempdir()?;
         let state_root = temp.path().join("state");
@@ -767,7 +873,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn add_directory_to_zip_rejects_symlink_entries() -> Result<()> {
         let temp = tempdir()?;
@@ -778,7 +883,12 @@ mod tests {
 
         let outside_file = outside_root.join("secret.txt");
         fs::write(outside_file.as_path(), b"secret")?;
-        symlink(outside_file.as_path(), source_root.join("leak.txt").as_path())?;
+        if let Err(error) =
+            create_file_symlink(outside_file.as_path(), source_root.join("leak.txt").as_path())
+        {
+            eprintln!("skipping unsupported symlink rejection test: {error}");
+            return Ok(());
+        }
 
         let archive_path = temp.path().join("backup.zip");
         let file = fs::File::create(archive_path.as_path())?;
