@@ -1669,6 +1669,72 @@ async fn browser_service_roundtrip_navigate_and_screenshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_wait_for_requires_requested_selector_and_text() {
+    let runtime = simulated_runtime_for_tests();
+    let service = BrowserServiceImpl { runtime };
+    let created = create_test_session(&service, "user:ops").await;
+    let session_id = created.session_id.expect("session id should be present");
+    let (url, handle) = spawn_static_http_server(
+        200,
+        "<html><body><div id='card-error'>Card declined</div></body></html>",
+    );
+
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url,
+            timeout_ms: 2_000,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should succeed")
+        .into_inner();
+    assert!(navigate.success, "navigation should succeed: {}", navigate.error);
+
+    let missing_text = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            selector: "#card-error".to_owned(),
+            text: "not valid".to_owned(),
+            timeout_ms: 75,
+            poll_interval_ms: 25,
+            capture_failure_screenshot: false,
+            max_failure_screenshot_bytes: 0,
+        }))
+        .await
+        .expect("wait_for should execute")
+        .into_inner();
+    assert!(!missing_text.success, "selector-only match must not satisfy requested text");
+    assert!(missing_text.matched_selector.is_empty());
+    assert!(missing_text.matched_text.is_empty());
+    assert!(missing_text.error.contains("not satisfied"), "{}", missing_text.error);
+
+    let matched = service
+        .wait_for(Request::new(browser_v1::WaitForRequest {
+            v: 1,
+            session_id: Some(session_id),
+            selector: "#card-error".to_owned(),
+            text: "Card declined".to_owned(),
+            timeout_ms: 75,
+            poll_interval_ms: 25,
+            capture_failure_screenshot: false,
+            max_failure_screenshot_bytes: 0,
+        }))
+        .await
+        .expect("wait_for should execute")
+        .into_inner();
+    assert!(matched.success, "selector and text should match: {}", matched.error);
+    assert_eq!(matched.matched_selector, "#card-error");
+    assert_eq!(matched.matched_text, "Card declined");
+
+    handle.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_chromium_engine_executes_real_dom_actions() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;

@@ -6270,9 +6270,8 @@ pub(crate) async fn scroll_with_chromium(
     }
 }
 
-/// Polls the active tab until `selector` matches or the page text contains
-/// `text`, refreshing the tab snapshot on success. The selector match wins
-/// when both conditions hit in the same probe.
+/// Polls the active tab until every requested condition is satisfied,
+/// refreshing the tab snapshot on success.
 pub(crate) async fn wait_for_with_chromium(
     runtime: &BrowserRuntimeState,
     session_id: &str,
@@ -6298,6 +6297,8 @@ pub(crate) async fn wait_for_with_chromium(
     let mut attempts = 0_u32;
     let selector_owned = selector.to_owned();
     let text_owned = text.to_owned();
+    let selector_required = !selector_owned.is_empty();
+    let text_required = !text_owned.trim().is_empty();
     loop {
         attempts = attempts.saturating_add(1);
         let tab_for_attempt = Arc::clone(&tab);
@@ -6328,25 +6329,17 @@ pub(crate) async fn wait_for_with_chromium(
 
         match check {
             Ok((selector_hit, text_hit)) => {
-                if selector_hit {
+                if (!selector_required || selector_hit) && (!text_required || text_hit) {
                     let _ =
                         chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
                     return ChromiumWaitOutcome {
                         success: true,
-                        matched_selector: selector_owned.clone(),
-                        matched_text: String::new(),
-                        attempts,
-                        waited_ms: started.elapsed().as_millis() as u64,
-                        error: String::new(),
-                    };
-                }
-                if text_hit {
-                    let _ =
-                        chromium_refresh_tab_snapshot(runtime, session_id, tab_id.as_str()).await;
-                    return ChromiumWaitOutcome {
-                        success: true,
-                        matched_selector: String::new(),
-                        matched_text: text_owned.clone(),
+                        matched_selector: if selector_hit {
+                            selector_owned.clone()
+                        } else {
+                            String::new()
+                        },
+                        matched_text: if text_hit { text_owned.clone() } else { String::new() },
                         attempts,
                         waited_ms: started.elapsed().as_millis() as u64,
                         error: String::new(),

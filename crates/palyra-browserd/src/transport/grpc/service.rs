@@ -2653,65 +2653,70 @@ impl browser_v1::browser_service_server::BrowserService for BrowserServiceImpl {
             request_timeout_ms(payload.timeout_ms, context.budget.max_action_timeout_ms);
         let poll_interval_ms = payload.poll_interval_ms.clamp(25, 1_000);
         let started_at_unix_ms = current_unix_ms();
-        let (success, matched_selector, matched_text, attempts, waited_ms, error) =
-            match self.runtime.engine_mode {
-                BrowserEngineMode::Simulated => {
-                    let started = Instant::now();
-                    let mut attempts = 0_u32;
-                    let mut matched_selector = String::new();
-                    let mut matched_text = String::new();
-                    let mut success = false;
-                    loop {
-                        attempts = attempts.saturating_add(1);
-                        if !selector.is_empty()
-                            && find_matching_html_tag(selector.as_str(), context.page_body.as_str())
-                                .is_some()
-                        {
+        let selector_required = !selector.is_empty();
+        let text_required = !text.trim().is_empty();
+        let (success, matched_selector, matched_text, attempts, waited_ms, error) = match self
+            .runtime
+            .engine_mode
+        {
+            BrowserEngineMode::Simulated => {
+                let started = Instant::now();
+                let mut attempts = 0_u32;
+                let mut matched_selector = String::new();
+                let mut matched_text = String::new();
+                let mut success = false;
+                loop {
+                    attempts = attempts.saturating_add(1);
+                    let selector_hit = selector_required
+                        && find_matching_html_tag(selector.as_str(), context.page_body.as_str())
+                            .is_some();
+                    let text_hit = text_required && context.page_body.contains(text.as_str());
+                    if (!selector_required || selector_hit) && (!text_required || text_hit) {
+                        if selector_hit {
                             matched_selector = selector.clone();
-                            success = true;
-                            break;
                         }
-                        if !text.trim().is_empty() && context.page_body.contains(text.as_str()) {
+                        if text_hit {
                             matched_text = text.clone();
-                            success = true;
-                            break;
                         }
-                        if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                            break;
-                        }
-                        let remaining_ms =
-                            timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
-                        let sleep_ms = poll_interval_ms.min(remaining_ms.max(1));
-                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                        success = true;
+                        break;
                     }
-                    let waited_ms = started.elapsed().as_millis() as u64;
-                    let error = if success {
-                        String::new()
-                    } else {
-                        "wait_for condition was not satisfied before timeout".to_owned()
-                    };
-                    (success, matched_selector, matched_text, attempts, waited_ms, error)
+                    if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                        break;
+                    }
+                    let remaining_ms =
+                        timeout_ms.saturating_sub(started.elapsed().as_millis() as u64);
+                    let sleep_ms = poll_interval_ms.min(remaining_ms.max(1));
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
-                BrowserEngineMode::Chromium => {
-                    let result = wait_for_with_chromium(
-                        self.runtime.as_ref(),
-                        session_id.as_str(),
-                        selector.as_str(),
-                        text.as_str(),
-                        timeout_ms,
-                        poll_interval_ms,
-                    )
-                    .await;
-                    (
-                        result.success,
-                        result.matched_selector,
-                        result.matched_text,
-                        result.attempts,
-                        result.waited_ms,
-                        result.error,
-                    )
-                }
-            };
+                let waited_ms = started.elapsed().as_millis() as u64;
+                let error = if success {
+                    String::new()
+                } else {
+                    "wait_for condition was not satisfied before timeout".to_owned()
+                };
+                (success, matched_selector, matched_text, attempts, waited_ms, error)
+            }
+            BrowserEngineMode::Chromium => {
+                let result = wait_for_with_chromium(
+                    self.runtime.as_ref(),
+                    session_id.as_str(),
+                    selector.as_str(),
+                    text.as_str(),
+                    timeout_ms,
+                    poll_interval_ms,
+                )
+                .await;
+                (
+                    result.success,
+                    result.matched_selector,
+                    result.matched_text,
+                    result.attempts,
+                    result.waited_ms,
+                    result.error,
+                )
+            }
+        };
 
         let (action_log, failure_screenshot_bytes, failure_screenshot_mime_type) =
             finalize_session_action(
