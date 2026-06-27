@@ -13,6 +13,10 @@ use std::time::Instant;
 use palyra_auth::{AuthCredential, AuthProviderKind};
 use palyra_common::daemon_config_schema::{FileModelProviderConfig, RootFileConfig};
 use palyra_common::redaction::redact_auth_error;
+use palyra_model_providers::{
+    configured_model_ids_by_provider, default_provider_id_for_configured_models,
+    legacy_provider_id_for_file_config_kind, normalized_provider_filter_alias,
+};
 use palyra_vault::{Vault, VaultRef};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
@@ -223,13 +227,14 @@ fn build_console_probe_targets_with_env(
 ) -> Vec<ConsoleProbeTarget> {
     let provider_kind =
         config.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
-    let models_by_provider = registry_model_ids_by_provider(config);
+    let models_by_provider = configured_model_ids_by_provider(config);
     let global_allow_private_base_url =
         effective_global_allow_private_base_url(config, allow_private_env);
 
     if let Some(entries) = config.providers.as_ref() {
         let default_provider_id =
-            default_provider_id_from_config(config, &models_by_provider).map(str::to_owned);
+            default_provider_id_for_configured_models(config, &models_by_provider)
+                .map(str::to_owned);
         return entries
             .iter()
             .map(|entry| {
@@ -273,16 +278,19 @@ fn build_console_probe_targets_with_env(
                     }),
                     configured_model_ids: models_by_provider
                         .iter()
-                        .find(|(candidate, _)| candidate == &provider_id)
-                        .map(|(_, models)| models.clone())
+                        .find(|group| group.provider_id == provider_id)
+                        .map(|group| group.model_ids.clone())
                         .unwrap_or_default(),
                 }
             })
             .collect();
     }
 
-    let provider_id =
-        legacy_provider_id(provider_kind.as_str(), config.auth_provider_kind.as_deref()).to_owned();
+    let provider_id = legacy_provider_id_for_file_config_kind(
+        provider_kind.as_str(),
+        config.auth_provider_kind.as_deref(),
+    )
+    .to_owned();
     vec![ConsoleProbeTarget {
         provider_id: provider_id.clone(),
         kind: provider_kind.clone(),
@@ -295,8 +303,8 @@ fn build_console_probe_targets_with_env(
         vault_ref: vault_ref_for_kind(provider_kind.as_str(), config),
         configured_model_ids: models_by_provider
             .iter()
-            .find(|(candidate, _)| candidate == &provider_id)
-            .map(|(_, models)| models.clone())
+            .find(|group| group.provider_id == provider_id)
+            .map(|group| group.model_ids.clone())
             .unwrap_or_default(),
     }]
 }
@@ -358,56 +366,8 @@ fn overlay_probe_targets_with_runtime_snapshot(
     targets
 }
 
-fn registry_model_ids_by_provider(config: &FileModelProviderConfig) -> Vec<(String, Vec<String>)> {
-    if let Some(entries) = config.models.as_ref() {
-        let mut grouped = Vec::<(String, Vec<String>)>::new();
-        for entry in entries {
-            let provider_id = entry.provider_id.clone().unwrap_or_default();
-            let model_id = entry.model_id.clone().unwrap_or_default();
-            if provider_id.is_empty() || model_id.is_empty() {
-                continue;
-            }
-            if let Some((_, models)) =
-                grouped.iter_mut().find(|(candidate, _)| *candidate == provider_id)
-            {
-                models.push(model_id);
-            } else {
-                grouped.push((provider_id, vec![model_id]));
-            }
-        }
-        return grouped;
-    }
-
-    let kind = config.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
-    let provider_id =
-        legacy_provider_id(kind.as_str(), config.auth_provider_kind.as_deref()).to_owned();
-    let mut models = Vec::new();
-    if let Some(model_id) = config.openai_model.clone().or_else(|| config.anthropic_model.clone()) {
-        models.push(model_id);
-    }
-    if let Some(model_id) = config.openai_embeddings_model.clone() {
-        models.push(model_id);
-    }
-    vec![(provider_id, models)]
-}
-
-fn default_provider_id_from_config<'a>(
-    config: &FileModelProviderConfig,
-    models_by_provider: &'a [(String, Vec<String>)],
-) -> Option<&'a str> {
-    let default_model_id = config
-        .default_chat_model_id
-        .as_deref()
-        .or(config.openai_model.as_deref())
-        .or(config.anthropic_model.as_deref());
-    let default_model_id = default_model_id?;
-    models_by_provider.iter().find_map(|(provider_id, models)| {
-        models.iter().any(|model_id| model_id == default_model_id).then_some(provider_id.as_str())
-    })
-}
-
 fn provider_matches_filter(target: &ConsoleProbeTarget, filter: &str) -> bool {
-    let normalized_filter = normalize_provider_filter_alias(filter);
+    let normalized_filter = normalized_provider_filter_alias(filter);
     [
         Some(target.provider_id.as_str()),
         Some(target.kind.as_str()),
@@ -415,39 +375,7 @@ fn provider_matches_filter(target: &ConsoleProbeTarget, filter: &str) -> bool {
     ]
     .into_iter()
     .flatten()
-    .any(|candidate| normalize_provider_filter_alias(candidate) == normalized_filter)
-}
-
-fn normalize_provider_filter_alias(raw: &str) -> String {
-    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
-    match normalized.as_str() {
-        "x_ai" | "grok" => "xai".to_owned(),
-        "open_router" => "openrouter".to_owned(),
-        "gemini" => "google_gemini".to_owned(),
-        "gemini_cli" => "google_gemini_cli".to_owned(),
-        _ => normalized,
-    }
-}
-
-fn legacy_provider_id(provider_kind: &str, auth_provider_kind: Option<&str>) -> &'static str {
-    if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
-        if let Some(auth_provider_kind) = auth_provider_kind {
-            let normalized_auth_kind = normalize_provider_filter_alias(auth_provider_kind);
-            match normalized_auth_kind.as_str() {
-                "xai" | "grok" => return "xai-primary",
-                "google_gemini" | "google_gemini_cli" | "gemini" | "gemini_cli" => {
-                    return "google-gemini-primary";
-                }
-                "openrouter" | "open_router" => return "openrouter-primary",
-                _ => {}
-            }
-        }
-    }
-    match provider_kind {
-        OPENAI_COMPATIBLE_PROVIDER_KIND => "openai-primary",
-        ANTHROPIC_PROVIDER_KIND => "anthropic-primary",
-        _ => "deterministic-primary",
-    }
+    .any(|candidate| normalized_provider_filter_alias(candidate) == normalized_filter)
 }
 
 fn default_base_url_for_kind(kind: &str, config: &FileModelProviderConfig) -> Option<String> {
@@ -1082,6 +1010,31 @@ mod tests {
         assert_eq!(targets[0].auth_profile_provider_kind.as_deref(), Some("xai"));
         assert!(provider_matches_filter(&targets[0], "xai"));
         assert!(provider_matches_filter(&targets[0], "grok"));
+    }
+
+    #[test]
+    fn console_probe_targets_include_synthesized_registry_default_model() {
+        let config = FileModelProviderConfig {
+            kind: Some(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
+            auth_profile_id: Some("chatgpt-login-test".to_owned()),
+            auth_provider_kind: Some("openai".to_owned()),
+            providers: Some(vec![FileModelProviderRegistryEntry {
+                provider_id: Some("openai-primary".to_owned()),
+                display_name: Some("ChatGPT Login".to_owned()),
+                kind: Some(OPENAI_COMPATIBLE_PROVIDER_KIND.to_owned()),
+                base_url: Some(OPENAI_CODEX_BACKEND_BASE_URL.to_owned()),
+                ..FileModelProviderRegistryEntry::default()
+            }]),
+            default_chat_model_id: Some("gpt-5.5".to_owned()),
+            ..FileModelProviderConfig::default()
+        };
+
+        let targets = build_console_probe_targets_with_env(&config, None);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider_id, "openai-primary");
+        assert_eq!(targets[0].auth_profile_id.as_deref(), Some("chatgpt-login-test"));
+        assert_eq!(targets[0].configured_model_ids, vec!["gpt-5.5".to_owned()]);
     }
 
     #[test]

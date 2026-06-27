@@ -16,10 +16,13 @@ mod redaction;
 
 pub use config::{
     capability_defaults_for_kind, capability_defaults_for_provider, configured_model_id,
+    configured_model_ids_by_provider, default_provider_id_for_configured_models,
+    legacy_provider_id_for_file_config_kind, legacy_provider_identity_for_file_config_kind,
+    normalized_provider_filter_alias, preserved_unresolved_default_chat_model_for_provider,
     validate_model_provider_config, validate_openai_base_url_network_policy,
-    validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
-    ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
-    ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
+    validate_openai_base_url_network_policy_with_resolver, ConfiguredProviderModelIds,
+    ModelProviderAuthProviderKind, ModelProviderConfig, ModelProviderCredentialSource,
+    ModelProviderKind, ModelProviderRegistryConfig, ProviderCapabilitiesSnapshot, ProviderCostTier,
     ProviderLatencyTier, ProviderMetadataSource, ProviderModelEntryConfig, ProviderModelRole,
     ProviderRegistryEntryConfig, DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
     DEFAULT_PROVIDER_DISCOVERY_TTL_MS, DEFAULT_PROVIDER_HEALTH_TTL_MS,

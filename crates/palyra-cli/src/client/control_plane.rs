@@ -6,9 +6,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use palyra_control_plane::{ConsoleLoginRequest, ControlPlaneClient, ControlPlaneClientConfig};
+use palyra_control_plane::{
+    ConsoleLoginRequest, ControlPlaneClient, ControlPlaneClientConfig, ControlPlaneClientError,
+};
 
 use crate::app;
+
+const ADMIN_LOGIN_RATE_LIMIT_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_millis(100), Duration::from_millis(250), Duration::from_millis(500)];
 
 /// A control-plane client that already holds an authenticated console session.
 pub(crate) struct AdminConsoleContext {
@@ -46,14 +51,65 @@ pub(crate) async fn connect_admin_console_with_request_timeout(
     }
     let mut client = ControlPlaneClient::new(config)
         .context("failed to initialize control-plane HTTP client")?;
-    client
-        .login(&ConsoleLoginRequest {
-            admin_token: connection.token.clone(),
-            principal: connection.principal.clone(),
-            device_id: connection.device_id.clone(),
-            channel: Some(connection.channel.clone()),
-        })
+    let login_request = ConsoleLoginRequest {
+        admin_token: connection.token.clone(),
+        principal: connection.principal.clone(),
+        device_id: connection.device_id.clone(),
+        channel: Some(connection.channel.clone()),
+    };
+    login_admin_console_with_rate_limit_retry(&mut client, &login_request)
         .await
         .context("failed to establish authenticated console session")?;
     Ok(AdminConsoleContext { client })
+}
+
+async fn login_admin_console_with_rate_limit_retry(
+    client: &mut ControlPlaneClient,
+    request: &ConsoleLoginRequest,
+) -> Result<(), ControlPlaneClientError> {
+    for delay in ADMIN_LOGIN_RATE_LIMIT_RETRY_DELAYS {
+        match client.login(request).await {
+            Ok(_) => return Ok(()),
+            Err(error) if control_plane_login_error_is_rate_limited(&error) => {
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    client.login(request).await.map(|_| ())
+}
+
+fn control_plane_login_error_is_rate_limited(error: &ControlPlaneClientError) -> bool {
+    matches!(error, ControlPlaneClientError::Http { status: 429, .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use palyra_control_plane::{ControlPlaneClientError, ErrorCategory, ErrorEnvelope};
+
+    use super::control_plane_login_error_is_rate_limited;
+
+    #[test]
+    fn control_plane_login_retry_is_limited_to_http_429() {
+        let rate_limited = ControlPlaneClientError::Http {
+            status: 429,
+            message: "admin API rate limit exceeded for 127.0.0.1".to_owned(),
+            envelope: Some(ErrorEnvelope {
+                error: "admin API rate limit exceeded for 127.0.0.1".to_owned(),
+                code: "rate_limited".to_owned(),
+                category: ErrorCategory::Availability,
+                retryable: true,
+                redacted: false,
+                validation_errors: Vec::new(),
+            }),
+        };
+        let unauthorized = ControlPlaneClientError::Http {
+            status: 401,
+            message: "unauthorized".to_owned(),
+            envelope: None,
+        };
+
+        assert!(control_plane_login_error_is_rate_limited(&rate_limited));
+        assert!(!control_plane_login_error_is_rate_limited(&unauthorized));
+    }
 }

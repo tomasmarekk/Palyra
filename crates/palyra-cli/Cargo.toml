@@ -27,6 +27,7 @@ palyra-common = { version = "0.1.0", path = "../palyra-common" }
 palyra-control-plane = { version = "0.1.0", path = "../palyra-control-plane" }
 palyra-connectors = { version = "0.1.0", path = "../palyra-connectors" }
 palyra-identity = { version = "0.1.0", path = "../palyra-identity" }
+palyra-model-providers = { version = "0.1.0", path = "../palyra-model-providers" }
 palyra-policy = { version = "0.1.0", path = "../palyra-policy" }
 palyra-skills = { version = "0.1.0", path = "../palyra-skills" }
 palyra-vault = { version = "0.1.0", path = "../palyra-vault" }

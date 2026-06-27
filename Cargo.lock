@@ -2964,6 +2964,7 @@ dependencies = [
  "palyra-connectors",
  "palyra-control-plane",
  "palyra-identity",
+ "palyra-model-providers",
  "palyra-policy",
  "palyra-skills",
  "palyra-vault",

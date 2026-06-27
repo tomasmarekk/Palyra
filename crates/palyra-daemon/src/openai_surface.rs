@@ -21,6 +21,8 @@ use crate::openai_model_discovery::{
     discover_preferred_openai_chatgpt_codex_model_id,
     discover_preferred_openai_compatible_model_id,
 };
+use palyra_common::daemon_config_schema::FileModelProviderConfig;
+use palyra_model_providers::preserved_unresolved_default_chat_model_for_provider;
 
 const OPENAI_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTHROPIC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3928,23 +3930,32 @@ fn apply_openai_provider_selection_defaults(
                 "model_provider.openai_base_url",
                 OPENAI_CHATGPT_CODEX_BASE_URL,
             )?;
-            apply_discovered_or_clear_text_model_selection(
-                document,
-                "model_provider.openai_model",
-                discovered_model_id,
-                true,
-            )?;
-            if !discovered_model_present {
-                write_pending_model_registry(
+            let provider = PendingModelRegistryProvider {
+                provider_id: "openai-primary",
+                display_name: "ChatGPT Login",
+                kind: "openai_compatible",
+                base_url: OPENAI_CHATGPT_CODEX_BASE_URL,
+                auth_provider_kind: "openai",
+            };
+            let model_provider_config = file_model_provider_config_from_document(document)?;
+            if let Some(model_id) = preserved_unresolved_default_chat_model_for_provider(
+                &model_provider_config,
+                provider.provider_id,
+                discovered_model_present,
+            ) {
+                // Operator-selected registry defaults come from `models set --allow-custom`;
+                // keep them when ChatGPT live discovery is unavailable.
+                preserve_provider_registry_default_model(document, provider, model_id.as_str())?;
+            } else {
+                apply_discovered_or_clear_text_model_selection(
                     document,
-                    PendingModelRegistryProvider {
-                        provider_id: "openai-primary",
-                        display_name: "ChatGPT Login",
-                        kind: "openai_compatible",
-                        base_url: OPENAI_CHATGPT_CODEX_BASE_URL,
-                        auth_provider_kind: "openai",
-                    },
+                    "model_provider.openai_model",
+                    discovered_model_id,
+                    true,
                 )?;
+                if !discovered_model_present {
+                    write_pending_model_registry(document, provider)?;
+                }
             }
         }
         OpenAiProviderSelectionRuntime::OpenAiCompatible
@@ -4040,6 +4051,20 @@ fn document_string_value_at_path<'a>(document: &'a toml::Value, path: &str) -> O
 }
 
 #[allow(clippy::result_large_err)]
+fn file_model_provider_config_from_document(
+    document: &toml::Value,
+) -> Result<FileModelProviderConfig, Response> {
+    let Some(model_provider) = get_value_at_path(document, "model_provider").ok().flatten() else {
+        return Ok(FileModelProviderConfig::default());
+    };
+    model_provider.clone().try_into().map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "invalid model_provider config schema: {error}"
+        )))
+    })
+}
+
+#[allow(clippy::result_large_err)]
 fn apply_discovered_or_clear_text_model_selection(
     document: &mut toml::Value,
     model_path: &str,
@@ -4058,6 +4083,7 @@ fn apply_discovered_or_clear_text_model_selection(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 struct PendingModelRegistryProvider<'a> {
     provider_id: &'a str,
     display_name: &'a str,
@@ -4067,7 +4093,7 @@ struct PendingModelRegistryProvider<'a> {
 }
 
 #[allow(clippy::result_large_err)]
-fn write_pending_model_registry(
+fn set_single_model_registry_provider(
     document: &mut toml::Value,
     provider: PendingModelRegistryProvider<'_>,
 ) -> Result<(), Response> {
@@ -4090,9 +4116,29 @@ fn write_pending_model_registry(
         runtime_status_response(tonic::Status::invalid_argument(format!(
             "failed to set model_provider.providers: {error}"
         )))
-    })?;
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn write_pending_model_registry(
+    document: &mut toml::Value,
+    provider: PendingModelRegistryProvider<'_>,
+) -> Result<(), Response> {
+    set_single_model_registry_provider(document, provider)?;
     unset_model_value_at_path(document, "model_provider.models")?;
     unset_model_value_at_path(document, "model_provider.default_chat_model_id")
+}
+
+#[allow(clippy::result_large_err)]
+fn preserve_provider_registry_default_model(
+    document: &mut toml::Value,
+    provider: PendingModelRegistryProvider<'_>,
+    model_id: &str,
+) -> Result<(), Response> {
+    set_single_model_registry_provider(document, provider)?;
+    unset_model_value_at_path(document, "model_provider.models")?;
+    set_string_value_at_path(document, "model_provider.default_chat_model_id", model_id)?;
+    unset_model_value_at_path(document, "model_provider.openai_model")
 }
 
 #[allow(clippy::result_large_err)]
@@ -5083,6 +5129,55 @@ mod tests {
                 .and_then(toml::Value::as_array)
                 .is_some_and(|providers| !providers.is_empty()),
             "missing discovery should leave an explicit pending provider registry"
+        );
+    }
+
+    #[test]
+    fn chatgpt_selection_defaults_preserve_registry_default_model_without_discovery() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            kind = "openai_compatible"
+            auth_provider_kind = "openai"
+            openai_base_url = "https://chatgpt.com/backend-api/codex"
+            openai_model = "stale-provider-model"
+            default_chat_model_id = "gpt-5.5"
+
+            [[model_provider.providers]]
+            provider_id = "openai-primary"
+            display_name = "ChatGPT Login"
+            kind = "openai_compatible"
+            base_url = "https://chatgpt.com/backend-api/codex"
+            auth_provider_kind = "openai"
+            enabled = true
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_openai_provider_selection_defaults(
+            &mut document,
+            Some(ModelProviderAuthProviderKind::Openai),
+            OpenAiProviderSelectionRuntime::ChatGptCodex,
+            None,
+        )
+        .expect("ChatGPT selection defaults should preserve custom registry default");
+
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_base_url"),
+            Some(OPENAI_CHATGPT_CODEX_BASE_URL)
+        );
+        assert_eq!(document_string_value_at_path(&document, "model_provider.openai_model"), None);
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.default_chat_model_id"),
+            Some("gpt-5.5")
+        );
+        assert!(
+            get_value_at_path(&document, "model_provider.providers")
+                .ok()
+                .flatten()
+                .and_then(toml::Value::as_array)
+                .is_some_and(|providers| providers.len() == 1),
+            "selection should keep an explicit ChatGPT provider registry"
         );
     }
 

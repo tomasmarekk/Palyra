@@ -26,7 +26,7 @@ impl RuntimeConfigReloadOutcome {
             active_runs: None,
             applied_steps: 0,
             skipped_steps: 0,
-            requires_restart: None,
+            requires_restart: Some(true),
         }
     }
 
@@ -103,4 +103,19 @@ async fn apply_active_config_reload(path: Option<String>) -> Result<RuntimeConfi
 fn sanitize_reload_error(error: anyhow::Error) -> String {
     let raw = error.to_string();
     redact_auth_error(redact_url_segments_in_text(raw.as_str()).as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeConfigReloadOutcome;
+
+    #[test]
+    fn unavailable_reload_marks_restart_required() {
+        let outcome = RuntimeConfigReloadOutcome::unavailable(anyhow::anyhow!(
+            "failed to establish authenticated console session"
+        ));
+
+        assert_eq!(outcome.reload_state, "unavailable");
+        assert_eq!(outcome.requires_restart, Some(true));
+    }
 }

@@ -9,6 +9,10 @@ use crate::*;
 use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
 use palyra_common::redaction::redact_auth_error;
+use palyra_model_providers::{
+    legacy_provider_identity_for_file_config_kind, model_id_supports_reasoning_effort,
+    normalized_provider_filter_alias,
+};
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
@@ -1129,7 +1133,7 @@ fn run_provider_checks_local(
 }
 
 fn provider_matches_filter(provider: &ProbeableProvider, filter: &str) -> bool {
-    let normalized_filter = normalize_provider_filter_alias(filter);
+    let normalized_filter = normalized_provider_filter_alias(filter);
     [
         Some(provider.provider_id.as_str()),
         Some(provider.kind.as_str()),
@@ -1137,11 +1141,7 @@ fn provider_matches_filter(provider: &ProbeableProvider, filter: &str) -> bool {
     ]
     .into_iter()
     .flatten()
-    .any(|candidate| normalize_provider_filter_alias(candidate) == normalized_filter)
-}
-
-fn normalize_provider_filter_alias(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase().replace('-', "_")
+    .any(|candidate| normalized_provider_filter_alias(candidate) == normalized_filter)
 }
 
 fn explain_models_routing(
@@ -2044,16 +2044,6 @@ fn provider_for_synthetic_default_model<'a>(
         .or_else(|| enabled_providers.first().copied())
 }
 
-fn model_id_supports_reasoning_effort(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    let model = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    matches!(model, "o1" | "o1-mini" | "o1-pro" | "o3" | "o3-mini" | "o3-pro" | "o4-mini")
-        || model.starts_with("o1-")
-        || model.starts_with("o3-")
-        || model.starts_with("o4-")
-        || model.starts_with("gpt-5")
-}
-
 fn default_reasoning_efforts() -> Vec<String> {
     ["none", "minimal", "low", "medium", "high", "xhigh"]
         .into_iter()
@@ -2307,39 +2297,7 @@ fn legacy_provider_identity(
     provider_kind: &str,
     auth_provider_kind: Option<&str>,
 ) -> (&'static str, &'static str) {
-    if provider_kind == ANTHROPIC_PROVIDER_KIND
-        && auth_provider_kind
-            .is_some_and(|kind| kind.eq_ignore_ascii_case(MINIMAX_AUTH_PROVIDER_KIND))
-    {
-        return ("minimax-primary", "MiniMax");
-    }
-    if provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND {
-        if let Some(auth_provider_kind) = auth_provider_kind {
-            if auth_provider_kind.eq_ignore_ascii_case("xai")
-                || auth_provider_kind.eq_ignore_ascii_case("x-ai")
-                || auth_provider_kind.eq_ignore_ascii_case("grok")
-            {
-                return ("xai-primary", "xAI (Grok)");
-            }
-            if auth_provider_kind.eq_ignore_ascii_case("google_gemini")
-                || auth_provider_kind.eq_ignore_ascii_case("google-gemini")
-                || auth_provider_kind.eq_ignore_ascii_case("google_gemini_cli")
-                || auth_provider_kind.eq_ignore_ascii_case("google-gemini-cli")
-            {
-                return ("google-gemini-primary", "Google Gemini");
-            }
-            if auth_provider_kind.eq_ignore_ascii_case("openrouter")
-                || auth_provider_kind.eq_ignore_ascii_case("open-router")
-            {
-                return ("openrouter-primary", "OpenRouter");
-            }
-        }
-    }
-    match provider_kind {
-        OPENAI_COMPATIBLE_PROVIDER_KIND => ("openai-primary", "OpenAI-compatible"),
-        ANTHROPIC_PROVIDER_KIND => ("anthropic-primary", "Anthropic"),
-        _ => ("deterministic-primary", "Deterministic"),
-    }
+    legacy_provider_identity_for_file_config_kind(provider_kind, auth_provider_kind)
 }
 
 fn provider_display_name(provider: &RegistryProviderEntry) -> String {

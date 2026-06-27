@@ -6,7 +6,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use palyra_common::secret_refs::SecretRef;
+use palyra_common::{
+    daemon_config_schema::{
+        FileModelProviderConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
+    },
+    secret_refs::SecretRef,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::{
@@ -465,6 +470,264 @@ pub fn configured_model_id(raw: &str) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+/// Configured model ids grouped by the provider id that should serve them.
+///
+/// This is the file-config view used by CLI and console probes before the full
+/// daemon config loader expands capability metadata into a normalized runtime
+/// registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredProviderModelIds {
+    /// Provider id that owns the listed configured model ids.
+    pub provider_id: String,
+    /// Configured model ids assigned to `provider_id`.
+    pub model_ids: Vec<String>,
+}
+
+/// Returns configured chat/embeddings model ids grouped by provider id.
+///
+/// Registry defaults are included even when no explicit
+/// `[[model_provider.models]]` entry exists, matching the normalized registry
+/// behavior that synthesizes default model entries for a single enabled
+/// provider.
+#[must_use]
+pub fn configured_model_ids_by_provider(
+    config: &FileModelProviderConfig,
+) -> Vec<ConfiguredProviderModelIds> {
+    let mut grouped = if let Some(entries) = config.models.as_ref() {
+        let mut grouped = Vec::<ConfiguredProviderModelIds>::new();
+        for entry in entries {
+            let Some(provider_id) = entry.provider_id.as_deref().and_then(configured_model_id)
+            else {
+                continue;
+            };
+            let Some(model_id) = entry.model_id.as_deref().and_then(configured_model_id) else {
+                continue;
+            };
+            push_configured_model_id(&mut grouped, provider_id, model_id);
+        }
+        grouped
+    } else if config.providers.is_some() {
+        Vec::new()
+    } else {
+        let kind = config
+            .kind
+            .as_deref()
+            .and_then(configured_model_id)
+            .unwrap_or(ModelProviderKind::Deterministic.as_str());
+        let provider_id =
+            legacy_provider_id_for_file_config_kind(kind, config.auth_provider_kind.as_deref());
+        let mut model_ids = Vec::new();
+        if let Some(model_id) = config
+            .openai_model
+            .as_deref()
+            .or(config.anthropic_model.as_deref())
+            .and_then(configured_model_id)
+        {
+            model_ids.push(model_id.to_owned());
+        }
+        if let Some(model_id) =
+            config.openai_embeddings_model.as_deref().and_then(configured_model_id)
+        {
+            model_ids.push(model_id.to_owned());
+        }
+        vec![ConfiguredProviderModelIds { provider_id: provider_id.to_owned(), model_ids }]
+    };
+    append_default_model_ids_by_provider(config, &mut grouped);
+    grouped
+}
+
+/// Returns the provider id that owns the configured default chat model.
+#[must_use]
+pub fn default_provider_id_for_configured_models<'a>(
+    config: &FileModelProviderConfig,
+    models_by_provider: &'a [ConfiguredProviderModelIds],
+) -> Option<&'a str> {
+    let default_model_id = config
+        .default_chat_model_id
+        .as_deref()
+        .or(config.openai_model.as_deref())
+        .or(config.anthropic_model.as_deref())
+        .and_then(configured_model_id)?;
+    models_by_provider.iter().find_map(|group| {
+        group
+            .model_ids
+            .iter()
+            .any(|model_id| model_id == default_model_id)
+            .then_some(group.provider_id.as_str())
+    })
+}
+
+/// Returns a registry default chat model that should survive provider
+/// selection when discovery did not produce a concrete model id.
+///
+/// A default can be preserved only when it is already assigned to `provider_id`
+/// by an explicit model entry or when the registry has exactly one enabled
+/// provider, allowing the normalizer to synthesize the missing model entry.
+#[must_use]
+pub fn preserved_unresolved_default_chat_model_for_provider(
+    config: &FileModelProviderConfig,
+    provider_id: &str,
+    discovered_model_present: bool,
+) -> Option<String> {
+    if discovered_model_present {
+        return None;
+    }
+    let model_id = config.default_chat_model_id.as_deref().and_then(configured_model_id)?;
+    if registry_model_entry_matches_provider(config.models.as_deref(), provider_id, model_id)
+        || registry_has_single_enabled_provider(config.providers.as_deref(), provider_id)
+    {
+        return Some(model_id.to_owned());
+    }
+    None
+}
+
+/// Returns the provider id used when a legacy file config is projected into a
+/// single-provider registry.
+#[must_use]
+pub fn legacy_provider_id_for_file_config_kind(
+    provider_kind: &str,
+    auth_provider_kind: Option<&str>,
+) -> &'static str {
+    let provider_kind = parse_file_config_provider_kind(provider_kind);
+    let auth_provider_kind = auth_provider_kind.and_then(parse_file_config_auth_provider_kind);
+    crate::providers::legacy_provider_id(provider_kind, auth_provider_kind)
+}
+
+/// Returns the provider id and display name used for a legacy file-config
+/// provider.
+#[must_use]
+pub fn legacy_provider_identity_for_file_config_kind(
+    provider_kind: &str,
+    auth_provider_kind: Option<&str>,
+) -> (&'static str, &'static str) {
+    let provider_kind = parse_file_config_provider_kind(provider_kind);
+    let auth_provider_kind = auth_provider_kind.and_then(parse_file_config_auth_provider_kind);
+    (
+        crate::providers::legacy_provider_id(provider_kind, auth_provider_kind),
+        crate::providers::legacy_display_name(provider_kind, auth_provider_kind),
+    )
+}
+
+/// Canonicalizes provider filter aliases accepted by operator surfaces.
+#[must_use]
+pub fn normalized_provider_filter_alias(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "x_ai" | "grok" => "xai".to_owned(),
+        "open_router" => "openrouter".to_owned(),
+        "gemini" => "google_gemini".to_owned(),
+        "gemini_cli" => "google_gemini_cli".to_owned(),
+        _ => normalized,
+    }
+}
+
+fn push_configured_model_id(
+    grouped: &mut Vec<ConfiguredProviderModelIds>,
+    provider_id: &str,
+    model_id: &str,
+) {
+    if let Some(group) = grouped.iter_mut().find(|group| group.provider_id == provider_id) {
+        if !group.model_ids.iter().any(|existing| existing == model_id) {
+            group.model_ids.push(model_id.to_owned());
+        }
+        return;
+    }
+    grouped.push(ConfiguredProviderModelIds {
+        provider_id: provider_id.to_owned(),
+        model_ids: vec![model_id.to_owned()],
+    });
+}
+
+fn append_default_model_ids_by_provider(
+    config: &FileModelProviderConfig,
+    grouped: &mut Vec<ConfiguredProviderModelIds>,
+) {
+    for model_id in
+        [config.default_chat_model_id.as_deref(), config.default_embeddings_model_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(configured_model_id)
+    {
+        if grouped.iter().any(|group| group.model_ids.iter().any(|existing| existing == model_id)) {
+            continue;
+        }
+        let Some(provider_id) = default_model_provider_id(config, grouped, model_id) else {
+            continue;
+        };
+        push_configured_model_id(grouped, provider_id.as_str(), model_id);
+    }
+}
+
+fn default_model_provider_id(
+    config: &FileModelProviderConfig,
+    grouped: &[ConfiguredProviderModelIds],
+    model_id: &str,
+) -> Option<String> {
+    grouped
+        .iter()
+        .find_map(|group| {
+            group
+                .model_ids
+                .iter()
+                .any(|candidate| candidate == model_id)
+                .then(|| group.provider_id.clone())
+        })
+        .or_else(|| single_enabled_registry_provider_id(config.providers.as_deref()))
+}
+
+fn registry_model_entry_matches_provider(
+    models: Option<&[FileModelProviderRegistryModel]>,
+    provider_id: &str,
+    model_id: &str,
+) -> bool {
+    models.is_some_and(|models| {
+        models.iter().any(|entry| {
+            entry.model_id.as_deref().and_then(configured_model_id) == Some(model_id)
+                && entry.provider_id.as_deref().and_then(configured_model_id) == Some(provider_id)
+                && entry
+                    .role
+                    .as_deref()
+                    .and_then(configured_model_id)
+                    .is_none_or(|role| role.eq_ignore_ascii_case(ProviderModelRole::Chat.as_str()))
+                && entry.enabled.unwrap_or(true)
+        })
+    })
+}
+
+fn registry_has_single_enabled_provider(
+    providers: Option<&[FileModelProviderRegistryEntry]>,
+    provider_id: &str,
+) -> bool {
+    single_enabled_registry_provider_id(providers).as_deref() == Some(provider_id)
+}
+
+fn single_enabled_registry_provider_id(
+    providers: Option<&[FileModelProviderRegistryEntry]>,
+) -> Option<String> {
+    let mut enabled_provider_id = None;
+    for provider in providers? {
+        if !provider.enabled.unwrap_or(true) {
+            continue;
+        }
+        let Some(provider_id) = provider.provider_id.as_deref().and_then(configured_model_id)
+        else {
+            continue;
+        };
+        if enabled_provider_id.replace(provider_id.to_owned()).is_some() {
+            return None;
+        }
+    }
+    enabled_provider_id
+}
+
+fn parse_file_config_provider_kind(raw: &str) -> ModelProviderKind {
+    ModelProviderKind::parse(raw).unwrap_or(ModelProviderKind::Deterministic)
+}
+
+fn parse_file_config_auth_provider_kind(raw: &str) -> Option<ModelProviderAuthProviderKind> {
+    ModelProviderAuthProviderKind::parse(raw).ok()
 }
 
 // Synthesizes a one-provider registry from the legacy flat config fields so
@@ -959,7 +1222,12 @@ fn is_localhost_hostname(host: &str) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use palyra_common::daemon_config_schema::{
+        FileModelProviderConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
+    };
+
     use super::{
+        configured_model_ids_by_provider, preserved_unresolved_default_chat_model_for_provider,
         validate_openai_base_url_network_policy_with_resolver, ModelProviderAuthProviderKind,
         ModelProviderConfig, ModelProviderKind,
     };
@@ -997,6 +1265,80 @@ mod tests {
             Some(ModelProviderAuthProviderKind::Minimax)
         );
         assert!(!registry.models[0].capabilities.vision);
+    }
+
+    #[test]
+    fn configured_model_ids_include_single_provider_registry_default() {
+        let config = FileModelProviderConfig {
+            providers: Some(vec![FileModelProviderRegistryEntry {
+                provider_id: Some("openai-primary".to_owned()),
+                kind: Some("openai_compatible".to_owned()),
+                enabled: Some(true),
+                ..FileModelProviderRegistryEntry::default()
+            }]),
+            default_chat_model_id: Some("gpt-5.5".to_owned()),
+            ..FileModelProviderConfig::default()
+        };
+
+        let grouped = configured_model_ids_by_provider(&config);
+
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].provider_id, "openai-primary");
+        assert_eq!(grouped[0].model_ids, vec!["gpt-5.5".to_owned()]);
+    }
+
+    #[test]
+    fn unresolved_default_chat_model_preserves_only_matching_provider() {
+        let matching = FileModelProviderConfig {
+            providers: Some(vec![FileModelProviderRegistryEntry {
+                provider_id: Some("openai-primary".to_owned()),
+                enabled: Some(true),
+                ..FileModelProviderRegistryEntry::default()
+            }]),
+            models: Some(vec![FileModelProviderRegistryModel {
+                model_id: Some("gpt-5.5".to_owned()),
+                provider_id: Some("openai-primary".to_owned()),
+                role: Some("chat".to_owned()),
+                enabled: Some(true),
+                ..FileModelProviderRegistryModel::default()
+            }]),
+            default_chat_model_id: Some("gpt-5.5".to_owned()),
+            ..FileModelProviderConfig::default()
+        };
+        let mismatched = FileModelProviderConfig {
+            providers: Some(vec![
+                FileModelProviderRegistryEntry {
+                    provider_id: Some("openai-primary".to_owned()),
+                    enabled: Some(true),
+                    ..FileModelProviderRegistryEntry::default()
+                },
+                FileModelProviderRegistryEntry {
+                    provider_id: Some("xai-primary".to_owned()),
+                    enabled: Some(true),
+                    ..FileModelProviderRegistryEntry::default()
+                },
+            ]),
+            default_chat_model_id: Some("gpt-5.5".to_owned()),
+            ..FileModelProviderConfig::default()
+        };
+
+        assert_eq!(
+            preserved_unresolved_default_chat_model_for_provider(
+                &matching,
+                "openai-primary",
+                false
+            )
+            .as_deref(),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            preserved_unresolved_default_chat_model_for_provider(
+                &mismatched,
+                "openai-primary",
+                false
+            ),
+            None
+        );
     }
 
     #[test]
