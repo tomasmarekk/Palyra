@@ -1461,11 +1461,68 @@ fn process_output_looks_binary(output: &[u8]) -> bool {
     if output.contains(&0) {
         return true;
     }
-    let control_bytes = output
-        .iter()
-        .filter(|byte| matches!(**byte, 0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f))
-        .count();
+    let control_bytes = non_terminal_control_byte_count(output);
     control_bytes > 8 && control_bytes.saturating_mul(100) > output.len()
+}
+
+fn non_terminal_control_byte_count(output: &[u8]) -> usize {
+    let mut index = 0usize;
+    let mut count = 0usize;
+    while index < output.len() {
+        if output[index] == 0x1b {
+            if let Some(sequence_len) = ansi_escape_sequence_len(&output[index..]) {
+                index = index.saturating_add(sequence_len);
+                continue;
+            }
+        }
+        if matches!(output[index], 0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f) {
+            count = count.saturating_add(1);
+        }
+        index = index.saturating_add(1);
+    }
+    count
+}
+
+fn ansi_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 2 || bytes[0] != 0x1b {
+        return None;
+    }
+    match bytes[1] {
+        b'[' => csi_escape_sequence_len(bytes),
+        b']' => osc_escape_sequence_len(bytes),
+        b'(' | b')' | b'*' | b'+' => (bytes.len() >= 3).then_some(3),
+        b'7' | b'8' | b'c' | b'D' | b'E' | b'H' | b'M' => Some(2),
+        _ => None,
+    }
+}
+
+fn csi_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
+    let max_len = bytes.len().min(64);
+    for index in 2..max_len {
+        let byte = bytes[index];
+        if (0x40..=0x7e).contains(&byte) {
+            return Some(index + 1);
+        }
+        if !(0x20..=0x3f).contains(&byte) {
+            return None;
+        }
+    }
+    None
+}
+
+fn osc_escape_sequence_len(bytes: &[u8]) -> Option<usize> {
+    let max_len = bytes.len().min(1024);
+    let mut index = 2usize;
+    while index < max_len {
+        if bytes[index] == 0x07 {
+            return Some(index + 1);
+        }
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+            return Some(index + 2);
+        }
+        index = index.saturating_add(1);
+    }
+    None
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -12205,6 +12262,43 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .is_some_and(|value| value.starts_with("7f454c4600010203040506070809")),
             "binary summary should expose hex metadata without raw control escapes"
+        );
+    }
+
+    #[test]
+    fn process_success_output_preserves_ansi_stdout_as_text() {
+        let ansi_table =
+            "\r\n\x1b[32;1mName\x1b[0m            \x1b[32;1mMode\x1b[0m\r\nsrc             d----\r\n"
+                .repeat(24);
+        let stdout =
+            StreamCapture { bytes: ansi_table.into_bytes(), truncated: false, read_error: None };
+        let stderr = StreamCapture::default();
+
+        let output = process_success_output_json(
+            0,
+            &stdout,
+            &stderr,
+            11,
+            "b",
+            "tier_b_in_process",
+            &empty_process_risk_report(),
+        )
+        .expect("process output should serialize");
+        let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.as_slice()).expect("output should parse");
+        let stdout = parsed["stdout"].as_str().expect("stdout should be string");
+
+        assert!(!rendered.contains("binary stdout omitted"), "{rendered}");
+        assert!(stdout.contains("Name"), "{stdout}");
+        assert_eq!(parsed.pointer("/streams/stdout/binary").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            parsed.pointer("/streams/stdout/binary_output_omitted").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            parsed.pointer("/streams/stdout/encoding").and_then(|v| v.as_str()),
+            Some("utf-8")
         );
     }
 
