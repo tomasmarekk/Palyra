@@ -947,11 +947,13 @@ fn apply_local_desktop_tool_defaults(
         "tool_call.execution_timeout_ms",
         toml::Value::Integer(LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS),
     )?;
-    set_value_at_path(
-        document,
-        "tool_call.http_fetch.allowed_credential_vault_refs",
-        string_array_value(LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS),
-    )?;
+    if !LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS.is_empty() {
+        set_value_at_path(
+            document,
+            "tool_call.http_fetch.allowed_credential_vault_refs",
+            string_array_value(LOCAL_DESKTOP_DEFAULT_HTTP_FETCH_CREDENTIAL_VAULT_REFS),
+        )?;
+    }
     set_value_at_path(document, "tool_call.process_runner.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(document, "tool_call.wasm_runtime.enabled", toml::Value::Boolean(true))?;
     set_value_at_path(
@@ -13629,6 +13631,17 @@ mod init_command_tests {
         cursor.as_integer()
     }
 
+    fn has_path(document: &toml::Value, key: &str) -> bool {
+        let mut cursor = document;
+        for segment in key.split('.') {
+            let Some(next) = cursor.get(segment) else {
+                return false;
+            };
+            cursor = next;
+        }
+        true
+    }
+
     fn read_string_array(document: &toml::Value, key: &str) -> Vec<String> {
         let mut cursor = document;
         for segment in key.split('.') {
@@ -13772,9 +13785,9 @@ mod init_command_tests {
             read_integer(&document, "tool_call.execution_timeout_ms"),
             Some(super::LOCAL_DESKTOP_TOOL_EXECUTION_TIMEOUT_MS)
         );
-        assert_eq!(
-            read_string_array(&document, "tool_call.http_fetch.allowed_credential_vault_refs"),
-            Vec::<String>::new()
+        assert!(
+            !has_path(&document, "tool_call.http_fetch.allowed_credential_vault_refs"),
+            "local init must not write an explicit empty HTTP credential allowlist"
         );
         assert_eq!(read_bool(&document, "tool_call.process_runner.allow_interpreters"), Some(true));
         assert_eq!(
