@@ -4091,8 +4091,16 @@ pub(crate) async fn navigate_tab_with_chromium(
         tab.set_default_timeout(Duration::from_millis(chromium_timeout_ms.max(1)));
         tab.navigate_to(target_url.as_str())
             .map_err(|error| format!("failed to issue Chromium navigation command: {error}"))?;
-        tab.wait_until_navigated()
-            .map_err(|error| format!("Chromium navigation timeout or failure: {error}"))?;
+        let mut warnings = Vec::new();
+        if let Err(error) = tab.wait_until_navigated() {
+            let page_url = tab.get_url();
+            if !chromium_timeout_snapshot_url_is_usable(page_url.as_str(), target_url.as_str()) {
+                return Err(format!("Chromium navigation timeout or failure: {error}"));
+            }
+            warnings.push(format!(
+                "Chromium navigation wait timed out after page URL reached {page_url}: {error}"
+            ));
+        }
         // Best-effort probe that the pre-registered diagnostics hook survived
         // the navigation; failures are non-fatal because the hooks are
         // reinstalled via chromium_install_page_diagnostics afterwards.
@@ -4132,9 +4140,20 @@ pub(crate) async fn navigate_tab_with_chromium(
                 tab.navigate_to(page_url.as_str()).map_err(|error| {
                     format!("failed to reload Chromium page after localStorage restore: {error}")
                 })?;
-                tab.wait_until_navigated().map_err(|error| {
-                    format!("Chromium reload after localStorage restore timed out: {error}")
-                })?;
+                if let Err(error) = tab.wait_until_navigated() {
+                    let reloaded_url = tab.get_url();
+                    if !chromium_timeout_snapshot_url_is_usable(
+                        reloaded_url.as_str(),
+                        page_url.as_str(),
+                    ) {
+                        return Err(format!(
+                            "Chromium reload after localStorage restore timed out: {error}"
+                        ));
+                    }
+                    warnings.push(format!(
+                        "Chromium reload wait timed out after page URL reached {reloaded_url}: {error}"
+                    ));
+                }
                 page_url = tab.get_url();
             }
         }
@@ -4142,10 +4161,10 @@ pub(crate) async fn navigate_tab_with_chromium(
             format!("failed to read Chromium page HTML after navigation: {error}")
         })?;
         let title = tab.get_title().unwrap_or_default();
-        Ok(ChromiumObserveSnapshot { page_body, title, page_url })
+        Ok((ChromiumObserveSnapshot { page_body, title, page_url }, warnings))
     })
     .await;
-    let snapshot = match chromium_snapshot {
+    let (snapshot, navigation_warnings) = match chromium_snapshot {
         Ok(value) => value,
         Err(error) => {
             outcome.success = false;
@@ -4183,6 +4202,9 @@ pub(crate) async fn navigate_tab_with_chromium(
     outcome.title = snapshot.title;
     outcome.page_body = page_body;
     outcome.body_bytes = body_bytes;
+    if outcome.error.is_empty() && !navigation_warnings.is_empty() {
+        outcome.error = navigation_warnings.join("; ");
+    }
     if let Err(error) = chromium_apply_current_session_permissions(runtime, session_id).await {
         outcome.success = false;
         outcome.error =
@@ -4192,6 +4214,13 @@ pub(crate) async fn navigate_tab_with_chromium(
     let _ = chromium_install_page_diagnostics(runtime, session_id, tab_id).await;
     let _ = chromium_refresh_tab_snapshot(runtime, session_id, tab_id).await;
     outcome
+}
+
+fn chromium_timeout_snapshot_url_is_usable(page_url: &str, target_url: &str) -> bool {
+    if page_url == target_url {
+        return true;
+    }
+    page_url.strip_prefix(target_url).is_some_and(|suffix| suffix.starts_with('#'))
 }
 
 /// Clicks the first element matching `selector` on the active tab.
@@ -5358,8 +5387,9 @@ mod tests {
         chromium_permission_set_requests, chromium_read_document_cookies_script,
         chromium_read_local_storage_script, chromium_restore_local_storage_script,
         chromium_sync_tab_url_is_allowed, chromium_sync_tab_url_is_trackable,
-        chromium_touch_emulation_max_touch_points, chromium_transport_idle_timeout,
-        chromium_upload_staging_path, chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
+        chromium_timeout_snapshot_url_is_usable, chromium_touch_emulation_max_touch_points,
+        chromium_transport_idle_timeout, chromium_upload_staging_path,
+        chromium_viewport_metrics_mismatch, clamp_chromium_snapshot,
         decode_chromium_console_entries_value, decode_chromium_json_script_value,
         decode_chromium_network_entries_value, decode_chromium_observe_state_value,
         page_body_with_chromium_observe_state, parse_chromium_clear_storage_status,
@@ -5938,6 +5968,30 @@ mod tests {
         assert!(!chromium_sync_tab_url_is_trackable("about:blank"));
         assert!(!chromium_sync_tab_url_is_trackable("chrome://newtab/"));
         assert!(!chromium_sync_tab_url_is_trackable(""));
+    }
+
+    #[test]
+    fn chromium_timeout_snapshot_url_accepts_reached_target_or_hash_route() {
+        assert!(chromium_timeout_snapshot_url_is_usable(
+            "http://127.0.0.1:8765/index.html?v=2#/settings",
+            "http://127.0.0.1:8765/index.html?v=2#/settings",
+        ));
+        assert!(chromium_timeout_snapshot_url_is_usable(
+            "http://127.0.0.1:8765/index.html?v=1#/login",
+            "http://127.0.0.1:8765/index.html?v=1",
+        ));
+    }
+
+    #[test]
+    fn chromium_timeout_snapshot_url_rejects_unrelated_or_partial_targets() {
+        assert!(!chromium_timeout_snapshot_url_is_usable(
+            "http://127.0.0.1:8765/other.html",
+            "http://127.0.0.1:8765/index.html",
+        ));
+        assert!(!chromium_timeout_snapshot_url_is_usable(
+            "http://127.0.0.1:8765/index.html-extra",
+            "http://127.0.0.1:8765/index.html",
+        ));
     }
 
     #[test]

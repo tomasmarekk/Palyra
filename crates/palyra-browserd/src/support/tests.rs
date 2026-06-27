@@ -2992,6 +2992,107 @@ async fn browser_service_chromium_allows_initial_private_css_subresource() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn browser_service_chromium_salvages_timeout_when_dom_is_reached() {
+    let Some(chromium_path) = resolve_chromium_path_for_tests() else {
+        return;
+    };
+    let _guard = chromium_integration_test_guard().await;
+    let runtime = std::sync::Arc::new(
+        browser_runtime_state_for_tests(&Args {
+            bind: "127.0.0.1".to_owned(),
+            port: 7143,
+            grpc_bind: "127.0.0.1".to_owned(),
+            grpc_port: 7543,
+            auth_token: None,
+            session_idle_ttl_ms: 60_000,
+            max_sessions: 16,
+            max_navigation_timeout_ms: 10_000,
+            max_session_lifetime_ms: 60_000,
+            max_screenshot_bytes: 256 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_title_bytes: 4 * 1024,
+            engine_mode: BrowserEngineMode::Chromium,
+            chromium_path: Some(chromium_path),
+            chromium_startup_timeout_ms: DEFAULT_CHROMIUM_STARTUP_TIMEOUT_MS,
+        })
+        .expect("chromium runtime should initialize"),
+    );
+    let service = BrowserServiceImpl { runtime };
+    let created = create_session_with_retry_for_chromium_test(
+        &service,
+        browser_v1::CreateSessionRequest {
+            v: 1,
+            principal: "user:ops".to_owned(),
+            idle_ttl_ms: 10_000,
+            budget: None,
+            allow_private_targets: false,
+            allow_downloads: false,
+            action_allowed_domains: Vec::new(),
+            persistence_enabled: false,
+            persistence_id: String::new(),
+            profile_id: None,
+            private_profile: false,
+            channel: String::new(),
+        },
+        3,
+    )
+    .await
+    .expect("create_session should succeed for chromium timeout salvage test");
+    let session_id = created.session_id.expect("session id should exist");
+
+    let (url, handle) = spawn_hanging_subresource_http_server();
+    let navigate = service
+        .navigate(Request::new(browser_v1::NavigateRequest {
+            v: 1,
+            session_id: Some(session_id.clone()),
+            url: url.clone(),
+            timeout_ms: 300,
+            allow_redirects: true,
+            max_redirects: 3,
+            allow_private_targets: true,
+        }))
+        .await
+        .expect("navigate should execute")
+        .into_inner();
+    assert!(
+        navigate.success,
+        "navigate should salvage usable DOM after subresource timeout: {}",
+        navigate.error
+    );
+    assert_eq!(navigate.final_url, url);
+    assert!(
+        navigate.error.contains("timed out"),
+        "salvaged timeout should keep diagnostic warning: {}",
+        navigate.error
+    );
+    let observed = service
+        .observe(Request::new(browser_v1::ObserveRequest {
+            v: 1,
+            session_id: Some(session_id),
+            include_dom_snapshot: false,
+            include_accessibility_tree: false,
+            include_visible_text: true,
+            max_dom_snapshot_bytes: 0,
+            max_accessibility_tree_bytes: 0,
+            max_visible_text_bytes: 4 * 1024,
+            capture_selectors: Vec::new(),
+            computed_style_properties: Vec::new(),
+            max_capture_text_bytes: 0,
+        }))
+        .await
+        .expect("observe should execute")
+        .into_inner();
+    assert!(observed.success, "observe should succeed after salvaged navigate");
+    assert!(
+        observed.visible_text.contains("usable dom"),
+        "observe should read live DOM after salvaged timeout: {}",
+        observed.visible_text
+    );
+
+    handle.join().expect("test server thread should exit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn browser_service_chromium_refreshes_snapshot_before_allowlisted_actions() {
     let Some(chromium_path) = resolve_chromium_path_for_tests() else {
         return;
@@ -7586,6 +7687,62 @@ fn spawn_css_subresource_http_server() -> (String, thread::JoinHandle<()>) {
             }
         }
         assert!(css_seen, "fixture should receive the initial stylesheet request before shutdown");
+    });
+    (format!("http://{address}/index.html"), handle)
+}
+
+fn spawn_hanging_subresource_http_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    listener.set_nonblocking(true).expect("listener should become nonblocking");
+    let address = listener.local_addr().expect("listener local address should resolve");
+    let handle = thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        let mut root_requests = 0usize;
+        let mut hanging_seen = false;
+        while started_at.elapsed() < Duration::from_secs(20)
+            && !(hanging_seen && root_requests >= 2)
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("accepted stream should become blocking");
+                    let request = read_http_request(&mut stream);
+                    if request.trim().is_empty() {
+                        continue;
+                    }
+                    let path = http_request_path(request.as_str());
+                    if path.starts_with("/slow.png") {
+                        hanging_seen = true;
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    if path == "/" || path.starts_with("/index.html") {
+                        root_requests = root_requests.saturating_add(1);
+                        let body = r#"<html><head><title>Slow Subresource</title></head><body><main>usable dom</main><img src="/slow.png" alt="" /></body></html>"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("server should write page response");
+                        stream.flush().expect("server should flush page response");
+                        continue;
+                    }
+                    let body = "not found";
+                    let response = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).expect("server should write fallback");
+                    stream.flush().expect("server should flush fallback");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+        assert!(hanging_seen, "fixture should receive the hanging subresource request");
     });
     (format!("http://{address}/index.html"), handle)
 }
