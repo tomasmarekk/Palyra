@@ -3078,6 +3078,32 @@ mod tests {
     }
 
     #[test]
+    fn read_workspace_file_preserves_plural_token_parser_variables() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let file_path = tempdir.path().join("parser.py");
+        let contents =
+            "import shlex\n\ndef parse(text):\n    tokens = shlex.split(text)\n    return tokens\n";
+        fs::write(file_path, contents).expect("workspace file should be written");
+        let input = WorkspaceReadFileInput {
+            path: "parser.py".to_owned(),
+            workspace_root: None,
+            offset_bytes: 0,
+            max_bytes: None,
+            line_start: None,
+            line_count: None,
+        };
+
+        let output = read_workspace_file_from_roots(&[tempdir.path().to_path_buf()], &input)
+            .expect("workspace file should be readable");
+
+        assert!(!output.redacted);
+        assert_eq!(output.text.as_deref(), Some(contents));
+        assert_eq!(output.text_authoritative, None);
+        assert_eq!(output.redaction_notice, None);
+        assert_eq!(output.redaction_reasons, None);
+    }
+
+    #[test]
     fn read_workspace_file_preserves_safe_storage_and_env_key_identifiers() {
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let file_path = tempdir.path().join("app.js");

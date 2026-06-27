@@ -2940,6 +2940,25 @@ mod tests {
     }
 
     #[test]
+    fn plural_token_parser_variables_are_not_redacted_as_secret_values() {
+        let source = "tokens = shlex.split(text)";
+        let outcome = redact_text_for_export(
+            source,
+            SafetySourceKind::Workspace,
+            SafetyContentKind::WorkspaceDocument,
+            TrustLabel::TrustedLocal,
+        );
+
+        assert!(!outcome.redacted);
+        assert_eq!(outcome.redacted_text, source);
+        assert!(!outcome
+            .scan
+            .finding_codes()
+            .iter()
+            .any(|code| code == "secret_leak.assignment.token"));
+    }
+
+    #[test]
     fn source_env_secret_references_are_not_redacted_as_secret_literals() {
         let source = "const apiKey = import.meta.env.PRIVATE_API_KEY;\n\
                       const token = process.env.ACCESS_TOKEN;\n\
