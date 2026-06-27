@@ -10,8 +10,11 @@ use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
 use palyra_common::redaction::redact_auth_error;
 use palyra_model_providers::{
-    legacy_provider_identity_for_file_config_kind, model_id_supports_reasoning_effort,
-    normalized_provider_filter_alias,
+    is_openai_chatgpt_oauth_client_id, legacy_provider_identity_for_file_config_kind,
+    model_id_supports_reasoning_effort, normalized_provider_filter_alias,
+    parse_discovered_model_ids,
+    provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
+    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_CODEX_BACKEND_BASE_URL,
 };
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use reqwest::blocking::Client;
@@ -29,12 +32,7 @@ const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
 const ANTHROPIC_PROVIDER_KIND: &str = "anthropic";
 const DETERMINISTIC_PROVIDER_KIND: &str = "deterministic";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const OPENAI_CODEX_MODELS_ENDPOINT: &str =
-    "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const MINIMAX_AUTH_PROVIDER_KIND: &str = "minimax";
 const DESKTOP_CONTROL_CENTER_DIR: &str = "desktop-control-center";
 const DESKTOP_RUNTIME_DIR: &str = "runtime";
@@ -176,23 +174,6 @@ pub(crate) struct ProviderConnectionCheckPayload {
     pub(crate) latency_ms: Option<u64>,
 }
 
-/// Model id advertised by a provider discovery endpoint, with optional recency metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiscoveredProviderModel {
-    pub(crate) id: String,
-    recency_rank: Option<i64>,
-    chat_default_eligible: bool,
-    pub(crate) supports_tool_calls: Option<bool>,
-    pub(crate) supports_json_mode: Option<bool>,
-    pub(crate) supports_vision: Option<bool>,
-}
-
-impl DiscoveredProviderModel {
-    pub(crate) fn can_be_chat_default(&self) -> bool {
-        self.chat_default_eligible
-    }
-}
-
 /// Aggregate payload for `models test-connection` and `models discover`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsConnectionPayload {
@@ -306,19 +287,6 @@ enum ResolvedCredential {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedOauthProfileKind {
     OpenAiChatGptLogin,
-}
-
-#[derive(Debug, Clone)]
-struct ProviderModelsEndpoint {
-    url: reqwest::Url,
-    base_url: String,
-    response_format: ProviderModelsResponseFormat,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderModelsResponseFormat {
-    OpenAiCompatible,
-    OpenAiCodexBackend,
 }
 
 /// Dispatches `palyra models` subcommands.
@@ -2634,10 +2602,7 @@ fn probe_provider(
             let status = response.status();
             let body = response.text().unwrap_or_default();
             if status.is_success() {
-                match parse_discovered_model_ids_with_format(
-                    body.as_str(),
-                    endpoint.response_format,
-                ) {
+                match parse_discovered_model_ids(body.as_str(), endpoint.response_format) {
                     Ok(discovered) => {
                         payload.live_discovery_verified = true;
                         payload.discovery_source = "live".to_owned();
@@ -2948,8 +2913,8 @@ fn oauth_kind_for_profile(
     provider_kind: &AuthProviderKind,
     client_id: Option<&str>,
 ) -> Option<ResolvedOauthProfileKind> {
-    let is_chatgpt_login = provider_kind == &AuthProviderKind::Openai
-        && client_id.map(str::trim).is_some_and(|value| value == OPENAI_CHATGPT_OAUTH_CLIENT_ID);
+    let is_chatgpt_login =
+        provider_kind == &AuthProviderKind::Openai && is_openai_chatgpt_oauth_client_id(client_id);
     is_chatgpt_login.then_some(ResolvedOauthProfileKind::OpenAiChatGptLogin)
 }
 
@@ -2987,311 +2952,15 @@ fn load_vault_secret_utf8(vault: &palyra_vault::Vault, vault_ref: &str) -> Resul
     String::from_utf8(bytes).context("vault secret must contain valid UTF-8")
 }
 
-/// Builds the `/v1/models` discovery endpoint URL for a provider base URL,
-/// avoiding a doubled version segment when the base URL already ends in a
-/// versioned OpenAI-compatible route.
-///
-/// # Errors
-/// Returns an error when the resulting URL cannot be parsed.
 fn provider_models_endpoint_for_probe(
     target: &ProbeableProvider,
     base_url: &str,
     credential: &ResolvedCredential,
 ) -> Result<ProviderModelsEndpoint> {
-    if target_uses_openai_chatgpt_oauth(target, credential) {
-        let url = reqwest::Url::parse(OPENAI_CODEX_MODELS_ENDPOINT)
-            .context("invalid OpenAI Codex models endpoint")?;
-        return Ok(ProviderModelsEndpoint {
-            url,
-            base_url: OPENAI_CODEX_BACKEND_BASE_URL.to_owned(),
-            response_format: ProviderModelsResponseFormat::OpenAiCodexBackend,
-        });
-    }
-
-    Ok(ProviderModelsEndpoint {
-        url: provider_models_endpoint(base_url)?,
-        base_url: base_url.trim().trim_end_matches('/').to_owned(),
-        response_format: ProviderModelsResponseFormat::OpenAiCompatible,
-    })
-}
-
-pub(crate) fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
-        format!("{trimmed}/models")
-    } else {
-        format!("{trimmed}/v1/models")
-    };
-    reqwest::Url::parse(raw.as_str())
-        .with_context(|| format!("invalid provider base_url: {base_url}"))
-}
-
-/// Parses an OpenAI-style `{"data": [...]}` discovery response into model entries.
-///
-/// # Errors
-/// Returns an error when the body is not valid JSON; a JSON body without the
-/// expected shape yields an empty list instead.
-pub(crate) fn parse_discovered_provider_models(body: &str) -> Result<Vec<DiscoveredProviderModel>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let discovered = value
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries.iter().filter_map(parse_discovered_provider_model).collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Ok(discovered)
-}
-
-/// Parses a discovery response and keeps only the advertised model ids.
-///
-/// # Errors
-/// Returns an error when the body is not valid JSON.
-pub(crate) fn parse_discovered_model_ids(body: &str) -> Result<Vec<String>> {
-    parse_discovered_model_ids_with_format(body, ProviderModelsResponseFormat::OpenAiCompatible)
-}
-
-fn parse_discovered_model_ids_with_format(
-    body: &str,
-    response_format: ProviderModelsResponseFormat,
-) -> Result<Vec<String>> {
-    match response_format {
-        ProviderModelsResponseFormat::OpenAiCompatible => {
-            Ok(parse_discovered_provider_models(body)?.into_iter().map(|model| model.id).collect())
-        }
-        ProviderModelsResponseFormat::OpenAiCodexBackend => parse_openai_codex_model_ids(body),
-    }
-}
-
-fn parse_openai_codex_model_ids(body: &str) -> Result<Vec<String>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) else {
-        return parse_discovered_model_ids(body);
-    };
-
-    let mut sortable = Vec::<(i64, String)>::new();
-    for entry in entries {
-        if codex_model_is_hidden(entry) {
-            continue;
-        }
-        let Some(model_id) = entry
-            .get("slug")
-            .or_else(|| entry.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if sortable.iter().any(|(_, existing)| existing == model_id) {
-            continue;
-        }
-        sortable.push((codex_model_priority(entry), model_id.to_owned()));
-    }
-    sortable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(sortable.into_iter().map(|(_, model_id)| model_id).collect())
-}
-
-fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
-    entry
-        .get("visibility")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|visibility| matches!(visibility.as_str(), "hide" | "hidden"))
-}
-
-fn codex_model_priority(entry: &serde_json::Value) -> i64 {
-    entry
-        .get("priority")
-        .and_then(|value| {
-            value.as_i64().or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
-        })
-        .unwrap_or(i64::MAX)
-}
-
-/// Selects the preferred model id from a discovery response.
-///
-/// Prefers the newest entry when every model carries recency metadata;
-/// otherwise preserves the provider's response order and takes the first id.
-pub(crate) fn select_preferred_discovered_model_id(
-    models: &[DiscoveredProviderModel],
-) -> Option<String> {
-    select_preferred_discovered_model(models).map(|model| model.id.clone())
-}
-
-/// Selects the preferred model entry from a provider discovery response.
-///
-/// Capability metadata wins over raw provider order when the provider exposes
-/// it: Palyra agents need tool-capable chat models, and providers such as
-/// OpenRouter advertise that via `supported_parameters`.
-pub(crate) fn select_preferred_discovered_model(
-    models: &[DiscoveredProviderModel],
-) -> Option<&DiscoveredProviderModel> {
-    let candidates = models
-        .iter()
-        .filter(|model| !model.id.trim().is_empty() && model.can_be_chat_default())
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return None;
-    }
-    let candidate_pool = if candidates.iter().any(|model| model.supports_tool_calls == Some(true)) {
-        candidates
-            .iter()
-            .copied()
-            .filter(|model| model.supports_tool_calls == Some(true))
-            .collect::<Vec<_>>()
-    } else {
-        candidates
-    };
-
-    // Do not infer freshness from provider-specific model ID strings. Prefer provider metadata
-    // when it is complete; otherwise treat the discovery response order as authoritative.
-    if candidate_pool.iter().all(|model| model.recency_rank.is_some()) {
-        let (mut selected, mut selected_rank) =
-            (candidate_pool[0], candidate_pool[0].recency_rank?);
-        for model in candidate_pool.iter().skip(1) {
-            let recency_rank = model.recency_rank?;
-            if recency_rank > selected_rank {
-                selected = model;
-                selected_rank = recency_rank;
-            }
-        }
-        return Some(selected);
-    }
-
-    Some(candidate_pool[0])
-}
-
-fn parse_discovered_provider_model(entry: &serde_json::Value) -> Option<DiscoveredProviderModel> {
-    let id = entry
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())?;
-    Some(DiscoveredProviderModel {
-        id: id.to_owned(),
-        recency_rank: discovered_model_recency_rank(entry),
-        chat_default_eligible: discovered_model_can_be_chat_default(entry, id),
-        supports_tool_calls: model_supported_parameter(entry, &["tools", "tool_choice"]),
-        supports_json_mode: model_supported_parameter(entry, &["response_format"]),
-        supports_vision: discovered_model_supports_vision(entry),
-    })
-}
-
-fn model_supported_parameter(entry: &serde_json::Value, names: &[&str]) -> Option<bool> {
-    let supported = entry.get("supported_parameters")?.as_array()?;
-    let parameters = supported
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    Some(names.iter().any(|name| {
-        let normalized = name.to_ascii_lowercase();
-        parameters.iter().any(|parameter| parameter == &normalized)
-    }))
-}
-
-fn discovered_model_supports_vision(entry: &serde_json::Value) -> Option<bool> {
-    let modalities = discovered_model_modalities(entry, "input_modalities")?;
-    Some(modalities.iter().any(|modality| matches!(modality.as_str(), "image" | "vision")))
-}
-
-fn discovered_model_can_be_chat_default(entry: &serde_json::Value, model_id: &str) -> bool {
-    if model_id_looks_non_chat_default(model_id) {
-        return false;
-    }
-
-    let Some(output_modalities) = discovered_model_modalities(entry, "output_modalities") else {
-        return true;
-    };
-    let has_text_output = output_modalities.iter().any(|modality| modality == "text");
-    let has_media_output = output_modalities
-        .iter()
-        .any(|modality| matches!(modality.as_str(), "image" | "video" | "audio"));
-    has_text_output && !has_media_output
-}
-
-fn discovered_model_modalities(entry: &serde_json::Value, field: &str) -> Option<Vec<String>> {
-    let modalities = entry
-        .get("architecture")
-        .and_then(|architecture| architecture.get(field))
-        .and_then(serde_json::Value::as_array)?;
-    Some(
-        modalities
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|modality| !modality.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect(),
+    build_provider_models_endpoint_for_probe(
+        base_url,
+        target_uses_openai_chatgpt_oauth(target, credential),
     )
-}
-
-fn model_id_looks_non_chat_default(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    [
-        "audio",
-        "embed",
-        "embedding",
-        "image",
-        "imagine",
-        "moderation",
-        "realtime",
-        "speech",
-        "transcrib",
-        "tts",
-        "video",
-        "whisper",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn discovered_model_recency_rank(entry: &serde_json::Value) -> Option<i64> {
-    const RECENCY_FIELDS: &[&str] = &[
-        "created",
-        "created_at",
-        "createdAt",
-        "created_unix_ms",
-        "createdUnixMs",
-        "released_at",
-        "releasedAt",
-        "release_unix_ms",
-        "releaseUnixMs",
-    ];
-    RECENCY_FIELDS
-        .iter()
-        .find_map(|field| entry.get(*field).and_then(model_recency_rank_from_value))
-}
-
-fn model_recency_rank_from_value(value: &serde_json::Value) -> Option<i64> {
-    if let Some(raw) = value.as_i64() {
-        return normalize_numeric_recency_rank(raw);
-    }
-    if let Some(raw) = value.as_u64().and_then(|raw| i64::try_from(raw).ok()) {
-        return normalize_numeric_recency_rank(raw);
-    }
-    value
-        .as_str()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .and_then(normalize_numeric_recency_rank)
-}
-
-fn normalize_numeric_recency_rank(raw: i64) -> Option<i64> {
-    // Providers report timestamps in either epoch seconds or milliseconds.
-    // Any value below this bound (~year 5138 in seconds) is treated as
-    // seconds and scaled so all ranks compare on a millisecond axis.
-    const EPOCH_SECONDS_UPPER_BOUND: i64 = 100_000_000_000;
-    if raw <= 0 {
-        return None;
-    }
-    if raw < EPOCH_SECONDS_UPPER_BOUND {
-        return raw.checked_mul(1000);
-    }
-    Some(raw)
 }
 
 fn classify_provider_failure(status_code: u16) -> String {
@@ -3335,6 +3004,11 @@ fn get_string_value_at_path(document: &toml::Value, key: &str) -> Result<Option<
 mod tests {
     use super::*;
     use palyra_common::daemon_config_schema::FileModelProviderRegistryEntry;
+    use palyra_model_providers::{
+        parse_discovered_provider_models, provider_models_endpoint,
+        select_preferred_discovered_model_id, ProviderModelsResponseFormat,
+        OPENAI_CHATGPT_OAUTH_CLIENT_ID, OPENAI_CODEX_MODELS_ENDPOINT,
+    };
 
     fn sample_probe_target(base_url: &str, allow_private_base_url: bool) -> ProbeableProvider {
         ProbeableProvider {
@@ -3868,11 +3542,9 @@ mod tests {
         })
         .to_string();
 
-        let discovered = parse_discovered_model_ids_with_format(
-            &body,
-            ProviderModelsResponseFormat::OpenAiCodexBackend,
-        )
-        .expect("Codex model response should parse");
+        let discovered =
+            parse_discovered_model_ids(&body, ProviderModelsResponseFormat::OpenAiCodexBackend)
+                .expect("Codex model response should parse");
 
         assert_eq!(discovered, vec!["gpt-5.4", "gpt-5.3-codex"]);
     }

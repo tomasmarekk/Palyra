@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod contract;
+pub mod discovery;
 pub mod error_envelope;
 pub mod errors;
 pub mod providers;
@@ -38,6 +39,17 @@ pub use contract::{
     ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
     ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
     DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE, MAX_PROVIDER_TURN_TEXT_BYTES,
+};
+pub use discovery::{
+    is_openai_chatgpt_oauth_client_id, parse_discovered_model_ids,
+    parse_discovered_provider_models, provider_models_endpoint, provider_models_endpoint_for_probe,
+    select_preferred_discovered_model, select_preferred_discovered_model_id,
+    select_preferred_discovered_model_id_from_response,
+    select_preferred_tool_capable_discovered_model,
+    select_preferred_tool_capable_discovered_model_id,
+    select_preferred_tool_capable_discovered_model_id_from_response, DiscoveredProviderModel,
+    ProviderModelsEndpoint, ProviderModelsResponseFormat, ANTHROPIC_API_VERSION,
+    OPENAI_CHATGPT_OAUTH_CLIENT_ID, OPENAI_CODEX_BACKEND_BASE_URL, OPENAI_CODEX_MODELS_ENDPOINT,
 };
 pub use error_envelope::{
     ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity, ProviderRetryability,

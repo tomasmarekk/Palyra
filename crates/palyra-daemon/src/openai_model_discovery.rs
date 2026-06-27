@@ -5,13 +5,15 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use palyra_model_providers::{
+    provider_models_endpoint, provider_models_endpoint_for_probe,
+    select_preferred_discovered_model_id_from_response,
+    select_preferred_tool_capable_discovered_model_id_from_response, ProviderModelsResponseFormat,
+};
 use reqwest::{Client as ReqwestClient, Url};
 
 use crate::{model_provider::sanitize_remote_error, openai_auth::OpenAiCredentialValidationError};
-
-const OPENAI_CHATGPT_CODEX_MODELS_ENDPOINT: &str =
-    "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiModelDiscoveryFormat {
@@ -25,7 +27,7 @@ pub(crate) async fn discover_preferred_openai_compatible_model_id(
     bearer_token: &str,
     timeout: Duration,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
-    let endpoint = openai_compatible_models_endpoint(base_url)
+    let endpoint = provider_models_endpoint(base_url)
         .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
@@ -41,7 +43,7 @@ pub(crate) async fn discover_explicit_tool_capable_openai_compatible_model_id(
     bearer_token: &str,
     timeout: Duration,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
-    let endpoint = openai_compatible_models_endpoint(base_url)
+    let endpoint = provider_models_endpoint(base_url)
         .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
@@ -56,7 +58,8 @@ pub(crate) async fn discover_preferred_openai_chatgpt_codex_model_id(
     bearer_token: &str,
     timeout: Duration,
 ) -> Result<Option<String>, OpenAiCredentialValidationError> {
-    let endpoint = Url::parse(OPENAI_CHATGPT_CODEX_MODELS_ENDPOINT)
+    let endpoint = provider_models_endpoint_for_probe("https://api.openai.com/v1", true)
+        .map(|endpoint| endpoint.url)
         .map_err(|error| OpenAiCredentialValidationError::Unexpected(error.to_string()))?;
     discover_preferred_openai_model_id_from_endpoint(
         endpoint,
@@ -107,243 +110,27 @@ async fn discover_preferred_openai_model_id_from_endpoint(
     }
 }
 
-fn openai_compatible_models_endpoint(base_url: &str) -> Result<Url> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
-        format!("{trimmed}/models")
-    } else {
-        format!("{trimmed}/v1/models")
-    };
-    Url::parse(raw.as_str()).with_context(|| format!("invalid provider base_url: {base_url}"))
-}
-
 fn preferred_openai_model_id_from_body(
     body: &str,
     format: OpenAiModelDiscoveryFormat,
 ) -> Result<Option<String>> {
     match format {
         OpenAiModelDiscoveryFormat::OpenAiCompatible => {
-            preferred_openai_compatible_model_id_from_body(body)
+            select_preferred_discovered_model_id_from_response(
+                body,
+                ProviderModelsResponseFormat::OpenAiCompatible,
+            )
         }
         OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities => {
-            preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
+            select_preferred_tool_capable_discovered_model_id_from_response(body)
         }
-        OpenAiModelDiscoveryFormat::ChatGptCodex => preferred_codex_model_id_from_body(body),
+        OpenAiModelDiscoveryFormat::ChatGptCodex => {
+            select_preferred_discovered_model_id_from_response(
+                body,
+                ProviderModelsResponseFormat::OpenAiCodexBackend,
+            )
+        }
     }
-}
-
-fn preferred_openai_compatible_model_id_from_body(body: &str) -> Result<Option<String>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let Some(entries) = value.get("data").and_then(serde_json::Value::as_array) else {
-        return Ok(None);
-    };
-    let candidates = entries
-        .iter()
-        .filter_map(|entry| {
-            let model_id = entry
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            if !model_can_be_chat_default(entry, model_id) {
-                return None;
-            }
-            Some((model_id.to_owned(), model_recency_rank(entry)))
-        })
-        .collect::<Vec<_>>();
-    Ok(preferred_model_id_from_candidates(candidates))
-}
-
-fn preferred_explicit_tool_capable_openai_compatible_model_id_from_body(
-    body: &str,
-) -> Result<Option<String>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let Some(entries) = value.get("data").and_then(serde_json::Value::as_array) else {
-        return Ok(None);
-    };
-    let candidates = entries
-        .iter()
-        .filter_map(|entry| {
-            if model_supported_parameter(entry, &["tools", "tool_choice"]) != Some(true) {
-                return None;
-            }
-            let model_id = entry
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            if !model_can_be_chat_default(entry, model_id) {
-                return None;
-            }
-            Some((model_id.to_owned(), model_recency_rank(entry)))
-        })
-        .collect::<Vec<_>>();
-    Ok(preferred_model_id_from_candidates(candidates))
-}
-
-fn preferred_codex_model_id_from_body(body: &str) -> Result<Option<String>> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) else {
-        return preferred_openai_compatible_model_id_from_body(body);
-    };
-
-    let mut candidates = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            if codex_model_is_hidden(entry) {
-                return None;
-            }
-            let model_id = entry
-                .get("slug")
-                .or_else(|| entry.get("id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            Some((codex_model_priority(entry), index, model_id.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(candidates.into_iter().map(|(_, _, model_id)| model_id).next())
-}
-
-fn preferred_model_id_from_candidates(candidates: Vec<(String, Option<i64>)>) -> Option<String> {
-    if candidates.is_empty() {
-        return None;
-    }
-    if candidates.iter().all(|(_, recency_rank)| recency_rank.is_some()) {
-        return candidates
-            .into_iter()
-            .max_by_key(|(_, recency_rank)| recency_rank.unwrap_or(i64::MIN))
-            .map(|(model_id, _)| model_id);
-    }
-    candidates.into_iter().map(|(model_id, _)| model_id).next()
-}
-
-fn model_recency_rank(entry: &serde_json::Value) -> Option<i64> {
-    const RECENCY_FIELDS: &[&str] = &[
-        "created",
-        "created_at",
-        "createdAt",
-        "created_unix_ms",
-        "createdUnixMs",
-        "released_at",
-        "releasedAt",
-        "release_unix_ms",
-        "releaseUnixMs",
-    ];
-    RECENCY_FIELDS
-        .iter()
-        .find_map(|field| entry.get(*field).and_then(model_recency_rank_from_value))
-}
-
-fn model_recency_rank_from_value(value: &serde_json::Value) -> Option<i64> {
-    if let Some(raw) = value.as_i64() {
-        return normalize_numeric_model_recency_rank(raw);
-    }
-    if let Some(raw) = value.as_u64().and_then(|raw| i64::try_from(raw).ok()) {
-        return normalize_numeric_model_recency_rank(raw);
-    }
-    value
-        .as_str()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .and_then(normalize_numeric_model_recency_rank)
-}
-
-fn normalize_numeric_model_recency_rank(raw: i64) -> Option<i64> {
-    if raw <= 0 {
-        return None;
-    }
-    if raw < 10_000_000_000 {
-        Some(raw.saturating_mul(1_000))
-    } else {
-        Some(raw)
-    }
-}
-
-fn model_supported_parameter(entry: &serde_json::Value, names: &[&str]) -> Option<bool> {
-    let supported = entry.get("supported_parameters")?.as_array()?;
-    let parameters = supported
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    Some(names.iter().any(|name| {
-        let normalized = name.to_ascii_lowercase();
-        parameters.iter().any(|parameter| parameter == &normalized)
-    }))
-}
-
-fn model_can_be_chat_default(entry: &serde_json::Value, model_id: &str) -> bool {
-    if model_id_looks_non_chat_default(model_id) {
-        return false;
-    }
-
-    let Some(output_modalities) = model_output_modalities(entry) else {
-        return true;
-    };
-    let has_text_output = output_modalities.iter().any(|modality| modality == "text");
-    let has_media_output = output_modalities
-        .iter()
-        .any(|modality| matches!(modality.as_str(), "image" | "video" | "audio"));
-    has_text_output && !has_media_output
-}
-
-fn model_output_modalities(entry: &serde_json::Value) -> Option<Vec<String>> {
-    let modalities = entry
-        .get("architecture")
-        .and_then(|architecture| architecture.get("output_modalities"))
-        .and_then(serde_json::Value::as_array)?;
-    Some(
-        modalities
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|modality| !modality.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect(),
-    )
-}
-
-fn model_id_looks_non_chat_default(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    [
-        "audio",
-        "embed",
-        "embedding",
-        "image",
-        "imagine",
-        "moderation",
-        "realtime",
-        "speech",
-        "transcrib",
-        "tts",
-        "video",
-        "whisper",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
-    entry
-        .get("visibility")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|visibility| matches!(visibility.as_str(), "hide" | "hidden"))
-}
-
-fn codex_model_priority(entry: &serde_json::Value) -> i64 {
-    entry
-        .get("priority")
-        .and_then(|value| {
-            value.as_i64().or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
-        })
-        .unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -355,8 +142,9 @@ mod tests {
         let body =
             r#"{"data":[{"id":"older","created":1700000000},{"id":"newer","created":1800000000}]}"#;
 
-        let model_id = preferred_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id =
+            preferred_openai_model_id_from_body(body, OpenAiModelDiscoveryFormat::OpenAiCompatible)
+                .expect("provider model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("newer"));
     }
@@ -365,8 +153,9 @@ mod tests {
     fn openai_model_discovery_rejects_media_output_defaults() {
         let body = r#"{"data":[{"id":"grok-imagine-video-1.5","created":1800000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["video"]}},{"id":"grok-4.3","created":1700000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["text"]}}]}"#;
 
-        let model_id = preferred_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id =
+            preferred_openai_model_id_from_body(body, OpenAiModelDiscoveryFormat::OpenAiCompatible)
+                .expect("provider model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("grok-4.3"));
     }
@@ -375,8 +164,9 @@ mod tests {
     fn openai_model_discovery_returns_none_for_media_only_inventory() {
         let body = r#"{"data":[{"id":"google/gemini-3-pro-image","created":1800000000,"architecture":{"output_modalities":["image"]}},{"id":"grok-imagine-video-1.5","created":1700000000,"architecture":{"output_modalities":["video"]}}]}"#;
 
-        let model_id = preferred_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id =
+            preferred_openai_model_id_from_body(body, OpenAiModelDiscoveryFormat::OpenAiCompatible)
+                .expect("provider model response should parse");
 
         assert_eq!(model_id, None);
     }
@@ -385,8 +175,11 @@ mod tests {
     fn openai_public_discovery_requires_explicit_tool_metadata_for_default() {
         let body = r#"{"data":[{"id":"gpt-realtime-whisper","created":1800000000},{"id":"gpt-chat-candidate","created":1700000000}]}"#;
 
-        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id = preferred_openai_model_id_from_body(
+            body,
+            OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities,
+        )
+        .expect("provider model response should parse");
 
         assert_eq!(model_id, None);
     }
@@ -395,8 +188,11 @@ mod tests {
     fn openai_public_discovery_prefers_explicit_tool_capable_model() {
         let body = r#"{"data":[{"id":"newer-non-tool","created":1800000000,"supported_parameters":["temperature"]},{"id":"tool-capable","created":1700000000,"supported_parameters":["tools","response_format"]}]}"#;
 
-        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id = preferred_openai_model_id_from_body(
+            body,
+            OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities,
+        )
+        .expect("provider model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("tool-capable"));
     }
@@ -405,8 +201,11 @@ mod tests {
     fn openai_public_discovery_rejects_tool_capable_media_output_default() {
         let body = r#"{"data":[{"id":"google/gemini-3-pro-image","created":1800000000,"supported_parameters":["tools"],"architecture":{"output_modalities":["image"]}},{"id":"tool-capable","created":1700000000,"supported_parameters":["tools","response_format"],"architecture":{"output_modalities":["text"]}}]}"#;
 
-        let model_id = preferred_explicit_tool_capable_openai_compatible_model_id_from_body(body)
-            .expect("provider model response should parse");
+        let model_id = preferred_openai_model_id_from_body(
+            body,
+            OpenAiModelDiscoveryFormat::OpenAiCompatibleExplicitToolCapabilities,
+        )
+        .expect("provider model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("tool-capable"));
     }
@@ -416,7 +215,8 @@ mod tests {
         let body = r#"{"models":[{"slug":"secondary","priority":20},{"slug":"primary","priority":10},{"slug":"hidden","priority":1,"visibility":"hidden"}]}"#;
 
         let model_id =
-            preferred_codex_model_id_from_body(body).expect("Codex model response should parse");
+            preferred_openai_model_id_from_body(body, OpenAiModelDiscoveryFormat::ChatGptCodex)
+                .expect("Codex model response should parse");
 
         assert_eq!(model_id.as_deref(), Some("primary"));
     }

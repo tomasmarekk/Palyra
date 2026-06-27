@@ -65,6 +65,7 @@ use palyra_model_providers::{
     invalid_response_classification, provider_output_from_text_and_tools,
     provider_request_has_vision, retry_provider_classification,
     retryable_invalid_response_classification, user_action_provider_classification,
+    ANTHROPIC_API_VERSION, OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -93,7 +94,6 @@ pub use palyra_model_providers::{
 };
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
-const OPENAI_CODEX_RESPONSES_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const OPENAI_CODEX_RESPONSES_PATH: &str = "/responses";
 const OPENAI_CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const OPENAI_CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (Palyra)";
@@ -102,7 +102,6 @@ const OPENAI_CHATGPT_ACCOUNT_ID_CLAIM: &str = "chatgpt_account_id";
 const OPENAI_EMBEDDINGS_PATH: &str = "/embeddings";
 const OPENAI_AUDIO_TRANSCRIPTIONS_PATH: &str = "/audio/transcriptions";
 const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 // Shared by all HTTP backends; 529 is the Anthropic/MiniMax overload status

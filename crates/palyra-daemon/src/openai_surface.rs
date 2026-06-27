@@ -22,7 +22,10 @@ use crate::openai_model_discovery::{
     discover_preferred_openai_compatible_model_id,
 };
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
-use palyra_model_providers::preserved_unresolved_default_chat_model_for_provider;
+use palyra_model_providers::{
+    preserved_unresolved_default_chat_model_for_provider, ANTHROPIC_API_VERSION,
+    OPENAI_CHATGPT_OAUTH_CLIENT_ID, OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CHATGPT_CODEX_BASE_URL,
+};
 
 const OPENAI_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTHROPIC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,8 +33,6 @@ const ANTHROPIC_VALIDATION_RETRY_ATTEMPTS: usize = 3;
 const ANTHROPIC_VALIDATION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const OPENAI_DEFAULT_CONFIG_BACKUPS: usize = 5;
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const OPENAI_CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CHATGPT_DEVICE_CODE_ENDPOINT: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const OPENAI_CHATGPT_DEVICE_TOKEN_ENDPOINT: &str =
@@ -41,7 +42,6 @@ const OPENAI_CHATGPT_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token
 const OPENAI_CHATGPT_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const OPENAI_CHATGPT_DEVICE_ATTEMPT_TTL_MS: i64 = 15 * 60 * 1_000;
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_ALLOWED_TOKEN_HOSTS: &[&str] =
     &["console.anthropic.com", "platform.claude.com"];

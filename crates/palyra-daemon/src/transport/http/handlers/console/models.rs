@@ -15,7 +15,10 @@ use palyra_common::daemon_config_schema::{FileModelProviderConfig, RootFileConfi
 use palyra_common::redaction::redact_auth_error;
 use palyra_model_providers::{
     configured_model_ids_by_provider, default_provider_id_for_configured_models,
-    legacy_provider_id_for_file_config_kind, normalized_provider_filter_alias,
+    is_openai_chatgpt_oauth_client_id, legacy_provider_id_for_file_config_kind,
+    normalized_provider_filter_alias, parse_discovered_model_ids,
+    provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
+    ProviderModelsEndpoint, ANTHROPIC_API_VERSION,
 };
 use palyra_vault::{Vault, VaultRef};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
@@ -28,12 +31,7 @@ const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
 const ANTHROPIC_PROVIDER_KIND: &str = "anthropic";
 const DETERMINISTIC_PROVIDER_KIND: &str = "deterministic";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const OPENAI_CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_CODEX_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const OPENAI_CODEX_MODELS_ENDPOINT: &str =
-    "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
 const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_PROVIDER_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// Request body shared by the test-connection and discover endpoints:
@@ -106,19 +104,6 @@ enum ResolvedCredential {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedOauthProfileKind {
     OpenAiChatGptLogin,
-}
-
-#[derive(Debug, Clone)]
-struct ProviderModelsEndpoint {
-    url: reqwest::Url,
-    base_url: String,
-    response_format: ProviderModelsResponseFormat,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderModelsResponseFormat {
-    OpenAiCompatible,
-    OpenAiCodexBackend,
 }
 
 /// Probes provider connectivity and credentials without model discovery.
@@ -730,8 +715,8 @@ fn oauth_kind_for_profile(
     provider_kind: &AuthProviderKind,
     client_id: Option<&str>,
 ) -> Option<ResolvedOauthProfileKind> {
-    let is_chatgpt_login = provider_kind == &AuthProviderKind::Openai
-        && client_id.map(str::trim).is_some_and(|value| value == OPENAI_CHATGPT_OAUTH_CLIENT_ID);
+    let is_chatgpt_login =
+        provider_kind == &AuthProviderKind::Openai && is_openai_chatgpt_oauth_client_id(client_id);
     is_chatgpt_login.then_some(ResolvedOauthProfileKind::OpenAiChatGptLogin)
 }
 
@@ -783,108 +768,10 @@ fn provider_models_endpoint_for_probe(
     base_url: &str,
     credential: &ResolvedCredential,
 ) -> Result<ProviderModelsEndpoint, anyhow::Error> {
-    if target_uses_openai_chatgpt_oauth(target, credential) {
-        let url = reqwest::Url::parse(OPENAI_CODEX_MODELS_ENDPOINT)
-            .context("invalid OpenAI Codex models endpoint")?;
-        return Ok(ProviderModelsEndpoint {
-            url,
-            base_url: OPENAI_CODEX_BACKEND_BASE_URL.to_owned(),
-            response_format: ProviderModelsResponseFormat::OpenAiCodexBackend,
-        });
-    }
-
-    Ok(ProviderModelsEndpoint {
-        url: provider_models_endpoint(base_url)?,
-        base_url: base_url.trim().trim_end_matches('/').to_owned(),
-        response_format: ProviderModelsResponseFormat::OpenAiCompatible,
-    })
-}
-
-// Configured base URLs appear both with and without a trailing `/v1` or
-// `/openai` segment; normalize so either form probes the same models endpoint.
-fn provider_models_endpoint(base_url: &str) -> Result<reqwest::Url, anyhow::Error> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let raw = if trimmed.ends_with("/v1") || trimmed.ends_with("/openai") {
-        format!("{trimmed}/models")
-    } else {
-        format!("{trimmed}/v1/models")
-    };
-    reqwest::Url::parse(raw.as_str())
-        .with_context(|| format!("invalid provider base_url: {base_url}"))
-}
-
-fn parse_discovered_model_ids(
-    body: &str,
-    response_format: ProviderModelsResponseFormat,
-) -> Result<Vec<String>, anyhow::Error> {
-    match response_format {
-        ProviderModelsResponseFormat::OpenAiCompatible => parse_openai_compatible_model_ids(body),
-        ProviderModelsResponseFormat::OpenAiCodexBackend => parse_openai_codex_model_ids(body),
-    }
-}
-
-fn parse_openai_compatible_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    Ok(value
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default())
-}
-
-fn parse_openai_codex_model_ids(body: &str) -> Result<Vec<String>, anyhow::Error> {
-    let value: serde_json::Value =
-        serde_json::from_str(body).context("provider returned invalid JSON for model discovery")?;
-    let Some(entries) = value.get("models").and_then(serde_json::Value::as_array) else {
-        return parse_openai_compatible_model_ids(body);
-    };
-
-    let mut sortable = Vec::<(i64, String)>::new();
-    for entry in entries {
-        if codex_model_is_hidden(entry) {
-            continue;
-        }
-        let Some(model_id) = entry
-            .get("slug")
-            .or_else(|| entry.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if sortable.iter().any(|(_, existing)| existing == model_id) {
-            continue;
-        }
-        sortable.push((codex_model_priority(entry), model_id.to_owned()));
-    }
-    sortable.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(sortable.into_iter().map(|(_, model_id)| model_id).collect())
-}
-
-fn codex_model_is_hidden(entry: &serde_json::Value) -> bool {
-    entry
-        .get("visibility")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|visibility| matches!(visibility.as_str(), "hide" | "hidden"))
-}
-
-fn codex_model_priority(entry: &serde_json::Value) -> i64 {
-    entry
-        .get("priority")
-        .and_then(|value| {
-            value.as_i64().or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
-        })
-        .unwrap_or(i64::MAX)
+    build_provider_models_endpoint_for_probe(
+        base_url,
+        target_uses_openai_chatgpt_oauth(target, credential),
+    )
 }
 
 fn classify_provider_failure(status_code: u16) -> String {
@@ -928,6 +815,10 @@ mod tests {
     use super::*;
     use palyra_auth::{AuthCredential, AuthProfileRegistry, AuthProviderKind};
     use palyra_common::daemon_config_schema::FileModelProviderRegistryEntry;
+    use palyra_model_providers::{
+        ProviderModelsResponseFormat, OPENAI_CHATGPT_OAUTH_CLIENT_ID,
+        OPENAI_CODEX_BACKEND_BASE_URL, OPENAI_CODEX_MODELS_ENDPOINT,
+    };
     use palyra_vault::{BackendPreference, VaultConfig, VaultScope};
 
     fn sample_probe_target(allow_private_base_url: bool) -> ConsoleProbeTarget {

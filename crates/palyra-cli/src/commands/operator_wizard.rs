@@ -21,13 +21,13 @@ use self::model_auth::{
     GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND, MINIMAX_AUTH_PROVIDER_KIND,
     OPENROUTER_AUTH_PROVIDER_KIND, XAI_AUTH_PROVIDER_KIND,
 };
-use crate::commands::models::{
-    parse_discovered_provider_models, provider_models_endpoint, sanitize_provider_error,
-    select_preferred_discovered_model, select_preferred_discovered_model_id,
-    DiscoveredProviderModel,
-};
+use crate::commands::models::sanitize_provider_error;
 use palyra_common::runtime_preview::{
     RuntimePreviewCapability, RuntimePreviewMode, ALL_RUNTIME_PREVIEW_CAPABILITIES,
+};
+use palyra_model_providers::{
+    parse_discovered_provider_models, provider_models_endpoint, select_preferred_discovered_model,
+    select_preferred_discovered_model_id, DiscoveredProviderModel,
 };
 use reqwest::{
     blocking::Client,
