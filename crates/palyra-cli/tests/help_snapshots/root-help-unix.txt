@@ -52,6 +52,7 @@ Commands:
   policy          Explain policy decisions and authorization posture
   protocol        Validate schema and protocol contract artifacts
   config          Inspect and validate local configuration
+  workers         Inspect networked workers, leases, and cleanup evidence
   models          Inspect and configure model providers and defaults
   patch           Apply workspace patches through the guarded patch engine
   skills          Manage skill packages, trust, and lifecycle gates [aliases: skill]
