@@ -173,6 +173,21 @@ pub(super) fn build_saturation_snapshot(
     if queue.paused {
         reasons.push("queue_paused".to_owned());
     }
+    if queue.due_ingress > 0 {
+        reasons.push(format!("due_ingress={}", queue.due_ingress));
+    }
+    if queue.claimed_ingress > 0 {
+        reasons.push(format!("claimed_ingress={}", queue.claimed_ingress));
+    }
+    if queue.retrying_ingress > 0 {
+        reasons.push(format!("retrying_ingress={}", queue.retrying_ingress));
+    }
+    if queue.failed_ingress > 0 {
+        reasons.push(format!("failed_ingress={}", queue.failed_ingress));
+    }
+    if queue.quarantined_ingress > 0 {
+        reasons.push(format!("quarantined_ingress={}", queue.quarantined_ingress));
+    }
     if queue.due_outbox > 0 {
         reasons.push(format!("due_outbox={}", queue.due_outbox));
     }
@@ -187,12 +202,16 @@ pub(super) fn build_saturation_snapshot(
     }
     let state = if queue.paused {
         "paused"
+    } else if queue.quarantined_ingress > 0 || queue.failed_ingress > 0 {
+        "action_required"
     } else if queue.dead_letters > 0
         || queue.claimed_outbox > 0
+        || queue.claimed_ingress > 0
         || queue.due_outbox >= SATURATED_DUE_OUTBOX_THRESHOLD
+        || queue.due_ingress >= SATURATED_DUE_OUTBOX_THRESHOLD
     {
         "saturated"
-    } else if queue.pending_outbox > 0 || queue.due_outbox > 0 {
+    } else if queue.pending_outbox > 0 || queue.due_outbox > 0 || queue.pending_ingress > 0 {
         "backlogged"
     } else {
         "nominal"

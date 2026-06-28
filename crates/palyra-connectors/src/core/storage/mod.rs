@@ -18,7 +18,9 @@ use rusqlite::{Connection, Transaction};
 use thiserror::Error;
 
 mod dead_letters;
+mod delivery_intents;
 mod events;
+mod ingress;
 mod instances;
 mod outbox;
 mod queue_state;
@@ -29,8 +31,10 @@ mod schema;
 mod tests;
 
 pub use records::{
-    ConnectorEventRecord, ConnectorInstanceRecord, ConnectorQueueSnapshot, DeadLetterRecord,
-    OutboxEnqueueOutcome, OutboxEntryRecord,
+    ChannelIngressEnqueueOutcome, ChannelIngressRecord, ChannelIngressStatus, ConnectorEventRecord,
+    ConnectorInstanceRecord, ConnectorQueueSnapshot, DeadLetterRecord, DeliveryIntentDraft,
+    DeliveryIntentRecord, DeliveryIntentRetryOutcome, DeliveryIntentStatus,
+    IngressBlockedLaneSnapshot, OutboxEnqueueOutcome, OutboxEntryRecord,
 };
 
 /// Handle to the connector sqlite database; cheap to share behind an `Arc`.
@@ -55,10 +59,20 @@ pub enum ConnectorStoreError {
     UnknownReadiness(String),
     #[error("connector storage schema contains unknown liveness '{0}'")]
     UnknownLiveness(String),
+    #[error("connector storage schema contains unknown ingress status '{0}'")]
+    UnknownIngressStatus(String),
+    #[error("connector storage schema contains unknown delivery intent status '{0}'")]
+    UnknownDeliveryIntentStatus(String),
     #[error("connector storage value overflow while converting '{field}'")]
     ValueOverflow { field: &'static str },
     #[error("connector record not found: {0}")]
     NotFound(String),
+    #[error("ingress event not found: {0}")]
+    ChannelIngressNotFound(i64),
+    #[error("delivery intent not found: {0}")]
+    DeliveryIntentNotFound(String),
+    #[error("delivery intent '{intent_id}' cannot be retried from status '{status}'")]
+    InvalidDeliveryIntentRetry { intent_id: String, status: String },
     #[error("outbox entry not found: {0}")]
     OutboxNotFound(i64),
     #[error("dead-letter entry not found: {0}")]
@@ -73,6 +87,7 @@ pub enum ConnectorStoreError {
 /// claim is considered abandoned and the entry becomes reclaimable.
 pub(super) const OUTBOX_CLAIM_LEASE_MS: i64 = 60_000;
 static OUTBOX_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static INGRESS_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 impl ConnectorStore {
     /// Opens (creating if necessary) the database at `path` and applies the schema.
@@ -122,4 +137,9 @@ impl ConnectorStore {
 pub(super) fn next_outbox_claim_token(now_unix_ms: i64) -> String {
     let sequence = OUTBOX_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("claim-{now_unix_ms}-{sequence}")
+}
+
+pub(super) fn next_ingress_claim_token(now_unix_ms: i64) -> String {
+    let sequence = INGRESS_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("ingress-claim-{now_unix_ms}-{sequence}")
 }

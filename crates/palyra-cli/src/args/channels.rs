@@ -673,6 +673,90 @@ pub enum ChannelsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    IngressList {
+        connector_id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    IngressShow {
+        connector_id: String,
+        ingress_event_id: i64,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    DeliveryList {
+        connector_id: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    DeliveryShow {
+        intent_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    DeliveryRetry {
+        intent_id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long, default_value = "user:local")]
+        principal: String,
+        #[arg(long, default_value = "01ARZ3NDEKTSV4RRFFQ69G5FAV")]
+        device_id: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Test {
         connector_id: String,
         #[arg(long)]

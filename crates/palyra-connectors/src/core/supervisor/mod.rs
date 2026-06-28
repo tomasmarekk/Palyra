@@ -25,7 +25,7 @@ mod tests;
 pub use types::{
     ConnectorAdapter, ConnectorAdapterError, ConnectorAdapterSdkDescriptor,
     ConnectorAdapterSdkOperation, ConnectorRouter, ConnectorRouterError, ConnectorSupervisorConfig,
-    ConnectorSupervisorError, DrainOutcome, InboundIngestOutcome,
+    ConnectorSupervisorError, DeliveryPipelineMode, DrainOutcome, InboundIngestOutcome,
 };
 
 /// Orchestrates connector instances: one router, one adapter per

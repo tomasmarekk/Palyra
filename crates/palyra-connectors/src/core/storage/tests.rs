@@ -4,8 +4,13 @@
 use rusqlite::params;
 use tempfile::TempDir;
 
-use super::super::protocol::{ConnectorInstanceSpec, ConnectorKind, OutboundMessageRequest};
-use super::{ConnectorStore, ConnectorStoreError};
+use super::super::protocol::{
+    ConnectorInstanceSpec, ConnectorKind, InboundMessageEvent, OutboundMessageRequest,
+};
+use super::{
+    ChannelIngressStatus, ConnectorStore, ConnectorStoreError, DeliveryIntentDraft,
+    DeliveryIntentStatus,
+};
 
 fn open_store() -> (TempDir, ConnectorStore) {
     let tempdir = TempDir::new().expect("tempdir should initialize");
@@ -50,6 +55,24 @@ fn sample_outbound_for_connector(connector_id: &str, envelope_id: &str) -> Outbo
         a2ui_update: None,
         timeout_ms: 30_000,
         max_payload_bytes: 16_384,
+    }
+}
+
+fn sample_inbound(envelope_id: &str, conversation_id: &str) -> InboundMessageEvent {
+    InboundMessageEvent {
+        envelope_id: envelope_id.to_owned(),
+        connector_id: "echo:default".to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        thread_id: None,
+        sender_id: "u1".to_owned(),
+        sender_display: None,
+        body: "hello".to_owned(),
+        adapter_message_id: Some(format!("adapter-{envelope_id}")),
+        adapter_thread_id: None,
+        received_at_unix_ms: 1_000,
+        is_direct_message: true,
+        requested_broadcast: false,
+        attachments: Vec::new(),
     }
 }
 
@@ -116,6 +139,167 @@ fn outbox_enforces_idempotent_unique_envelope_per_connector() {
 
     assert!(created.created, "first enqueue must create a record");
     assert!(!duplicate.created, "duplicate envelope must be ignored");
+}
+
+#[test]
+fn channel_ingress_persists_payload_hash_and_tombstone_dedupes() {
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    let event = sample_inbound("env-ingress", "conv-1");
+
+    let first = store
+        .enqueue_channel_ingress_if_absent(&event, "channel:echo:default", 1_000, 3, 10_000)
+        .expect("first ingress enqueue should succeed");
+    let duplicate = store
+        .enqueue_channel_ingress_if_absent(&event, "channel:echo:default", 1_100, 3, 10_000)
+        .expect("duplicate ingress enqueue should succeed");
+
+    assert!(first.created);
+    assert!(!duplicate.created);
+    assert_eq!(first.record.payload_hash, duplicate.record.payload_hash);
+    assert_eq!(duplicate.record.status, ChannelIngressStatus::Pending);
+    assert_eq!(duplicate.record.payload.body, "hello");
+}
+
+#[test]
+fn channel_ingress_claims_preserve_lane_order_and_reclaim_stale_claims() {
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    store
+        .enqueue_channel_ingress_if_absent(
+            &sample_inbound("env-a", "conv-1"),
+            "channel:echo:default",
+            1_000,
+            3,
+            10_000,
+        )
+        .expect("first ingress enqueue should succeed");
+    store
+        .enqueue_channel_ingress_if_absent(
+            &sample_inbound("env-b", "conv-1"),
+            "channel:echo:default",
+            1_001,
+            3,
+            10_000,
+        )
+        .expect("second same-lane ingress enqueue should succeed");
+    store
+        .enqueue_channel_ingress_if_absent(
+            &sample_inbound("env-c", "conv-2"),
+            "channel:echo:default",
+            1_002,
+            3,
+            10_000,
+        )
+        .expect("parallel lane ingress enqueue should succeed");
+
+    let first_claim = store
+        .load_due_channel_ingress(1_100, 10, Some("echo:default"), 100, false)
+        .expect("due ingress claim should succeed");
+    let claimed_envelopes =
+        first_claim.iter().map(|record| record.envelope_id.as_str()).collect::<Vec<_>>();
+    assert_eq!(claimed_envelopes, vec!["env-a", "env-c"]);
+
+    let second_claim = store
+        .load_due_channel_ingress(1_150, 10, Some("echo:default"), 100, false)
+        .expect("active claims should not be reclaimed");
+    assert!(second_claim.is_empty());
+
+    let reclaimed = store
+        .load_due_channel_ingress(1_250, 10, Some("echo:default"), 100, false)
+        .expect("stale claim should be reclaimed");
+    let reclaimed_envelopes =
+        reclaimed.iter().map(|record| record.envelope_id.as_str()).collect::<Vec<_>>();
+    assert_eq!(reclaimed_envelopes, vec!["env-a", "env-c"]);
+    let snapshot = store
+        .queue_snapshot("echo:default", 1_250)
+        .expect("queue snapshot should include blocked lanes");
+    assert_eq!(snapshot.claimed_ingress, 2);
+    assert_eq!(snapshot.blocked_ingress_lanes.len(), 2);
+}
+
+#[test]
+fn delivery_intent_lifecycle_reports_without_raw_payload_and_retries_safe_state() {
+    let (_tempdir, store) = open_store();
+    store.upsert_instance(&sample_spec(), 1_000).expect("instance should be created");
+    let ingress = store
+        .enqueue_channel_ingress_if_absent(
+            &sample_inbound("env-delivery", "conv-1"),
+            "channel:echo:default",
+            1_000,
+            3,
+            10_000,
+        )
+        .expect("ingress enqueue should succeed")
+        .record;
+    let request = sample_outbound("env-delivery:0");
+    store.enqueue_outbox_if_absent(&request, 3, 1_000).expect("outbox enqueue should succeed");
+    let draft = DeliveryIntentDraft {
+        intent_id: "delivery:echo:default:1:env-delivery:0".to_owned(),
+        connector_id: "echo:default".to_owned(),
+        ingress_event_id: ingress.ingress_event_id,
+        ingress_envelope_id: ingress.envelope_id,
+        session_id: Some("session-1".to_owned()),
+        run_id: Some("run-1".to_owned()),
+        principal: "channel:echo:default".to_owned(),
+        conversation_id: "conv-1".to_owned(),
+        outbox_envelope_id: request.envelope_id.clone(),
+        output_index: 0,
+        payload_hash: "hash-visible".to_owned(),
+        visible_text_preview: "hello".to_owned(),
+        status: DeliveryIntentStatus::Queued,
+        redaction_summary_json: Some(r#"{"redaction_count":1}"#.to_owned()),
+    };
+
+    let intent =
+        store.upsert_delivery_intent(&draft, 1_000).expect("delivery intent should upsert");
+    assert_eq!(intent.status, DeliveryIntentStatus::Queued);
+    assert_eq!(intent.visible_text_preview, "hello");
+    assert_eq!(intent.payload_hash, "hash-visible");
+
+    store
+        .mark_delivery_intent_send_started_for_outbox("echo:default", "env-delivery:0", 1_100)
+        .expect("send-start transition should succeed");
+    let started = store.get_delivery_intent(draft.intent_id.as_str()).expect("intent should load");
+    assert_eq!(started.status, DeliveryIntentStatus::AdapterSendStarted);
+    assert_eq!(started.send_attempts, 1);
+
+    store
+        .mark_delivery_intent_unknown_for_outbox(
+            "echo:default",
+            "env-delivery:0",
+            "transient_network",
+            1_200,
+        )
+        .expect("unknown transition should succeed");
+    let retry = store
+        .retry_delivery_intent(draft.intent_id.as_str(), 3, 1_300)
+        .expect("platform-unknown intent should be retryable");
+    assert!(retry.requeued);
+    assert_eq!(retry.intent.status, DeliveryIntentStatus::Queued);
+
+    store
+        .mark_delivery_intent_delivered_for_outbox(
+            "echo:default",
+            "env-delivery:0",
+            "native-1",
+            1_400,
+        )
+        .expect("delivery transition should succeed");
+    let delivered =
+        store.get_delivery_intent(draft.intent_id.as_str()).expect("delivered intent should load");
+    assert_eq!(delivered.status, DeliveryIntentStatus::Delivered);
+    assert_eq!(delivered.native_message_id.as_deref(), Some("native-1"));
+    assert!(
+        serde_json::to_string(&delivered)
+            .expect("delivery intent report should encode")
+            .contains("hello"),
+        "report should include only visible preview, not raw outbox payload"
+    );
+    let error = store
+        .retry_delivery_intent(draft.intent_id.as_str(), 3, 1_500)
+        .expect_err("delivered intent must not be retryable");
+    assert!(matches!(error, ConnectorStoreError::InvalidDeliveryIntentRetry { .. }));
 }
 
 #[test]

@@ -135,6 +135,10 @@ pub struct RouteInboundResult {
     pub decision_reason: String,
     pub outputs: Vec<RoutedOutboundMessage>,
     pub route_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub retry_attempt: u32,
     #[serde(default)]
     pub route_message_latency_ms: Option<u64>,

@@ -168,6 +168,18 @@ impl ConnectorStore {
                 "DELETE FROM inbound_dedupe WHERE connector_id = ?1",
                 params![connector_id],
             )?;
+            transaction.execute(
+                "DELETE FROM channel_ingress_events WHERE connector_id = ?1",
+                params![connector_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM delivery_transcript_mirror WHERE connector_id = ?1",
+                params![connector_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM delivery_intents WHERE connector_id = ?1",
+                params![connector_id],
+            )?;
             transaction
                 .execute("DELETE FROM outbox WHERE connector_id = ?1", params![connector_id])?;
             let changed = transaction.execute(

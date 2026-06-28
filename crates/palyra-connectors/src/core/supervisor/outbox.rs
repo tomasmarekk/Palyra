@@ -98,6 +98,12 @@ impl ConnectorSupervisor {
                 "connector instance not found",
                 now,
             )?;
+            self.store.mark_delivery_intent_dead_lettered_for_outbox(
+                entry.connector_id.as_str(),
+                entry.envelope_id.as_str(),
+                "connector instance not found",
+                now,
+            )?;
             return Ok(DispatchResult::DeadLettered);
         };
         if !instance.enabled {
@@ -111,6 +117,12 @@ impl ConnectorSupervisor {
                 "connector disabled",
                 retry_at,
             )?;
+            self.store.mark_delivery_intent_unknown_for_outbox(
+                instance.connector_id.as_str(),
+                entry.envelope_id.as_str(),
+                "connector disabled",
+                now,
+            )?;
             return Ok(DispatchResult::Retried);
         }
 
@@ -118,6 +130,12 @@ impl ConnectorSupervisor {
             self.store.move_outbox_to_dead_letter(
                 entry.outbox_id,
                 entry.claim_token.as_str(),
+                "connector adapter implementation missing",
+                now,
+            )?;
+            self.store.mark_delivery_intent_dead_lettered_for_outbox(
+                instance.connector_id.as_str(),
+                entry.envelope_id.as_str(),
                 "connector adapter implementation missing",
                 now,
             )?;
@@ -138,6 +156,11 @@ impl ConnectorSupervisor {
         // Transport-level adapter errors are not terminal: treat them as a
         // transient-network retry so the normal backoff/dead-letter budget
         // applies instead of failing the whole drain pass.
+        self.store.mark_delivery_intent_send_started_for_outbox(
+            instance.connector_id.as_str(),
+            entry.envelope_id.as_str(),
+            now,
+        )?;
         let delivery = match adapter.send_outbound(&instance, &entry.payload).await {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -178,6 +201,12 @@ impl ConnectorSupervisor {
                     native_message_id.as_str(),
                     now_unix_ms,
                 )?;
+                self.store.mark_delivery_intent_delivered_for_outbox(
+                    instance.connector_id.as_str(),
+                    entry.envelope_id.as_str(),
+                    native_message_id.as_str(),
+                    now_unix_ms,
+                )?;
                 self.store.record_last_outbound(instance.connector_id.as_str(), now_unix_ms)?;
                 self.store.record_event(
                     instance.connector_id.as_str(),
@@ -200,6 +229,12 @@ impl ConnectorSupervisor {
                     self.store.move_outbox_to_dead_letter(
                         entry.outbox_id,
                         entry.claim_token.as_str(),
+                        reason.as_str(),
+                        now_unix_ms,
+                    )?;
+                    self.store.mark_delivery_intent_dead_lettered_for_outbox(
+                        instance.connector_id.as_str(),
+                        entry.envelope_id.as_str(),
                         reason.as_str(),
                         now_unix_ms,
                     )?;
@@ -229,6 +264,12 @@ impl ConnectorSupervisor {
                     attempts,
                     reason.as_str(),
                     next_attempt_unix_ms,
+                )?;
+                self.store.mark_delivery_intent_unknown_for_outbox(
+                    instance.connector_id.as_str(),
+                    entry.envelope_id.as_str(),
+                    reason.as_str(),
+                    now_unix_ms,
                 )?;
                 if matches!(class, RetryClass::ConnectorRestarting) {
                     self.store.increment_restart_count(
@@ -270,6 +311,12 @@ impl ConnectorSupervisor {
                 self.store.move_outbox_to_dead_letter(
                     entry.outbox_id,
                     entry.claim_token.as_str(),
+                    reason.as_str(),
+                    now_unix_ms,
+                )?;
+                self.store.mark_delivery_intent_dead_lettered_for_outbox(
+                    instance.connector_id.as_str(),
+                    entry.envelope_id.as_str(),
                     reason.as_str(),
                     now_unix_ms,
                 )?;

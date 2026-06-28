@@ -10,6 +10,7 @@
 //! canonicalization, gateway auth resolution, and proto mapping.
 
 use std::{
+    env,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,14 +18,16 @@ use std::{
 
 use palyra_common::{validate_canonical_id, CANONICAL_PROTOCOL_MAJOR};
 use palyra_connectors::{
-    providers::default_adapters, ConnectorAvailability, ConnectorConversationTarget, ConnectorKind,
-    ConnectorMessageDeleteRequest, ConnectorMessageEditRequest, ConnectorMessageLocator,
-    ConnectorMessageMutationResult, ConnectorMessageReactionRequest, ConnectorMessageReadRequest,
-    ConnectorMessageReadResult, ConnectorMessageRecord, ConnectorMessageSearchRequest,
-    ConnectorMessageSearchResult, ConnectorQueueSnapshot, ConnectorRouter, ConnectorRouterError,
-    ConnectorStatusSnapshot, ConnectorSupervisor, ConnectorSupervisorConfig,
-    ConnectorSupervisorError, DeadLetterRecord, DrainOutcome, InboundIngestOutcome,
-    InboundMessageEvent, RouteInboundResult, RoutedOutboundMessage,
+    providers::default_adapters, ChannelIngressRecord, ChannelIngressStatus, ConnectorAvailability,
+    ConnectorConversationTarget, ConnectorKind, ConnectorMessageDeleteRequest,
+    ConnectorMessageEditRequest, ConnectorMessageLocator, ConnectorMessageMutationResult,
+    ConnectorMessageReactionRequest, ConnectorMessageReadRequest, ConnectorMessageReadResult,
+    ConnectorMessageRecord, ConnectorMessageSearchRequest, ConnectorMessageSearchResult,
+    ConnectorQueueSnapshot, ConnectorRouter, ConnectorRouterError, ConnectorStatusSnapshot,
+    ConnectorSupervisor, ConnectorSupervisorConfig, ConnectorSupervisorError, DeadLetterRecord,
+    DeliveryIntentRecord, DeliveryIntentRetryOutcome, DeliveryIntentStatus, DeliveryPipelineMode,
+    DrainOutcome, InboundIngestOutcome, InboundMessageEvent, RouteInboundResult,
+    RoutedOutboundMessage,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -167,6 +170,7 @@ pub struct ChannelPlatform {
     supervisor: Arc<ConnectorSupervisor>,
     media_store: Arc<MediaArtifactStore>,
     worker_interval: Duration,
+    supervisor_config: ConnectorSupervisorConfig,
 }
 
 impl ChannelPlatform {
@@ -191,16 +195,18 @@ impl ChannelPlatform {
         )?);
         let router =
             Arc::new(GrpcChannelRouter { grpc_url, auth, media_store: Arc::clone(&media_store) });
+        let supervisor_config = connector_supervisor_config_from_env()?;
         let supervisor = Arc::new(ConnectorSupervisor::new(
             Arc::clone(&store),
             router,
             default_adapters(),
-            ConnectorSupervisorConfig::default(),
+            supervisor_config.clone(),
         ));
         let platform = Self {
             supervisor,
             media_store,
             worker_interval: Duration::from_millis(DEFAULT_CHANNEL_WORKER_INTERVAL_MS),
+            supervisor_config,
         };
         platform.ensure_default_connector_inventory()?;
         Ok(platform)
@@ -346,6 +352,97 @@ impl ChannelPlatform {
         self.ensure_operator_visible(connector_id)?;
         self.supervisor
             .list_dead_letters(connector_id, limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT))
+            .map_err(ChannelPlatformError::from)
+    }
+
+    /// Returns recent durable ingress events for a connector.
+    ///
+    /// # Errors
+    /// Returns visibility or storage errors.
+    pub fn ingress_events(
+        &self,
+        connector_id: &str,
+        status: Option<ChannelIngressStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ChannelIngressRecord>, ChannelPlatformError> {
+        self.ensure_operator_visible(connector_id)?;
+        self.supervisor
+            .store()
+            .list_channel_ingress_events(
+                connector_id,
+                status,
+                limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT),
+            )
+            .map_err(ChannelPlatformError::from)
+    }
+
+    /// Returns one durable ingress event.
+    ///
+    /// # Errors
+    /// Returns visibility or storage errors.
+    pub fn ingress_event(
+        &self,
+        connector_id: &str,
+        ingress_event_id: i64,
+    ) -> Result<ChannelIngressRecord, ChannelPlatformError> {
+        self.ensure_operator_visible(connector_id)?;
+        self.supervisor
+            .store()
+            .get_channel_ingress_event(connector_id, ingress_event_id)
+            .map_err(ChannelPlatformError::from)
+    }
+
+    /// Returns recent delivery intents for a connector.
+    ///
+    /// # Errors
+    /// Returns visibility or storage errors.
+    pub fn delivery_intents(
+        &self,
+        connector_id: &str,
+        status: Option<DeliveryIntentStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DeliveryIntentRecord>, ChannelPlatformError> {
+        self.ensure_operator_visible(connector_id)?;
+        self.supervisor
+            .store()
+            .list_delivery_intents(connector_id, status, limit.unwrap_or(DEFAULT_LOG_PAGE_LIMIT))
+            .map_err(ChannelPlatformError::from)
+    }
+
+    /// Returns one delivery intent.
+    ///
+    /// # Errors
+    /// Returns storage errors, including unknown intent ids.
+    pub fn delivery_intent(
+        &self,
+        intent_id: &str,
+    ) -> Result<DeliveryIntentRecord, ChannelPlatformError> {
+        let intent = self
+            .supervisor
+            .store()
+            .get_delivery_intent(intent_id)
+            .map_err(ChannelPlatformError::from)?;
+        self.ensure_operator_visible(intent.connector_id.as_str())?;
+        Ok(intent)
+    }
+
+    /// Requeues a delivery intent from a safe retry state.
+    ///
+    /// # Errors
+    /// Returns storage errors, including unsafe current states.
+    pub fn retry_delivery_intent(
+        &self,
+        intent_id: &str,
+    ) -> Result<DeliveryIntentRetryOutcome, ChannelPlatformError> {
+        let intent = self.delivery_intent(intent_id)?;
+        self.ensure_operator_visible(intent.connector_id.as_str())?;
+        self.supervisor
+            .store()
+            .retry_delivery_intent(
+                intent_id,
+                self.supervisor_config().max_retry_attempts,
+                unix_ms_now(),
+            )
             .map_err(ChannelPlatformError::from)
     }
 
@@ -647,6 +744,10 @@ impl ChannelPlatform {
     /// Returns supervisor errors from the drain.
     pub async fn drain_due(&self) -> Result<palyra_connectors::DrainOutcome, ChannelPlatformError> {
         self.supervisor
+            .process_due_ingress(self.supervisor_config().background_drain_batch_size)
+            .await
+            .map_err(ChannelPlatformError::from)?;
+        self.supervisor
             .drain_due_outbox(self.supervisor_config().background_drain_batch_size)
             .await
             .map_err(ChannelPlatformError::from)
@@ -662,6 +763,14 @@ impl ChannelPlatform {
         connector_id: &str,
     ) -> Result<DrainOutcome, ChannelPlatformError> {
         self.ensure_operator_visible(connector_id)?;
+        self.supervisor
+            .process_due_ingress_for_connector(
+                connector_id,
+                self.supervisor_config().background_drain_batch_size,
+                true,
+            )
+            .await
+            .map_err(ChannelPlatformError::from)?;
         self.supervisor
             .drain_due_outbox_for_connector_force(
                 connector_id,
@@ -710,7 +819,7 @@ impl ChannelPlatform {
     }
 
     fn supervisor_config(&self) -> ConnectorSupervisorConfig {
-        ConnectorSupervisorConfig::default()
+        self.supervisor_config.clone()
     }
 
     /// Recovers the provider-native message id of a delivered envelope by
@@ -768,6 +877,45 @@ impl ChannelPlatform {
         }
         Ok(())
     }
+}
+
+fn connector_supervisor_config_from_env() -> Result<ConnectorSupervisorConfig, ChannelPlatformError>
+{
+    let mut config = ConnectorSupervisorConfig::default();
+    if let Some(mode) = optional_env("PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE") {
+        config.delivery_pipeline_mode =
+            DeliveryPipelineMode::parse(mode.as_str()).ok_or_else(|| {
+                ChannelPlatformError::InvalidInput(
+                    "PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE must be off, shadow, or enforce"
+                        .to_owned(),
+                )
+            })?;
+    }
+    if let Some(value) = optional_env("PALYRA_CHANNEL_INGRESS_CLAIM_LEASE_MS") {
+        config.ingress_claim_lease_ms =
+            parse_positive_i64_env("PALYRA_CHANNEL_INGRESS_CLAIM_LEASE_MS", value.as_str())?;
+    }
+    if let Some(value) = optional_env("PALYRA_CHANNEL_INGRESS_MAX_RETRY_ATTEMPTS") {
+        config.max_ingress_retry_attempts =
+            parse_positive_u32_env("PALYRA_CHANNEL_INGRESS_MAX_RETRY_ATTEMPTS", value.as_str())?;
+    }
+    Ok(config)
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn parse_positive_i64_env(name: &str, value: &str) -> Result<i64, ChannelPlatformError> {
+    value.trim().parse::<i64>().ok().filter(|parsed| *parsed > 0).ok_or_else(|| {
+        ChannelPlatformError::InvalidInput(format!("{name} must be a positive integer"))
+    })
+}
+
+fn parse_positive_u32_env(name: &str, value: &str) -> Result<u32, ChannelPlatformError> {
+    value.trim().parse::<u32>().ok().filter(|parsed| *parsed > 0).ok_or_else(|| {
+        ChannelPlatformError::InvalidInput(format!("{name} must be a positive integer"))
+    })
 }
 
 /// Connector-to-gateway bridge: canonicalizes Discord identities,
@@ -912,6 +1060,8 @@ impl ConnectorRouter for GrpcChannelRouter {
             decision_reason: response.decision_reason,
             outputs,
             route_key: non_empty(response.route_key),
+            session_id: response.session_id.map(|value| value.ulid),
+            run_id: response.run_id.map(|value| value.ulid),
             retry_attempt: response.retry_attempt,
             route_message_latency_ms: Some(route_message_latency_ms),
         })
@@ -929,9 +1079,10 @@ mod tests {
     use super::attachments::render_attachment_context;
     use super::{
         default_connector_specs, discord, discord_connector_id, discord_token_vault_ref,
-        from_proto_a2ui_update, normalize_discord_account_id, resolve_connector_gateway_auth,
-        route_message_max_payload_bytes, to_proto_message_attachments, with_attachment_context,
-        ChannelPlatform, ChannelPlatformError,
+        from_proto_a2ui_update, normalize_discord_account_id, parse_positive_i64_env,
+        parse_positive_u32_env, resolve_connector_gateway_auth, route_message_max_payload_bytes,
+        to_proto_message_attachments, with_attachment_context, ChannelPlatform,
+        ChannelPlatformError,
     };
     use crate::gateway::GatewayAuthConfig;
     use crate::media::MediaRuntimeConfig;
@@ -1179,6 +1330,29 @@ mod tests {
         assert_ne!(
             max_payload_bytes, 5,
             "route reply chunking must not collapse to the size of a short inbound prompt"
+        );
+    }
+
+    #[test]
+    fn channel_rollout_env_parsers_reject_non_positive_values() {
+        assert_eq!(
+            parse_positive_i64_env("PALYRA_CHANNEL_INGRESS_CLAIM_LEASE_MS", "250")
+                .expect("positive lease should parse"),
+            250
+        );
+        assert!(
+            parse_positive_i64_env("PALYRA_CHANNEL_INGRESS_CLAIM_LEASE_MS", "0").is_err(),
+            "zero claim lease should fail fast"
+        );
+        assert_eq!(
+            parse_positive_u32_env("PALYRA_CHANNEL_INGRESS_MAX_RETRY_ATTEMPTS", "3")
+                .expect("positive max retry count should parse"),
+            3
+        );
+        assert!(
+            parse_positive_u32_env("PALYRA_CHANNEL_INGRESS_MAX_RETRY_ATTEMPTS", "not-a-number")
+                .is_err(),
+            "invalid retry count should fail fast"
         );
     }
 

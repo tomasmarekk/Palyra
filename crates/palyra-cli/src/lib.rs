@@ -2903,11 +2903,13 @@ fn build_support_bundle_journal_snapshot(
                 queue_state: unavailable_support_bundle_queue_state(error.to_string()),
                 recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
+                channel_delivery: unavailable_support_bundle_channel_delivery(error.to_string()),
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
         }
     };
     let db_path = path.to_string_lossy().into_owned();
+    let channel_delivery = read_support_bundle_channel_delivery_for_journal_path(path.as_path());
     if !path.exists() || !path.is_file() {
         return SupportBundleJournalSnapshot {
             db_path,
@@ -2923,6 +2925,7 @@ fn build_support_bundle_journal_snapshot(
             flow_timeline: unavailable_support_bundle_flow_timeline(
                 "journal database is unavailable",
             ),
+            channel_delivery,
             error: Some("journal database is unavailable".to_owned()),
         };
     }
@@ -2940,6 +2943,7 @@ fn build_support_bundle_journal_snapshot(
                 queue_state: unavailable_support_bundle_queue_state(error.to_string()),
                 recall_artifacts: unavailable_support_bundle_recall_artifacts(error.to_string()),
                 flow_timeline: unavailable_support_bundle_flow_timeline(error.to_string()),
+                channel_delivery,
                 error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
             };
         }
@@ -2963,6 +2967,7 @@ fn build_support_bundle_journal_snapshot(
         queue_state,
         recall_artifacts,
         flow_timeline,
+        channel_delivery,
         error: None,
     }
 }
@@ -3003,6 +3008,205 @@ fn unavailable_support_bundle_flow_timeline(
         recent_events: Vec::new(),
         error: Some(sanitize_diagnostic_error(error.as_str())),
     }
+}
+
+fn unavailable_support_bundle_channel_delivery(
+    error: impl Into<String>,
+) -> SupportBundleChannelDeliverySnapshot {
+    SupportBundleChannelDeliverySnapshot {
+        available: false,
+        connector_db_path: None,
+        ingress_by_status: BTreeMap::new(),
+        delivery_by_status: BTreeMap::new(),
+        recent_ingress: Vec::new(),
+        recent_delivery: Vec::new(),
+        error: Some(sanitize_diagnostic_error(error.into().as_str())),
+    }
+}
+
+fn read_support_bundle_channel_delivery_for_journal_path(
+    journal_path: &Path,
+) -> SupportBundleChannelDeliverySnapshot {
+    let connector_db_path = connector_db_path_from_journal_path(journal_path);
+    read_support_bundle_channel_delivery(connector_db_path.as_path())
+}
+
+fn connector_db_path_from_journal_path(journal_path: &Path) -> PathBuf {
+    let Some(parent) = journal_path.parent().filter(|path| !path.as_os_str().is_empty()) else {
+        return PathBuf::from("data").join("connectors.sqlite3");
+    };
+    let Some(stem) = journal_path.file_stem().and_then(OsStr::to_str) else {
+        return parent.join("connectors.sqlite3");
+    };
+    if stem == "journal" {
+        return parent.join("connectors.sqlite3");
+    }
+    parent.join(format!("{stem}.connectors.sqlite3"))
+}
+
+fn read_support_bundle_channel_delivery(
+    connector_db_path: &Path,
+) -> SupportBundleChannelDeliverySnapshot {
+    let connector_db_path_string = connector_db_path.to_string_lossy().into_owned();
+    if !connector_db_path.exists() || !connector_db_path.is_file() {
+        return SupportBundleChannelDeliverySnapshot {
+            connector_db_path: Some(connector_db_path_string),
+            ..unavailable_support_bundle_channel_delivery("connector database is unavailable")
+        };
+    }
+    let connection = match Connection::open(connector_db_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return SupportBundleChannelDeliverySnapshot {
+                connector_db_path: Some(connector_db_path_string),
+                ..unavailable_support_bundle_channel_delivery(error.to_string())
+            };
+        }
+    };
+    let ingress_by_status = match read_grouped_count(
+        &connection,
+        "SELECT status, COUNT(*) FROM channel_ingress_events GROUP BY status",
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return SupportBundleChannelDeliverySnapshot {
+                connector_db_path: Some(connector_db_path_string),
+                ..unavailable_support_bundle_channel_delivery(error.to_string())
+            };
+        }
+    };
+    let delivery_by_status = match read_grouped_count(
+        &connection,
+        "SELECT status, COUNT(*) FROM delivery_intents GROUP BY status",
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return SupportBundleChannelDeliverySnapshot {
+                connector_db_path: Some(connector_db_path_string),
+                ..unavailable_support_bundle_channel_delivery(error.to_string())
+            };
+        }
+    };
+    let recent_ingress = match read_recent_support_bundle_channel_ingress(&connection, 16) {
+        Ok(value) => value,
+        Err(error) => {
+            return SupportBundleChannelDeliverySnapshot {
+                connector_db_path: Some(connector_db_path_string),
+                ..unavailable_support_bundle_channel_delivery(error.to_string())
+            };
+        }
+    };
+    let recent_delivery = match read_recent_support_bundle_delivery_intents(&connection, 16) {
+        Ok(value) => value,
+        Err(error) => {
+            return SupportBundleChannelDeliverySnapshot {
+                connector_db_path: Some(connector_db_path_string),
+                ..unavailable_support_bundle_channel_delivery(error.to_string())
+            };
+        }
+    };
+    SupportBundleChannelDeliverySnapshot {
+        available: true,
+        connector_db_path: Some(connector_db_path_string),
+        ingress_by_status,
+        delivery_by_status,
+        recent_ingress,
+        recent_delivery,
+        error: None,
+    }
+}
+
+fn read_recent_support_bundle_channel_ingress(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<SupportBundleChannelIngressRecord>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT ingress_event_id, connector_id, conversation_id, envelope_id, payload_hash, status, \
+                lane_key, attempts, last_error_reason_code, route_key, session_id, run_id, updated_at_unix_ms \
+         FROM channel_ingress_events ORDER BY updated_at_unix_ms DESC, ingress_event_id DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        let connector_id: String = row.get(1)?;
+        let conversation_id: String = row.get(2)?;
+        let envelope_id: String = row.get(3)?;
+        let lane_key: String = row.get(6)?;
+        let route_key: Option<String> = row.get(9)?;
+        let session_id: Option<String> = row.get(10)?;
+        let run_id: Option<String> = row.get(11)?;
+        Ok(SupportBundleChannelIngressRecord {
+            ingress_event_id: row.get(0)?,
+            connector_ref: redacted_support_bundle_identifier(connector_id.as_str()),
+            conversation_ref: redacted_support_bundle_identifier(conversation_id.as_str()),
+            envelope_ref: redacted_support_bundle_identifier(envelope_id.as_str()),
+            payload_hash: row.get(4)?,
+            status: row.get(5)?,
+            lane_ref: redacted_support_bundle_identifier(lane_key.as_str()),
+            attempts: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+            last_error_reason_code: row.get(8)?,
+            route_key_ref: route_key
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            session_ref: session_id
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            run_ref: run_id
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            updated_at_unix_ms: row.get(12)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .context("failed to read support-bundle channel ingress")
+}
+
+fn read_recent_support_bundle_delivery_intents(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<SupportBundleDeliveryIntentRecord>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(
+        "SELECT intent_id, connector_id, ingress_event_id, ingress_envelope_id, session_id, run_id, \
+                outbox_envelope_id, status, send_attempts, native_message_id, last_reason_code, updated_at_unix_ms \
+         FROM delivery_intents ORDER BY updated_at_unix_ms DESC, intent_id ASC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        let intent_id: String = row.get(0)?;
+        let connector_id: String = row.get(1)?;
+        let ingress_envelope_id: String = row.get(3)?;
+        let session_id: Option<String> = row.get(4)?;
+        let run_id: Option<String> = row.get(5)?;
+        let outbox_envelope_id: String = row.get(6)?;
+        let native_message_id: Option<String> = row.get(9)?;
+        Ok(SupportBundleDeliveryIntentRecord {
+            intent_ref: redacted_support_bundle_identifier(intent_id.as_str()),
+            connector_ref: redacted_support_bundle_identifier(connector_id.as_str()),
+            ingress_event_id: row.get(2)?,
+            ingress_envelope_ref: redacted_support_bundle_identifier(ingress_envelope_id.as_str()),
+            session_ref: session_id
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            run_ref: run_id
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            outbox_envelope_ref: redacted_support_bundle_identifier(outbox_envelope_id.as_str()),
+            status: row.get(7)?,
+            send_attempts: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+            native_message_ref: native_message_id
+                .as_deref()
+                .map(redacted_support_bundle_identifier)
+                .filter(|value| !value.is_empty()),
+            last_reason_code: row.get(10)?,
+            updated_at_unix_ms: row.get(11)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .context("failed to read support-bundle delivery intents")
 }
 
 fn read_support_bundle_queue_state(connection: &Connection) -> SupportBundleQueueStateSnapshot {
@@ -12058,6 +12262,7 @@ struct SupportBundleJournalSnapshot {
     queue_state: SupportBundleQueueStateSnapshot,
     recall_artifacts: SupportBundleRecallArtifactsSnapshot,
     flow_timeline: SupportBundleFlowTimelineSnapshot,
+    channel_delivery: SupportBundleChannelDeliverySnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -12153,6 +12358,60 @@ struct SupportBundleFlowEventRecord {
     to_state: Option<String>,
     summary: String,
     created_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleChannelDeliverySnapshot {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connector_db_path: Option<String>,
+    ingress_by_status: BTreeMap<String, u64>,
+    delivery_by_status: BTreeMap<String, u64>,
+    recent_ingress: Vec<SupportBundleChannelIngressRecord>,
+    recent_delivery: Vec<SupportBundleDeliveryIntentRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleChannelIngressRecord {
+    ingress_event_id: i64,
+    connector_ref: String,
+    conversation_ref: String,
+    envelope_ref: String,
+    payload_hash: String,
+    status: String,
+    lane_ref: String,
+    attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_key_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_ref: Option<String>,
+    updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleDeliveryIntentRecord {
+    intent_ref: String,
+    connector_ref: String,
+    ingress_event_id: i64,
+    ingress_envelope_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_ref: Option<String>,
+    outbox_envelope_ref: String,
+    status: String,
+    send_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_message_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reason_code: Option<String>,
+    updated_at_unix_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -13853,13 +14112,15 @@ mod init_command_tests {
 mod diagnostics_bundle_tests {
     use super::{
         build_support_bundle_incident_checklists, build_support_bundle_operator_runbooks,
-        encode_support_bundle_with_cap, extract_support_bundle_error_message,
-        read_recent_support_bundle_recall_artifacts, read_support_bundle_flow_timeline,
-        unavailable_support_bundle_queue_state, unavailable_support_bundle_recall_artifacts,
-        DoctorAccessSnapshot, DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
-        DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot,
-        DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
-        DoctorSummary, SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
+        connector_db_path_from_journal_path, encode_support_bundle_with_cap,
+        extract_support_bundle_error_message, read_recent_support_bundle_recall_artifacts,
+        read_support_bundle_channel_delivery, read_support_bundle_flow_timeline,
+        unavailable_support_bundle_channel_delivery, unavailable_support_bundle_queue_state,
+        unavailable_support_bundle_recall_artifacts, DoctorAccessSnapshot, DoctorBrowserSnapshot,
+        DoctorConfigSnapshot, DoctorConnectivityProbe, DoctorConnectivitySnapshot,
+        DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorIdentitySnapshot,
+        DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot, DoctorSummary,
+        SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
         SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
@@ -14207,6 +14468,9 @@ mod diagnostics_bundle_tests {
                     recent_events: Vec::new(),
                     error: None,
                 },
+                channel_delivery: unavailable_support_bundle_channel_delivery(
+                    "not loaded in test bundle",
+                ),
                 error: None,
             },
             truncated: false,
@@ -14232,6 +14496,99 @@ mod diagnostics_bundle_tests {
                 && !extracted.contains("abc123")
                 && !extracted.contains("qwerty"),
             "extracted error message must not leak raw secret values: {extracted}"
+        );
+    }
+
+    #[test]
+    fn support_bundle_connector_db_path_matches_daemon_channel_convention() {
+        assert_eq!(
+            connector_db_path_from_journal_path(std::path::Path::new("data/journal.sqlite3")),
+            std::path::PathBuf::from("data/connectors.sqlite3")
+        );
+        assert_eq!(
+            connector_db_path_from_journal_path(std::path::Path::new("data/palyra-daemon.sqlite3")),
+            std::path::PathBuf::from("data/palyra-daemon.connectors.sqlite3")
+        );
+    }
+
+    #[test]
+    fn support_bundle_channel_delivery_snapshot_redacts_payload_identifiers() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let connector_db_path = tempdir.path().join("connectors.sqlite3");
+        let connection =
+            Connection::open(connector_db_path.as_path()).expect("connector db should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE channel_ingress_events (
+                    ingress_event_id INTEGER PRIMARY KEY,
+                    connector_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    envelope_id TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    lane_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    last_error_reason_code TEXT,
+                    route_key TEXT,
+                    session_id TEXT,
+                    run_id TEXT,
+                    updated_at_unix_ms INTEGER NOT NULL
+                );
+                CREATE TABLE delivery_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    connector_id TEXT NOT NULL,
+                    ingress_event_id INTEGER NOT NULL,
+                    ingress_envelope_id TEXT NOT NULL,
+                    session_id TEXT,
+                    run_id TEXT,
+                    outbox_envelope_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    send_attempts INTEGER NOT NULL,
+                    native_message_id TEXT,
+                    last_reason_code TEXT,
+                    visible_text_preview TEXT,
+                    updated_at_unix_ms INTEGER NOT NULL
+                );
+                INSERT INTO channel_ingress_events (
+                    ingress_event_id, connector_id, conversation_id, envelope_id, payload_hash,
+                    payload_json, status, lane_key, attempts, last_error_reason_code, route_key,
+                    session_id, run_id, updated_at_unix_ms
+                ) VALUES (
+                    7, 'echo:secret-account', 'conversation-secret', 'envelope-secret',
+                    'abc123hash', '{"text":"raw secret payload"}', 'completed',
+                    'echo:secret-account:conversation-secret', 1, NULL, 'route-secret',
+                    'session-secret', 'run-secret', 1700000000000
+                );
+                INSERT INTO delivery_intents (
+                    intent_id, connector_id, ingress_event_id, ingress_envelope_id, session_id,
+                    run_id, outbox_envelope_id, status, send_attempts, native_message_id,
+                    last_reason_code, visible_text_preview, updated_at_unix_ms
+                ) VALUES (
+                    'delivery-secret', 'echo:secret-account', 7, 'envelope-secret',
+                    'session-secret', 'run-secret', 'outbox-secret', 'delivered', 1,
+                    'native-secret', NULL, 'visible preview secret', 1700000000100
+                );
+                "#,
+            )
+            .expect("fixture schema should initialize");
+
+        let snapshot = read_support_bundle_channel_delivery(connector_db_path.as_path());
+
+        assert!(snapshot.available);
+        assert_eq!(snapshot.ingress_by_status.get("completed"), Some(&1));
+        assert_eq!(snapshot.delivery_by_status.get("delivered"), Some(&1));
+        assert_eq!(snapshot.recent_ingress.len(), 1);
+        assert_eq!(snapshot.recent_delivery.len(), 1);
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should encode");
+        assert!(encoded.contains("abc123hash"));
+        assert!(
+            !encoded.contains("raw secret payload")
+                && !encoded.contains("visible preview secret")
+                && !encoded.contains("session-secret")
+                && !encoded.contains("native-secret"),
+            "support bundle channel delivery snapshot must redact payload and platform ids: {encoded}"
         );
     }
 

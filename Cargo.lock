@@ -3016,6 +3016,7 @@ dependencies = [
  "flate2",
  "futures",
  "palyra-common",
+ "palyra-safety",
  "reqwest",
  "rusqlite",
  "serde",

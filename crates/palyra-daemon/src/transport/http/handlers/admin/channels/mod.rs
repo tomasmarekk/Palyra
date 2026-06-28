@@ -114,6 +114,145 @@ pub(crate) async fn admin_channel_logs_handler(
     admin_channel_logs_response(&state, connector_id, query.limit)
 }
 
+/// Lists durable ingress events for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, connector-id
+/// normalization, status parsing, or storage access fails.
+pub(crate) async fn admin_channel_ingress_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Query(query): Query<ChannelIngressQuery>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let status = parse_ingress_status(query.status).map_err(runtime_status_response)?;
+    let events = state
+        .channels
+        .ingress_events(connector_id.as_str(), status, query.limit)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "ingress_events": events })))
+}
+
+/// Shows one durable ingress event.
+///
+/// # Errors
+/// Returns an error response when admin authorization, path normalization, or
+/// storage access fails.
+pub(crate) async fn admin_channel_ingress_show_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChannelIngressPath>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(path.connector_id, "connector_id")?;
+    let event = state
+        .channels
+        .ingress_event(connector_id.as_str(), path.ingress_event_id)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "ingress_event": event })))
+}
+
+/// Lists delivery intents for one connector.
+///
+/// # Errors
+/// Returns an error response when admin authorization, status parsing, or
+/// storage access fails.
+pub(crate) async fn admin_channel_delivery_list_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(connector_id): Path<String>,
+    Query(query): Query<ChannelDeliveryQuery>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let connector_id = normalize_non_empty_field(connector_id, "connector_id")?;
+    let status = parse_delivery_status(query.status).map_err(runtime_status_response)?;
+    let intents = state
+        .channels
+        .delivery_intents(connector_id.as_str(), status, query.limit)
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "delivery_intents": intents })))
+}
+
+/// Shows one delivery intent.
+///
+/// # Errors
+/// Returns an error response when admin authorization, intent-id
+/// normalization, or storage access fails.
+pub(crate) async fn admin_channel_delivery_show_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChannelDeliveryPath>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let intent_id = normalize_non_empty_field(path.intent_id, "intent_id")?;
+    let intent = state
+        .channels
+        .delivery_intent(intent_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "delivery_intent": intent })))
+}
+
+/// Retries one delivery intent from a safe retry state.
+///
+/// # Errors
+/// Returns an error response when admin authorization, intent-id
+/// normalization, or retry validation fails.
+pub(crate) async fn admin_channel_delivery_retry_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<ChannelDeliveryPath>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let intent_id = normalize_non_empty_field(path.intent_id, "intent_id")?;
+    let retry = state
+        .channels
+        .retry_delivery_intent(intent_id.as_str())
+        .map_err(channel_platform_error_response)?;
+    Ok(Json(json!({ "retry": retry })))
+}
+
 /// Reads channel messages through the admin API.
 ///
 /// # Errors
@@ -360,6 +499,34 @@ fn admin_channel_logs_response(
         "events": events,
         "dead_letters": dead_letters,
     })))
+}
+
+fn parse_ingress_status(
+    value: Option<String>,
+) -> Result<Option<palyra_connectors::ChannelIngressStatus>, tonic::Status> {
+    value
+        .map(|status| {
+            palyra_connectors::ChannelIngressStatus::parse(status.as_str()).map_err(|_| {
+                tonic::Status::invalid_argument(
+                    "status must be one of pending, claimed, retrying, completed, failed, quarantined",
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_delivery_status(
+    value: Option<String>,
+) -> Result<Option<palyra_connectors::DeliveryIntentStatus>, tonic::Status> {
+    value
+        .map(|status| {
+            palyra_connectors::DeliveryIntentStatus::parse(status.as_str()).map_err(|_| {
+                tonic::Status::invalid_argument(
+                    "status must be one of created, planned, queued, adapter_send_started, platform_outcome_unknown, delivered, suppressed, failed, dead_lettered",
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Pauses outbound queue processing for one connector.

@@ -46,6 +46,12 @@ pub struct ConnectorSupervisorConfig {
     pub immediate_drain_batch_size: usize,
     /// Drain batch size intended for periodic background drains.
     pub background_drain_batch_size: usize,
+    /// Rollout mode for durable ingress and delivery intents.
+    pub delivery_pipeline_mode: DeliveryPipelineMode,
+    /// How long an ingress claim stays invisible before it can be reclaimed.
+    pub ingress_claim_lease_ms: i64,
+    /// Attempts before an ingress row is failed instead of retried.
+    pub max_ingress_retry_attempts: u32,
 }
 
 impl Default for ConnectorSupervisorConfig {
@@ -61,6 +67,44 @@ impl Default for ConnectorSupervisorConfig {
             disabled_poll_delay_ms: 30_000,
             immediate_drain_batch_size: 64,
             background_drain_batch_size: 128,
+            delivery_pipeline_mode: DeliveryPipelineMode::Enforce,
+            ingress_claim_lease_ms: 60_000,
+            max_ingress_retry_attempts: 5,
+        }
+    }
+}
+
+/// Rollout posture for durable channel ingress and delivery intents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryPipelineMode {
+    /// Legacy route-and-enqueue path without durable ingress/delivery intents.
+    Off,
+    /// Durable path enabled while reporting rollout state for comparison.
+    Shadow,
+    /// Durable ingress and delivery intents are the source of truth.
+    Enforce,
+}
+
+impl DeliveryPipelineMode {
+    /// Returns the stable snake_case label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// Parses a stable mode label.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "shadow" => Some(Self::Shadow),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
         }
     }
 }
@@ -93,6 +137,10 @@ pub struct InboundIngestOutcome {
     pub queued_for_retry: bool,
     pub decision_reason: String,
     pub route_key: Option<String>,
+    pub ingress_event_id: Option<i64>,
+    pub ingress_status: Option<String>,
+    pub delivery_intents: usize,
+    pub sanitized_outputs: usize,
     pub enqueued_outbound: usize,
     /// Messages delivered by the inline drain that follows ingestion.
     pub immediate_delivery: usize,

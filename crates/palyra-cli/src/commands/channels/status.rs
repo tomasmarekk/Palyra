@@ -247,6 +247,162 @@ pub(super) fn run_logs(
     emit_logs(response, json_output)
 }
 
+/// Lists durable ingress events for a connector.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_ingress_list(
+    connector_id: String,
+    status: Option<String>,
+    limit: Option<usize>,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/{}/ingress",
+        request_context.base_url.trim_end_matches('/'),
+        connector_id,
+    );
+    let client = channels_client::build_client()?;
+    let response = channels_client::send_request(
+        client.get(endpoint).query(&query_pairs(status, limit)),
+        request_context,
+        "failed to call channels ingress list endpoint",
+    )?;
+    emit_ingress(response, json_output)
+}
+
+/// Shows one durable ingress event.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_ingress_show(
+    connector_id: String,
+    ingress_event_id: i64,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/{}/ingress/{}",
+        request_context.base_url.trim_end_matches('/'),
+        connector_id,
+        ingress_event_id,
+    );
+    let client = channels_client::build_client()?;
+    let response = channels_client::send_request(
+        client.get(endpoint),
+        request_context,
+        "failed to call channels ingress show endpoint",
+    )?;
+    emit_ingress(response, json_output)
+}
+
+/// Lists delivery intents for a connector.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_delivery_list(
+    connector_id: String,
+    status: Option<String>,
+    limit: Option<usize>,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/{}/delivery",
+        request_context.base_url.trim_end_matches('/'),
+        connector_id,
+    );
+    let client = channels_client::build_client()?;
+    let response = channels_client::send_request(
+        client.get(endpoint).query(&query_pairs(status, limit)),
+        request_context,
+        "failed to call channels delivery list endpoint",
+    )?;
+    emit_delivery(response, json_output)
+}
+
+/// Shows one delivery intent.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_delivery_show(
+    intent_id: String,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/delivery/{}",
+        request_context.base_url.trim_end_matches('/'),
+        intent_id,
+    );
+    let client = channels_client::build_client()?;
+    let response = channels_client::send_request(
+        client.get(endpoint),
+        request_context,
+        "failed to call channels delivery show endpoint",
+    )?;
+    emit_delivery(response, json_output)
+}
+
+/// Retries one delivery intent from a safe retry state.
+///
+/// # Errors
+/// Fails when the endpoint call or output encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn run_delivery_retry(
+    intent_id: String,
+    url: Option<String>,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    json_output: bool,
+) -> Result<()> {
+    let request_context =
+        channels_client::resolve_request_context(url, token, principal, device_id, channel)?;
+    let endpoint = format!(
+        "{}/admin/v1/channels/delivery/{}/retry",
+        request_context.base_url.trim_end_matches('/'),
+        intent_id,
+    );
+    let client = channels_client::build_client()?;
+    let response = channels_client::send_request(
+        client.post(endpoint),
+        request_context,
+        "failed to call channels delivery retry endpoint",
+    )?;
+    emit_delivery(response, json_output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_all_logs(
     url: Option<String>,
@@ -369,6 +525,93 @@ fn emit_logs(response: Value, json_output: bool) -> Result<()> {
         println!("{}", render_logs_summary_line(&response));
     }
     Ok(())
+}
+
+fn emit_ingress(response: Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response)
+                .context("failed to encode channels ingress payload as JSON")?
+        );
+    } else if let Some(events) = response.get("ingress_events").and_then(Value::as_array) {
+        println!("channels.ingress count={}", events.len());
+        for event in events {
+            let ingress_event_id =
+                event.get("ingress_event_id").and_then(Value::as_i64).unwrap_or(0);
+            let connector_id =
+                event.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
+            let status = event.get("status").and_then(Value::as_str).unwrap_or("unknown");
+            let attempts = event.get("attempts").and_then(Value::as_u64).unwrap_or(0);
+            let envelope_id = event.get("envelope_id").and_then(Value::as_str).unwrap_or("unknown");
+            println!(
+                "channels.ingress.event id={} connector_id={} status={} attempts={} envelope_id={}",
+                ingress_event_id, connector_id, status, attempts, envelope_id
+            );
+        }
+    } else {
+        let event = response.get("ingress_event").unwrap_or(&response);
+        let ingress_event_id = event.get("ingress_event_id").and_then(Value::as_i64).unwrap_or(0);
+        let connector_id = event.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
+        let status = event.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let payload_hash = event.get("payload_hash").and_then(Value::as_str).unwrap_or("unknown");
+        println!(
+            "channels.ingress.show id={} connector_id={} status={} payload_hash={}",
+            ingress_event_id, connector_id, status, payload_hash
+        );
+    }
+    Ok(())
+}
+
+fn emit_delivery(response: Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response)
+                .context("failed to encode channels delivery payload as JSON")?
+        );
+    } else if let Some(intents) = response.get("delivery_intents").and_then(Value::as_array) {
+        println!("channels.delivery count={}", intents.len());
+        for intent in intents {
+            println!("{}", render_delivery_intent_line("channels.delivery.intent", intent));
+        }
+    } else if let Some(retry) = response.get("retry") {
+        let requeued = retry.get("requeued").and_then(Value::as_bool).unwrap_or(false);
+        let intent = retry.get("intent").unwrap_or(retry);
+        println!(
+            "{} requeued={}",
+            render_delivery_intent_line("channels.delivery.retry", intent),
+            requeued
+        );
+    } else {
+        let intent = response.get("delivery_intent").unwrap_or(&response);
+        println!("{}", render_delivery_intent_line("channels.delivery.show", intent));
+    }
+    Ok(())
+}
+
+fn render_delivery_intent_line(prefix: &str, intent: &Value) -> String {
+    let intent_id = intent.get("intent_id").and_then(Value::as_str).unwrap_or("unknown");
+    let connector_id = intent.get("connector_id").and_then(Value::as_str).unwrap_or("unknown");
+    let status = intent.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let send_attempts = intent.get("send_attempts").and_then(Value::as_u64).unwrap_or(0);
+    let outbox_envelope_id =
+        intent.get("outbox_envelope_id").and_then(Value::as_str).unwrap_or("unknown");
+    format!(
+        "{} id={} connector_id={} status={} send_attempts={} outbox_envelope_id={}",
+        prefix, intent_id, connector_id, status, send_attempts, outbox_envelope_id
+    )
+}
+
+fn query_pairs(status: Option<String>, limit: Option<usize>) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    if let Some(status) = status {
+        pairs.push(("status".to_owned(), status));
+    }
+    if let Some(limit) = limit {
+        pairs.push(("limit".to_owned(), limit.to_string()));
+    }
+    pairs
 }
 
 fn render_logs_summary_line(response: &Value) -> String {

@@ -15,6 +15,7 @@ base64.workspace = true
 flate2.workspace = true
 futures.workspace = true
 palyra-common = { version = "0.1.0", path = "../palyra-common" }
+palyra-safety = { version = "0.1.0", path = "../palyra-safety" }
 reqwest = { workspace = true, features = ["multipart"] }
 rusqlite.workspace = true
 serde.workspace = true

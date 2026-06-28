@@ -16,12 +16,15 @@ use crate::{
         ConnectorAvailability, ConnectorInstanceSpec, ConnectorKind, ConnectorReadiness,
         DeliveryOutcome, OutboundMessageRequest, RetryClass, RoutedOutboundMessage,
     },
-    storage::ConnectorStore,
+    storage::{
+        ChannelIngressRecord, ChannelIngressStatus, ConnectorStore, DeliveryIntentDraft,
+        DeliveryIntentStatus,
+    },
 };
 
 use super::{
     unix_ms_now, ConnectorAdapter, ConnectorAdapterError, ConnectorRouter, ConnectorRouterError,
-    ConnectorSupervisor, ConnectorSupervisorConfig,
+    ConnectorSupervisor, ConnectorSupervisorConfig, DeliveryPipelineMode,
 };
 
 struct RouterStub;
@@ -49,9 +52,26 @@ impl ConnectorRouter for RouterStub {
                 a2ui_update: None,
             }],
             route_key: Some("channel:echo:conversation:c1".to_owned()),
+            session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned()),
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAR".to_owned()),
             retry_attempt: 0,
             route_message_latency_ms: Some(1),
         })
+    }
+}
+
+struct RouteErrorRouter {
+    message: &'static str,
+}
+
+#[async_trait]
+impl ConnectorRouter for RouteErrorRouter {
+    async fn route_inbound(
+        &self,
+        _principal: &str,
+        _event: &crate::protocol::InboundMessageEvent,
+    ) -> Result<crate::protocol::RouteInboundResult, ConnectorRouterError> {
+        Err(ConnectorRouterError::Message(self.message.to_owned()))
     }
 }
 
@@ -75,6 +95,15 @@ impl FlakyAdapter {
             .lock()
             .expect("stopped connector lock should not be poisoned")
             .clone()
+    }
+
+    fn sends_for(&self, envelope_id: &str) -> usize {
+        self.attempts
+            .lock()
+            .expect("attempts lock should not be poisoned")
+            .get(envelope_id)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -241,23 +270,34 @@ impl ConnectorAdapter for PermanentFailureAdapter {
 }
 
 fn open_supervisor() -> (TempDir, ConnectorSupervisor, Arc<FlakyAdapter>) {
-    let tempdir = TempDir::new().expect("tempdir should initialize");
-    let store = std::sync::Arc::new(
-        ConnectorStore::open(tempdir.path().join("connectors.sqlite3"))
-            .expect("store should initialize"),
-    );
-    let adapter = Arc::new(FlakyAdapter::default());
-    let supervisor = ConnectorSupervisor::new(
-        store,
-        std::sync::Arc::new(RouterStub),
-        vec![adapter.clone()],
+    open_supervisor_with_router(Arc::new(RouterStub))
+}
+
+fn open_supervisor_with_router(
+    router: Arc<dyn ConnectorRouter>,
+) -> (TempDir, ConnectorSupervisor, Arc<FlakyAdapter>) {
+    open_supervisor_with_router_and_config(
+        router,
         ConnectorSupervisorConfig {
             min_retry_delay_ms: 1,
             base_retry_delay_ms: 1,
             max_retry_delay_ms: 8,
             ..ConnectorSupervisorConfig::default()
         },
+    )
+}
+
+fn open_supervisor_with_router_and_config(
+    router: Arc<dyn ConnectorRouter>,
+    config: ConnectorSupervisorConfig,
+) -> (TempDir, ConnectorSupervisor, Arc<FlakyAdapter>) {
+    let tempdir = TempDir::new().expect("tempdir should initialize");
+    let store = std::sync::Arc::new(
+        ConnectorStore::open(tempdir.path().join("connectors.sqlite3"))
+            .expect("store should initialize"),
     );
+    let adapter = Arc::new(FlakyAdapter::default());
+    let supervisor = ConnectorSupervisor::new(store, router, vec![adapter.clone()], config);
     (tempdir, supervisor, adapter)
 }
 
@@ -326,6 +366,50 @@ fn sample_outbound_request(envelope_id: &str, text: &str) -> OutboundMessageRequ
     }
 }
 
+fn stale_claimed_ingress(
+    supervisor: &ConnectorSupervisor,
+    event: &crate::protocol::InboundMessageEvent,
+) -> ChannelIngressRecord {
+    let now = unix_ms_now().expect("clock should be available").saturating_sub(10_000);
+    supervisor
+        .store()
+        .enqueue_channel_ingress_if_absent(event, "channel:echo:default", now, 3, 86_400_000)
+        .expect("ingress enqueue should succeed");
+    supervisor
+        .store()
+        .load_due_channel_ingress(now, 1, Some(event.connector_id.as_str()), 1, false)
+        .expect("ingress claim should succeed")
+        .into_iter()
+        .next()
+        .expect("ingress row should be claimed")
+}
+
+fn delivery_intent_fixture(
+    record: &ChannelIngressRecord,
+    outbox_envelope_id: &str,
+    status: DeliveryIntentStatus,
+) -> DeliveryIntentDraft {
+    DeliveryIntentDraft {
+        intent_id: format!(
+            "delivery:{}:{}:{}",
+            record.connector_id, record.ingress_event_id, outbox_envelope_id
+        ),
+        connector_id: record.connector_id.clone(),
+        ingress_event_id: record.ingress_event_id,
+        ingress_envelope_id: record.envelope_id.clone(),
+        session_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned()),
+        run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAR".to_owned()),
+        principal: record.principal.clone(),
+        conversation_id: record.conversation_id.clone(),
+        outbox_envelope_id: outbox_envelope_id.to_owned(),
+        output_index: 0,
+        payload_hash: "fixture-payload-hash".to_owned(),
+        visible_text_preview: "fixture preview".to_owned(),
+        status,
+        redaction_summary_json: None,
+    }
+}
+
 #[test]
 fn disabling_connector_stops_adapter_runtime() {
     let (_tempdir, supervisor, adapter) = open_supervisor();
@@ -369,6 +453,234 @@ async fn duplicate_inbound_does_not_create_duplicate_outbound() {
     assert_eq!(first.enqueued_outbound, 1);
     assert!(second.duplicate);
     assert_eq!(second.enqueued_outbound, 0);
+}
+
+#[tokio::test]
+async fn persisted_ingress_before_route_replays_after_restart() {
+    let (_tempdir, supervisor, adapter) = open_supervisor();
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+    let event = sample_inbound_for("echo:default", "env-before-route-crash", "hello persisted");
+    let now = 1_000;
+
+    let enqueued = supervisor
+        .store()
+        .enqueue_channel_ingress_if_absent(&event, "channel:echo:default", now, 3, 60_000)
+        .expect("ingress enqueue should succeed");
+    let before = supervisor.queue_snapshot("echo:default").expect("queue snapshot should load");
+    assert_eq!(before.pending_ingress, 1);
+    assert_eq!(adapter.sends_for("env-before-route-crash:0"), 0);
+
+    let outcomes = supervisor
+        .process_due_ingress_for_connector("echo:default", 8, false)
+        .await
+        .expect("persisted ingress should route after restart");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].ingress_status.as_deref(),
+        Some(ChannelIngressStatus::Completed.as_str())
+    );
+    assert_eq!(
+        adapter.sends_for("env-before-route-crash:0"),
+        1,
+        "replayed ingress should produce exactly one physical send"
+    );
+    let record = supervisor
+        .store()
+        .get_channel_ingress_event("echo:default", enqueued.record.ingress_event_id)
+        .expect("ingress record should be readable");
+    assert_eq!(record.status, ChannelIngressStatus::Completed);
+}
+
+#[tokio::test]
+async fn stale_claim_replays_without_duplicate_send_or_ingress_row() {
+    let (_tempdir, supervisor, adapter) = open_supervisor();
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+    let event = sample_inbound_for("echo:default", "env-claimed-crash", "hello claimed");
+    let claimed = stale_claimed_ingress(&supervisor, &event);
+    assert_eq!(claimed.status, ChannelIngressStatus::Claimed);
+
+    let outcomes = supervisor
+        .process_due_ingress_for_connector("echo:default", 8, false)
+        .await
+        .expect("stale claim should be reclaimed and processed");
+    assert_eq!(outcomes.len(), 1);
+    let duplicate = supervisor
+        .ingest_inbound(event)
+        .await
+        .expect("completed tombstone should make duplicate ingest safe");
+
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.enqueued_outbound, 0);
+    assert_eq!(
+        adapter.sends_for("env-claimed-crash:0"),
+        1,
+        "completed ingress tombstone should prevent a duplicate send"
+    );
+    let ingress_rows = supervisor
+        .store()
+        .list_channel_ingress_events("echo:default", None, 16)
+        .expect("ingress rows should be readable");
+    assert_eq!(
+        ingress_rows.iter().filter(|record| record.envelope_id == "env-claimed-crash").count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn crash_after_intent_replays_outbox_once() {
+    let (_tempdir, supervisor, adapter) = open_supervisor();
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+    let event = sample_inbound_for("echo:default", "env-after-intent-crash", "hello intent");
+    let claimed = stale_claimed_ingress(&supervisor, &event);
+    let draft =
+        delivery_intent_fixture(&claimed, "env-after-intent-crash:0", DeliveryIntentStatus::Queued);
+    supervisor
+        .store()
+        .upsert_delivery_intent(&draft, 1_100)
+        .expect("pre-crash intent should upsert");
+
+    let outcomes = supervisor
+        .process_due_ingress_for_connector("echo:default", 8, false)
+        .await
+        .expect("reroute should finish missing outbox work");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        adapter.sends_for("env-after-intent-crash:0"),
+        1,
+        "replayed intent should create and deliver one outbox row"
+    );
+    let intents = supervisor
+        .store()
+        .list_delivery_intents("echo:default", None, 16)
+        .expect("delivery intents should be readable");
+    assert_eq!(intents.iter().filter(|intent| intent.intent_id == draft.intent_id).count(), 1);
+    let intent = supervisor
+        .store()
+        .get_delivery_intent(draft.intent_id.as_str())
+        .expect("delivery intent should be readable");
+    assert_eq!(intent.status, DeliveryIntentStatus::Delivered);
+}
+
+#[tokio::test]
+async fn crash_after_outbox_enqueue_replays_without_duplicate_physical_send() {
+    let (_tempdir, supervisor, adapter) = open_supervisor();
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+    let event = sample_inbound_for("echo:default", "env-after-outbox-crash", "hello outbox");
+    let claimed = stale_claimed_ingress(&supervisor, &event);
+    let outbox_envelope_id = "env-after-outbox-crash:0";
+    let draft = delivery_intent_fixture(&claimed, outbox_envelope_id, DeliveryIntentStatus::Queued);
+    let request = sample_outbound_request(outbox_envelope_id, "hello outbox");
+    supervisor
+        .store()
+        .upsert_delivery_intent(&draft, 1_100)
+        .expect("pre-crash intent should upsert");
+    supervisor
+        .store()
+        .enqueue_outbox_if_absent(&request, 3, 1_100)
+        .expect("pre-crash outbox enqueue should succeed");
+
+    let outcomes = supervisor
+        .process_due_ingress_for_connector("echo:default", 8, false)
+        .await
+        .expect("reroute should reuse existing outbox work");
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        adapter.sends_for(outbox_envelope_id),
+        1,
+        "existing outbox row should be delivered once after replay"
+    );
+    let queue =
+        supervisor.queue_snapshot("echo:default").expect("queue snapshot should be readable");
+    assert_eq!(queue.pending_outbox + queue.due_outbox + queue.claimed_outbox, 0);
+    let intent = supervisor
+        .store()
+        .get_delivery_intent(draft.intent_id.as_str())
+        .expect("delivery intent should be readable");
+    assert_eq!(intent.status, DeliveryIntentStatus::Delivered);
+}
+
+#[tokio::test]
+async fn route_quarantine_does_not_enqueue_or_send_outbound() {
+    let (_tempdir, supervisor, adapter) = open_supervisor_with_router(Arc::new(RouteErrorRouter {
+        message: "invalid envelope schema",
+    }));
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+
+    let outcome = supervisor
+        .ingest_inbound(sample_inbound_for(
+            "echo:default",
+            "env-quarantine-crash",
+            "malformed inbound",
+        ))
+        .await
+        .expect("quarantine route error should be recorded");
+
+    assert_eq!(outcome.ingress_status.as_deref(), Some(ChannelIngressStatus::Quarantined.as_str()));
+    assert_eq!(adapter.sends_for("env-quarantine-crash:0"), 0);
+    let queue =
+        supervisor.queue_snapshot("echo:default").expect("queue snapshot should be readable");
+    assert_eq!(queue.quarantined_ingress, 1);
+    assert_eq!(queue.pending_outbox + queue.due_outbox + queue.claimed_outbox, 0);
+    assert!(
+        supervisor
+            .store()
+            .list_delivery_intents("echo:default", None, 16)
+            .expect("delivery intent list should be readable")
+            .is_empty(),
+        "quarantined ingress must not produce delivery intents"
+    );
+}
+
+#[tokio::test]
+async fn platform_retry_marks_delivery_intent_unknown_before_replay_delivery() {
+    let (_tempdir, supervisor, adapter) = open_supervisor();
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+
+    let ingest = supervisor
+        .ingest_inbound(sample_inbound_for(
+            "echo:default",
+            "env-platform-unknown",
+            "hello [connector-crash-once]",
+        ))
+        .await
+        .expect("ingest should enqueue and attempt delivery");
+    assert!(ingest.accepted);
+    assert_eq!(adapter.sends_for("env-platform-unknown:0"), 1);
+    let unknown_intents = supervisor
+        .store()
+        .list_delivery_intents(
+            "echo:default",
+            Some(DeliveryIntentStatus::PlatformOutcomeUnknown),
+            16,
+        )
+        .expect("unknown delivery intents should be readable");
+    assert_eq!(unknown_intents.len(), 1);
+    assert_eq!(unknown_intents[0].outbox_envelope_id, "env-platform-unknown:0");
+
+    let mut delivered = 0_usize;
+    for _ in 0..20 {
+        let drained = supervisor.drain_due_outbox(16).await.expect("retry drain should succeed");
+        delivered = delivered.saturating_add(drained.delivered);
+        if delivered >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        adapter.sends_for("env-platform-unknown:0"),
+        2,
+        "one retry should resolve the unknown platform outcome"
+    );
+    let intent = supervisor
+        .store()
+        .get_delivery_intent(unknown_intents[0].intent_id.as_str())
+        .expect("delivery intent should be readable after retry");
+    assert_eq!(intent.status, DeliveryIntentStatus::Delivered);
 }
 
 #[tokio::test]
@@ -815,6 +1127,36 @@ async fn runtime_snapshot_reports_connector_metrics() {
             .and_then(Value::as_str),
         Some("nominal"),
         "empty queue should report nominal saturation"
+    );
+}
+
+#[tokio::test]
+async fn runtime_snapshot_reports_legacy_delivery_pipeline_warning() {
+    let (_tempdir, supervisor, _adapter) = open_supervisor_with_router_and_config(
+        Arc::new(RouterStub),
+        ConnectorSupervisorConfig {
+            delivery_pipeline_mode: DeliveryPipelineMode::Off,
+            ..ConnectorSupervisorConfig::default()
+        },
+    );
+    supervisor.register_connector(&sample_spec()).expect("register should succeed");
+
+    let runtime = supervisor
+        .runtime_snapshot("echo:default")
+        .expect("runtime snapshot should resolve")
+        .expect("runtime snapshot should be present");
+    let delivery_pipeline = runtime
+        .get("delivery_pipeline")
+        .and_then(Value::as_object)
+        .expect("runtime snapshot should include delivery pipeline mode");
+
+    assert_eq!(delivery_pipeline.get("mode").and_then(Value::as_str), Some("off"));
+    assert!(
+        delivery_pipeline
+            .get("legacy_warning")
+            .and_then(Value::as_str)
+            .is_some_and(|warning| warning.contains("production should use enforce")),
+        "legacy rollout mode should emit an operator-visible warning"
     );
 }
 

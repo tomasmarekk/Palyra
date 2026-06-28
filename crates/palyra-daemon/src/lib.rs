@@ -1027,6 +1027,29 @@ struct ChannelLogsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChannelIngressQuery {
+    limit: Option<usize>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelIngressPath {
+    connector_id: String,
+    ingress_event_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelDeliveryQuery {
+    limit: Option<usize>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelDeliveryPath {
+    intent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChannelLogsRequest {
     connector_id: String,
     #[serde(default)]

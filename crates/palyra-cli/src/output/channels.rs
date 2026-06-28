@@ -285,12 +285,25 @@ pub(crate) fn render_status_lines(payload: &Value) -> Vec<String> {
         let pending_outbox = queue.get("pending_outbox").and_then(Value::as_u64).unwrap_or(0);
         let due_outbox = queue.get("due_outbox").and_then(Value::as_u64).unwrap_or(0);
         let claimed_outbox = queue.get("claimed_outbox").and_then(Value::as_u64).unwrap_or(0);
+        let pending_ingress = queue.get("pending_ingress").and_then(Value::as_u64).unwrap_or(0);
+        let due_ingress = queue.get("due_ingress").and_then(Value::as_u64).unwrap_or(0);
+        let claimed_ingress = queue.get("claimed_ingress").and_then(Value::as_u64).unwrap_or(0);
+        let retrying_ingress = queue.get("retrying_ingress").and_then(Value::as_u64).unwrap_or(0);
+        let failed_ingress = queue.get("failed_ingress").and_then(Value::as_u64).unwrap_or(0);
+        let quarantined_ingress =
+            queue.get("quarantined_ingress").and_then(Value::as_u64).unwrap_or(0);
         let dead_letters = queue.get("dead_letters").and_then(Value::as_u64).unwrap_or(0);
         lines.push(format!(
-            "channels.operations.queue id={} paused={} pause_reason={} pending_outbox={} due_outbox={} claimed_outbox={} dead_letters={}",
+            "channels.operations.queue id={} paused={} pause_reason={} pending_ingress={} due_ingress={} claimed_ingress={} retrying_ingress={} failed_ingress={} quarantined_ingress={} pending_outbox={} due_outbox={} claimed_outbox={} dead_letters={}",
             connector_id,
             paused,
             pause_reason,
+            pending_ingress,
+            due_ingress,
+            claimed_ingress,
+            retrying_ingress,
+            failed_ingress,
+            quarantined_ingress,
             pending_outbox,
             due_outbox,
             claimed_outbox,
@@ -480,6 +493,12 @@ mod tests {
                 "queue": {
                     "paused": true,
                     "pause_reason": "operator requested queue pause via admin API",
+                    "pending_ingress": 6,
+                    "due_ingress": 5,
+                    "claimed_ingress": 1,
+                    "retrying_ingress": 2,
+                    "failed_ingress": 1,
+                    "quarantined_ingress": 0,
                     "pending_outbox": 4,
                     "due_outbox": 2,
                     "claimed_outbox": 1,
@@ -514,7 +533,7 @@ mod tests {
             "channels.status id=discord:default availability=supported enabled=false readiness=missing_credential liveness=stopped pending_outbox=0 dead_letters=0"
         );
         assert!(lines.iter().any(|line| {
-            line == "channels.operations.queue id=discord:default paused=true pause_reason=operator requested queue pause via admin API pending_outbox=4 due_outbox=2 claimed_outbox=1 dead_letters=3"
+            line == "channels.operations.queue id=discord:default paused=true pause_reason=operator requested queue pause via admin API pending_ingress=6 due_ingress=5 claimed_ingress=1 retrying_ingress=2 failed_ingress=1 quarantined_ingress=0 pending_outbox=4 due_outbox=2 claimed_outbox=1 dead_letters=3"
         }));
         assert!(lines.iter().any(|line| {
             line == "channels.operations.saturation id=discord:default state=paused reasons=queue_paused,pause_reason=operator requested queue pause via admin API"

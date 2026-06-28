@@ -4310,6 +4310,63 @@ fn parse_channels_dead_letter_replay() {
 }
 
 #[test]
+fn parse_channels_ingress_list_with_status_filter() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "channels",
+        "ingress-list",
+        "discord:default",
+        "--status",
+        "retrying",
+        "--limit",
+        "25",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Channels {
+            command: ChannelsCommand::IngressList {
+                connector_id: "discord:default".to_owned(),
+                status: Some("retrying".to_owned()),
+                limit: Some(25),
+                url: None,
+                token: None,
+                principal: "user:local".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: None,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_channels_delivery_retry() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "channels",
+        "delivery-retry",
+        "delivery:discord:default:1:env-1:0",
+        "--token",
+        "admin-token",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Channels {
+            command: ChannelsCommand::DeliveryRetry {
+                intent_id: "delivery:discord:default:1:env-1:0".to_owned(),
+                url: None,
+                token: Some("admin-token".to_owned()),
+                principal: "user:local".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: None,
+                json: false,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_channels_router_mint_pairing_code() {
     let parsed = Cli::parse_from([
         "palyra",

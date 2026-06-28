@@ -26,11 +26,14 @@ pub use protocol::{
     RetryClass, RouteInboundResult, RoutedOutboundMessage,
 };
 pub use storage::{
-    ConnectorEventRecord, ConnectorInstanceRecord, ConnectorQueueSnapshot, ConnectorStore,
-    ConnectorStoreError, DeadLetterRecord, OutboxEnqueueOutcome, OutboxEntryRecord,
+    ChannelIngressEnqueueOutcome, ChannelIngressRecord, ChannelIngressStatus, ConnectorEventRecord,
+    ConnectorInstanceRecord, ConnectorQueueSnapshot, ConnectorStore, ConnectorStoreError,
+    DeadLetterRecord, DeliveryIntentDraft, DeliveryIntentRecord, DeliveryIntentRetryOutcome,
+    DeliveryIntentStatus, IngressBlockedLaneSnapshot, OutboxEnqueueOutcome, OutboxEntryRecord,
 };
 pub use supervisor::{
     ConnectorAdapter, ConnectorAdapterError, ConnectorAdapterSdkDescriptor,
     ConnectorAdapterSdkOperation, ConnectorRouter, ConnectorRouterError, ConnectorSupervisor,
-    ConnectorSupervisorConfig, ConnectorSupervisorError, DrainOutcome, InboundIngestOutcome,
+    ConnectorSupervisorConfig, ConnectorSupervisorError, DeliveryPipelineMode, DrainOutcome,
+    InboundIngestOutcome,
 };

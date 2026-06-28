@@ -69,6 +69,8 @@ impl ConnectorRouter for SimulatorRouter {
                 "channel:{}:conversation:{}",
                 event.connector_id, event.conversation_id
             )),
+            session_id: None,
+            run_id: None,
             retry_attempt: 0,
             route_message_latency_ms: Some(1),
         })

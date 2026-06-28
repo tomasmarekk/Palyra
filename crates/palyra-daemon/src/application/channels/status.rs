@@ -165,6 +165,13 @@ fn build_channel_operations_snapshot(
     );
     json!({
         "queue": {
+            "pending_ingress": queue.pending_ingress,
+            "due_ingress": queue.due_ingress,
+            "claimed_ingress": queue.claimed_ingress,
+            "retrying_ingress": queue.retrying_ingress,
+            "failed_ingress": queue.failed_ingress,
+            "quarantined_ingress": queue.quarantined_ingress,
+            "blocked_ingress_lanes": queue.blocked_ingress_lanes,
             "pending_outbox": queue.pending_outbox,
             "due_outbox": queue.due_outbox,
             "claimed_outbox": queue.claimed_outbox,
@@ -292,6 +299,13 @@ mod tests {
 
     fn sample_queue() -> palyra_connectors::ConnectorQueueSnapshot {
         palyra_connectors::ConnectorQueueSnapshot {
+            pending_ingress: 0,
+            due_ingress: 0,
+            claimed_ingress: 0,
+            retrying_ingress: 0,
+            failed_ingress: 0,
+            quarantined_ingress: 0,
+            blocked_ingress_lanes: Vec::new(),
             pending_outbox: 0,
             due_outbox: 0,
             claimed_outbox: 0,

@@ -57,6 +57,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(admin::channels::admin_channel_logs_handler),
         )
         .route(
+            "/admin/v1/channels/{connector_id}/ingress",
+            get(admin::channels::admin_channel_ingress_list_handler),
+        )
+        .route(
+            "/admin/v1/channels/{connector_id}/ingress/{ingress_event_id}",
+            get(admin::channels::admin_channel_ingress_show_handler),
+        )
+        .route(
+            "/admin/v1/channels/{connector_id}/delivery",
+            get(admin::channels::admin_channel_delivery_list_handler),
+        )
+        .route(
+            "/admin/v1/channels/delivery/{intent_id}",
+            get(admin::channels::admin_channel_delivery_show_handler),
+        )
+        .route(
+            "/admin/v1/channels/delivery/{intent_id}/retry",
+            post(admin::channels::admin_channel_delivery_retry_handler),
+        )
+        .route(
             "/admin/v1/channels/{connector_id}/messages/read",
             post(admin::channels::admin_channel_message_read_handler),
         )

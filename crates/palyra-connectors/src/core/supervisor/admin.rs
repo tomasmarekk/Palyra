@@ -179,6 +179,23 @@ impl ConnectorSupervisor {
             object.insert("metrics".to_owned(), json!(metrics));
             object.insert("queue".to_owned(), json!(queue));
             object.insert("saturation".to_owned(), json!(build_saturation_snapshot(&queue)));
+            object.insert(
+                "delivery_pipeline".to_owned(),
+                json!({
+                    "mode": self.config.delivery_pipeline_mode.as_str(),
+                    "legacy_warning": if matches!(
+                        self.config.delivery_pipeline_mode,
+                        super::DeliveryPipelineMode::Enforce
+                    ) {
+                        None::<String>
+                    } else {
+                        Some(
+                            "legacy channel delivery pipeline mode is enabled; production should use enforce"
+                                .to_owned(),
+                        )
+                    },
+                }),
+            );
         }
         Ok(Some(runtime))
     }
