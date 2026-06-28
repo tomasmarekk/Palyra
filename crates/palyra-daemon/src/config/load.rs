@@ -35,11 +35,12 @@ use palyra_common::{
     feature_rollouts::{
         parse_boolish_feature_rollout, FeatureRolloutSetting, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
         CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
-        DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
-        EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
-        EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV, FLOW_ORCHESTRATION_ROLLOUT_ENV,
-        NETWORKED_WORKERS_ROLLOUT_ENV, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
-        REPLAY_CAPTURE_ROLLOUT_ENV, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
+        DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
+        EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
+        EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
+        FLOW_ORCHESTRATION_ROLLOUT_ENV, NETWORKED_WORKERS_ROLLOUT_ENV,
+        PRUNING_POLICY_MATRIX_ROLLOUT_ENV, REPLAY_CAPTURE_ROLLOUT_ENV,
+        RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
         SESSION_QUEUE_POLICY_ROLLOUT_ENV,
     },
     parse_config_path,
@@ -230,6 +231,10 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
             if let Some(enabled) = file_feature_rollouts.execution_backend_networked_worker {
                 feature_rollouts.execution_backend_networked_worker =
+                    FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.execution_backend_docker {
+                feature_rollouts.execution_backend_docker =
                     FeatureRolloutSetting::from_config(enabled);
             }
             if let Some(enabled) = file_feature_rollouts.execution_backend_ssh_tunnel {
@@ -855,6 +860,51 @@ pub fn load_config() -> Result<LoadedConfig> {
                         max_output_bytes,
                         "tool_call.process_runner.max_output_bytes",
                     )?;
+                }
+            }
+            if let Some(file_code_intel) = file_tool_call.code_intel {
+                if let Some(enabled) = file_code_intel.enabled {
+                    tool_call.code_intel.enabled = enabled;
+                }
+                if let Some(workspace_root) = file_code_intel.workspace_root {
+                    tool_call.code_intel.workspace_root =
+                        Some(parse_workspace_root(workspace_root.as_str())?);
+                }
+                if let Some(binary) = file_code_intel.rust_analyzer_binary {
+                    tool_call.code_intel.rust_analyzer_binary = parse_non_empty_config_text(
+                        binary.as_str(),
+                        "tool_call.code_intel.rust_analyzer_binary",
+                    )?;
+                }
+                if let Some(binary) = file_code_intel.typescript_server_binary {
+                    tool_call.code_intel.typescript_server_binary = parse_non_empty_config_text(
+                        binary.as_str(),
+                        "tool_call.code_intel.typescript_server_binary",
+                    )?;
+                }
+                if let Some(binary) = file_code_intel.pyright_binary {
+                    tool_call.code_intel.pyright_binary = parse_non_empty_config_text(
+                        binary.as_str(),
+                        "tool_call.code_intel.pyright_binary",
+                    )?;
+                }
+                if let Some(timeout_ms) = file_code_intel.timeout_ms {
+                    tool_call.code_intel.timeout_ms =
+                        parse_positive_u64(timeout_ms, "tool_call.code_intel.timeout_ms")?;
+                }
+                if let Some(max_output_bytes) = file_code_intel.max_output_bytes {
+                    tool_call.code_intel.max_output_bytes = parse_positive_u64(
+                        max_output_bytes,
+                        "tool_call.code_intel.max_output_bytes",
+                    )?;
+                }
+                if let Some(max_items) = file_code_intel.max_items {
+                    tool_call.code_intel.max_items =
+                        parse_positive_usize(max_items, "tool_call.code_intel.max_items")?;
+                }
+                if let Some(idle_reap_ms) = file_code_intel.idle_reap_ms {
+                    tool_call.code_intel.idle_reap_ms =
+                        parse_positive_u64(idle_reap_ms, "tool_call.code_intel.idle_reap_ms")?;
                 }
             }
             if let Some(file_wasm_runtime) = file_tool_call.wasm_runtime {
@@ -2081,6 +2131,11 @@ pub fn load_config() -> Result<LoadedConfig> {
         EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
         &mut source,
     )?;
+    feature_rollouts.execution_backend_docker = apply_feature_rollout_env_override(
+        feature_rollouts.execution_backend_docker,
+        EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
+        &mut source,
+    )?;
     feature_rollouts.execution_backend_ssh_tunnel = apply_feature_rollout_env_override(
         feature_rollouts.execution_backend_ssh_tunnel,
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
@@ -2622,6 +2677,17 @@ fn validate_secret_field_conflict(
         anyhow::bail!("{field_name} cannot set both *_secret_ref and legacy vault_ref");
     }
     Ok(())
+}
+
+fn parse_non_empty_config_text(raw: &str, source_name: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("{source_name} cannot contain embedded NUL byte");
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn parse_optional_text(raw: &str, source_name: &str) -> Result<Option<String>> {
@@ -4359,6 +4425,7 @@ mod tests {
             context_engine = true
             execution_backend_remote_node = false
             execution_backend_networked_worker = true
+            execution_backend_docker = false
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
@@ -4379,6 +4446,7 @@ mod tests {
         assert_eq!(feature_rollouts.context_engine, Some(true));
         assert_eq!(feature_rollouts.execution_backend_remote_node, Some(false));
         assert_eq!(feature_rollouts.execution_backend_networked_worker, Some(true));
+        assert_eq!(feature_rollouts.execution_backend_docker, Some(false));
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
@@ -4886,6 +4954,14 @@ mod tests {
             EgressEnforcementMode::Strict,
             "process runner egress enforcement must default to strict"
         );
+        assert!(!config.code_intel.enabled, "code diagnostics must default to disabled");
+        assert!(
+            config.code_intel.workspace_root.is_none(),
+            "code diagnostics workspace root should default to active workspace roots"
+        );
+        assert_eq!(config.code_intel.timeout_ms, 2_000);
+        assert_eq!(config.code_intel.max_output_bytes, 64 * 1024);
+        assert_eq!(config.code_intel.max_items, 64);
         assert!(!config.wasm_runtime.enabled, "wasm plugin runtime must default to disabled");
         assert!(
             !config.wasm_runtime.allow_inline_modules,
@@ -5049,6 +5125,36 @@ mod tests {
             tool_call.process_runner.expect("process_runner section should be present");
         assert_eq!(process_runner.tier.as_deref(), Some("c"));
         assert_eq!(process_runner.path_access_mode.as_deref(), Some("approved_roots"));
+    }
+
+    #[test]
+    fn code_intel_config_parses_provider_overrides() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [tool_call.code_intel]
+            enabled = true
+            workspace_root = "workspace"
+            rust_analyzer_binary = "ra-fixture"
+            typescript_server_binary = "ts-fixture"
+            pyright_binary = "py-fixture"
+            timeout_ms = 1500
+            max_output_bytes = 32768
+            max_items = 24
+            idle_reap_ms = 60000
+            "#,
+        )
+        .expect("code intel override should parse");
+        let tool_call = parsed.tool_call.expect("tool_call section should be present");
+        let code_intel = tool_call.code_intel.expect("code_intel section should be present");
+        assert_eq!(code_intel.enabled, Some(true));
+        assert_eq!(code_intel.workspace_root.as_deref(), Some("workspace"));
+        assert_eq!(code_intel.rust_analyzer_binary.as_deref(), Some("ra-fixture"));
+        assert_eq!(code_intel.typescript_server_binary.as_deref(), Some("ts-fixture"));
+        assert_eq!(code_intel.pyright_binary.as_deref(), Some("py-fixture"));
+        assert_eq!(code_intel.timeout_ms, Some(1_500));
+        assert_eq!(code_intel.max_output_bytes, Some(32_768));
+        assert_eq!(code_intel.max_items, Some(24));
+        assert_eq!(code_intel.idle_reap_ms, Some(60_000));
     }
 
     #[test]
@@ -5320,6 +5426,51 @@ max_calls_per_run = {configured_limit}
 
             assert_eq!(loaded.tool_call.max_calls_per_run, configured_limit);
         }
+    }
+
+    #[test]
+    fn load_config_applies_code_intel_overrides() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[admin]
+require_auth = false
+
+[tool_call.code_intel]
+enabled = true
+workspace_root = "workspace"
+rust_analyzer_binary = "ra-fixture"
+typescript_server_binary = "ts-fixture"
+pyright_binary = "py-fixture"
+timeout_ms = 1500
+max_output_bytes = 32768
+max_items = 24
+idle_reap_ms = 60000
+"#,
+        )
+        .expect("code-intel config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+
+        let loaded = super::load_config().expect("code-intel config should load");
+
+        assert!(loaded.tool_call.code_intel.enabled);
+        assert_eq!(loaded.tool_call.code_intel.workspace_root, Some(PathBuf::from("workspace")));
+        assert_eq!(loaded.tool_call.code_intel.rust_analyzer_binary, "ra-fixture");
+        assert_eq!(loaded.tool_call.code_intel.typescript_server_binary, "ts-fixture");
+        assert_eq!(loaded.tool_call.code_intel.pyright_binary, "py-fixture");
+        assert_eq!(loaded.tool_call.code_intel.timeout_ms, 1_500);
+        assert_eq!(loaded.tool_call.code_intel.max_output_bytes, 32_768);
+        assert_eq!(loaded.tool_call.code_intel.max_items, 24);
+        assert_eq!(loaded.tool_call.code_intel.idle_reap_ms, 60_000);
     }
 
     #[test]

@@ -693,6 +693,26 @@ path = "patch"
 file = "patch-help.txt"
 
 [[entries]]
+path = "patch bundles"
+category = "nested_surface"
+status = "done"
+summary = "Workspace patch bundle inspection, approval, apply, and discard workflows."
+
+[entries.snapshot]
+path = "patch bundles"
+file = "patch-bundles-help.txt"
+
+[[entries]]
+path = "workers"
+category = "canonical_family"
+status = "done"
+summary = "Networked-worker diagnostics, lease visibility, and cleanup workflows."
+
+[entries.snapshot]
+path = "workers"
+file = "workers-help.txt"
+
+[[entries]]
 path = "skills"
 category = "top_level"
 status = "done"

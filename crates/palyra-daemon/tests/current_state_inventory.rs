@@ -64,7 +64,7 @@ fn current_state_inventory_snapshot_covers_capabilities_cli_and_compat_surface()
         .collect::<Vec<_>>();
     assert_eq!(
         backend_ids,
-        vec!["desktop_node", "local_sandbox", "networked_worker", "ssh_tunnel"],
+        vec!["desktop_node", "docker", "local_sandbox", "networked_worker", "ssh_tunnel"],
         "inventory should expose the current runtime execution backend inventory"
     );
 

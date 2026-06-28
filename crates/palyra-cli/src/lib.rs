@@ -121,11 +121,11 @@ use cli::{
     DeploymentCommand, DeploymentProfileArg, DocsCommand, ExtensionCommand, GatewayBindProfileArg,
     HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
     MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg,
-    OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    StateCommand, SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
-    WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    OnboardingCommand, OnboardingFlowArg, PatchBundleCommand, PatchCommand, PluginsCommand,
+    PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg,
+    SecretsCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
+    SkillsPackageCommand, StateCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -466,6 +466,7 @@ fn run_cli() -> Result<()> {
         CliCommand::Config { command } => commands::config::run_config(command),
         CliCommand::Models { command } => commands::models::run_models(command),
         CliCommand::Patch { command } => commands::patch::run_patch(command),
+        CliCommand::Workers { command } => commands::workers::run_workers(command),
         CliCommand::Skills { command } => commands::skills::run_skills(command),
         CliCommand::Secrets { command } => commands::secrets::run_secrets(command),
         CliCommand::Security { command } => commands::security::run_security(command),

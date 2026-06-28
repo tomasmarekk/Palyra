@@ -60,3 +60,4 @@ pub mod uninstall;
 pub mod update;
 pub mod webhooks;
 pub(crate) mod wizard;
+pub mod workers;

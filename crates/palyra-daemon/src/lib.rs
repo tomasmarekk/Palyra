@@ -2330,6 +2330,7 @@ pub async fn run() -> Result<()> {
             networked_workers: loaded.networked_workers.clone(),
             channel_router: loaded.channel_router.clone(),
             media: loaded.media.clone(),
+            code_intel: loaded.tool_call.code_intel.clone(),
             tool_call: tool_protocol::ToolCallConfig {
                 allowed_tools: loaded.tool_call.allowed_tools.clone(),
                 max_calls_per_run: loaded.tool_call.max_calls_per_run,

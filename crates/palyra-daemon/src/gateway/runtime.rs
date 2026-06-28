@@ -155,6 +155,7 @@ pub struct GatewayRuntimeConfigSnapshot {
     pub networked_workers: crate::config::NetworkedWorkersConfig,
     pub channel_router: ChannelRouterConfig,
     pub media: MediaRuntimeConfig,
+    pub code_intel: crate::config::CodeIntelConfig,
     pub tool_call: ToolCallConfig,
     pub tool_catalog_policy: crate::application::tool_registry::ToolCatalogPolicySnapshot,
     pub http_fetch: HttpFetchRuntimeConfig,
@@ -10647,6 +10648,7 @@ mod tests {
             networked_workers: crate::config::NetworkedWorkersConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
+            code_intel: crate::config::CodeIntelConfig::default(),
             tool_catalog_policy:
                 crate::application::tool_registry::ToolCatalogPolicySnapshot::direct_from_allowed_tools(
                     &["palyra.echo".to_owned()],

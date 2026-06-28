@@ -10,11 +10,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, env};
 
 use palyra_common::feature_rollouts::{
-    FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
-    EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
+    FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
+    EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
+    EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
 };
 use palyra_common::runtime_preview::RuntimePreviewMode;
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
@@ -44,6 +45,7 @@ pub(crate) enum ExecutionBackendPreference {
     Automatic,
     LocalSandbox,
     DesktopNode,
+    Docker,
     NetworkedWorker,
     SshTunnel,
 }
@@ -56,6 +58,7 @@ impl ExecutionBackendPreference {
             Self::Automatic => "automatic",
             Self::LocalSandbox => "local_sandbox",
             Self::DesktopNode => "desktop_node",
+            Self::Docker => "docker",
             Self::NetworkedWorker => "networked_worker",
             Self::SshTunnel => "ssh_tunnel",
         }
@@ -68,6 +71,7 @@ impl ExecutionBackendPreference {
             Self::Automatic => "Automatic",
             Self::LocalSandbox => "Local sandbox",
             Self::DesktopNode => "Desktop node",
+            Self::Docker => "Docker",
             Self::NetworkedWorker => "Networked worker",
             Self::SshTunnel => "SSH tunnel",
         }
@@ -85,6 +89,9 @@ impl ExecutionBackendPreference {
             }
             Self::DesktopNode => {
                 "Hand work off to a paired first-party desktop node when a healthy node is available."
+            }
+            Self::Docker => {
+                "Run work inside an explicit container profile with workspace changes returning as a reviewed patch bundle."
             }
             Self::NetworkedWorker => {
                 "Run work on an attested ephemeral worker with proxy-mediated egress and scoped artifact transport."
@@ -552,9 +559,45 @@ pub(crate) fn build_execution_backend_preflight_report(
                 record.reason_code = "backend.preflight.inventory_degraded".to_owned();
                 record.repair_hint = Some(backend.operator_summary.clone());
             }
+            apply_docker_cli_preflight_probe(&mut record, backend, docker_cli_available());
             record
         })
         .collect()
+}
+
+fn apply_docker_cli_preflight_probe(
+    record: &mut ExecutionBackendPreflightRecord,
+    backend: &ExecutionBackendInventoryRecord,
+    docker_available: bool,
+) {
+    if backend.backend_id != ExecutionBackendPreference::Docker.as_str()
+        || record.status != ExecutionBackendHealthStatus::Healthy
+        || docker_available
+    {
+        return;
+    }
+    record.status = ExecutionBackendHealthStatus::Unavailable;
+    record.reason_code = "backend.preflight.docker_unavailable".to_owned();
+    record.repair_hint = Some(
+        "Install Docker CLI or select local_sandbox; Docker target will not fall back to host execution."
+            .to_owned(),
+    );
+}
+
+fn docker_cli_available() -> bool {
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&paths)
+        .any(|directory| docker_cli_candidates().iter().any(|name| directory.join(name).is_file()))
+}
+
+fn docker_cli_candidates() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["docker.exe", "docker.cmd", "docker.bat", "docker"]
+    } else {
+        &["docker"]
+    }
 }
 
 /// Plans recovery for an in-flight tool job whose heartbeat is stale, or
@@ -842,13 +885,14 @@ pub(crate) fn parse_execution_backend_preference(
         "" | "automatic" | "auto" => ExecutionBackendPreference::Automatic,
         "local_sandbox" | "local" | "sandbox" => ExecutionBackendPreference::LocalSandbox,
         "desktop_node" | "node" | "remote_node" => ExecutionBackendPreference::DesktopNode,
+        "docker" | "container" | "container_sandbox" => ExecutionBackendPreference::Docker,
         "networked_worker" | "networked" | "worker" | "remote_worker" => {
             ExecutionBackendPreference::NetworkedWorker
         }
         "ssh_tunnel" | "ssh" | "tunnel" => ExecutionBackendPreference::SshTunnel,
         _ => {
             return Err(format!(
-                "{field_name} must be one of automatic, local_sandbox, desktop_node, networked_worker, ssh_tunnel"
+                "{field_name} must be one of automatic, local_sandbox, desktop_node, docker, networked_worker, ssh_tunnel"
             ));
         }
     };
@@ -908,12 +952,13 @@ pub(crate) fn build_execution_backend_inventory_with_worker_state(
             now_unix_ms.saturating_sub(node.last_seen_at_unix_ms.max(0)) <= NODE_HEALTHY_AFTER_MS
         })
         .collect::<Vec<_>>();
-    build_execution_backend_inventory_with_rollout(
+    build_execution_backend_inventory_with_docker_rollout(
         policy,
         nodes.len(),
         healthy_nodes.as_slice(),
         feature_rollouts.execution_backend_remote_node,
         feature_rollouts.execution_backend_networked_worker,
+        feature_rollouts.execution_backend_docker,
         feature_rollouts.networked_workers,
         feature_rollouts.execution_backend_ssh_tunnel,
         networked_workers,
@@ -935,9 +980,39 @@ fn build_execution_backend_inventory_with_rollout(
     worker_snapshot: WorkerFleetSnapshot,
     worker_policy: &WorkerFleetPolicy,
 ) -> Vec<ExecutionBackendInventoryRecord> {
+    build_execution_backend_inventory_with_docker_rollout(
+        policy,
+        total_nodes,
+        healthy_nodes,
+        remote_node_rollout,
+        networked_worker_rollout,
+        FeatureRolloutSetting::default(),
+        networked_workers_runtime_rollout,
+        ssh_tunnel_rollout,
+        networked_workers,
+        worker_snapshot,
+        worker_policy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_execution_backend_inventory_with_docker_rollout(
+    policy: &SandboxProcessRunnerPolicy,
+    total_nodes: usize,
+    healthy_nodes: &[&RegisteredNodeRecord],
+    remote_node_rollout: FeatureRolloutSetting,
+    networked_worker_rollout: FeatureRolloutSetting,
+    docker_rollout: FeatureRolloutSetting,
+    networked_workers_runtime_rollout: FeatureRolloutSetting,
+    ssh_tunnel_rollout: FeatureRolloutSetting,
+    networked_workers: &NetworkedWorkersConfig,
+    worker_snapshot: WorkerFleetSnapshot,
+    worker_policy: &WorkerFleetPolicy,
+) -> Vec<ExecutionBackendInventoryRecord> {
     vec![
         local_sandbox_inventory_record(policy),
         desktop_node_inventory_record(total_nodes, healthy_nodes, remote_node_rollout),
+        docker_inventory_record(docker_rollout),
         networked_worker_inventory_record(
             networked_worker_rollout,
             networked_workers_runtime_rollout,
@@ -1069,10 +1144,10 @@ pub(crate) fn resolve_execution_backend_for_request(
 /// Resolves a plain backend preference with fallback semantics.
 ///
 /// `Automatic` pins to the local sandbox. Unselectable preview backends fall
-/// back to the local sandbox (flagged via `fallback_used`) -- except
-/// `NetworkedWorker`, where falling back would silently downgrade a
-/// run-scoped attested worker grant onto the daemon host, so that request
-/// fails closed instead. Every non-local resolution requires approval.
+/// back to the local sandbox (flagged via `fallback_used`) -- except Docker
+/// and `NetworkedWorker`, where falling back would silently downgrade an
+/// explicit isolation or worker grant onto the daemon host, so those requests
+/// fail closed instead. Every non-local resolution requires approval.
 #[must_use]
 pub(crate) fn resolve_execution_backend(
     preference: ExecutionBackendPreference,
@@ -1124,26 +1199,32 @@ pub(crate) fn resolve_execution_backend(
         }
     }
 
-    // Deny local fallback for networked workers: the caller asked for an
-    // attested, proxy-mediated environment and must not silently end up on
-    // the daemon host (pinned by tests).
-    if matches!(preference, ExecutionBackendPreference::NetworkedWorker) {
+    // Deny local fallback for explicit isolation backends: the caller asked
+    // for a container or attested worker grant and must not silently end up
+    // on the daemon host (pinned by tests).
+    if matches!(
+        preference,
+        ExecutionBackendPreference::Docker | ExecutionBackendPreference::NetworkedWorker
+    ) {
         return ExecutionBackendResolution {
             requested: preference,
             resolved: preference,
             fallback_used: false,
-            reason_code: "backend.unavailable.networked_worker".to_owned(),
+            reason_code: format!("backend.unavailable.{}", preference.as_str()),
             approval_required: true,
             reason: requested_record
                 .map(|record| {
                     format!(
-                        "Requested backend 'networked_worker' is not selectable and local fallback is denied for run-scoped worker grants. {}",
+                        "Requested backend '{}' is not selectable and local fallback is denied for explicit isolation grants. {}",
+                        preference.as_str(),
                         record.operator_summary
                     )
                 })
                 .unwrap_or_else(|| {
-                    "Requested backend 'networked_worker' is missing from inventory and local fallback is denied for run-scoped worker grants."
-                        .to_owned()
+                    format!(
+                        "Requested backend '{}' is missing from inventory and local fallback is denied for explicit isolation grants.",
+                        preference.as_str()
+                    )
                 }),
         };
     }
@@ -1390,6 +1471,61 @@ fn desktop_node_inventory_record(
     }
 }
 
+fn docker_inventory_record(rollout: FeatureRolloutSetting) -> ExecutionBackendInventoryRecord {
+    let (state, selectable, operator_summary) = if rollout.enabled {
+        (
+            ExecutionBackendState::Available,
+            true,
+            "Preview backend is enabled. Docker runs require an allowlisted image, workspace-scoped mount, explicit network policy, and patch-bundle writeback."
+                .to_owned(),
+        )
+    } else {
+        (
+            ExecutionBackendState::Disabled,
+            false,
+            format!(
+                "Preview backend is disabled. Set {}=1 before selecting Docker execution.",
+                EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV
+            ),
+        )
+    };
+    ExecutionBackendInventoryRecord {
+        backend_id: ExecutionBackendPreference::Docker.as_str().to_owned(),
+        label: ExecutionBackendPreference::Docker.label().to_owned(),
+        state,
+        selectable,
+        selected_by_default: false,
+        description: ExecutionBackendPreference::Docker.description().to_owned(),
+        operator_summary,
+        executor_label: Some("docker".to_owned()),
+        rollout_flag: Some(EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV.to_owned()),
+        rollout_source: Some(rollout.source),
+        rollout_enabled: rollout.enabled,
+        capabilities: vec![
+            "containerized_execution".to_owned(),
+            "workspace_patch".to_owned(),
+            "scoped_artifact_transport".to_owned(),
+            "sandbox_process_runner".to_owned(),
+        ],
+        tradeoffs: vec![
+            "Requires an allowlisted image and non-privileged container profile".to_owned(),
+            "Authoritative workspace writes return as patch bundles for review".to_owned(),
+        ],
+        requires_attestation: true,
+        requires_egress_proxy: true,
+        attestation_mode: BackendAttestationMode::ContainerProfile,
+        workspace_strategy: WorkspaceStrategyDescriptor::container_volume(),
+        workspace_scope_mode: "workspace_scoped_container_mount".to_owned(),
+        artifact_transport: "container_patch_bundle_transfer".to_owned(),
+        cleanup_strategy: "container_and_volume_removal_attestation".to_owned(),
+        supports_cancellation: true,
+        supports_cleanup: true,
+        health_probe: "docker_cli_profile_preflight".to_owned(),
+        active_node_count: 0,
+        total_node_count: 0,
+    }
+}
+
 fn networked_worker_inventory_record(
     rollout: FeatureRolloutSetting,
     runtime_rollout: FeatureRolloutSetting,
@@ -1571,15 +1707,17 @@ mod tests {
     };
 
     use super::{
+        apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
-        plan_stuck_tool_job_recovery, resolve_execution_backend,
-        resolve_execution_backend_for_request, validate_execution_backend_selection,
-        ContainerBackendProfile, ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy,
-        ContainerNetworkPolicy, ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
+        parse_execution_backend_preference, plan_stuck_tool_job_recovery,
+        resolve_execution_backend, resolve_execution_backend_for_request,
+        validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
+        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
+        ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendResolutionRequest, ExecutionBackendState, FeatureRolloutSetting,
         SshWorkerBackendProfile, StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor,
-        WorkspaceStrategyKind,
+        WorkspaceStrategyKind, WorkspaceWritebackMode,
     };
 
     fn test_policy() -> SandboxProcessRunnerPolicy {
@@ -1724,6 +1862,124 @@ mod tests {
         assert!(!resolution.fallback_used);
         assert_eq!(resolution.reason_code, "backend.unavailable.networked_worker");
         assert!(resolution.reason.contains("local fallback is denied"));
+    }
+
+    #[test]
+    fn docker_backend_parser_accepts_container_aliases() {
+        for raw in ["docker", "container", "container_sandbox"] {
+            let parsed = parse_execution_backend_preference(raw, "execution_backend")
+                .expect("docker alias should parse");
+            assert_eq!(parsed, ExecutionBackendPreference::Docker);
+        }
+    }
+
+    #[test]
+    fn docker_inventory_requires_rollout_and_exposes_patch_bundle_contract() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let disabled_inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let disabled = disabled_inventory
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::Docker.as_str())
+            .expect("docker backend should exist");
+        assert_eq!(disabled.state, ExecutionBackendState::Disabled);
+        assert!(!disabled.selectable);
+
+        let enabled_inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let docker = enabled_inventory
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::Docker.as_str())
+            .expect("docker backend should exist");
+        assert_eq!(docker.state, ExecutionBackendState::Available);
+        assert!(docker.selectable);
+        assert_eq!(docker.workspace_strategy.kind, WorkspaceStrategyKind::ContainerVolume);
+        assert_eq!(docker.workspace_strategy.writeback, WorkspaceWritebackMode::PatchBundle);
+        assert_eq!(docker.artifact_transport, "container_patch_bundle_transfer");
+        assert!(docker.requires_attestation);
+        assert!(docker.requires_egress_proxy);
+    }
+
+    #[test]
+    fn docker_resolution_denies_local_fallback_when_unavailable() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let resolution = resolve_execution_backend(ExecutionBackendPreference::Docker, &inventory);
+
+        assert_eq!(resolution.resolved, ExecutionBackendPreference::Docker);
+        assert!(!resolution.fallback_used);
+        assert_eq!(resolution.reason_code, "backend.unavailable.docker");
+        assert!(resolution.reason.contains("local fallback is denied"));
+    }
+
+    #[test]
+    fn docker_preflight_reports_missing_cli_with_repair_hint() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let docker = inventory
+            .iter()
+            .find(|entry| entry.backend_id == ExecutionBackendPreference::Docker.as_str())
+            .expect("docker backend should exist");
+        let mut record = docker.preflight(
+            &ExecutionBackendResolutionRequest {
+                preference: ExecutionBackendPreference::Docker,
+                required_capabilities: vec!["containerized_execution".to_owned()],
+                workspace_strategy: Some(WorkspaceStrategyKind::ContainerVolume),
+            },
+            42_000,
+        );
+
+        apply_docker_cli_preflight_probe(&mut record, docker, false);
+
+        assert_eq!(record.status, ExecutionBackendHealthStatus::Unavailable);
+        assert_eq!(record.reason_code, "backend.preflight.docker_unavailable");
+        assert!(record.repair_hint.as_deref().is_some_and(|hint| hint.contains("Docker CLI")));
     }
 
     #[test]

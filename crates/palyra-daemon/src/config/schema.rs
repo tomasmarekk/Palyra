@@ -320,6 +320,7 @@ pub struct FeatureRolloutsConfig {
     pub context_engine: FeatureRolloutSetting,
     pub execution_backend_remote_node: FeatureRolloutSetting,
     pub execution_backend_networked_worker: FeatureRolloutSetting,
+    pub execution_backend_docker: FeatureRolloutSetting,
     pub execution_backend_ssh_tunnel: FeatureRolloutSetting,
     pub safety_boundary: FeatureRolloutSetting,
     pub execution_gate_pipeline_v2: FeatureRolloutSetting,
@@ -541,9 +542,25 @@ pub struct ToolCallConfig {
     pub max_calls_per_run: u32,
     pub execution_timeout_ms: u64,
     pub process_runner: ProcessRunnerConfig,
+    pub code_intel: CodeIntelConfig,
     pub wasm_runtime: WasmRuntimeConfig,
     pub http_fetch: HttpFetchConfig,
     pub browser_service: BrowserServiceConfig,
+}
+
+/// Code diagnostics adapter policy (disabled by default): workspace scope,
+/// provider binaries, time budget, and output caps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeIntelConfig {
+    pub enabled: bool,
+    pub workspace_root: Option<PathBuf>,
+    pub rust_analyzer_binary: String,
+    pub typescript_server_binary: String,
+    pub pyright_binary: String,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub max_items: usize,
+    pub idle_reap_ms: u64,
 }
 
 /// Sandboxed process runner policy (disabled by default): tier, executable
@@ -819,9 +836,26 @@ impl Default for ToolCallConfig {
             max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
             process_runner: ProcessRunnerConfig::default(),
+            code_intel: CodeIntelConfig::default(),
             wasm_runtime: WasmRuntimeConfig::default(),
             http_fetch: HttpFetchConfig::default(),
             browser_service: BrowserServiceConfig::default(),
+        }
+    }
+}
+
+impl Default for CodeIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            workspace_root: None,
+            rust_analyzer_binary: "rust-analyzer".to_owned(),
+            typescript_server_binary: "typescript-language-server".to_owned(),
+            pyright_binary: "pyright-langserver".to_owned(),
+            timeout_ms: 2_000,
+            max_output_bytes: 64 * 1024,
+            max_items: 64,
+            idle_reap_ms: 5 * 60 * 1_000,
         }
     }
 }

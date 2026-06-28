@@ -23,6 +23,7 @@ use tracing::error;
 use ulid::Ulid;
 
 use crate::{
+    application::tool_runtime::code_intel,
     application::workspace_observability::{
         capture_workspace_patch_checkpoint, compare_workspace_anchors, WorkspaceCompareAnchor,
         WorkspacePatchCheckpointCapture, WorkspacePatchCheckpointStage,
@@ -154,6 +155,12 @@ pub(super) async fn execute_workspace_patch_mutation(
             preflight_error = Some(status.message().to_owned());
         }
     }
+
+    let diagnostic_baseline = code_intel::capture_diagnostic_snapshot(
+        &runtime_state.config.code_intel,
+        workspace_roots,
+        planned_outcome.files_touched.as_slice(),
+    );
 
     let request = WorkspacePatchRequest {
         patch: patch.to_owned(),
@@ -291,6 +298,17 @@ pub(super) async fn execute_workspace_patch_mutation(
         pair_error: pair_error.as_deref(),
     };
     append_workspace_checkpoint_output(&mut output_value, checkpoint_output_context);
+    let diagnostic_after = code_intel::capture_diagnostic_snapshot(
+        &runtime_state.config.code_intel,
+        workspace_roots,
+        outcome.files_touched.as_slice(),
+    );
+    let diagnostic_delta = code_intel::diagnostic_delta(
+        &runtime_state.config.code_intel,
+        &diagnostic_baseline,
+        &diagnostic_after,
+    );
+    code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta);
     serialize_workspace_patch_success_value(proposal_id, input_json, output_value)
 }
 

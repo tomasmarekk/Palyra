@@ -62,6 +62,7 @@ mod tui;
 mod uninstall;
 mod update;
 mod webhooks;
+mod workers;
 
 pub use acp::{
     AcpBridgeArgs, AcpCommand, AcpConnectionArgs, AcpSessionDefaultsArgs, AcpShimArgs,
@@ -117,7 +118,7 @@ pub use onboarding::{
     RemoteVerificationModeArg, SetupWizardOverridesArg, WizardOverridesArg,
 };
 pub use pairing::{PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg};
-pub use patch::PatchCommand;
+pub use patch::{PatchBundleCommand, PatchCommand};
 pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
 pub use profile::{ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg};
@@ -140,6 +141,7 @@ pub use tui::TuiCommand;
 pub use uninstall::UninstallCommand;
 pub use update::UpdateCommand;
 pub use webhooks::WebhooksCommand;
+pub use workers::WorkersCommand;
 
 const ROOT_AFTER_HELP: &str = "\
 Examples:
@@ -956,6 +958,11 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         command: Option<ConfigCommand>,
+    },
+    #[command(about = "Inspect networked workers, leases, and cleanup evidence")]
+    Workers {
+        #[command(subcommand)]
+        command: WorkersCommand,
     },
     #[command(about = "Inspect and configure model providers and defaults")]
     Models {

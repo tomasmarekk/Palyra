@@ -241,6 +241,13 @@ async fn record_worker_artifact_transport_event(
             "read_only": lease.workspace_scope.read_only,
             "allowed_paths": lease.workspace_scope.allowed_paths.clone(),
         },
+        "workspace_writeback": {
+            "mode": "patch_bundle",
+            "authoritative_workspace_mutation": false,
+            "approval_required": true,
+            "conflict_policy": "reject_changed_local_workspace",
+            "cleanup_attestation_required": true,
+        },
         "artifact_transport": {
             "input_manifest_sha256": sha256_hex(input_json),
             "output_manifest_sha256": output_manifest_sha256,

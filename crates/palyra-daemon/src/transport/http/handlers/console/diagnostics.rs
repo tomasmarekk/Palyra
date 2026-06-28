@@ -19,6 +19,7 @@ use palyra_common::feature_rollouts::{
     CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH, CONTEXT_ENGINE_ROLLOUT_ENV,
     DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH, DELIVERY_ARBITRATION_ROLLOUT_ENV,
     DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
+    EXECUTION_BACKEND_DOCKER_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
     EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH,
     EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
     EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
@@ -966,6 +967,12 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.execution_backend_networked_worker.source,
             "config_path": EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH,
             "env_var": EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
+        },
+        "execution_backend_docker": {
+            "enabled": feature_rollouts.execution_backend_docker.enabled,
+            "source": feature_rollouts.execution_backend_docker.source,
+            "config_path": EXECUTION_BACKEND_DOCKER_ROLLOUT_CONFIG_PATH,
+            "env_var": EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
         },
         "execution_backend_ssh_tunnel": {
             "enabled": feature_rollouts.execution_backend_ssh_tunnel.enabled,

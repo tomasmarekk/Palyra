@@ -733,6 +733,12 @@
       "config_path": "feature_rollouts.execution_backend_networked_worker",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER"
     },
+    "execution_backend_docker": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.execution_backend_docker",
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER"
+    },
     "execution_backend_ssh_tunnel": {
       "enabled": false,
       "source": "default",
@@ -900,6 +906,23 @@
       "cleanup_strategy": "node_disconnect_or_run_completion_cleanup"
     },
     {
+      "backend_id": "docker",
+      "label": "Docker",
+      "description": "Run work inside an explicit container profile with workspace changes returning as a reviewed patch bundle.",
+      "executor_label": "docker",
+      "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
+      "rollout_enabled": false,
+      "tradeoffs": [
+        "Requires an allowlisted image and non-privileged container profile",
+        "Authoritative workspace writes return as patch bundles for review"
+      ],
+      "requires_attestation": true,
+      "requires_egress_proxy": true,
+      "workspace_scope_mode": "workspace_scoped_container_mount",
+      "artifact_transport": "container_patch_bundle_transfer",
+      "cleanup_strategy": "container_and_volume_removal_attestation"
+    },
+    {
       "backend_id": "local_sandbox",
       "label": "Local sandbox",
       "description": "Run work on the daemon host and keep sandbox/process-runner guardrails local.",
@@ -1037,6 +1060,7 @@
     "uninstall",
     "update",
     "version",
-    "webhooks"
+    "webhooks",
+    "workers"
   ]
 }

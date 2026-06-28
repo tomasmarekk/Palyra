@@ -20,16 +20,17 @@ use super::{
     MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
     ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
-    PairingCommand, PairingMethodArg, PairingStateArg, PatchCommand, PluginsCommand, PolicyCommand,
-    ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand,
-    RemoteVerificationModeArg, RequiredCommandIdArg, ResetCommand, ResetScopeArg,
-    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
-    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
-    RoutineUpsertCommand, RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
-    SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand, SupportBundleCommand,
-    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand, UninstallCommand,
-    UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
+    PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg, ProfileModeArg,
+    ProfileRiskLevelArg, ProtocolCommand, RemoteVerificationModeArg, RequiredCommandIdArg,
+    ResetCommand, ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg,
+    RoutineExecutionPostureArg, RoutinePreviewTimezoneArg, RoutineRunModeArg,
+    RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand, RoutinesCommand,
+    SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
+    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
+    WizardOverridesArg, WorkersCommand, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -5893,6 +5894,67 @@ fn parse_patch_apply_from_stdin() {
                 stdin: true,
                 dry_run: true,
                 json: true
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_patch_bundle_apply_uses_explicit_store_and_workspace() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "patch",
+        "bundles",
+        "apply",
+        "bundle-01",
+        "--workspace-root",
+        "workspace",
+        "--store",
+        "state/patch-bundles",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Patch {
+            command: PatchCommand::Bundles {
+                command: PatchBundleCommand::Apply {
+                    id: "bundle-01".to_owned(),
+                    workspace_root: Some("workspace".to_owned()),
+                    store: Some("state/patch-bundles".to_owned()),
+                    dry_run: true,
+                    json: true,
+                }
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_workers_cleanup_requires_explicit_evidence_flags() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "workers",
+        "cleanup",
+        "worker-01",
+        "--removed-workspace-scope",
+        "--removed-artifacts",
+        "--failure-reason",
+        "lease-expired",
+        "--confirm",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Workers {
+            command: WorkersCommand::Cleanup {
+                worker_id: "worker-01".to_owned(),
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: false,
+                failure_reason: Some("lease-expired".to_owned()),
+                confirm: true,
+                json: true,
             }
         }
     );

@@ -16,4 +16,50 @@ pub enum PatchCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Bundles {
+        #[command(subcommand)]
+        command: PatchBundleCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum PatchBundleCommand {
+    List {
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Approve {
+        id: String,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Apply {
+        id: String,
+        #[arg(long)]
+        workspace_root: Option<String>,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Discard {
+        id: String,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }

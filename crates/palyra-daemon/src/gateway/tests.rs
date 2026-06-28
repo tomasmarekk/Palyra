@@ -956,6 +956,7 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
             networked_workers: crate::config::NetworkedWorkersConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
+            code_intel: crate::config::CodeIntelConfig::default(),
             tool_catalog_policy:
                 crate::application::tool_registry::ToolCatalogPolicySnapshot::direct_from_allowed_tools(
                     tool_call.allowed_tools.as_slice(),
@@ -4634,12 +4635,70 @@ async fn networked_worker_runtime_executes_echo_with_artifact_transport_journal(
         artifact_payload.pointer("/payload/details/tool_name").and_then(Value::as_str),
         Some("palyra.echo")
     );
+    assert_eq!(
+        artifact_payload
+            .pointer("/payload/details/workspace_scope/read_only")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        artifact_payload
+            .pointer("/payload/details/workspace_writeback/mode")
+            .and_then(Value::as_str),
+        Some("patch_bundle")
+    );
+    assert_eq!(
+        artifact_payload
+            .pointer("/payload/details/workspace_writeback/authoritative_workspace_mutation")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
     assert!(
         artifact_payload
             .pointer("/payload/details/artifact_transport/output_manifest_sha256")
             .and_then(Value::as_str)
             .is_some(),
         "artifact transport event should attest output manifest"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn docker_runtime_fails_closed_without_host_fallback() {
+    let state = build_test_runtime_state(false);
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-docker-runtime",
+            run_id: "run-docker-runtime",
+            execution_backend: ExecutionBackendPreference::Docker,
+            backend_reason_code: "backend.available.docker",
+        },
+        "proposal-docker-runtime",
+        "palyra.echo",
+        br#"{"text":"must not run locally"}"#,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.success, "Docker target must not fall back to local execution");
+    assert_eq!(outcome.attestation.executor, "docker");
+    assert_eq!(outcome.attestation.sandbox_enforcement, "container_profile_preflight");
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(
+        output.get("reason_code").and_then(Value::as_str),
+        Some("backend.preflight.docker_unavailable")
+    );
+    assert_eq!(
+        output.get("workspace_writeback").and_then(Value::as_str),
+        Some("patch_bundle_required")
+    );
+    assert!(
+        outcome.error.contains("Docker execution target is unavailable"),
+        "error should be actionable: {}",
+        outcome.error
     );
 }
 

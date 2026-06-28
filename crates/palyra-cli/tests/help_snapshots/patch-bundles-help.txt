@@ -1,10 +1,11 @@
-Apply workspace patches through the guarded patch engine
-
-Usage: palyra patch [OPTIONS] <COMMAND>
+Usage: palyra patch bundles [OPTIONS] <COMMAND>
 
 Commands:
+  list
+  show
+  approve
   apply
-  bundles
+  discard
 
 Options:
   -h, --help  Print help

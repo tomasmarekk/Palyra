@@ -820,6 +820,8 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
+    } else if context.execution_backend == ExecutionBackendPreference::Docker {
+        docker_execution_target_unavailable_outcome(proposal_id, tool_name, input_json)
     } else if tool_name == TOOL_PROGRAM_RUN_TOOL_NAME {
         let fallback_budget;
         let remaining_tool_budget = match controls.remaining_tool_budget {
@@ -1158,6 +1160,34 @@ fn detached_background_process_from_tool_output(
         start_command: payload.pointer("/handoff/start_command").cloned().unwrap_or(Value::Null),
         cleanup: payload.get("cleanup").cloned().unwrap_or(Value::Null),
     })
+}
+
+fn docker_execution_target_unavailable_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "execution_target": "docker",
+        "status": "degraded",
+        "reason_code": "backend.preflight.docker_unavailable",
+        "repair_hint": "Install Docker, configure an allowlisted non-privileged container profile, or select local_sandbox. Docker target never falls back to host execution.",
+        "workspace_writeback": "patch_bundle_required",
+        "egress_policy": "explicit_profile_required",
+    });
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        "Docker execution target is unavailable until an allowlisted container profile passes preflight"
+            .to_owned(),
+        false,
+        "docker".to_owned(),
+        "container_profile_preflight".to_owned(),
+    )
 }
 
 fn execute_process_list_tool(

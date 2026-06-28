@@ -224,6 +224,7 @@ pub struct FileFeatureRolloutsConfig {
     pub context_engine: Option<bool>,
     pub execution_backend_remote_node: Option<bool>,
     pub execution_backend_networked_worker: Option<bool>,
+    pub execution_backend_docker: Option<bool>,
     pub execution_backend_ssh_tunnel: Option<bool>,
     pub safety_boundary: Option<bool>,
     pub execution_gate_pipeline_v2: Option<bool>,
@@ -525,9 +526,25 @@ pub struct FileToolCallConfig {
     pub max_calls_per_run: Option<u32>,
     pub execution_timeout_ms: Option<u64>,
     pub process_runner: Option<FileProcessRunnerConfig>,
+    pub code_intel: Option<FileCodeIntelConfig>,
     pub wasm_runtime: Option<FileWasmRuntimeConfig>,
     pub http_fetch: Option<FileHttpFetchConfig>,
     pub browser_service: Option<FileBrowserServiceConfig>,
+}
+
+/// `[tool_call.code_intel]`: bounded code diagnostics provider settings.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCodeIntelConfig {
+    pub enabled: Option<bool>,
+    pub workspace_root: Option<String>,
+    pub rust_analyzer_binary: Option<String>,
+    pub typescript_server_binary: Option<String>,
+    pub pyright_binary: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub max_output_bytes: Option<u64>,
+    pub max_items: Option<u64>,
+    pub idle_reap_ms: Option<u64>,
 }
 
 /// `[tool_call.http_fetch]`: outbound HTTP fetch policy and limits.
@@ -909,6 +926,7 @@ mod tests {
             context_engine = true
             execution_backend_remote_node = false
             execution_backend_networked_worker = true
+            execution_backend_docker = false
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
@@ -930,6 +948,7 @@ mod tests {
         assert_eq!(feature_rollouts.context_engine, Some(true));
         assert_eq!(feature_rollouts.execution_backend_remote_node, Some(false));
         assert_eq!(feature_rollouts.execution_backend_networked_worker, Some(true));
+        assert_eq!(feature_rollouts.execution_backend_docker, Some(false));
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
@@ -1036,5 +1055,42 @@ mod tests {
                 .and_then(|value| value.expected_image_digest_sha256.as_deref()),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn code_intel_tool_call_section_parses_expected_fields() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [tool_call.code_intel]
+            enabled = true
+            workspace_root = "workspace"
+            rust_analyzer_binary = "rust-analyzer"
+            typescript_server_binary = "typescript-language-server"
+            pyright_binary = "pyright-langserver"
+            timeout_ms = 1500
+            max_output_bytes = 32768
+            max_items = 24
+            idle_reap_ms = 60000
+            "#,
+        )
+        .expect("code_intel section should parse");
+
+        let code_intel = parsed
+            .tool_call
+            .as_ref()
+            .and_then(|tool_call| tool_call.code_intel.as_ref())
+            .expect("code_intel section should be present");
+        assert_eq!(code_intel.enabled, Some(true));
+        assert_eq!(code_intel.workspace_root.as_deref(), Some("workspace"));
+        assert_eq!(code_intel.rust_analyzer_binary.as_deref(), Some("rust-analyzer"));
+        assert_eq!(
+            code_intel.typescript_server_binary.as_deref(),
+            Some("typescript-language-server")
+        );
+        assert_eq!(code_intel.pyright_binary.as_deref(), Some("pyright-langserver"));
+        assert_eq!(code_intel.timeout_ms, Some(1_500));
+        assert_eq!(code_intel.max_output_bytes, Some(32_768));
+        assert_eq!(code_intel.max_items, Some(24));
+        assert_eq!(code_intel.idle_reap_ms, Some(60_000));
     }
 }

@@ -18,6 +18,9 @@ pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV: &str =
 /// Env toggle for the experimental networked-worker execution backend.
 pub const EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER";
+/// Env toggle for the experimental Docker execution backend.
+pub const EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV: &str =
+    "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER";
 /// Env toggle for the experimental SSH-tunnel execution backend.
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL";
@@ -53,6 +56,9 @@ pub const EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH: &str =
 /// Config path for [`EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV`].
 pub const EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_networked_worker";
+/// Config path for [`EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV`].
+pub const EXECUTION_BACKEND_DOCKER_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.execution_backend_docker";
 /// Config path for [`EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV`].
 pub const EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_backend_ssh_tunnel";

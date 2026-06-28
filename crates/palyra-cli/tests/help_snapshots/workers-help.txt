@@ -1,10 +1,12 @@
-Apply workspace patches through the guarded patch engine
+Inspect networked workers, leases, and cleanup evidence
 
-Usage: palyra patch [OPTIONS] <COMMAND>
+Usage: palyra workers [OPTIONS] <COMMAND>
 
 Commands:
-  apply
-  bundles
+  list
+  doctor
+  leases
+  cleanup
 
 Options:
   -h, --help  Print help
