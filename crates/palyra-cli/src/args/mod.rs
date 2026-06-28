@@ -55,6 +55,7 @@ mod secrets;
 mod security;
 mod sessions;
 mod skills;
+mod state;
 mod support_bundle;
 mod system;
 mod tui;
@@ -132,6 +133,7 @@ pub use secrets::{SecretsCommand, SecretsConfigureCommand};
 pub use security::SecurityCommand;
 pub use sessions::SessionsCommand;
 pub use skills::{SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand};
+pub use state::StateCommand;
 pub use support_bundle::SupportBundleCommand;
 pub use system::{SystemCommand, SystemEventCommand, SystemEventSeverityArg};
 pub use tui::TuiCommand;
@@ -733,6 +735,11 @@ pub enum Command {
     System {
         #[command(subcommand)]
         command: SystemCommand,
+    },
+    #[command(about = "Inspect and repair local durable state")]
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
     },
     #[command(
         about = "Inspect effective process-runner and WASM sandbox policy surfaces",

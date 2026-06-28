@@ -124,7 +124,7 @@ use cli::{
     OnboardingCommand, OnboardingFlowArg, PatchCommand, PluginsCommand, PolicyCommand,
     ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
     SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    StateCommand, SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
     WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
@@ -372,6 +372,7 @@ fn run_cli() -> Result<()> {
         CliCommand::Profile { command } => commands::profile::run_profile(command),
         CliCommand::Browser { command } => commands::browser::run_browser(command),
         CliCommand::System { command } => commands::system::run_system(command),
+        CliCommand::State { command } => commands::state::run_state(command),
         CliCommand::Sandbox { command } => commands::sandbox::run_sandbox(command),
         CliCommand::Completion { shell, shell_flag } => {
             let shell = shell.or(shell_flag).ok_or_else(|| {

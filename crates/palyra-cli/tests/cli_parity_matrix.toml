@@ -465,6 +465,71 @@ path = "system"
 file = "system-help.txt"
 
 [[entries]]
+path = "state"
+category = "canonical_family"
+status = "done"
+summary = "Offline durable state doctor, repair, checkpoint, and sidecar maintenance surface."
+
+[entries.snapshot]
+path = "state"
+file = "state-help.txt"
+
+[[entries]]
+path = "state doctor"
+category = "nested_surface"
+status = "done"
+summary = "Offline SQLite journal state health report."
+required_flags = ["db-path", "fast-window", "full", "json"]
+
+[entries.snapshot]
+path = "state doctor"
+file = "state-doctor-help.txt"
+
+[[entries]]
+path = "state verify-hash-chain"
+category = "nested_surface"
+status = "done"
+summary = "Offline journal hash-chain verifier."
+required_flags = ["db-path", "full", "limit", "json"]
+
+[entries.snapshot]
+path = "state verify-hash-chain"
+file = "state-verify-hash-chain-help.txt"
+
+[[entries]]
+path = "state repair"
+category = "nested_surface"
+status = "done"
+summary = "Offline targeted FTS repair planner and executor."
+required_flags = ["db-path", "dry-run", "fts-only", "actor-principal", "json"]
+
+[entries.snapshot]
+path = "state repair"
+file = "state-repair-help.txt"
+
+[[entries]]
+path = "state checkpoint"
+category = "nested_surface"
+status = "done"
+summary = "Offline SQLite WAL checkpoint executor."
+required_flags = ["db-path", "mode", "json"]
+
+[entries.snapshot]
+path = "state checkpoint"
+file = "state-checkpoint-help.txt"
+
+[[entries]]
+path = "state sidecars-prepare"
+category = "nested_surface"
+status = "done"
+summary = "Create rebuildable journal sidecar directories."
+required_flags = ["db-path", "json"]
+
+[entries.snapshot]
+path = "state sidecars-prepare"
+file = "state-sidecars-prepare-help.txt"
+
+[[entries]]
 path = "sandbox"
 category = "canonical_family"
 status = "done"
