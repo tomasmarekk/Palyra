@@ -25,6 +25,11 @@ Commands:
   dead-letter-discard
   disable
   logs
+  ingress-list
+  ingress-show
+  delivery-list
+  delivery-show
+  delivery-retry
   test
 
 Options:
