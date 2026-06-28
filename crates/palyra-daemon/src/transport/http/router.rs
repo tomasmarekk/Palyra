@@ -27,6 +27,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/admin/v1/status", get(admin::core::admin_status_handler))
         .route("/admin/v1/metrics", get(admin::core::admin_metrics_handler))
         .route("/admin/v1/journal/recent", get(admin::core::admin_journal_recent_handler))
+        .route("/admin/v1/state/doctor", get(admin::core::admin_state_doctor_handler))
+        .route("/admin/v1/state/repair", post(admin::core::admin_state_repair_handler))
+        .route("/admin/v1/state/checkpoint", post(admin::core::admin_state_checkpoint_handler))
+        .route("/admin/v1/state/hash-chain", get(admin::core::admin_state_hash_chain_handler))
+        .route(
+            "/admin/v1/state/sidecars/prepare",
+            post(admin::core::admin_state_sidecars_prepare_handler),
+        )
         .route("/admin/v1/policy/explain", get(admin::core::admin_policy_explain_handler))
         .route("/admin/v1/runs/{run_id}", get(admin::core::admin_run_status_handler))
         .route("/admin/v1/runs/{run_id}/tape", get(admin::core::admin_run_tape_handler))

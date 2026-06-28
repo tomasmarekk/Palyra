@@ -182,6 +182,173 @@ pub(crate) async fn admin_journal_recent_handler(
     Ok(Json(snapshot))
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminStateDoctorQuery {
+    #[serde(default)]
+    fast_window: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminStateHashChainQuery {
+    #[serde(default)]
+    full: Option<bool>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminStateRepairRequest {
+    #[serde(default)]
+    dry_run: Option<bool>,
+    #[serde(default)]
+    fts_only: Option<bool>,
+    #[serde(default)]
+    actor_principal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminStateCheckpointRequest {
+    #[serde(default)]
+    mode: Option<crate::journal::state_health::JournalWalCheckpointMode>,
+}
+
+/// Returns the SQLite journal state doctor report.
+///
+/// # Errors
+/// Returns an error response when admin authorization, request context
+/// extraction, or state probes fail.
+pub(crate) async fn admin_state_doctor_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminStateDoctorQuery>,
+) -> Result<Json<crate::journal::state_health::JournalHealthReport>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let report = state
+        .runtime
+        .journal_state_health_report(query.fast_window)
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(report))
+}
+
+/// Previews or applies targeted SQLite journal repair.
+///
+/// # Errors
+/// Returns an error response when admin authorization, request context
+/// extraction, or the repair operation fails.
+pub(crate) async fn admin_state_repair_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminStateRepairRequest>,
+) -> Result<Json<crate::journal::state_health::JournalStateRepairReport>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let actor_principal = payload.actor_principal.unwrap_or(context.principal);
+    let request = crate::journal::state_health::JournalStateRepairRequest {
+        dry_run: payload.dry_run.unwrap_or(true),
+        fts_only: payload.fts_only.unwrap_or(true),
+        actor_principal,
+    };
+    let report =
+        state.runtime.repair_journal_state(request).await.map_err(runtime_status_response)?;
+    Ok(Json(report))
+}
+
+/// Runs a WAL checkpoint against the SQLite journal.
+///
+/// # Errors
+/// Returns an error response when admin authorization, request context
+/// extraction, or SQLite checkpoint execution fails.
+pub(crate) async fn admin_state_checkpoint_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminStateCheckpointRequest>,
+) -> Result<Json<crate::journal::state_health::JournalWalCheckpointReport>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let mode =
+        payload.mode.unwrap_or(crate::journal::state_health::JournalWalCheckpointMode::Passive);
+    let report =
+        state.runtime.checkpoint_journal_wal(mode).await.map_err(runtime_status_response)?;
+    Ok(Json(report))
+}
+
+/// Verifies the SQLite journal hash chain.
+///
+/// # Errors
+/// Returns an error response when admin authorization, request context
+/// extraction, or hash-chain verification fails.
+pub(crate) async fn admin_state_hash_chain_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminStateHashChainQuery>,
+) -> Result<Json<crate::journal::state_health::JournalHashChainVerificationReport>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let scope = if query.full.unwrap_or(false) {
+        crate::journal::state_health::JournalHashVerificationScope::Full
+    } else {
+        crate::journal::state_health::JournalHashVerificationScope::FastWindow {
+            limit: query.limit.unwrap_or(256).max(1),
+        }
+    };
+    let report =
+        state.runtime.verify_journal_hash_chain(scope).await.map_err(runtime_status_response)?;
+    Ok(Json(report))
+}
+
+/// Creates rebuildable SQLite journal sidecar directories.
+///
+/// # Errors
+/// Returns an error response when admin authorization, request context
+/// extraction, directory creation, or permission hardening fails.
+pub(crate) async fn admin_state_sidecars_prepare_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::journal::state_health::SidecarIndexDescriptor>>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    let descriptors =
+        state.runtime.prepare_journal_sidecar_storage().await.map_err(runtime_status_response)?;
+    Ok(Json(descriptors))
+}
+
 /// Explains the policy decision for an operator-supplied principal/action pair.
 ///
 /// # Errors

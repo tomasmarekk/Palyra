@@ -30,6 +30,11 @@ use crate::agents::{
     AgentUnbindOutcome, AgentUnbindRequest, SessionAgentBinding,
 };
 use crate::application::auth::map_auth_profile_error;
+use crate::journal::state_health::{
+    JournalHashChainVerificationReport, JournalHashVerificationScope, JournalHealthReport,
+    JournalStateRepairReport, JournalStateRepairRequest, JournalWalCheckpointMode,
+    JournalWalCheckpointReport, SidecarIndexDescriptor,
+};
 use crate::journal::{
     FlowBundleRecord, FlowCreateRequest, FlowListFilter, FlowRecord, FlowStepRecord,
     FlowStepUpdateRequest, FlowTransitionRequest, IdempotencyBeginRequest,
@@ -1527,6 +1532,19 @@ fn stable_error_from_journal(code: &str, error: &JournalError) -> StableErrorEnv
         error.to_string(),
         "inspect the journal error and retry only after the underlying state is corrected",
     )
+}
+
+fn journal_state_error_status(error: JournalError) -> Status {
+    match &error {
+        JournalError::InvalidArgument(message) => Status::invalid_argument(message.clone()),
+        JournalError::WriteBlockedByHashChainMismatch { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
+        JournalError::EmptyPath | JournalError::ParentTraversalPath { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        _ => Status::internal(format!("journal state operation failed: {error}")),
+    }
 }
 
 /// Parses the stored run state into the canonical lifecycle phase, failing
@@ -3690,6 +3708,141 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.recent_journal_snapshot_blocking(limit))
             .await
             .map_err(|_| Status::internal("journal read worker panicked"))?
+    }
+
+    /// Builds the journal state doctor report on the blocking journal worker.
+    ///
+    /// # Errors
+    /// `internal` when state probes fail, `failed_precondition` when writes are
+    /// already blocked by a known hash-chain mismatch.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn journal_state_health_report_blocking(
+        &self,
+        fast_window: Option<usize>,
+    ) -> Result<JournalHealthReport, Status> {
+        self.journal_store.state_health_report(fast_window).map_err(journal_state_error_status)
+    }
+
+    /// Async wrapper for [`Self::journal_state_health_report_blocking`].
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn journal_state_health_report(
+        self: &Arc<Self>,
+        fast_window: Option<usize>,
+    ) -> Result<JournalHealthReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.journal_state_health_report_blocking(fast_window))
+            .await
+            .map_err(|_| Status::internal("journal state doctor worker panicked"))?
+    }
+
+    /// Applies or previews journal state repair on the blocking journal worker.
+    ///
+    /// # Errors
+    /// `invalid_argument` when the requested repair is outside the supported
+    /// Phase 1 FTS-only contract, or `internal` when the repair fails.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn repair_journal_state_blocking(
+        &self,
+        request: &JournalStateRepairRequest,
+    ) -> Result<JournalStateRepairReport, Status> {
+        self.journal_store.repair_state(request).map_err(journal_state_error_status)
+    }
+
+    /// Async wrapper for [`Self::repair_journal_state_blocking`].
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn repair_journal_state(
+        self: &Arc<Self>,
+        request: JournalStateRepairRequest,
+    ) -> Result<JournalStateRepairReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.repair_journal_state_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("journal state repair worker panicked"))?
+    }
+
+    /// Runs a WAL checkpoint on the blocking journal worker.
+    ///
+    /// # Errors
+    /// `internal` when SQLite rejects the checkpoint.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn checkpoint_journal_wal_blocking(
+        &self,
+        mode: JournalWalCheckpointMode,
+    ) -> Result<JournalWalCheckpointReport, Status> {
+        self.journal_store.checkpoint_wal(mode).map_err(journal_state_error_status)
+    }
+
+    /// Async wrapper for [`Self::checkpoint_journal_wal_blocking`].
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn checkpoint_journal_wal(
+        self: &Arc<Self>,
+        mode: JournalWalCheckpointMode,
+    ) -> Result<JournalWalCheckpointReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.checkpoint_journal_wal_blocking(mode))
+            .await
+            .map_err(|_| Status::internal("journal WAL checkpoint worker panicked"))?
+    }
+
+    /// Verifies the journal hash chain on the blocking journal worker.
+    ///
+    /// # Errors
+    /// `internal` when SQLite verification fails.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn verify_journal_hash_chain_blocking(
+        &self,
+        scope: JournalHashVerificationScope,
+    ) -> Result<JournalHashChainVerificationReport, Status> {
+        self.journal_store.verify_hash_chain(scope).map_err(journal_state_error_status)
+    }
+
+    /// Async wrapper for [`Self::verify_journal_hash_chain_blocking`].
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn verify_journal_hash_chain(
+        self: &Arc<Self>,
+        scope: JournalHashVerificationScope,
+    ) -> Result<JournalHashChainVerificationReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.verify_journal_hash_chain_blocking(scope))
+            .await
+            .map_err(|_| Status::internal("journal hash-chain verifier worker panicked"))?
+    }
+
+    /// Creates rebuildable journal sidecar directories on the blocking worker.
+    ///
+    /// # Errors
+    /// `internal` when directory creation or permission hardening fails.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn prepare_journal_sidecar_storage_blocking(
+        &self,
+    ) -> Result<Vec<SidecarIndexDescriptor>, Status> {
+        self.journal_store.prepare_sidecar_storage().map_err(journal_state_error_status)
+    }
+
+    /// Async wrapper for [`Self::prepare_journal_sidecar_storage_blocking`].
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn prepare_journal_sidecar_storage(
+        self: &Arc<Self>,
+    ) -> Result<Vec<SidecarIndexDescriptor>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.prepare_journal_sidecar_storage_blocking())
+            .await
+            .map_err(|_| Status::internal("journal sidecar prepare worker panicked"))?
     }
 
     /// Whether the v1 orchestrator run loop is enabled by configuration.

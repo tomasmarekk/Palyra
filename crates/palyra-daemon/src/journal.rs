@@ -59,6 +59,7 @@ use crate::{
 };
 
 mod retrieval_index_status;
+pub(crate) mod state_health;
 /// Aggregate indexing status of the workspace retrieval index, surfaced by the journal API.
 pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrievalIndexStatus;
 
@@ -3665,6 +3666,8 @@ pub enum JournalError {
     InvalidCanvasReplay { canvas_id: String, reason: String },
     #[error("invalid journal argument: {0}")]
     InvalidArgument(String),
+    #[error("journal writes blocked by hash-chain mismatch at event {event_id}: {reason_code}; {fix_hint}")]
+    WriteBlockedByHashChainMismatch { event_id: String, reason_code: String, fix_hint: String },
     #[error("{payload_kind} payload exceeds max bytes ({actual_bytes} > {max_bytes})")]
     PayloadTooLarge { payload_kind: &'static str, actual_bytes: usize, max_bytes: usize },
     #[error("journal max payload bytes must be greater than 0")]
@@ -5903,6 +5906,7 @@ pub struct JournalStore {
     memory_embedding_provider: Arc<dyn MemoryEmbeddingProvider>,
     memory_embedding_runtime: MemoryEmbeddingsRuntimeProfile,
     query_embedding_cache: Mutex<QueryEmbeddingCacheState>,
+    write_guard: Mutex<state_health::JournalWriteGuardState>,
 }
 
 impl fmt::Debug for JournalStore {
@@ -6043,6 +6047,7 @@ impl JournalStore {
             memory_embedding_provider,
             memory_embedding_runtime,
             query_embedding_cache: Mutex::new(QueryEmbeddingCacheState::default()),
+            write_guard: Mutex::new(state_health::JournalWriteGuardState::default()),
         })
     }
 
@@ -6165,6 +6170,7 @@ impl JournalStore {
         &self,
         request: &JournalAppendRequest,
     ) -> Result<JournalAppendOutcome, JournalError> {
+        self.ensure_hash_chain_writes_allowed()?;
         if request.payload_json.len() > self.config.max_payload_bytes {
             return Err(JournalError::PayloadTooLarge {
                 payload_kind: "journal",

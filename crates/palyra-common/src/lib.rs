@@ -40,7 +40,10 @@ pub use config::{
     default_state_root, default_state_root_from_env, parse_config_path, ConfigPathParseError,
     IdentityStorePathError,
 };
-pub use health::{health_response, HealthResponse};
+pub use health::{
+    health_response, highest_state_health_severity, HealthResponse, StateHealthEvidenceRef,
+    StateHealthFinding, StateHealthSeverity,
+};
 pub use ids::{validate_canonical_id, CanonicalIdError};
 pub use net::parse_daemon_bind_socket;
 pub use webhook::{
