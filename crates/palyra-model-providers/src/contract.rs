@@ -320,6 +320,87 @@ pub struct ProviderRequest {
     pub reasoning_effort: Option<ProviderReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ProviderServiceTier>,
+    pub prompt_segments: Vec<ProviderPromptSegment>,
+    pub prompt_cache_policy: PromptCachePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_report: Option<PromptCacheReport>,
+}
+
+/// Stable prompt segment classification for provider cache hints and request explainability.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPromptSegmentKind {
+    System,
+    Tool,
+    Policy,
+    Project,
+    Memory,
+    Session,
+    Tail,
+    CurrentTurn,
+}
+
+/// Provider-neutral cache hint for one prompt segment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPromptCacheHint {
+    LongLived,
+    ShortLived,
+    Volatile,
+    Sensitive,
+    Disabled,
+}
+
+/// Hash-only prompt segment metadata; raw prompt text stays in `input_text` and `messages`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderPromptSegment {
+    pub kind: ProviderPromptSegmentKind,
+    pub content_hash: String,
+    pub byte_len: usize,
+    pub trust_label: String,
+    pub cache_hint: ProviderPromptCacheHint,
+    pub invalidation_reason: Option<String>,
+}
+
+/// Strategy for choosing provider cache breakpoints.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheStrategy {
+    ProviderDefault,
+    StablePrefix,
+    SystemAndTool,
+    Disabled,
+}
+
+/// Provider-neutral prompt cache policy carried alongside a request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCachePolicy {
+    pub enabled: bool,
+    pub ttl_ms: u64,
+    pub strategy: PromptCacheStrategy,
+    pub max_breakpoints: usize,
+    pub provider_compatibility: String,
+}
+
+impl Default for PromptCachePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl_ms: 300_000,
+            strategy: PromptCacheStrategy::ProviderDefault,
+            max_breakpoints: 4,
+            provider_compatibility: "metadata_only".to_owned(),
+        }
+    }
+}
+
+/// Cache accounting emitted without raw prompt text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheReport {
+    pub eligible_bytes: usize,
+    pub invalidated_bytes: usize,
+    pub invalidation_reasons: Vec<String>,
+    pub provider_request_hash: String,
 }
 
 impl ProviderRequest {
@@ -346,6 +427,9 @@ impl ProviderRequest {
             max_output_tokens: None,
             reasoning_effort: None,
             service_tier: None,
+            prompt_segments: Vec::new(),
+            prompt_cache_policy: PromptCachePolicy::default(),
+            prompt_cache_report: None,
         }
     }
 

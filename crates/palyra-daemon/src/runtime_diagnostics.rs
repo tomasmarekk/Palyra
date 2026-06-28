@@ -625,6 +625,10 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
             allowed_channels: Vec::new(),
         },
     };
+    let tool_catalog_policy =
+        crate::application::tool_registry::ToolCatalogPolicySnapshot::direct_from_allowed_tools(
+            tool_config.allowed_tools.as_slice(),
+        );
     let request_context = ToolRequestContext {
         principal: "user:contract".to_owned(),
         device_id: Some("device:contract".to_owned()),
@@ -635,7 +639,9 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
     };
     let tool_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &tool_config,
+        catalog_policy: &tool_catalog_policy,
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context,
         provider_kind: "deterministic",
         provider_model_id: Some("contract-model"),

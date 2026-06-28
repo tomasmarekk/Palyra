@@ -45,6 +45,9 @@ use palyra_common::{
     parse_config_path,
     runtime_preview::{parse_runtime_preview_mode, RuntimePreviewMode},
     secret_refs::{SecretRef, SecretSource},
+    tool_catalog::{
+        expand_toolset_profiles, normalize_configured_tool_names, ToolCatalogExposureMode,
+    },
 };
 use palyra_vault::VaultRef;
 
@@ -744,9 +747,39 @@ pub fn load_config() -> Result<LoadedConfig> {
         }
         if let Some(file_tool_call) = parsed.tool_call {
             if let Some(allowed_tools) = file_tool_call.allowed_tools {
-                tool_call.allowed_tools = parse_tool_allowlist(
+                let allowed_tools = parse_tool_allowlist(
                     allowed_tools.join(",").as_str(),
                     "tool_call.allowed_tools",
+                )?;
+                tool_call.explicit_allowed_tools = allowed_tools.clone();
+                tool_call.allowed_tools = allowed_tools;
+            }
+            if let Some(profiles) = file_tool_call.profiles {
+                tool_call.toolset_profiles = parse_toolset_profile_allowlist(
+                    profiles.join(",").as_str(),
+                    "tool_call.profiles",
+                )?;
+            }
+            if let Some(extra_tools) = file_tool_call.extra_tools {
+                tool_call.extra_tools =
+                    parse_tool_allowlist(extra_tools.join(",").as_str(), "tool_call.extra_tools")?;
+            }
+            if let Some(disabled_tools) = file_tool_call.disabled_tools {
+                tool_call.disabled_tools = parse_tool_allowlist(
+                    disabled_tools.join(",").as_str(),
+                    "tool_call.disabled_tools",
+                )?;
+            }
+            if let Some(catalog_exposure_mode) = file_tool_call.catalog_exposure_mode {
+                tool_call.catalog_exposure_mode = parse_tool_catalog_exposure_mode(
+                    catalog_exposure_mode.as_str(),
+                    "tool_call.catalog_exposure_mode",
+                )?;
+            }
+            if let Some(compact_tool_threshold) = file_tool_call.compact_tool_threshold {
+                tool_call.compact_tool_threshold = parse_positive_usize(
+                    compact_tool_threshold as u64,
+                    "tool_call.compact_tool_threshold",
                 )?;
             }
             if let Some(max_calls_per_run) = file_tool_call.max_calls_per_run {
@@ -1582,9 +1615,42 @@ pub fn load_config() -> Result<LoadedConfig> {
     }
 
     if let Ok(allowed_tools) = env::var("PALYRA_TOOL_CALL_ALLOWED_TOOLS") {
-        tool_call.allowed_tools =
+        let allowed_tools =
             parse_tool_allowlist(allowed_tools.as_str(), "PALYRA_TOOL_CALL_ALLOWED_TOOLS")?;
+        tool_call.explicit_allowed_tools = allowed_tools.clone();
+        tool_call.allowed_tools = allowed_tools;
         source.push_str(" +env(PALYRA_TOOL_CALL_ALLOWED_TOOLS)");
+    }
+    if let Ok(profiles) = env::var("PALYRA_TOOL_CALL_PROFILES") {
+        tool_call.toolset_profiles =
+            parse_toolset_profile_allowlist(profiles.as_str(), "PALYRA_TOOL_CALL_PROFILES")?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_PROFILES)");
+    }
+    if let Ok(extra_tools) = env::var("PALYRA_TOOL_CALL_EXTRA_TOOLS") {
+        tool_call.extra_tools =
+            parse_tool_allowlist(extra_tools.as_str(), "PALYRA_TOOL_CALL_EXTRA_TOOLS")?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_EXTRA_TOOLS)");
+    }
+    if let Ok(disabled_tools) = env::var("PALYRA_TOOL_CALL_DISABLED_TOOLS") {
+        tool_call.disabled_tools =
+            parse_tool_allowlist(disabled_tools.as_str(), "PALYRA_TOOL_CALL_DISABLED_TOOLS")?;
+        source.push_str(" +env(PALYRA_TOOL_CALL_DISABLED_TOOLS)");
+    }
+    if let Ok(catalog_exposure_mode) = env::var("PALYRA_TOOL_CATALOG_EXPOSURE_MODE") {
+        tool_call.catalog_exposure_mode = parse_tool_catalog_exposure_mode(
+            catalog_exposure_mode.as_str(),
+            "PALYRA_TOOL_CATALOG_EXPOSURE_MODE",
+        )?;
+        source.push_str(" +env(PALYRA_TOOL_CATALOG_EXPOSURE_MODE)");
+    }
+    if let Ok(compact_tool_threshold) = env::var("PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD") {
+        tool_call.compact_tool_threshold = parse_positive_usize(
+            compact_tool_threshold
+                .parse::<u64>()
+                .context("PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD must be a valid u64")?,
+            "PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD",
+        )?;
+        source.push_str(" +env(PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD)");
     }
 
     if let Ok(max_calls_per_run) = env::var("PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN") {
@@ -2107,6 +2173,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         tool_call.process_runner.path_access_mode =
             legacy_process_runner_path_access_mode(&tool_call.process_runner, deployment.mode);
     }
+    reconcile_tool_call_profiles(&mut tool_call)?;
     // Anchor relative storage paths against the state root only now, after
     // env overrides, so PALYRA_STATE_ROOT and path overrides compose.
     let runtime_state_root =
@@ -3415,6 +3482,34 @@ fn parse_tool_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
     parse_identifier_allowlist(raw, source_name, "tool name")
 }
 
+fn parse_toolset_profile_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
+    parse_identifier_allowlist(raw, source_name, "toolset profile")
+}
+
+fn parse_tool_catalog_exposure_mode(
+    raw: &str,
+    source_name: &str,
+) -> Result<ToolCatalogExposureMode> {
+    ToolCatalogExposureMode::parse(raw)
+        .ok_or_else(|| anyhow::anyhow!("{source_name} must be one of: direct, compact, hybrid"))
+}
+
+fn reconcile_tool_call_profiles(config: &mut ToolCallConfig) -> Result<()> {
+    let expansion = expand_toolset_profiles(
+        config.toolset_profiles.as_slice(),
+        config.explicit_allowed_tools.as_slice(),
+        config.extra_tools.as_slice(),
+        config.disabled_tools.as_slice(),
+    )
+    .map_err(|error| anyhow::anyhow!("tool_call.profiles contains {}", error))?;
+    config.toolset_profiles = expansion.profiles;
+    config.explicit_allowed_tools = expansion.explicit_allowed_tools;
+    config.allowed_tools = expansion.effective_allowed_tools;
+    config.extra_tools = normalize_configured_tool_names(config.extra_tools.as_slice());
+    config.disabled_tools = normalize_configured_tool_names(config.disabled_tools.as_slice());
+    Ok(())
+}
+
 /// Parses the process-runner executable allowlist: lowercase identifier
 /// names, plus the literal `*` wildcard that grants full host access.
 fn parse_process_executable_allowlist(raw: &str, source_name: &str) -> Result<Vec<String>> {
@@ -4092,6 +4187,7 @@ mod tests {
         ProviderModelRole, ProviderReasoningEffort, ProviderServiceTier,
     };
     use crate::sandbox_runner::{EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerTier};
+    use palyra_common::tool_catalog::ToolCatalogExposureMode;
     use palyra_common::{
         daemon_config_schema::{
             FileModelProviderRegistryEntry, FileModelProviderRegistryModel, RootFileConfig,
@@ -4755,6 +4851,15 @@ mod tests {
             config.allowed_tools.is_empty(),
             "tool call allowlist must default empty to enforce deny-by-default"
         );
+        assert!(
+            config.explicit_allowed_tools.is_empty(),
+            "explicit tool grants must default empty"
+        );
+        assert!(config.toolset_profiles.is_empty(), "toolset profiles must default empty");
+        assert!(config.extra_tools.is_empty(), "extra tool grants must default empty");
+        assert!(config.disabled_tools.is_empty(), "disabled tool list must default empty");
+        assert_eq!(config.catalog_exposure_mode, ToolCatalogExposureMode::Direct);
+        assert_eq!(config.compact_tool_threshold, 16);
         assert_eq!(config.max_calls_per_run, 0);
         assert_eq!(config.execution_timeout_ms, 750);
         assert!(!config.process_runner.enabled, "sandbox process runner must default to disabled");
@@ -4944,6 +5049,30 @@ mod tests {
             tool_call.process_runner.expect("process_runner section should be present");
         assert_eq!(process_runner.tier.as_deref(), Some("c"));
         assert_eq!(process_runner.path_access_mode.as_deref(), Some("approved_roots"));
+    }
+
+    #[test]
+    fn tool_call_config_parses_profiles_and_catalog_projection() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [tool_call]
+            allowed_tools = ["palyra.echo"]
+            profiles = ["code"]
+            extra_tools = ["palyra.http.fetch"]
+            disabled_tools = ["palyra.fs.apply_patch"]
+            catalog_exposure_mode = "hybrid"
+            compact_tool_threshold = 12
+            "#,
+        )
+        .expect("tool-call profile config should parse");
+
+        let tool_call = parsed.tool_call.expect("tool_call section should be present");
+        assert_eq!(tool_call.allowed_tools, Some(vec!["palyra.echo".to_owned()]));
+        assert_eq!(tool_call.profiles, Some(vec!["code".to_owned()]));
+        assert_eq!(tool_call.extra_tools, Some(vec!["palyra.http.fetch".to_owned()]));
+        assert_eq!(tool_call.disabled_tools, Some(vec!["palyra.fs.apply_patch".to_owned()]));
+        assert_eq!(tool_call.catalog_exposure_mode.as_deref(), Some("hybrid"));
+        assert_eq!(tool_call.compact_tool_threshold, Some(12));
     }
 
     #[test]
@@ -5191,6 +5320,54 @@ max_calls_per_run = {configured_limit}
 
             assert_eq!(loaded.tool_call.max_calls_per_run, configured_limit);
         }
+    }
+
+    #[test]
+    fn load_config_expands_toolset_profiles_and_applies_disabled_tools() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[admin]
+require_auth = false
+
+[tool_call]
+allowed_tools = ["palyra.echo"]
+profiles = ["code"]
+extra_tools = ["palyra.http.fetch"]
+disabled_tools = ["palyra.fs.apply_patch"]
+catalog_exposure_mode = "compact"
+compact_tool_threshold = 9
+"#,
+        )
+        .expect("tool-call profile config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _allowed_tools = ScopedEnvVar::unset("PALYRA_TOOL_CALL_ALLOWED_TOOLS");
+        let _profiles = ScopedEnvVar::unset("PALYRA_TOOL_CALL_PROFILES");
+        let _extra_tools = ScopedEnvVar::unset("PALYRA_TOOL_CALL_EXTRA_TOOLS");
+        let _disabled_tools = ScopedEnvVar::unset("PALYRA_TOOL_CALL_DISABLED_TOOLS");
+        let _exposure_mode = ScopedEnvVar::unset("PALYRA_TOOL_CATALOG_EXPOSURE_MODE");
+        let _compact_threshold = ScopedEnvVar::unset("PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD");
+
+        let loaded = super::load_config().expect("tool-call profile config should load");
+
+        assert_eq!(loaded.tool_call.explicit_allowed_tools, vec!["palyra.echo".to_owned()]);
+        assert_eq!(loaded.tool_call.toolset_profiles, vec!["code".to_owned()]);
+        assert_eq!(loaded.tool_call.extra_tools, vec!["palyra.http.fetch".to_owned()]);
+        assert_eq!(loaded.tool_call.disabled_tools, vec!["palyra.fs.apply_patch".to_owned()]);
+        assert_eq!(loaded.tool_call.catalog_exposure_mode, ToolCatalogExposureMode::Compact);
+        assert_eq!(loaded.tool_call.compact_tool_threshold, 9);
+        assert!(loaded.tool_call.allowed_tools.iter().any(|tool| tool == "palyra.fs.read_file"));
+        assert!(loaded.tool_call.allowed_tools.iter().any(|tool| tool == "palyra.http.fetch"));
+        assert!(!loaded.tool_call.allowed_tools.iter().any(|tool| tool == "palyra.fs.apply_patch"));
     }
 
     #[test]

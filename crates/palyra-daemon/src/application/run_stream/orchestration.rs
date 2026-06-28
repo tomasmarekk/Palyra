@@ -68,7 +68,8 @@ use crate::{
 
 use super::{
     agent_loop::{
-        AgentLoopTerminationReason, AgentRunLoopState, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
+        AgentLoopTerminationReason, AgentRunLoopState, RunProgressAttempt, RunProgressController,
+        RunProgressIntervention, RunProgressOutcomeClass, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
     },
     cancellation::transition_run_stream_to_cancelled,
     tape::{
@@ -208,6 +209,8 @@ pub(crate) enum RunStreamProviderResponseOutcome {
         tool_result_messages: Vec<ProviderMessage>,
         /// Names of the tools that completed, used for follow-up deadlines.
         completed_tool_names: Vec<String>,
+        /// Normalized attempts used only by the no-progress controller.
+        run_progress_attempts: Vec<RunProgressAttempt>,
         provider_trace_ref: Option<String>,
         /// Final reply text; `Some` only when no tool results are pending.
         final_reply_text: Option<String>,
@@ -1019,7 +1022,9 @@ async fn build_run_stream_tool_catalog_snapshot(
         .await;
     Ok(build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
+        catalog_policy: &runtime_state.config.tool_catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
+        browser_service_configured: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {
             principal: request_context.principal.clone(),
             device_id: Some(request_context.device_id.clone()),
@@ -1694,6 +1699,9 @@ pub(crate) async fn process_run_stream_message(
     base_provider_request.max_output_tokens = prepared_provider_input.max_output_tokens;
     base_provider_request.reasoning_effort = prepared_provider_input.reasoning_effort;
     base_provider_request.service_tier = prepared_provider_input.service_tier;
+    base_provider_request.prompt_segments = prepared_provider_input.prompt_segments.clone();
+    base_provider_request.prompt_cache_policy = prepared_provider_input.prompt_cache_policy.clone();
+    base_provider_request.prompt_cache_report = prepared_provider_input.prompt_cache_report.clone();
     if !prepared_provider_input.provider_messages.is_empty() {
         let mut messages = prepared_provider_input.provider_messages.clone();
         messages.push(ProviderMessage::user_text(base_provider_request.input_text.clone()));
@@ -1725,6 +1733,7 @@ pub(crate) async fn process_run_stream_message(
     let mut final_answer_recovery_attempted = false;
     let mut browser_followup_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
+    let mut run_progress_controller = RunProgressController::new(3);
     let mut pending_browser_followup_deadline = false;
     let mut pending_tool_followup_deadline = false;
 
@@ -1962,6 +1971,9 @@ pub(crate) async fn process_run_stream_message(
         provider_request.max_output_tokens = base_provider_request.max_output_tokens;
         provider_request.reasoning_effort = base_provider_request.reasoning_effort;
         provider_request.service_tier = base_provider_request.service_tier;
+        provider_request.prompt_segments = base_provider_request.prompt_segments.clone();
+        provider_request.prompt_cache_policy = base_provider_request.prompt_cache_policy.clone();
+        provider_request.prompt_cache_report = base_provider_request.prompt_cache_report.clone();
         if let Some(budget_tokens) = background_budget_tokens {
             let consumed_tokens = loop_state.snapshot(run_id.as_str(), None).usage.total_tokens;
             match apply_background_budget_guard(
@@ -2256,6 +2268,7 @@ pub(crate) async fn process_run_stream_message(
             RunStreamProviderResponseOutcome::Completed {
                 tool_result_messages,
                 completed_tool_names,
+                run_progress_attempts,
                 provider_trace_ref,
                 final_reply_text,
                 final_provider_output,
@@ -2438,6 +2451,10 @@ pub(crate) async fn process_run_stream_message(
 
                 let repeated_tool_failure =
                     repeated_tool_failure_tracker.observe(tool_result_messages.as_slice());
+                let run_progress_intervention = observe_run_progress_controller(
+                    &mut run_progress_controller,
+                    run_progress_attempts.as_slice(),
+                );
                 let tool_result_count = tool_result_messages.len();
                 // Arm the next-turn follow-up deadline after tool results;
                 // browser tools use the shorter browser-specific guard.
@@ -2460,6 +2477,40 @@ pub(crate) async fn process_run_stream_message(
                     )
                     .await?;
                     return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                }
+                if let Some(intervention) = run_progress_intervention {
+                    append_agent_loop_tape_event(
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        "agent_loop.run_progress_intervention",
+                        serde_json::to_string(&intervention).unwrap_or_else(|_| "{}".to_owned()),
+                    )
+                    .await?;
+                    loop_state.append_user_guidance(intervention.guidance.clone());
+                    send_agent_loop_progress_status(
+                        sender,
+                        runtime_state,
+                        run_id.as_str(),
+                        tape_seq,
+                        "agent_loop.run_progress_intervention",
+                    )
+                    .await?;
+                    if intervention.terminate_run {
+                        terminate_run_stream_with_agent_loop_reason(
+                            sender,
+                            runtime_state,
+                            run_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            &loop_state,
+                            AgentLoopTerminationReason::RepeatedToolFailure,
+                            intervention.guidance.as_str(),
+                            provider_trace_ref,
+                        )
+                        .await?;
+                        return Ok(RunStreamMessageProcessingOutcome::Terminate);
+                    }
                 }
                 let compaction_will_run = tool_result_count > 0 && !*tool_result_compaction_emitted;
                 if compaction_will_run {
@@ -2683,6 +2734,8 @@ async fn process_run_stream_provider_response(
     };
     let completed_tool_names =
         tool_results.iter().map(|result| result.tool_name.clone()).collect::<Vec<_>>();
+    let run_progress_attempts =
+        tool_results.iter().map(run_progress_attempt_from_tool_result).collect::<Vec<_>>();
     let has_pending_tool_results = !tool_result_messages.is_empty();
     let reply_text = if provider_output.full_text.trim().is_empty() {
         summary_tokens.concat()
@@ -2757,6 +2810,7 @@ async fn process_run_stream_provider_response(
     Ok(RunStreamProviderResponseOutcome::Completed {
         tool_result_messages,
         completed_tool_names,
+        run_progress_attempts,
         provider_trace_ref: provider_output.raw_provider_refs.provider_trace_ref.clone(),
         final_reply_text: (!has_pending_tool_results).then_some(reply_text),
         final_provider_output: (!has_pending_tool_results && !stream_model_tokens_immediately)
@@ -2899,6 +2953,58 @@ impl RepeatedToolFailureTracker {
         self.last_signature = None;
         self.repeated_count = 0;
     }
+}
+
+fn observe_run_progress_controller(
+    controller: &mut RunProgressController,
+    attempts: &[RunProgressAttempt],
+) -> Option<RunProgressIntervention> {
+    attempts.iter().cloned().find_map(|attempt| controller.observe(attempt))
+}
+
+fn run_progress_attempt_from_tool_result(
+    result: &RunStreamToolResultForModel,
+) -> RunProgressAttempt {
+    let output_or_error = if result.outcome.output_json.is_empty() {
+        result.outcome.error.as_bytes().to_vec()
+    } else {
+        result.outcome.output_json.clone()
+    };
+    RunProgressAttempt {
+        tool_name: result.tool_name.clone(),
+        normalized_input_json: output_or_error,
+        workspace_key: None,
+        query_hash: None,
+        sensitivity: "runtime_result".to_owned(),
+        outcome_class: run_progress_outcome_class(result),
+    }
+}
+
+fn run_progress_outcome_class(result: &RunStreamToolResultForModel) -> RunProgressOutcomeClass {
+    if result.outcome.success {
+        if run_progress_is_read_only_workspace_tool(result.tool_name.as_str()) {
+            return RunProgressOutcomeClass::ReadNoProgress;
+        }
+        return RunProgressOutcomeClass::Success;
+    }
+
+    let error = result.outcome.error.to_ascii_lowercase();
+    if error.contains("approval") && error.contains("denied") {
+        return RunProgressOutcomeClass::ApprovalDenied;
+    }
+    if error.contains("policy") && (error.contains("denied") || error.contains("blocked")) {
+        return RunProgressOutcomeClass::PolicyDenied;
+    }
+    RunProgressOutcomeClass::Failure
+}
+
+fn run_progress_is_read_only_workspace_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
+            | crate::gateway::WORKSPACE_LIST_DIR_TOOL_NAME
+            | crate::gateway::WORKSPACE_SEARCH_TOOL_NAME
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -956,6 +956,10 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
             networked_workers: crate::config::NetworkedWorkersConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
+            tool_catalog_policy:
+                crate::application::tool_registry::ToolCatalogPolicySnapshot::direct_from_allowed_tools(
+                    tool_call.allowed_tools.as_slice(),
+                ),
             tool_call,
             http_fetch: super::HttpFetchRuntimeConfig {
                 allow_private_targets,

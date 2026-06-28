@@ -70,11 +70,13 @@ use palyra_model_providers::{
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
     AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
-    EmbeddingsRequest, EmbeddingsResponse, ProviderAttemptSummary, ProviderEvent,
-    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
+    EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
+    PromptCacheStrategy, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,
+    ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+    ProviderMessageToolCall, ProviderOutputContentPart, ProviderPromptCacheHint,
+    ProviderPromptSegment, ProviderPromptSegmentKind, ProviderRawProviderRefs,
+    ProviderReasoningEffort, ProviderRedactionState, ProviderRequest, ProviderResponse,
+    ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -745,6 +747,13 @@ impl RegistryBackedModelProvider {
             "budget_profile": request.budget_profile.as_deref(),
             "max_output_tokens": request.max_output_tokens,
             "vision_inputs": &request.vision_inputs,
+            "prompt_segments": &request.prompt_segments,
+            "prompt_cache_policy": &request.prompt_cache_policy,
+            "prompt_cache_report": request.prompt_cache_report.as_ref().map(|report| json!({
+                "eligible_bytes": report.eligible_bytes,
+                "invalidated_bytes": report.invalidated_bytes,
+                "invalidation_reasons": report.invalidation_reasons,
+            })),
         });
         crate::sha256_hex(
             serde_json::to_vec(&payload).unwrap_or_else(|_| b"null".to_vec()).as_slice(),
@@ -1407,6 +1416,17 @@ fn stable_tool_catalog_snapshot_for_response_cache(snapshot: &Value) -> Value {
             "principal_hash": snapshot.principal_hash,
             "channel_hash": snapshot.channel_hash,
             "remaining_tool_budget": snapshot.remaining_tool_budget,
+            "profile_expansion": snapshot.profile_expansion,
+            "exposure_mode": snapshot.exposure_mode.as_str(),
+            "compact_tool_threshold": snapshot.compact_tool_threshold,
+            "direct_tool_count": snapshot.direct_tool_count,
+            "exposed_tool_count": snapshot.exposed_tool_count,
+            "estimated_direct_tool_bytes": snapshot.estimated_direct_tool_bytes,
+            "estimated_exposed_tool_bytes": snapshot.estimated_exposed_tool_bytes,
+            "estimated_saved_bytes": snapshot.estimated_saved_bytes,
+            "availability_probes": snapshot.availability_probes,
+            "index": snapshot.index,
+            "indexed_tools": snapshot.indexed_tools,
             "tools": snapshot.tools,
             "filtered_tools": snapshot.filtered_tools,
         });
@@ -4792,6 +4812,9 @@ mod tests {
             max_output_tokens: Some(6_144),
             reasoning_effort: None,
             service_tier: None,
+            prompt_segments: Vec::new(),
+            prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
+            prompt_cache_report: None,
         };
 
         let openai_payload =
@@ -4851,6 +4874,9 @@ mod tests {
             max_output_tokens: None,
             reasoning_effort: None,
             service_tier: None,
+            prompt_segments: Vec::new(),
+            prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
+            prompt_cache_report: None,
         };
 
         let openai_payload =
@@ -4904,6 +4930,9 @@ mod tests {
             max_output_tokens: None,
             reasoning_effort: None,
             service_tier: None,
+            prompt_segments: Vec::new(),
+            prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
+            prompt_cache_report: None,
         };
 
         let anthropic_payload =
@@ -4959,6 +4988,9 @@ mod tests {
             max_output_tokens: None,
             reasoning_effort: None,
             service_tier: None,
+            prompt_segments: Vec::new(),
+            prompt_cache_policy: palyra_model_providers::PromptCachePolicy::default(),
+            prompt_cache_report: None,
         };
 
         let anthropic_payload =
@@ -5417,6 +5449,55 @@ mod tests {
             "channel_hash": null,
             "remaining_tool_budget": null,
             "created_at_unix_ms": created_at_unix_ms,
+            "profile_expansion": {
+                "profiles": [],
+                "profile_expansions": [],
+                "explicit_allowed_tools": ["palyra.echo"],
+                "extra_tools": [],
+                "disabled_tools": [],
+                "effective_allowed_tools": ["palyra.echo"]
+            },
+            "exposure_mode": "direct",
+            "compact_tool_threshold": 16,
+            "direct_tool_count": 1,
+            "exposed_tool_count": 1,
+            "estimated_direct_tool_bytes": 128,
+            "estimated_exposed_tool_bytes": 128,
+            "estimated_saved_bytes": 0,
+            "availability_probes": [],
+            "index": {
+                "schema_version": 1,
+                "index_digest": "index_sha256",
+                "entries": []
+            },
+            "indexed_tools": [{
+                "name": "palyra.echo",
+                "description": "Echo text for diagnostics.",
+                "version": 1,
+                "provenance": "builtin",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"}
+                    },
+                    "required": ["text"]
+                },
+                "provider_schema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"}
+                    },
+                    "required": ["text"]
+                },
+                "internal_schema_hash": "internal_schema_sha256",
+                "provider_schema_hash": "provider_schema_sha256",
+                "description_hash": "description_sha256",
+                "capabilities": ["diagnostics"],
+                "approval_posture": "safe",
+                "projection_policy": "inline_unless_large",
+                "parallelism_policy": "read_only",
+                "exposure_reason": "allowlisted_policy_visible"
+            }],
             "tools": [{
                 "name": "palyra.echo",
                 "description": "Echo text for diagnostics.",

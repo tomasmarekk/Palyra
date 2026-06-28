@@ -528,6 +528,12 @@ pub struct MemoryRetentionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallConfig {
     pub allowed_tools: Vec<String>,
+    pub explicit_allowed_tools: Vec<String>,
+    pub toolset_profiles: Vec<String>,
+    pub extra_tools: Vec<String>,
+    pub disabled_tools: Vec<String>,
+    pub catalog_exposure_mode: palyra_common::tool_catalog::ToolCatalogExposureMode,
+    pub compact_tool_threshold: usize,
     /// Legacy config key accepted for existing installations.
     ///
     /// Count-based agent-run limiting is disabled; `0` means unlimited and
@@ -804,6 +810,12 @@ impl Default for ToolCallConfig {
     fn default() -> Self {
         Self {
             allowed_tools: Vec::new(),
+            explicit_allowed_tools: Vec::new(),
+            toolset_profiles: Vec::new(),
+            extra_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            catalog_exposure_mode: palyra_common::tool_catalog::ToolCatalogExposureMode::Direct,
+            compact_tool_threshold: 16,
             max_calls_per_run: DEFAULT_TOOL_CALL_MAX_CALLS_PER_RUN,
             execution_timeout_ms: DEFAULT_TOOL_CALL_EXECUTION_TIMEOUT_MS,
             process_runner: ProcessRunnerConfig::default(),

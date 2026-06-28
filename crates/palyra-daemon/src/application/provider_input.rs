@@ -69,8 +69,10 @@ use crate::{
     media::MediaDerivedArtifactSelection,
     media::MediaRuntimeConfig,
     model_provider::{
-        ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderReasoningEffort, ProviderServiceTier,
+        PromptCachePolicy, PromptCacheReport, PromptCacheStrategy, ProviderImageInput,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole, ProviderPromptCacheHint,
+        ProviderPromptSegment, ProviderPromptSegmentKind, ProviderReasoningEffort,
+        ProviderServiceTier,
     },
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
@@ -104,6 +106,125 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) max_output_tokens: Option<u64>,
     pub(crate) reasoning_effort: Option<ProviderReasoningEffort>,
     pub(crate) service_tier: Option<ProviderServiceTier>,
+    pub(crate) prompt_segments: Vec<ProviderPromptSegment>,
+    pub(crate) prompt_cache_policy: PromptCachePolicy,
+    pub(crate) prompt_cache_report: Option<PromptCacheReport>,
+}
+
+pub(crate) fn build_prompt_cache_metadata(
+    provider_input_text: &str,
+    provider_messages: &[ProviderMessage],
+    user_visible_input_text: Option<&str>,
+    tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+) -> (Vec<ProviderPromptSegment>, PromptCachePolicy, Option<PromptCacheReport>) {
+    let mut segments = Vec::new();
+    segments.push(prompt_segment(
+        ProviderPromptSegmentKind::System,
+        provider_input_text.as_bytes(),
+        "runtime_prompt",
+        ProviderPromptCacheHint::LongLived,
+        None,
+    ));
+    if let Some(snapshot) = tool_catalog_snapshot {
+        segments.push(prompt_segment(
+            ProviderPromptSegmentKind::Tool,
+            snapshot.catalog_hash.as_bytes(),
+            "tool_catalog_snapshot",
+            ProviderPromptCacheHint::LongLived,
+            None,
+        ));
+        if snapshot.estimated_saved_bytes > 0 {
+            segments.push(prompt_segment(
+                ProviderPromptSegmentKind::Policy,
+                snapshot.index.index_digest.as_bytes(),
+                "tool_catalog_index",
+                ProviderPromptCacheHint::LongLived,
+                None,
+            ));
+        }
+    }
+    if !provider_messages.is_empty() {
+        let encoded =
+            serde_json::to_vec(provider_messages).unwrap_or_else(|_| b"messages".to_vec());
+        segments.push(prompt_segment(
+            ProviderPromptSegmentKind::Session,
+            encoded.as_slice(),
+            "session_messages",
+            ProviderPromptCacheHint::ShortLived,
+            None,
+        ));
+    }
+    if let Some(user_visible_input_text) = user_visible_input_text {
+        segments.push(prompt_segment(
+            ProviderPromptSegmentKind::CurrentTurn,
+            user_visible_input_text.as_bytes(),
+            "user_current_turn",
+            ProviderPromptCacheHint::Volatile,
+            Some("current_turn_changes".to_owned()),
+        ));
+    }
+    let policy = PromptCachePolicy {
+        enabled: true,
+        ttl_ms: 300_000,
+        strategy: if tool_catalog_snapshot.is_some() {
+            PromptCacheStrategy::SystemAndTool
+        } else {
+            PromptCacheStrategy::StablePrefix
+        },
+        max_breakpoints: 4,
+        provider_compatibility: "metadata_only".to_owned(),
+    };
+    let report = prompt_cache_report(provider_input_text, segments.as_slice());
+    (segments, policy, Some(report))
+}
+
+fn prompt_segment(
+    kind: ProviderPromptSegmentKind,
+    bytes: &[u8],
+    trust_label: &str,
+    cache_hint: ProviderPromptCacheHint,
+    invalidation_reason: Option<String>,
+) -> ProviderPromptSegment {
+    ProviderPromptSegment {
+        kind,
+        content_hash: crate::sha256_hex(bytes),
+        byte_len: bytes.len(),
+        trust_label: trust_label.to_owned(),
+        cache_hint,
+        invalidation_reason,
+    }
+}
+
+fn prompt_cache_report(
+    provider_input_text: &str,
+    segments: &[ProviderPromptSegment],
+) -> PromptCacheReport {
+    let mut eligible_bytes = 0usize;
+    let mut invalidated_bytes = 0usize;
+    let mut invalidation_reasons = Vec::new();
+    for segment in segments {
+        match segment.cache_hint {
+            ProviderPromptCacheHint::LongLived | ProviderPromptCacheHint::ShortLived => {
+                eligible_bytes = eligible_bytes.saturating_add(segment.byte_len);
+            }
+            ProviderPromptCacheHint::Volatile
+            | ProviderPromptCacheHint::Sensitive
+            | ProviderPromptCacheHint::Disabled => {
+                invalidated_bytes = invalidated_bytes.saturating_add(segment.byte_len);
+                if let Some(reason) = segment.invalidation_reason.as_ref() {
+                    invalidation_reasons.push(reason.clone());
+                }
+            }
+        }
+    }
+    invalidation_reasons.sort();
+    invalidation_reasons.dedup();
+    PromptCacheReport {
+        eligible_bytes,
+        invalidated_bytes,
+        invalidation_reasons,
+        provider_request_hash: crate::sha256_hex(provider_input_text.as_bytes()),
+    }
 }
 
 /// How memory-augmentation failures affect the overall input preparation.
@@ -1473,7 +1594,7 @@ async fn prepare_model_provider_input_legacy(
         attachments,
         provider_kind_hint: _,
         provider_model_id_hint: _,
-        tool_catalog_snapshot: _,
+        tool_catalog_snapshot,
         memory_ingest_reason,
         memory_prompt_failure_mode,
         channel_for_log,
@@ -1634,6 +1755,13 @@ async fn prepare_model_provider_input_legacy(
         )
         .await?;
         let provider_input_text = prepend_legacy_runtime_context(provider_input_text);
+        let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
+            build_prompt_cache_metadata(
+                provider_input_text.as_str(),
+                &[],
+                Some(input_text),
+                tool_catalog_snapshot,
+            );
         return Ok(PreparedModelProviderInput {
             provider_input_text,
             provider_messages: Vec::new(),
@@ -1644,6 +1772,9 @@ async fn prepare_model_provider_input_legacy(
             max_output_tokens: None,
             reasoning_effort,
             service_tier,
+            prompt_segments,
+            prompt_cache_policy,
+            prompt_cache_report,
         });
     }
     let provider_input_text = match build_context_reference_prompt(
@@ -1715,6 +1846,12 @@ async fn prepare_model_provider_input_legacy(
     )
     .await?;
     let provider_input_text = prepend_legacy_runtime_context(provider_input_text);
+    let (prompt_segments, prompt_cache_policy, prompt_cache_report) = build_prompt_cache_metadata(
+        provider_input_text.as_str(),
+        previous_provider_messages.as_slice(),
+        Some(input_text),
+        tool_catalog_snapshot,
+    );
     Ok(PreparedModelProviderInput {
         provider_input_text,
         provider_messages: previous_provider_messages,
@@ -1725,6 +1862,9 @@ async fn prepare_model_provider_input_legacy(
         max_output_tokens: None,
         reasoning_effort,
         service_tier,
+        prompt_segments,
+        prompt_cache_policy,
+        prompt_cache_report,
     })
 }
 
@@ -2031,12 +2171,15 @@ fn memory_auto_inject_tape_payload_with_workspace(
 #[cfg(test)]
 mod tests {
     use super::{
-        curated_memory_sources_for_prompt_context, parse_provider_reasoning_effort_override,
-        parse_provider_service_tier_override, render_legacy_runtime_context_prompt,
-        sanitize_prompt_inline_value,
+        build_prompt_cache_metadata, curated_memory_sources_for_prompt_context,
+        parse_provider_reasoning_effort_override, parse_provider_service_tier_override,
+        render_legacy_runtime_context_prompt, sanitize_prompt_inline_value,
     };
     use crate::journal::MemorySource;
-    use crate::model_provider::{ProviderReasoningEffort, ProviderServiceTier};
+    use crate::model_provider::{
+        PromptCacheStrategy, ProviderMessage, ProviderPromptCacheHint, ProviderPromptSegmentKind,
+        ProviderReasoningEffort, ProviderServiceTier,
+    };
     use chrono::TimeZone;
 
     #[test]
@@ -2069,6 +2212,30 @@ mod tests {
         assert!(prompt.contains("current_unix_ms: 1779021296000"));
         assert!(prompt.contains("temporal_evidence_contract"));
         assert!(prompt.contains("Do not invent calendar dates or times"));
+    }
+
+    #[test]
+    fn prompt_cache_metadata_marks_current_turn_volatile() {
+        let (segments, policy, report) = build_prompt_cache_metadata(
+            "system prefix\n\nuser asks current question",
+            &[ProviderMessage::user_text("prior context")],
+            Some("user asks current question"),
+            None,
+        );
+        let report = report.expect("cache report should be present");
+
+        assert_eq!(policy.strategy, PromptCacheStrategy::StablePrefix);
+        assert!(report.eligible_bytes > 0);
+        assert!(report.invalidated_bytes > 0);
+        assert!(report.invalidation_reasons.contains(&"current_turn_changes".to_owned()));
+        assert!(segments.iter().any(|segment| {
+            segment.kind == ProviderPromptSegmentKind::CurrentTurn
+                && segment.cache_hint == ProviderPromptCacheHint::Volatile
+        }));
+        assert!(
+            segments.iter().all(|segment| !segment.content_hash.contains("current question")),
+            "segment metadata must stay hash-only"
+        );
     }
 
     #[test]

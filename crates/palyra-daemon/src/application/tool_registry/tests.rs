@@ -2,18 +2,25 @@
 //! model-visible tool registry.
 
 use super::builtin::registry_entry;
-use super::types::{ToolCallRejectionKind, ToolParallelismPolicy};
+use super::catalog::clear_availability_probe_cache_for_tests;
+use super::types::{
+    ModelVisibleToolCatalogSnapshot, ToolCallRejectionKind, ToolCatalogFilterReasonCode,
+    ToolParallelismPolicy,
+};
 use super::{
-    build_model_visible_tool_catalog_snapshot, projection_policy_for_tool,
-    provider_tools_from_catalog_snapshot, snapshot_to_provider_request_value,
-    validate_tool_call_against_catalog_snapshot, ToolCatalogBuildRequest, ToolExposureSurface,
-    ToolResultProjectionPolicy, ToolSchemaDialect,
+    build_model_visible_tool_catalog_snapshot, describe_catalog_tool, projection_policy_for_tool,
+    provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
+    snapshot_to_provider_request_value, validate_tool_call_against_catalog_snapshot,
+    ToolCatalogBuildRequest, ToolCatalogPolicySnapshot, ToolExposureSurface,
+    ToolResultProjectionPolicy, ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
+    TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
 };
 use crate::{
     sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier},
     tool_protocol::{ToolCallConfig, ToolRequestContext},
     wasm_plugin_runner::WasmPluginRunnerPolicy,
 };
+use palyra_common::tool_catalog::ToolCatalogExposureMode;
 
 fn config(allowed_tools: &[&str]) -> ToolCallConfig {
     ToolCallConfig {
@@ -61,12 +68,18 @@ fn request_context() -> ToolRequestContext {
     }
 }
 
+fn catalog_policy(config: &ToolCallConfig) -> ToolCatalogPolicySnapshot {
+    ToolCatalogPolicySnapshot::direct_from_allowed_tools(config.allowed_tools.as_slice())
+}
+
 #[test]
 fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
     let config = config(&["palyra.echo", "palyra.sleep"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: Some("gpt-test"),
@@ -82,11 +95,145 @@ fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
 }
 
 #[test]
+fn availability_probe_cache_uses_ttl_and_last_good_browser_grace() {
+    clear_availability_probe_cache_for_tests();
+    let config = config(&["palyra.browser.navigate", "palyra.test.browser_probe_cache"]);
+
+    let available = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: true,
+        browser_service_configured: true,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 1_000,
+    });
+    let available_probe = availability_probe(&available, "browser_service");
+    assert_eq!(available_probe.status, "available");
+    assert_eq!(available_probe.cache_status, "refreshed");
+    assert_eq!(available_probe.last_good_unix_ms, Some(1_000));
+    assert!(available.tools.iter().any(|tool| tool.name == "palyra.browser.navigate"));
+
+    let cached = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: true,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 2_000,
+    });
+    let cached_probe = availability_probe(&cached, "browser_service");
+    assert_eq!(cached_probe.status, "available");
+    assert_eq!(cached_probe.cache_status, "cached");
+    assert!(cached.tools.iter().any(|tool| tool.name == "palyra.browser.navigate"));
+
+    let grace = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: true,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 31_001,
+    });
+    let grace_probe = availability_probe(&grace, "browser_service");
+    assert_eq!(grace_probe.status, "last_good_grace");
+    assert_eq!(grace_probe.last_good_unix_ms, Some(1_000));
+    assert_eq!(grace_probe.last_good_grace_until_unix_ms, Some(121_000));
+    assert!(grace.tools.iter().any(|tool| tool.name == "palyra.browser.navigate"));
+
+    let expired = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: true,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 121_001,
+    });
+    let expired_probe = availability_probe(&expired, "browser_service");
+    assert_eq!(expired_probe.status, "unavailable");
+    assert!(expired.filtered_tools.iter().any(|tool| {
+        tool.name == "palyra.browser.navigate"
+            && tool.reason_code == ToolCatalogFilterReasonCode::RuntimeUnavailable
+    }));
+}
+
+#[test]
+fn availability_probe_cache_invalidates_high_risk_process_on_config_change() {
+    clear_availability_probe_cache_for_tests();
+    let mut config = config(&["palyra.process.run", "palyra.test.process_probe_cache"]);
+    config.process_runner.enabled = true;
+    let enabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 10_000,
+    });
+    assert_eq!(availability_probe(&enabled_snapshot, "process_runner").status, "available");
+    assert!(enabled_snapshot.tools.iter().any(|tool| tool.name == "palyra.process.run"));
+
+    config.process_runner.enabled = false;
+    let disabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 10_001,
+    });
+    let disabled_probe = availability_probe(&disabled_snapshot, "process_runner");
+    assert_eq!(disabled_probe.status, "unavailable");
+    assert!(!disabled_probe.grace_allowed);
+    assert_eq!(disabled_probe.last_good_unix_ms, None);
+    assert!(disabled_snapshot.filtered_tools.iter().any(|tool| {
+        tool.name == "palyra.process.run"
+            && tool.reason_code == ToolCatalogFilterReasonCode::RuntimeUnavailable
+    }));
+}
+
+fn availability_probe<'a>(
+    snapshot: &'a ModelVisibleToolCatalogSnapshot,
+    runtime: &str,
+) -> &'a super::types::AvailabilityProbeResult {
+    snapshot
+        .availability_probes
+        .iter()
+        .find(|probe| probe.runtime == runtime)
+        .expect("runtime probe should be present")
+}
+
+#[test]
 fn provider_payload_projects_native_openai_tools() {
     let config = config(&["palyra.echo"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -104,12 +251,121 @@ fn provider_payload_projects_native_openai_tools() {
 }
 
 #[test]
+fn compact_catalog_exposes_bridge_tools_and_indexes_authorized_targets() {
+    let config = config(&["palyra.echo", "palyra.sleep"]);
+    let mut policy = catalog_policy(&config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let exposed = snapshot.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(
+        exposed,
+        vec![
+            TOOL_CATALOG_DESCRIBE_TOOL_NAME,
+            TOOL_CATALOG_INVOKE_TOOL_NAME,
+            TOOL_CATALOG_SEARCH_TOOL_NAME,
+        ]
+    );
+    assert!(snapshot.index.entries.iter().any(|entry| entry.name == "palyra.echo"));
+    assert!(snapshot.indexed_tools.iter().any(|tool| tool.name == "palyra.sleep"));
+    assert!(snapshot.estimated_direct_tool_bytes > 0);
+    assert!(snapshot.estimated_exposed_tool_bytes > 0);
+    assert!(snapshot.filtered_tools.iter().any(|tool| {
+        tool.name == "palyra.echo" && tool.reason_code.as_str() == "policy_invisible"
+    }));
+}
+
+#[test]
+fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
+    let config = config(&["palyra.echo"]);
+    let mut policy = catalog_policy(&config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+
+    let search = search_tool_catalog_index(&snapshot, br#"{"query":"echo text","limit":3}"#)
+        .expect("search should return indexed echo");
+    assert_eq!(search["index_digest"], snapshot.index.index_digest);
+    assert_eq!(search["results"][0]["id"], "palyra.echo");
+    let schema_digest = search["results"][0]["schema_digest"].as_str().expect("schema digest");
+
+    let describe = describe_catalog_tool(
+        &snapshot,
+        format!(r#"{{"tool_id":"palyra.echo","schema_digest":"{schema_digest}"}}"#).as_bytes(),
+    )
+    .expect("describe should return provider schema");
+    assert_eq!(describe["tool_id"], "palyra.echo");
+    assert_eq!(describe["provider_schema"]["type"], "object");
+
+    let invoke = resolve_catalog_invoke_target(
+        &snapshot,
+        format!(
+            r#"{{"tool_id":"palyra.echo","schema_digest":"{schema_digest}","arguments":{{"text":"hello"}}}}"#
+        )
+        .as_bytes(),
+    )
+    .expect("invoke target should resolve");
+    assert_eq!(invoke.tool_name, "palyra.echo");
+    assert_eq!(invoke.schema_digest, schema_digest);
+}
+
+#[test]
+fn intake_strict_preview_repairs_standalone_json_object_wrapper() {
+    let config = config(&["palyra.echo"]);
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        b"```json\n{\"text\":\"hello\"}\n```",
+    )
+    .expect("strict preview repair should accept standalone fenced object");
+
+    assert_eq!(normalized.audit.steps[0].reason_code, "tool_call.arguments.strict_preview_repair");
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
 fn process_run_allowlist_exposes_lifecycle_controls() {
     let mut config = config(&["palyra.process.run"]);
     config.process_runner.enabled = true;
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -138,7 +394,9 @@ fn plugin_run_visibility_tracks_wasm_runtime_policy() {
     let mut config = config(&["palyra.plugin.run"]);
     let disabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -161,7 +419,9 @@ fn plugin_run_visibility_tracks_wasm_runtime_policy() {
     config.wasm_runtime.enabled = true;
     let enabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -181,7 +441,9 @@ fn anthropic_catalog_exposes_http_fetch_with_boolean_additional_properties() {
     let config = config(&["palyra.http.fetch"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -232,7 +494,9 @@ fn anthropic_catalog_exposes_browser_observe_without_default_keywords() {
     let config = config(&["palyra.browser.observe"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: true,
+        browser_service_configured: true,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -270,7 +534,9 @@ fn anthropic_catalog_exposes_browser_viewport_without_exclusive_bounds() {
     let config = config(&["palyra.browser.viewport"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: true,
+        browser_service_configured: true,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -307,7 +573,9 @@ fn anthropic_catalog_exposes_routines_control_trigger_payload() {
     let config = config(&["palyra.routines.control"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -707,7 +975,9 @@ fn intake_normalizes_safe_scalar_arguments() {
     let config = config(&["palyra.sleep"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -733,7 +1003,9 @@ fn intake_normalizes_apply_patch_raw_parameter_alias() {
     let config = config(&["palyra.fs.apply_patch"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -765,7 +1037,9 @@ fn intake_preserves_embedded_apply_patch_parameter_markers_as_patch_content() {
     let config = config(&["palyra.fs.apply_patch"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "anthropic",
         provider_model_id: Some("minimax-m2.7"),
@@ -804,7 +1078,9 @@ fn intake_normalizes_nested_apply_patch_raw_object() {
     let config = config(&["palyra.fs.apply_patch"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -832,7 +1108,9 @@ fn intake_rejects_runtime_unavailable_tool() {
     let config = config(&["palyra.process.run"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,
@@ -856,7 +1134,9 @@ fn intake_rejects_command_scalar_coercion() {
     config.process_runner.enabled = true;
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &config,
+        catalog_policy: &catalog_policy(&config),
         browser_service_enabled: false,
+        browser_service_configured: false,
         request_context: &request_context(),
         provider_kind: "openai_compatible",
         provider_model_id: None,

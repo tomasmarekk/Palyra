@@ -2381,6 +2381,10 @@ pub async fn run() -> Result<()> {
                     allowed_channels: loaded.tool_call.wasm_runtime.allowed_channels.clone(),
                 },
             },
+            tool_catalog_policy:
+                application::tool_registry::ToolCatalogPolicySnapshot::from_loaded_tool_call_config(
+                    &loaded.tool_call,
+                ),
             http_fetch: gateway::HttpFetchRuntimeConfig {
                 allow_private_targets: loaded.tool_call.http_fetch.allow_private_targets,
                 connect_timeout_ms: loaded.tool_call.http_fetch.connect_timeout_ms,

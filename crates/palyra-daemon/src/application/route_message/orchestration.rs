@@ -85,7 +85,9 @@ async fn build_and_record_route_tool_catalog_snapshot(
 ) -> Result<ModelVisibleToolCatalogSnapshot, Status> {
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
         config: &runtime_state.config.tool_call,
+        catalog_policy: &runtime_state.config.tool_catalog_policy,
         browser_service_enabled: runtime_state.config.browser_service.enabled,
+        browser_service_configured: runtime_state.config.browser_service.enabled,
         request_context: &ToolRequestContext {
             principal: request_context.principal.clone(),
             device_id: Some(request_context.device_id.clone()),
@@ -522,6 +524,11 @@ pub(crate) async fn handle_routed_route_message(
     provider_request.context_trace_id = prepared_provider_input.context_trace_id.clone();
     provider_request.budget_profile = prepared_provider_input.budget_profile.clone();
     provider_request.max_output_tokens = prepared_provider_input.max_output_tokens;
+    provider_request.reasoning_effort = prepared_provider_input.reasoning_effort;
+    provider_request.service_tier = prepared_provider_input.service_tier;
+    provider_request.prompt_segments = prepared_provider_input.prompt_segments.clone();
+    provider_request.prompt_cache_policy = prepared_provider_input.prompt_cache_policy.clone();
+    provider_request.prompt_cache_report = prepared_provider_input.prompt_cache_report.clone();
     if !prepared_provider_input.provider_messages.is_empty() {
         let mut messages = prepared_provider_input.provider_messages.clone();
         messages.push(ProviderMessage::user_text(provider_request.input_text.clone()));

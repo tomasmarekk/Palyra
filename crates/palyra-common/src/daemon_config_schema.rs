@@ -517,6 +517,11 @@ pub struct FileModelProviderRegistryModel {
 #[serde(deny_unknown_fields)]
 pub struct FileToolCallConfig {
     pub allowed_tools: Option<Vec<String>>,
+    pub profiles: Option<Vec<String>>,
+    pub extra_tools: Option<Vec<String>>,
+    pub disabled_tools: Option<Vec<String>>,
+    pub catalog_exposure_mode: Option<String>,
+    pub compact_tool_threshold: Option<usize>,
     pub max_calls_per_run: Option<u32>,
     pub execution_timeout_ms: Option<u64>,
     pub process_runner: Option<FileProcessRunnerConfig>,

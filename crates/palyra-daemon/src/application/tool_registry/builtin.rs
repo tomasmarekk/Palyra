@@ -45,6 +45,56 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.tools.search",
+            "Search the authorized compact tool catalog for matching tools by task, capability, or keyword.",
+            object_schema(
+                &["query"],
+                vec![
+                    ("query", json!({"type":"string","maxLength":4096})),
+                    (
+                        "capability_hints",
+                        json!({"type":"array","items":{"type":"string","maxLength":64},"maxItems":8}),
+                    ),
+                    ("limit", json!({"type":"integer","minimum":1,"maximum":12})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.tools.describe",
+            "Return the provider-compatible schema, safety notes, and approval requirements for one authorized compact-catalog tool.",
+            object_schema(
+                &["tool_id"],
+                vec![
+                    ("tool_id", json!({"type":"string","maxLength":128})),
+                    ("schema_digest", json!({"type":"string","maxLength":128})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.tools.invoke",
+            "Invoke one authorized compact-catalog tool by id and schema digest using the current catalog snapshot.",
+            object_schema(
+                &["tool_id", "schema_digest", "arguments"],
+                vec![
+                    ("tool_id", json!({"type":"string","maxLength":128})),
+                    ("schema_digest", json!({"type":"string","maxLength":128})),
+                    (
+                        "arguments",
+                        json!({"type":"object","properties":{},"additionalProperties":true,"maxProperties":128}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.memory.status",
             "Inspect read-only memory usage, retention limits, maintenance timing, and capacity_state; use this before deciding whether memory is full or needs consolidation.",
             object_schema(&[], Vec::new(), false),

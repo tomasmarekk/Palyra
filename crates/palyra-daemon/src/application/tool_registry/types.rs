@@ -9,6 +9,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use palyra_common::tool_catalog::{
+    expand_toolset_profiles, ToolCatalogExposureMode, ToolsetProfileExpansionReport,
+};
+
 use crate::tool_protocol::{ToolCallConfig, ToolRequestContext};
 
 /// Schema version stamped into every catalog snapshot; bump on breaking payload changes.
@@ -21,6 +25,12 @@ pub(super) const TOOL_REJECTION_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_SCHEMA_DEPTH: usize = 8;
 /// Maximum number of properties accepted on a single object schema node.
 pub(super) const MAX_SCHEMA_PROPERTIES: usize = 128;
+/// Catalog bridge tool that searches compact/hybrid tool indexes.
+pub(crate) const TOOL_CATALOG_SEARCH_TOOL_NAME: &str = "palyra.tools.search";
+/// Catalog bridge tool that describes one indexed tool.
+pub(crate) const TOOL_CATALOG_DESCRIBE_TOOL_NAME: &str = "palyra.tools.describe";
+/// Catalog bridge tool that invokes one indexed tool after schema validation.
+pub(crate) const TOOL_CATALOG_INVOKE_TOOL_NAME: &str = "palyra.tools.invoke";
 
 /// Provider schema dialect a catalog snapshot is sanitized and serialized for.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -194,6 +204,61 @@ pub(crate) struct ModelVisibleTool {
     pub(crate) exposure_reason: String,
 }
 
+/// One compact index entry describing a policy-visible target tool without
+/// shipping its full schema to the provider prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolCatalogIndexEntry {
+    pub(crate) name: String,
+    pub(crate) short_description: String,
+    pub(crate) keywords: Vec<String>,
+    pub(crate) capability_class: String,
+    pub(crate) risk_tier: String,
+    pub(crate) approval_summary: String,
+    pub(crate) provider_schema_hash: String,
+    pub(crate) internal_schema_hash: String,
+}
+
+/// Compact searchable index for all authorized target tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolCatalogIndex {
+    pub(crate) schema_version: u32,
+    pub(crate) index_digest: String,
+    pub(crate) entries: Vec<ToolCatalogIndexEntry>,
+}
+
+/// Error returned by compact-catalog bridge helpers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolCatalogBridgeError {
+    pub(crate) reason_code: String,
+    pub(crate) message: String,
+}
+
+/// Resolved target call for `palyra.tools.invoke`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCatalogInvokeTarget {
+    pub(crate) tool_name: String,
+    pub(crate) schema_digest: String,
+    pub(crate) input_json: Vec<u8>,
+}
+
+/// Cached runtime-availability probe result captured while building a catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AvailabilityProbeResult {
+    pub(crate) runtime: String,
+    pub(crate) status: String,
+    pub(crate) cache_status: String,
+    pub(crate) ttl_ms: u64,
+    pub(crate) checked_at_unix_ms: i64,
+    pub(crate) ttl_expires_unix_ms: i64,
+    pub(crate) last_good_unix_ms: Option<i64>,
+    pub(crate) last_good_grace_until_unix_ms: Option<i64>,
+    pub(crate) reason_code: String,
+    pub(crate) repair_hint: String,
+    pub(crate) cache_key_hash: String,
+    pub(crate) config_hash: String,
+    pub(crate) grace_allowed: bool,
+}
+
 /// A tool excluded from a catalog snapshot, with the filter reason and an
 /// operator-facing repair hint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,14 +286,81 @@ pub(crate) struct ModelVisibleToolCatalogSnapshot {
     pub(crate) channel_hash: Option<String>,
     pub(crate) remaining_tool_budget: Option<u32>,
     pub(crate) created_at_unix_ms: i64,
+    pub(crate) profile_expansion: ToolsetProfileExpansionReport,
+    pub(crate) exposure_mode: ToolCatalogExposureMode,
+    pub(crate) compact_tool_threshold: usize,
+    pub(crate) direct_tool_count: usize,
+    pub(crate) exposed_tool_count: usize,
+    pub(crate) estimated_direct_tool_bytes: usize,
+    pub(crate) estimated_exposed_tool_bytes: usize,
+    pub(crate) estimated_saved_bytes: usize,
+    pub(crate) availability_probes: Vec<AvailabilityProbeResult>,
+    pub(crate) index: ToolCatalogIndex,
+    pub(crate) indexed_tools: Vec<ModelVisibleTool>,
     pub(crate) tools: Vec<ModelVisibleTool>,
     pub(crate) filtered_tools: Vec<FilteredToolCatalogEntry>,
+}
+
+/// Per-runtime catalog policy after daemon config precedence has been applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolCatalogPolicySnapshot {
+    pub(crate) profile_expansion: ToolsetProfileExpansionReport,
+    pub(crate) exposure_mode: ToolCatalogExposureMode,
+    pub(crate) compact_tool_threshold: usize,
+}
+
+impl ToolCatalogPolicySnapshot {
+    /// Builds a policy snapshot from the loaded daemon tool-call config.
+    #[must_use]
+    pub(crate) fn from_loaded_tool_call_config(config: &crate::config::ToolCallConfig) -> Self {
+        let profile_expansion = expand_toolset_profiles(
+            config.toolset_profiles.as_slice(),
+            config.explicit_allowed_tools.as_slice(),
+            config.extra_tools.as_slice(),
+            config.disabled_tools.as_slice(),
+        )
+        .unwrap_or_else(|_| ToolsetProfileExpansionReport {
+            profiles: config.toolset_profiles.clone(),
+            profile_expansions: Vec::new(),
+            explicit_allowed_tools: config.explicit_allowed_tools.clone(),
+            extra_tools: config.extra_tools.clone(),
+            disabled_tools: config.disabled_tools.clone(),
+            effective_allowed_tools: config.allowed_tools.clone(),
+        });
+        Self {
+            profile_expansion,
+            exposure_mode: config.catalog_exposure_mode,
+            compact_tool_threshold: config.compact_tool_threshold,
+        }
+    }
+
+    /// Builds the legacy direct policy used by tests and older in-process call sites.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn direct_from_allowed_tools(allowed_tools: &[String]) -> Self {
+        let profile_expansion = expand_toolset_profiles(&[], allowed_tools, &[], &[])
+            .unwrap_or_else(|_| ToolsetProfileExpansionReport {
+                profiles: Vec::new(),
+                profile_expansions: Vec::new(),
+                explicit_allowed_tools: allowed_tools.to_vec(),
+                extra_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                effective_allowed_tools: allowed_tools.to_vec(),
+            });
+        Self {
+            profile_expansion,
+            exposure_mode: ToolCatalogExposureMode::Direct,
+            compact_tool_threshold: 16,
+        }
+    }
 }
 
 /// Inputs for building one [`ModelVisibleToolCatalogSnapshot`].
 pub(crate) struct ToolCatalogBuildRequest<'a> {
     pub(crate) config: &'a ToolCallConfig,
+    pub(crate) catalog_policy: &'a ToolCatalogPolicySnapshot,
     pub(crate) browser_service_enabled: bool,
+    pub(crate) browser_service_configured: bool,
     pub(crate) request_context: &'a ToolRequestContext,
     pub(crate) provider_kind: &'a str,
     pub(crate) provider_model_id: Option<&'a str>,

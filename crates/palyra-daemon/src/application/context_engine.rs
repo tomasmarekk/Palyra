@@ -778,6 +778,13 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
     let mut provider_messages = compiled_instructions.provider_messages();
     provider_messages
         .extend(build_previous_run_provider_messages(runtime_state, previous_run_id).await?);
+    let (prompt_segments, prompt_cache_policy, prompt_cache_report) =
+        crate::application::provider_input::build_prompt_cache_metadata(
+            assembled.prompt_text.as_str(),
+            provider_messages.as_slice(),
+            Some(input_text),
+            tool_catalog_snapshot,
+        );
 
     Ok(PreparedModelProviderInput {
         provider_input_text: assembled.prompt_text,
@@ -789,6 +796,9 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         max_output_tokens: Some(assembled.explain.budget.reserved_completion_tokens),
         reasoning_effort: parse_provider_reasoning_effort_override(parameter_delta_json)?,
         service_tier: parse_provider_service_tier_override(parameter_delta_json)?,
+        prompt_segments,
+        prompt_cache_policy,
+        prompt_cache_report,
     })
 }
 

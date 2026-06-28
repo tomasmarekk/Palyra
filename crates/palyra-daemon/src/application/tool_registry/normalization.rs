@@ -15,9 +15,9 @@ use crate::tool_protocol::ToolExecutionOutcome;
 
 use super::hashing::{canonical_json_bytes, stable_hash_bytes};
 use super::types::{
-    ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
-    ToolArgumentNormalizationStep, ToolCallRejection, ToolCallRejectionKind,
-    ToolCatalogFilterReasonCode, TOOL_REJECTION_SCHEMA_VERSION,
+    ModelVisibleTool, ModelVisibleToolCatalogSnapshot, NormalizedToolCall,
+    ToolArgumentNormalizationAudit, ToolArgumentNormalizationStep, ToolCallRejection,
+    ToolCallRejectionKind, ToolCatalogFilterReasonCode, TOOL_REJECTION_SCHEMA_VERSION,
 };
 
 /// Validates one proposed tool call against the catalog snapshot the model
@@ -54,31 +54,24 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
         }
         return Err(rejection_for_missing_snapshot_tool(snapshot, tool_name, raw_json_hash));
     };
-    let raw_value =
-        serde_json::from_slice::<Value>(input_json).map_err(|error| ToolCallRejection {
-            schema_version: TOOL_REJECTION_SCHEMA_VERSION,
-            kind: ToolCallRejectionKind::MalformedArguments,
-            tool_name: tool_name.to_owned(),
-            reason_code: "tool_call.arguments.invalid_json".to_owned(),
-            message: format!("tool arguments must be valid JSON object: {error}"),
-            raw_json_hash: raw_json_hash.clone(),
-            snapshot_id: Some(snapshot.snapshot_id.clone()),
-            catalog_hash: Some(snapshot.catalog_hash.clone()),
-        })?;
-    if !raw_value.is_object() {
-        return Err(ToolCallRejection {
-            schema_version: TOOL_REJECTION_SCHEMA_VERSION,
-            kind: ToolCallRejectionKind::MalformedArguments,
-            tool_name: tool_name.to_owned(),
-            reason_code: "tool_call.arguments.not_object".to_owned(),
-            message: "tool arguments must be a JSON object".to_owned(),
-            raw_json_hash,
-            snapshot_id: Some(snapshot.snapshot_id.clone()),
-            catalog_hash: Some(snapshot.catalog_hash.clone()),
-        });
-    }
+    validate_tool_call_against_model_visible_tool(snapshot, tool, tool_name, input_json)
+}
 
-    let mut steps = Vec::new();
+/// Validates a proposed call against a specific model-visible tool record.
+///
+/// Used by direct calls (`snapshot.tools`) and by compact-catalog invoke
+/// (`snapshot.indexed_tools`) so both paths share the same schema enforcement.
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_tool_call_against_model_visible_tool(
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+    tool: &ModelVisibleTool,
+    tool_name: &str,
+    input_json: &[u8],
+) -> Result<NormalizedToolCall, ToolCallRejection> {
+    let raw_json_hash = stable_hash_bytes(input_json);
+    let (raw_value, mut steps) =
+        parse_visible_tool_arguments(snapshot, tool_name, input_json, raw_json_hash.clone())
+            .map_err(|rejection| *rejection)?;
     let raw_value = normalize_tool_specific_argument_aliases(tool_name, raw_value, &mut steps);
     let normalized_value =
         normalize_value_against_schema(raw_value, &tool.schema, "", None, &mut steps).map_err(
@@ -99,6 +92,90 @@ pub(crate) fn validate_tool_call_against_catalog_snapshot(
         input_json,
         audit: ToolArgumentNormalizationAudit { raw_json_hash, normalized_json_hash, steps },
     })
+}
+
+fn parse_visible_tool_arguments(
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+    tool_name: &str,
+    input_json: &[u8],
+    raw_json_hash: String,
+) -> Result<(Value, Vec<ToolArgumentNormalizationStep>), Box<ToolCallRejection>> {
+    match serde_json::from_slice::<Value>(input_json) {
+        Ok(value) if value.is_object() => Ok((value, Vec::new())),
+        Ok(Value::String(text)) => strict_preview_repair_argument_object(text.as_str())
+            .map(|value| (value, strict_preview_repair_steps()))
+            .ok_or_else(|| Box::new(not_object_rejection(snapshot, tool_name, raw_json_hash))),
+        Ok(_) => Err(Box::new(not_object_rejection(snapshot, tool_name, raw_json_hash))),
+        Err(error) => {
+            let input = std::str::from_utf8(input_json).unwrap_or_default();
+            strict_preview_repair_argument_object(input)
+                .map(|value| (value, strict_preview_repair_steps()))
+                .ok_or_else(|| {
+                    Box::new(ToolCallRejection {
+                        schema_version: TOOL_REJECTION_SCHEMA_VERSION,
+                        kind: ToolCallRejectionKind::MalformedArguments,
+                        tool_name: tool_name.to_owned(),
+                        reason_code: "tool_call.arguments.invalid_json".to_owned(),
+                        message: format!("tool arguments must be valid JSON object: {error}"),
+                        raw_json_hash,
+                        snapshot_id: Some(snapshot.snapshot_id.clone()),
+                        catalog_hash: Some(snapshot.catalog_hash.clone()),
+                    })
+                })
+        }
+    }
+}
+
+fn not_object_rejection(
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+    tool_name: &str,
+    raw_json_hash: String,
+) -> ToolCallRejection {
+    ToolCallRejection {
+        schema_version: TOOL_REJECTION_SCHEMA_VERSION,
+        kind: ToolCallRejectionKind::MalformedArguments,
+        tool_name: tool_name.to_owned(),
+        reason_code: "tool_call.arguments.not_object".to_owned(),
+        message: "tool arguments must be a JSON object".to_owned(),
+        raw_json_hash,
+        snapshot_id: Some(snapshot.snapshot_id.clone()),
+        catalog_hash: Some(snapshot.catalog_hash.clone()),
+    }
+}
+
+fn strict_preview_repair_argument_object(input: &str) -> Option<Value> {
+    parse_json_object(input.trim())
+        .or_else(|| parse_code_fenced_json_object(input.trim()))
+        .or_else(|| parse_wrapped_json_object(input.trim(), "tool_arguments"))
+}
+
+fn strict_preview_repair_steps() -> Vec<ToolArgumentNormalizationStep> {
+    vec![ToolArgumentNormalizationStep {
+        json_pointer: "/".to_owned(),
+        from_type: "string".to_owned(),
+        to_type: "object".to_owned(),
+        reason_code: "tool_call.arguments.strict_preview_repair".to_owned(),
+    }]
+}
+
+fn parse_code_fenced_json_object(input: &str) -> Option<Value> {
+    let body = input.strip_prefix("```")?;
+    let line_end = body.find('\n')?;
+    let body = &body[line_end + 1..];
+    let body = body.strip_suffix("```")?.trim();
+    parse_json_object(body)
+}
+
+fn parse_wrapped_json_object(input: &str, tag: &str) -> Option<Value> {
+    let opening = format!("<{tag}>");
+    let closing = format!("</{tag}>");
+    let body = input.strip_prefix(opening.as_str())?.strip_suffix(closing.as_str())?.trim();
+    parse_json_object(body)
+}
+
+fn parse_json_object(input: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(input).ok()?;
+    value.is_object().then_some(value)
 }
 
 /// Canonicalizes arguments for a tool the catalog did not expose without

@@ -41,6 +41,131 @@ const RUN_PROGRESS_MAX_MISSING_ARTIFACTS: usize = 12;
 const RUN_PROGRESS_MAX_ACTIVE_PROCESSES: usize = 8;
 const RUN_PROGRESS_MAX_FAILED_ATTEMPTS: usize = 8;
 
+/// Observable class of one tool attempt for repeated-no-progress detection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunProgressOutcomeClass {
+    Success,
+    Failure,
+    PolicyDenied,
+    ApprovalDenied,
+    ReadNoProgress,
+}
+
+/// Normalized attempt data fed into [`RunProgressController`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressAttempt {
+    pub(crate) tool_name: String,
+    pub(crate) normalized_input_json: Vec<u8>,
+    pub(crate) workspace_key: Option<String>,
+    pub(crate) query_hash: Option<String>,
+    pub(crate) sensitivity: String,
+    pub(crate) outcome_class: RunProgressOutcomeClass,
+}
+
+/// Stable attempt fingerprint used for loop detection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RunProgressAttemptFingerprint {
+    pub(crate) tool_name: String,
+    pub(crate) input_hash: String,
+    pub(crate) workspace_key: Option<String>,
+    pub(crate) query_hash: Option<String>,
+    pub(crate) sensitivity: String,
+    pub(crate) outcome_class: RunProgressOutcomeClass,
+}
+
+/// Controller decision emitted when repeated attempts stop making progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunProgressIntervention {
+    pub(crate) fingerprint: RunProgressAttemptFingerprint,
+    pub(crate) attempts: u32,
+    pub(crate) guidance: String,
+    pub(crate) terminate_run: bool,
+    pub(crate) learning_observation: String,
+}
+
+/// Pure no-progress detector for repeated tool failure, denial, or read loops.
+#[derive(Debug, Clone)]
+pub(crate) struct RunProgressController {
+    max_repeated_attempts: u32,
+    attempt_counts: BTreeMap<RunProgressAttemptFingerprint, u32>,
+}
+
+impl RunProgressController {
+    /// Creates a controller that intervenes after `max_repeated_attempts`.
+    #[must_use]
+    pub(crate) fn new(max_repeated_attempts: u32) -> Self {
+        Self {
+            max_repeated_attempts: max_repeated_attempts.max(1),
+            attempt_counts: BTreeMap::new(),
+        }
+    }
+
+    /// Records an attempt and returns guidance once the same failure repeats.
+    pub(crate) fn observe(
+        &mut self,
+        attempt: RunProgressAttempt,
+    ) -> Option<RunProgressIntervention> {
+        if attempt.outcome_class == RunProgressOutcomeClass::Success {
+            self.attempt_counts.clear();
+            return None;
+        }
+        let fingerprint = attempt.fingerprint();
+        let count = self.attempt_counts.entry(fingerprint.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < self.max_repeated_attempts {
+            return None;
+        }
+        Some(RunProgressIntervention {
+            guidance: guidance_for_repeated_attempt(&fingerprint, *count),
+            terminate_run: matches!(
+                fingerprint.outcome_class,
+                RunProgressOutcomeClass::PolicyDenied | RunProgressOutcomeClass::ApprovalDenied
+            ),
+            learning_observation: format!(
+                "repeated_no_progress tool={} outcome={:?} attempts={}",
+                fingerprint.tool_name, fingerprint.outcome_class, count
+            ),
+            fingerprint,
+            attempts: *count,
+        })
+    }
+}
+
+impl RunProgressAttempt {
+    fn fingerprint(&self) -> RunProgressAttemptFingerprint {
+        RunProgressAttemptFingerprint {
+            tool_name: self.tool_name.clone(),
+            input_hash: crate::sha256_hex(self.normalized_input_json.as_slice()),
+            workspace_key: self.workspace_key.clone(),
+            query_hash: self.query_hash.clone(),
+            sensitivity: self.sensitivity.clone(),
+            outcome_class: self.outcome_class.clone(),
+        }
+    }
+}
+
+fn guidance_for_repeated_attempt(
+    fingerprint: &RunProgressAttemptFingerprint,
+    attempts: u32,
+) -> String {
+    match fingerprint.outcome_class {
+        RunProgressOutcomeClass::PolicyDenied | RunProgressOutcomeClass::ApprovalDenied => format!(
+            "Tool '{}' was denied {attempts} times with the same arguments; stop retrying and ask for a changed policy, approval, or alternate plan.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::ReadNoProgress => format!(
+            "Tool '{}' repeated the same read without new evidence {attempts} times; change query/path or summarize current evidence before continuing.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::Failure => format!(
+            "Tool '{}' failed {attempts} times with the same normalized input; change the input or choose a different tool before retrying.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::Success => "progress observed".to_owned(),
+    }
+}
+
 /// Why the agent loop stopped; serialized into tape payloads as `snake_case`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1379,6 +1504,57 @@ mod tests {
         ProviderFinishReason, ProviderMessageContentPart, ProviderMessageRole,
         ProviderMessageToolCall, ProviderRawProviderRefs, ProviderUsage,
     };
+
+    fn failed_attempt(tool_name: &str, input: &[u8]) -> RunProgressAttempt {
+        RunProgressAttempt {
+            tool_name: tool_name.to_owned(),
+            normalized_input_json: input.to_vec(),
+            workspace_key: Some("workspace-a".to_owned()),
+            query_hash: None,
+            sensitivity: "normal".to_owned(),
+            outcome_class: RunProgressOutcomeClass::Failure,
+        }
+    }
+
+    #[test]
+    fn run_progress_controller_intervenes_after_repeated_failure() {
+        let mut controller = RunProgressController::new(3);
+        let attempt = failed_attempt("palyra.fs.apply_patch", br#"{"patch":"bad"}"#);
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        assert!(controller.observe(attempt.clone()).is_none());
+        let intervention = controller.observe(attempt).expect("third identical failure intervenes");
+
+        assert_eq!(intervention.attempts, 3);
+        assert!(!intervention.terminate_run);
+        assert!(intervention.guidance.contains("palyra.fs.apply_patch"));
+        assert_eq!(intervention.fingerprint.input_hash.len(), 64);
+    }
+
+    #[test]
+    fn run_progress_controller_terminates_repeated_denial() {
+        let mut controller = RunProgressController::new(2);
+        let mut attempt = failed_attempt("palyra.process.run", br#"{"command":"curl"}"#);
+        attempt.outcome_class = RunProgressOutcomeClass::PolicyDenied;
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        let intervention = controller.observe(attempt).expect("second denial intervenes");
+
+        assert!(intervention.terminate_run);
+        assert!(intervention.learning_observation.contains("repeated_no_progress"));
+    }
+
+    #[test]
+    fn run_progress_controller_success_resets_failure_counts() {
+        let mut controller = RunProgressController::new(2);
+        let failure = failed_attempt("palyra.fs.read_file", br#"{"path":"missing"}"#);
+        let mut success = failure.clone();
+        success.outcome_class = RunProgressOutcomeClass::Success;
+
+        assert!(controller.observe(failure.clone()).is_none());
+        assert!(controller.observe(success).is_none());
+        assert!(controller.observe(failure).is_none());
+    }
 
     #[test]
     fn loop_state_ignores_legacy_turn_budget_and_serializes_unlimited_snapshot() {

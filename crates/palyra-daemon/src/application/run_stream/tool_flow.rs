@@ -42,10 +42,13 @@ use crate::{
     },
     application::execution_gate::ToolProposalApprovalState,
     application::tool_registry::{
-        normalization_audit_tape_payload, projection_policy_for_tool, rejection_tape_payload,
+        describe_catalog_tool, normalization_audit_tape_payload, projection_policy_for_tool,
+        rejection_tape_payload, resolve_catalog_invoke_target, search_tool_catalog_index,
         tool_call_rejection_outcome, validate_tool_call_against_catalog_snapshot,
-        ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolArgumentNormalizationAudit,
-        ToolCallRejection, ToolResultProjectionPolicy,
+        validate_tool_call_against_model_visible_tool, ModelVisibleToolCatalogSnapshot,
+        NormalizedToolCall, ToolArgumentNormalizationAudit, ToolCallRejection,
+        ToolCatalogBridgeError, ToolResultProjectionPolicy, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
+        TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
     },
     application::tool_runtime::{
         artifacts::bounded_tool_result_artifact_content,
@@ -72,7 +75,7 @@ use crate::{
     },
     orchestrator::RunStateMachine,
     sandbox_runner::{ProcessProgressEvent, ProcessProgressSink},
-    tool_protocol::{denied_execution_outcome, ToolExecutionOutcome},
+    tool_protocol::{build_tool_execution_outcome, denied_execution_outcome, ToolExecutionOutcome},
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
@@ -303,6 +306,123 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         )
         .await?;
     }
+    if tool_name == TOOL_CATALOG_SEARCH_TOOL_NAME || tool_name == TOOL_CATALOG_DESCRIBE_TOOL_NAME {
+        let bridge_result = if tool_name == TOOL_CATALOG_SEARCH_TOOL_NAME {
+            search_tool_catalog_index(tool_catalog_snapshot, normalized_input_json.as_slice())
+        } else {
+            describe_catalog_tool(tool_catalog_snapshot, normalized_input_json.as_slice())
+        };
+        let outcome = complete_catalog_bridge_tool_call(
+            sender,
+            runtime_state,
+            run_id,
+            proposal_id,
+            tool_name,
+            normalized_input_json.as_slice(),
+            bridge_result,
+            tool_catalog_snapshot.index.index_digest.as_str(),
+            tape_seq,
+        )
+        .await?;
+        return Ok(RunStreamToolProposalPreparationOutcome::Completed(outcome));
+    }
+    let (execution_tool_name, execution_input_json) = if tool_name == TOOL_CATALOG_INVOKE_TOOL_NAME
+    {
+        let target = match resolve_catalog_invoke_target(
+            tool_catalog_snapshot,
+            normalized_input_json.as_slice(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                let outcome = complete_catalog_bridge_tool_call(
+                    sender,
+                    runtime_state,
+                    run_id,
+                    proposal_id,
+                    tool_name,
+                    normalized_input_json.as_slice(),
+                    Err(error),
+                    tool_catalog_snapshot.index.index_digest.as_str(),
+                    tape_seq,
+                )
+                .await?;
+                return Ok(RunStreamToolProposalPreparationOutcome::Completed(outcome));
+            }
+        };
+        let Some(target_tool) =
+            tool_catalog_snapshot.indexed_tools.iter().find(|tool| tool.name == target.tool_name)
+        else {
+            let outcome = complete_catalog_bridge_tool_call(
+                sender,
+                runtime_state,
+                run_id,
+                proposal_id,
+                tool_name,
+                normalized_input_json.as_slice(),
+                Err(ToolCatalogBridgeError {
+                    reason_code: "tool_catalog.tool_not_indexed".to_owned(),
+                    message: "tool_id is unknown or hidden in the current catalog snapshot"
+                        .to_owned(),
+                }),
+                tool_catalog_snapshot.index.index_digest.as_str(),
+                tape_seq,
+            )
+            .await?;
+            return Ok(RunStreamToolProposalPreparationOutcome::Completed(outcome));
+        };
+        let target_call = match validate_tool_call_against_model_visible_tool(
+            tool_catalog_snapshot,
+            target_tool,
+            target.tool_name.as_str(),
+            target.input_json.as_slice(),
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                let bridge_error = ToolCatalogBridgeError {
+                    reason_code: error.reason_code,
+                    message: error.message,
+                };
+                let outcome = complete_catalog_bridge_tool_call(
+                    sender,
+                    runtime_state,
+                    run_id,
+                    proposal_id,
+                    tool_name,
+                    normalized_input_json.as_slice(),
+                    Err(bridge_error),
+                    tool_catalog_snapshot.index.index_digest.as_str(),
+                    tape_seq,
+                )
+                .await?;
+                return Ok(RunStreamToolProposalPreparationOutcome::Completed(outcome));
+            }
+        };
+        if !target_call.audit.steps.is_empty() {
+            append_tool_argument_normalization_tape_event(
+                runtime_state,
+                run_id,
+                tape_seq,
+                proposal_id,
+                target.tool_name.as_str(),
+                &target_call.audit,
+            )
+            .await?;
+        }
+        append_catalog_invoke_lineage_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            proposal_id,
+            target.tool_name.as_str(),
+            target.schema_digest.as_str(),
+            tool_catalog_snapshot.index.index_digest.as_str(),
+            target_call.audit.normalized_json_hash.as_str(),
+        )
+        .await?;
+        (target.tool_name, target_call.input_json)
+    } else {
+        (tool_name.to_owned(), normalized_input_json)
+    };
 
     let RunStreamToolProposalPreparation { decision, resolved_session_id, backend_selection } =
         prepare_run_stream_tool_proposal_execution(
@@ -314,8 +434,8 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
             session_id,
             run_id,
             proposal_id,
-            tool_name,
-            normalized_input_json.as_slice(),
+            execution_tool_name.as_str(),
+            execution_input_json.as_slice(),
             remaining_tool_budget,
             allow_sensitive_tools,
             approval_cache_generation,
@@ -325,8 +445,8 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
 
     Ok(RunStreamToolProposalPreparationOutcome::Prepared(RunStreamPreparedToolExecution {
         proposal_id: proposal_id.to_owned(),
-        tool_name: tool_name.to_owned(),
-        input_json: normalized_input_json,
+        tool_name: execution_tool_name,
+        input_json: execution_input_json,
         decision,
         resolved_session_id,
         backend_selection,
@@ -348,6 +468,205 @@ async fn append_tool_argument_normalization_tape_event(
             seq: *tape_seq,
             event_type: "tool.arguments.normalized".to_owned(),
             payload_json: normalization_audit_tape_payload(proposal_id, tool_name, audit),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn complete_catalog_bridge_tool_call(
+    sender: &mpsc::Sender<
+        Result<crate::transport::grpc::proto::palyra::common::v1::RunStreamEvent, Status>,
+    >,
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    bridge_result: Result<Value, ToolCatalogBridgeError>,
+    index_digest: &str,
+    tape_seq: &mut i64,
+) -> Result<RunStreamToolExecutionOutcome, Status> {
+    runtime_state.record_tool_proposal();
+    send_tool_proposal_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+    )
+    .await?;
+    let success = bridge_result.is_ok();
+    let reason = bridge_result
+        .as_ref()
+        .map(|_| "catalog bridge query resolved".to_owned())
+        .unwrap_or_else(|error| format!("{}: {}", error.reason_code, error.message));
+    send_tool_decision_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        proposal_id,
+        tool_name,
+        success,
+        reason.as_str(),
+        false,
+        true,
+    )
+    .await?;
+
+    let output_value = bridge_result.unwrap_or_else(|error| {
+        json!({
+            "schema_version": 1,
+            "error": {
+                "reason_code": error.reason_code,
+                "message": error.message,
+                "index_digest": index_digest,
+            }
+        })
+    });
+    append_catalog_bridge_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        CatalogBridgeTapeEvent {
+            proposal_id,
+            tool_name,
+            index_digest,
+            output_value: &output_value,
+            success,
+        },
+    )
+    .await?;
+    let output_json = serde_json::to_vec(&output_value).unwrap_or_else(|_| b"{}".to_vec());
+    let execution_outcome = build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        success,
+        output_json,
+        if success { String::new() } else { reason },
+        false,
+        "tool_catalog_bridge".to_owned(),
+        format!("catalog_snapshot:index_digest={index_digest}"),
+    );
+    send_tool_result_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        proposal_id,
+        execution_outcome.success,
+        execution_outcome.output_json.as_slice(),
+        execution_outcome.error.as_str(),
+    )
+    .await?;
+    send_tool_attestation_with_tape(
+        sender,
+        runtime_state,
+        run_id,
+        tape_seq,
+        proposal_id,
+        execution_outcome.attestation.attestation_id.as_str(),
+        execution_outcome.attestation.execution_sha256.as_str(),
+        execution_outcome.attestation.executed_at_unix_ms,
+        execution_outcome.attestation.timed_out,
+        execution_outcome.attestation.executor.as_str(),
+        execution_outcome.attestation.sandbox_enforcement.as_str(),
+    )
+    .await?;
+    runtime_state.record_tool_attestation_emitted();
+    Ok(RunStreamToolExecutionOutcome::Completed {
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        outcome: execution_outcome,
+    })
+}
+
+struct CatalogBridgeTapeEvent<'a> {
+    proposal_id: &'a str,
+    tool_name: &'a str,
+    index_digest: &'a str,
+    output_value: &'a Value,
+    success: bool,
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_catalog_bridge_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    event: CatalogBridgeTapeEvent<'_>,
+) -> Result<(), Status> {
+    let event_type = match event.tool_name {
+        TOOL_CATALOG_SEARCH_TOOL_NAME => "tool.catalog_search",
+        TOOL_CATALOG_DESCRIBE_TOOL_NAME => "tool.catalog_describe",
+        TOOL_CATALOG_INVOKE_TOOL_NAME => "tool.catalog_invoke",
+        _ => "tool.catalog_bridge",
+    };
+    let result_ids = event
+        .output_value
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| result.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: event_type.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "proposal_id": event.proposal_id,
+                "tool_name": event.tool_name,
+                "success": event.success,
+                "index_digest": event.index_digest,
+                "result_ids": result_ids,
+                "filtered_count": event.output_value.get("filtered_count").and_then(Value::as_u64),
+                "schema_digest": event.output_value.get("schema_digest").and_then(Value::as_str),
+                "error": event.output_value.get("error"),
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn append_catalog_invoke_lineage_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    target_tool_name: &str,
+    schema_digest: &str,
+    index_digest: &str,
+    normalized_arguments_hash: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "tool.catalog_invoke.lineage".to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "bridge_tool_name": TOOL_CATALOG_INVOKE_TOOL_NAME,
+                "target_tool_name": target_tool_name,
+                "schema_digest": schema_digest,
+                "index_digest": index_digest,
+                "normalized_arguments_hash": normalized_arguments_hash,
+            })
+            .to_string(),
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);

@@ -33,11 +33,13 @@ pub use contract::{
     append_provider_text_with_hard_limit, bounded_provider_turn_output_for_persistence,
     model_id_supports_reasoning_effort, provider_events_from_output, provider_request_has_vision,
     AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
-    EmbeddingsRequest, EmbeddingsResponse, ProviderAttemptSummary, ProviderEvent,
-    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
+    EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
+    PromptCacheStrategy, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,
+    ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+    ProviderMessageToolCall, ProviderOutputContentPart, ProviderPromptCacheHint,
+    ProviderPromptSegment, ProviderPromptSegmentKind, ProviderRawProviderRefs,
+    ProviderReasoningEffort, ProviderRedactionState, ProviderRequest, ProviderResponse,
+    ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
     DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE, MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 pub use discovery::{

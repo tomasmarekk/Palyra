@@ -8,6 +8,9 @@
 use crate::*;
 use anyhow::{Context, Result};
 use base64::Engine;
+use palyra_common::tool_catalog::{
+    expand_toolset_profiles, normalize_configured_tool_names, ToolCatalogExposureMode,
+};
 use ring::{
     aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305},
     rand::{SecureRandom, SystemRandom},
@@ -89,7 +92,37 @@ pub(crate) struct DoctorExecutionReport {
     generated_at_unix_ms: i64,
     mode: DoctorExecutionMode,
     diagnostics: DoctorReport,
+    tools: DoctorToolsReport,
     recovery: DoctorRecoveryReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct DoctorToolsReport {
+    schema_version: u32,
+    config_path: Option<String>,
+    profile_expansion_status: String,
+    profiles: Vec<String>,
+    explicit_allowed_tools: Vec<String>,
+    extra_tools: Vec<String>,
+    disabled_tools: Vec<String>,
+    effective_allowed_tools: Vec<String>,
+    catalog_exposure_mode: String,
+    compact_tool_threshold: usize,
+    final_visible_tools: Vec<String>,
+    hidden_reason_summary: BTreeMap<String, usize>,
+    runtime_availability_probes: Vec<DoctorToolRuntimeProbe>,
+    provider_compatibility: String,
+    repair_hints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorToolRuntimeProbe {
+    runtime: String,
+    status: String,
+    ttl_ms: u64,
+    last_good_unix_ms: Option<i64>,
+    reason_code: String,
+    repair_hint: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -344,6 +377,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     let environment = resolve_doctor_environment()?;
     let checks = build_doctor_checks();
     let diagnostics = build_doctor_report(checks.as_slice())?;
+    let tools = build_doctor_tools_report(&environment);
     let mut recovery = DoctorRecoveryReport {
         requested: request.repair || request.rollback_run.is_some(),
         dry_run: request.dry_run,
@@ -405,6 +439,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
         generated_at_unix_ms: environment.generated_at_unix_ms,
         mode,
         diagnostics,
+        tools,
         recovery,
     })
 }
@@ -422,6 +457,175 @@ fn resolve_doctor_environment() -> Result<DoctorEnvironment> {
         .and_then(|context| context.config_path().map(|path| path.to_path_buf()))
         .or_else(doctor_config_path);
     Ok(DoctorEnvironment { state_root, config_path, generated_at_unix_ms })
+}
+
+fn build_doctor_tools_report(environment: &DoctorEnvironment) -> DoctorToolsReport {
+    let parsed = read_doctor_root_file_config().ok().flatten();
+    let tool_call = parsed.and_then(|config| config.tool_call);
+    let profiles =
+        tool_call.as_ref().and_then(|config| config.profiles.clone()).unwrap_or_default();
+    let explicit_allowed_tools =
+        tool_call.as_ref().and_then(|config| config.allowed_tools.clone()).unwrap_or_default();
+    let extra_tools =
+        tool_call.as_ref().and_then(|config| config.extra_tools.clone()).unwrap_or_default();
+    let disabled_tools =
+        tool_call.as_ref().and_then(|config| config.disabled_tools.clone()).unwrap_or_default();
+    let exposure_mode = tool_call
+        .as_ref()
+        .and_then(|config| config.catalog_exposure_mode.as_deref())
+        .and_then(ToolCatalogExposureMode::parse)
+        .unwrap_or(ToolCatalogExposureMode::Direct);
+    let compact_tool_threshold = tool_call
+        .as_ref()
+        .and_then(|config| config.compact_tool_threshold)
+        .filter(|value| *value > 0)
+        .unwrap_or(16);
+    let mut repair_hints = Vec::new();
+    let expansion = match expand_toolset_profiles(
+        profiles.as_slice(),
+        explicit_allowed_tools.as_slice(),
+        extra_tools.as_slice(),
+        disabled_tools.as_slice(),
+    ) {
+        Ok(expansion) => expansion,
+        Err(error) => {
+            repair_hints.push(format!(
+                "remove or rename unknown toolset profile '{}'",
+                error.invalid_profile()
+            ));
+            palyra_common::tool_catalog::ToolsetProfileExpansionReport {
+                profiles: normalize_configured_tool_names(profiles.as_slice()),
+                profile_expansions: Vec::new(),
+                explicit_allowed_tools: normalize_configured_tool_names(
+                    explicit_allowed_tools.as_slice(),
+                ),
+                extra_tools: normalize_configured_tool_names(extra_tools.as_slice()),
+                disabled_tools: normalize_configured_tool_names(disabled_tools.as_slice()),
+                effective_allowed_tools: normalize_configured_tool_names(
+                    explicit_allowed_tools.as_slice(),
+                ),
+            }
+        }
+    };
+    let final_visible_tools = final_doctor_visible_tools(
+        expansion.effective_allowed_tools.as_slice(),
+        exposure_mode,
+        compact_tool_threshold,
+    );
+    let mut hidden_reason_summary = BTreeMap::new();
+    if !expansion.disabled_tools.is_empty() {
+        hidden_reason_summary
+            .insert("disabled_by_config".to_owned(), expansion.disabled_tools.len());
+    }
+    let compacted = match exposure_mode {
+        ToolCatalogExposureMode::Direct => 0,
+        ToolCatalogExposureMode::Compact => expansion.effective_allowed_tools.len(),
+        ToolCatalogExposureMode::Hybrid => {
+            expansion.effective_allowed_tools.len().saturating_sub(compact_tool_threshold)
+        }
+    };
+    if compacted > 0 {
+        hidden_reason_summary.insert("available_through_compact_index".to_owned(), compacted);
+    }
+    let profile_expansion_status = if repair_hints.is_empty() { "ok" } else { "invalid" };
+    DoctorToolsReport {
+        schema_version: 1,
+        config_path: environment.config_path.as_ref().map(|path| display_path(path.as_path())),
+        profile_expansion_status: profile_expansion_status.to_owned(),
+        profiles: expansion.profiles,
+        explicit_allowed_tools: expansion.explicit_allowed_tools,
+        extra_tools: expansion.extra_tools,
+        disabled_tools: expansion.disabled_tools,
+        effective_allowed_tools: expansion.effective_allowed_tools,
+        catalog_exposure_mode: exposure_mode.as_str().to_owned(),
+        compact_tool_threshold,
+        final_visible_tools,
+        hidden_reason_summary,
+        runtime_availability_probes: doctor_tool_runtime_probes(tool_call.as_ref()),
+        provider_compatibility: "validated per provider when the daemon builds a catalog snapshot"
+            .to_owned(),
+        repair_hints,
+    }
+}
+
+fn final_doctor_visible_tools(
+    effective_allowed_tools: &[String],
+    exposure_mode: ToolCatalogExposureMode,
+    compact_tool_threshold: usize,
+) -> Vec<String> {
+    let bridge_tools = [
+        "palyra.tools.describe".to_owned(),
+        "palyra.tools.invoke".to_owned(),
+        "palyra.tools.search".to_owned(),
+    ];
+    match exposure_mode {
+        ToolCatalogExposureMode::Direct => effective_allowed_tools.to_vec(),
+        ToolCatalogExposureMode::Compact => bridge_tools.to_vec(),
+        ToolCatalogExposureMode::Hybrid => {
+            let mut visible = effective_allowed_tools
+                .iter()
+                .take(compact_tool_threshold)
+                .cloned()
+                .collect::<Vec<_>>();
+            visible.extend(bridge_tools);
+            visible.sort();
+            visible.dedup();
+            visible
+        }
+    }
+}
+
+fn doctor_tool_runtime_probes(
+    tool_call: Option<&palyra_common::daemon_config_schema::FileToolCallConfig>,
+) -> Vec<DoctorToolRuntimeProbe> {
+    let process_enabled = tool_call
+        .and_then(|config| config.process_runner.as_ref())
+        .and_then(|config| config.enabled)
+        .unwrap_or(false);
+    let wasm_enabled = tool_call
+        .and_then(|config| config.wasm_runtime.as_ref())
+        .and_then(|config| config.enabled)
+        .unwrap_or(false);
+    let browser_enabled = tool_call
+        .and_then(|config| config.browser_service.as_ref())
+        .and_then(|config| config.enabled)
+        .unwrap_or(false);
+    vec![
+        doctor_tool_runtime_probe(
+            "process_runner",
+            process_enabled,
+            "tool_call.process_runner.enabled=false",
+            "enable tool_call.process_runner before exposing process tools",
+        ),
+        doctor_tool_runtime_probe(
+            "wasm_runtime",
+            wasm_enabled,
+            "tool_call.wasm_runtime.enabled=false",
+            "enable tool_call.wasm_runtime before exposing plugin tools",
+        ),
+        doctor_tool_runtime_probe(
+            "browser_service",
+            browser_enabled,
+            "tool_call.browser_service.enabled=false",
+            "enable and start browserd before exposing browser tools",
+        ),
+    ]
+}
+
+fn doctor_tool_runtime_probe(
+    runtime: &str,
+    enabled: bool,
+    disabled_reason: &str,
+    repair_hint: &str,
+) -> DoctorToolRuntimeProbe {
+    DoctorToolRuntimeProbe {
+        runtime: runtime.to_owned(),
+        status: if enabled { "available" } else { "unavailable" }.to_owned(),
+        ttl_ms: 30_000,
+        last_good_unix_ms: None,
+        reason_code: if enabled { "runtime.available" } else { disabled_reason }.to_owned(),
+        repair_hint: if enabled { "runtime is enabled in config" } else { repair_hint }.to_owned(),
+    }
 }
 
 fn evaluate_repair_plans(environment: &DoctorEnvironment) -> Result<Vec<DoctorRepairPlan>> {
@@ -2610,6 +2814,25 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
         )
         .as_str(),
     )?;
+    output::print_text_line(
+        format!(
+            "doctor.tools exposure_mode={} visible_tools={} effective_allowed_tools={} profile_expansion_status={}",
+            execution.tools.catalog_exposure_mode,
+            execution.tools.final_visible_tools.len(),
+            execution.tools.effective_allowed_tools.len(),
+            execution.tools.profile_expansion_status
+        )
+        .as_str(),
+    )?;
+    for probe in execution.tools.runtime_availability_probes.as_slice() {
+        output::print_text_line(
+            format!(
+                "doctor.tools.probe runtime={} status={} reason_code={}",
+                probe.runtime, probe.status, probe.reason_code
+            )
+            .as_str(),
+        )?;
+    }
     if let Some(message) = execution.diagnostics.connectivity.http.message.as_deref() {
         output::print_text_line(format!("doctor.connectivity.http_message={message}").as_str())?;
     }
