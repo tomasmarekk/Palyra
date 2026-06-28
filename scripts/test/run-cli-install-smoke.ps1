@@ -389,6 +389,8 @@ foreach ($directory in @($outputRoot, $reportRoot, $logsRoot, $helpTranscriptRoo
 
 $version = (& (Join-Path $repoRoot "scripts/release/assert-version-coherence.ps1")).Trim()
 $platform = Get-PlatformSlug
+$cargoTargetRoot = Join-Path $repoRoot "target/cli-install-smoke-cargo-target/$platform"
+$cargoReleaseRoot = Join-Path $cargoTargetRoot "release"
 $headlessPackageOutput = Join-Path $outputRoot "headless"
 $installRoot = Join-Path $outputRoot "installed-headless"
 $configPath = Join-Path $outputRoot "installed-headless-config/palyra.toml"
@@ -412,6 +414,17 @@ $openAiModelsFixture = $null
 
 Push-Location $repoRoot
 try {
+    # Keep install-smoke release builds away from the default target dir so
+    # stale or cross-platform build-script binaries cannot poison the smoke run.
+    if (Test-Path -LiteralPath $cargoTargetRoot) {
+        Remove-Item -LiteralPath $cargoTargetRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $cargoTargetRoot -Force | Out-Null
+
+    $cargoEnvironment = @{
+        CARGO_TARGET_DIR = $cargoTargetRoot
+    }
+
     Invoke-TranscriptCommand `
         -Label "ensure-web-ui" `
         -Command (Join-Path $repoRoot "scripts/test/ensure-web-ui.ps1") `
@@ -423,11 +436,12 @@ try {
         -Command "cargo" `
         -Arguments @("build", "-p", "palyra-daemon", "-p", "palyra-browserd", "-p", "palyra-cli", "--release", "--locked") `
         -WorkingDirectory $repoRoot `
-        -LogPath (Join-Path $logsRoot "cargo-build-release.log") | Out-Null
+        -LogPath (Join-Path $logsRoot "cargo-build-release.log") `
+        -Environment $cargoEnvironment | Out-Null
 
-    $daemonBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyrad"))
-    $browserBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra-browserd"))
-    $cliBinary = Join-Path $repoRoot ("target/release/" + (Resolve-ExecutableName -BaseName "palyra"))
+    $daemonBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyrad")
+    $browserBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyra-browserd")
+    $cliBinary = Join-Path $cargoReleaseRoot (Resolve-ExecutableName -BaseName "palyra")
     $webDist = Join-Path $repoRoot "apps/web/dist"
 
     Invoke-TranscriptCommand `
@@ -502,7 +516,8 @@ try {
             $inventoryPath
         ) `
         -WorkingDirectory $repoRoot `
-        -LogPath (Join-Path $logsRoot "generate-cli-install-smoke-inventory.log") | Out-Null
+        -LogPath (Join-Path $logsRoot "generate-cli-install-smoke-inventory.log") `
+        -Environment $cargoEnvironment | Out-Null
 
     $inventory = Get-Content -LiteralPath $inventoryPath -Raw | ConvertFrom-Json -Depth 16
     $helpContext = New-ScenarioContext -Root (Join-Path $reportRoot "contexts") -Name "help"
@@ -619,7 +634,8 @@ try {
             -Command "cargo" `
             -Arguments @("test", "-p", "palyra-cli", "--test", "installed_smoke", "--locked", "--", "--test-threads=1") `
             -WorkingDirectory $repoRoot `
-            -LogPath (Join-Path $logsRoot "cargo-test-installed-smoke.log") | Out-Null
+            -LogPath (Join-Path $logsRoot "cargo-test-installed-smoke.log") `
+            -Environment $cargoEnvironment | Out-Null
     }
     finally {
         if ($null -eq $previousBinary) { Remove-Item Env:PALYRA_BIN_UNDER_TEST -ErrorAction SilentlyContinue } else { $env:PALYRA_BIN_UNDER_TEST = $previousBinary }
