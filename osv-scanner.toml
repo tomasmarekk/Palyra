@@ -1,1 +1,3 @@
-# No ignored vulnerabilities are currently allowlisted.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0192"
+reason = "Transitive through lopdf; no safe upgrade is available yet."
