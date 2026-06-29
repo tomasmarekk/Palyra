@@ -170,6 +170,36 @@ path = "flows"
 file = "flows-help.txt"
 
 [[entries]]
+path = "tasks"
+category = "top_level"
+status = "done"
+summary = "Unified runtime task timeline and WorkBoard operator control surface."
+
+[entries.snapshot]
+path = "tasks"
+file = "tasks-help.txt"
+
+[[entries]]
+path = "tasks workboard"
+category = "nested_surface"
+status = "done"
+summary = "Durable WorkBoard item lifecycle controls."
+
+[entries.snapshot]
+path = "tasks workboard"
+file = "tasks-workboard-help.txt"
+
+[[entries]]
+path = "commitments"
+category = "top_level"
+status = "done"
+summary = "Commitment extraction, review, source inspection, and scheduling lifecycle controls."
+
+[entries.snapshot]
+path = "commitments"
+file = "commitments-help.txt"
+
+[[entries]]
 path = "memory"
 category = "top_level"
 status = "done"

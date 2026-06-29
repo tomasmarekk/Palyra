@@ -20,6 +20,7 @@ mod auth;
 mod backup;
 mod browser;
 mod channels;
+mod commitments;
 mod completion;
 mod config;
 mod configure;
@@ -58,6 +59,7 @@ mod skills;
 mod state;
 mod support_bundle;
 mod system;
+mod tasks;
 mod tui;
 mod uninstall;
 mod update;
@@ -87,6 +89,7 @@ pub use channels::{
     ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand,
     ChannelsRouterCommand,
 };
+pub use commitments::CommitmentsCommand;
 pub use completion::CompletionShell;
 pub use config::ConfigCommand;
 pub use configure::ConfigureSectionArg;
@@ -137,6 +140,7 @@ pub use skills::{SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand};
 pub use state::StateCommand;
 pub use support_bundle::SupportBundleCommand;
 pub use system::{SystemCommand, SystemEventCommand, SystemEventSeverityArg};
+pub use tasks::{TasksCommand, WorkboardCommand};
 pub use tui::TuiCommand;
 pub use uninstall::UninstallCommand;
 pub use update::UpdateCommand;
@@ -623,10 +627,20 @@ pub enum Command {
         #[command(subcommand)]
         command: FlowsCommand,
     },
+    #[command(about = "Inspect unified runtime tasks and WorkBoard items")]
+    Tasks {
+        #[command(subcommand)]
+        command: TasksCommand,
+    },
     #[command(about = "Inspect and control durable long-running tool jobs")]
     Jobs {
         #[command(subcommand)]
         command: JobsCommand,
+    },
+    #[command(about = "Extract, review, and schedule user commitments")]
+    Commitments {
+        #[command(subcommand)]
+        command: CommitmentsCommand,
     },
     #[command(
         about = "Manage schedule-only cron workflows through the routines compatibility layer",
