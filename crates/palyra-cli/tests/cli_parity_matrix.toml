@@ -693,6 +693,49 @@ path = "protocol"
 file = "protocol-help.txt"
 
 [[entries]]
+path = "eval"
+category = "top_level"
+status = "done"
+summary = "Local eval bundle and replay metadata workflows."
+
+[entries.snapshot]
+path = "eval"
+file = "eval-help.txt"
+
+[[entries]]
+path = "eval bundle"
+category = "nested_surface"
+status = "done"
+summary = "Eval bundle lifecycle workflows."
+
+[entries.snapshot]
+path = "eval bundle"
+file = "eval-bundle-help.txt"
+
+[[entries]]
+path = "eval bundle create"
+category = "nested_surface"
+status = "done"
+summary = "Create an offline eval bundle from replay artifacts and run exports."
+required_flags = [
+    "name",
+    "output",
+    "run-id",
+    "run-export",
+    "replay-bundle",
+    "scenario-manifest",
+    "memory-fixture",
+    "journal-db",
+    "max-events",
+    "fake-provider",
+    "json",
+]
+
+[entries.snapshot]
+path = "eval bundle create"
+file = "eval-bundle-create-help.txt"
+
+[[entries]]
 path = "config"
 category = "top_level"
 status = "done"
@@ -741,6 +784,27 @@ summary = "Networked-worker diagnostics, lease visibility, and cleanup workflows
 [entries.snapshot]
 path = "workers"
 file = "workers-help.txt"
+
+[[entries]]
+path = "run"
+category = "top_level"
+status = "done"
+summary = "Run trajectory export workflows for audit and evals."
+
+[entries.snapshot]
+path = "run"
+file = "run-help.txt"
+
+[[entries]]
+path = "run export"
+category = "nested_surface"
+status = "done"
+summary = "Export a redacted run trajectory in evaluator-friendly formats."
+required_flags = ["run-id", "output", "format", "redacted", "journal-db", "max-events"]
+
+[entries.snapshot]
+path = "run export"
+file = "run-export-help.txt"
 
 [[entries]]
 path = "skills"
