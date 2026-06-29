@@ -21,6 +21,9 @@ use crate::{
     wasm_plugin_runner::WasmPluginRunnerPolicy,
 };
 use palyra_common::tool_catalog::ToolCatalogExposureMode;
+use std::sync::{Mutex, OnceLock};
+
+static AVAILABILITY_PROBE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn config(allowed_tools: &[&str]) -> ToolCallConfig {
     ToolCallConfig {
@@ -72,6 +75,13 @@ fn catalog_policy(config: &ToolCallConfig) -> ToolCatalogPolicySnapshot {
     ToolCatalogPolicySnapshot::direct_from_allowed_tools(config.allowed_tools.as_slice())
 }
 
+fn availability_probe_cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    AVAILABILITY_PROBE_CACHE_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("availability probe cache test lock poisoned")
+}
+
 #[test]
 fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
     let config = config(&["palyra.echo", "palyra.sleep"]);
@@ -96,6 +106,7 @@ fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
 
 #[test]
 fn availability_probe_cache_uses_ttl_and_last_good_browser_grace() {
+    let _guard = availability_probe_cache_test_guard();
     clear_availability_probe_cache_for_tests();
     let config = config(&["palyra.browser.navigate", "palyra.test.browser_probe_cache"]);
 
@@ -174,6 +185,7 @@ fn availability_probe_cache_uses_ttl_and_last_good_browser_grace() {
 
 #[test]
 fn availability_probe_cache_invalidates_high_risk_process_on_config_change() {
+    let _guard = availability_probe_cache_test_guard();
     clear_availability_probe_cache_for_tests();
     let mut config = config(&["palyra.process.run", "palyra.test.process_probe_cache"]);
     config.process_runner.enabled = true;
