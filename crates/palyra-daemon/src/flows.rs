@@ -23,15 +23,17 @@ use crate::{
     },
     gateway::GatewayRuntimeState,
     journal::{
-        ApprovalDecision, FlowCreateRequest, FlowListFilter, FlowRecord, FlowStepCreateRequest,
-        FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
-        OrchestratorBackgroundTaskCreateRequest,
+        ApprovalDecision, FlowBundleRecord, FlowCreateRequest, FlowListFilter, FlowRecord,
+        FlowStepCreateRequest, FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
+        OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskUpdateRequest,
+        OrchestratorCancelRequest,
     },
 };
 
 const FLOW_COORDINATOR_LIMIT: usize = 64;
 const FLOW_EVENT_LIMIT: usize = 512;
 const FLOW_COORDINATOR_ACTOR: &str = "system:flow-coordinator";
+const FLOW_COORDINATOR_LEASE_MS: i64 = 60_000;
 const DEFAULT_FLOW_RETRY_MAX_ATTEMPTS: u64 = 1;
 const DEFAULT_FLOW_BACKOFF_MS: u64 = 1_000;
 const DEFAULT_BACKGROUND_TASK_BUDGET_TOKENS: u64 = 1_200;
@@ -148,6 +150,241 @@ impl FlowCoordinator {
     }
 
     #[allow(clippy::result_large_err)]
+    async fn acquire_flow_lease(
+        runtime: &Arc<GatewayRuntimeState>,
+        flow: &FlowRecord,
+    ) -> Result<Option<FlowRecord>, Status> {
+        let now = crate::gateway::current_unix_ms();
+        let lock_is_live = flow.lock_expires_at_unix_ms.is_some_and(|expires_at| expires_at > now);
+        if lock_is_live
+            && flow.lock_owner.as_deref().is_some_and(|owner| owner != FLOW_COORDINATOR_ACTOR)
+        {
+            return Ok(None);
+        }
+        if lock_is_live && flow.lock_owner.as_deref() == Some(FLOW_COORDINATOR_ACTOR) {
+            return Ok(Some(flow.clone()));
+        }
+
+        match runtime
+            .transition_flow(FlowTransitionRequest {
+                flow_id: flow.flow_id.clone(),
+                expected_revision: Some(flow.revision),
+                state: flow.state.clone(),
+                current_step_id: None,
+                lock_owner: Some(Some(FLOW_COORDINATOR_ACTOR.to_owned())),
+                lock_expires_at_unix_ms: Some(Some(now.saturating_add(FLOW_COORDINATOR_LEASE_MS))),
+                completed_at_unix_ms: None,
+                actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+                event_type: "flow.lease_acquired".to_owned(),
+                summary: "flow coordinator lease acquired".to_owned(),
+                payload_json: json!({
+                    "lease_owner": FLOW_COORDINATOR_ACTOR,
+                    "lease_expires_at_unix_ms": now.saturating_add(FLOW_COORDINATOR_LEASE_MS),
+                })
+                .to_string(),
+            })
+            .await
+        {
+            Ok(flow) => Ok(Some(flow)),
+            Err(status) if status.code() == tonic::Code::Aborted => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn drive_cancel_requested_flow(
+        runtime: &Arc<GatewayRuntimeState>,
+        bundle: &FlowBundleRecord,
+    ) -> Result<(), Status> {
+        let Some(leased_flow) = Self::acquire_flow_lease(runtime, &bundle.flow).await? else {
+            return Ok(());
+        };
+        let Some(bundle) =
+            runtime.get_flow_bundle(leased_flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
+        else {
+            return Ok(());
+        };
+        for step in &bundle.steps {
+            if FlowStepState::from_str(step.state.as_str()).is_some_and(FlowStepState::is_terminal)
+            {
+                continue;
+            }
+            Self::request_step_cancel(runtime, &bundle.flow, step).await?;
+        }
+
+        let Some(updated) =
+            runtime.get_flow_bundle(bundle.flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
+        else {
+            return Ok(());
+        };
+        let all_terminal = updated.steps.iter().all(|step| {
+            FlowStepState::from_str(step.state.as_str()).is_some_and(FlowStepState::is_terminal)
+        });
+        if all_terminal {
+            runtime
+                .transition_flow(FlowTransitionRequest {
+                    flow_id: updated.flow.flow_id.clone(),
+                    expected_revision: Some(updated.flow.revision),
+                    state: FlowState::Cancelled.as_str().to_owned(),
+                    current_step_id: Some(None),
+                    lock_owner: Some(None),
+                    lock_expires_at_unix_ms: Some(None),
+                    completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                    actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+                    event_type: "flow.cancel.completed".to_owned(),
+                    summary: "flow cancellation completed".to_owned(),
+                    payload_json: json!({ "source": "flow_coordinator" }).to_string(),
+                })
+                .await?;
+            return Ok(());
+        }
+
+        let next_active_step = active_step_id(updated.steps.as_slice());
+        if next_active_step.clone().flatten() != updated.flow.current_step_id {
+            runtime
+                .transition_flow(FlowTransitionRequest {
+                    flow_id: updated.flow.flow_id.clone(),
+                    expected_revision: Some(updated.flow.revision),
+                    state: FlowState::CancelRequested.as_str().to_owned(),
+                    current_step_id: next_active_step,
+                    lock_owner: None,
+                    lock_expires_at_unix_ms: None,
+                    completed_at_unix_ms: None,
+                    actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+                    event_type: "flow.cancel.waiting".to_owned(),
+                    summary: "flow cancellation waiting for child work".to_owned(),
+                    payload_json: json!({ "source": "flow_coordinator" }).to_string(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn request_step_cancel(
+        runtime: &Arc<GatewayRuntimeState>,
+        flow: &FlowRecord,
+        step: &FlowStepRecord,
+    ) -> Result<(), Status> {
+        let lineage = parse_lineage(step)?;
+        if let Some(task_id) = lineage.background_task_id.as_deref() {
+            let Some(task) = runtime.get_orchestrator_background_task(task_id.to_owned()).await?
+            else {
+                return mark_step_cancelled(runtime, step, "background task missing").await;
+            };
+            if !same_flow_scope(
+                flow,
+                task.owner_principal.as_str(),
+                task.device_id.as_str(),
+                task.channel.as_deref(),
+            ) {
+                return Ok(());
+            }
+            let Some(mapped_state) = map_auxiliary_task_state(task.state.as_str()) else {
+                return Ok(());
+            };
+            if mapped_state.is_terminal() {
+                return update_step_to_external_terminal(
+                    runtime,
+                    step,
+                    ExternalTerminalStepUpdate {
+                        mapped_state,
+                        output_json: task.result_json.clone(),
+                        last_error: task.last_error.clone(),
+                        completed_at_unix_ms: task.completed_at_unix_ms,
+                        payload: json!({
+                            "background_task_id": task_id,
+                            "background_task_state": task.state,
+                        }),
+                        event_type: "flow.step.cancel_external_sync",
+                    },
+                )
+                .await;
+            }
+            if task.state != AuxiliaryTaskState::CancelRequested.as_str() {
+                runtime
+                    .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
+                        task_id: task.task_id.clone(),
+                        state: Some(AuxiliaryTaskState::CancelRequested.as_str().to_owned()),
+                        target_run_id: None,
+                        increment_attempt_count: false,
+                        last_error: Some(Some("cancelled by parent flow".to_owned())),
+                        result_json: Some(Some(
+                            json!({
+                                "cancel_requested_by": "flow",
+                                "flow_id": flow.flow_id,
+                                "step_id": step.step_id,
+                            })
+                            .to_string(),
+                        )),
+                        started_at_unix_ms: None,
+                        completed_at_unix_ms: None,
+                    })
+                    .await?;
+            }
+            return mark_step_cancel_requested(
+                runtime,
+                step,
+                "waiting for background task cancellation",
+                json!({ "background_task_id": task_id }),
+            )
+            .await;
+        }
+
+        if let Some(run_id) = lineage.child_run_id.as_deref() {
+            let Some(run) = runtime.orchestrator_run_status_snapshot(run_id.to_owned()).await?
+            else {
+                return mark_step_cancelled(runtime, step, "child run missing").await;
+            };
+            if !same_flow_scope(
+                flow,
+                run.principal.as_str(),
+                run.device_id.as_str(),
+                run.channel.as_deref(),
+            ) {
+                return Ok(());
+            }
+            if let Some(mapped_state) = map_run_state(run.state.as_str()) {
+                if mapped_state.is_terminal() {
+                    return update_step_to_external_terminal(
+                        runtime,
+                        step,
+                        ExternalTerminalStepUpdate {
+                            mapped_state,
+                            output_json: None,
+                            last_error: run.last_error.clone(),
+                            completed_at_unix_ms: run.completed_at_unix_ms,
+                            payload: json!({
+                                "child_run_id": run_id,
+                                "run_state": run.state,
+                            }),
+                            event_type: "flow.step.cancel_child_run_sync",
+                        },
+                    )
+                    .await;
+                }
+            }
+            if !run.cancel_requested {
+                runtime
+                    .request_orchestrator_cancel(OrchestratorCancelRequest {
+                        run_id: run_id.to_owned(),
+                        reason: format!("cancelled by flow {}", flow.flow_id),
+                    })
+                    .await?;
+            }
+            return mark_step_cancel_requested(
+                runtime,
+                step,
+                "waiting for child run cancellation",
+                json!({ "child_run_id": run_id }),
+            )
+            .await;
+        }
+
+        mark_step_cancelled(runtime, step, "no external child to cancel").await
+    }
+
+    #[allow(clippy::result_large_err)]
     async fn reconcile_flow(
         runtime: &Arc<GatewayRuntimeState>,
         flow: &FlowRecord,
@@ -157,16 +394,25 @@ impl FlowCoordinator {
             return Ok(());
         };
         let state = FlowState::from_str(bundle.flow.state.as_str());
-        // Paused and cancel-requested flows are operator-owned; the coordinator must not advance
-        // or time out their steps until the operator resumes or the cancel completes.
-        if state.is_some_and(FlowState::is_terminal)
-            || matches!(state, Some(FlowState::Paused | FlowState::CancelRequested))
-        {
+        if state.is_some_and(FlowState::is_terminal) || matches!(state, Some(FlowState::Paused)) {
+            return Ok(());
+        }
+        if matches!(state, Some(FlowState::CancelRequested)) {
+            Self::drive_cancel_requested_flow(runtime, &bundle).await?;
             return Ok(());
         }
 
+        let Some(leased_flow) = Self::acquire_flow_lease(runtime, &bundle.flow).await? else {
+            return Ok(());
+        };
+        let Some(bundle) =
+            runtime.get_flow_bundle(leased_flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
+        else {
+            return Ok(());
+        };
+
         for step in &bundle.steps {
-            if let Some(next_state) = Self::sync_external_step(runtime, flow, step).await? {
+            if let Some(next_state) = Self::sync_external_step(runtime, &bundle.flow, step).await? {
                 if next_state.is_terminal() {
                     continue;
                 }
@@ -187,14 +433,16 @@ impl FlowCoordinator {
             } else {
                 None
             };
+            let clear_lock_owner = next_flow_state.is_terminal().then_some(None);
+            let clear_lock_expires_at = next_flow_state.is_terminal().then_some(None);
             runtime
                 .transition_flow(FlowTransitionRequest {
                     flow_id: updated.flow.flow_id.clone(),
                     expected_revision: Some(updated.flow.revision),
                     state: next_flow_state.as_str().to_owned(),
                     current_step_id: active_step_id(updated.steps.as_slice()),
-                    lock_owner: None,
-                    lock_expires_at_unix_ms: None,
+                    lock_owner: clear_lock_owner,
+                    lock_expires_at_unix_ms: clear_lock_expires_at,
                     completed_at_unix_ms: completed_at,
                     actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
                     event_type: "flow.reconciled".to_owned(),
@@ -999,6 +1247,111 @@ async fn mark_step_blocked(
             event_type: "flow.step.blocked".to_owned(),
             summary: reason.to_owned(),
             payload_json: json!({ "reason": reason }).to_string(),
+        })
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+async fn mark_step_cancel_requested(
+    runtime: &Arc<GatewayRuntimeState>,
+    step: &FlowStepRecord,
+    reason: &str,
+    payload: Value,
+) -> Result<(), Status> {
+    if step.state == FlowStepState::CancelRequested.as_str() {
+        return Ok(());
+    }
+    runtime
+        .update_flow_step(FlowStepUpdateRequest {
+            flow_id: step.flow_id.clone(),
+            step_id: step.step_id.clone(),
+            state: Some(FlowStepState::CancelRequested.as_str().to_owned()),
+            increment_attempt_count: false,
+            output_json: None,
+            lineage_json: None,
+            not_before_unix_ms: None,
+            waiting_reason: Some(Some(reason.to_owned())),
+            last_error: Some(None),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+            event_type: "flow.step.cancel_requested".to_owned(),
+            summary: reason.to_owned(),
+            payload_json: payload.to_string(),
+        })
+        .await
+        .map(|_| ())
+}
+
+#[allow(clippy::result_large_err)]
+async fn mark_step_cancelled(
+    runtime: &Arc<GatewayRuntimeState>,
+    step: &FlowStepRecord,
+    reason: &str,
+) -> Result<(), Status> {
+    if step.state == FlowStepState::Cancelled.as_str() {
+        return Ok(());
+    }
+    runtime
+        .update_flow_step(FlowStepUpdateRequest {
+            flow_id: step.flow_id.clone(),
+            step_id: step.step_id.clone(),
+            state: Some(FlowStepState::Cancelled.as_str().to_owned()),
+            increment_attempt_count: false,
+            output_json: None,
+            lineage_json: None,
+            not_before_unix_ms: None,
+            waiting_reason: Some(None),
+            last_error: Some(Some(reason.to_owned())),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+            actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+            event_type: "flow.step.cancelled".to_owned(),
+            summary: reason.to_owned(),
+            payload_json: json!({ "reason": reason }).to_string(),
+        })
+        .await
+        .map(|_| ())
+}
+
+struct ExternalTerminalStepUpdate<'a> {
+    mapped_state: FlowStepState,
+    output_json: Option<String>,
+    last_error: Option<String>,
+    completed_at_unix_ms: Option<i64>,
+    payload: Value,
+    event_type: &'a str,
+}
+
+#[allow(clippy::result_large_err)]
+async fn update_step_to_external_terminal(
+    runtime: &Arc<GatewayRuntimeState>,
+    step: &FlowStepRecord,
+    update: ExternalTerminalStepUpdate<'_>,
+) -> Result<(), Status> {
+    if step.state == update.mapped_state.as_str() {
+        return Ok(());
+    }
+    runtime
+        .update_flow_step(FlowStepUpdateRequest {
+            flow_id: step.flow_id.clone(),
+            step_id: step.step_id.clone(),
+            state: Some(update.mapped_state.as_str().to_owned()),
+            increment_attempt_count: false,
+            output_json: Some(update.output_json),
+            lineage_json: None,
+            not_before_unix_ms: None,
+            waiting_reason: Some(None),
+            last_error: Some(update.last_error),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: Some(update.completed_at_unix_ms.or_else(|| {
+                update.mapped_state.is_terminal().then(crate::gateway::current_unix_ms)
+            })),
+            actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+            event_type: update.event_type.to_owned(),
+            summary: format!("external child mapped to {}", update.mapped_state.as_str()),
+            payload_json: update.payload.to_string(),
         })
         .await
         .map(|_| ())

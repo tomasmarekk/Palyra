@@ -59,6 +59,28 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         } => Status::aborted(format!(
             "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
         )),
+        JournalError::DuplicateWorkItemId { work_item_id } => {
+            Status::already_exists(format!("work item already exists: {work_item_id}"))
+        }
+        JournalError::WorkItemNotFound { work_item_id } => {
+            Status::not_found(format!("work item not found: {work_item_id}"))
+        }
+        JournalError::InvalidWorkItemTransition { work_item_id, from, to } => {
+            Status::failed_precondition(format!(
+                "invalid work item transition for {work_item_id}: {from} -> {to}"
+            ))
+        }
+        JournalError::DuplicateCommitmentId { commitment_id } => {
+            Status::already_exists(format!("commitment already exists: {commitment_id}"))
+        }
+        JournalError::CommitmentNotFound { commitment_id } => {
+            Status::not_found(format!("commitment not found: {commitment_id}"))
+        }
+        JournalError::InvalidCommitmentTransition { commitment_id, from, to } => {
+            Status::failed_precondition(format!(
+                "invalid commitment transition for {commitment_id}: {from} -> {to}"
+            ))
+        }
         JournalError::InvalidArgument(message) => Status::invalid_argument(message),
         JournalError::DuplicateToolResultArtifactId { artifact_id } => {
             Status::already_exists(format!("tool result artifact already exists: {artifact_id}"))

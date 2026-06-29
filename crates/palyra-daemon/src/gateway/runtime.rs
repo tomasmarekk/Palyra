@@ -36,13 +36,15 @@ use crate::journal::state_health::{
     JournalWalCheckpointReport, SidecarIndexDescriptor,
 };
 use crate::journal::{
-    FlowBundleRecord, FlowCreateRequest, FlowListFilter, FlowRecord, FlowStepRecord,
-    FlowStepUpdateRequest, FlowTransitionRequest, IdempotencyBeginRequest,
-    IdempotencyCompleteRequest, IdempotencyFailRequest, LearningCandidateCreateRequest,
-    LearningCandidateHistoryRecord, LearningCandidateListFilter, LearningCandidateRecord,
-    LearningCandidateReviewRequest, LearningPreferenceListFilter, LearningPreferenceRecord,
-    LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemLifecycleUpdateRequest,
-    MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
+    CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest,
+    CommitmentDeliveryAttemptRecord, CommitmentEventRecord, CommitmentListFilter, CommitmentRecord,
+    CommitmentSourceRecord, CommitmentUpdateRequest, FlowBundleRecord, FlowCreateRequest,
+    FlowListFilter, FlowRecord, FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
+    IdempotencyBeginRequest, IdempotencyCompleteRequest, IdempotencyFailRequest,
+    LearningCandidateCreateRequest, LearningCandidateHistoryRecord, LearningCandidateListFilter,
+    LearningCandidateRecord, LearningCandidateReviewRequest, LearningPreferenceListFilter,
+    LearningPreferenceRecord, LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus,
+    MemoryItemLifecycleUpdateRequest, MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
     OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorCheckpointCreateRequest,
     OrchestratorCheckpointRecord, OrchestratorCheckpointRestoreMarkRequest,
@@ -62,8 +64,10 @@ use crate::journal::{
     ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord, ToolJobRetryRequest,
     ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest, ToolJobTransitionRequest,
     ToolJobsListFilter, ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
-    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
-    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter, WorkItemRecord,
+    WorkItemUpdateRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
+    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -7211,6 +7215,344 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator background task detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_work_item_blocking(
+        &self,
+        request: &WorkItemCreateRequest,
+    ) -> Result<WorkItemRecord, Status> {
+        self.journal_store
+            .create_work_item(request)
+            .map_err(|error| map_orchestrator_store_error("create work item", error))
+    }
+
+    /// Creates a WorkBoard item.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn create_work_item(
+        self: &Arc<Self>,
+        request: WorkItemCreateRequest,
+    ) -> Result<WorkItemRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_work_item_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work item create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_work_item_blocking(
+        &self,
+        request: &WorkItemUpdateRequest,
+    ) -> Result<WorkItemRecord, Status> {
+        self.journal_store
+            .update_work_item(request)
+            .map_err(|error| map_orchestrator_store_error("update work item", error))
+    }
+
+    /// Updates a WorkBoard item.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn update_work_item(
+        self: &Arc<Self>,
+        request: WorkItemUpdateRequest,
+    ) -> Result<WorkItemRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.update_work_item_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("work item update worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_work_items_blocking(
+        &self,
+        filter: &WorkItemListFilter,
+    ) -> Result<Vec<WorkItemRecord>, Status> {
+        self.journal_store
+            .list_work_items(filter)
+            .map_err(|error| map_orchestrator_store_error("list work items", error))
+    }
+
+    /// Lists WorkBoard items matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_work_items(
+        self: &Arc<Self>,
+        filter: WorkItemListFilter,
+    ) -> Result<Vec<WorkItemRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_work_items_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("work item list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_work_item_blocking(&self, work_item_id: &str) -> Result<Option<WorkItemRecord>, Status> {
+        self.journal_store
+            .get_work_item(work_item_id)
+            .map_err(|error| map_orchestrator_store_error("load work item", error))
+    }
+
+    /// Loads a WorkBoard item by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn get_work_item(
+        self: &Arc<Self>,
+        work_item_id: String,
+    ) -> Result<Option<WorkItemRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.get_work_item_blocking(work_item_id.as_str()))
+            .await
+            .map_err(|_| Status::internal("work item detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_work_item_events_blocking(
+        &self,
+        work_item_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkItemEventRecord>, Status> {
+        self.journal_store
+            .list_work_item_events(work_item_id, limit)
+            .map_err(|error| map_orchestrator_store_error("list work item events", error))
+    }
+
+    /// Lists a WorkBoard item's audit events.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_work_item_events(
+        self: &Arc<Self>,
+        work_item_id: String,
+        limit: usize,
+    ) -> Result<Vec<WorkItemEventRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_work_item_events_blocking(work_item_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("work item event list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_commitment_blocking(
+        &self,
+        request: &CommitmentCreateRequest,
+    ) -> Result<CommitmentRecord, Status> {
+        self.journal_store
+            .create_commitment(request)
+            .map_err(|error| map_orchestrator_store_error("create commitment", error))
+    }
+
+    /// Creates a commitment record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn create_commitment(
+        self: &Arc<Self>,
+        request: CommitmentCreateRequest,
+    ) -> Result<CommitmentRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.create_commitment_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("commitment create worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn update_commitment_blocking(
+        &self,
+        request: &CommitmentUpdateRequest,
+    ) -> Result<CommitmentRecord, Status> {
+        self.journal_store
+            .update_commitment(request)
+            .map_err(|error| map_orchestrator_store_error("update commitment", error))
+    }
+
+    /// Updates a commitment record.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn update_commitment(
+        self: &Arc<Self>,
+        request: CommitmentUpdateRequest,
+    ) -> Result<CommitmentRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.update_commitment_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("commitment update worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_commitments_blocking(
+        &self,
+        filter: &CommitmentListFilter,
+    ) -> Result<Vec<CommitmentRecord>, Status> {
+        self.journal_store
+            .list_commitments(filter)
+            .map_err(|error| map_orchestrator_store_error("list commitments", error))
+    }
+
+    /// Lists commitments matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_commitments(
+        self: &Arc<Self>,
+        filter: CommitmentListFilter,
+    ) -> Result<Vec<CommitmentRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_commitments_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("commitment list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn get_commitment_blocking(
+        &self,
+        commitment_id: &str,
+    ) -> Result<Option<CommitmentRecord>, Status> {
+        self.journal_store
+            .get_commitment(commitment_id)
+            .map_err(|error| map_orchestrator_store_error("load commitment", error))
+    }
+
+    /// Loads a commitment by id.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn get_commitment(
+        self: &Arc<Self>,
+        commitment_id: String,
+    ) -> Result<Option<CommitmentRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.get_commitment_blocking(commitment_id.as_str()))
+            .await
+            .map_err(|_| Status::internal("commitment detail worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_commitment_sources_blocking(
+        &self,
+        commitment_id: &str,
+    ) -> Result<Vec<CommitmentSourceRecord>, Status> {
+        self.journal_store
+            .list_commitment_sources(commitment_id)
+            .map_err(|error| map_orchestrator_store_error("list commitment sources", error))
+    }
+
+    /// Lists source evidence for a commitment.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_commitment_sources(
+        self: &Arc<Self>,
+        commitment_id: String,
+    ) -> Result<Vec<CommitmentSourceRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_commitment_sources_blocking(commitment_id.as_str())
+        })
+        .await
+        .map_err(|_| Status::internal("commitment source list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_commitment_events_blocking(
+        &self,
+        commitment_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitmentEventRecord>, Status> {
+        self.journal_store
+            .list_commitment_events(commitment_id, limit)
+            .map_err(|error| map_orchestrator_store_error("list commitment events", error))
+    }
+
+    /// Lists commitment audit events.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_commitment_events(
+        self: &Arc<Self>,
+        commitment_id: String,
+        limit: usize,
+    ) -> Result<Vec<CommitmentEventRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_commitment_events_blocking(commitment_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("commitment event list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn create_commitment_delivery_attempt_blocking(
+        &self,
+        request: &CommitmentDeliveryAttemptCreateRequest,
+    ) -> Result<CommitmentDeliveryAttemptRecord, Status> {
+        self.journal_store.create_commitment_delivery_attempt(request).map_err(|error| {
+            map_orchestrator_store_error("create commitment delivery attempt", error)
+        })
+    }
+
+    /// Records a commitment delivery attempt.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn create_commitment_delivery_attempt(
+        self: &Arc<Self>,
+        request: CommitmentDeliveryAttemptCreateRequest,
+    ) -> Result<CommitmentDeliveryAttemptRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.create_commitment_delivery_attempt_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("commitment delivery attempt worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_commitment_delivery_attempts_blocking(
+        &self,
+        commitment_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitmentDeliveryAttemptRecord>, Status> {
+        self.journal_store.list_commitment_delivery_attempts(commitment_id, limit).map_err(
+            |error| map_orchestrator_store_error("list commitment delivery attempts", error),
+        )
+    }
+
+    /// Lists commitment delivery attempts.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_commitment_delivery_attempts(
+        self: &Arc<Self>,
+        commitment_id: String,
+        limit: usize,
+    ) -> Result<Vec<CommitmentDeliveryAttemptRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_commitment_delivery_attempts_blocking(commitment_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("commitment delivery attempt list worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

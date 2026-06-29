@@ -2806,6 +2806,274 @@ pub struct FlowStepUpdateRequest {
     pub payload_json: String,
 }
 
+/// Durable operator-visible work item shown on the WorkBoard.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkItemRecord {
+    pub work_item_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routine_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub state: String,
+    pub priority: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_expires_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at_unix_ms: Option<i64>,
+    pub dependencies_json: String,
+    pub artifact_refs_json: String,
+    pub blocker_json: String,
+    pub metadata_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+}
+
+/// Append-only WorkBoard audit event.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkItemEventRecord {
+    pub event_id: String,
+    pub work_item_id: String,
+    pub event_type: String,
+    pub actor_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_state: Option<String>,
+    pub summary: String,
+    pub payload_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Parameters for creating a WorkBoard item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkItemCreateRequest {
+    pub work_item_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub routine_id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub state: String,
+    pub priority: i64,
+    pub assigned_worker: Option<String>,
+    pub dependencies_json: String,
+    pub artifact_refs_json: String,
+    pub blocker_json: String,
+    pub metadata_json: String,
+    pub actor_principal: String,
+}
+
+/// Partial WorkBoard item update; `Some(None)` clears nullable fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkItemUpdateRequest {
+    pub work_item_id: String,
+    pub expected_state: Option<String>,
+    pub state: Option<String>,
+    pub priority: Option<i64>,
+    pub assigned_worker: Option<Option<String>>,
+    pub claim_owner: Option<Option<String>>,
+    pub claim_expires_at_unix_ms: Option<Option<i64>>,
+    pub heartbeat_at_unix_ms: Option<Option<i64>>,
+    pub blocker_json: Option<String>,
+    pub artifact_refs_json: Option<String>,
+    pub metadata_json: Option<String>,
+    pub completed_at_unix_ms: Option<Option<i64>>,
+    pub actor_principal: String,
+    pub event_type: String,
+    pub summary: String,
+    pub payload_json: String,
+}
+
+/// Filter and pagination options for listing WorkBoard items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkItemListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub state: Option<String>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
+/// Commitment extracted from a conversation/run and awaiting review or delivery.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitmentRecord {
+    pub commitment_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub user_wording: String,
+    pub normalized_action: String,
+    pub due_condition_json: String,
+    pub recurrence_json: String,
+    pub channel_binding_json: String,
+    pub approval_requirement: String,
+    pub privacy_label: String,
+    pub status: String,
+    pub confidence_bps: u64,
+    pub extraction_model: String,
+    pub review_reason: String,
+    pub scheduler_binding_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+}
+
+/// Source evidence range for a commitment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitmentSourceRecord {
+    pub source_id: String,
+    pub commitment_id: String,
+    pub source_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tape_start_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tape_end_seq: Option<i64>,
+    pub evidence_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Append-only commitment lifecycle event.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitmentEventRecord {
+    pub event_id: String,
+    pub commitment_id: String,
+    pub event_type: String,
+    pub actor_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_status: Option<String>,
+    pub summary: String,
+    pub payload_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Delivery attempt or scheduling bridge record for a commitment.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommitmentDeliveryAttemptRecord {
+    pub attempt_id: String,
+    pub commitment_id: String,
+    pub delivery_intent_id: Option<String>,
+    pub channel_binding_json: String,
+    pub status: String,
+    pub reason: String,
+    pub result_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Parameters for creating a commitment and its first source row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitmentCreateRequest {
+    pub commitment_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub user_wording: String,
+    pub normalized_action: String,
+    pub due_condition_json: String,
+    pub recurrence_json: String,
+    pub channel_binding_json: String,
+    pub approval_requirement: String,
+    pub privacy_label: String,
+    pub status: String,
+    pub confidence_bps: u64,
+    pub extraction_model: String,
+    pub review_reason: String,
+    pub scheduler_binding_json: String,
+    pub due_at_unix_ms: Option<i64>,
+    pub source_kind: String,
+    pub tape_start_seq: Option<i64>,
+    pub tape_end_seq: Option<i64>,
+    pub evidence_json: String,
+    pub actor_principal: String,
+}
+
+/// Commitment lifecycle update with append-only audit event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitmentUpdateRequest {
+    pub commitment_id: String,
+    pub expected_status: Option<String>,
+    pub status: Option<String>,
+    pub user_wording: Option<String>,
+    pub normalized_action: Option<String>,
+    pub due_condition_json: Option<String>,
+    pub recurrence_json: Option<String>,
+    pub channel_binding_json: Option<String>,
+    pub approval_requirement: Option<String>,
+    pub privacy_label: Option<String>,
+    pub review_reason: Option<String>,
+    pub scheduler_binding_json: Option<String>,
+    pub due_at_unix_ms: Option<Option<i64>>,
+    pub scheduled_at_unix_ms: Option<Option<i64>>,
+    pub completed_at_unix_ms: Option<Option<i64>>,
+    pub actor_principal: String,
+    pub event_type: String,
+    pub summary: String,
+    pub payload_json: String,
+}
+
+/// Filter and pagination options for listing commitments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitmentListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub status: Option<String>,
+    pub due_before_unix_ms: Option<i64>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
+/// Parameters for recording a commitment delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitmentDeliveryAttemptCreateRequest {
+    pub attempt_id: String,
+    pub commitment_id: String,
+    pub delivery_intent_id: Option<String>,
+    pub channel_binding_json: String,
+    pub status: String,
+    pub reason: String,
+    pub result_json: String,
+}
+
 /// Stored learning candidate awaiting (or past) review.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LearningCandidateRecord {
@@ -3646,6 +3914,18 @@ pub enum JournalError {
     FlowStepNotFound { flow_id: String, step_id: String },
     #[error("flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}")]
     FlowRevisionConflict { flow_id: String, expected_revision: i64, actual_revision: i64 },
+    #[error("work item already exists: {work_item_id}")]
+    DuplicateWorkItemId { work_item_id: String },
+    #[error("work item not found: {work_item_id}")]
+    WorkItemNotFound { work_item_id: String },
+    #[error("invalid work item transition for {work_item_id}: {from} -> {to}")]
+    InvalidWorkItemTransition { work_item_id: String, from: String, to: String },
+    #[error("commitment already exists: {commitment_id}")]
+    DuplicateCommitmentId { commitment_id: String },
+    #[error("commitment not found: {commitment_id}")]
+    CommitmentNotFound { commitment_id: String },
+    #[error("invalid commitment transition for {commitment_id}: {from} -> {to}")]
+    InvalidCommitmentTransition { commitment_id: String, from: String, to: String },
     #[error("canvas state not found: {canvas_id}")]
     CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
@@ -5198,6 +5478,168 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_approval_consumptions_consumed_at
                 ON approval_consumptions(consumed_at_unix_ms DESC);
+        "#,
+    },
+    Migration {
+        version: 35,
+        name: "task_runtime_workboard_commitments",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS work_items (
+                work_item_ulid TEXT PRIMARY KEY,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                session_ulid TEXT,
+                run_ulid TEXT,
+                objective_id TEXT,
+                routine_id TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                state TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                assigned_worker TEXT,
+                claim_owner TEXT,
+                claim_expires_at_unix_ms INTEGER,
+                heartbeat_at_unix_ms INTEGER,
+                dependencies_json TEXT NOT NULL,
+                artifact_refs_json TEXT NOT NULL,
+                blocker_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_work_items_owner_state_updated
+                ON work_items(owner_principal, state, updated_at_unix_ms DESC, work_item_ulid DESC);
+            CREATE INDEX IF NOT EXISTS idx_work_items_claim
+                ON work_items(state, claim_owner, claim_expires_at_unix_ms);
+            CREATE INDEX IF NOT EXISTS idx_work_items_heartbeat
+                ON work_items(state, heartbeat_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS work_item_events (
+                event_ulid TEXT PRIMARY KEY,
+                work_item_ulid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                from_state TEXT,
+                to_state TEXT,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(work_item_ulid) REFERENCES work_items(work_item_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_work_item_events_item
+                ON work_item_events(work_item_ulid, created_at_unix_ms ASC, event_ulid ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_work_item_events_prevent_update
+            BEFORE UPDATE ON work_item_events
+            BEGIN
+                SELECT RAISE(ABORT, 'work_item_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_work_item_events_prevent_delete
+            BEFORE DELETE ON work_item_events
+            BEGIN
+                SELECT RAISE(ABORT, 'work_item_events is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS commitments (
+                commitment_ulid TEXT PRIMARY KEY,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                session_ulid TEXT,
+                run_ulid TEXT,
+                user_wording TEXT NOT NULL,
+                normalized_action TEXT NOT NULL,
+                due_condition_json TEXT NOT NULL,
+                recurrence_json TEXT NOT NULL,
+                channel_binding_json TEXT NOT NULL,
+                approval_requirement TEXT NOT NULL,
+                privacy_label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confidence_bps INTEGER NOT NULL,
+                extraction_model TEXT NOT NULL,
+                review_reason TEXT NOT NULL,
+                scheduler_binding_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                due_at_unix_ms INTEGER,
+                scheduled_at_unix_ms INTEGER,
+                completed_at_unix_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_commitments_owner_status_due
+                ON commitments(owner_principal, status, due_at_unix_ms, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_commitments_due
+                ON commitments(status, due_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS commitment_sources (
+                source_ulid TEXT PRIMARY KEY,
+                commitment_ulid TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                session_ulid TEXT,
+                run_ulid TEXT,
+                tape_start_seq INTEGER,
+                tape_end_seq INTEGER,
+                evidence_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(commitment_ulid) REFERENCES commitments(commitment_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_commitment_sources_commitment
+                ON commitment_sources(commitment_ulid, created_at_unix_ms ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_commitment_sources_prevent_update
+            BEFORE UPDATE ON commitment_sources
+            BEGIN
+                SELECT RAISE(ABORT, 'commitment_sources is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_commitment_sources_prevent_delete
+            BEFORE DELETE ON commitment_sources
+            BEGIN
+                SELECT RAISE(ABORT, 'commitment_sources is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS commitment_events (
+                event_ulid TEXT PRIMARY KEY,
+                commitment_ulid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(commitment_ulid) REFERENCES commitments(commitment_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_commitment_events_commitment
+                ON commitment_events(commitment_ulid, created_at_unix_ms ASC, event_ulid ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_commitment_events_prevent_update
+            BEFORE UPDATE ON commitment_events
+            BEGIN
+                SELECT RAISE(ABORT, 'commitment_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_commitment_events_prevent_delete
+            BEFORE DELETE ON commitment_events
+            BEGIN
+                SELECT RAISE(ABORT, 'commitment_events is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS commitment_delivery_attempts (
+                attempt_ulid TEXT PRIMARY KEY,
+                commitment_ulid TEXT NOT NULL,
+                delivery_intent_id TEXT,
+                channel_binding_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(commitment_ulid) REFERENCES commitments(commitment_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_commitment_delivery_attempts_commitment
+                ON commitment_delivery_attempts(commitment_ulid, created_at_unix_ms DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_commitment_delivery_attempts_prevent_delete
+            BEFORE DELETE ON commitment_delivery_attempts
+            BEGIN
+                SELECT RAISE(ABORT, 'commitment_delivery_attempts is append-only');
+            END;
         "#,
     },
 ];
@@ -12509,6 +12951,856 @@ impl JournalStore {
         })
     }
 
+    /// Creates a durable WorkBoard item with its initial audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateWorkItemId`] for duplicate ids,
+    /// [`JournalError::InvalidArgument`] for invalid JSON/state fields, or a
+    /// storage error.
+    pub fn create_work_item(
+        &self,
+        request: &WorkItemCreateRequest,
+    ) -> Result<WorkItemRecord, JournalError> {
+        ensure_nonempty_field(request.work_item_id.as_str(), "work_item_id")?;
+        ensure_nonempty_field(request.owner_principal.as_str(), "owner_principal")?;
+        ensure_nonempty_field(request.device_id.as_str(), "device_id")?;
+        ensure_nonempty_field(request.title.as_str(), "title")?;
+        ensure_valid_work_item_state(request.state.as_str())?;
+        ensure_json_field(request.dependencies_json.as_str(), "dependencies_json")?;
+        ensure_json_field(request.artifact_refs_json.as_str(), "artifact_refs_json")?;
+        ensure_json_field(request.blocker_json.as_str(), "blocker_json")?;
+        ensure_json_field(request.metadata_json.as_str(), "metadata_json")?;
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
+            r#"
+                INSERT INTO work_items (
+                    work_item_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    objective_id,
+                    routine_id,
+                    title,
+                    summary,
+                    state,
+                    priority,
+                    assigned_worker,
+                    claim_owner,
+                    claim_expires_at_unix_ms,
+                    heartbeat_at_unix_ms,
+                    dependencies_json,
+                    artifact_refs_json,
+                    blocker_json,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?18, NULL
+                )
+            "#,
+            params![
+                request.work_item_id,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                request.session_id,
+                request.run_id,
+                request.objective_id,
+                request.routine_id,
+                request.title,
+                request.summary,
+                request.state,
+                request.priority,
+                request.assigned_worker,
+                request.dependencies_json,
+                request.artifact_refs_json,
+                request.blocker_json,
+                request.metadata_json,
+                now,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .is_some_and(|value| value.contains("work_items"))) =>
+            {
+                return Err(JournalError::DuplicateWorkItemId {
+                    work_item_id: request.work_item_id.clone(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        insert_work_item_event(
+            &transaction,
+            WorkItemEventInsert {
+                event_id: Ulid::new().to_string(),
+                work_item_id: request.work_item_id.as_str(),
+                event_type: "work_item.created",
+                actor_principal: request.actor_principal.as_str(),
+                from_state: None,
+                to_state: Some(request.state.as_str()),
+                summary: "work item created",
+                payload_json: request.metadata_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_work_item(request.work_item_id.as_str())?.ok_or_else(|| {
+            JournalError::WorkItemNotFound { work_item_id: request.work_item_id.clone() }
+        })
+    }
+
+    /// Applies a WorkBoard item update and writes an audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::WorkItemNotFound`],
+    /// [`JournalError::InvalidWorkItemTransition`], or a storage error.
+    pub fn update_work_item(
+        &self,
+        request: &WorkItemUpdateRequest,
+    ) -> Result<WorkItemRecord, JournalError> {
+        ensure_json_field(request.payload_json.as_str(), "payload_json")?;
+        if let Some(blocker_json) = request.blocker_json.as_deref() {
+            ensure_json_field(blocker_json, "blocker_json")?;
+        }
+        if let Some(artifact_refs_json) = request.artifact_refs_json.as_deref() {
+            ensure_json_field(artifact_refs_json, "artifact_refs_json")?;
+        }
+        if let Some(metadata_json) = request.metadata_json.as_deref() {
+            ensure_json_field(metadata_json, "metadata_json")?;
+        }
+        if let Some(state) = request.state.as_deref() {
+            ensure_valid_work_item_state(state)?;
+        }
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let existing = query_work_item_by_id(&transaction, request.work_item_id.as_str())?
+            .ok_or_else(|| JournalError::WorkItemNotFound {
+                work_item_id: request.work_item_id.clone(),
+            })?;
+        if let Some(expected) = request.expected_state.as_deref() {
+            if existing.state != expected {
+                return Err(JournalError::InvalidWorkItemTransition {
+                    work_item_id: request.work_item_id.clone(),
+                    from: existing.state,
+                    to: request.state.clone().unwrap_or_else(|| expected.to_owned()),
+                });
+            }
+        }
+        let next_state = request.state.as_deref().unwrap_or(existing.state.as_str());
+        validate_work_item_transition(
+            request.work_item_id.as_str(),
+            existing.state.as_str(),
+            next_state,
+        )?;
+
+        let assigned_worker = request.assigned_worker.clone().flatten();
+        let clear_assigned_worker = request.assigned_worker.is_some() && assigned_worker.is_none();
+        let claim_owner = request.claim_owner.clone().flatten();
+        let clear_claim_owner = request.claim_owner.is_some() && claim_owner.is_none();
+        let claim_expires_at = request.claim_expires_at_unix_ms.flatten();
+        let clear_claim_expires =
+            request.claim_expires_at_unix_ms.is_some() && claim_expires_at.is_none();
+        let heartbeat_at = request.heartbeat_at_unix_ms.flatten();
+        let clear_heartbeat = request.heartbeat_at_unix_ms.is_some() && heartbeat_at.is_none();
+        let completed_at = request.completed_at_unix_ms.flatten();
+        let clear_completed = request.completed_at_unix_ms.is_some() && completed_at.is_none();
+        transaction.execute(
+            r#"
+                UPDATE work_items
+                SET
+                    state = COALESCE(?2, state),
+                    priority = COALESCE(?3, priority),
+                    assigned_worker = CASE
+                        WHEN ?4 = 1 THEN NULL
+                        ELSE COALESCE(?5, assigned_worker)
+                    END,
+                    claim_owner = CASE
+                        WHEN ?6 = 1 THEN NULL
+                        ELSE COALESCE(?7, claim_owner)
+                    END,
+                    claim_expires_at_unix_ms = CASE
+                        WHEN ?8 = 1 THEN NULL
+                        ELSE COALESCE(?9, claim_expires_at_unix_ms)
+                    END,
+                    heartbeat_at_unix_ms = CASE
+                        WHEN ?10 = 1 THEN NULL
+                        ELSE COALESCE(?11, heartbeat_at_unix_ms)
+                    END,
+                    blocker_json = COALESCE(?12, blocker_json),
+                    artifact_refs_json = COALESCE(?13, artifact_refs_json),
+                    metadata_json = COALESCE(?14, metadata_json),
+                    completed_at_unix_ms = CASE
+                        WHEN ?15 = 1 THEN NULL
+                        ELSE COALESCE(?16, completed_at_unix_ms)
+                    END,
+                    updated_at_unix_ms = ?17
+                WHERE work_item_ulid = ?1
+            "#,
+            params![
+                request.work_item_id,
+                request.state,
+                request.priority,
+                if clear_assigned_worker { 1_i64 } else { 0_i64 },
+                assigned_worker,
+                if clear_claim_owner { 1_i64 } else { 0_i64 },
+                claim_owner,
+                if clear_claim_expires { 1_i64 } else { 0_i64 },
+                claim_expires_at,
+                if clear_heartbeat { 1_i64 } else { 0_i64 },
+                heartbeat_at,
+                request.blocker_json,
+                request.artifact_refs_json,
+                request.metadata_json,
+                if clear_completed { 1_i64 } else { 0_i64 },
+                completed_at,
+                now,
+            ],
+        )?;
+        insert_work_item_event(
+            &transaction,
+            WorkItemEventInsert {
+                event_id: Ulid::new().to_string(),
+                work_item_id: request.work_item_id.as_str(),
+                event_type: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                from_state: Some(existing.state.as_str()),
+                to_state: Some(next_state),
+                summary: request.summary.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_work_item(request.work_item_id.as_str())?.ok_or_else(|| {
+            JournalError::WorkItemNotFound { work_item_id: request.work_item_id.clone() }
+        })
+    }
+
+    /// Lists WorkBoard items matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_work_items(
+        &self,
+        filter: &WorkItemListFilter,
+    ) -> Result<Vec<WorkItemRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    work_item_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    objective_id,
+                    routine_id,
+                    title,
+                    summary,
+                    state,
+                    priority,
+                    assigned_worker,
+                    claim_owner,
+                    claim_expires_at_unix_ms,
+                    heartbeat_at_unix_ms,
+                    dependencies_json,
+                    artifact_refs_json,
+                    blocker_json,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM work_items
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR state = ?4)
+                  AND (?5 = 1 OR state NOT IN ('succeeded', 'failed', 'cancelled'))
+                ORDER BY
+                    CASE state
+                        WHEN 'running' THEN 0
+                        WHEN 'queued' THEN 1
+                        WHEN 'blocked' THEN 2
+                        WHEN 'paused' THEN 3
+                        WHEN 'failed' THEN 4
+                        ELSE 5
+                    END,
+                    priority DESC,
+                    updated_at_unix_ms DESC,
+                    work_item_ulid DESC
+                LIMIT ?6
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.owner_principal,
+                filter.device_id,
+                filter.channel,
+                filter.state,
+                if filter.include_terminal { 1_i64 } else { 0_i64 },
+                limit,
+            ],
+            map_work_item_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Returns one WorkBoard item, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn get_work_item(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<WorkItemRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_work_item_by_id(&guard, work_item_id)
+    }
+
+    /// Lists WorkBoard audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_work_item_events(
+        &self,
+        work_item_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkItemEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    work_item_ulid,
+                    event_type,
+                    actor_principal,
+                    from_state,
+                    to_state,
+                    summary,
+                    payload_json,
+                    created_at_unix_ms
+                FROM work_item_events
+                WHERE work_item_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![work_item_id, limit], map_work_item_event_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Creates a commitment with source evidence and an initial audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateCommitmentId`] for duplicate ids,
+    /// [`JournalError::InvalidArgument`] for invalid contract fields, or a
+    /// storage error.
+    pub fn create_commitment(
+        &self,
+        request: &CommitmentCreateRequest,
+    ) -> Result<CommitmentRecord, JournalError> {
+        ensure_nonempty_field(request.commitment_id.as_str(), "commitment_id")?;
+        ensure_nonempty_field(request.owner_principal.as_str(), "owner_principal")?;
+        ensure_nonempty_field(request.device_id.as_str(), "device_id")?;
+        ensure_nonempty_field(request.user_wording.as_str(), "user_wording")?;
+        ensure_nonempty_field(request.normalized_action.as_str(), "normalized_action")?;
+        ensure_nonempty_field(request.privacy_label.as_str(), "privacy_label")?;
+        ensure_valid_commitment_status(request.status.as_str())?;
+        ensure_json_field(request.due_condition_json.as_str(), "due_condition_json")?;
+        ensure_json_field(request.recurrence_json.as_str(), "recurrence_json")?;
+        ensure_json_field(request.channel_binding_json.as_str(), "channel_binding_json")?;
+        ensure_json_field(request.scheduler_binding_json.as_str(), "scheduler_binding_json")?;
+        ensure_json_field(request.evidence_json.as_str(), "evidence_json")?;
+        if request.confidence_bps > 10_000 {
+            return Err(JournalError::InvalidArgument(
+                "confidence_bps must be in 0..=10000".to_owned(),
+            ));
+        }
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
+            r#"
+                INSERT INTO commitments (
+                    commitment_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    user_wording,
+                    normalized_action,
+                    due_condition_json,
+                    recurrence_json,
+                    channel_binding_json,
+                    approval_requirement,
+                    privacy_label,
+                    status,
+                    confidence_bps,
+                    extraction_model,
+                    review_reason,
+                    scheduler_binding_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    due_at_unix_ms,
+                    scheduled_at_unix_ms,
+                    completed_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19, ?20, NULL, NULL
+                )
+            "#,
+            params![
+                request.commitment_id,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                request.session_id,
+                request.run_id,
+                request.user_wording,
+                request.normalized_action,
+                request.due_condition_json,
+                request.recurrence_json,
+                request.channel_binding_json,
+                request.approval_requirement,
+                request.privacy_label,
+                request.status,
+                u64_to_sqlite(request.confidence_bps, "confidence_bps")?,
+                request.extraction_model,
+                request.review_reason,
+                request.scheduler_binding_json,
+                now,
+                request.due_at_unix_ms,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .is_some_and(|value| value.contains("commitments"))) =>
+            {
+                return Err(JournalError::DuplicateCommitmentId {
+                    commitment_id: request.commitment_id.clone(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        insert_commitment_source(
+            &transaction,
+            CommitmentSourceInsert {
+                source_id: Ulid::new().to_string(),
+                commitment_id: request.commitment_id.as_str(),
+                source_kind: request.source_kind.as_str(),
+                session_id: request.session_id.as_deref(),
+                run_id: request.run_id.as_deref(),
+                tape_start_seq: request.tape_start_seq,
+                tape_end_seq: request.tape_end_seq,
+                evidence_json: request.evidence_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_commitment_event(
+            &transaction,
+            CommitmentEventInsert {
+                event_id: Ulid::new().to_string(),
+                commitment_id: request.commitment_id.as_str(),
+                event_type: "commitment.extracted",
+                actor_principal: request.actor_principal.as_str(),
+                from_status: None,
+                to_status: Some(request.status.as_str()),
+                summary: "commitment extracted",
+                payload_json: request.evidence_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_commitment(request.commitment_id.as_str())?.ok_or_else(|| {
+            JournalError::CommitmentNotFound { commitment_id: request.commitment_id.clone() }
+        })
+    }
+
+    /// Applies a commitment lifecycle update with an audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CommitmentNotFound`],
+    /// [`JournalError::InvalidCommitmentTransition`], or a storage error.
+    pub fn update_commitment(
+        &self,
+        request: &CommitmentUpdateRequest,
+    ) -> Result<CommitmentRecord, JournalError> {
+        ensure_json_field(request.payload_json.as_str(), "payload_json")?;
+        if let Some(raw) = request.due_condition_json.as_deref() {
+            ensure_json_field(raw, "due_condition_json")?;
+        }
+        if let Some(raw) = request.recurrence_json.as_deref() {
+            ensure_json_field(raw, "recurrence_json")?;
+        }
+        if let Some(raw) = request.channel_binding_json.as_deref() {
+            ensure_json_field(raw, "channel_binding_json")?;
+        }
+        if let Some(raw) = request.scheduler_binding_json.as_deref() {
+            ensure_json_field(raw, "scheduler_binding_json")?;
+        }
+        if let Some(status) = request.status.as_deref() {
+            ensure_valid_commitment_status(status)?;
+        }
+        if let Some(label) = request.privacy_label.as_deref() {
+            ensure_nonempty_field(label, "privacy_label")?;
+        }
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let existing = query_commitment_by_id(&transaction, request.commitment_id.as_str())?
+            .ok_or_else(|| JournalError::CommitmentNotFound {
+                commitment_id: request.commitment_id.clone(),
+            })?;
+        if let Some(expected) = request.expected_status.as_deref() {
+            if existing.status != expected {
+                return Err(JournalError::InvalidCommitmentTransition {
+                    commitment_id: request.commitment_id.clone(),
+                    from: existing.status,
+                    to: request.status.clone().unwrap_or_else(|| expected.to_owned()),
+                });
+            }
+        }
+        let next_status = request.status.as_deref().unwrap_or(existing.status.as_str());
+        validate_commitment_transition(
+            request.commitment_id.as_str(),
+            existing.status.as_str(),
+            next_status,
+        )?;
+
+        let due_at = request.due_at_unix_ms.flatten();
+        let clear_due_at = request.due_at_unix_ms.is_some() && due_at.is_none();
+        let scheduled_at = request.scheduled_at_unix_ms.flatten();
+        let clear_scheduled_at = request.scheduled_at_unix_ms.is_some() && scheduled_at.is_none();
+        let completed_at = request.completed_at_unix_ms.flatten();
+        let clear_completed_at = request.completed_at_unix_ms.is_some() && completed_at.is_none();
+        transaction.execute(
+            r#"
+                UPDATE commitments
+                SET
+                    status = COALESCE(?2, status),
+                    user_wording = COALESCE(?3, user_wording),
+                    normalized_action = COALESCE(?4, normalized_action),
+                    due_condition_json = COALESCE(?5, due_condition_json),
+                    recurrence_json = COALESCE(?6, recurrence_json),
+                    channel_binding_json = COALESCE(?7, channel_binding_json),
+                    approval_requirement = COALESCE(?8, approval_requirement),
+                    privacy_label = COALESCE(?9, privacy_label),
+                    review_reason = COALESCE(?10, review_reason),
+                    scheduler_binding_json = COALESCE(?11, scheduler_binding_json),
+                    due_at_unix_ms = CASE
+                        WHEN ?12 = 1 THEN NULL
+                        ELSE COALESCE(?13, due_at_unix_ms)
+                    END,
+                    scheduled_at_unix_ms = CASE
+                        WHEN ?14 = 1 THEN NULL
+                        ELSE COALESCE(?15, scheduled_at_unix_ms)
+                    END,
+                    completed_at_unix_ms = CASE
+                        WHEN ?16 = 1 THEN NULL
+                        ELSE COALESCE(?17, completed_at_unix_ms)
+                    END,
+                    updated_at_unix_ms = ?18
+                WHERE commitment_ulid = ?1
+            "#,
+            params![
+                request.commitment_id,
+                request.status,
+                request.user_wording,
+                request.normalized_action,
+                request.due_condition_json,
+                request.recurrence_json,
+                request.channel_binding_json,
+                request.approval_requirement,
+                request.privacy_label,
+                request.review_reason,
+                request.scheduler_binding_json,
+                if clear_due_at { 1_i64 } else { 0_i64 },
+                due_at,
+                if clear_scheduled_at { 1_i64 } else { 0_i64 },
+                scheduled_at,
+                if clear_completed_at { 1_i64 } else { 0_i64 },
+                completed_at,
+                now,
+            ],
+        )?;
+        insert_commitment_event(
+            &transaction,
+            CommitmentEventInsert {
+                event_id: Ulid::new().to_string(),
+                commitment_id: request.commitment_id.as_str(),
+                event_type: request.event_type.as_str(),
+                actor_principal: request.actor_principal.as_str(),
+                from_status: Some(existing.status.as_str()),
+                to_status: Some(next_status),
+                summary: request.summary.as_str(),
+                payload_json: request.payload_json.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_commitment(request.commitment_id.as_str())?.ok_or_else(|| {
+            JournalError::CommitmentNotFound { commitment_id: request.commitment_id.clone() }
+        })
+    }
+
+    /// Lists commitments matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_commitments(
+        &self,
+        filter: &CommitmentListFilter,
+    ) -> Result<Vec<CommitmentRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    commitment_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    user_wording,
+                    normalized_action,
+                    due_condition_json,
+                    recurrence_json,
+                    channel_binding_json,
+                    approval_requirement,
+                    privacy_label,
+                    status,
+                    confidence_bps,
+                    extraction_model,
+                    review_reason,
+                    scheduler_binding_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    due_at_unix_ms,
+                    scheduled_at_unix_ms,
+                    completed_at_unix_ms
+                FROM commitments
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR status = ?4)
+                  AND (?5 IS NULL OR due_at_unix_ms <= ?5)
+                  AND (?6 = 1 OR status NOT IN ('delivered', 'dismissed', 'failed'))
+                ORDER BY COALESCE(due_at_unix_ms, updated_at_unix_ms) ASC, updated_at_unix_ms DESC
+                LIMIT ?7
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.owner_principal,
+                filter.device_id,
+                filter.channel,
+                filter.status,
+                filter.due_before_unix_ms,
+                if filter.include_terminal { 1_i64 } else { 0_i64 },
+                limit,
+            ],
+            map_commitment_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Returns one commitment, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn get_commitment(
+        &self,
+        commitment_id: &str,
+    ) -> Result<Option<CommitmentRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_commitment_by_id(&guard, commitment_id)
+    }
+
+    /// Lists commitment source rows.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_commitment_sources(
+        &self,
+        commitment_id: &str,
+    ) -> Result<Vec<CommitmentSourceRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    source_ulid,
+                    commitment_ulid,
+                    source_kind,
+                    session_ulid,
+                    run_ulid,
+                    tape_start_seq,
+                    tape_end_seq,
+                    evidence_json,
+                    created_at_unix_ms
+                FROM commitment_sources
+                WHERE commitment_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, source_ulid ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![commitment_id], map_commitment_source_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Lists commitment audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_commitment_events(
+        &self,
+        commitment_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitmentEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    commitment_ulid,
+                    event_type,
+                    actor_principal,
+                    from_status,
+                    to_status,
+                    summary,
+                    payload_json,
+                    created_at_unix_ms
+                FROM commitment_events
+                WHERE commitment_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![commitment_id, limit], map_commitment_event_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Records a commitment delivery attempt.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CommitmentNotFound`] if the target is missing, or
+    /// a storage error.
+    pub fn create_commitment_delivery_attempt(
+        &self,
+        request: &CommitmentDeliveryAttemptCreateRequest,
+    ) -> Result<CommitmentDeliveryAttemptRecord, JournalError> {
+        ensure_nonempty_field(request.attempt_id.as_str(), "attempt_id")?;
+        ensure_nonempty_field(request.commitment_id.as_str(), "commitment_id")?;
+        ensure_json_field(request.channel_binding_json.as_str(), "channel_binding_json")?;
+        ensure_json_field(request.result_json.as_str(), "result_json")?;
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        if query_commitment_by_id(&transaction, request.commitment_id.as_str())?.is_none() {
+            return Err(JournalError::CommitmentNotFound {
+                commitment_id: request.commitment_id.clone(),
+            });
+        }
+        transaction.execute(
+            r#"
+                INSERT INTO commitment_delivery_attempts (
+                    attempt_ulid,
+                    commitment_ulid,
+                    delivery_intent_id,
+                    channel_binding_json,
+                    status,
+                    reason,
+                    result_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+            "#,
+            params![
+                request.attempt_id,
+                request.commitment_id,
+                request.delivery_intent_id,
+                request.channel_binding_json,
+                request.status,
+                request.reason,
+                request.result_json,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(CommitmentDeliveryAttemptRecord {
+            attempt_id: request.attempt_id.clone(),
+            commitment_id: request.commitment_id.clone(),
+            delivery_intent_id: request.delivery_intent_id.clone(),
+            channel_binding_json: request.channel_binding_json.clone(),
+            status: request.status.clone(),
+            reason: request.reason.clone(),
+            result_json: request.result_json.clone(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+        })
+    }
+
+    /// Lists commitment delivery attempts.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_commitment_delivery_attempts(
+        &self,
+        commitment_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitmentDeliveryAttemptRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    attempt_ulid,
+                    commitment_ulid,
+                    delivery_intent_id,
+                    channel_binding_json,
+                    status,
+                    reason,
+                    result_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                FROM commitment_delivery_attempts
+                WHERE commitment_ulid = ?1
+                ORDER BY created_at_unix_ms DESC, attempt_ulid DESC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement
+            .query_map(params![commitment_id, limit], map_commitment_delivery_attempt_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
     /// Creates or refreshes a learning candidate, deduplicating by key.
     ///
     /// # Errors
@@ -19486,6 +20778,97 @@ fn ensure_json_field(raw: &str, field: &'static str) -> Result<(), JournalError>
     })
 }
 
+fn ensure_nonempty_field(raw: &str, field: &'static str) -> Result<(), JournalError> {
+    if raw.trim().is_empty() {
+        return Err(JournalError::InvalidArgument(format!("{field} cannot be empty")));
+    }
+    Ok(())
+}
+
+fn ensure_valid_work_item_state(state: &str) -> Result<(), JournalError> {
+    if is_known_work_item_state(state) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument(format!("unknown work item state: {state}")))
+    }
+}
+
+fn is_known_work_item_state(state: &str) -> bool {
+    matches!(
+        state,
+        "queued"
+            | "running"
+            | "paused"
+            | "blocked"
+            | "waiting"
+            | "succeeded"
+            | "failed"
+            | "cancel_requested"
+            | "cancelled"
+    )
+}
+
+fn is_terminal_work_item_state(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}
+
+fn validate_work_item_transition(
+    work_item_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), JournalError> {
+    ensure_valid_work_item_state(to)?;
+    if from == to {
+        return Ok(());
+    }
+    if is_terminal_work_item_state(from) {
+        return Err(JournalError::InvalidWorkItemTransition {
+            work_item_id: work_item_id.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_valid_commitment_status(status: &str) -> Result<(), JournalError> {
+    if is_known_commitment_status(status) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument(format!("unknown commitment status: {status}")))
+    }
+}
+
+fn is_known_commitment_status(status: &str) -> bool {
+    matches!(
+        status,
+        "proposed" | "approved" | "scheduled" | "snoozed" | "delivered" | "dismissed" | "failed"
+    )
+}
+
+fn is_terminal_commitment_status(status: &str) -> bool {
+    matches!(status, "delivered" | "dismissed" | "failed")
+}
+
+fn validate_commitment_transition(
+    commitment_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), JournalError> {
+    ensure_valid_commitment_status(to)?;
+    if from == to {
+        return Ok(());
+    }
+    if is_terminal_commitment_status(from) {
+        return Err(JournalError::InvalidCommitmentTransition {
+            commitment_id: commitment_id.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 struct FlowEventInsert<'a> {
     event_id: String,
     flow_id: &'a str,
@@ -19571,6 +20954,144 @@ fn insert_flow_revision(
             revision.actor_principal,
             revision.payload_json,
             revision.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+struct WorkItemEventInsert<'a> {
+    event_id: String,
+    work_item_id: &'a str,
+    event_type: &'a str,
+    actor_principal: &'a str,
+    from_state: Option<&'a str>,
+    to_state: Option<&'a str>,
+    summary: &'a str,
+    payload_json: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_work_item_event(
+    transaction: &Transaction<'_>,
+    event: WorkItemEventInsert<'_>,
+) -> Result<(), JournalError> {
+    ensure_json_field(event.payload_json, "work_item_event.payload_json")?;
+    transaction.execute(
+        r#"
+            INSERT INTO work_item_events (
+                event_ulid,
+                work_item_ulid,
+                event_type,
+                actor_principal,
+                from_state,
+                to_state,
+                summary,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+        params![
+            event.event_id,
+            event.work_item_id,
+            event.event_type,
+            event.actor_principal,
+            event.from_state,
+            event.to_state,
+            event.summary,
+            event.payload_json,
+            event.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+struct CommitmentSourceInsert<'a> {
+    source_id: String,
+    commitment_id: &'a str,
+    source_kind: &'a str,
+    session_id: Option<&'a str>,
+    run_id: Option<&'a str>,
+    tape_start_seq: Option<i64>,
+    tape_end_seq: Option<i64>,
+    evidence_json: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_commitment_source(
+    transaction: &Transaction<'_>,
+    source: CommitmentSourceInsert<'_>,
+) -> Result<(), JournalError> {
+    ensure_json_field(source.evidence_json, "commitment_source.evidence_json")?;
+    transaction.execute(
+        r#"
+            INSERT INTO commitment_sources (
+                source_ulid,
+                commitment_ulid,
+                source_kind,
+                session_ulid,
+                run_ulid,
+                tape_start_seq,
+                tape_end_seq,
+                evidence_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+        params![
+            source.source_id,
+            source.commitment_id,
+            source.source_kind,
+            source.session_id,
+            source.run_id,
+            source.tape_start_seq,
+            source.tape_end_seq,
+            source.evidence_json,
+            source.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+struct CommitmentEventInsert<'a> {
+    event_id: String,
+    commitment_id: &'a str,
+    event_type: &'a str,
+    actor_principal: &'a str,
+    from_status: Option<&'a str>,
+    to_status: Option<&'a str>,
+    summary: &'a str,
+    payload_json: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_commitment_event(
+    transaction: &Transaction<'_>,
+    event: CommitmentEventInsert<'_>,
+) -> Result<(), JournalError> {
+    ensure_json_field(event.payload_json, "commitment_event.payload_json")?;
+    transaction.execute(
+        r#"
+            INSERT INTO commitment_events (
+                event_ulid,
+                commitment_ulid,
+                event_type,
+                actor_principal,
+                from_status,
+                to_status,
+                summary,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+        params![
+            event.event_id,
+            event.commitment_id,
+            event.event_type,
+            event.actor_principal,
+            event.from_status,
+            event.to_status,
+            event.summary,
+            event.payload_json,
+            event.created_at_unix_ms,
         ],
     )?;
     Ok(())
@@ -19738,6 +21259,208 @@ fn map_flow_revision_row(row: &rusqlite::Row<'_>) -> Result<FlowRevisionRecord, 
         actor_principal: row.get(5)?,
         payload_json: row.get(6)?,
         created_at_unix_ms: row.get(7)?,
+    })
+}
+
+fn query_work_item_by_id(
+    connection: &Connection,
+    work_item_id: &str,
+) -> Result<Option<WorkItemRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    work_item_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    objective_id,
+                    routine_id,
+                    title,
+                    summary,
+                    state,
+                    priority,
+                    assigned_worker,
+                    claim_owner,
+                    claim_expires_at_unix_ms,
+                    heartbeat_at_unix_ms,
+                    dependencies_json,
+                    artifact_refs_json,
+                    blocker_json,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM work_items
+                WHERE work_item_ulid = ?1
+            "#,
+            params![work_item_id],
+            map_work_item_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn map_work_item_row(row: &rusqlite::Row<'_>) -> Result<WorkItemRecord, rusqlite::Error> {
+    Ok(WorkItemRecord {
+        work_item_id: row.get(0)?,
+        owner_principal: row.get(1)?,
+        device_id: row.get(2)?,
+        channel: row.get(3)?,
+        session_id: row.get(4)?,
+        run_id: row.get(5)?,
+        objective_id: row.get(6)?,
+        routine_id: row.get(7)?,
+        title: row.get(8)?,
+        summary: row.get(9)?,
+        state: row.get(10)?,
+        priority: row.get(11)?,
+        assigned_worker: row.get(12)?,
+        claim_owner: row.get(13)?,
+        claim_expires_at_unix_ms: row.get(14)?,
+        heartbeat_at_unix_ms: row.get(15)?,
+        dependencies_json: row.get(16)?,
+        artifact_refs_json: row.get(17)?,
+        blocker_json: row.get(18)?,
+        metadata_json: row.get(19)?,
+        created_at_unix_ms: row.get(20)?,
+        updated_at_unix_ms: row.get(21)?,
+        completed_at_unix_ms: row.get(22)?,
+    })
+}
+
+fn map_work_item_event_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<WorkItemEventRecord, rusqlite::Error> {
+    Ok(WorkItemEventRecord {
+        event_id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        event_type: row.get(2)?,
+        actor_principal: row.get(3)?,
+        from_state: row.get(4)?,
+        to_state: row.get(5)?,
+        summary: row.get(6)?,
+        payload_json: row.get(7)?,
+        created_at_unix_ms: row.get(8)?,
+    })
+}
+
+fn query_commitment_by_id(
+    connection: &Connection,
+    commitment_id: &str,
+) -> Result<Option<CommitmentRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    commitment_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    run_ulid,
+                    user_wording,
+                    normalized_action,
+                    due_condition_json,
+                    recurrence_json,
+                    channel_binding_json,
+                    approval_requirement,
+                    privacy_label,
+                    status,
+                    confidence_bps,
+                    extraction_model,
+                    review_reason,
+                    scheduler_binding_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    due_at_unix_ms,
+                    scheduled_at_unix_ms,
+                    completed_at_unix_ms
+                FROM commitments
+                WHERE commitment_ulid = ?1
+            "#,
+            params![commitment_id],
+            map_commitment_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn map_commitment_row(row: &rusqlite::Row<'_>) -> Result<CommitmentRecord, rusqlite::Error> {
+    Ok(CommitmentRecord {
+        commitment_id: row.get(0)?,
+        owner_principal: row.get(1)?,
+        device_id: row.get(2)?,
+        channel: row.get(3)?,
+        session_id: row.get(4)?,
+        run_id: row.get(5)?,
+        user_wording: row.get(6)?,
+        normalized_action: row.get(7)?,
+        due_condition_json: row.get(8)?,
+        recurrence_json: row.get(9)?,
+        channel_binding_json: row.get(10)?,
+        approval_requirement: row.get(11)?,
+        privacy_label: row.get(12)?,
+        status: row.get(13)?,
+        confidence_bps: row.get::<_, i64>(14)?.max(0) as u64,
+        extraction_model: row.get(15)?,
+        review_reason: row.get(16)?,
+        scheduler_binding_json: row.get(17)?,
+        created_at_unix_ms: row.get(18)?,
+        updated_at_unix_ms: row.get(19)?,
+        due_at_unix_ms: row.get(20)?,
+        scheduled_at_unix_ms: row.get(21)?,
+        completed_at_unix_ms: row.get(22)?,
+    })
+}
+
+fn map_commitment_source_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CommitmentSourceRecord, rusqlite::Error> {
+    Ok(CommitmentSourceRecord {
+        source_id: row.get(0)?,
+        commitment_id: row.get(1)?,
+        source_kind: row.get(2)?,
+        session_id: row.get(3)?,
+        run_id: row.get(4)?,
+        tape_start_seq: row.get(5)?,
+        tape_end_seq: row.get(6)?,
+        evidence_json: row.get(7)?,
+        created_at_unix_ms: row.get(8)?,
+    })
+}
+
+fn map_commitment_event_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CommitmentEventRecord, rusqlite::Error> {
+    Ok(CommitmentEventRecord {
+        event_id: row.get(0)?,
+        commitment_id: row.get(1)?,
+        event_type: row.get(2)?,
+        actor_principal: row.get(3)?,
+        from_status: row.get(4)?,
+        to_status: row.get(5)?,
+        summary: row.get(6)?,
+        payload_json: row.get(7)?,
+        created_at_unix_ms: row.get(8)?,
+    })
+}
+
+fn map_commitment_delivery_attempt_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<CommitmentDeliveryAttemptRecord, rusqlite::Error> {
+    Ok(CommitmentDeliveryAttemptRecord {
+        attempt_id: row.get(0)?,
+        commitment_id: row.get(1)?,
+        delivery_intent_id: row.get(2)?,
+        channel_binding_json: row.get(3)?,
+        status: row.get(4)?,
+        reason: row.get(5)?,
+        result_json: row.get(6)?,
+        created_at_unix_ms: row.get(7)?,
+        updated_at_unix_ms: row.get(8)?,
     })
 }
 
@@ -21720,14 +23443,15 @@ mod tests {
         workspace_query_embedding_cache_scope, ApprovalCreateRequest, ApprovalDecision,
         ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
         ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter,
-        CanvasStateTransitionRequest, CronConcurrencyPolicy, CronJobCreateRequest,
-        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
-        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
-        HashMemoryEmbeddingProvider, IdempotencyBeginRequest, IdempotencyCompleteRequest,
-        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryEmbeddingProvider,
-        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
-        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
-        OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
+        CanvasStateTransitionRequest, CommitmentCreateRequest,
+        CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter, CommitmentUpdateRequest,
+        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
+        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
+        CronRunsListFilter, CronScheduleType, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
+        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
+        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
+        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
         OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
         OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, RecallArtifactCreateRequest,
@@ -21736,10 +23460,11 @@ mod tests {
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
-        ToolResultArtifactReadRequest, WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest,
-        WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest,
-        WorkspaceSearchRequest, CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS,
-        MIGRATIONS, MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
+        ToolResultArtifactReadRequest, WorkItemCreateRequest, WorkItemUpdateRequest,
+        WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter,
+        WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
+        CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
+        MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
         RECALL_ARTIFACT_KIND_SESSION_SEARCH,
     };
 
@@ -22449,6 +24174,172 @@ mod tests {
                 migration.version
             );
         }
+    }
+
+    #[test]
+    fn work_items_record_lifecycle_events_and_reject_terminal_reopen() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let created = store
+            .create_work_item(&WorkItemCreateRequest {
+                work_item_id: "work-item-1".to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "device-1".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                run_id: None,
+                objective_id: Some("objective-1".to_owned()),
+                routine_id: None,
+                title: "Review incident".to_owned(),
+                summary: "Review the incident notes".to_owned(),
+                state: "queued".to_owned(),
+                priority: 10,
+                assigned_worker: None,
+                dependencies_json: "[]".to_owned(),
+                artifact_refs_json: "[]".to_owned(),
+                blocker_json: "{}".to_owned(),
+                metadata_json: "{}".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+            })
+            .expect("work item should be created");
+        assert_eq!(created.state, "queued");
+
+        let completed = store
+            .update_work_item(&WorkItemUpdateRequest {
+                work_item_id: "work-item-1".to_owned(),
+                state: Some("succeeded".to_owned()),
+                completed_at_unix_ms: Some(Some(1_730_000_000_000)),
+                actor_principal: "user:ops".to_owned(),
+                event_type: "work_item.completed".to_owned(),
+                summary: "done".to_owned(),
+                payload_json: "{}".to_owned(),
+                ..WorkItemUpdateRequest::default()
+            })
+            .expect("work item should complete");
+        assert_eq!(completed.completed_at_unix_ms, Some(1_730_000_000_000));
+
+        let reopen = store.update_work_item(&WorkItemUpdateRequest {
+            work_item_id: "work-item-1".to_owned(),
+            state: Some("queued".to_owned()),
+            actor_principal: "user:ops".to_owned(),
+            event_type: "work_item.retry".to_owned(),
+            summary: "retry".to_owned(),
+            payload_json: "{}".to_owned(),
+            ..WorkItemUpdateRequest::default()
+        });
+        assert!(matches!(reopen, Err(JournalError::InvalidWorkItemTransition { .. })));
+
+        let events =
+            store.list_work_item_events("work-item-1", 10).expect("work item events should load");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "work_item.created");
+        assert_eq!(events[1].event_type, "work_item.completed");
+    }
+
+    #[test]
+    fn commitments_store_source_events_and_delivery_attempts() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+
+        let created = store
+            .create_commitment(&CommitmentCreateRequest {
+                commitment_id: "commitment-1".to_owned(),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "device-1".to_owned(),
+                channel: Some("cli".to_owned()),
+                session_id: Some("session-1".to_owned()),
+                run_id: Some("run-1".to_owned()),
+                user_wording: "Remind me tomorrow".to_owned(),
+                normalized_action: "remind me tomorrow".to_owned(),
+                due_condition_json: r#"{"type":"natural_language","text":"tomorrow"}"#.to_owned(),
+                recurrence_json: r#"{"type":"none"}"#.to_owned(),
+                channel_binding_json: r#"{"type":"console_review"}"#.to_owned(),
+                approval_requirement: "manual_review".to_owned(),
+                privacy_label: "user_visible".to_owned(),
+                status: "proposed".to_owned(),
+                confidence_bps: 7_500,
+                extraction_model: "test-extractor".to_owned(),
+                review_reason: "test".to_owned(),
+                scheduler_binding_json: r#"{"type":"none"}"#.to_owned(),
+                due_at_unix_ms: None,
+                source_kind: "post_run_text".to_owned(),
+                tape_start_seq: Some(1),
+                tape_end_seq: Some(3),
+                evidence_json: r#"{"quote":"Remind me tomorrow"}"#.to_owned(),
+                actor_principal: "user:ops".to_owned(),
+            })
+            .expect("commitment should be created");
+        assert_eq!(created.status, "proposed");
+
+        let approved = store
+            .update_commitment(&CommitmentUpdateRequest {
+                commitment_id: "commitment-1".to_owned(),
+                expected_status: Some("proposed".to_owned()),
+                status: Some("approved".to_owned()),
+                user_wording: None,
+                normalized_action: None,
+                due_condition_json: None,
+                recurrence_json: None,
+                channel_binding_json: None,
+                approval_requirement: None,
+                privacy_label: None,
+                review_reason: Some("operator approved".to_owned()),
+                scheduler_binding_json: None,
+                due_at_unix_ms: None,
+                scheduled_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                actor_principal: "user:ops".to_owned(),
+                event_type: "commitment.approved".to_owned(),
+                summary: "approved".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .expect("commitment should approve");
+        assert_eq!(approved.status, "approved");
+
+        let attempt = store
+            .create_commitment_delivery_attempt(&CommitmentDeliveryAttemptCreateRequest {
+                attempt_id: "attempt-1".to_owned(),
+                commitment_id: "commitment-1".to_owned(),
+                delivery_intent_id: Some("routine-bridge:commitment-1".to_owned()),
+                channel_binding_json: r#"{"type":"console_review"}"#.to_owned(),
+                status: "queued".to_owned(),
+                reason: "scheduled".to_owned(),
+                result_json: "{}".to_owned(),
+            })
+            .expect("delivery attempt should be recorded");
+        assert_eq!(attempt.status, "queued");
+
+        let commitments = store
+            .list_commitments(&CommitmentListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: Some("device-1".to_owned()),
+                channel: Some("cli".to_owned()),
+                status: Some("approved".to_owned()),
+                due_before_unix_ms: None,
+                include_terminal: false,
+                limit: 10,
+            })
+            .expect("commitments should list");
+        assert_eq!(commitments.len(), 1);
+        assert_eq!(
+            store.list_commitment_sources("commitment-1").expect("sources should list")[0]
+                .tape_start_seq,
+            Some(1)
+        );
+        assert_eq!(
+            store.list_commitment_events("commitment-1", 10).expect("events should list").len(),
+            2
+        );
+        assert_eq!(
+            store
+                .list_commitment_delivery_attempts("commitment-1", 10)
+                .expect("attempts should list")
+                .len(),
+            1
+        );
     }
 
     #[test]
