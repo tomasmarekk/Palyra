@@ -4,6 +4,12 @@ all-features = true
 
 [advisories]
 version = 2
+ignore = [
+  # Transitive through lopdf. RUSTSEC-2026-0192 marks ttf-parser unmaintained,
+  # but lopdf has no safe replacement path yet; keep this scoped and revisit
+  # when lopdf drops ttf-parser or the PDF adapter moves to a maintained parser.
+  { id = "RUSTSEC-2026-0192", reason = "transitive through lopdf; no safe upgrade is available yet" },
+]
 
 [licenses]
 version = 2
