@@ -17,7 +17,7 @@
 //! into prompts passes `sanitize_prompt_inline_value`.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -141,7 +141,13 @@ pub(crate) struct RecallScoreBreakdown {
     #[serde(default)]
     pub(crate) semantic_score: f64,
     pub(crate) recency_score: f64,
+    #[serde(default)]
+    pub(crate) temporal_decay_score: f64,
+    #[serde(default)]
+    pub(crate) diversity_score: f64,
     pub(crate) source_quality_score: f64,
+    #[serde(default)]
+    pub(crate) trust_modifier: f64,
     #[serde(default)]
     pub(crate) sensitivity_penalty: f64,
     #[serde(default)]
@@ -226,6 +232,42 @@ pub(crate) struct RecallCandidate {
     pub(crate) created_at_unix_ms: i64,
     pub(crate) rationale: String,
     pub(crate) score: RecallScoreBreakdown,
+}
+
+/// Redacted explain trace for recall ranking and candidate rejection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RecallExplainTrace {
+    #[serde(default)]
+    pub(crate) source_distribution: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub(crate) selected_refs: Vec<RecallExplainSelectedRef>,
+    #[serde(default)]
+    pub(crate) rejected_candidates: Vec<RecallExplainRejectedCandidate>,
+    pub(crate) duplicate_suppression_count: usize,
+    pub(crate) citation_failures: usize,
+    pub(crate) telemetry_enabled: bool,
+}
+
+/// One selected candidate reference in the explain trace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RecallExplainSelectedRef {
+    pub(crate) candidate_id: String,
+    pub(crate) source_kind: RecallSourceKind,
+    pub(crate) source_ref: String,
+    pub(crate) final_score: f64,
+}
+
+/// One rejected or suppressed candidate in the explain trace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RecallExplainRejectedCandidate {
+    pub(crate) candidate_id: String,
+    pub(crate) source_kind: RecallSourceKind,
+    pub(crate) source_ref_hash: String,
+    pub(crate) reason: String,
+    pub(crate) final_score: f64,
+    pub(crate) privacy_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) safe_snippet: Option<String>,
 }
 
 /// Natural-language statement distilled from evidence, linked back to the
@@ -336,6 +378,7 @@ pub(crate) struct RecallPreviewEnvelope {
     pub(crate) plan: RecallPlan,
     #[serde(default)]
     pub(crate) diagnostics: Vec<RetrievalBranchDiagnostics>,
+    pub(crate) explain: RecallExplainTrace,
     pub(crate) parameter_delta: Value,
     pub(crate) prompt_preview: String,
 }
@@ -394,6 +437,7 @@ struct RecallExecution {
     prompt_preview: String,
     plan: RecallPlan,
     diagnostics: Vec<RetrievalBranchDiagnostics>,
+    explain: RecallExplainTrace,
 }
 
 /// Ranking wrapper around a candidate; kept as a distinct type so the
@@ -401,6 +445,12 @@ struct RecallExecution {
 #[derive(Debug, Clone)]
 struct CandidateRecord {
     candidate: RecallCandidate,
+}
+
+#[derive(Debug, Clone)]
+struct FinalizedRecallCandidates {
+    top_candidates: Vec<RecallCandidate>,
+    explain: RecallExplainTrace,
 }
 
 /// Borrowed view over all per-source hit lists feeding candidate ranking.
@@ -502,6 +552,7 @@ pub(crate) async fn preview_recall(
         structured_output: execution.structured_output,
         plan: execution.plan,
         diagnostics: execution.diagnostics,
+        explain: execution.explain,
         parameter_delta: execution.parameter_delta,
         prompt_preview: execution.prompt_preview,
     })
@@ -543,11 +594,12 @@ pub(crate) async fn materialize_explicit_recall_context(
         current_unix_ms(),
         &retrieval_config,
     );
-    let top_candidates = finalize_top_candidates(
+    let finalized = finalize_top_candidates_with_explain(
         candidate_records,
         request.max_candidates,
         request.prompt_budget_tokens,
     );
+    let top_candidates = finalized.top_candidates;
     let structured_output = build_structured_output(top_candidates.as_slice(), query);
     Ok(MaterializedRecallContext {
         memory_hits: selection_context.memory_hits,
@@ -592,6 +644,7 @@ pub(crate) fn recall_preview_console_payload(preview: &RecallPreviewEnvelope) ->
         "top_candidates": preview.top_candidates.len(),
         "structured_output": preview.structured_output,
         "diagnostics": preview.diagnostics,
+        "explain": preview.explain,
     })
 }
 
@@ -851,11 +904,12 @@ async fn execute_recall(
         current_unix_ms(),
         &retrieval_config,
     );
-    let top_candidates = finalize_top_candidates(
+    let finalized = finalize_top_candidates_with_explain(
         candidate_records,
         request.max_candidates,
         request.prompt_budget_tokens,
     );
+    let top_candidates = finalized.top_candidates;
     let selection = selection_from_candidates(
         query,
         request,
@@ -898,6 +952,7 @@ async fn execute_recall(
         prompt_preview,
         plan,
         diagnostics,
+        explain: finalized.explain,
     })
 }
 
@@ -1705,7 +1760,10 @@ fn recall_score_breakdown(
         vector_score,
         semantic_score: vector_score,
         recency_score,
+        temporal_decay_score: recency_score,
+        diversity_score: 1.0,
         source_quality_score,
+        trust_modifier: source_quality_score,
         sensitivity_penalty,
         exact_phrase_match,
         final_score,
@@ -1748,30 +1806,158 @@ fn recall_sensitivity_penalty(snippet: &str) -> f64 {
 /// The top candidate is always admitted even when it alone exceeds the
 /// budget, and over-budget candidates are skipped rather than ending the
 /// scan, so smaller lower-ranked items can still fill the remaining space.
+#[cfg(test)]
 fn finalize_top_candidates(
-    mut candidate_records: Vec<CandidateRecord>,
+    candidate_records: Vec<CandidateRecord>,
     max_candidates: usize,
     prompt_budget_tokens: usize,
 ) -> Vec<RecallCandidate> {
+    finalize_top_candidates_with_explain(candidate_records, max_candidates, prompt_budget_tokens)
+        .top_candidates
+}
+
+fn finalize_top_candidates_with_explain(
+    mut candidate_records: Vec<CandidateRecord>,
+    max_candidates: usize,
+    prompt_budget_tokens: usize,
+) -> FinalizedRecallCandidates {
+    let mut source_distribution = BTreeMap::new();
+    for record in &candidate_records {
+        let key = record.candidate.source_kind.as_str().to_owned();
+        *source_distribution.entry(key).or_insert(0) += 1;
+    }
     candidate_records.sort_by(|left, right| compare_candidate_records(right, left));
     let mut selected = Vec::new();
+    let mut rejected_candidates = Vec::new();
     let mut used_tokens = 0usize;
+    let mut duplicate_suppression_count = 0usize;
     for record in candidate_records {
-        if selected.len() >= max_candidates {
-            break;
+        let mut candidate = record.candidate;
+        let diversity_score = recall_diversity_score(&candidate, selected.as_slice());
+        if diversity_score < 1.0 {
+            duplicate_suppression_count = duplicate_suppression_count.saturating_add(1);
         }
-        let candidate_tokens = estimate_tokens(
-            format!("{}\n{}", record.candidate.title, record.candidate.snippet).as_str(),
-        );
+        candidate.score.diversity_score = diversity_score;
+        candidate.score.final_score =
+            (candidate.score.final_score * diversity_score).clamp(0.0, 1.0);
+        if selected.len() >= max_candidates {
+            push_rejected_recall_candidate(
+                &mut rejected_candidates,
+                &candidate,
+                "max_candidates_reached",
+            );
+            continue;
+        }
+        let candidate_tokens =
+            estimate_tokens(format!("{}\n{}", candidate.title, candidate.snippet).as_str());
         if !selected.is_empty()
             && used_tokens.saturating_add(candidate_tokens) > prompt_budget_tokens
         {
+            push_rejected_recall_candidate(
+                &mut rejected_candidates,
+                &candidate,
+                "prompt_budget_exceeded",
+            );
             continue;
         }
         used_tokens = used_tokens.saturating_add(candidate_tokens);
-        selected.push(record.candidate);
+        selected.push(candidate);
     }
-    selected
+    let selected_refs = selected
+        .iter()
+        .map(|candidate| RecallExplainSelectedRef {
+            candidate_id: candidate.candidate_id.clone(),
+            source_kind: candidate.source_kind.clone(),
+            source_ref: candidate.source_ref.clone(),
+            final_score: candidate.score.final_score,
+        })
+        .collect::<Vec<_>>();
+    let citation_failures =
+        selected.iter().filter(|candidate| candidate.source_ref.trim().is_empty()).count();
+    FinalizedRecallCandidates {
+        top_candidates: selected,
+        explain: RecallExplainTrace {
+            source_distribution,
+            selected_refs,
+            rejected_candidates,
+            duplicate_suppression_count,
+            citation_failures,
+            telemetry_enabled: true,
+        },
+    }
+}
+
+fn recall_diversity_score(candidate: &RecallCandidate, selected: &[RecallCandidate]) -> f64 {
+    if selected.is_empty() {
+        return 1.0;
+    }
+    let candidate_fingerprint = recall_candidate_fingerprint(candidate);
+    let duplicate_like = selected.iter().any(|existing| {
+        existing.source_kind == candidate.source_kind && existing.source_ref == candidate.source_ref
+            || recall_token_jaccard(
+                candidate_fingerprint.as_slice(),
+                recall_candidate_fingerprint(existing).as_slice(),
+            ) >= 0.72
+    });
+    if duplicate_like {
+        0.65
+    } else {
+        1.0
+    }
+}
+
+fn recall_candidate_fingerprint(candidate: &RecallCandidate) -> Vec<String> {
+    format!("{} {}", candidate.title, candidate.snippet)
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() >= 3)
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn recall_token_jaccard(left: &[String], right: &[String]) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let left_set = left.iter().collect::<BTreeSet<_>>();
+    let right_set = right.iter().collect::<BTreeSet<_>>();
+    let intersection = left_set.intersection(&right_set).count();
+    let union = left_set.union(&right_set).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn push_rejected_recall_candidate(
+    rejected_candidates: &mut Vec<RecallExplainRejectedCandidate>,
+    candidate: &RecallCandidate,
+    reason: &str,
+) {
+    const MAX_REJECTED_CANDIDATES: usize = 32;
+    if rejected_candidates.len() >= MAX_REJECTED_CANDIDATES {
+        return;
+    }
+    let privacy_label =
+        if candidate.score.sensitivity_penalty > 0.0 { "sensitive" } else { "standard" };
+    let safe_snippet = (privacy_label == "standard").then(|| {
+        truncate_console_text(
+            sanitize_prompt_inline_value(candidate.snippet.as_str()).as_str(),
+            180,
+        )
+    });
+    rejected_candidates.push(RecallExplainRejectedCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        source_kind: candidate.source_kind.clone(),
+        source_ref_hash: crate::sha256_hex(candidate.source_ref.as_bytes()),
+        reason: reason.to_owned(),
+        final_score: candidate.score.final_score,
+        privacy_label: privacy_label.to_owned(),
+        safe_snippet,
+    });
 }
 
 /// Folds ranked candidates back into the source-specific id lists of an
@@ -2341,6 +2527,7 @@ mod tests {
         TranscriptRecallRef,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn candidate(
         id: &str,
@@ -2371,7 +2558,10 @@ mod tests {
                 vector_score: final_score,
                 semantic_score: final_score,
                 recency_score: final_score,
+                temporal_decay_score: final_score,
+                diversity_score: 1.0,
                 source_quality_score,
+                trust_modifier: source_quality_score,
                 sensitivity_penalty: 0.0,
                 exact_phrase_match: 0.0,
                 final_score,
@@ -2466,6 +2656,74 @@ mod tests {
         assert_eq!(top[0].source_ref, "memory-c");
         assert_eq!(top[1].source_ref, "memory-b");
         assert_eq!(top[2].source_ref, "memory-a");
+    }
+
+    #[test]
+    fn reranker_penalizes_duplicate_candidates_without_filtering_them() {
+        let first = candidate("memory-a", RecallSourceKind::Memory, 0.9, 0.9, 10);
+        let mut duplicate = candidate("memory-b", RecallSourceKind::Memory, 0.89, 0.9, 9);
+        duplicate.title = first.title.clone();
+        duplicate.snippet = first.snippet.clone();
+
+        let finalized = super::finalize_top_candidates_with_explain(
+            vec![
+                super::CandidateRecord { candidate: first },
+                super::CandidateRecord { candidate: duplicate },
+            ],
+            2,
+            2_000,
+        );
+
+        assert_eq!(finalized.top_candidates.len(), 2);
+        assert_eq!(finalized.explain.duplicate_suppression_count, 1);
+        assert!(
+            finalized.top_candidates[1].score.diversity_score < 1.0,
+            "duplicate candidate should be demoted, not removed"
+        );
+    }
+
+    #[test]
+    fn reranker_redacts_sensitive_rejected_candidate_snippets() {
+        let first = candidate("memory-a", RecallSourceKind::Memory, 0.9, 0.9, 10);
+        let mut sensitive = candidate("memory-b", RecallSourceKind::Memory, 0.8, 0.8, 9);
+        sensitive.snippet = format!("api key secret {}", "very long rejected content ".repeat(80));
+        sensitive.score.sensitivity_penalty = 0.25;
+
+        let finalized = super::finalize_top_candidates_with_explain(
+            vec![
+                super::CandidateRecord { candidate: first },
+                super::CandidateRecord { candidate: sensitive },
+            ],
+            2,
+            8,
+        );
+
+        let rejected = finalized
+            .explain
+            .rejected_candidates
+            .first()
+            .expect("budget rejection should be recorded");
+        assert_eq!(rejected.privacy_label, "sensitive");
+        assert!(rejected.safe_snippet.is_none());
+        assert_eq!(rejected.reason, "prompt_budget_exceeded");
+    }
+
+    #[test]
+    fn temporal_decay_component_does_not_filter_old_relevant_preferences() {
+        let old_relevant = candidate("memory-old", RecallSourceKind::Memory, 0.92, 0.9, 1);
+        let recent_weak = candidate("memory-new", RecallSourceKind::Memory, 0.41, 0.9, 100);
+
+        let top = finalize_top_candidates(
+            vec![
+                super::CandidateRecord { candidate: recent_weak },
+                super::CandidateRecord { candidate: old_relevant },
+            ],
+            2,
+            2_000,
+        );
+
+        assert_eq!(top[0].source_ref, "memory-old");
+        assert_eq!(top[0].score.temporal_decay_score, 0.92);
     }
 
     #[test]
@@ -2606,7 +2864,10 @@ mod tests {
                         vector_score: 1.0,
                         semantic_score: 1.0,
                         recency_score: 1.0,
+                        temporal_decay_score: 1.0,
+                        diversity_score: 1.0,
                         source_quality_score: 1.0,
+                        trust_modifier: 1.0,
                         sensitivity_penalty: 0.0,
                         exact_phrase_match: 0.0,
                         final_score: 1.0,
@@ -2634,7 +2895,10 @@ mod tests {
                         vector_score: 0.9,
                         semantic_score: 0.9,
                         recency_score: 0.9,
+                        temporal_decay_score: 0.9,
+                        diversity_score: 1.0,
                         source_quality_score: 0.9,
+                        trust_modifier: 0.9,
                         sensitivity_penalty: 0.0,
                         exact_phrase_match: 0.0,
                         final_score: 0.9,
@@ -2677,6 +2941,14 @@ mod tests {
                 sources: Vec::new(),
             },
             diagnostics: Vec::new(),
+            explain: super::RecallExplainTrace {
+                source_distribution: BTreeMap::from([("memory".to_owned(), 1)]),
+                selected_refs: Vec::new(),
+                rejected_candidates: Vec::new(),
+                duplicate_suppression_count: 0,
+                citation_failures: 0,
+                telemetry_enabled: true,
+            },
             parameter_delta: json!({
                 "explicit_recall": ExplicitRecallSelection {
                     query: "rollback".to_owned(),

@@ -5041,6 +5041,7 @@ mod tests {
                 sources: Vec::new(),
             },
             diagnostics: Vec::new(),
+            explain: Default::default(),
             parameter_delta: json!({}),
             prompt_preview: "preview".to_owned(),
         };
