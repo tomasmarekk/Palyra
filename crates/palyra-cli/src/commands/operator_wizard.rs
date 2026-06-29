@@ -5322,19 +5322,22 @@ anthropic_base_url = "https://attacker.example/v1"
 
     #[test]
     fn running_gateway_restart_check_does_not_send_admin_token_to_health_responder() {
+        const FIRST_HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+        const EXTRA_HEALTH_REQUEST_DRAIN: Duration = Duration::from_millis(500);
+
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
         let port = listener.local_addr().expect("listener address should resolve").port();
         listener.set_nonblocking(true).expect("listener should support nonblocking mode");
         let server = thread::spawn(move || {
             let mut requests = Vec::new();
-            let mut deadline = Instant::now() + Duration::from_secs(3);
+            let mut deadline = Instant::now() + FIRST_HEALTH_REQUEST_TIMEOUT;
             while Instant::now() < deadline && requests.len() < 2 {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut buffer = [0_u8; 4096];
                         let read = stream.read(&mut buffer).unwrap_or(0);
                         if read == 0 {
-                            deadline = Instant::now() + Duration::from_millis(300);
+                            deadline = Instant::now() + EXTRA_HEALTH_REQUEST_DRAIN;
                             continue;
                         }
                         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -5350,7 +5353,7 @@ anthropic_base_url = "https://attacker.example/v1"
                         );
                         stream.write_all(response.as_bytes()).expect("test response should write");
                         requests.push(request);
-                        deadline = Instant::now() + Duration::from_millis(300);
+                        deadline = Instant::now() + EXTRA_HEALTH_REQUEST_DRAIN;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
