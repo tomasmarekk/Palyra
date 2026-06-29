@@ -22,9 +22,9 @@ use std::{
 use palyra_common::{
     runtime_contracts::{
         AcpBindingConflictKind, AcpBindingRepairActionKind, AcpCapability, AcpClientContext,
-        AcpCommand, AcpCommandResultEnvelope, AcpCursor, AcpPendingPromptRecord,
-        AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord, AcpSessionMode,
-        ConversationBindingConflictState, ConversationBindingRecord,
+        AcpCommand, AcpCommandResultEnvelope, AcpCursor, AcpEventLedgerKind, AcpEventLedgerRecord,
+        AcpPendingPromptRecord, AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord,
+        AcpSessionMode, ConversationBindingConflictState, ConversationBindingRecord,
         ConversationBindingSensitivity, StableErrorEnvelope, ACP_DEFAULT_DISCONNECT_GRACE_MS,
         ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
     },
@@ -39,7 +39,7 @@ use thiserror::Error;
 use ulid::Ulid;
 use validation::{normalize_scope_strings, normalize_state_root};
 
-use crate::unix_ms_now;
+use crate::{sha256_hex, unix_ms_now};
 
 const ACP_BINDINGS_LAYOUT_VERSION: u32 = 1;
 const ACP_BINDINGS_INDEX_FILE_NAME: &str = "bindings.json";
@@ -47,6 +47,9 @@ const ACP_BINDINGS_INDEX_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("ACP bindings index", ACP_BINDINGS_LAYOUT_VERSION);
 const MAX_TEXT_BYTES: usize = 512;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
+const MAX_EVENT_LEDGER_PAYLOAD_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_EVENT_LEDGER_EVENTS: usize = 1_024;
+pub(crate) const MAX_EVENT_LEDGER_EVENTS_PER_SESSION: usize = 200;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
 const RATE_LIMIT_MAX_REQUESTS_PER_WINDOW: u32 = 120;
 
@@ -139,6 +142,8 @@ pub(crate) struct AcpBindingsIndex {
     pub(crate) conversation_bindings: Vec<ConversationBindingRecord>,
     #[serde(default)]
     pub(crate) pending_prompts: Vec<AcpPendingPromptRecord>,
+    #[serde(default)]
+    pub(crate) event_ledger: Vec<AcpEventLedgerRecord>,
 }
 
 impl Default for AcpBindingsIndex {
@@ -149,6 +154,7 @@ impl Default for AcpBindingsIndex {
             session_bindings: Vec::new(),
             conversation_bindings: Vec::new(),
             pending_prompts: Vec::new(),
+            event_ledger: Vec::new(),
         }
     }
 }
@@ -182,6 +188,19 @@ pub(crate) struct AcpPendingPromptUpsert {
     pub(crate) ttl_ms: i64,
 }
 
+/// Request to append a redacted ACP event into the reconnect replay ledger.
+#[derive(Debug, Clone)]
+pub(crate) struct AcpEventLedgerAppend {
+    pub(crate) context: AcpClientContext,
+    pub(crate) acp_session_id: String,
+    pub(crate) palyra_session_id: String,
+    pub(crate) kind: AcpEventLedgerKind,
+    pub(crate) run_id: Option<String>,
+    pub(crate) approval_id: Option<String>,
+    pub(crate) redacted_summary: String,
+    pub(crate) redacted_payload: Value,
+}
+
 /// What a reconnecting ACP client gets back: its refreshed binding, prompts
 /// still inside the grace window, and the ids of prompts that expired.
 #[derive(Debug, Clone)]
@@ -189,6 +208,7 @@ pub(crate) struct AcpReconnectOutcome {
     pub(crate) binding: AcpSessionBindingRecord,
     pub(crate) pending_prompts: Vec<AcpPendingPromptRecord>,
     pub(crate) expired_prompt_ids: Vec<String>,
+    pub(crate) event_ledger: Vec<AcpEventLedgerRecord>,
 }
 
 /// Optional filters for [`AcpRuntime::list_conversation_bindings`]; unset
@@ -571,8 +591,16 @@ impl AcpRuntime {
             })
             .cloned()
             .collect();
+        let event_ledger = event_ledger_after_cursor(
+            &index,
+            binding.acp_client_id.as_str(),
+            binding.acp_session_id.as_str(),
+            binding.palyra_session_id.as_str(),
+            cursor.sequence,
+            MAX_EVENT_LEDGER_EVENTS_PER_SESSION,
+        );
         save_locked_index(self.root.as_path(), &mut index)?;
-        Ok(AcpReconnectOutcome { binding, pending_prompts, expired_prompt_ids })
+        Ok(AcpReconnectOutcome { binding, pending_prompts, expired_prompt_ids, event_ledger })
     }
 
     /// Persists (or refreshes) a pending prompt so it can be re-delivered if
@@ -623,6 +651,88 @@ impl AcpRuntime {
         } else {
             index.pending_prompts.push(record.clone());
         }
+        save_locked_index(self.root.as_path(), &mut index)?;
+        Ok(record)
+    }
+
+    /// Appends a redacted ACP event to the bounded reconnect replay ledger.
+    ///
+    /// The stored record contains only a redacted summary and a SHA-256 digest
+    /// of the sanitized payload. The raw payload never reaches `bindings.json`.
+    ///
+    /// # Errors
+    /// Fails on invalid ids, unsupported protocol versions, owner mismatches,
+    /// payloads that exceed the bounded hashing budget, and storage errors.
+    pub(crate) fn record_event(
+        &self,
+        request: AcpEventLedgerAppend,
+    ) -> AcpRuntimeResult<AcpEventLedgerRecord> {
+        validate_protocol_version(request.context.protocol_version)?;
+        validate_scopes_and_capabilities(&request.context)?;
+        validate_canonical_id(request.palyra_session_id.as_str()).map_err(|_| {
+            AcpRuntimeError::InvalidField {
+                field: "palyra_session_id",
+                message: "expected canonical Palyra session id".to_owned(),
+            }
+        })?;
+        validate_optional_canonical_id(request.run_id.as_deref(), "run_id")?;
+        validate_optional_canonical_id(request.approval_id.as_deref(), "approval_id")?;
+        let now = unix_ms_now().map_err(|error| AcpRuntimeError::InvalidField {
+            field: "system_time",
+            message: error.to_string(),
+        })?;
+        let acp_client_id = normalize_text(&request.context.client_id, "client_id", 128)?;
+        let acp_session_id = normalize_text(&request.acp_session_id, "acp_session_id", 128)?;
+        let owner_principal =
+            normalize_text(&request.context.owner_principal, "owner_principal", 128)?;
+        let redacted_summary =
+            normalize_text(&request.redacted_summary, "redacted_summary", MAX_TEXT_BYTES)?;
+        let mut redacted_payload = request.redacted_payload;
+        redact_sensitive_payload_fields(&mut redacted_payload);
+        let payload_bytes = serde_json::to_vec(&redacted_payload)
+            .map_err(|source| AcpRuntimeError::Json { path: self.index_path.clone(), source })?;
+        if payload_bytes.len() > MAX_EVENT_LEDGER_PAYLOAD_BYTES {
+            return Err(AcpRuntimeError::InvalidField {
+                field: "redacted_payload",
+                message: format!("payload exceeds {MAX_EVENT_LEDGER_PAYLOAD_BYTES} bytes"),
+            });
+        }
+
+        let mut index = self.lock_index()?;
+        if !index.session_bindings.iter().any(|entry| {
+            entry.acp_client_id == acp_client_id
+                && entry.acp_session_id == acp_session_id
+                && entry.palyra_session_id == request.palyra_session_id
+                && entry.owner_principal == owner_principal
+        }) {
+            return Err(AcpRuntimeError::NotFound {
+                kind: "acp_session_binding",
+                id: format!("{acp_client_id}/{acp_session_id}"),
+            });
+        }
+        let sequence = next_event_ledger_sequence(
+            &index,
+            acp_client_id.as_str(),
+            acp_session_id.as_str(),
+            request.palyra_session_id.as_str(),
+        );
+        let record = AcpEventLedgerRecord {
+            schema_version: ACP_BINDINGS_LAYOUT_VERSION,
+            event_id: format!("acpevt_{}", Ulid::new()),
+            kind: request.kind,
+            sequence,
+            acp_client_id,
+            acp_session_id,
+            palyra_session_id: request.palyra_session_id,
+            run_id: request.run_id,
+            approval_id: request.approval_id,
+            redacted_summary,
+            payload_sha256: sha256_hex(payload_bytes.as_slice()),
+            created_at_unix_ms: now,
+            protocol_version: request.context.protocol_version,
+        };
+        index.event_ledger.push(record.clone());
+        prune_event_ledger(&mut index);
         save_locked_index(self.root.as_path(), &mut index)?;
         Ok(record)
     }
@@ -1046,6 +1156,7 @@ fn load_index(path: &Path) -> AcpRuntimeResult<AcpBindingsIndex> {
 
 fn save_locked_index(root: &Path, index: &mut AcpBindingsIndex) -> AcpRuntimeResult<()> {
     normalize_conversation_conflicts(index);
+    prune_event_ledger(index);
     save_index(root, index)
 }
 
@@ -1141,6 +1252,14 @@ fn normalize_loaded_index(index: &mut AcpBindingsIndex) -> AcpRuntimeResult<()> 
             .then(left.external_identity.cmp(&right.external_identity))
             .then(left.external_conversation_id.cmp(&right.external_conversation_id))
     });
+    index.event_ledger.sort_by(|left, right| {
+        left.acp_client_id
+            .cmp(&right.acp_client_id)
+            .then(left.acp_session_id.cmp(&right.acp_session_id))
+            .then(left.palyra_session_id.cmp(&right.palyra_session_id))
+            .then(left.sequence.cmp(&right.sequence))
+            .then(left.event_id.cmp(&right.event_id))
+    });
     for binding in &index.session_bindings {
         validate_canonical_id(binding.palyra_session_id.as_str()).map_err(|_| {
             AcpRuntimeError::InvalidField {
@@ -1158,7 +1277,18 @@ fn normalize_loaded_index(index: &mut AcpBindingsIndex) -> AcpRuntimeResult<()> 
             }
         })?;
     }
+    for event in &index.event_ledger {
+        validate_canonical_id(event.palyra_session_id.as_str()).map_err(|_| {
+            AcpRuntimeError::InvalidField {
+                field: "palyra_session_id",
+                message: "stored ACP event contains invalid Palyra session id".to_owned(),
+            }
+        })?;
+        validate_optional_canonical_id(event.run_id.as_deref(), "run_id")?;
+        validate_optional_canonical_id(event.approval_id.as_deref(), "approval_id")?;
+    }
     normalize_conversation_conflicts(index);
+    prune_event_ledger(index);
     Ok(())
 }
 
@@ -1329,6 +1459,127 @@ fn prune_expired_pending_prompts(index: &mut AcpBindingsIndex, now_unix_ms: i64)
         }
     });
     expired
+}
+
+fn event_ledger_after_cursor(
+    index: &AcpBindingsIndex,
+    acp_client_id: &str,
+    acp_session_id: &str,
+    palyra_session_id: &str,
+    cursor_sequence: u64,
+    limit: usize,
+) -> Vec<AcpEventLedgerRecord> {
+    let mut records = index
+        .event_ledger
+        .iter()
+        .filter(|entry| {
+            entry.acp_client_id == acp_client_id
+                && entry.acp_session_id == acp_session_id
+                && entry.palyra_session_id == palyra_session_id
+                && entry.sequence > cursor_sequence
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.sequence.cmp(&right.sequence).then(left.event_id.cmp(&right.event_id))
+    });
+    if records.len() > limit {
+        records.split_off(records.len().saturating_sub(limit))
+    } else {
+        records
+    }
+}
+
+fn next_event_ledger_sequence(
+    index: &AcpBindingsIndex,
+    acp_client_id: &str,
+    acp_session_id: &str,
+    palyra_session_id: &str,
+) -> u64 {
+    let latest_event_sequence = index
+        .event_ledger
+        .iter()
+        .filter(|entry| {
+            entry.acp_client_id == acp_client_id
+                && entry.acp_session_id == acp_session_id
+                && entry.palyra_session_id == palyra_session_id
+        })
+        .map(|entry| entry.sequence)
+        .max()
+        .unwrap_or(0);
+    let binding_cursor_sequence = index
+        .session_bindings
+        .iter()
+        .find(|entry| {
+            entry.acp_client_id == acp_client_id
+                && entry.acp_session_id == acp_session_id
+                && entry.palyra_session_id == palyra_session_id
+        })
+        .map(|entry| entry.cursor.sequence)
+        .unwrap_or(0);
+    latest_event_sequence.max(binding_cursor_sequence).saturating_add(1)
+}
+
+fn prune_event_ledger(index: &mut AcpBindingsIndex) {
+    index.event_ledger.sort_by(|left, right| {
+        left.created_at_unix_ms
+            .cmp(&right.created_at_unix_ms)
+            .then(left.sequence.cmp(&right.sequence))
+            .then(left.event_id.cmp(&right.event_id))
+    });
+    let mut retained_per_session = BTreeMap::<(String, String, String), usize>::new();
+    let mut retained_event_ids = BTreeSet::<String>::new();
+    for entry in index.event_ledger.iter().rev() {
+        let key = (
+            entry.acp_client_id.clone(),
+            entry.acp_session_id.clone(),
+            entry.palyra_session_id.clone(),
+        );
+        let count = retained_per_session.entry(key).or_default();
+        if *count < MAX_EVENT_LEDGER_EVENTS_PER_SESSION {
+            retained_event_ids.insert(entry.event_id.clone());
+            *count = count.saturating_add(1);
+        }
+    }
+    index.event_ledger.retain(|entry| retained_event_ids.contains(entry.event_id.as_str()));
+    if index.event_ledger.len() > MAX_EVENT_LEDGER_EVENTS {
+        index.event_ledger.sort_by(|left, right| {
+            left.created_at_unix_ms
+                .cmp(&right.created_at_unix_ms)
+                .then(left.sequence.cmp(&right.sequence))
+                .then(left.event_id.cmp(&right.event_id))
+        });
+        let drop_count = index.event_ledger.len().saturating_sub(MAX_EVENT_LEDGER_EVENTS);
+        index.event_ledger.drain(0..drop_count);
+    }
+    index.event_ledger.sort_by(|left, right| {
+        left.acp_client_id
+            .cmp(&right.acp_client_id)
+            .then(left.acp_session_id.cmp(&right.acp_session_id))
+            .then(left.palyra_session_id.cmp(&right.palyra_session_id))
+            .then(left.sequence.cmp(&right.sequence))
+            .then(left.event_id.cmp(&right.event_id))
+    });
+}
+
+fn redact_sensitive_payload_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *child = Value::String("[REDACTED]".to_owned());
+                } else {
+                    redact_sensitive_payload_fields(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_payload_fields(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 // Re-derives duplicate-style conflict states from scratch for every binding

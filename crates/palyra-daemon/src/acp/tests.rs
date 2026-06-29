@@ -1,5 +1,7 @@
 use super::*;
-use palyra_common::runtime_contracts::{AcpCapability, AcpScope, AcpTransportKind};
+use palyra_common::runtime_contracts::{
+    AcpCapability, AcpEventLedgerKind, AcpEventLedgerRecord, AcpScope, AcpTransportKind,
+};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -89,6 +91,144 @@ fn reconnect_returns_pending_prompt_within_grace_window() {
     assert_eq!(outcome.binding.cursor.sequence, 8);
     assert_eq!(outcome.pending_prompts.len(), 1);
     assert!(outcome.expired_prompt_ids.is_empty());
+}
+
+#[test]
+fn event_ledger_redacts_payload_and_keeps_only_hashable_replay_metadata() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let root = tempdir.path().join("acp");
+    let runtime = AcpRuntime::open(root.clone()).expect("runtime should open");
+    runtime
+        .upsert_session_binding(AcpSessionBindingUpsert {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_key: "repo:C:/work/palyra".to_owned(),
+            session_label: None,
+            mode: AcpSessionMode::Normal,
+            config: json!({}),
+            cursor: AcpCursor::default(),
+        })
+        .expect("binding should persist");
+
+    let record = runtime
+        .record_event(AcpEventLedgerAppend {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            kind: AcpEventLedgerKind::ToolCallUpdate,
+            run_id: Some("01BX5ZZKBKACTAV9WEVGEMMVRZ".to_owned()),
+            approval_id: None,
+            redacted_summary: "Tool call completed".to_owned(),
+            redacted_payload: json!({
+                "tool": "shell",
+                "api_key": "secret-value",
+                "nested": { "token": "raw-token", "safe": "visible" },
+            }),
+        })
+        .expect("ledger event should persist");
+
+    let expected_payload = serde_json::to_vec(&json!({
+        "tool": "shell",
+        "api_key": "[REDACTED]",
+        "nested": { "token": "[REDACTED]", "safe": "visible" },
+    }))
+    .expect("expected payload should serialize");
+    assert_eq!(record.kind, AcpEventLedgerKind::ToolCallUpdate);
+    assert_eq!(record.payload_sha256, crate::sha256_hex(expected_payload.as_slice()));
+    let persisted =
+        std::fs::read_to_string(root.join(ACP_BINDINGS_INDEX_FILE_NAME)).expect("state exists");
+    assert!(!persisted.contains("secret-value"));
+    assert!(!persisted.contains("raw-token"));
+    assert!(persisted.contains("Tool call completed"));
+}
+
+#[test]
+fn reconnect_returns_event_ledger_records_after_client_cursor() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let runtime = AcpRuntime::open(tempdir.path().join("acp")).expect("runtime should open");
+    runtime
+        .upsert_session_binding(AcpSessionBindingUpsert {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_key: "repo:C:/work/palyra".to_owned(),
+            session_label: None,
+            mode: AcpSessionMode::Normal,
+            config: json!({}),
+            cursor: AcpCursor::default(),
+        })
+        .expect("binding should persist");
+    runtime
+        .record_event(AcpEventLedgerAppend {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            kind: AcpEventLedgerKind::SessionUpdate,
+            run_id: None,
+            approval_id: None,
+            redacted_summary: "Session opened".to_owned(),
+            redacted_payload: json!({ "event": "session.new" }),
+        })
+        .expect("first event should persist");
+    runtime
+        .record_event(AcpEventLedgerAppend {
+            context: context(),
+            acp_session_id: "acp-session-a".to_owned(),
+            palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            kind: AcpEventLedgerKind::Cancel,
+            run_id: Some("01BX5ZZKBKACTAV9WEVGEMMVRZ".to_owned()),
+            approval_id: None,
+            redacted_summary: "Cancel requested".to_owned(),
+            redacted_payload: json!({ "event": "run.abort" }),
+        })
+        .expect("second event should persist");
+
+    let outcome = runtime
+        .reconnect(&context(), "acp-session-a", AcpCursor { sequence: 1 })
+        .expect("reconnect should succeed");
+
+    assert_eq!(outcome.event_ledger.len(), 1);
+    assert_eq!(outcome.event_ledger[0].kind, AcpEventLedgerKind::Cancel);
+    assert_eq!(outcome.event_ledger[0].sequence, 2);
+}
+
+#[test]
+fn event_ledger_retention_is_bounded_per_session() {
+    let mut index = AcpBindingsIndex {
+        schema_version: 1,
+        updated_at_unix_ms: 10_000,
+        session_bindings: Vec::new(),
+        conversation_bindings: Vec::new(),
+        pending_prompts: Vec::new(),
+        event_ledger: (0..MAX_EVENT_LEDGER_EVENTS_PER_SESSION + 5)
+            .map(|offset| {
+                event_record(
+                    format!("acpevt_{offset}").as_str(),
+                    (offset + 1) as u64,
+                    offset as i64,
+                )
+            })
+            .collect(),
+    };
+
+    prune_event_ledger(&mut index);
+
+    assert_eq!(index.event_ledger.len(), MAX_EVENT_LEDGER_EVENTS_PER_SESSION);
+    assert_eq!(index.event_ledger.first().map(|entry| entry.sequence), Some(6));
+    assert_eq!(
+        index.event_ledger.last().map(|entry| entry.sequence),
+        Some((MAX_EVENT_LEDGER_EVENTS_PER_SESSION + 5) as u64)
+    );
+}
+
+#[test]
+fn event_ledger_record_matches_golden_fixture() {
+    let actual = serde_json::to_value(event_record("acpevt_fixture", 42, 1_700_000_000_000))
+        .expect("event should serialize");
+    let expected = read_golden_json("acp_event_ledger_record.json");
+
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -197,6 +337,7 @@ fn conversation_binding_repair_marks_principal_mismatch_without_widening() {
             conversation_record("convbind_b", "operator:b", "01BX5ZZKBKACTAV9WEVGEMMVRZ", 2),
         ],
         pending_prompts: Vec::new(),
+        event_ledger: Vec::new(),
     };
 
     let plan = build_repair_plan(&index, true);
@@ -223,6 +364,7 @@ fn conversation_binding_repair_apply_skips_principal_mismatch_manual_actions() {
                 conversation_record("convbind_b", "operator:b", "01BX5ZZKBKACTAV9WEVGEMMVRZ", 2),
             ],
             pending_prompts: Vec::new(),
+            event_ledger: Vec::new(),
         }),
         rate_limits: Mutex::new(BTreeMap::new()),
     };
@@ -253,6 +395,7 @@ fn conversation_binding_repair_plan_matches_golden_fixture() {
             conversation_record("convbind_b", "operator", "01BX5ZZKBKACTAV9WEVGEMMVRZ", 2),
         ],
         pending_prompts: Vec::new(),
+        event_ledger: Vec::new(),
     };
 
     let actual = serde_json::to_value(build_repair_plan(&index, true))
@@ -273,6 +416,7 @@ fn conversation_binding_repair_can_mark_parent_missing_for_required_parent_scope
         session_bindings: Vec::new(),
         conversation_bindings: vec![record],
         pending_prompts: Vec::new(),
+        event_ledger: Vec::new(),
     };
 
     let plan = build_repair_plan(&index, true);
@@ -314,6 +458,24 @@ fn conversation_record(
         conflict_state: ConversationBindingConflictState::None,
         created_at_unix_ms: 0,
         updated_at_unix_ms,
+    }
+}
+
+fn event_record(event_id: &str, sequence: u64, created_at_unix_ms: i64) -> AcpEventLedgerRecord {
+    AcpEventLedgerRecord {
+        schema_version: 1,
+        event_id: event_id.to_owned(),
+        kind: AcpEventLedgerKind::SessionUpdate,
+        sequence,
+        acp_client_id: "zed-extension".to_owned(),
+        acp_session_id: "acp-session-a".to_owned(),
+        palyra_session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        run_id: None,
+        approval_id: None,
+        redacted_summary: "Session updated".to_owned(),
+        payload_sha256: "a".repeat(64),
+        created_at_unix_ms,
+        protocol_version: 1,
     }
 }
 

@@ -8,9 +8,9 @@ use std::collections::BTreeSet;
 
 use palyra_common::runtime_contracts::{
     AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpCommandResultEnvelope,
-    AcpCursor, AcpReplayCap, AcpScope, AcpSessionMode, ConversationBindingSensitivity,
-    RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope, RealtimeCursor,
-    RealtimeHandshakeRequest, RealtimeRole, RealtimeScope, StableErrorEnvelope,
+    AcpCursor, AcpEventLedgerKind, AcpReplayCap, AcpScope, AcpSessionMode,
+    ConversationBindingSensitivity, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
+    RealtimeCursor, RealtimeHandshakeRequest, RealtimeRole, RealtimeScope, StableErrorEnvelope,
     ACP_DEFAULT_REPLAY_MAX_EVENTS,
 };
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     acp::{
-        AcpPendingPromptUpsert, AcpRuntimeError, AcpSessionBindingUpsert,
+        AcpEventLedgerAppend, AcpPendingPromptUpsert, AcpRuntimeError, AcpSessionBindingUpsert,
         ConversationBindingFilter, ConversationBindingUpsert,
     },
     application::session_compaction::{
@@ -258,6 +258,25 @@ async fn session_load(
         })
         .transpose()
         .map_err(AcpDispatchError::Acp)?;
+    if let Some(binding) = binding.as_ref() {
+        record_acp_ledger_event(
+            state,
+            client,
+            AcpLedgerEventRecordRequest {
+                acp_session_id: binding.acp_session_id.clone(),
+                palyra_session_id: session.session_id.clone(),
+                kind: AcpEventLedgerKind::SessionUpdate,
+                run_id: None,
+                approval_id: None,
+                redacted_summary: "ACP session binding loaded".to_owned(),
+                redacted_payload: json!({
+                    "event": "session.load",
+                    "binding_id": binding.binding_id.as_str(),
+                    "session_id": session.session_id.as_str(),
+                }),
+            },
+        )?;
+    }
     Ok(json!({ "session": session, "binding": binding }))
 }
 
@@ -299,6 +318,24 @@ async fn session_new(
             cursor: AcpCursor::default(),
         })
         .map_err(AcpDispatchError::Acp)?;
+    record_acp_ledger_event(
+        state,
+        client,
+        AcpLedgerEventRecordRequest {
+            acp_session_id: binding.acp_session_id.clone(),
+            palyra_session_id: outcome.session.session_id.clone(),
+            kind: AcpEventLedgerKind::SessionUpdate,
+            run_id: None,
+            approval_id: None,
+            redacted_summary: "ACP session binding created".to_owned(),
+            redacted_payload: json!({
+                "event": "session.new",
+                "binding_id": binding.binding_id.as_str(),
+                "session_id": outcome.session.session_id.as_str(),
+                "created": outcome.created,
+            }),
+        },
+    )?;
     Ok(json!({ "session": outcome.session, "created": outcome.created, "binding": binding }))
 }
 
@@ -364,6 +401,7 @@ async fn session_reconnect(
         "binding": outcome.binding,
         "pending_prompts": outcome.pending_prompts,
         "expired_prompt_ids": outcome.expired_prompt_ids,
+        "event_ledger": outcome.event_ledger,
     }))
 }
 
@@ -574,6 +612,24 @@ async fn session_config_set(
             cursor: binding.cursor,
         })
         .map_err(AcpDispatchError::Acp)?;
+    record_acp_ledger_event(
+        state,
+        client,
+        AcpLedgerEventRecordRequest {
+            acp_session_id: updated.acp_session_id.clone(),
+            palyra_session_id: updated.palyra_session_id.clone(),
+            kind: AcpEventLedgerKind::SessionUpdate,
+            run_id: None,
+            approval_id: None,
+            redacted_summary: "ACP session config updated".to_owned(),
+            redacted_payload: json!({
+                "event": "session.config.set",
+                "binding_id": updated.binding_id.as_str(),
+                "mode": updated.mode.as_str(),
+                "has_config": !updated.config.is_null(),
+            }),
+        },
+    )?;
     Ok(json!({ "binding": updated }))
 }
 
@@ -583,7 +639,12 @@ async fn dispatch_via_command_router(
     client: &AcpClientContext,
     envelope: AcpCommandEnvelope,
 ) -> Result<Value, AcpDispatchError> {
-    let realtime_command = match envelope.command {
+    let acp_command = envelope.command;
+    let acp_session_id = optional_string(&envelope.params, "acp_session_id");
+    let session_id = optional_string(&envelope.params, "session_id");
+    let run_id = optional_string(&envelope.params, "run_id");
+    let approval_id = optional_string(&envelope.params, "approval_id");
+    let realtime_command = match acp_command {
         AcpCommand::RunCreate => {
             ensure_grant(client, AcpScope::RunsWrite, AcpCapability::RunControl)?;
             RealtimeCommand::RunCreate
@@ -642,7 +703,56 @@ async fn dispatch_via_command_router(
     )
     .await;
     if result.ok {
-        Ok(result.result.unwrap_or_else(|| json!({})))
+        let value = result.result.unwrap_or_else(|| json!({}));
+        if matches!(acp_command, AcpCommand::RunAbort) {
+            if let (Some(acp_session_id), Some(session_id)) =
+                (acp_session_id.as_deref(), session_id.as_deref())
+            {
+                record_acp_ledger_event(
+                    state,
+                    client,
+                    AcpLedgerEventRecordRequest {
+                        acp_session_id: acp_session_id.to_owned(),
+                        palyra_session_id: session_id.to_owned(),
+                        kind: AcpEventLedgerKind::Cancel,
+                        run_id: run_id.clone(),
+                        approval_id: None,
+                        redacted_summary: "ACP run cancellation requested".to_owned(),
+                        redacted_payload: json!({
+                            "event": "run.abort",
+                            "run_id": run_id,
+                            "session_id": session_id,
+                            "source": "acp",
+                        }),
+                    },
+                )?;
+            }
+        }
+        if matches!(acp_command, AcpCommand::ApprovalDecide) {
+            if let (Some(acp_session_id), Some(session_id)) =
+                (acp_session_id.as_deref(), session_id.as_deref())
+            {
+                record_acp_ledger_event(
+                    state,
+                    client,
+                    AcpLedgerEventRecordRequest {
+                        acp_session_id: acp_session_id.to_owned(),
+                        palyra_session_id: session_id.to_owned(),
+                        kind: AcpEventLedgerKind::ApprovalDecision,
+                        run_id,
+                        approval_id: approval_id.clone(),
+                        redacted_summary: "ACP approval decision submitted".to_owned(),
+                        redacted_payload: json!({
+                            "event": "approval.decide",
+                            "approval_id": approval_id,
+                            "session_id": session_id,
+                            "source": "acp",
+                        }),
+                    },
+                )?;
+            }
+        }
+        Ok(value)
     } else {
         Err(AcpDispatchError::Stable(result.error.unwrap_or_else(|| {
             StableErrorEnvelope::new(
@@ -694,7 +804,7 @@ async fn approval_request(
             prompt: ApprovalPromptRecord {
                 title: "ACP permission request".to_owned(),
                 risk_level,
-                subject_id,
+                subject_id: subject_id.clone(),
                 summary: summary.clone(),
                 options: vec![
                     ApprovalPromptOption {
@@ -729,19 +839,72 @@ async fn approval_request(
         .await
         .map_err(AcpDispatchError::from_status)?;
     if let Some(acp_session_id) = optional_string(&envelope.params, "acp_session_id") {
-        let _ = state.acp_runtime.remember_pending_prompt(AcpPendingPromptUpsert {
-            prompt_id: format!("approval-{approval_id}"),
-            acp_client_id: client.client_id.clone(),
-            acp_session_id,
-            palyra_session_id: session_id,
-            approval_id: Some(approval_id),
-            run_id: Some(run_id),
-            prompt_kind: "approval".to_owned(),
-            redacted_summary: summary,
-            ttl_ms: optional_i64(&envelope.params, "ttl_ms").unwrap_or(300_000),
-        });
+        state
+            .acp_runtime
+            .remember_pending_prompt(AcpPendingPromptUpsert {
+                prompt_id: format!("approval-{approval_id}"),
+                acp_client_id: client.client_id.clone(),
+                acp_session_id: acp_session_id.clone(),
+                palyra_session_id: session_id,
+                approval_id: Some(approval_id.clone()),
+                run_id: Some(run_id.clone()),
+                prompt_kind: "approval".to_owned(),
+                redacted_summary: summary.clone(),
+                ttl_ms: optional_i64(&envelope.params, "ttl_ms").unwrap_or(300_000),
+            })
+            .map_err(AcpDispatchError::Acp)?;
+        record_acp_ledger_event(
+            state,
+            client,
+            AcpLedgerEventRecordRequest {
+                acp_session_id,
+                palyra_session_id: record.session_id.clone(),
+                kind: AcpEventLedgerKind::ApprovalPrompt,
+                run_id: Some(run_id),
+                approval_id: Some(approval_id),
+                redacted_summary: "ACP approval prompt created".to_owned(),
+                redacted_payload: json!({
+                    "event": "approval.request",
+                    "approval_id": record.approval_id.as_str(),
+                    "session_id": record.session_id.as_str(),
+                    "subject_id": subject_id.as_str(),
+                    "risk_level": risk_level.as_str(),
+                }),
+            },
+        )?;
     }
     Ok(json!({ "approval": record }))
+}
+
+struct AcpLedgerEventRecordRequest {
+    acp_session_id: String,
+    palyra_session_id: String,
+    kind: AcpEventLedgerKind,
+    run_id: Option<String>,
+    approval_id: Option<String>,
+    redacted_summary: String,
+    redacted_payload: Value,
+}
+
+fn record_acp_ledger_event(
+    state: &AppState,
+    client: &AcpClientContext,
+    request: AcpLedgerEventRecordRequest,
+) -> Result<(), AcpDispatchError> {
+    state
+        .acp_runtime
+        .record_event(AcpEventLedgerAppend {
+            context: client.clone(),
+            acp_session_id: request.acp_session_id,
+            palyra_session_id: request.palyra_session_id,
+            kind: request.kind,
+            run_id: request.run_id,
+            approval_id: request.approval_id,
+            redacted_summary: request.redacted_summary,
+            redacted_payload: request.redacted_payload,
+        })
+        .map(|_| ())
+        .map_err(AcpDispatchError::Acp)
 }
 
 async fn binding_list(

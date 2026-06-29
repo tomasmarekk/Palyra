@@ -1,0 +1,13 @@
+{
+  "acp_client_id": "zed-extension",
+  "acp_session_id": "acp-session-a",
+  "created_at_unix_ms": 1700000000000,
+  "event_id": "acpevt_fixture",
+  "kind": "session_update",
+  "palyra_session_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "protocol_version": 1,
+  "redacted_summary": "Session updated",
+  "schema_version": 1,
+  "sequence": 42
+}

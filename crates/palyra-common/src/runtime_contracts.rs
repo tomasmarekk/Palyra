@@ -972,6 +972,18 @@ runtime_contract_enum! {
 }
 
 runtime_contract_enum! {
+    /// Bounded ACP event ledger category retained for reconnect replay and diagnostics.
+    pub enum AcpEventLedgerKind {
+        SessionUpdate => "session_update",
+        ToolCallUpdate => "tool_call_update",
+        ApprovalPrompt => "approval_prompt",
+        ApprovalDecision => "approval_decision",
+        Terminal => "terminal",
+        Cancel => "cancel"
+    }
+}
+
+runtime_contract_enum! {
     /// Sensitivity label for connector-independent conversation bindings.
     pub enum ConversationBindingSensitivity {
         Public => "public",
@@ -1108,6 +1120,32 @@ pub struct AcpPendingPromptRecord {
     pub redacted_summary: String,
     pub created_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
+}
+
+/// Redacted ACP event retained across short disconnects for client replay.
+///
+/// The original event payload is never persisted in this record. Callers store a
+/// human-readable redacted summary and a SHA-256 digest of the canonical
+/// redacted payload so clients can correlate replayed frames without exposing
+/// secrets in the durable ACP state file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpEventLedgerRecord {
+    pub schema_version: u32,
+    pub event_id: String,
+    pub kind: AcpEventLedgerKind,
+    pub sequence: u64,
+    pub acp_client_id: String,
+    pub acp_session_id: String,
+    pub palyra_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    pub redacted_summary: String,
+    pub payload_sha256: String,
+    pub created_at_unix_ms: i64,
+    pub protocol_version: u32,
 }
 
 /// Canonical connector-independent binding from an external conversation to a Palyra session.
