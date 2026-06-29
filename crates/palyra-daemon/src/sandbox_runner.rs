@@ -11018,11 +11018,15 @@ mod tests {
             .expect("process env lock should not be poisoned");
         let workspace = unique_temp_dir("workspace-background-windows-job-child");
         fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
-        fs::write(workspace.join("child.py"), "import time\ntime.sleep(30)\n")
-            .expect("child script should be written");
+        let child_pid_path = workspace.join("child.pid");
+        fs::write(
+            workspace.join("child.py"),
+            "import os, pathlib, time\npathlib.Path('child.pid').write_text(str(os.getpid()), encoding='utf-8')\ntime.sleep(30)\n",
+        )
+        .expect("child script should be written");
         fs::write(
             workspace.join("launcher.py"),
-            "import os, subprocess, sys, time\ntime.sleep(0.5)\nsubprocess.Popen([sys.executable, 'child.py'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\nprint('ready', flush=True)\ntime.sleep(6)\nos._exit(0)\n",
+            "import os, subprocess, sys, time\nworkspace = os.path.dirname(__file__)\nchild = subprocess.Popen([sys.executable, os.path.join(workspace, 'child.py')], cwd=workspace, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)\nprint(f'child_pid={child.pid}', flush=True)\ntime.sleep(6)\nos._exit(0)\n",
         )
         .expect("launcher script should be written");
         let mut policy = sandbox_policy_with_allowed_executables(
@@ -11064,6 +11068,25 @@ mod tests {
             "windows background process should be bound to a cleanup job: {started_output}"
         );
 
+        let child_pid_deadline = Instant::now() + Duration::from_secs(5);
+        while !child_pid_path.exists() {
+            if Instant::now() >= child_pid_deadline {
+                let _ = super::stop_background_process_by_pid(pid);
+                let _ = fs::remove_dir_all(workspace.as_path());
+                panic!("launcher pid {pid} should start a child process before exiting");
+            }
+            thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
+        }
+        let child_pid = fs::read_to_string(child_pid_path.as_path())
+            .expect("child pid file should be readable")
+            .trim()
+            .parse::<u32>()
+            .expect("child pid should parse");
+        assert!(
+            super::process_id_is_alive(child_pid).unwrap_or(false),
+            "child process {child_pid} should still be alive before launcher exits"
+        );
+
         let deadline = Instant::now() + Duration::from_secs(9);
         loop {
             if super::process_id_is_alive(pid).map(|alive| !alive).unwrap_or(false) {
@@ -11077,11 +11100,31 @@ mod tests {
             thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
         }
 
-        let status = super::background_process_status_by_pid(pid);
+        let status_deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            let status = super::background_process_status_by_pid(pid)
+                .expect("status should inspect the Windows job after direct pid exits");
+            let status_output: serde_json::Value =
+                serde_json::from_slice(&status.output_json).expect("status output should parse");
+            let direct_pid_alive =
+                status_output.get("direct_pid_alive").and_then(serde_json::Value::as_bool);
+            let process_tree_alive =
+                status_output.get("process_tree_alive").and_then(serde_json::Value::as_bool);
+            if direct_pid_alive == Some(false) && process_tree_alive == Some(true) {
+                break status;
+            }
+            if Instant::now() >= status_deadline {
+                let _ = super::stop_background_process_by_pid(pid);
+                let _ = fs::remove_dir_all(workspace.as_path());
+                panic!(
+                    "job should still report child process {child_pid} as alive: {status_output}"
+                );
+            }
+            thread::sleep(Duration::from_millis(BACKGROUND_MONITOR_POLL_MS));
+        };
         let stopped = super::stop_background_process_by_pid(pid);
         let _ = fs::remove_dir_all(workspace.as_path());
 
-        let status = status.expect("status should inspect the Windows job after direct pid exits");
         let status_output: serde_json::Value =
             serde_json::from_slice(&status.output_json).expect("status output should parse");
         assert_eq!(

@@ -350,9 +350,15 @@ fn assert_agentic_matrix_contract(
     scenario_id: &str,
     expected: AgenticScenarioExpectation,
 ) -> Result<()> {
-    let (_, manifest, _) = load_regression_assets()?;
+    let (_, manifest, checklist) = load_regression_assets()?;
+    let fast_profile =
+        manifest.profiles.get("fast").context("workflow regression fast profile should exist")?;
     let full_profile =
         manifest.profiles.get("full").context("workflow regression full profile should exist")?;
+    assert!(
+        !fast_profile.required_subsystems.iter().any(|entry| entry == "agentic_regression_matrix"),
+        "fast profile should keep agentic_regression_matrix out of lightweight CI"
+    );
     assert!(
         full_profile.required_subsystems.iter().any(|entry| entry == "agentic_regression_matrix"),
         "full profile should require agentic_regression_matrix"
@@ -376,6 +382,33 @@ fn assert_agentic_matrix_contract(
         AGENTIC_FAILURE_REPORT_FIELDS.iter().copied().map(str::to_owned).collect::<Vec<_>>()
     );
     assert_eq!(scenario.command, contract_command(&format!("{scenario_id}_matrix_contract")));
+
+    let fast_evidence = checklist
+        .evidence
+        .iter()
+        .find(|entry| entry.id == "workflow_regression_fast")
+        .context("readiness checklist should contain workflow_regression_fast evidence")?;
+    let full_evidence = checklist
+        .evidence
+        .iter()
+        .find(|entry| entry.id == "workflow_regression_full")
+        .context("readiness checklist should contain workflow_regression_full evidence")?;
+    assert!(
+        !fast_evidence.required_subsystems.iter().any(|entry| entry == "agentic_regression_matrix"),
+        "fast readiness evidence should not require full-profile agentic coverage"
+    );
+    assert!(
+        full_evidence.required_subsystems.iter().any(|entry| entry == "agentic_regression_matrix"),
+        "full readiness evidence should require agentic_regression_matrix"
+    );
+    assert!(
+        !fast_evidence.must_pass_scenarios.iter().any(|entry| entry == scenario_id),
+        "fast readiness evidence should not require full-profile scenario '{scenario_id}'"
+    );
+    assert!(
+        full_evidence.must_pass_scenarios.iter().any(|entry| entry == scenario_id),
+        "full readiness evidence should require scenario '{scenario_id}'"
+    );
 
     Ok(())
 }
