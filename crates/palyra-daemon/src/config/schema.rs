@@ -332,6 +332,15 @@ pub struct FeatureRolloutsConfig {
     pub delivery_arbitration: FeatureRolloutSetting,
     pub replay_capture: FeatureRolloutSetting,
     pub networked_workers: FeatureRolloutSetting,
+    pub tool_repair: FeatureRolloutSetting,
+    pub provider_stream_normalizer: FeatureRolloutSetting,
+    pub channel_turn_kernel: FeatureRolloutSetting,
+    pub agent_plan_state: FeatureRolloutSetting,
+    pub objective_judge: FeatureRolloutSetting,
+    pub verification_runtime: FeatureRolloutSetting,
+    pub progress_drafts: FeatureRolloutSetting,
+    pub compaction_safeguard: FeatureRolloutSetting,
+    pub attack_surface_audit: FeatureRolloutSetting,
 }
 
 /// Orchestrator feature toggles; the v1 run loop defaults to disabled.

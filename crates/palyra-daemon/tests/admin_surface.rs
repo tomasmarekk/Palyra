@@ -3161,6 +3161,29 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
         Some("feature_rollouts.session_queue_policy"),
         "diagnostics should expose the runtime rollout config path for session queue policy"
     );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/tool_repair/config_path")
+            .and_then(Value::as_str),
+        Some("feature_rollouts.tool_repair"),
+        "diagnostics should expose the roadmap rollout config path for tool repair"
+    );
+    assert_eq!(
+        diagnostics_response.pointer("/runtime_roadmap/schema_version").and_then(Value::as_u64),
+        Some(1),
+        "diagnostics should expose the runtime roadmap contract schema version"
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/runtime_roadmap/capabilities")
+            .and_then(Value::as_array)
+            .is_some_and(|capabilities| {
+                capabilities.iter().any(|capability| {
+                    capability.get("capability").and_then(Value::as_str) == Some("tool_repair")
+                })
+            }),
+        "diagnostics should publish the tool repair roadmap capability"
+    );
 
     let initial_events = client
         .get(format!("http://127.0.0.1:{admin_port}/console/v1/system/events?limit=5"))

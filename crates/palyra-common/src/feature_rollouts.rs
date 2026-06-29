@@ -45,6 +45,25 @@ pub const DELIVERY_ARBITRATION_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_DELIVERY
 pub const REPLAY_CAPTURE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE";
 /// Env toggle for experimental networked workers.
 pub const NETWORKED_WORKERS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS";
+/// Env toggle for experimental tool-call repair.
+pub const TOOL_REPAIR_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_TOOL_REPAIR";
+/// Env toggle for experimental provider stream normalization.
+pub const PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV: &str =
+    "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER";
+/// Env toggle for the experimental channel turn kernel.
+pub const CHANNEL_TURN_KERNEL_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL";
+/// Env toggle for experimental model-visible agent plan state.
+pub const AGENT_PLAN_STATE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE";
+/// Env toggle for the experimental objective judge loop.
+pub const OBJECTIVE_JUDGE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE";
+/// Env toggle for the experimental verification runtime.
+pub const VERIFICATION_RUNTIME_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME";
+/// Env toggle for experimental progress drafts.
+pub const PROGRESS_DRAFTS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS";
+/// Env toggle for the experimental compaction safeguard.
+pub const COMPACTION_SAFEGUARD_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD";
+/// Env toggle for the experimental attack-surface audit.
+pub const ATTACK_SURFACE_AUDIT_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT";
 
 /// Config path for [`DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV`].
 pub const DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.dynamic_tool_builder";
@@ -84,6 +103,25 @@ pub const DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.del
 pub const REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.replay_capture";
 /// Config path for [`NETWORKED_WORKERS_ROLLOUT_ENV`].
 pub const NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.networked_workers";
+/// Config path for [`TOOL_REPAIR_ROLLOUT_ENV`].
+pub const TOOL_REPAIR_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.tool_repair";
+/// Config path for [`PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV`].
+pub const PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.provider_stream_normalizer";
+/// Config path for [`CHANNEL_TURN_KERNEL_ROLLOUT_ENV`].
+pub const CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.channel_turn_kernel";
+/// Config path for [`AGENT_PLAN_STATE_ROLLOUT_ENV`].
+pub const AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.agent_plan_state";
+/// Config path for [`OBJECTIVE_JUDGE_ROLLOUT_ENV`].
+pub const OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.objective_judge";
+/// Config path for [`VERIFICATION_RUNTIME_ROLLOUT_ENV`].
+pub const VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.verification_runtime";
+/// Config path for [`PROGRESS_DRAFTS_ROLLOUT_ENV`].
+pub const PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.progress_drafts";
+/// Config path for [`COMPACTION_SAFEGUARD_ROLLOUT_ENV`].
+pub const COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.compaction_safeguard";
+/// Config path for [`ATTACK_SURFACE_AUDIT_ROLLOUT_ENV`].
+pub const ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.attack_surface_audit";
 
 /// Where a rollout decision came from, for diagnostics and precedence reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

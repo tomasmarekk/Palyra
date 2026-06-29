@@ -567,6 +567,15 @@ pub struct FileFeatureRolloutsConfig {
     pub delivery_arbitration: Option<bool>,
     pub replay_capture: Option<bool>,
     pub networked_workers: Option<bool>,
+    pub tool_repair: Option<bool>,
+    pub provider_stream_normalizer: Option<bool>,
+    pub channel_turn_kernel: Option<bool>,
+    pub agent_plan_state: Option<bool>,
+    pub objective_judge: Option<bool>,
+    pub verification_runtime: Option<bool>,
+    pub progress_drafts: Option<bool>,
+    pub compaction_safeguard: Option<bool>,
+    pub attack_surface_audit: Option<bool>,
 }
 
 /// `[session_queue_policy]`: runtime-preview queue posture.
@@ -1269,6 +1278,15 @@ mod tests {
             delivery_arbitration = true
             replay_capture = true
             networked_workers = false
+            tool_repair = true
+            provider_stream_normalizer = false
+            channel_turn_kernel = true
+            agent_plan_state = false
+            objective_judge = true
+            verification_runtime = true
+            progress_drafts = false
+            compaction_safeguard = true
+            attack_surface_audit = false
             "#,
         )
         .expect("feature_rollouts section should parse");
@@ -1291,6 +1309,15 @@ mod tests {
         assert_eq!(feature_rollouts.delivery_arbitration, Some(true));
         assert_eq!(feature_rollouts.replay_capture, Some(true));
         assert_eq!(feature_rollouts.networked_workers, Some(false));
+        assert_eq!(feature_rollouts.tool_repair, Some(true));
+        assert_eq!(feature_rollouts.provider_stream_normalizer, Some(false));
+        assert_eq!(feature_rollouts.channel_turn_kernel, Some(true));
+        assert_eq!(feature_rollouts.agent_plan_state, Some(false));
+        assert_eq!(feature_rollouts.objective_judge, Some(true));
+        assert_eq!(feature_rollouts.verification_runtime, Some(true));
+        assert_eq!(feature_rollouts.progress_drafts, Some(false));
+        assert_eq!(feature_rollouts.compaction_safeguard, Some(true));
+        assert_eq!(feature_rollouts.attack_surface_audit, Some(false));
     }
 
     #[test]

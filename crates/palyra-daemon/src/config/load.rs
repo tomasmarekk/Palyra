@@ -33,15 +33,19 @@ use palyra_common::{
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
-        parse_boolish_feature_rollout, FeatureRolloutSetting, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        parse_boolish_feature_rollout, FeatureRolloutSetting, AGENT_PLAN_STATE_ROLLOUT_ENV,
+        ATTACK_SURFACE_AUDIT_ROLLOUT_ENV, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        CHANNEL_TURN_KERNEL_ROLLOUT_ENV, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
         CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
         DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
         EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
-        FLOW_ORCHESTRATION_ROLLOUT_ENV, NETWORKED_WORKERS_ROLLOUT_ENV,
+        FLOW_ORCHESTRATION_ROLLOUT_ENV, NETWORKED_WORKERS_ROLLOUT_ENV, OBJECTIVE_JUDGE_ROLLOUT_ENV,
+        PROGRESS_DRAFTS_ROLLOUT_ENV, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
         PRUNING_POLICY_MATRIX_ROLLOUT_ENV, REPLAY_CAPTURE_ROLLOUT_ENV,
         RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
-        SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+        SESSION_QUEUE_POLICY_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV,
+        VERIFICATION_RUNTIME_ROLLOUT_ENV,
     },
     parse_config_path,
     runtime_preview::{parse_runtime_preview_mode, RuntimePreviewMode},
@@ -272,6 +276,34 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
             if let Some(enabled) = file_feature_rollouts.networked_workers {
                 feature_rollouts.networked_workers = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.tool_repair {
+                feature_rollouts.tool_repair = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.provider_stream_normalizer {
+                feature_rollouts.provider_stream_normalizer =
+                    FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.channel_turn_kernel {
+                feature_rollouts.channel_turn_kernel = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.agent_plan_state {
+                feature_rollouts.agent_plan_state = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.objective_judge {
+                feature_rollouts.objective_judge = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.verification_runtime {
+                feature_rollouts.verification_runtime = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.progress_drafts {
+                feature_rollouts.progress_drafts = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.compaction_safeguard {
+                feature_rollouts.compaction_safeguard = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.attack_surface_audit {
+                feature_rollouts.attack_surface_audit = FeatureRolloutSetting::from_config(enabled);
             }
         }
         if let Some(file_session_queue_policy) = parsed.session_queue_policy {
@@ -2189,6 +2221,51 @@ pub fn load_config() -> Result<LoadedConfig> {
     feature_rollouts.networked_workers = apply_feature_rollout_env_override(
         feature_rollouts.networked_workers,
         NETWORKED_WORKERS_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.tool_repair = apply_feature_rollout_env_override(
+        feature_rollouts.tool_repair,
+        TOOL_REPAIR_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.provider_stream_normalizer = apply_feature_rollout_env_override(
+        feature_rollouts.provider_stream_normalizer,
+        PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.channel_turn_kernel = apply_feature_rollout_env_override(
+        feature_rollouts.channel_turn_kernel,
+        CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.agent_plan_state = apply_feature_rollout_env_override(
+        feature_rollouts.agent_plan_state,
+        AGENT_PLAN_STATE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.objective_judge = apply_feature_rollout_env_override(
+        feature_rollouts.objective_judge,
+        OBJECTIVE_JUDGE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.verification_runtime = apply_feature_rollout_env_override(
+        feature_rollouts.verification_runtime,
+        VERIFICATION_RUNTIME_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.progress_drafts = apply_feature_rollout_env_override(
+        feature_rollouts.progress_drafts,
+        PROGRESS_DRAFTS_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.compaction_safeguard = apply_feature_rollout_env_override(
+        feature_rollouts.compaction_safeguard,
+        COMPACTION_SAFEGUARD_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.attack_surface_audit = apply_feature_rollout_env_override(
+        feature_rollouts.attack_surface_audit,
+        ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
         &mut source,
     )?;
 
@@ -4437,6 +4514,15 @@ mod tests {
             delivery_arbitration = false
             replay_capture = true
             networked_workers = false
+            tool_repair = true
+            provider_stream_normalizer = false
+            channel_turn_kernel = true
+            agent_plan_state = false
+            objective_judge = true
+            verification_runtime = true
+            progress_drafts = false
+            compaction_safeguard = true
+            attack_surface_audit = false
             "#,
         )
         .expect("feature_rollouts should parse");
@@ -4458,6 +4544,15 @@ mod tests {
         assert_eq!(feature_rollouts.delivery_arbitration, Some(false));
         assert_eq!(feature_rollouts.replay_capture, Some(true));
         assert_eq!(feature_rollouts.networked_workers, Some(false));
+        assert_eq!(feature_rollouts.tool_repair, Some(true));
+        assert_eq!(feature_rollouts.provider_stream_normalizer, Some(false));
+        assert_eq!(feature_rollouts.channel_turn_kernel, Some(true));
+        assert_eq!(feature_rollouts.agent_plan_state, Some(false));
+        assert_eq!(feature_rollouts.objective_judge, Some(true));
+        assert_eq!(feature_rollouts.verification_runtime, Some(true));
+        assert_eq!(feature_rollouts.progress_drafts, Some(false));
+        assert_eq!(feature_rollouts.compaction_safeguard, Some(true));
+        assert_eq!(feature_rollouts.attack_surface_audit, Some(false));
     }
 
     #[test]

@@ -15,7 +15,11 @@
 
 use crate::*;
 use palyra_common::feature_rollouts::{
+    AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH, AGENT_PLAN_STATE_ROLLOUT_ENV,
+    ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
     AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+    CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH, CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
+    COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
     CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH, CONTEXT_ENGINE_ROLLOUT_ENV,
     DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH, DELIVERY_ARBITRATION_ROLLOUT_ENV,
     DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
@@ -27,14 +31,22 @@ use palyra_common::feature_rollouts::{
     EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
     FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH, FLOW_ORCHESTRATION_ROLLOUT_ENV,
     NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH, NETWORKED_WORKERS_ROLLOUT_ENV,
+    OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH, OBJECTIVE_JUDGE_ROLLOUT_ENV,
+    PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH, PROGRESS_DRAFTS_ROLLOUT_ENV,
+    PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
     PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
     REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH, REPLAY_CAPTURE_ROLLOUT_ENV,
     RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
     SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH, SAFETY_BOUNDARY_ROLLOUT_ENV,
     SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH, SESSION_QUEUE_POLICY_ROLLOUT_ENV,
+    TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV,
+    VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH, VERIFICATION_RUNTIME_ROLLOUT_ENV,
 };
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
+use palyra_common::runtime_roadmap::{
+    runtime_roadmap_capability_catalog, RUNTIME_ROADMAP_SCHEMA_VERSION,
+};
 
 // Keeps CLI helper subprocesses (doctor, support-bundle export) from flashing
 // a console window when the daemon runs as a desktop-supervised process.
@@ -284,6 +296,7 @@ pub(crate) async fn console_diagnostics_handler(
             "telemetry": access_snapshot.telemetry,
         },
         "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state),
+        "runtime_roadmap": collect_console_runtime_roadmap_diagnostics(),
         "context_engine": context_engine_payload,
         "runtime_controls": runtime_controls_payload,
         "deployment": deployment_payload,
@@ -1040,6 +1053,69 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "config_path": NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH,
             "env_var": NETWORKED_WORKERS_ROLLOUT_ENV,
         },
+        "tool_repair": {
+            "enabled": feature_rollouts.tool_repair.enabled,
+            "source": feature_rollouts.tool_repair.source,
+            "config_path": TOOL_REPAIR_ROLLOUT_CONFIG_PATH,
+            "env_var": TOOL_REPAIR_ROLLOUT_ENV,
+        },
+        "provider_stream_normalizer": {
+            "enabled": feature_rollouts.provider_stream_normalizer.enabled,
+            "source": feature_rollouts.provider_stream_normalizer.source,
+            "config_path": PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH,
+            "env_var": PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
+        },
+        "channel_turn_kernel": {
+            "enabled": feature_rollouts.channel_turn_kernel.enabled,
+            "source": feature_rollouts.channel_turn_kernel.source,
+            "config_path": CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH,
+            "env_var": CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
+        },
+        "agent_plan_state": {
+            "enabled": feature_rollouts.agent_plan_state.enabled,
+            "source": feature_rollouts.agent_plan_state.source,
+            "config_path": AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH,
+            "env_var": AGENT_PLAN_STATE_ROLLOUT_ENV,
+        },
+        "objective_judge": {
+            "enabled": feature_rollouts.objective_judge.enabled,
+            "source": feature_rollouts.objective_judge.source,
+            "config_path": OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH,
+            "env_var": OBJECTIVE_JUDGE_ROLLOUT_ENV,
+        },
+        "verification_runtime": {
+            "enabled": feature_rollouts.verification_runtime.enabled,
+            "source": feature_rollouts.verification_runtime.source,
+            "config_path": VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH,
+            "env_var": VERIFICATION_RUNTIME_ROLLOUT_ENV,
+        },
+        "progress_drafts": {
+            "enabled": feature_rollouts.progress_drafts.enabled,
+            "source": feature_rollouts.progress_drafts.source,
+            "config_path": PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH,
+            "env_var": PROGRESS_DRAFTS_ROLLOUT_ENV,
+        },
+        "compaction_safeguard": {
+            "enabled": feature_rollouts.compaction_safeguard.enabled,
+            "source": feature_rollouts.compaction_safeguard.source,
+            "config_path": COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH,
+            "env_var": COMPACTION_SAFEGUARD_ROLLOUT_ENV,
+        },
+        "attack_surface_audit": {
+            "enabled": feature_rollouts.attack_surface_audit.enabled,
+            "source": feature_rollouts.attack_surface_audit.source,
+            "config_path": ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH,
+            "env_var": ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
+        },
+    })
+}
+
+/// Reports the shared runtime-roadmap contract catalog used by upcoming
+/// runtime-loop work.
+fn collect_console_runtime_roadmap_diagnostics() -> Value {
+    json!({
+        "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
+        "capabilities": runtime_roadmap_capability_catalog(),
     })
 }
 

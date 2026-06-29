@@ -182,6 +182,7 @@ fn build_current_state_inventory_snapshot(
         "capabilities": capabilities,
         "migration_notes": capability_catalog.get("migration_notes").cloned().unwrap_or(Value::Null),
         "feature_rollouts": diagnostics.get("feature_rollouts").cloned().unwrap_or(Value::Null),
+        "runtime_roadmap": diagnostics.get("runtime_roadmap").cloned().unwrap_or(Value::Null),
         "runtime_controls": {
             "schema_version": runtime_controls.remove("schema_version").unwrap_or(Value::Null),
             "state": runtime_controls.remove("state").unwrap_or(Value::Null),

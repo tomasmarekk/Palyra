@@ -32,6 +32,7 @@
     "rate_limits",
     "runtime_controls",
     "runtime_health",
+    "runtime_roadmap",
     "runtime_watchdog",
     "skills",
     "webhooks"
@@ -804,7 +805,175 @@
       "source": "default",
       "config_path": "feature_rollouts.networked_workers",
       "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS"
+    },
+    "tool_repair": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.tool_repair",
+      "env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR"
+    },
+    "provider_stream_normalizer": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.provider_stream_normalizer",
+      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER"
+    },
+    "channel_turn_kernel": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.channel_turn_kernel",
+      "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL"
+    },
+    "agent_plan_state": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.agent_plan_state",
+      "env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE"
+    },
+    "objective_judge": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.objective_judge",
+      "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE"
+    },
+    "verification_runtime": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.verification_runtime",
+      "env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME"
+    },
+    "progress_drafts": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.progress_drafts",
+      "env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS"
+    },
+    "compaction_safeguard": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.compaction_safeguard",
+      "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD"
+    },
+    "attack_surface_audit": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.attack_surface_audit",
+      "env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT"
     }
+  },
+  "runtime_roadmap": {
+    "schema_version": 1,
+    "capabilities": [
+      {
+        "schema_version": 1,
+        "capability": "baseline_contracts",
+        "label": "Baseline contracts",
+        "summary": "Defines the shared metadata contract used before roadmap runtime loops execute.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "reason_code_taxonomy",
+        "label": "Reason code taxonomy",
+        "summary": "Keeps roadmap reason codes stable across journal, replay, diagnostics, and tests.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "journal_schema_extension",
+        "label": "Journal schema extension",
+        "summary": "Uses the existing journal append log with typed payload envelopes.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "runtime_loop_rollout_config",
+        "label": "Runtime loop rollout config",
+        "summary": "Registers default-off rollout gates for new agent-runtime behavior.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "tool_repair",
+        "label": "Tool repair",
+        "summary": "Guards tool-call repair parsing and proposal recovery.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR",
+        "rollout_config_path": "feature_rollouts.tool_repair",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "provider_stream_normalizer",
+        "label": "Provider stream normalizer",
+        "summary": "Guards provider stream normalization before tool proposal flow.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
+        "rollout_config_path": "feature_rollouts.provider_stream_normalizer",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "channel_turn_kernel",
+        "label": "Channel turn kernel",
+        "summary": "Guards channel turn admission, debounce, history, and delivery lifecycle work.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
+        "rollout_config_path": "feature_rollouts.channel_turn_kernel",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "agent_plan_state",
+        "label": "Agent plan state",
+        "summary": "Guards model-visible plan state and progress checkpoints.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE",
+        "rollout_config_path": "feature_rollouts.agent_plan_state",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "objective_judge",
+        "label": "Objective judge",
+        "summary": "Guards auxiliary objective completion judging.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
+        "rollout_config_path": "feature_rollouts.objective_judge",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "verification_runtime",
+        "label": "Verification runtime",
+        "summary": "Guards evidence ledger, verify-before-finish, and diagnostics status.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME",
+        "rollout_config_path": "feature_rollouts.verification_runtime",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "progress_drafts",
+        "label": "Progress drafts",
+        "summary": "Guards durable progress drafts and long-running turn visibility.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS",
+        "rollout_config_path": "feature_rollouts.progress_drafts",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "compaction_safeguard",
+        "label": "Compaction safeguard",
+        "summary": "Guards compaction checkpoints and rollback decisions.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD",
+        "rollout_config_path": "feature_rollouts.compaction_safeguard",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "attack_surface_audit",
+        "label": "Attack surface audit",
+        "summary": "Guards attack-surface graphing and outbound sanitizer previews.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT",
+        "rollout_config_path": "feature_rollouts.attack_surface_audit",
+        "default_enabled": false
+      }
+    ]
   },
   "runtime_controls": {
     "schema_version": 1,
