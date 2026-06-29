@@ -6,9 +6,12 @@ use std::{
     fs,
     io::Read,
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStderr, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -31,6 +34,7 @@ const PALYRAD_STARTUP_ATTEMPTS: usize = 3;
 const PALYRAD_STARTUP_RETRY_DELAY: Duration = Duration::from_millis(150);
 const PALYRAD_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 static TEMP_IDENTITY_COUNTER: AtomicU64 = AtomicU64::new(0);
+static WORKSPACE_BINARY_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[test]
 fn admin_status_requires_token_and_context() -> Result<()> {
@@ -5332,6 +5336,7 @@ fn admin_run_cancel_rejects_oversized_request_body() -> Result<()> {
 
 #[test]
 fn console_support_bundle_job_lifecycle_publishes_deterministic_completion_state() -> Result<()> {
+    ensure_workspace_binary("palyra", "palyra-cli")?;
     let (child, admin_port) = spawn_palyrad_with_bound_console_principal(CONSOLE_ADMIN_PRINCIPAL)?;
     let mut daemon = ChildGuard::new(child);
     wait_for_health(admin_port, daemon.child_mut())?;
@@ -5651,6 +5656,49 @@ fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Result<Stri
 
 fn spawn_palyrad_with_dynamic_ports_once(extra_env: &[(&str, &str)]) -> Result<(Child, u16)> {
     spawn_palyrad_with_config_and_env_once("version = 1\n", extra_env)
+}
+
+fn ensure_workspace_binary(base_name: &str, package_name: &str) -> Result<PathBuf> {
+    let workspace_root = workspace_root()?;
+    let executable = if cfg!(windows) { format!("{base_name}.exe") } else { base_name.to_owned() };
+    let binary_path = workspace_root.join("target").join("debug").join(executable);
+    if binary_path.is_file() {
+        return Ok(binary_path);
+    }
+
+    let _guard = WORKSPACE_BINARY_BUILD_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("workspace binary build lock was poisoned"))?;
+    if binary_path.is_file() {
+        return Ok(binary_path);
+    }
+
+    let cargo_bin = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo_bin)
+        .current_dir(workspace_root.as_path())
+        .args(["build", "-p", package_name, "--bin", base_name, "--locked"])
+        .status()
+        .with_context(|| format!("failed to build required test binary {base_name}"))?;
+    if !status.success() {
+        anyhow::bail!("building required test binary {base_name} failed with status {status}");
+    }
+    if !binary_path.is_file() {
+        anyhow::bail!(
+            "required test binary is still missing after build: {}",
+            binary_path.display()
+        );
+    }
+
+    Ok(binary_path)
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("failed to resolve workspace root from CARGO_MANIFEST_DIR")
 }
 
 fn spawn_palyrad_with_config_and_env_once(
