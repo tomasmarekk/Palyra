@@ -139,19 +139,13 @@ fn looks_like_commitment(sentence: &str) -> bool {
         "please remind",
         "follow up",
         "send me",
-        "nezapome",
-        "nezapomeň",
-        "pripomen",
-        "připomeň",
     ];
     MARKERS.iter().any(|marker| sentence.contains(marker))
 }
 
 fn infer_due_condition(sentence: &str) -> serde_json::Value {
     let lower = sentence.to_ascii_lowercase();
-    let due_hint = ["tomorrow", "today", "next week", "zítra", "dnes", "příští týden"]
-        .into_iter()
-        .find(|hint| lower.contains(hint));
+    let due_hint = ["tomorrow", "today", "next week"].into_iter().find(|hint| lower.contains(hint));
     match due_hint {
         Some(hint) => json!({ "type": "natural_language", "text": hint }),
         None => json!({ "type": "unspecified" }),
