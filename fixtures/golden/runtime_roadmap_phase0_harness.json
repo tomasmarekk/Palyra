@@ -1,0 +1,86 @@
+[
+  {
+    "schema_version": 1,
+    "fixture_id": "phase0_replay_regression_harness",
+    "capability": "replay_regression_harness",
+    "source_path": "crates/palyra-common/src/release_evals/evaluator.rs",
+    "decision": "adopt_existing_surface",
+    "reason_code": "runtime_roadmap.fixture.replay_regression_accepted",
+    "expected_journal_event": "harness_completed",
+    "redaction_boundary": "sanitized_audit_payload",
+    "evidence_refs": [
+      "fixtures/golden/release_eval_inventory.json",
+      "crates/palyra-common/tests/release_eval_contract.rs"
+    ],
+    "smoke_targets": [
+      {
+        "target_id": "release_eval_replay_bundle_builder",
+        "source_path": "crates/palyra-common/src/release_evals/evaluator.rs",
+        "required_symbol": "build_release_eval_replay_bundle",
+        "reason_code": "runtime_roadmap.fixture.replay_regression_accepted"
+      },
+      {
+        "target_id": "release_eval_contract_test",
+        "source_path": "crates/palyra-common/tests/release_eval_contract.rs",
+        "required_symbol": "release_eval_fixture_covers_all_required_suites_and_inventory",
+        "reason_code": "runtime_roadmap.fixture.replay_regression_accepted"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "phase0_codex_milestone_style",
+    "capability": "milestone_implementation_style",
+    "source_path": "crates/palyra-common/src/runtime_roadmap.rs",
+    "decision": "define_contract",
+    "reason_code": "runtime_roadmap.implementation_style.documented",
+    "expected_journal_event": "contract_completed",
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "crates/palyra-common/src/runtime_roadmap.rs"
+    ],
+    "smoke_targets": [
+      {
+        "target_id": "runtime_roadmap_metadata_only_boundary",
+        "source_path": "crates/palyra-common/src/runtime_roadmap.rs",
+        "required_symbol": "RuntimeRoadmapHarnessFixture",
+        "reason_code": "runtime_roadmap.implementation_style.documented"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "phase0_integration_smoke_validation",
+    "capability": "integration_smoke_validation",
+    "source_path": "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+    "decision": "adopt_existing_surface",
+    "reason_code": "runtime_roadmap.integration_smoke.target_verified",
+    "expected_journal_event": "harness_completed",
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "crates/palyra-daemon/src/journal.rs",
+      "crates/palyra-daemon/src/application/run_stream/tape.rs",
+      "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs"
+    ],
+    "smoke_targets": [
+      {
+        "target_id": "journal_append_log",
+        "source_path": "crates/palyra-daemon/src/journal.rs",
+        "required_symbol": "JournalStore",
+        "reason_code": "runtime_roadmap.integration_smoke.target_verified"
+      },
+      {
+        "target_id": "run_stream_tape_projection",
+        "source_path": "crates/palyra-daemon/src/application/run_stream/tape.rs",
+        "required_symbol": "append_runtime_decision_tape_event",
+        "reason_code": "runtime_roadmap.integration_smoke.target_verified"
+      },
+      {
+        "target_id": "console_runtime_roadmap_diagnostics",
+        "source_path": "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+        "required_symbol": "collect_console_runtime_roadmap_diagnostics",
+        "reason_code": "runtime_roadmap.integration_smoke.target_verified"
+      }
+    ]
+  }
+]

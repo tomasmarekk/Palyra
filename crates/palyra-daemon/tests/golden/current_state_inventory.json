@@ -894,6 +894,27 @@
       },
       {
         "schema_version": 1,
+        "capability": "replay_regression_harness",
+        "label": "Replay regression harness",
+        "summary": "Defines shared replay and regression fixture contracts for roadmap work.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "milestone_implementation_style",
+        "label": "Milestone implementation style",
+        "summary": "Documents the conservative implementation style expected for roadmap milestones.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "integration_smoke_validation",
+        "label": "Integration smoke validation",
+        "summary": "Pins smoke targets for journal, run-stream, fixture, and diagnostics integration points.",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
         "capability": "tool_repair",
         "label": "Tool repair",
         "summary": "Guards tool-call repair parsing and proposal recovery.",
@@ -973,7 +994,37 @@
         "rollout_config_path": "feature_rollouts.attack_surface_audit",
         "default_enabled": false
       }
-    ]
+    ],
+    "phase0_harness": {
+      "valid": true,
+      "projection": {
+        "schema_version": 1,
+        "fixtures_total": 3,
+        "smoke_targets_total": 6,
+        "capabilities": [
+          "replay_regression_harness",
+          "milestone_implementation_style",
+          "integration_smoke_validation"
+        ],
+        "journal_event_names": [
+          "runtime_roadmap.contract.completed",
+          "runtime_roadmap.harness.completed"
+        ],
+        "reason_codes": [
+          "runtime_roadmap.fixture.replay_regression_accepted",
+          "runtime_roadmap.implementation_style.documented",
+          "runtime_roadmap.integration_smoke.target_verified"
+        ],
+        "evidence_refs": [
+          "crates/palyra-common/src/runtime_roadmap.rs",
+          "crates/palyra-common/tests/release_eval_contract.rs",
+          "crates/palyra-daemon/src/application/run_stream/tape.rs",
+          "crates/palyra-daemon/src/journal.rs",
+          "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+          "fixtures/golden/release_eval_inventory.json"
+        ]
+      }
+    }
   },
   "runtime_controls": {
     "schema_version": 1,

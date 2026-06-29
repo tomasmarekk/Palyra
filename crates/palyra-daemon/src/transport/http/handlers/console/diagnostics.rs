@@ -45,7 +45,8 @@ use palyra_common::feature_rollouts::{
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 use palyra_common::runtime_roadmap::{
-    runtime_roadmap_capability_catalog, RUNTIME_ROADMAP_SCHEMA_VERSION,
+    runtime_roadmap_capability_catalog, runtime_roadmap_phase0_harness_projection,
+    RUNTIME_ROADMAP_SCHEMA_VERSION,
 };
 
 // Keeps CLI helper subprocesses (doctor, support-bundle export) from flashing
@@ -1113,9 +1114,21 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
 /// Reports the shared runtime-roadmap contract catalog used by upcoming
 /// runtime-loop work.
 fn collect_console_runtime_roadmap_diagnostics() -> Value {
+    let phase0_harness = match runtime_roadmap_phase0_harness_projection() {
+        Ok(projection) => json!({
+            "valid": true,
+            "projection": projection,
+        }),
+        Err(error) => json!({
+            "valid": false,
+            "error": error.to_string(),
+        }),
+    };
+
     json!({
         "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
         "capabilities": runtime_roadmap_capability_catalog(),
+        "phase0_harness": phase0_harness,
     })
 }
 

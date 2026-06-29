@@ -5,7 +5,7 @@
 //! It is intentionally metadata-only; enabling behavior still belongs behind
 //! the daemon's feature rollout config.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,9 @@ runtime_roadmap_enum! {
         ReasonCodeTaxonomy => "reason_code_taxonomy",
         JournalSchemaExtension => "journal_schema_extension",
         RuntimeLoopRolloutConfig => "runtime_loop_rollout_config",
+        ReplayRegressionHarness => "replay_regression_harness",
+        MilestoneImplementationStyle => "milestone_implementation_style",
+        IntegrationSmokeValidation => "integration_smoke_validation",
         ToolRepair => "tool_repair",
         ProviderStreamNormalizer => "provider_stream_normalizer",
         ChannelTurnKernel => "channel_turn_kernel",
@@ -96,11 +99,14 @@ runtime_roadmap_enum! {
 }
 
 /// Every runtime-roadmap capability, in canonical display order.
-pub const ALL_RUNTIME_ROADMAP_CAPABILITIES: [RuntimeRoadmapCapability; 13] = [
+pub const ALL_RUNTIME_ROADMAP_CAPABILITIES: [RuntimeRoadmapCapability; 16] = [
     RuntimeRoadmapCapability::BaselineContracts,
     RuntimeRoadmapCapability::ReasonCodeTaxonomy,
     RuntimeRoadmapCapability::JournalSchemaExtension,
     RuntimeRoadmapCapability::RuntimeLoopRolloutConfig,
+    RuntimeRoadmapCapability::ReplayRegressionHarness,
+    RuntimeRoadmapCapability::MilestoneImplementationStyle,
+    RuntimeRoadmapCapability::IntegrationSmokeValidation,
     RuntimeRoadmapCapability::ToolRepair,
     RuntimeRoadmapCapability::ProviderStreamNormalizer,
     RuntimeRoadmapCapability::ChannelTurnKernel,
@@ -121,6 +127,9 @@ impl RuntimeRoadmapCapability {
             Self::ReasonCodeTaxonomy => "Reason code taxonomy",
             Self::JournalSchemaExtension => "Journal schema extension",
             Self::RuntimeLoopRolloutConfig => "Runtime loop rollout config",
+            Self::ReplayRegressionHarness => "Replay regression harness",
+            Self::MilestoneImplementationStyle => "Milestone implementation style",
+            Self::IntegrationSmokeValidation => "Integration smoke validation",
             Self::ToolRepair => "Tool repair",
             Self::ProviderStreamNormalizer => "Provider stream normalizer",
             Self::ChannelTurnKernel => "Channel turn kernel",
@@ -148,6 +157,15 @@ impl RuntimeRoadmapCapability {
             }
             Self::RuntimeLoopRolloutConfig => {
                 "Registers default-off rollout gates for new agent-runtime behavior."
+            }
+            Self::ReplayRegressionHarness => {
+                "Defines shared replay and regression fixture contracts for roadmap work."
+            }
+            Self::MilestoneImplementationStyle => {
+                "Documents the conservative implementation style expected for roadmap milestones."
+            }
+            Self::IntegrationSmokeValidation => {
+                "Pins smoke targets for journal, run-stream, fixture, and diagnostics integration points."
             }
             Self::ToolRepair => "Guards tool-call repair parsing and proposal recovery.",
             Self::ProviderStreamNormalizer => {
@@ -178,7 +196,10 @@ impl RuntimeRoadmapCapability {
             Self::BaselineContracts
             | Self::ReasonCodeTaxonomy
             | Self::JournalSchemaExtension
-            | Self::RuntimeLoopRolloutConfig => None,
+            | Self::RuntimeLoopRolloutConfig
+            | Self::ReplayRegressionHarness
+            | Self::MilestoneImplementationStyle
+            | Self::IntegrationSmokeValidation => None,
             Self::ToolRepair => Some(RuntimeRoadmapRolloutGate::new(
                 TOOL_REPAIR_ROLLOUT_ENV,
                 TOOL_REPAIR_ROLLOUT_CONFIG_PATH,
@@ -225,7 +246,10 @@ runtime_roadmap_enum! {
         ContractRegistered => "contract_registered",
         ContractCompleted => "contract_completed",
         ContractFailed => "contract_failed",
-        RolloutGateRegistered => "rollout_gate_registered"
+        RolloutGateRegistered => "rollout_gate_registered",
+        HarnessStarted => "harness_started",
+        HarnessCompleted => "harness_completed",
+        HarnessFailed => "harness_failed"
     }
 }
 
@@ -238,6 +262,9 @@ impl RuntimeRoadmapEventType {
             Self::ContractCompleted => "runtime_roadmap.contract.completed",
             Self::ContractFailed => "runtime_roadmap.contract.failed",
             Self::RolloutGateRegistered => "runtime_roadmap.rollout_gate.registered",
+            Self::HarnessStarted => "runtime_roadmap.harness.started",
+            Self::HarnessCompleted => "runtime_roadmap.harness.completed",
+            Self::HarnessFailed => "runtime_roadmap.harness.failed",
         }
     }
 }
@@ -269,6 +296,10 @@ runtime_roadmap_enum! {
         JournalAppendLogReused => "runtime_roadmap.journal.existing_append_log",
         RolloutDefaultOff => "runtime_roadmap.rollout.default_off",
         RuntimeBehaviorDeferred => "runtime_roadmap.behavior.deferred",
+        ReplayRegressionFixtureAccepted => "runtime_roadmap.fixture.replay_regression_accepted",
+        ImplementationStyleDocumented => "runtime_roadmap.implementation_style.documented",
+        IntegrationSmokeTargetVerified => "runtime_roadmap.integration_smoke.target_verified",
+        FixtureValidationFailed => "runtime_roadmap.fixture.validation_failed",
         InvalidContractRejected => "runtime_roadmap.contract.invalid"
     }
 }
@@ -338,6 +369,302 @@ pub fn runtime_roadmap_capability_catalog() -> Vec<RuntimeRoadmapCapabilityDescr
         .into_iter()
         .map(RuntimeRoadmapCapabilityDescriptor::from_capability)
         .collect()
+}
+
+/// One source-level smoke target required by a Phase 0 roadmap fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRoadmapSmokeTarget {
+    pub target_id: String,
+    pub source_path: String,
+    pub required_symbol: String,
+    pub reason_code: RuntimeRoadmapReasonCode,
+}
+
+impl RuntimeRoadmapSmokeTarget {
+    /// Builds a source-level smoke target with stable identifiers.
+    #[must_use]
+    pub fn new(
+        target_id: impl Into<String>,
+        source_path: impl Into<String>,
+        required_symbol: impl Into<String>,
+        reason_code: RuntimeRoadmapReasonCode,
+    ) -> Self {
+        Self {
+            target_id: target_id.into(),
+            source_path: source_path.into(),
+            required_symbol: required_symbol.into(),
+            reason_code,
+        }
+    }
+
+    fn validate(&self) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+        validate_slug("smoke target id", self.target_id.as_str())?;
+        validate_repo_relative_path("smoke target source path", self.source_path.as_str())?;
+        if self.required_symbol.trim().is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingRequiredSymbol {
+                target_id: self.target_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Shared replay/regression fixture contract for Phase 0 roadmap milestones.
+///
+/// The fixture is metadata-only: it names existing sources, expected journal
+/// event names, reason codes, redaction boundaries, and evidence references so
+/// later runtime milestones can reuse one audit vocabulary without creating a
+/// second storage path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRoadmapHarnessFixture {
+    pub schema_version: u32,
+    pub fixture_id: String,
+    pub capability: RuntimeRoadmapCapability,
+    pub source_path: String,
+    pub decision: RuntimeRoadmapDecision,
+    pub reason_code: RuntimeRoadmapReasonCode,
+    pub expected_journal_event: RuntimeRoadmapEventType,
+    pub redaction_boundary: RuntimeRoadmapRedactionBoundary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub smoke_targets: Vec<RuntimeRoadmapSmokeTarget>,
+}
+
+impl RuntimeRoadmapHarnessFixture {
+    /// Builds a Phase 0 harness fixture using the current schema version.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        fixture_id: impl Into<String>,
+        capability: RuntimeRoadmapCapability,
+        source_path: impl Into<String>,
+        decision: RuntimeRoadmapDecision,
+        reason_code: RuntimeRoadmapReasonCode,
+        expected_journal_event: RuntimeRoadmapEventType,
+        redaction_boundary: RuntimeRoadmapRedactionBoundary,
+        evidence_refs: Vec<String>,
+        smoke_targets: Vec<RuntimeRoadmapSmokeTarget>,
+    ) -> Self {
+        Self {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            fixture_id: fixture_id.into(),
+            capability,
+            source_path: source_path.into(),
+            decision,
+            reason_code,
+            expected_journal_event,
+            redaction_boundary,
+            evidence_refs,
+            smoke_targets,
+        }
+    }
+
+    /// Validates that the fixture can be used in journal and replay-oriented tests.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeRoadmapHarnessValidationError`] when the fixture uses an
+    /// unsupported schema, unsafe path, empty evidence set, invalid smoke target,
+    /// or a journal event that violates the canonical rollout metadata rules.
+    pub fn validate(&self) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+        if self.schema_version != RUNTIME_ROADMAP_SCHEMA_VERSION {
+            return Err(RuntimeRoadmapHarnessValidationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            });
+        }
+        validate_slug("fixture id", self.fixture_id.as_str())?;
+        validate_repo_relative_path("fixture source path", self.source_path.as_str())?;
+        if self.evidence_refs.is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingEvidenceRef {
+                fixture_id: self.fixture_id.clone(),
+            });
+        }
+        for evidence_ref in &self.evidence_refs {
+            validate_repo_relative_path("fixture evidence ref", evidence_ref.as_str())?;
+        }
+        for smoke_target in &self.smoke_targets {
+            smoke_target.validate()?;
+        }
+        self.to_journal_event()?
+            .validate()
+            .map_err(RuntimeRoadmapHarnessValidationError::JournalEventInvalid)?;
+        Ok(())
+    }
+
+    /// Builds the journal payload associated with this fixture.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeRoadmapHarnessValidationError`] if the fixture cannot be
+    /// represented safely as a journal event.
+    pub fn to_journal_event(
+        &self,
+    ) -> Result<RuntimeRoadmapJournalEvent, RuntimeRoadmapHarnessValidationError> {
+        if self.schema_version != RUNTIME_ROADMAP_SCHEMA_VERSION {
+            return Err(RuntimeRoadmapHarnessValidationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            });
+        }
+        let mut event = RuntimeRoadmapJournalEvent::new(
+            self.expected_journal_event,
+            self.capability,
+            self.decision,
+            self.reason_code,
+            self.redaction_boundary,
+        );
+        for evidence_ref in &self.evidence_refs {
+            event = event.with_evidence_ref(evidence_ref);
+        }
+        Ok(event)
+    }
+}
+
+/// Read model exposed through diagnostics for the Phase 0 harness fixtures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRoadmapHarnessProjection {
+    pub schema_version: u32,
+    pub fixtures_total: usize,
+    pub smoke_targets_total: usize,
+    pub capabilities: Vec<RuntimeRoadmapCapability>,
+    pub journal_event_names: Vec<String>,
+    pub reason_codes: Vec<RuntimeRoadmapReasonCode>,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Returns the canonical Phase 0 harness fixture catalog.
+#[must_use]
+pub fn runtime_roadmap_phase0_harness_fixtures() -> Vec<RuntimeRoadmapHarnessFixture> {
+    vec![
+        RuntimeRoadmapHarnessFixture::new(
+            "phase0_replay_regression_harness",
+            RuntimeRoadmapCapability::ReplayRegressionHarness,
+            "crates/palyra-common/src/release_evals/evaluator.rs",
+            RuntimeRoadmapDecision::AdoptExistingSurface,
+            RuntimeRoadmapReasonCode::ReplayRegressionFixtureAccepted,
+            RuntimeRoadmapEventType::HarnessCompleted,
+            RuntimeRoadmapRedactionBoundary::SanitizedAuditPayload,
+            vec![
+                "fixtures/golden/release_eval_inventory.json".to_owned(),
+                "crates/palyra-common/tests/release_eval_contract.rs".to_owned(),
+            ],
+            vec![
+                RuntimeRoadmapSmokeTarget::new(
+                    "release_eval_replay_bundle_builder",
+                    "crates/palyra-common/src/release_evals/evaluator.rs",
+                    "build_release_eval_replay_bundle",
+                    RuntimeRoadmapReasonCode::ReplayRegressionFixtureAccepted,
+                ),
+                RuntimeRoadmapSmokeTarget::new(
+                    "release_eval_contract_test",
+                    "crates/palyra-common/tests/release_eval_contract.rs",
+                    "release_eval_fixture_covers_all_required_suites_and_inventory",
+                    RuntimeRoadmapReasonCode::ReplayRegressionFixtureAccepted,
+                ),
+            ],
+        ),
+        RuntimeRoadmapHarnessFixture::new(
+            "phase0_codex_milestone_style",
+            RuntimeRoadmapCapability::MilestoneImplementationStyle,
+            "crates/palyra-common/src/runtime_roadmap.rs",
+            RuntimeRoadmapDecision::DefineContract,
+            RuntimeRoadmapReasonCode::ImplementationStyleDocumented,
+            RuntimeRoadmapEventType::ContractCompleted,
+            RuntimeRoadmapRedactionBoundary::MetadataOnly,
+            vec!["crates/palyra-common/src/runtime_roadmap.rs".to_owned()],
+            vec![RuntimeRoadmapSmokeTarget::new(
+                "runtime_roadmap_metadata_only_boundary",
+                "crates/palyra-common/src/runtime_roadmap.rs",
+                "RuntimeRoadmapHarnessFixture",
+                RuntimeRoadmapReasonCode::ImplementationStyleDocumented,
+            )],
+        ),
+        RuntimeRoadmapHarnessFixture::new(
+            "phase0_integration_smoke_validation",
+            RuntimeRoadmapCapability::IntegrationSmokeValidation,
+            "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+            RuntimeRoadmapDecision::AdoptExistingSurface,
+            RuntimeRoadmapReasonCode::IntegrationSmokeTargetVerified,
+            RuntimeRoadmapEventType::HarnessCompleted,
+            RuntimeRoadmapRedactionBoundary::MetadataOnly,
+            vec![
+                "crates/palyra-daemon/src/journal.rs".to_owned(),
+                "crates/palyra-daemon/src/application/run_stream/tape.rs".to_owned(),
+                "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs"
+                    .to_owned(),
+            ],
+            vec![
+                RuntimeRoadmapSmokeTarget::new(
+                    "journal_append_log",
+                    "crates/palyra-daemon/src/journal.rs",
+                    "JournalStore",
+                    RuntimeRoadmapReasonCode::IntegrationSmokeTargetVerified,
+                ),
+                RuntimeRoadmapSmokeTarget::new(
+                    "run_stream_tape_projection",
+                    "crates/palyra-daemon/src/application/run_stream/tape.rs",
+                    "append_runtime_decision_tape_event",
+                    RuntimeRoadmapReasonCode::IntegrationSmokeTargetVerified,
+                ),
+                RuntimeRoadmapSmokeTarget::new(
+                    "console_runtime_roadmap_diagnostics",
+                    "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+                    "collect_console_runtime_roadmap_diagnostics",
+                    RuntimeRoadmapReasonCode::IntegrationSmokeTargetVerified,
+                ),
+            ],
+        ),
+    ]
+}
+
+/// Projects harness fixtures into a compact diagnostics/read-model summary.
+///
+/// # Errors
+/// Returns [`RuntimeRoadmapHarnessValidationError`] when any fixture is invalid.
+pub fn project_runtime_roadmap_harness(
+    fixtures: &[RuntimeRoadmapHarnessFixture],
+) -> Result<RuntimeRoadmapHarnessProjection, RuntimeRoadmapHarnessValidationError> {
+    let mut capabilities = BTreeSet::new();
+    let mut journal_event_names = BTreeSet::new();
+    let mut reason_codes = BTreeSet::new();
+    let mut evidence_refs = BTreeSet::new();
+    let mut smoke_targets_total = 0;
+
+    for fixture in fixtures {
+        fixture.validate()?;
+        capabilities.insert(fixture.capability);
+        journal_event_names.insert(fixture.expected_journal_event.journal_event().to_owned());
+        reason_codes.insert(fixture.reason_code);
+        smoke_targets_total += fixture.smoke_targets.len();
+        for evidence_ref in &fixture.evidence_refs {
+            evidence_refs.insert(evidence_ref.clone());
+        }
+        for smoke_target in &fixture.smoke_targets {
+            reason_codes.insert(smoke_target.reason_code);
+        }
+    }
+
+    Ok(RuntimeRoadmapHarnessProjection {
+        schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+        fixtures_total: fixtures.len(),
+        smoke_targets_total,
+        capabilities: capabilities.into_iter().collect(),
+        journal_event_names: journal_event_names.into_iter().collect(),
+        reason_codes: reason_codes.into_iter().collect(),
+        evidence_refs: evidence_refs.into_iter().collect(),
+    })
+}
+
+/// Builds the canonical diagnostics projection for Phase 0 harness fixtures.
+///
+/// # Errors
+/// Returns [`RuntimeRoadmapHarnessValidationError`] if the built-in catalog drifts.
+pub fn runtime_roadmap_phase0_harness_projection(
+) -> Result<RuntimeRoadmapHarnessProjection, RuntimeRoadmapHarnessValidationError> {
+    project_runtime_roadmap_harness(runtime_roadmap_phase0_harness_fixtures().as_slice())
 }
 
 /// Journal payload envelope for roadmap baseline and rollout decisions.
@@ -464,17 +791,79 @@ pub enum RuntimeRoadmapValidationError {
     },
 }
 
+/// Validation failure for Phase 0 harness fixtures and smoke targets.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeRoadmapHarnessValidationError {
+    #[error(
+        "runtime roadmap harness schema version {actual} is not supported; expected {expected}"
+    )]
+    UnsupportedSchemaVersion { actual: u32, expected: u32 },
+    #[error("{field} must be a non-empty lowercase ASCII slug")]
+    InvalidSlug { field: &'static str, value: String },
+    #[error("{field} must be a repo-relative path without traversal or platform separators")]
+    InvalidRepoRelativePath { field: &'static str, value: String },
+    #[error("{fixture_id} must include at least one evidence reference")]
+    MissingEvidenceRef { fixture_id: String },
+    #[error("smoke target {target_id} must name a required symbol")]
+    MissingRequiredSymbol { target_id: String },
+    #[error("harness fixture cannot be represented as a valid journal event: {0}")]
+    JournalEventInvalid(RuntimeRoadmapValidationError),
+}
+
+fn validate_slug(
+    field: &'static str,
+    value: &str,
+) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+    let valid = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeRoadmapHarnessValidationError::InvalidSlug { field, value: value.to_owned() })
+    }
+}
+
+fn validate_repo_relative_path(
+    field: &'static str,
+    value: &str,
+) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+    let invalid = value.trim().is_empty()
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    if invalid {
+        Err(RuntimeRoadmapHarnessValidationError::InvalidRepoRelativePath {
+            field,
+            value: value.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        runtime_roadmap_capability_catalog, RuntimeRoadmapCapability, RuntimeRoadmapDecision,
-        RuntimeRoadmapEventType, RuntimeRoadmapJournalEvent, RuntimeRoadmapReasonCode,
-        RuntimeRoadmapRedactionBoundary, RuntimeRoadmapValidationError,
-        ALL_RUNTIME_ROADMAP_CAPABILITIES, RUNTIME_ROADMAP_SCHEMA_VERSION,
+        project_runtime_roadmap_harness, runtime_roadmap_capability_catalog,
+        runtime_roadmap_phase0_harness_fixtures, runtime_roadmap_phase0_harness_projection,
+        RuntimeRoadmapCapability, RuntimeRoadmapDecision, RuntimeRoadmapEventType,
+        RuntimeRoadmapHarnessFixture, RuntimeRoadmapHarnessValidationError,
+        RuntimeRoadmapJournalEvent, RuntimeRoadmapReasonCode, RuntimeRoadmapRedactionBoundary,
+        RuntimeRoadmapValidationError, ALL_RUNTIME_ROADMAP_CAPABILITIES,
+        RUNTIME_ROADMAP_SCHEMA_VERSION,
     };
     use crate::feature_rollouts::{TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV};
+
+    const PHASE0_HARNESS_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/golden/runtime_roadmap_phase0_harness.json"
+    );
 
     #[test]
     fn roadmap_capability_catalog_exposes_rollout_boundaries() {
@@ -576,5 +965,137 @@ mod tests {
             event.validate(),
             Err(RuntimeRoadmapValidationError::UnsupportedSchemaVersion { actual: 2, expected: 1 })
         ));
+    }
+
+    #[test]
+    fn phase0_harness_fixture_serializes_stable_contract_fields() {
+        let fixture = runtime_roadmap_phase0_harness_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "phase0_replay_regression_harness")
+            .expect("replay regression fixture should be declared");
+
+        fixture.validate().expect("built-in fixture should validate");
+        let event = fixture.to_journal_event().expect("fixture should build journal event");
+        assert_eq!(event.journal_event_name(), "runtime_roadmap.harness.completed");
+
+        let encoded = serde_json::to_value(&fixture).expect("fixture should serialize");
+        assert_eq!(encoded["schema_version"], 1);
+        assert_eq!(encoded["capability"], "replay_regression_harness");
+        assert_eq!(encoded["reason_code"], "runtime_roadmap.fixture.replay_regression_accepted");
+        assert_eq!(encoded["expected_journal_event"], "harness_completed");
+        assert_eq!(encoded["redaction_boundary"], "sanitized_audit_payload");
+        assert_eq!(
+            encoded["smoke_targets"][0]["required_symbol"],
+            "build_release_eval_replay_bundle"
+        );
+    }
+
+    #[test]
+    fn phase0_harness_projection_covers_foundation_capabilities() {
+        let projection =
+            runtime_roadmap_phase0_harness_projection().expect("projection should validate");
+
+        assert_eq!(projection.schema_version, RUNTIME_ROADMAP_SCHEMA_VERSION);
+        assert_eq!(projection.fixtures_total, 3);
+        assert_eq!(projection.smoke_targets_total, 6);
+        assert_eq!(
+            projection.capabilities,
+            vec![
+                RuntimeRoadmapCapability::ReplayRegressionHarness,
+                RuntimeRoadmapCapability::MilestoneImplementationStyle,
+                RuntimeRoadmapCapability::IntegrationSmokeValidation,
+            ]
+        );
+        assert!(projection
+            .journal_event_names
+            .contains(&"runtime_roadmap.harness.completed".to_owned()));
+        assert!(projection
+            .reason_codes
+            .contains(&RuntimeRoadmapReasonCode::IntegrationSmokeTargetVerified));
+        assert!(projection
+            .evidence_refs
+            .contains(&"fixtures/golden/release_eval_inventory.json".to_owned()));
+    }
+
+    #[test]
+    fn phase0_harness_rejects_unsafe_fixture_paths() {
+        let mut fixture = runtime_roadmap_phase0_harness_fixtures()
+            .into_iter()
+            .next()
+            .expect("built-in fixtures should not be empty");
+        fixture.source_path = "../escaped.json".to_owned();
+
+        let error = fixture.validate().expect_err("path traversal should be rejected");
+        assert_eq!(
+            error,
+            RuntimeRoadmapHarnessValidationError::InvalidRepoRelativePath {
+                field: "fixture source path",
+                value: "../escaped.json".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn phase0_harness_rejects_missing_evidence() {
+        let mut fixture = runtime_roadmap_phase0_harness_fixtures()
+            .into_iter()
+            .next()
+            .expect("built-in fixtures should not be empty");
+        fixture.evidence_refs.clear();
+
+        let error = fixture.validate().expect_err("evidence refs should be required");
+        assert_eq!(
+            error,
+            RuntimeRoadmapHarnessValidationError::MissingEvidenceRef {
+                fixture_id: "phase0_replay_regression_harness".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn phase0_harness_golden_fixture_matches_generated_catalog() {
+        let fixture_bytes =
+            std::fs::read(PHASE0_HARNESS_FIXTURE).expect("golden harness fixture should exist");
+        let from_disk: Vec<RuntimeRoadmapHarnessFixture> =
+            serde_json::from_slice(fixture_bytes.as_slice())
+                .expect("golden harness fixture should deserialize");
+        let generated = runtime_roadmap_phase0_harness_fixtures();
+
+        assert_eq!(from_disk, generated);
+        project_runtime_roadmap_harness(from_disk.as_slice())
+            .expect("golden harness fixture should project");
+    }
+
+    #[test]
+    fn phase0_smoke_targets_reference_existing_sources_and_symbols() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        for fixture in runtime_roadmap_phase0_harness_fixtures() {
+            let source_path = repo_root.join(fixture.source_path.as_str());
+            assert!(
+                source_path.is_file(),
+                "fixture source path should exist: {}",
+                fixture.source_path
+            );
+            for evidence_ref in &fixture.evidence_refs {
+                assert!(
+                    repo_root.join(evidence_ref).is_file(),
+                    "fixture evidence ref should exist: {evidence_ref}"
+                );
+            }
+            for smoke_target in fixture.smoke_targets {
+                let target_path = repo_root.join(smoke_target.source_path.as_str());
+                let source =
+                    std::fs::read_to_string(target_path.as_path()).unwrap_or_else(|error| {
+                        panic!("failed to read smoke target {}: {error}", smoke_target.source_path)
+                    });
+                assert!(
+                    source.contains(smoke_target.required_symbol.as_str()),
+                    "smoke target {} should contain symbol {}",
+                    smoke_target.target_id,
+                    smoke_target.required_symbol
+                );
+            }
+        }
     }
 }
