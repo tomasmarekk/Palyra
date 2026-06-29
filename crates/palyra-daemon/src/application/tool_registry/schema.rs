@@ -16,9 +16,9 @@ use super::types::{
 
 /// Why a tool schema cannot be expressed in the target provider dialect.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SchemaCompatibilityError {
-    pub(super) reason_code: String,
-    pub(super) message: String,
+pub(crate) struct SchemaCompatibilityError {
+    pub(crate) reason_code: String,
+    pub(crate) message: String,
 }
 
 /// Produces the provider-safe form of an internal tool schema.
@@ -30,7 +30,7 @@ pub(super) struct SchemaCompatibilityError {
 /// # Errors
 /// Returns [`SchemaCompatibilityError`] when the schema exceeds the depth or
 /// property gates, or uses constructs outside the supported provider subset.
-pub(super) fn sanitize_schema_for_provider(
+pub(crate) fn sanitize_schema_for_provider(
     schema: &Value,
     dialect: ToolSchemaDialect,
 ) -> Result<Value, SchemaCompatibilityError> {

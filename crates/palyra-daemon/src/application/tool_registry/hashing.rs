@@ -44,12 +44,12 @@ pub(super) fn catalog_hash_payload(snapshot: &ModelVisibleToolCatalogSnapshot) -
 }
 
 /// Hex-encoded SHA-256 of the canonical JSON form of `value`.
-pub(super) fn stable_hash_value(value: &Value) -> String {
+pub(crate) fn stable_hash_value(value: &Value) -> String {
     stable_hash_bytes(canonical_json_bytes(value).as_slice())
 }
 
 /// Hex-encoded SHA-256 of raw bytes.
-pub(super) fn stable_hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn stable_hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())

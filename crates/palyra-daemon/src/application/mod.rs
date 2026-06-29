@@ -16,6 +16,7 @@ pub mod execution_gate;
 pub mod inbound_coalescer;
 pub mod instruction_compiler;
 pub mod learning;
+pub mod mcp_broker;
 pub mod memory;
 pub mod memory_provider;
 pub mod outbound_lifecycle;

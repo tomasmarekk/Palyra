@@ -41,6 +41,19 @@ const LAST_GOOD_GRACE_MS: u64 = 120_000;
 pub(crate) fn build_model_visible_tool_catalog_snapshot(
     request: ToolCatalogBuildRequest<'_>,
 ) -> ModelVisibleToolCatalogSnapshot {
+    build_model_visible_tool_catalog_snapshot_with_external_tools(request, &[])
+}
+
+/// Builds a catalog snapshot with additional externally-discovered tools.
+///
+/// External entries are filtered through the same allowlist, surface, runtime,
+/// provider-schema, deterministic ordering, and catalog hashing gates as
+/// builtins. Callers are responsible for namespacing external tools before
+/// import so provider-visible names cannot collide with builtins.
+pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_tools(
+    request: ToolCatalogBuildRequest<'_>,
+    external_tools: &[ToolRegistryEntry],
+) -> ModelVisibleToolCatalogSnapshot {
     let dialect = ToolSchemaDialect::from_provider_kind(request.provider_kind);
     let mut filtered_tools = Vec::new();
     let allowed_tools = normalized_configured_tools(
@@ -53,8 +66,11 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
         request.created_at_unix_ms,
     );
     let mut authorized_target_tools = Vec::new();
+    let mut registry = registry_entries();
+    registry.extend(external_tools.iter().cloned());
+    let registered_names = registry.iter().map(|entry| entry.name.clone()).collect::<BTreeSet<_>>();
 
-    for entry in registry_entries() {
+    for entry in registry {
         if is_catalog_bridge_tool(entry.name.as_str()) {
             continue;
         }
@@ -99,7 +115,7 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot(
     // Surface allowlisted names with no registry entry so operators see
     // typos instead of tools silently never appearing.
     for allowed in &allowed_tools {
-        if registry_entry(allowed.as_str()).is_none() {
+        if !registered_names.contains(allowed.as_str()) {
             filtered_tools.push(filtered(
                 allowed.as_str(),
                 ToolCatalogFilterReasonCode::UnknownTool,
