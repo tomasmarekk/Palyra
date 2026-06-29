@@ -69,6 +69,14 @@ use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
+    decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
+    tool_repair_audit_events_for_decision, NormalizedAssistantOutput, ProviderNeutralStreamEvent,
+    ProviderStreamSegment, ToolProposalCandidate, ToolRepairAuditEvent, ToolRepairBoundary,
+    ToolRepairBoundaryState, ToolRepairCandidate, ToolRepairCandidateFormat, ToolRepairDecision,
+    ToolRepairDecisionStatus, ToolRepairStreamNormalizer, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+};
+#[allow(unused_imports)]
+pub use palyra_model_providers::{
     AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
     EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
     PromptCacheStrategy, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,

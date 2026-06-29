@@ -12,6 +12,7 @@ pub mod errors;
 pub mod providers;
 pub mod snapshots;
 pub mod streaming;
+pub mod tool_repair;
 
 mod redaction;
 
@@ -83,4 +84,13 @@ pub use snapshots::{
 };
 pub use streaming::{
     provider_output_from_text_and_tools, ProviderStreamAccumulator, ProviderStreamEvent,
+};
+pub use tool_repair::{
+    decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
+    tool_repair_audit_events_for_decision, NormalizedAssistantOutput, ProviderNeutralStreamEvent,
+    ProviderStreamSegment, ToolProposalCandidate, ToolRepairAuditEvent, ToolRepairBoundary,
+    ToolRepairBoundaryState, ToolRepairCandidate, ToolRepairCandidateFormat, ToolRepairDecision,
+    ToolRepairDecisionStatus, ToolRepairStreamNormalizer, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+    PROVIDER_STREAM_NORMALIZED_EVENT, PROVIDER_STREAM_REPAIR_BOUNDARY_CLOSED_EVENT,
+    TOOL_REPAIR_ACCEPTED_EVENT, TOOL_REPAIR_CANDIDATE_DETECTED_EVENT, TOOL_REPAIR_REJECTED_EVENT,
 };

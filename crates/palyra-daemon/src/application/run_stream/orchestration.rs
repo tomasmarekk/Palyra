@@ -51,10 +51,13 @@ use crate::{
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
     model_provider::{
-        bounded_provider_turn_output_for_persistence, provider_events_from_output, ProviderEvent,
-        ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        bounded_provider_turn_output_for_persistence, decide_tool_repair_candidate,
+        normalize_assistant_output_for_tool_repair, provider_events_from_output,
+        tool_repair_audit_events_for_decision, ProviderEvent, ProviderFinishReason,
+        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
         ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -2762,6 +2765,22 @@ async fn process_run_stream_provider_response(
     }
 
     if !has_pending_tool_results {
+        if let Err(error) = append_tool_repair_audit_tape_events_if_relevant(
+            runtime_state,
+            run_id,
+            tape_seq,
+            &provider_output,
+            tool_catalog_snapshot,
+        )
+        .await
+        {
+            warn!(
+                run_id,
+                status_code = ?error.code(),
+                status_message = %error.message(),
+                "failed to append observe-only tool repair audit tape events"
+            );
+        }
         if let Some(message) = tool_calls_finish_without_tool_payload(&provider_output) {
             return Ok(RunStreamProviderResponseOutcome::Failed {
                 message,
@@ -2817,6 +2836,74 @@ async fn process_run_stream_provider_response(
             .then_some(Box::new(provider_output)),
         final_reply_tokens_deferred: !has_pending_tool_results && !stream_model_tokens_immediately,
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_tool_repair_audit_tape_events_if_relevant(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    provider_output: &ProviderTurnOutput,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> Result<(), Status> {
+    if !provider_output_needs_tool_repair_audit(provider_output) {
+        return Ok(());
+    }
+    let normalized_output = normalize_assistant_output_for_tool_repair(provider_output);
+    let decision = decide_tool_repair_candidate(
+        provider_output.full_text.as_str(),
+        tool_catalog_snapshot.tools.iter().map(|tool| tool.name.as_str()),
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+    );
+    for event in tool_repair_audit_events_for_decision(&normalized_output, &decision) {
+        runtime_state
+            .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+                run_id: run_id.to_owned(),
+                seq: *tape_seq,
+                event_type: event.event_type.clone(),
+                payload_json: json!({
+                    "schema_version": 1,
+                    "event": event.event_type,
+                    "runtime_mode": "observe_only",
+                    "redaction_level": "hash_only",
+                    "tool_catalog_snapshot_id": tool_catalog_snapshot.snapshot_id,
+                    "tool_catalog_hash": tool_catalog_snapshot.catalog_hash,
+                    "rollouts": {
+                        "tool_repair": {
+                            "enabled": runtime_state.config.feature_rollouts.tool_repair.enabled,
+                            "source": runtime_state.config.feature_rollouts.tool_repair.source,
+                        },
+                        "provider_stream_normalizer": {
+                            "enabled": runtime_state
+                                .config
+                                .feature_rollouts
+                                .provider_stream_normalizer
+                                .enabled,
+                            "source": runtime_state
+                                .config
+                                .feature_rollouts
+                                .provider_stream_normalizer
+                                .source,
+                        },
+                    },
+                    "audit": event.payload_json,
+                })
+                .to_string(),
+            })
+            .await?;
+        *tape_seq = (*tape_seq).saturating_add(1);
+    }
+    Ok(())
+}
+
+fn provider_output_needs_tool_repair_audit(output: &ProviderTurnOutput) -> bool {
+    let has_structured_tool_call = output
+        .content_parts
+        .iter()
+        .any(|part| matches!(part, ProviderOutputContentPart::ToolCall { .. }));
+    !has_structured_tool_call
+        && (matches!(output.finish_reason, ProviderFinishReason::ToolCalls)
+            || contains_raw_provider_tool_call_markup(output.full_text.as_str()))
 }
 
 fn tool_result_to_provider_message(
@@ -3958,17 +4045,17 @@ mod tests {
         incomplete_terminal_final_answer, is_browser_tool_name,
         is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
         provider_error_partial_summary, provider_model_override_for_routing,
-        provider_request_deadline_timeout, provider_request_timeout_message,
-        provider_request_timeout_status, provider_timeout_termination_reason,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
-        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
+        provider_request_timeout_message, provider_request_timeout_status,
+        provider_timeout_termination_reason, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, should_emit_budget_exhausted_partial_summary,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunLoopPhase, RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
@@ -5081,6 +5168,43 @@ mod tests {
         assert!(!contains_raw_provider_tool_call_markup(
             "The page had no tool calls and the final answer is complete."
         ));
+    }
+
+    #[test]
+    fn tool_repair_audit_runs_for_raw_markup_without_structured_tool() {
+        let output = ProviderTurnOutput::text(
+            r#"<tool_call name="palyra.fs.read">{"path":"Cargo.toml"}</tool_call>"#.to_owned(),
+            ProviderFinishReason::ToolCalls,
+            ProviderUsage::new(10, 20, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        assert!(provider_output_needs_tool_repair_audit(&output));
+    }
+
+    #[test]
+    fn tool_repair_audit_skips_normal_final_answer_and_structured_tool() {
+        let final_answer = ProviderTurnOutput::text(
+            "Done.".to_owned(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(10, 20, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+        let structured_tool = ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![ProviderOutputContentPart::ToolCall {
+                proposal_id: "toolu_test_01".to_owned(),
+                tool_name: "palyra.fs.read".to_owned(),
+                input_json: json!({"path":"Cargo.toml"}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(10, 20, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        };
+
+        assert!(!provider_output_needs_tool_repair_audit(&final_answer));
+        assert!(!provider_output_needs_tool_repair_audit(&structured_tool));
     }
 
     #[test]
