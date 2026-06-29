@@ -13299,7 +13299,7 @@ impl JournalStore {
                     created_at_unix_ms
                 FROM work_item_events
                 WHERE work_item_ulid = ?1
-                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                ORDER BY created_at_unix_ms ASC, rowid ASC
                 LIMIT ?2
             "#,
         )?;
@@ -13667,7 +13667,7 @@ impl JournalStore {
                     created_at_unix_ms
                 FROM commitment_sources
                 WHERE commitment_ulid = ?1
-                ORDER BY created_at_unix_ms ASC, source_ulid ASC
+                ORDER BY created_at_unix_ms ASC, rowid ASC
             "#,
         )?;
         let rows = statement.query_map(params![commitment_id], map_commitment_source_row)?;
@@ -13699,7 +13699,7 @@ impl JournalStore {
                     created_at_unix_ms
                 FROM commitment_events
                 WHERE commitment_ulid = ?1
-                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                ORDER BY created_at_unix_ms ASC, rowid ASC
                 LIMIT ?2
             "#,
         )?;
@@ -13792,7 +13792,7 @@ impl JournalStore {
                     updated_at_unix_ms
                 FROM commitment_delivery_attempts
                 WHERE commitment_ulid = ?1
-                ORDER BY created_at_unix_ms DESC, attempt_ulid DESC
+                ORDER BY created_at_unix_ms DESC, rowid DESC
                 LIMIT ?2
             "#,
         )?;
