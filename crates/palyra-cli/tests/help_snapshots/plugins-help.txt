@@ -4,12 +4,16 @@ Usage: palyra plugins [OPTIONS] <COMMAND>
 
 Commands:
   list
-  inspect   [aliases: info]
+  inspect      [aliases: info]
   discover
   check
   explain
   doctor
-  install   [aliases: bind]
+  validate
+  dry-run
+  permissions
+  test
+  install      [aliases: bind]
   update
   enable
   disable
