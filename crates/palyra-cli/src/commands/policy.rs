@@ -9,6 +9,7 @@ use palyra_common::tool_catalog::{
     sensitive_allowlisted_tool_names, tool_policy_capability_names, tool_requires_approval,
     SENSITIVE_CAPABILITY_POLICY_NAMES,
 };
+use serde::Serialize;
 
 /// Runs `palyra policy explain`, emitting the decision in JSON, NDJSON, or
 /// the pinned text form.
@@ -135,7 +136,310 @@ pub(crate) fn run_policy(command: PolicyCommand) -> Result<()> {
             }
             std::io::stdout().flush().context("stdout flush failed")
         }
+        PolicyCommand::Conformance { baseline, json } => {
+            let report = build_policy_posture_report(None, None)?;
+            if let Some(path) = baseline {
+                let diff = build_policy_diff_report(path.as_str(), &report)?;
+                emit_policy_report(&diff, json)
+            } else {
+                emit_policy_report(&report, json)
+            }
+        }
+        PolicyCommand::Diff { baseline, candidate, json } => {
+            let baseline_value = read_policy_report_value(baseline.as_str())?;
+            let candidate_value = read_policy_report_value(candidate.as_str())?;
+            let report = diff_policy_report_values(&baseline_value, &candidate_value);
+            emit_policy_report(&report, json)
+        }
+        PolicyCommand::Posture { session, json } => {
+            let report = build_policy_posture_report(session, None)?;
+            emit_policy_report(&report, json)
+        }
+        PolicyCommand::ToolPosture { catalog, json } => {
+            let report = build_policy_posture_report(None, catalog)?;
+            emit_policy_report(&report, json)
+        }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PolicyPostureReport {
+    schema_version: u32,
+    report_kind: &'static str,
+    status: &'static str,
+    source: String,
+    session: Option<String>,
+    weaker_rules: Vec<PolicyRuleFinding>,
+    missing_rules: Vec<PolicyRuleFinding>,
+    invalid_rules: Vec<PolicyRuleFinding>,
+    fix_hints: Vec<String>,
+    findings: Vec<PolicyRuleFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PolicyRuleFinding {
+    severity: String,
+    code: String,
+    message: String,
+    fix_hint: String,
+}
+
+fn build_policy_posture_report(
+    session: Option<String>,
+    catalog: Option<String>,
+) -> Result<PolicyPostureReport> {
+    let (allowlisted_tools, source) = load_policy_allowlisted_tools()?;
+    let mut weaker_rules = Vec::new();
+    let mut missing_rules = Vec::new();
+    let mut invalid_rules = Vec::new();
+
+    if allowlisted_tools.iter().any(|entry| entry == "*") {
+        weaker_rules.push(policy_finding(
+            "critical",
+            "wildcard_allow_risk",
+            "tool allowlist contains a wildcard entry",
+            "replace '*' with explicit tool names and require approval for sensitive tools",
+        ));
+    }
+    if !allowlisted_tools.is_empty() && env::var("PALYRA_TOOL_CALL_DENIED_TOOLS").is_err() {
+        missing_rules.push(policy_finding(
+            "warning",
+            "missing_explicit_deny_rules",
+            "tool allowlist is configured without an explicit deny overlay",
+            "add deny rules for high-risk tools that must never run in this profile",
+        ));
+    }
+    if env::var("PALYRA_HTTP_FETCH_ALLOWED_HOSTS").is_err()
+        && env::var("PALYRA_HTTP_FETCH_ALLOWLIST").is_err()
+    {
+        missing_rules.push(policy_finding(
+            "warning",
+            "egress_without_allowlist",
+            "HTTP fetch policy has no visible host allowlist override",
+            "set an explicit HTTP fetch allowlist before enabling network egress in CI or production",
+        ));
+    }
+    if env::var("PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE")
+        .map(|value| value.eq_ignore_ascii_case("group"))
+        .unwrap_or(false)
+        && env::var("PALYRA_CHANNEL_ROUTER_GROUP_GUARDRAILS").is_err()
+    {
+        missing_rules.push(policy_finding(
+            "warning",
+            "group_delivery_without_guardrails",
+            "group delivery mode is enabled without a visible guardrail override",
+            "configure channel-router guardrails before enabling group delivery",
+        ));
+    }
+
+    for sensitive in sensitive_allowlisted_tool_names(allowlisted_tools.as_slice()) {
+        if !tool_requires_approval(sensitive.as_str()) {
+            invalid_rules.push(policy_finding(
+                "critical",
+                "secret_access_without_approval_gate",
+                format!("sensitive tool '{sensitive}' is allowlisted without an approval gate"),
+                "mark the tool approval-required or remove it from the allowlist",
+            ));
+        }
+    }
+    if let Some(catalog_path) = catalog {
+        append_tool_catalog_posture_findings(catalog_path.as_str(), &mut invalid_rules)?;
+    }
+
+    let mut findings = Vec::new();
+    findings.extend(weaker_rules.clone());
+    findings.extend(missing_rules.clone());
+    findings.extend(invalid_rules.clone());
+    let status = if findings.iter().any(|entry| entry.severity == "critical") {
+        "fail"
+    } else if findings.is_empty() {
+        "pass"
+    } else {
+        "warn"
+    };
+    let fix_hints = findings.iter().map(|entry| entry.fix_hint.clone()).collect::<Vec<_>>();
+    Ok(PolicyPostureReport {
+        schema_version: 1,
+        report_kind: "policy_posture",
+        status,
+        source,
+        session,
+        weaker_rules,
+        missing_rules,
+        invalid_rules,
+        fix_hints,
+        findings,
+    })
+}
+
+fn append_tool_catalog_posture_findings(
+    catalog_path: &str,
+    invalid_rules: &mut Vec<PolicyRuleFinding>,
+) -> Result<()> {
+    let bytes = fs::read(catalog_path)
+        .with_context(|| format!("failed to read tool posture catalog {catalog_path}"))?;
+    let value: Value = serde_json::from_slice(bytes.as_slice())
+        .with_context(|| format!("failed to parse tool posture catalog {catalog_path}"))?;
+    let tools = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| value.as_array().cloned().unwrap_or_default());
+    for tool in tools {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        let sensitivity = tool.get("sensitivity").and_then(Value::as_str).unwrap_or_default();
+        let approval_required =
+            tool.get("approval_required").and_then(Value::as_bool).unwrap_or_else(|| {
+                (!name.is_empty() && tool_requires_approval(name)) || sensitivity == "sensitive"
+            });
+        if tool_requires_approval(name) && matches!(sensitivity, "public" | "low" | "normal") {
+            invalid_rules.push(policy_finding(
+                "critical",
+                "tool_sensitivity_downgrade",
+                format!(
+                    "tool '{name}' is approval-gated by runtime catalog but marked '{sensitivity}'"
+                ),
+                "raise the tool sensitivity label or keep the approval-required flag",
+            ));
+        }
+        if (name.contains("secret") || name.contains("token") || sensitivity == "sensitive")
+            && !approval_required
+        {
+            invalid_rules.push(policy_finding(
+                "critical",
+                "secret_access_without_approval_gate",
+                format!("tool '{name}' can access secrets without approval_required=true"),
+                "require approval for secret-capable tools",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_policy_diff_report(
+    baseline_path: &str,
+    candidate: &PolicyPostureReport,
+) -> Result<PolicyPostureReport> {
+    let baseline = read_policy_report_value(baseline_path)?;
+    let candidate = serde_json::to_value(candidate).context("failed to encode policy report")?;
+    Ok(diff_policy_report_values(&baseline, &candidate))
+}
+
+fn diff_policy_report_values(baseline: &Value, candidate: &Value) -> PolicyPostureReport {
+    let baseline_codes = finding_codes(baseline);
+    let candidate_findings =
+        candidate.get("findings").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut weaker_rules = Vec::new();
+    let mut missing_rules = Vec::new();
+    let mut invalid_rules = Vec::new();
+    for finding in candidate_findings {
+        let code = finding.get("code").and_then(Value::as_str).unwrap_or("unknown_policy_drift");
+        if baseline_codes.contains(code) {
+            continue;
+        }
+        let severity = finding.get("severity").and_then(Value::as_str).unwrap_or("warning");
+        let message = finding
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("candidate policy posture introduced a new finding")
+            .to_owned();
+        let fix_hint = finding
+            .get("fix_hint")
+            .and_then(Value::as_str)
+            .unwrap_or("inspect the candidate policy posture report")
+            .to_owned();
+        let entry = PolicyRuleFinding {
+            severity: if severity == "critical" { "critical" } else { "warning" }.to_owned(),
+            code: code.to_owned(),
+            message,
+            fix_hint,
+        };
+        match code {
+            "missing_explicit_deny_rules"
+            | "egress_without_allowlist"
+            | "group_delivery_without_guardrails" => missing_rules.push(entry),
+            "tool_sensitivity_downgrade" | "secret_access_without_approval_gate" => {
+                invalid_rules.push(entry)
+            }
+            _ => weaker_rules.push(entry),
+        }
+    }
+    let mut findings = Vec::new();
+    findings.extend(weaker_rules.clone());
+    findings.extend(missing_rules.clone());
+    findings.extend(invalid_rules.clone());
+    let status = if findings.iter().any(|entry| entry.severity == "critical") {
+        "fail"
+    } else if findings.is_empty() {
+        "pass"
+    } else {
+        "warn"
+    };
+    let fix_hints = findings.iter().map(|entry| entry.fix_hint.clone()).collect::<Vec<_>>();
+    PolicyPostureReport {
+        schema_version: 1,
+        report_kind: "policy_diff",
+        status,
+        source: "policy_report_diff".to_owned(),
+        session: None,
+        weaker_rules,
+        missing_rules,
+        invalid_rules,
+        fix_hints,
+        findings,
+    }
+}
+
+fn read_policy_report_value(path: &str) -> Result<Value> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read policy report {path}"))?;
+    serde_json::from_slice(bytes.as_slice())
+        .with_context(|| format!("failed to parse policy report {path}"))
+}
+
+fn finding_codes(value: &Value) -> std::collections::BTreeSet<&str> {
+    value
+        .get("findings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("code").and_then(Value::as_str))
+        .collect()
+}
+
+fn policy_finding(
+    severity: &'static str,
+    code: &'static str,
+    message: impl Into<String>,
+    fix_hint: impl Into<String>,
+) -> PolicyRuleFinding {
+    PolicyRuleFinding {
+        severity: severity.to_owned(),
+        code: code.to_owned(),
+        message: message.into(),
+        fix_hint: fix_hint.into(),
+    }
+}
+
+fn emit_policy_report(report: &PolicyPostureReport, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(report, "failed to encode policy posture report as JSON");
+    }
+    println!(
+        "policy.{} status={} findings={} weaker_rules={} missing_rules={} invalid_rules={}",
+        report.report_kind,
+        report.status,
+        report.findings.len(),
+        report.weaker_rules.len(),
+        report.missing_rules.len(),
+        report.invalid_rules.len(),
+    );
+    for finding in &report.findings {
+        println!(
+            "finding severity={} code={} message={} fix_hint={}",
+            finding.severity, finding.code, finding.message, finding.fix_hint
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
 }
 
 /// Evaluation inputs assembled for one explain request, with the provenance
@@ -314,6 +618,62 @@ mod tests {
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
         assert!(!evaluation.explanation.is_sensitive_action);
+        Ok(())
+    }
+
+    #[test]
+    fn policy_diff_reports_new_wildcard_allow_as_weaker_rule() {
+        let baseline = json!({ "findings": [] });
+        let candidate = json!({
+            "findings": [
+                {
+                    "severity": "critical",
+                    "code": "wildcard_allow_risk",
+                    "message": "wildcard introduced",
+                    "fix_hint": "replace wildcard"
+                }
+            ]
+        });
+
+        let report = diff_policy_report_values(&baseline, &candidate);
+
+        assert_eq!(report.status, "fail");
+        assert_eq!(report.weaker_rules.len(), 1);
+        assert_eq!(report.weaker_rules[0].code, "wildcard_allow_risk");
+        assert_eq!(report.fix_hints, vec!["replace wildcard".to_owned()]);
+    }
+
+    #[test]
+    fn tool_catalog_posture_detects_sensitivity_and_secret_approval_regressions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let catalog_path = temp.path().join("catalog.json");
+        fs::write(
+            catalog_path.as_path(),
+            serde_json::to_vec(&json!({
+                "tools": [
+                    {
+                        "name": "palyra.process.run",
+                        "sensitivity": "public",
+                        "approval_required": true
+                    },
+                    {
+                        "name": "secret.reader",
+                        "sensitivity": "sensitive",
+                        "approval_required": false
+                    }
+                ]
+            }))?,
+        )?;
+        let mut invalid = Vec::new();
+
+        append_tool_catalog_posture_findings(
+            catalog_path.to_string_lossy().as_ref(),
+            &mut invalid,
+        )?;
+
+        let codes = invalid.iter().map(|entry| entry.code.as_str()).collect::<Vec<_>>();
+        assert!(codes.contains(&"tool_sensitivity_downgrade"));
+        assert!(codes.contains(&"secret_access_without_approval_gate"));
         Ok(())
     }
 }

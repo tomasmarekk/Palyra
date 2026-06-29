@@ -40,6 +40,8 @@ const TASK01_HARNESS_SCENARIOS: &[(&str, &str)] = &[
     ("harness_image_observe_no_approval", "harness_redaction_image_observation"),
 ];
 
+const AGENTIC_FAILURE_REPORT_FIELDS: &[&str] = &["subsystem", "event_ids", "health_findings"];
+
 #[test]
 fn workflow_regression_manifest_and_compat_checklist_remain_consistent() -> Result<()> {
     let (_, manifest, checklist) = load_regression_assets()?;
@@ -102,6 +104,70 @@ fn task01_harness_regression_matrix_contract() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn agentic_long_session_compaction_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_long_session_compaction",
+        AgenticScenarioExpectation { chaos: false, flaky: false, slow: true },
+    )
+}
+
+#[test]
+fn agentic_availability_tool_disappears_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_availability_tool_disappears",
+        AgenticScenarioExpectation { chaos: true, flaky: false, slow: false },
+    )
+}
+
+#[test]
+fn agentic_mcp_schema_drift_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_mcp_schema_drift",
+        AgenticScenarioExpectation { chaos: true, flaky: false, slow: false },
+    )
+}
+
+#[test]
+fn agentic_stuck_delegated_run_heartbeat_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_stuck_delegated_run_heartbeat",
+        AgenticScenarioExpectation { chaos: true, flaky: false, slow: true },
+    )
+}
+
+#[test]
+fn agentic_sensitive_child_tool_approval_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_sensitive_child_tool_approval",
+        AgenticScenarioExpectation { chaos: false, flaky: false, slow: false },
+    )
+}
+
+#[test]
+fn agentic_commitment_reminder_after_restart_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_commitment_reminder_after_restart",
+        AgenticScenarioExpectation { chaos: false, flaky: false, slow: true },
+    )
+}
+
+#[test]
+fn agentic_plugin_quarantine_fallback_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_plugin_quarantine_fallback",
+        AgenticScenarioExpectation { chaos: true, flaky: false, slow: false },
+    )
+}
+
+#[test]
+fn agentic_learning_rollback_matrix_contract() -> Result<()> {
+    assert_agentic_matrix_contract(
+        "agentic_learning_rollback",
+        AgenticScenarioExpectation { chaos: true, flaky: true, slow: true },
+    )
 }
 
 #[test]
@@ -271,6 +337,47 @@ fn assert_contract_scenario_wiring(
     assert!(!scenario.chaos);
     assert_eq!(scenario.acceptance_scenarios, vec![acceptance.as_str().to_owned()]);
     assert_eq!(scenario.command, contract_command(scenario_id));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgenticScenarioExpectation {
+    chaos: bool,
+    flaky: bool,
+    slow: bool,
+}
+
+fn assert_agentic_matrix_contract(
+    scenario_id: &str,
+    expected: AgenticScenarioExpectation,
+) -> Result<()> {
+    let (_, manifest, _) = load_regression_assets()?;
+    let full_profile =
+        manifest.profiles.get("full").context("workflow regression full profile should exist")?;
+    assert!(
+        full_profile.required_subsystems.iter().any(|entry| entry == "agentic_regression_matrix"),
+        "full profile should require agentic_regression_matrix"
+    );
+    let scenario =
+        manifest.scenarios.iter().find(|entry| entry.id == scenario_id).with_context(|| {
+            format!("workflow regression manifest should contain '{scenario_id}'")
+        })?;
+
+    assert_eq!(scenario.category, "agentic");
+    assert_eq!(scenario.profiles, vec!["full".to_owned()]);
+    assert!(scenario.subsystems.iter().any(|entry| entry == "agentic_regression_matrix"));
+    assert_eq!(scenario.chaos, expected.chaos);
+    assert_eq!(scenario.flaky, expected.flaky);
+    assert_eq!(scenario.slow, expected.slow);
+    assert!(scenario.required);
+    assert!(scenario.fake_provider);
+    assert!(scenario.fake_external_services);
+    assert_eq!(
+        scenario.failure_report_fields,
+        AGENTIC_FAILURE_REPORT_FIELDS.iter().copied().map(str::to_owned).collect::<Vec<_>>()
+    );
+    assert_eq!(scenario.command, contract_command(&format!("{scenario_id}_matrix_contract")));
+
+    Ok(())
 }
 
 fn contract_command(test_name: &str) -> Vec<String> {

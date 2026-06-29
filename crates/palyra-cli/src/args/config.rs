@@ -27,6 +27,22 @@ pub enum ConfigCommand {
         #[arg(long, default_value_t = false, help = "Print validation results as JSON")]
         json: bool,
     },
+    #[command(about = "Explain configuration metadata and effective source")]
+    Explain {
+        #[arg(long, help = "Read metadata from this palyra.toml path")]
+        path: Option<String>,
+        #[arg(long, help = "Dotted configuration key to explain")]
+        key: Option<String>,
+        #[arg(long, default_value_t = false, help = "Print config explanation as JSON")]
+        json: bool,
+    },
+    #[command(about = "Check config, env overrides, and unsafe rollout posture")]
+    Doctor {
+        #[arg(long, help = "Inspect this palyra.toml path")]
+        path: Option<String>,
+        #[arg(long, default_value_t = false, help = "Print config doctor report as JSON")]
+        json: bool,
+    },
     #[command(visible_alias = "show", about = "List effective configuration values")]
     List {
         #[arg(long, help = "List values from this palyra.toml path")]

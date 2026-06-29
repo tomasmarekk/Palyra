@@ -166,6 +166,16 @@ pub enum ReleaseEvalStatus {
     Failed,
 }
 
+/// Additive release-gate verdict used by reports and support tooling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseGateVerdict {
+    Pass,
+    Warn,
+    Fail,
+    ManualReview,
+}
+
 /// Severity for an eval gate issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,10 +301,31 @@ pub struct ReleaseEvalReport {
     pub schema_version: u32,
     pub contract_version: String,
     pub status: ReleaseEvalStatus,
+    pub gate_verdict: ReleaseGateVerdict,
     pub summary: ReleaseEvalSummary,
     pub protocol_inventory: ReleaseGoldenProtocolInventory,
+    pub compatibility_matrix: ReleaseCompatibilityMatrix,
     pub issues: Vec<ReleaseEvalIssue>,
     pub suites: Vec<ReleaseEvalSuiteReport>,
+}
+
+/// Compatibility matrix derived from the golden protocol inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseCompatibilityMatrix {
+    pub schema_version: u32,
+    pub inventory_version: String,
+    pub entries: Vec<ReleaseCompatibilityMatrixEntry>,
+}
+
+/// One protocol compatibility record used by release and support reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReleaseCompatibilityMatrixEntry {
+    pub domain: String,
+    pub contract: String,
+    pub version: String,
+    pub compatibility_policy: String,
+    pub status: ReleaseGateVerdict,
+    pub evidence_refs: Vec<String>,
 }
 
 /// Aggregate counters for a release eval run.

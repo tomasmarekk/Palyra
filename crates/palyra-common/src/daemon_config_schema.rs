@@ -6,7 +6,7 @@
 //! config contracts under `schemas/json`, so renames are breaking changes.
 //! Also owns the secret config paths redacted from config exports.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::secret_refs::SecretRef;
@@ -36,6 +36,337 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.state_key_secret_ref",
     "tool_call.browser_service.state_key_vault_ref",
 ];
+
+/// Typed metadata for operator-facing config diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConfigSchemaEntry {
+    pub path: &'static str,
+    pub value_type: &'static str,
+    pub default_value: Option<&'static str>,
+    pub env_vars: &'static [&'static str],
+    pub secret: bool,
+    pub deprecated: bool,
+    pub restart_required: bool,
+    pub category: &'static str,
+    pub description: &'static str,
+}
+
+/// Durable config metadata surfaced by `palyra config explain` and doctor
+/// diagnostics. The list is intentionally compact and tracks operator-facing
+/// keys with defaults, env overrides, secret posture, or rollout risk.
+pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
+    ConfigSchemaEntry {
+        path: "deployment.mode",
+        value_type: "enum(local_desktop|server|remote_agent)",
+        default_value: Some("local_desktop"),
+        env_vars: &["PALYRA_DEPLOYMENT_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "deployment",
+        description: "Runtime deployment posture used by bind and remote-access checks.",
+    },
+    ConfigSchemaEntry {
+        path: "deployment.dangerous_remote_bind_ack",
+        value_type: "bool",
+        default_value: Some("false"),
+        env_vars: &["PALYRA_DEPLOYMENT_DANGEROUS_REMOTE_BIND_ACK"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "deployment",
+        description: "Explicit config-side acknowledgement for non-loopback runtime binds.",
+    },
+    ConfigSchemaEntry {
+        path: "daemon.bind_addr",
+        value_type: "ip_addr",
+        default_value: Some("127.0.0.1"),
+        env_vars: &["PALYRA_DAEMON_BIND_ADDR"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "daemon",
+        description: "HTTP/admin daemon bind address.",
+    },
+    ConfigSchemaEntry {
+        path: "daemon.port",
+        value_type: "u16",
+        default_value: Some("7142"),
+        env_vars: &["PALYRA_DAEMON_PORT"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "daemon",
+        description: "HTTP/admin daemon port.",
+    },
+    ConfigSchemaEntry {
+        path: "gateway.grpc_bind_addr",
+        value_type: "ip_addr",
+        default_value: Some("127.0.0.1"),
+        env_vars: &["PALYRA_GATEWAY_GRPC_BIND_ADDR"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "gateway",
+        description: "gRPC gateway bind address.",
+    },
+    ConfigSchemaEntry {
+        path: "gateway.grpc_port",
+        value_type: "u16",
+        default_value: Some("7443"),
+        env_vars: &["PALYRA_GATEWAY_GRPC_PORT"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "gateway",
+        description: "gRPC gateway port.",
+    },
+    ConfigSchemaEntry {
+        path: "gateway.allow_insecure_remote",
+        value_type: "bool",
+        default_value: Some("false"),
+        env_vars: &["PALYRA_GATEWAY_ALLOW_INSECURE_REMOTE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "gateway",
+        description: "Escape hatch for remote gateway binds without the secure profile.",
+    },
+    ConfigSchemaEntry {
+        path: "admin.auth_token",
+        value_type: "string",
+        default_value: None,
+        env_vars: &["PALYRA_ADMIN_TOKEN"],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "admin",
+        description: "Admin API bearer token.",
+    },
+    ConfigSchemaEntry {
+        path: "admin.auth_token_secret_ref",
+        value_type: "secret_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "admin",
+        description: "Structured secret reference for the admin API token.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.kind",
+        value_type: "enum(deterministic|openai_compatible|anthropic)",
+        default_value: Some("openai_compatible"),
+        env_vars: &["PALYRA_MODEL_PROVIDER_KIND"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Default model-provider protocol family.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.openai_api_key",
+        value_type: "string",
+        default_value: None,
+        env_vars: &["PALYRA_OPENAI_API_KEY"],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Inline OpenAI-compatible API key.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.openai_api_key_secret_ref",
+        value_type: "secret_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Structured secret reference for the OpenAI-compatible API key.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.openai_api_key_vault_ref",
+        value_type: "vault_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Vault reference for the OpenAI-compatible API key.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.anthropic_api_key",
+        value_type: "string",
+        default_value: None,
+        env_vars: &["PALYRA_ANTHROPIC_API_KEY"],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Inline Anthropic-compatible API key.",
+    },
+    ConfigSchemaEntry {
+        path: "model_provider.auth_profile_id",
+        value_type: "string",
+        default_value: None,
+        env_vars: &["PALYRA_MODEL_PROVIDER_AUTH_PROFILE_ID"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "model_provider",
+        description: "Auth profile id used by model-provider requests.",
+    },
+    ConfigSchemaEntry {
+        path: "tool_call.allowed_tools",
+        value_type: "array<string>",
+        default_value: Some("[]"),
+        env_vars: &["PALYRA_TOOL_CALL_ALLOWED_TOOLS"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "tool_call",
+        description: "Explicit tool allowlist exposed to model runs.",
+    },
+    ConfigSchemaEntry {
+        path: "tool_call.disabled_tools",
+        value_type: "array<string>",
+        default_value: Some("[]"),
+        env_vars: &["PALYRA_TOOL_CALL_DISABLED_TOOLS"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "tool_call",
+        description: "Tools removed from the effective tool catalog.",
+    },
+    ConfigSchemaEntry {
+        path: "tool_call.max_calls_per_run",
+        value_type: "u32",
+        default_value: Some("0"),
+        env_vars: &["PALYRA_TOOL_CALL_MAX_CALLS_PER_RUN"],
+        secret: false,
+        deprecated: true,
+        restart_required: true,
+        category: "tool_call",
+        description: "Legacy compatibility budget; must not terminate agent run loops.",
+    },
+    ConfigSchemaEntry {
+        path: "tool_call.http_fetch.allow_private_targets",
+        value_type: "bool",
+        default_value: Some("false"),
+        env_vars: &["PALYRA_HTTP_FETCH_ALLOW_PRIVATE_TARGETS"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "tool_call",
+        description: "Escape hatch allowing HTTP fetches to private network targets.",
+    },
+    ConfigSchemaEntry {
+        path: "networked_workers.mode",
+        value_type: "enum(disabled|preview_only|enabled)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_NETWORKED_WORKERS_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "workers",
+        description: "Networked worker runtime mode.",
+    },
+    ConfigSchemaEntry {
+        path: "networked_workers.require_attestation",
+        value_type: "bool",
+        default_value: Some("true"),
+        env_vars: &["PALYRA_NETWORKED_WORKERS_REQUIRE_ATTESTATION"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "workers",
+        description: "Requires worker attestation before capability grants.",
+    },
+    ConfigSchemaEntry {
+        path: "networked_workers.expected_image_digest_sha256",
+        value_type: "sha256",
+        default_value: None,
+        env_vars: &["PALYRA_NETWORKED_WORKERS_EXPECTED_IMAGE_DIGEST_SHA256"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "workers",
+        description: "Pinned expected worker image digest.",
+    },
+    ConfigSchemaEntry {
+        path: "orchestrator.runloop_v1_enabled",
+        value_type: "bool",
+        default_value: Some("false"),
+        env_vars: &["PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "orchestrator",
+        description: "Enables the v1 orchestrator run loop.",
+    },
+    ConfigSchemaEntry {
+        path: "identity.allow_insecure_node_rpc_without_mtls",
+        value_type: "bool",
+        default_value: Some("false"),
+        env_vars: &["PALYRA_ALLOW_INSECURE_NODE_RPC_WITHOUT_MTLS"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "identity",
+        description: "Escape hatch for node RPC without mTLS.",
+    },
+];
+
+/// Returns the stable config metadata catalog.
+#[must_use]
+pub fn config_schema_entries() -> &'static [ConfigSchemaEntry] {
+    CONFIG_SCHEMA_ENTRIES
+}
+
+/// Finds a config metadata entry by dot-separated config path.
+#[must_use]
+pub fn config_schema_entry(path: &str) -> Option<&'static ConfigSchemaEntry> {
+    let normalized = normalize_config_path(path);
+    CONFIG_SCHEMA_ENTRIES.iter().find(|entry| entry.path == normalized)
+}
+
+/// Returns PALYRA_* environment variables known to the config schema catalog.
+#[must_use]
+pub fn known_config_env_vars() -> Vec<&'static str> {
+    let mut env_vars = CONFIG_SCHEMA_ENTRIES
+        .iter()
+        .flat_map(|entry| entry.env_vars.iter().copied())
+        .collect::<Vec<_>>();
+    env_vars.extend([
+        "PALYRA_CONFIG",
+        "PALYRA_STATE_ROOT",
+        "PALYRA_HOME",
+        "PALYRA_DAEMON_URL",
+        "PALYRA_CLI_PROFILE",
+        "PALYRA_CLI_PROFILES_PATH",
+        "PALYRA_GATEWAY_DANGEROUS_REMOTE_BIND_ACK",
+        "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
+        "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
+        "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
+        "PALYRA_HTTP_FETCH_ALLOWED_HOSTS",
+        "PALYRA_HTTP_FETCH_ALLOWLIST",
+        "PALYRA_HTTP_FETCH_ALLOWED_CREDENTIAL_VAULT_REFS",
+        "PALYRA_CHANNEL_DELIVERY_PIPELINE_MODE",
+        "PALYRA_CHANNEL_ROUTER_GROUP_GUARDRAILS",
+        "PALYRA_TOOL_CATALOG_EXPOSURE_MODE",
+        "PALYRA_TOOL_CATALOG_COMPACT_THRESHOLD",
+        "PALYRA_TOOL_CALL_DENIED_TOOLS",
+        "PALYRA_MINIMAX_API_KEY",
+        "PALYRA_XAI_API_KEY",
+    ]);
+    env_vars.sort_unstable();
+    env_vars.dedup();
+    env_vars
+}
 
 /// Reports whether a dot-separated config path names a secret value.
 ///

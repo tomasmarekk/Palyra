@@ -4,6 +4,10 @@ Usage: palyra policy [OPTIONS] <COMMAND>
 
 Commands:
   explain
+  conformance
+  diff
+  posture
+  tool-posture
 
 Options:
   -h, --help  Print help

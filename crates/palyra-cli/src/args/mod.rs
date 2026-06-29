@@ -29,6 +29,7 @@ mod daemon;
 mod deployment;
 mod devices;
 mod docs;
+mod eval;
 mod extension;
 mod flows;
 mod hooks;
@@ -51,6 +52,7 @@ mod profile;
 mod protocol;
 mod reset;
 mod routines;
+mod run;
 mod sandbox;
 mod secrets;
 mod security;
@@ -98,6 +100,7 @@ pub use daemon::{DaemonCommand, JournalCheckpointModeArg};
 pub use deployment::{DeploymentCommand, DeploymentProfileArg};
 pub use devices::DevicesCommand;
 pub use docs::DocsCommand;
+pub use eval::{EvalBundleCommand, EvalCommand};
 pub use extension::ExtensionCommand;
 pub use flows::{FlowStateArg, FlowsCommand};
 pub use hooks::HooksCommand;
@@ -132,6 +135,7 @@ pub use routines::{
     RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
     RoutineUpsertCommand, RoutinesCommand,
 };
+pub use run::{RunCommand, RunExportFormatArg};
 pub use sandbox::{SandboxCommand, SandboxRuntimeArg};
 pub use secrets::{SecretsCommand, SecretsConfigureCommand};
 pub use security::SecurityCommand;
@@ -968,6 +972,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ProtocolCommand,
     },
+    #[command(about = "Create local eval bundles and replay metadata")]
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
     #[command(about = "Inspect and validate local configuration")]
     Config {
         #[command(subcommand)]
@@ -977,6 +986,11 @@ pub enum Command {
     Workers {
         #[command(subcommand)]
         command: WorkersCommand,
+    },
+    #[command(about = "Export run trajectories for audit and evals")]
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
     },
     #[command(about = "Inspect and configure model providers and defaults")]
     Models {

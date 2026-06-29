@@ -93,7 +93,45 @@ pub(crate) struct DoctorExecutionReport {
     mode: DoctorExecutionMode,
     diagnostics: DoctorReport,
     tools: DoctorToolsReport,
+    unified: UnifiedDoctorReport,
     recovery: DoctorRecoveryReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UnifiedDoctorReport {
+    schema_version: u32,
+    status: String,
+    sections: Vec<UnifiedDoctorSection>,
+    findings: Vec<UnifiedDoctorFinding>,
+    suppressions: UnifiedDoctorSuppressionPolicy,
+    sarif_like: JsonValue,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UnifiedDoctorSection {
+    name: String,
+    status: String,
+    finding_count: usize,
+    evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UnifiedDoctorFinding {
+    severity: String,
+    subsystem: String,
+    code: String,
+    message: String,
+    evidence_refs: Vec<String>,
+    fix_hints: Vec<String>,
+    affected_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UnifiedDoctorSuppressionPolicy {
+    supported: bool,
+    required_fields: Vec<String>,
+    max_duration_days: u32,
+    audit_log: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -352,6 +390,7 @@ pub(crate) fn build_doctor_execution_preview_value() -> Result<JsonValue> {
 /// Returns an error when the dry-run preview cannot be built or encoded.
 pub(crate) fn build_doctor_support_bundle_value() -> Result<JsonValue> {
     let preview = build_doctor_execution_preview_value()?;
+    let unified = preview.get("unified").cloned().unwrap_or_else(|| json!({ "status": "unknown" }));
     let environment = resolve_doctor_environment()?;
     let available_runs = collect_recovery_runs(environment.state_root.as_path());
     let recent_manifests = collect_recovery_manifest_values(
@@ -360,6 +399,7 @@ pub(crate) fn build_doctor_support_bundle_value() -> Result<JsonValue> {
     );
     Ok(json!({
         "preview": preview,
+        "unified": unified,
         "available_runs": available_runs,
         "recent_manifests": recent_manifests,
     }))
@@ -378,6 +418,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     let checks = build_doctor_checks();
     let diagnostics = build_doctor_report(checks.as_slice())?;
     let tools = build_doctor_tools_report(&environment);
+    let unified = build_unified_doctor_report(&diagnostics, &tools, &environment)?;
     let mut recovery = DoctorRecoveryReport {
         requested: request.repair || request.rollback_run.is_some(),
         dry_run: request.dry_run,
@@ -440,6 +481,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
         mode,
         diagnostics,
         tools,
+        unified,
         recovery,
     })
 }
@@ -545,6 +587,239 @@ fn build_doctor_tools_report(environment: &DoctorEnvironment) -> DoctorToolsRepo
         provider_compatibility: "validated per provider when the daemon builds a catalog snapshot"
             .to_owned(),
         repair_hints,
+    }
+}
+
+fn build_unified_doctor_report(
+    diagnostics: &DoctorReport,
+    tools: &DoctorToolsReport,
+    environment: &DoctorEnvironment,
+) -> Result<UnifiedDoctorReport> {
+    let mut findings = Vec::new();
+    for check in diagnostics.checks.iter().filter(|check| !check.ok) {
+        findings.push(UnifiedDoctorFinding {
+            severity: unified_severity_for_check(check.severity).to_owned(),
+            subsystem: subsystem_for_doctor_check(check.key).to_owned(),
+            code: check.key.to_owned(),
+            message: format!("doctor check '{}' failed", check.key),
+            evidence_refs: vec![format!("doctor.check:{}", check.key)],
+            fix_hints: check.remediation.iter().map(|hint| (*hint).to_owned()).collect(),
+            affected_ids: vec![check.key.to_owned()],
+        });
+    }
+
+    for probe in
+        tools.runtime_availability_probes.iter().filter(|probe| probe.status != "available")
+    {
+        findings.push(UnifiedDoctorFinding {
+            severity: "warning".to_owned(),
+            subsystem: "tools".to_owned(),
+            code: format!("tool_runtime_{}", probe.runtime),
+            message: format!("tool runtime '{}' is unavailable", probe.runtime),
+            evidence_refs: vec![format!("doctor.tools.probe:{}", probe.runtime)],
+            fix_hints: vec![probe.repair_hint.clone()],
+            affected_ids: vec![probe.runtime.clone()],
+        });
+    }
+
+    let config_path =
+        environment.config_path.as_ref().map(|path| path.to_string_lossy().into_owned());
+    let config_report = commands::config::build_config_doctor_report_from_environment(config_path)?;
+    for finding in config_report.findings {
+        findings.push(UnifiedDoctorFinding {
+            severity: if finding.severity == "critical" {
+                "critical".to_owned()
+            } else {
+                "warning".to_owned()
+            },
+            subsystem: subsystem_for_config_finding(finding.code.as_str()).to_owned(),
+            code: finding.code,
+            message: finding.message,
+            evidence_refs: vec![format!("config.doctor:{}", finding.key)],
+            fix_hints: vec![finding.remediation],
+            affected_ids: vec![finding.key],
+        });
+    }
+
+    let sections = build_unified_doctor_sections(findings.as_slice());
+    let status = unified_status_for_findings(findings.as_slice()).to_owned();
+    let sarif_like = build_unified_doctor_sarif(findings.as_slice());
+    Ok(UnifiedDoctorReport {
+        schema_version: 1,
+        status,
+        sections,
+        findings,
+        suppressions: UnifiedDoctorSuppressionPolicy {
+            supported: true,
+            required_fields: vec![
+                "reason".to_owned(),
+                "owner".to_owned(),
+                "expires_at".to_owned(),
+                "evidence_ref".to_owned(),
+            ],
+            max_duration_days: 30,
+            audit_log:
+                "doctor suppressions must be persisted with owner, expiry, and evidence reference"
+                    .to_owned(),
+        },
+        sarif_like,
+    })
+}
+
+fn build_unified_doctor_sections(findings: &[UnifiedDoctorFinding]) -> Vec<UnifiedDoctorSection> {
+    const SECTIONS: &[&str] = &[
+        "security", "state", "tools", "memory", "plugins", "tasks", "delivery", "workers",
+        "config", "acp",
+    ];
+    SECTIONS
+        .iter()
+        .map(|section| {
+            let section_findings =
+                findings.iter().filter(|finding| finding.subsystem == *section).collect::<Vec<_>>();
+            let status = unified_status_for_refs(section_findings.as_slice()).to_owned();
+            let mut evidence_refs = section_findings
+                .iter()
+                .flat_map(|finding| finding.evidence_refs.iter().cloned())
+                .collect::<Vec<_>>();
+            evidence_refs.sort();
+            evidence_refs.dedup();
+            UnifiedDoctorSection {
+                name: (*section).to_owned(),
+                status,
+                finding_count: section_findings.len(),
+                evidence_refs,
+            }
+        })
+        .collect()
+}
+
+fn unified_status_for_findings(findings: &[UnifiedDoctorFinding]) -> &'static str {
+    let mut saw_warning = false;
+    for finding in findings {
+        if finding.severity == "critical" {
+            return "fail";
+        }
+        if finding.severity == "warning" {
+            saw_warning = true;
+        }
+    }
+    if saw_warning {
+        "warn"
+    } else {
+        "pass"
+    }
+}
+
+fn unified_status_for_refs(findings: &[&UnifiedDoctorFinding]) -> &'static str {
+    let mut saw_warning = false;
+    for finding in findings {
+        if finding.severity == "critical" {
+            return "fail";
+        }
+        if finding.severity == "warning" {
+            saw_warning = true;
+        }
+    }
+    if saw_warning {
+        "warn"
+    } else {
+        "pass"
+    }
+}
+
+fn build_unified_doctor_sarif(findings: &[UnifiedDoctorFinding]) -> JsonValue {
+    let rules = findings
+        .iter()
+        .map(|finding| {
+            json!({
+                "id": finding.code.clone(),
+                "name": finding.code.clone(),
+                "shortDescription": { "text": finding.message.clone() },
+                "properties": {
+                    "subsystem": finding.subsystem.clone(),
+                    "severity": finding.severity.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = findings
+        .iter()
+        .map(|finding| {
+            json!({
+                "ruleId": finding.code.clone(),
+                "level": sarif_level_for_unified_severity(finding.severity.as_str()),
+                "message": { "text": finding.message.clone() },
+                "properties": {
+                    "subsystem": finding.subsystem.clone(),
+                    "evidence_refs": finding.evidence_refs.clone(),
+                    "fix_hints": finding.fix_hints.clone(),
+                    "affected_ids": finding.affected_ids.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "palyra doctor unified",
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }]
+    })
+}
+
+fn unified_severity_for_check(severity: DoctorSeverity) -> &'static str {
+    match severity {
+        DoctorSeverity::Blocking => "critical",
+        DoctorSeverity::Warning => "warning",
+        DoctorSeverity::Info => "info",
+    }
+}
+
+fn sarif_level_for_unified_severity(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "error",
+        "warning" => "warning",
+        _ => "note",
+    }
+}
+
+fn subsystem_for_config_finding(code: &str) -> &'static str {
+    match code {
+        "remote_worker_policy_gap" => "workers",
+        "unsafe_dev_flag" | "missing_required_secret" => "security",
+        _ => "config",
+    }
+}
+
+fn subsystem_for_doctor_check(key: &str) -> &'static str {
+    if key.contains("memory") {
+        "memory"
+    } else if key.contains("process_runner") || key.contains("tool") {
+        "tools"
+    } else if key.contains("gitleaks")
+        || key.contains("audit")
+        || key.contains("deny")
+        || key.contains("osv")
+        || key.contains("sandbox")
+    {
+        "security"
+    } else if key.contains("plugin") || key.contains("skill") {
+        "plugins"
+    } else if key.contains("channel") || key.contains("delivery") {
+        "delivery"
+    } else if key.contains("worker") {
+        "workers"
+    } else if key.contains("config") {
+        "config"
+    } else if key.contains("acp") {
+        "acp"
+    } else {
+        "state"
     }
 }
 
@@ -2802,6 +3077,15 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
             warning_checks.len(),
             info_checks.len(),
             execution.diagnostics.summary.required_checks_failed
+        )
+        .as_str(),
+    )?;
+    output::print_text_line(
+        format!(
+            "doctor.unified status={} findings={} sections={}",
+            execution.unified.status,
+            execution.unified.findings.len(),
+            execution.unified.sections.len()
         )
         .as_str(),
     )?;

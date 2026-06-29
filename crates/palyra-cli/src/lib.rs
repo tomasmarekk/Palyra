@@ -118,11 +118,12 @@ use cli::{
     AuthAnthropicCommand, AuthCommand, AuthCredentialArg, AuthOpenAiCommand, AuthProfilesCommand,
     AuthProviderArg, AuthScopeArg, AuthXaiCommand, BrowserCommand, Cli, Command as CliCommand,
     CompletionShell, ConfigCommand, ConfigureSectionArg, CronCommand, DaemonCommand,
-    DeploymentCommand, DeploymentProfileArg, DocsCommand, ExtensionCommand, GatewayBindProfileArg,
-    HooksCommand, InitModeArg, InitTlsScaffoldArg, JournalCheckpointModeArg, MemoryCommand,
-    MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg,
-    OnboardingCommand, OnboardingFlowArg, PatchBundleCommand, PatchCommand, PluginsCommand,
-    PolicyCommand, ProtocolCommand, RemoteVerificationModeArg, SandboxCommand, SandboxRuntimeArg,
+    DeploymentCommand, DeploymentProfileArg, DocsCommand, EvalBundleCommand, EvalCommand,
+    ExtensionCommand, GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg,
+    JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
+    MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
+    PatchBundleCommand, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand,
+    RemoteVerificationModeArg, RunCommand, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg,
     SecretsCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
     SkillsPackageCommand, StateCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
     SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
@@ -465,10 +466,12 @@ fn run_cli() -> Result<()> {
         }
         CliCommand::Policy { command } => commands::policy::run_policy(command),
         CliCommand::Protocol { command } => commands::protocol::run_protocol(command),
+        CliCommand::Eval { command } => commands::eval::run_eval(command),
         CliCommand::Config { command } => commands::config::run_config(command),
         CliCommand::Models { command } => commands::models::run_models(command),
         CliCommand::Patch { command } => commands::patch::run_patch(command),
         CliCommand::Workers { command } => commands::workers::run_workers(command),
+        CliCommand::Run { command } => commands::run::run_run(command),
         CliCommand::Skills { command } => commands::skills::run_skills(command),
         CliCommand::Secrets { command } => commands::secrets::run_secrets(command),
         CliCommand::Security { command } => commands::security::run_security(command),
@@ -2819,6 +2822,7 @@ fn support_checklist(id: &str, title: &str, items: &[&str]) -> SupportBundleChec
 fn build_support_bundle_replay_snapshot() -> SupportBundleReplaySnapshot {
     SupportBundleReplaySnapshot {
         contract: replay_contract_snapshot(),
+        release_gate: build_support_bundle_release_gate_snapshot(),
         cli_workflows: vec![
             "support-bundle replay-export".to_owned(),
             "support-bundle replay-import".to_owned(),
@@ -2856,6 +2860,25 @@ fn build_support_bundle_replay_snapshot() -> SupportBundleReplaySnapshot {
         },
         offline_only: true,
     }
+}
+
+fn build_support_bundle_release_gate_snapshot() -> Value {
+    json!({
+        "contract_version": palyra_common::release_evals::RELEASE_EVAL_CONTRACT_VERSION,
+        "schema_version": palyra_common::release_evals::RELEASE_EVAL_SCHEMA_VERSION,
+        "verdicts": ["pass", "warn", "fail", "manual_review"],
+        "compatibility_matrix": {
+            "report_path": "release_eval_report.compatibility_matrix",
+            "required_protocol_inventory": palyra_common::release_evals::required_release_eval_protocol_inventory(),
+        },
+        "support_bundle_sections": [
+            "recovery.unified",
+            "replay.release_gate",
+            "replay.contract",
+            "diagnostics",
+            "journal"
+        ],
+    })
 }
 
 fn resolve_support_bundle_daemon_url() -> Result<String> {
@@ -12240,6 +12263,7 @@ struct SupportBundleChecklist {
 #[derive(Debug, Serialize)]
 struct SupportBundleReplaySnapshot {
     contract: Value,
+    release_gate: Value,
     cli_workflows: Vec<String>,
     gate_profiles: Vec<String>,
     incident_workflow: Vec<String>,
@@ -14371,6 +14395,7 @@ mod diagnostics_bundle_tests {
             },
             replay: SupportBundleReplaySnapshot {
                 contract: crate::replay_contract_snapshot(),
+                release_gate: super::build_support_bundle_release_gate_snapshot(),
                 cli_workflows: vec![
                     "support-bundle replay-export".to_owned(),
                     "support-bundle replay-import".to_owned(),

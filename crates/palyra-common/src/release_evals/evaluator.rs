@@ -108,18 +108,92 @@ pub fn evaluate_release_eval_manifest(manifest: &ReleaseEvalManifest) -> Release
     } else {
         ReleaseEvalStatus::Failed
     };
+    let gate_verdict =
+        release_gate_verdict(status, manifest, issues.as_slice(), suite_reports.as_slice());
+    let compatibility_matrix = build_release_compatibility_matrix(manifest);
 
     ReleaseEvalOutput {
         report: ReleaseEvalReport {
             schema_version: RELEASE_EVAL_SCHEMA_VERSION,
             contract_version: RELEASE_EVAL_CONTRACT_VERSION.to_owned(),
             status,
+            gate_verdict,
             summary,
             protocol_inventory: manifest.inventory.clone(),
+            compatibility_matrix,
             issues,
             suites: suite_reports,
         },
         replay_bundles,
+    }
+}
+
+fn release_gate_verdict(
+    status: ReleaseEvalStatus,
+    manifest: &ReleaseEvalManifest,
+    report_issues: &[ReleaseEvalIssue],
+    suite_reports: &[ReleaseEvalSuiteReport],
+) -> ReleaseGateVerdict {
+    if status == ReleaseEvalStatus::Failed
+        || release_eval_issues_have_severity(
+            report_issues,
+            suite_reports,
+            ReleaseEvalIssueSeverity::Error,
+        )
+    {
+        return ReleaseGateVerdict::Fail;
+    }
+    if release_eval_issues_have_severity(
+        report_issues,
+        suite_reports,
+        ReleaseEvalIssueSeverity::Warning,
+    ) {
+        return ReleaseGateVerdict::Warn;
+    }
+    if manifest.suites.iter().flat_map(|suite| suite.cases.iter()).any(|case| case.flaky.is_some())
+    {
+        return ReleaseGateVerdict::ManualReview;
+    }
+    ReleaseGateVerdict::Pass
+}
+
+fn release_eval_issues_have_severity(
+    report_issues: &[ReleaseEvalIssue],
+    suite_reports: &[ReleaseEvalSuiteReport],
+    severity: ReleaseEvalIssueSeverity,
+) -> bool {
+    report_issues.iter().any(|issue| issue.severity == severity)
+        || suite_reports.iter().any(|suite| {
+            suite.issues.iter().any(|issue| issue.severity == severity)
+                || suite
+                    .cases
+                    .iter()
+                    .any(|case| case.issues.iter().any(|issue| issue.severity == severity))
+        })
+}
+
+fn build_release_compatibility_matrix(
+    manifest: &ReleaseEvalManifest,
+) -> ReleaseCompatibilityMatrix {
+    ReleaseCompatibilityMatrix {
+        schema_version: 1,
+        inventory_version: manifest.inventory.inventory_version.clone(),
+        entries: manifest
+            .inventory
+            .protocols
+            .iter()
+            .map(|entry| ReleaseCompatibilityMatrixEntry {
+                domain: entry.domain.clone(),
+                contract: entry.contract.clone(),
+                version: entry.version.clone(),
+                compatibility_policy: entry.compatibility_policy.clone(),
+                status: ReleaseGateVerdict::Pass,
+                evidence_refs: vec![
+                    format!("protocol_inventory:{}", entry.contract),
+                    entry.golden_fixture.clone(),
+                ],
+            })
+            .collect(),
     }
 }
 

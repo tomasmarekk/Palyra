@@ -6,6 +6,8 @@ Commands:
   status    Show effective configuration status
   path      Resolve the active configuration file path
   validate  Validate the local configuration file
+  explain   Explain configuration metadata and effective source
+  doctor    Check config, env overrides, and unsafe rollout posture
   list      List effective configuration values [aliases: show]
   get       Read one configuration key
   set       Set one configuration key

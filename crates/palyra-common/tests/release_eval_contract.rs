@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use palyra_common::release_evals::{
     ensure_release_eval_report_passed, evaluate_release_eval_manifest, parse_release_eval_manifest,
     release_eval_replay_bundle_filename, required_release_eval_protocol_inventory,
-    ReleaseEvalStatus, REQUIRED_RELEASE_SUITES,
+    ReleaseEvalStatus, ReleaseFlakyMark, ReleaseGateVerdict, REQUIRED_RELEASE_SUITES,
 };
 
 const RELEASE_EVAL_FIXTURE: &str =
@@ -17,8 +17,13 @@ fn release_eval_fixture_covers_all_required_suites_and_inventory() -> Result<()>
     let output = evaluate_release_eval_manifest(&manifest);
 
     ensure_release_eval_report_passed(&output.report)?;
+    assert_eq!(output.report.gate_verdict, ReleaseGateVerdict::Pass);
     assert_eq!(output.report.summary.suites_total, REQUIRED_RELEASE_SUITES.len());
     assert_eq!(output.report.summary.generated_replay_bundles, output.report.summary.cases_total);
+    assert_eq!(
+        output.report.compatibility_matrix.entries.len(),
+        output.report.protocol_inventory.protocols.len()
+    );
 
     let contracts = manifest
         .inventory
@@ -45,9 +50,32 @@ fn release_eval_gate_fails_when_assertion_regresses() -> Result<()> {
     assertion.actual = "regressed".to_owned();
 
     let output = evaluate_release_eval_manifest(&manifest);
+    assert_eq!(output.report.gate_verdict, ReleaseGateVerdict::Fail);
     let error = ensure_release_eval_report_passed(&output.report)
         .expect_err("failed assertion must fail release gate");
     assert!(error.to_string().contains("release eval gate failed"), "unexpected error: {error:#}");
+    Ok(())
+}
+
+#[test]
+fn release_eval_marks_flaky_cases_for_manual_review_without_silent_pass() -> Result<()> {
+    let mut manifest = load_manifest()?;
+    let case = manifest
+        .suites
+        .first_mut()
+        .and_then(|suite| suite.cases.first_mut())
+        .context("fixture should include at least one case")?;
+    case.deterministic = false;
+    case.flaky = Some(ReleaseFlakyMark {
+        reason: "provider latency trend is intentionally monitored".to_owned(),
+        trend_metric: "release_eval.provider_latency_p95_ms".to_owned(),
+    });
+
+    let output = evaluate_release_eval_manifest(&manifest);
+
+    ensure_release_eval_report_passed(&output.report)?;
+    assert_eq!(output.report.status, ReleaseEvalStatus::Passed);
+    assert_eq!(output.report.gate_verdict, ReleaseGateVerdict::ManualReview);
     Ok(())
 }
 

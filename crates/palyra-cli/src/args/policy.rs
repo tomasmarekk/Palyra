@@ -16,4 +16,30 @@ pub enum PolicyCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Conformance {
+        #[arg(long)]
+        baseline: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Diff {
+        #[arg(long)]
+        baseline: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Posture {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    ToolPosture {
+        #[arg(long)]
+        catalog: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }

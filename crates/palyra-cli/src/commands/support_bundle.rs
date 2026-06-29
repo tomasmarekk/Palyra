@@ -194,7 +194,7 @@ fn run_replay_baseline(input: String, output: String) -> Result<()> {
     std::io::stdout().flush().context("stdout flush failed")
 }
 
-fn build_replay_bundle_from_journal(
+pub(crate) fn build_replay_bundle_from_journal(
     run_id: &str,
     journal_db: Option<String>,
     max_events: usize,
@@ -283,7 +283,7 @@ fn build_replay_bundle_from_journal(
     })
 }
 
-fn write_replay_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_replay_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| {
             format!("failed to create replay artifact directory {}", parent.display())

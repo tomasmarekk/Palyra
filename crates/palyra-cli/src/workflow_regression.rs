@@ -90,6 +90,18 @@ pub struct WorkflowRegressionScenario {
     pub subsystems: Vec<String>,
     pub chaos: bool,
     #[serde(default)]
+    pub flaky: bool,
+    #[serde(default)]
+    pub slow: bool,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub fake_provider: bool,
+    #[serde(default)]
+    pub fake_external_services: bool,
+    #[serde(default)]
+    pub failure_report_fields: Vec<String>,
+    #[serde(default)]
     pub acceptance_scenarios: Vec<String>,
     pub command: Vec<String>,
 }
@@ -217,6 +229,12 @@ pub struct WorkflowRegressionExecutionRecord {
     pub category: String,
     pub subsystems: Vec<String>,
     pub chaos: bool,
+    pub flaky: bool,
+    pub slow: bool,
+    pub required: bool,
+    pub fake_provider: bool,
+    pub fake_external_services: bool,
+    pub failure_report_fields: Vec<String>,
     pub command: Vec<String>,
     pub status: WorkflowRegressionExecutionStatus,
     pub duration_ms: u64,
@@ -892,6 +910,21 @@ fn validate_scenarios(
                 "workflow regression scenario '{}' must cover at least one subsystem",
                 scenario.id
             );
+        }
+        if scenario.required && scenario.failure_report_fields.is_empty() {
+            anyhow::bail!(
+                "workflow regression required scenario '{}' must declare failure_report_fields",
+                scenario.id
+            );
+        }
+        for field in &scenario.failure_report_fields {
+            ensure_nonempty_value(
+                field.as_str(),
+                format!(
+                    "workflow regression scenario '{}' failure_report_fields entries must not be empty",
+                    scenario.id
+                ),
+            )?;
         }
         for subsystem in &scenario.subsystems {
             if !subsystem_ids.contains(subsystem) {

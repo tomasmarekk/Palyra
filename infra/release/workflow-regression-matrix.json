@@ -36,6 +36,7 @@
         "flow_orchestration",
         "delivery_arbitration",
         "networked_workers",
+        "agentic_regression_matrix",
         "harness_path_runtime",
         "harness_tool_output_streaming",
         "harness_resume_state",
@@ -80,6 +81,10 @@
     {
       "id": "networked_workers",
       "summary": "Networked worker preview inventory, lifecycle, and degrade posture stay fail-closed."
+    },
+    {
+      "id": "agentic_regression_matrix",
+      "summary": "Agentic behavior scenarios stay covered with fake providers, fake external services, and actionable failure report fields."
     },
     {
       "id": "harness_path_runtime",
@@ -1056,6 +1061,315 @@
         "gateway::tests::networked_worker_lifecycle_events_are_journaled",
         "--",
         "--exact"
+      ]
+    },
+    {
+      "id": "agentic_long_session_compaction",
+      "label": "Long session compaction remains deterministic with fake provider replay",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "pruning_policy_matrix"
+      ],
+      "chaos": false,
+      "flaky": false,
+      "slow": true,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [
+        "pruning_decision"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_long_session_compaction_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_availability_tool_disappears",
+      "label": "Availability tool disappearance fails closed with fake service replay",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "harness_tool_output_streaming"
+      ],
+      "chaos": true,
+      "flaky": false,
+      "slow": false,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_availability_tool_disappears_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_mcp_schema_drift",
+      "label": "MCP schema drift is isolated behind fake external service fixtures",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "harness_runtime_risk_posture"
+      ],
+      "chaos": true,
+      "flaky": false,
+      "slow": false,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_mcp_schema_drift_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_stuck_delegated_run_heartbeat",
+      "label": "Stuck delegated run heartbeat reports child-run health findings",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "auxiliary_executor",
+        "networked_workers"
+      ],
+      "chaos": true,
+      "flaky": false,
+      "slow": true,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [
+        "child_progress_merge",
+        "networked_worker_preview"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_stuck_delegated_run_heartbeat_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_sensitive_child_tool_approval",
+      "label": "Sensitive child tool approval remains explicit and auditable",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "auxiliary_executor",
+        "harness_runtime_risk_posture"
+      ],
+      "chaos": false,
+      "flaky": false,
+      "slow": false,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [
+        "child_progress_merge"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_sensitive_child_tool_approval_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_commitment_reminder_after_restart",
+      "label": "Commitment reminder after restart keeps scheduling evidence visible",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "flow_orchestration"
+      ],
+      "chaos": false,
+      "flaky": false,
+      "slow": true,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [
+        "routine_automation_smoke"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_commitment_reminder_after_restart_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_plugin_quarantine_fallback",
+      "label": "Plugin quarantine fallback stays deterministic with fake external services",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "harness_runtime_risk_posture"
+      ],
+      "chaos": true,
+      "flaky": false,
+      "slow": false,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_plugin_quarantine_fallback_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "id": "agentic_learning_rollback",
+      "label": "Learning rollback is explicitly marked flaky but still reportable",
+      "category": "agentic",
+      "profiles": [
+        "full"
+      ],
+      "subsystems": [
+        "agentic_regression_matrix",
+        "retrieval_dual_path"
+      ],
+      "chaos": true,
+      "flaky": true,
+      "slow": true,
+      "required": true,
+      "fake_provider": true,
+      "fake_external_services": true,
+      "failure_report_fields": [
+        "subsystem",
+        "event_ids",
+        "health_findings"
+      ],
+      "acceptance_scenarios": [
+        "dual_path_retrieval"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "palyra-cli",
+        "--test",
+        "workflow_regression_contract",
+        "--locked",
+        "agentic_learning_rollback_matrix_contract",
+        "--",
+        "--exact",
+        "--test-threads=1"
       ]
     }
   ]
