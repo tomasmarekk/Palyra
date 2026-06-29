@@ -271,6 +271,10 @@ impl SkillOperatorMetadata {
 #[serde(deny_unknown_fields)]
 pub struct SkillPluginMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_major: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_tool_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_module_path: Option<String>,
@@ -278,17 +282,111 @@ pub struct SkillPluginMetadata {
     pub default_entrypoint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contracts: Vec<TypedPluginContractDeclaration>,
+    #[serde(default, skip_serializing_if = "is_default_plugin_risk_class")]
+    pub risk: SkillPluginRiskClass,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<SkillPluginCapabilityRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_capabilities: Vec<SkillPluginCapabilityRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_subscriptions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<SkillPluginCompatibilityMatrix>,
 }
 
 impl SkillPluginMetadata {
     /// Returns `true` when no plugin default or contract declaration is set.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.default_tool_id.is_none()
+        self.plugin_id.is_none()
+            && self.abi_major.is_none()
+            && self.default_tool_id.is_none()
             && self.default_module_path.is_none()
             && self.default_entrypoint.is_none()
             && self.contracts.is_empty()
+            && self.risk == SkillPluginRiskClass::default()
+            && self.required_capabilities.is_empty()
+            && self.optional_capabilities.is_empty()
+            && self.storage_prefixes.is_empty()
+            && self.outbound_hosts.is_empty()
+            && self.secret_scopes.is_empty()
+            && self.event_subscriptions.is_empty()
+            && self.compatibility.is_none()
     }
+}
+
+/// Operator-facing risk class for a plugin package.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPluginRiskClass {
+    #[default]
+    Internal,
+    Public,
+    Sensitive,
+    Privileged,
+}
+
+fn is_default_plugin_risk_class(risk: &SkillPluginRiskClass) -> bool {
+    *risk == SkillPluginRiskClass::default()
+}
+
+/// Capability requirement declared by a plugin manifest extension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPluginCapabilityRequirement {
+    pub class: SkillPluginCapabilityClass,
+    pub value: String,
+}
+
+/// Capability classes a plugin can declare as required or optional.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPluginCapabilityClass {
+    HttpHost,
+    Secret,
+    StoragePrefix,
+    Channel,
+    EventSubscription,
+}
+
+/// ABI compatibility matrix declared by a plugin manifest extension.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPluginCompatibilityMatrix {
+    pub min_abi_major: u32,
+    pub max_abi_major: u32,
+    #[serde(default)]
+    pub host_versions: Vec<String>,
+}
+
+/// Machine-readable plugin manifest validation report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPluginManifestValidationReport {
+    pub schema_version: u32,
+    pub skill_id: String,
+    pub plugin_id: Option<String>,
+    pub valid: bool,
+    pub risk: SkillPluginRiskClass,
+    pub required_capabilities: Vec<SkillPluginCapabilityRequirement>,
+    pub optional_capabilities: Vec<SkillPluginCapabilityRequirement>,
+    pub findings: Vec<SkillPluginManifestFinding>,
+}
+
+/// One plugin manifest finding with a fix hint suitable for CLI output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPluginManifestFinding {
+    pub severity: SkillManifestWarningSeverity,
+    pub code: String,
+    pub message: String,
+    pub fix_hint: String,
 }
 
 /// Operator configuration contract: required keys plus typed property schema.

@@ -54,6 +54,32 @@ pub enum PluginsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Validate {
+        #[arg(long = "artifact", alias = "artifact-path")]
+        artifact_path: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    DryRun {
+        #[arg(long = "artifact", alias = "artifact-path")]
+        artifact_path: String,
+        #[arg(long)]
+        hook_event: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Permissions {
+        #[arg(long = "artifact", alias = "artifact-path")]
+        artifact_path: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Test {
+        #[arg(long = "artifact", alias = "artifact-path")]
+        artifact_path: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     #[command(visible_alias = "bind")]
     Install {
         plugin_id: String,

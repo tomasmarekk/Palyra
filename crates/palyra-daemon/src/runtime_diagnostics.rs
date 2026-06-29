@@ -85,6 +85,246 @@ impl RuntimeHealthStatus {
     }
 }
 
+/// Unified lifecycle state for extension/runtime components.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ComponentHealthState {
+    Healthy,
+    Degraded,
+    Quarantined,
+    DisabledByPolicy,
+    Incompatible,
+    PendingUpgrade,
+    FailedPreflight,
+}
+
+impl ComponentHealthState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Quarantined => "quarantined",
+            Self::DisabledByPolicy => "disabled_by_policy",
+            Self::Incompatible => "incompatible",
+            Self::PendingUpgrade => "pending_upgrade",
+            Self::FailedPreflight => "failed_preflight",
+        }
+    }
+}
+
+/// Observable outcome of one component call or preflight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentCallOutcome {
+    pub(crate) component: String,
+    pub(crate) capability: String,
+    pub(crate) duration_ms: u64,
+    #[serde(default)]
+    pub(crate) timed_out: bool,
+    #[serde(default)]
+    pub(crate) capability_denied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resource_event: Option<String>,
+}
+
+/// Snapshot of one component's health-registry state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentHealthRecord {
+    pub(crate) component: String,
+    pub(crate) state: ComponentHealthState,
+    pub(crate) consecutive_failures: u32,
+    pub(crate) total_failures: u64,
+    pub(crate) quarantine_until_unix_ms: Option<i64>,
+    pub(crate) last_error_code: Option<String>,
+    pub(crate) last_capability: Option<String>,
+    pub(crate) updated_at_unix_ms: i64,
+}
+
+/// Context fallback decision emitted when a component cannot be used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentContextFallback {
+    pub(crate) component: String,
+    pub(crate) use_fallback: bool,
+    pub(crate) state: ComponentHealthState,
+    pub(crate) audit_reason: String,
+}
+
+/// Audit event for health-registry state changes that require operator traceability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentHealthAuditEvent {
+    pub(crate) event_kind: String,
+    pub(crate) actor: String,
+    pub(crate) component: String,
+    pub(crate) from_state: ComponentHealthState,
+    pub(crate) to_state: ComponentHealthState,
+    pub(crate) recorded_at_unix_ms: i64,
+}
+
+/// In-memory health registry for plugins, skills, MCP servers, and external packages.
+#[derive(Debug, Clone)]
+pub(crate) struct ComponentHealthRegistry {
+    records: BTreeMap<String, ComponentHealthRecord>,
+    quarantine_after_failures: u32,
+    quarantine_backoff_ms: i64,
+}
+
+impl Default for ComponentHealthRegistry {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            quarantine_after_failures: 3,
+            quarantine_backoff_ms: 60_000,
+        }
+    }
+}
+
+impl ComponentHealthRegistry {
+    pub(crate) fn record_outcome(
+        &mut self,
+        outcome: ComponentCallOutcome,
+        now_unix_ms: i64,
+    ) -> ComponentHealthRecord {
+        let failed = outcome.timed_out || outcome.capability_denied || outcome.error_code.is_some();
+        let record = self.records.entry(outcome.component.clone()).or_insert_with(|| {
+            ComponentHealthRecord {
+                component: outcome.component.clone(),
+                state: ComponentHealthState::Healthy,
+                consecutive_failures: 0,
+                total_failures: 0,
+                quarantine_until_unix_ms: None,
+                last_error_code: None,
+                last_capability: None,
+                updated_at_unix_ms: now_unix_ms,
+            }
+        });
+        record.last_capability = Some(outcome.capability);
+        record.updated_at_unix_ms = now_unix_ms;
+        if matches!(
+            record.state,
+            ComponentHealthState::DisabledByPolicy
+                | ComponentHealthState::Incompatible
+                | ComponentHealthState::PendingUpgrade
+                | ComponentHealthState::FailedPreflight
+        ) {
+            return record.clone();
+        }
+        if failed {
+            record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+            record.total_failures = record.total_failures.saturating_add(1);
+            record.last_error_code = outcome.error_code.or_else(|| {
+                if outcome.timed_out {
+                    Some("timeout".to_owned())
+                } else if outcome.capability_denied {
+                    Some("capability_denied".to_owned())
+                } else {
+                    outcome.resource_event
+                }
+            });
+            if record.consecutive_failures >= self.quarantine_after_failures {
+                record.state = ComponentHealthState::Quarantined;
+                let multiplier = i64::from(record.consecutive_failures);
+                record.quarantine_until_unix_ms = Some(
+                    now_unix_ms
+                        .saturating_add(self.quarantine_backoff_ms.saturating_mul(multiplier)),
+                );
+            } else {
+                record.state = ComponentHealthState::Degraded;
+            }
+        } else if record.state != ComponentHealthState::Quarantined {
+            record.state = ComponentHealthState::Healthy;
+            record.consecutive_failures = 0;
+            record.last_error_code = None;
+            record.quarantine_until_unix_ms = None;
+        }
+        record.clone()
+    }
+
+    pub(crate) fn mark_state(
+        &mut self,
+        component: &str,
+        state: ComponentHealthState,
+        reason_code: &str,
+        now_unix_ms: i64,
+    ) -> ComponentHealthRecord {
+        let record =
+            self.records.entry(component.to_owned()).or_insert_with(|| ComponentHealthRecord {
+                component: component.to_owned(),
+                state,
+                consecutive_failures: 0,
+                total_failures: 0,
+                quarantine_until_unix_ms: None,
+                last_error_code: None,
+                last_capability: None,
+                updated_at_unix_ms: now_unix_ms,
+            });
+        record.state = state;
+        record.last_error_code = Some(reason_code.to_owned());
+        record.updated_at_unix_ms = now_unix_ms;
+        record.clone()
+    }
+
+    pub(crate) fn unquarantine_with_audit(
+        &mut self,
+        component: &str,
+        actor: &str,
+        now_unix_ms: i64,
+    ) -> Option<ComponentHealthAuditEvent> {
+        let actor = actor.trim();
+        if actor.is_empty() {
+            return None;
+        }
+        let record = self.records.get_mut(component)?;
+        if record.state != ComponentHealthState::Quarantined {
+            return None;
+        }
+        if record.quarantine_until_unix_ms.is_some_and(|until| now_unix_ms < until) {
+            return None;
+        }
+        let from_state = record.state;
+        record.state = ComponentHealthState::Degraded;
+        record.consecutive_failures = 0;
+        record.quarantine_until_unix_ms = None;
+        record.updated_at_unix_ms = now_unix_ms;
+        Some(ComponentHealthAuditEvent {
+            event_kind: "component_health.unquarantined".to_owned(),
+            actor: actor.to_owned(),
+            component: component.to_owned(),
+            from_state,
+            to_state: record.state,
+            recorded_at_unix_ms: now_unix_ms,
+        })
+    }
+
+    pub(crate) fn fallback_for_component(&self, component: &str) -> ComponentContextFallback {
+        let state = self
+            .records
+            .get(component)
+            .map(|record| record.state)
+            .unwrap_or(ComponentHealthState::Healthy);
+        let use_fallback =
+            !matches!(state, ComponentHealthState::Healthy | ComponentHealthState::Degraded);
+        ComponentContextFallback {
+            component: component.to_owned(),
+            use_fallback,
+            state,
+            audit_reason: if use_fallback {
+                format!("component {component} is {}", state.as_str())
+            } else {
+                "component is available".to_owned()
+            },
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<ComponentHealthRecord> {
+        self.records.values().cloned().collect()
+    }
+}
+
 /// Health verdict for one subsystem with stable reason codes, bounded
 /// numeric metrics, and operator repair hints.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -584,7 +824,80 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
         "audit": {
             "operator_action": "support_bundle.export",
             "observability_counters": true,
-        }
+        },
+        "component_health_registry": build_component_health_registry_contract(),
+    })
+}
+
+fn build_component_health_registry_contract() -> Value {
+    let mut registry = ComponentHealthRegistry::default();
+    let quarantined = registry.record_outcome(
+        ComponentCallOutcome {
+            component: "mcp.docs".to_owned(),
+            capability: "tool.search".to_owned(),
+            duration_ms: 50,
+            timed_out: true,
+            capability_denied: false,
+            error_code: None,
+            resource_event: None,
+        },
+        1_000,
+    );
+    let fallback = registry.fallback_for_component("mcp.docs");
+    let _ = registry.mark_state(
+        "plugin.policy",
+        ComponentHealthState::PendingUpgrade,
+        "plugin.pending_upgrade",
+        1_000,
+    );
+    let _ = registry.mark_state(
+        "plugin.recovered",
+        ComponentHealthState::Quarantined,
+        "plugin.repeated_failures",
+        1_000,
+    );
+    let unquarantine_audit = registry.unquarantine_with_audit("plugin.recovered", "system", 2_000);
+    json!({
+        "schema_version": 1,
+        "states": [
+            ComponentHealthState::Healthy.as_str(),
+            ComponentHealthState::Degraded.as_str(),
+            ComponentHealthState::Quarantined.as_str(),
+            ComponentHealthState::DisabledByPolicy.as_str(),
+            ComponentHealthState::Incompatible.as_str(),
+            ComponentHealthState::PendingUpgrade.as_str(),
+            ComponentHealthState::FailedPreflight.as_str(),
+        ],
+        "tracked_outcomes": [
+            "duration_ms",
+            "error_code",
+            "capability_denied",
+            "timed_out",
+            "resource_event",
+        ],
+        "quarantine": {
+            "after_consecutive_failures": registry.quarantine_after_failures,
+            "backoff_ms": registry.quarantine_backoff_ms,
+            "state_after_first_failure": quarantined.state.as_str(),
+        },
+        "fallback": {
+            "audit_reason": fallback.audit_reason,
+            "use_fallback": fallback.use_fallback,
+        },
+        "snapshot_fields": registry.snapshot().iter().map(|record| {
+            json!({
+                "component": record.component,
+                "state": record.state.as_str(),
+                "consecutive_failures": record.consecutive_failures,
+                "total_failures": record.total_failures,
+                "last_error_code": record.last_error_code,
+            })
+        }).collect::<Vec<_>>(),
+        "operator_unquarantine_requires_actor": true,
+        "unquarantine_audit_kind": unquarantine_audit
+            .as_ref()
+            .map(|event| event.event_kind.as_str())
+            .unwrap_or("component_health.unquarantined"),
     })
 }
 
@@ -1216,6 +1529,87 @@ mod tests {
             active_ref_count: 0,
             lease_expires_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn component_health_registry_quarantines_after_repeated_failures() {
+        let mut registry = ComponentHealthRegistry::default();
+        let outcome = ComponentCallOutcome {
+            component: "mcp.docs".to_owned(),
+            capability: "tool.search".to_owned(),
+            duration_ms: 25,
+            timed_out: false,
+            capability_denied: false,
+            error_code: Some("protocol.invalid_response".to_owned()),
+            resource_event: None,
+        };
+
+        let first = registry.record_outcome(outcome.clone(), 1_000);
+        let second = registry.record_outcome(outcome.clone(), 2_000);
+        let third = registry.record_outcome(outcome, 3_000);
+
+        assert_eq!(first.state, ComponentHealthState::Degraded);
+        assert_eq!(second.state, ComponentHealthState::Degraded);
+        assert_eq!(third.state, ComponentHealthState::Quarantined);
+        assert!(third.quarantine_until_unix_ms.is_some_and(|until| until > 3_000));
+        assert_eq!(
+            registry.fallback_for_component("mcp.docs").audit_reason,
+            "component mcp.docs is quarantined"
+        );
+    }
+
+    #[test]
+    fn component_health_registry_unquarantine_requires_actor_and_backoff_expiry() {
+        let mut registry = ComponentHealthRegistry::default();
+        registry.mark_state(
+            "plugin.policy",
+            ComponentHealthState::Quarantined,
+            "operator.quarantined",
+            1_000,
+        );
+        {
+            let record = registry.records.get_mut("plugin.policy").expect("record should exist");
+            record.quarantine_until_unix_ms = Some(5_000);
+        }
+
+        assert!(registry.unquarantine_with_audit("plugin.policy", "", 6_000).is_none());
+        assert!(registry.unquarantine_with_audit("plugin.policy", "user:test", 4_000).is_none());
+
+        let audit = registry
+            .unquarantine_with_audit("plugin.policy", "user:test", 5_000)
+            .expect("unquarantine should be audited");
+
+        assert_eq!(audit.from_state, ComponentHealthState::Quarantined);
+        assert_eq!(audit.to_state, ComponentHealthState::Degraded);
+        assert_eq!(audit.actor, "user:test");
+        assert!(!registry.fallback_for_component("plugin.policy").use_fallback);
+    }
+
+    #[test]
+    fn component_health_registry_respects_policy_disabled_state() {
+        let mut registry = ComponentHealthRegistry::default();
+        registry.mark_state(
+            "skill.external",
+            ComponentHealthState::DisabledByPolicy,
+            "policy.disabled",
+            1_000,
+        );
+        let record = registry.record_outcome(
+            ComponentCallOutcome {
+                component: "skill.external".to_owned(),
+                capability: "preflight".to_owned(),
+                duration_ms: 1,
+                timed_out: false,
+                capability_denied: false,
+                error_code: None,
+                resource_event: None,
+            },
+            2_000,
+        );
+
+        assert_eq!(record.state, ComponentHealthState::DisabledByPolicy);
+        assert!(registry.fallback_for_component("skill.external").use_fallback);
+        assert_eq!(registry.snapshot().len(), 1);
     }
 
     #[test]

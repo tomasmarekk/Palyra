@@ -423,6 +423,76 @@ fn parse_plugins_doctor_command() {
 }
 
 #[test]
+fn parse_plugins_local_validation_commands() {
+    let validate = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "validate",
+        "--artifact",
+        "dist/acme.palyra-skill",
+        "--json",
+    ]);
+    match validate.command {
+        Command::Plugins { command: PluginsCommand::Validate { artifact_path, json } } => {
+            assert_eq!(artifact_path, "dist/acme.palyra-skill");
+            assert!(json);
+        }
+        other => panic!("unexpected validate parse result: {other:?}"),
+    }
+
+    let dry_run = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "dry-run",
+        "--artifact",
+        "dist/acme.palyra-skill",
+        "--hook-event",
+        "before_tool_policy",
+    ]);
+    match dry_run.command {
+        Command::Plugins {
+            command: PluginsCommand::DryRun { artifact_path, hook_event, json },
+        } => {
+            assert_eq!(artifact_path, "dist/acme.palyra-skill");
+            assert_eq!(hook_event.as_deref(), Some("before_tool_policy"));
+            assert!(!json);
+        }
+        other => panic!("unexpected dry-run parse result: {other:?}"),
+    }
+
+    let permissions = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "permissions",
+        "--artifact-path",
+        "dist/acme.palyra-skill",
+    ]);
+    match permissions.command {
+        Command::Plugins { command: PluginsCommand::Permissions { artifact_path, json } } => {
+            assert_eq!(artifact_path, "dist/acme.palyra-skill");
+            assert!(!json);
+        }
+        other => panic!("unexpected permissions parse result: {other:?}"),
+    }
+
+    let test = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "test",
+        "--artifact",
+        "dist/acme.palyra-skill",
+        "--json",
+    ]);
+    match test.command {
+        Command::Plugins { command: PluginsCommand::Test { artifact_path, json } } => {
+            assert_eq!(artifact_path, "dist/acme.palyra-skill");
+            assert!(json);
+        }
+        other => panic!("unexpected test parse result: {other:?}"),
+    }
+}
+
+#[test]
 fn parse_plugins_update_command() {
     run_cli_parse_test_with_large_stack(|| {
         let update = Cli::parse_from([

@@ -13,8 +13,10 @@ mod audit;
 mod constants;
 mod error;
 mod extension;
+mod install_policy;
 mod manifest;
 mod models;
+mod plugin_testkit;
 mod runtime;
 mod trust;
 mod verify;
@@ -28,8 +30,12 @@ pub use constants::{
 };
 pub use error::SkillPackagingError;
 pub use extension::*;
-pub use manifest::{parse_ed25519_signing_key, parse_manifest_toml};
+pub use install_policy::*;
+pub use manifest::{
+    parse_ed25519_signing_key, parse_manifest_toml, plugin_manifest_validation_report,
+};
 pub use models::*;
+pub use plugin_testkit::*;
 pub use runtime::{
     capability_grants_from_manifest, policy_bindings_from_manifest, policy_requests_from_manifest,
 };

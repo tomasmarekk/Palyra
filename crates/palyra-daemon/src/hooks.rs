@@ -111,6 +111,16 @@ pub(crate) enum HookEventKind {
     SkillEnabled,
     SkillQuarantined,
     SkillDisabled,
+    RunStarted,
+    RunFinished,
+    BeforeContextBuild,
+    AfterContextBuild,
+    BeforeToolPolicy,
+    AfterToolResult,
+    MemoryCandidateCreated,
+    LearningCandidateReviewed,
+    ArtifactCreated,
+    ApprovalRequested,
     RunBeforeRun,
     RunBeforeTool,
     RunAfterTool,
@@ -126,6 +136,16 @@ impl HookEventKind {
             Self::SkillEnabled => "skill:enabled",
             Self::SkillQuarantined => "skill:quarantined",
             Self::SkillDisabled => "skill:disabled",
+            Self::RunStarted => "run_started",
+            Self::RunFinished => "run_finished",
+            Self::BeforeContextBuild => "before_context_build",
+            Self::AfterContextBuild => "after_context_build",
+            Self::BeforeToolPolicy => "before_tool_policy",
+            Self::AfterToolResult => "after_tool_result",
+            Self::MemoryCandidateCreated => "memory_candidate_created",
+            Self::LearningCandidateReviewed => "learning_candidate_reviewed",
+            Self::ArtifactCreated => "artifact_created",
+            Self::ApprovalRequested => "approval_requested",
             Self::RunBeforeRun => RunLifecycleHookPhase::BeforeRun.event_name(),
             Self::RunBeforeTool => RunLifecycleHookPhase::BeforeTool.event_name(),
             Self::RunAfterTool => RunLifecycleHookPhase::AfterTool.event_name(),
@@ -144,6 +164,17 @@ pub(crate) struct HookDispatchOutcome {
     pub(crate) success: bool,
     pub(crate) error: Option<String>,
     pub(crate) output_json: Value,
+}
+
+/// Redacted event envelope passed to constrained plugin hooks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HookEventEnvelope {
+    pub(crate) schema_version: u32,
+    pub(crate) event: String,
+    pub(crate) redacted: bool,
+    pub(crate) payload: Value,
+    pub(crate) forbidden_authorities: Vec<String>,
 }
 
 /// Resolves the hooks storage root as a sibling of the plugins root.
@@ -325,8 +356,61 @@ pub(crate) fn normalize_hook_event(raw: &str) -> Result<&'static str> {
         "skill:enabled" => Ok(HookEventKind::SkillEnabled.as_str()),
         "skill:quarantined" => Ok(HookEventKind::SkillQuarantined.as_str()),
         "skill:disabled" => Ok(HookEventKind::SkillDisabled.as_str()),
+        "run_started" | "run:started" => Ok(HookEventKind::RunStarted.as_str()),
+        "run_finished" | "run:finished" => Ok(HookEventKind::RunFinished.as_str()),
+        "before_context_build" | "context:before_build" => {
+            Ok(HookEventKind::BeforeContextBuild.as_str())
+        }
+        "after_context_build" | "context:after_build" => {
+            Ok(HookEventKind::AfterContextBuild.as_str())
+        }
+        "before_tool_policy" | "tool:before_policy" => Ok(HookEventKind::BeforeToolPolicy.as_str()),
+        "after_tool_result" | "tool:after_result" => Ok(HookEventKind::AfterToolResult.as_str()),
+        "memory_candidate_created" | "memory:candidate_created" => {
+            Ok(HookEventKind::MemoryCandidateCreated.as_str())
+        }
+        "learning_candidate_reviewed" | "learning:candidate_reviewed" => {
+            Ok(HookEventKind::LearningCandidateReviewed.as_str())
+        }
+        "artifact_created" | "artifact:created" => Ok(HookEventKind::ArtifactCreated.as_str()),
+        "approval_requested" | "approval:requested" => {
+            Ok(HookEventKind::ApprovalRequested.as_str())
+        }
         other => bail!("unsupported hook event '{other}'"),
     }
+}
+
+/// Builds the hook event envelope with secret-like fields replaced by a marker.
+///
+/// Adapters can preview exactly what a plugin would receive without executing
+/// untrusted code, and dispatch records the same redacted envelope for audit.
+pub(crate) fn build_redacted_hook_event_envelope(
+    event: &str,
+    payload: Value,
+) -> Result<HookEventEnvelope> {
+    let event = normalize_hook_event(event)?.to_owned();
+    Ok(HookEventEnvelope {
+        schema_version: 1,
+        event,
+        redacted: true,
+        payload: redact_hook_payload(payload),
+        forbidden_authorities: vec![
+            "approve_tool".to_owned(),
+            "read_raw_secret".to_owned(),
+            "mutate_historical_journal".to_owned(),
+            "bypass_policy".to_owned(),
+        ],
+    })
+}
+
+/// Validates that a plugin hook output stays advisory and non-authoritative.
+pub(crate) fn validate_hook_output_authority(output: &Value) -> Result<()> {
+    let mut denied_paths = Vec::new();
+    collect_forbidden_hook_output_paths(output, "$", &mut denied_paths);
+    if denied_paths.is_empty() {
+        return Ok(());
+    }
+    bail!("hook output requested forbidden authority at {}", denied_paths.join(", "));
 }
 
 fn hook_event_kind_for_lifecycle_phase(phase: RunLifecycleHookPhase) -> HookEventKind {
@@ -337,6 +421,84 @@ fn hook_event_kind_for_lifecycle_phase(phase: RunLifecycleHookPhase) -> HookEven
         RunLifecycleHookPhase::BeforeDelivery => HookEventKind::RunBeforeDelivery,
         RunLifecycleHookPhase::AfterRun => HookEventKind::RunAfterRun,
     }
+}
+
+fn redact_hook_payload(value: Value) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| {
+                    if is_secret_like_hook_key(key.as_str()) {
+                        (key, Value::String("<redacted>".to_owned()))
+                    } else {
+                        (key, redact_hook_payload(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_hook_payload).collect()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value,
+    }
+}
+
+fn collect_forbidden_hook_output_paths(value: &Value, path: &str, denied_paths: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, child) in fields {
+                let child_path = format!("{path}.{key}");
+                let normalized = key.to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "approve"
+                        | "approved"
+                        | "approve_tool"
+                        | "tool_approved"
+                        | "raw_secret"
+                        | "read_raw_secret"
+                        | "mutate_journal"
+                        | "mutate_historical_journal"
+                        | "bypass_policy"
+                ) {
+                    denied_paths.push(child_path);
+                    continue;
+                }
+                collect_forbidden_hook_output_paths(child, child_path.as_str(), denied_paths);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_forbidden_hook_output_paths(
+                    child,
+                    format!("{path}[{index}]").as_str(),
+                    denied_paths,
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_secret_like_hook_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '_' })
+        .collect::<String>();
+    [
+        "access_token",
+        "api_key",
+        "authorization",
+        "client_secret",
+        "cookie",
+        "password",
+        "private_key",
+        "raw_secret",
+        "refresh_token",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 /// Spawns the long-lived hook runtime: fires the startup hook once, then polls the journal and
@@ -427,6 +589,9 @@ pub(crate) async fn dispatch_named_event(
     event_payload: Value,
 ) -> Result<Vec<HookDispatchOutcome>> {
     let lifecycle_phase = RunLifecycleHookPhase::parse_hook_event(event);
+    let event_envelope =
+        serde_json::to_value(build_redacted_hook_event_envelope(event, event_payload.clone())?)
+            .unwrap_or_else(|_| json!({}));
     let hooks_root = resolve_hooks_root()?;
     let hooks_index = load_hook_bindings_index(hooks_root.as_path())?;
     let plugins_root = resolve_plugins_root()?;
@@ -448,7 +613,12 @@ pub(crate) async fn dispatch_named_event(
                     "hook.failed",
                     &hook,
                     Some(&plugin),
-                    json!({ "event": event, "reason": message, "event_payload": event_payload }),
+                    json!({
+                        "event": event,
+                        "reason": message,
+                        "event_payload": event_payload,
+                        "event_envelope": event_envelope.clone(),
+                    }),
                 )
                 .await;
                 outcomes.push(HookDispatchOutcome {
@@ -470,6 +640,7 @@ pub(crate) async fn dispatch_named_event(
                         "event": event,
                         "reason": sanitize_http_error_message(error.to_string().as_str()),
                         "event_payload": event_payload,
+                        "event_envelope": event_envelope.clone(),
                     }),
                 )
                 .await;
@@ -496,6 +667,7 @@ pub(crate) async fn dispatch_named_event(
                         "event": event,
                         "reason": message,
                         "event_payload": event_payload,
+                        "event_envelope": event_envelope.clone(),
                     }),
                 )
                 .await;
@@ -542,6 +714,7 @@ pub(crate) async fn dispatch_named_event(
                     "skill_id": resolved.skill_id,
                     "skill_version": resolved.skill_version,
                     "event_payload": event_payload,
+                    "event_envelope": event_envelope.clone(),
                 }),
             )
             .await;
@@ -568,6 +741,32 @@ pub(crate) async fn dispatch_named_event(
                 let mut output_json =
                     serde_json::from_slice::<Value>(success.output_json.as_slice())
                         .unwrap_or_else(|_| json!({}));
+                if let Err(error) = validate_hook_output_authority(&output_json) {
+                    let message = sanitize_http_error_message(error.to_string().as_str());
+                    record_hook_event(
+                        Arc::clone(&runtime),
+                        "hook.failed",
+                        &hook,
+                        Some(&plugin),
+                        json!({
+                            "event": event,
+                            "skill_id": resolved.skill_id,
+                            "skill_version": resolved.skill_version,
+                            "reason": message,
+                            "event_payload": event_payload,
+                            "event_envelope": event_envelope.clone(),
+                        }),
+                    )
+                    .await;
+                    outcomes.push(HookDispatchOutcome {
+                        hook,
+                        plugin,
+                        success: false,
+                        error: Some(message),
+                        output_json: json!({}),
+                    });
+                    continue;
+                }
                 if let Some(phase) = lifecycle_phase {
                     let decision =
                         lifecycle_decision_from_wasm_output(phase, &hook, &plugin, &output_json);
@@ -589,6 +788,7 @@ pub(crate) async fn dispatch_named_event(
                                 "reason": message,
                                 "decision": decision,
                                 "event_payload": event_payload,
+                                "event_envelope": event_envelope.clone(),
                             }),
                         )
                         .await;
@@ -617,6 +817,7 @@ pub(crate) async fn dispatch_named_event(
                         "entrypoint": resolved.entrypoint,
                         "output": output_json,
                         "event_payload": event_payload,
+                        "event_envelope": event_envelope.clone(),
                     }),
                 )
                 .await;
@@ -641,6 +842,7 @@ pub(crate) async fn dispatch_named_event(
                         "skill_version": resolved.skill_version,
                         "reason": message,
                         "event_payload": event_payload,
+                        "event_envelope": event_envelope.clone(),
                     }),
                 )
                 .await;
@@ -670,6 +872,7 @@ pub(crate) async fn dispatch_named_event(
                     "event": event,
                     "resolution": resolution,
                     "event_payload": event_payload,
+                    "event_envelope": event_envelope,
                 }),
             )
             .await;
@@ -843,9 +1046,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        attach_lifecycle_decision, enforce_run_lifecycle_resolution, hook_bindings_index_path,
+        attach_lifecycle_decision, build_redacted_hook_event_envelope,
+        enforce_run_lifecycle_resolution, hook_bindings_index_path,
         lifecycle_decision_kind_from_exit_code, load_hook_bindings_index, normalize_hook_event,
-        HOOK_BINDINGS_LAYOUT_VERSION,
+        validate_hook_output_authority, HOOK_BINDINGS_LAYOUT_VERSION,
     };
 
     #[test]
@@ -872,6 +1076,61 @@ mod tests {
                 .expect("canonical lifecycle event should normalize"),
             "run:before_delivery"
         );
+    }
+
+    #[test]
+    fn normalize_hook_event_accepts_constrained_hook_api_events() {
+        assert_eq!(
+            normalize_hook_event("run_started").expect("run_started should normalize"),
+            "run_started"
+        );
+        assert_eq!(
+            normalize_hook_event("tool:before_policy")
+                .expect("tool before policy alias should normalize"),
+            "before_tool_policy"
+        );
+        assert_eq!(
+            normalize_hook_event("approval:requested").expect("approval alias should normalize"),
+            "approval_requested"
+        );
+    }
+
+    #[test]
+    fn hook_event_envelope_redacts_secret_payload_fields() {
+        let envelope = build_redacted_hook_event_envelope(
+            "after_tool_result",
+            json!({
+                "tool": "mcp.docs.search",
+                "api_token": "plain-secret",
+                "nested": { "client_secret": "secret" },
+            }),
+        )
+        .expect("envelope should build");
+
+        assert_eq!(envelope.event, "after_tool_result");
+        assert_eq!(
+            envelope.payload.pointer("/api_token").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            envelope.payload.pointer("/nested/client_secret").and_then(serde_json::Value::as_str),
+            Some("<redacted>")
+        );
+        assert!(envelope.forbidden_authorities.iter().any(|entry| entry == "approve_tool"));
+    }
+
+    #[test]
+    fn hook_output_authority_rejects_tool_approval_and_journal_mutation() {
+        let error = validate_hook_output_authority(&json!({
+            "annotations": {},
+            "approve_tool": true,
+            "nested": { "mutate_historical_journal": true },
+        }))
+        .expect_err("forbidden authorities should be rejected")
+        .to_string();
+
+        assert!(error.contains("$.approve_tool"), "{error}");
+        assert!(error.contains("$.nested.mutate_historical_journal"), "{error}");
     }
 
     #[test]

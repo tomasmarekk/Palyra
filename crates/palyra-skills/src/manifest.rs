@@ -9,7 +9,9 @@ use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use palyra_common::{build_metadata, CANONICAL_PROTOCOL_MAJOR};
-use palyra_plugins_sdk::{typed_plugin_contract_descriptor, TypedPluginContractKind};
+use palyra_plugins_sdk::{
+    typed_plugin_contract_descriptor, TypedPluginContractKind, SDK_ABI_MAX_MAJOR, SDK_ABI_MIN_MAJOR,
+};
 use serde_json::Value;
 
 use crate::artifact::normalize_artifact_path;
@@ -18,6 +20,8 @@ use crate::error::SkillPackagingError;
 use crate::models::{
     SkillBuilderMetadata, SkillCompat, SkillConfigContract, SkillConfigProperty,
     SkillConfigValueType, SkillManifest, SkillManifestWarning, SkillManifestWarningSeverity,
+    SkillPluginCapabilityClass, SkillPluginCapabilityRequirement, SkillPluginManifestFinding,
+    SkillPluginManifestValidationReport,
 };
 
 /// Parses and fully validates a `skill.toml` manifest.
@@ -399,11 +403,183 @@ fn validate_operator_metadata(
     if let Some(entrypoint) = operator.plugin.default_entrypoint.as_deref() {
         validate_plugin_entrypoint(entrypoint, "operator.plugin.default_entrypoint")?;
     }
+    validate_plugin_manifest_extension(manifest, publisher)?;
     validate_plugin_contract_declarations(operator.plugin.contracts.as_slice())?;
     if let Some(config) = operator.config.as_ref() {
         validate_config_contract(config)?;
     }
     Ok(())
+}
+
+/// Builds the plugin-manifest report used by CLI validate/dry-run/test flows.
+#[must_use]
+pub fn plugin_manifest_validation_report(
+    manifest: &SkillManifest,
+) -> SkillPluginManifestValidationReport {
+    let plugin = &manifest.operator.plugin;
+    let mut findings = Vec::new();
+    if plugin.plugin_id.is_none() && !plugin.is_empty() {
+        findings.push(plugin_manifest_finding(
+            SkillManifestWarningSeverity::Warning,
+            "plugin_id_missing",
+            "operator.plugin.plugin_id is missing",
+            "set a stable plugin_id for install policy and diagnostics",
+        ));
+    }
+    if plugin.abi_major.is_none() && !plugin.is_empty() {
+        findings.push(plugin_manifest_finding(
+            SkillManifestWarningSeverity::Warning,
+            "abi_major_missing",
+            "operator.plugin.abi_major is missing",
+            "declare the plugin SDK ABI major expected by this package",
+        ));
+    }
+    if plugin.contracts.is_empty() && !plugin.is_empty() {
+        findings.push(plugin_manifest_finding(
+            SkillManifestWarningSeverity::Warning,
+            "typed_contracts_missing",
+            "operator.plugin.contracts is empty",
+            "declare at least one typed contract for non-legacy plugins",
+        ));
+    }
+    if let Some(compatibility) = plugin.compatibility.as_ref() {
+        if compatibility.min_abi_major > SDK_ABI_MAX_MAJOR
+            || compatibility.max_abi_major < SDK_ABI_MIN_MAJOR
+            || compatibility.min_abi_major > compatibility.max_abi_major
+        {
+            findings.push(plugin_manifest_finding(
+                SkillManifestWarningSeverity::Error,
+                "abi_compatibility_unsupported",
+                "operator.plugin.compatibility excludes the current host ABI",
+                "set min_abi_major/max_abi_major to include the supported SDK ABI range",
+            ));
+        }
+    }
+    if plugin.required_capabilities.is_empty()
+        && (!plugin.outbound_hosts.is_empty()
+            || !plugin.secret_scopes.is_empty()
+            || !plugin.storage_prefixes.is_empty()
+            || !plugin.event_subscriptions.is_empty())
+    {
+        findings.push(plugin_manifest_finding(
+            SkillManifestWarningSeverity::Warning,
+            "capability_requirements_not_classified",
+            "plugin declares capability lists without required_capabilities classification",
+            "classify each grant as required or optional",
+        ));
+    }
+    SkillPluginManifestValidationReport {
+        schema_version: 1,
+        skill_id: manifest.skill_id.clone(),
+        plugin_id: plugin.plugin_id.clone(),
+        valid: !findings
+            .iter()
+            .any(|finding| finding.severity == SkillManifestWarningSeverity::Error),
+        risk: plugin.risk,
+        required_capabilities: plugin.required_capabilities.clone(),
+        optional_capabilities: plugin.optional_capabilities.clone(),
+        findings,
+    }
+}
+
+fn validate_plugin_manifest_extension(
+    manifest: &SkillManifest,
+    publisher: &str,
+) -> Result<(), SkillPackagingError> {
+    let plugin = &manifest.operator.plugin;
+    if let Some(plugin_id) = plugin.plugin_id.as_deref() {
+        let normalized = normalize_identifier(plugin_id, "operator.plugin.plugin_id")?;
+        if !normalized.starts_with(format!("{publisher}.").as_str()) {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.plugin.plugin_id '{}' must be namespaced with '{}.'",
+                plugin_id, publisher
+            )));
+        }
+    }
+    if let Some(abi_major) = plugin.abi_major {
+        if !(SDK_ABI_MIN_MAJOR..=SDK_ABI_MAX_MAJOR).contains(&abi_major) {
+            return Err(SkillPackagingError::ManifestValidation(format!(
+                "operator.plugin.abi_major {} is not supported by this host SDK ABI range {}..={}",
+                abi_major, SDK_ABI_MIN_MAJOR, SDK_ABI_MAX_MAJOR
+            )));
+        }
+    }
+    validate_plugin_capability_requirements(plugin.required_capabilities.as_slice())?;
+    validate_plugin_capability_requirements(plugin.optional_capabilities.as_slice())?;
+    for prefix in &plugin.storage_prefixes {
+        validate_capability_path(prefix, manifest.capabilities.wildcard_opt_in.filesystem)?;
+    }
+    for host in &plugin.outbound_hosts {
+        validate_host(host, manifest.capabilities.wildcard_opt_in.http_egress)?;
+    }
+    for scope in &plugin.secret_scopes {
+        validate_secret_scope(scope)?;
+    }
+    for event in &plugin.event_subscriptions {
+        validate_config_key(event, "operator.plugin.event_subscriptions")?;
+    }
+    if let Some(compatibility) = plugin.compatibility.as_ref() {
+        if compatibility.min_abi_major == 0 || compatibility.max_abi_major == 0 {
+            return Err(SkillPackagingError::ManifestValidation(
+                "operator.plugin.compatibility ABI bounds must be non-zero".to_owned(),
+            ));
+        }
+        if compatibility.min_abi_major > compatibility.max_abi_major {
+            return Err(SkillPackagingError::ManifestValidation(
+                "operator.plugin.compatibility min_abi_major must not exceed max_abi_major"
+                    .to_owned(),
+            ));
+        }
+        for version in &compatibility.host_versions {
+            validate_optional_operator_text(
+                Some(version),
+                "operator.plugin.compatibility.host_versions",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_capability_requirements(
+    requirements: &[SkillPluginCapabilityRequirement],
+) -> Result<(), SkillPackagingError> {
+    let mut seen = BTreeSet::new();
+    for requirement in requirements {
+        let value = requirement.value.trim();
+        if value.is_empty() {
+            return Err(SkillPackagingError::ManifestValidation(
+                "operator.plugin capability requirement values cannot be empty".to_owned(),
+            ));
+        }
+        match requirement.class {
+            SkillPluginCapabilityClass::HttpHost => validate_host(value, false)?,
+            SkillPluginCapabilityClass::Secret => validate_secret_scope(value)?,
+            SkillPluginCapabilityClass::StoragePrefix => validate_capability_path(value, false)?,
+            SkillPluginCapabilityClass::Channel | SkillPluginCapabilityClass::EventSubscription => {
+                validate_config_key(value, "operator.plugin capability requirement")?;
+            }
+        }
+        if !seen.insert((requirement.class, value.to_owned())) {
+            return Err(SkillPackagingError::ManifestValidation(
+                "operator.plugin capability requirements must be unique".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn plugin_manifest_finding(
+    severity: SkillManifestWarningSeverity,
+    code: &str,
+    message: &str,
+    fix_hint: &str,
+) -> SkillPluginManifestFinding {
+    SkillPluginManifestFinding {
+        severity,
+        code: code.to_owned(),
+        message: message.to_owned(),
+        fix_hint: fix_hint.to_owned(),
+    }
 }
 
 /// Collects non-fatal findings (legacy version, missing/weak operator

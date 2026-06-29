@@ -4,7 +4,9 @@
 //! connection, and inline `--config-json` must not carry plain secret values.
 
 use palyra_control_plane as control_plane;
+use palyra_skills::{plugin_local_report_from_artifact_path, PluginLocalReportMode};
 use serde_json::{json, Value};
+use std::path::Path;
 
 use crate::*;
 
@@ -34,6 +36,45 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
         }
         _ => None,
     };
+    match &command {
+        PluginsCommand::Validate { artifact_path, json } => {
+            return emit_local_plugin_report(
+                "plugins.validate",
+                artifact_path.as_str(),
+                PluginLocalReportMode::Validate,
+                *json,
+                None,
+            );
+        }
+        PluginsCommand::DryRun { artifact_path, hook_event, json } => {
+            return emit_local_plugin_report(
+                "plugins.dry_run",
+                artifact_path.as_str(),
+                PluginLocalReportMode::DryRun,
+                *json,
+                hook_event.as_deref(),
+            );
+        }
+        PluginsCommand::Permissions { artifact_path, json } => {
+            return emit_local_plugin_report(
+                "plugins.permissions",
+                artifact_path.as_str(),
+                PluginLocalReportMode::Permissions,
+                *json,
+                None,
+            );
+        }
+        PluginsCommand::Test { artifact_path, json } => {
+            return emit_local_plugin_report(
+                "plugins.test",
+                artifact_path.as_str(),
+                PluginLocalReportMode::Test,
+                *json,
+                None,
+            );
+        }
+        _ => {}
+    }
     let context =
         client::control_plane::connect_admin_console(app::ConnectionOverrides::default()).await?;
     match command {
@@ -218,7 +259,84 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
             }
             Ok(())
         }
+        PluginsCommand::Validate { .. }
+        | PluginsCommand::DryRun { .. }
+        | PluginsCommand::Permissions { .. }
+        | PluginsCommand::Test { .. } => {
+            unreachable!("local plugin commands return before opening a daemon connection")
+        }
     }
+}
+
+fn emit_local_plugin_report(
+    event: &str,
+    artifact_path: &str,
+    mode: PluginLocalReportMode,
+    json_output: bool,
+    hook_event: Option<&str>,
+) -> Result<()> {
+    let mut report = plugin_local_report_from_artifact_path(Path::new(artifact_path), mode)
+        .with_context(|| format!("failed to inspect plugin artifact {artifact_path}"))?;
+    if let Some(hook_event) = hook_event.map(str::trim).filter(|event| !event.is_empty()) {
+        if let Some(validation) = &mut report.validation {
+            validation.findings.push(palyra_skills::SkillPluginManifestFinding {
+                severity: palyra_skills::SkillManifestWarningSeverity::Warning,
+                code: "dry_run.hook_event_selected".to_owned(),
+                message: format!("dry-run selected hook event '{hook_event}'"),
+                fix_hint: "use the same event name in hook fixture tests".to_owned(),
+            });
+        }
+    }
+    if output::preferred_json(json_output) {
+        output::print_json_pretty(&report, "failed to encode plugin local report as JSON")?;
+    } else if output::preferred_ndjson(json_output, false) {
+        output::print_json_line(&report, "failed to encode plugin local report as NDJSON")?;
+    } else {
+        println!(
+            "{event} accepted={} skill_id={} plugin_id={} checks={}",
+            report.accepted,
+            report.skill_id.as_deref().unwrap_or("unknown"),
+            report.plugin_id.as_deref().unwrap_or("none"),
+            report.checks.len()
+        );
+        if let Some(validation) = &report.validation {
+            println!(
+                "{event}.validation valid={} risk={:?} findings={}",
+                validation.valid,
+                validation.risk,
+                validation.findings.len()
+            );
+            for finding in &validation.findings {
+                println!(
+                    "{event}.finding severity={:?} code={} message={} fix_hint={}",
+                    finding.severity, finding.code, finding.message, finding.fix_hint
+                );
+            }
+        }
+        for capability in &report.required_capabilities {
+            println!(
+                "{event}.required_capability class={:?} value={}",
+                capability.class, capability.value
+            );
+        }
+        for capability in &report.optional_capabilities {
+            println!(
+                "{event}.optional_capability class={:?} value={}",
+                capability.class, capability.value
+            );
+        }
+        for check in &report.checks {
+            println!(
+                "{event}.check id={} status={:?} message={}",
+                check.check_id, check.status, check.message
+            );
+        }
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    if !report.accepted {
+        anyhow::bail!("{event} failed; see report checks for details");
+    }
+    Ok(())
 }
 
 fn emit_plugin_list(
