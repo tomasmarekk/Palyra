@@ -606,6 +606,41 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/jobs/{job_id}/release",
             post(console::jobs::console_job_release_handler),
         )
+        .route("/console/v1/tasks", get(console::tasks::console_tasks_list_handler))
+        .route("/console/v1/tasks/{task_id}", get(console::tasks::console_task_get_handler))
+        .route(
+            "/console/v1/tasks/{task_id}/timeline",
+            get(console::tasks::console_task_timeline_handler),
+        )
+        .route(
+            "/console/v1/tasks/{task_id}/cancel",
+            post(console::tasks::console_task_cancel_handler),
+        )
+        .route(
+            "/console/v1/tasks/{task_id}/pause",
+            post(console::tasks::console_task_pause_handler),
+        )
+        .route(
+            "/console/v1/tasks/{task_id}/retry",
+            post(console::tasks::console_task_retry_handler),
+        )
+        .route("/console/v1/workboard", get(console::tasks::console_workboard_list_handler))
+        .route(
+            "/console/v1/workboard/items",
+            post(console::tasks::console_workboard_create_handler),
+        )
+        .route(
+            "/console/v1/workboard/items/{item_id}/claim",
+            post(console::tasks::console_workboard_claim_handler),
+        )
+        .route(
+            "/console/v1/workboard/items/{item_id}/heartbeat",
+            post(console::tasks::console_workboard_heartbeat_handler),
+        )
+        .route(
+            "/console/v1/workboard/items/{item_id}/complete",
+            post(console::tasks::console_workboard_complete_handler),
+        )
         .route(
             "/console/v1/networked-workers/reap-expired",
             post(console::diagnostics::console_networked_workers_reap_expired_handler),
@@ -1029,6 +1064,46 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/flows/{flow_id}/steps/{step_id}/compensate",
             post(console::flows::console_flow_step_compensate_handler),
+        )
+        .route(
+            "/console/v1/commitments",
+            get(console::commitments::console_commitments_list_handler),
+        )
+        .route(
+            "/console/v1/commitments/extract",
+            post(console::commitments::console_commitments_extract_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}",
+            get(console::commitments::console_commitment_get_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/sources",
+            get(console::commitments::console_commitment_sources_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/explain",
+            get(console::commitments::console_commitment_explain_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/approve",
+            post(console::commitments::console_commitment_approve_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/dismiss",
+            post(console::commitments::console_commitment_dismiss_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/snooze",
+            post(console::commitments::console_commitment_snooze_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/edit",
+            post(console::commitments::console_commitment_edit_handler),
+        )
+        .route(
+            "/console/v1/commitments/{commitment_id}/schedule",
+            post(console::commitments::console_commitment_schedule_handler),
         )
         .route(
             "/console/v1/routines/templates",
