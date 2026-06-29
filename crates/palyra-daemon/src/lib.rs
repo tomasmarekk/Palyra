@@ -801,6 +801,19 @@ struct ConsoleLearningCandidateReviewRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleLearningCandidateEvalRequest {
+    eval_suite: String,
+    result: String,
+    threshold: f64,
+    score: f64,
+    decision: String,
+    #[serde(default)]
+    policy_decision: Option<String>,
+    #[serde(default)]
+    evidence_refs_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConsoleLearningCandidateApplyRequest {
     #[serde(default)]
     action_summary: Option<String>,

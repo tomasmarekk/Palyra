@@ -41,10 +41,12 @@ use crate::journal::{
     CommitmentSourceRecord, CommitmentUpdateRequest, FlowBundleRecord, FlowCreateRequest,
     FlowListFilter, FlowRecord, FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
     IdempotencyBeginRequest, IdempotencyCompleteRequest, IdempotencyFailRequest,
-    LearningCandidateCreateRequest, LearningCandidateHistoryRecord, LearningCandidateListFilter,
-    LearningCandidateRecord, LearningCandidateReviewRequest, LearningPreferenceListFilter,
-    LearningPreferenceRecord, LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus,
-    MemoryItemLifecycleUpdateRequest, MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
+    LearningCandidateCreateRequest, LearningCandidateEvalCreateRequest,
+    LearningCandidateEvalRecord, LearningCandidateHistoryRecord, LearningCandidateListFilter,
+    LearningCandidateRecord, LearningCandidateReviewRequest, LearningCandidateRolloutCreateRequest,
+    LearningCandidateRolloutRecord, LearningPreferenceListFilter, LearningPreferenceRecord,
+    LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemLifecycleUpdateRequest,
+    MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
     OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskRecord,
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorCheckpointCreateRequest,
     OrchestratorCheckpointRecord, OrchestratorCheckpointRestoreMarkRequest,
@@ -7655,6 +7657,116 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("learning candidate history worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_learning_candidate_eval_blocking(
+        &self,
+        request: &LearningCandidateEvalCreateRequest,
+    ) -> Result<LearningCandidateEvalRecord, Status> {
+        self.journal_store
+            .record_learning_candidate_eval(request)
+            .map_err(|error| map_orchestrator_store_error("record learning candidate eval", error))
+    }
+
+    /// Appends an evaluation gate result for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn record_learning_candidate_eval(
+        self: &Arc<Self>,
+        request: LearningCandidateEvalCreateRequest,
+    ) -> Result<LearningCandidateEvalRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.record_learning_candidate_eval_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("learning candidate eval worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_learning_candidate_evals_blocking(
+        &self,
+        candidate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateEvalRecord>, Status> {
+        self.journal_store
+            .list_learning_candidate_evals(candidate_id, limit)
+            .map_err(|error| map_orchestrator_store_error("list learning candidate evals", error))
+    }
+
+    /// Lists evaluation gate results for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_learning_candidate_evals(
+        self: &Arc<Self>,
+        candidate_id: String,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateEvalRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_learning_candidate_evals_blocking(candidate_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("learning candidate eval list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_learning_candidate_rollout_blocking(
+        &self,
+        request: &LearningCandidateRolloutCreateRequest,
+    ) -> Result<LearningCandidateRolloutRecord, Status> {
+        self.journal_store.record_learning_candidate_rollout(request).map_err(|error| {
+            map_orchestrator_store_error("record learning candidate rollout", error)
+        })
+    }
+
+    /// Appends a rollout, monitoring, or rollback event for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn record_learning_candidate_rollout(
+        self: &Arc<Self>,
+        request: LearningCandidateRolloutCreateRequest,
+    ) -> Result<LearningCandidateRolloutRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.record_learning_candidate_rollout_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("learning candidate rollout worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_learning_candidate_rollouts_blocking(
+        &self,
+        candidate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateRolloutRecord>, Status> {
+        self.journal_store.list_learning_candidate_rollouts(candidate_id, limit).map_err(|error| {
+            map_orchestrator_store_error("list learning candidate rollouts", error)
+        })
+    }
+
+    /// Lists rollout, monitoring, and rollback events for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_learning_candidate_rollouts(
+        self: &Arc<Self>,
+        candidate_id: String,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateRolloutRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_learning_candidate_rollouts_blocking(candidate_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("learning candidate rollout list worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

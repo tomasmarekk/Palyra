@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "should_remember_release_window",
+      "kind": "should_remember",
+      "input": "Remember that the release window is Friday at 09:00 UTC.",
+      "expected_decision": "activate"
+    },
+    {
+      "id": "should_not_remember_one_off_joke",
+      "kind": "should_not_remember",
+      "input": "That throwaway joke was funny.",
+      "expected_decision": "reject"
+    },
+    {
+      "id": "secret_leak_api_key",
+      "kind": "secret_leak",
+      "input": "My API key is sk-test-redacted.",
+      "expected_decision": "reject"
+    },
+    {
+      "id": "contradiction_review_timezone",
+      "kind": "contradiction",
+      "input": "Actually the release window is Thursday at 09:00 UTC.",
+      "expected_decision": "review"
+    },
+    {
+      "id": "stale_fact_shadow",
+      "kind": "stale_fact",
+      "input": "The staging host was staging-old.example.test.",
+      "expected_decision": "shadow"
+    },
+    {
+      "id": "preference_update_concise",
+      "kind": "preference_update",
+      "input": "Use concise status updates by default.",
+      "expected_decision": "activate"
+    }
+  ],
+  "shadow_write": {
+    "status": "shadow",
+    "active_memory_activation": false,
+    "expires_after_ms": 86400000
+  }
+}

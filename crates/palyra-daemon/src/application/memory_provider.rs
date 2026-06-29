@@ -312,6 +312,9 @@ pub(crate) struct MemoryProviderReindexProgress {
     pub(crate) scanned_count: u64,
     pub(crate) updated_count: u64,
     pub(crate) pending_count: u64,
+    pub(crate) claimed_count: u64,
+    pub(crate) failed_count: u64,
+    pub(crate) stale_count: u64,
     pub(crate) complete: bool,
     pub(crate) target_model_id: String,
     pub(crate) target_dims: usize,
@@ -851,14 +854,22 @@ pub(crate) async fn run_memory_provider_reindex(
             scanned_count: outcome.scanned_count,
             updated_count: outcome.updated_count,
             pending_count: outcome.pending_count,
+            claimed_count: outcome.claimed_count,
+            failed_count: outcome.failed_count,
+            stale_count: outcome.stale_count,
             complete: outcome.is_complete(),
             target_model_id: outcome.target_model_id.clone(),
             target_dims: outcome.target_dims,
             target_version: outcome.target_version,
         },
         artifact_log: vec![format!(
-            "memory embeddings backfill scanned={} updated={} pending={}",
-            outcome.scanned_count, outcome.updated_count, outcome.pending_count
+            "memory embeddings backfill scanned={} updated={} pending={} claimed={} failed={} stale={}",
+            outcome.scanned_count,
+            outcome.updated_count,
+            outcome.pending_count,
+            outcome.claimed_count,
+            outcome.failed_count,
+            outcome.stale_count
         )],
     })
 }

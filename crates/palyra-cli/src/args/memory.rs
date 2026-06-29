@@ -12,6 +12,10 @@ pub enum MemoryCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Doctor {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     #[command(visible_alias = "reindex")]
     Index {
         #[arg(long)]
@@ -264,6 +268,25 @@ pub enum MemoryLearningCommand {
         payload: Option<String>,
         #[arg(long, default_value_t = false)]
         apply_preference: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Eval {
+        candidate_id: String,
+        #[arg(long)]
+        suite: String,
+        #[arg(long)]
+        result: String,
+        #[arg(long, value_name = "0.0..1.0")]
+        threshold: String,
+        #[arg(long, value_name = "0.0..1.0")]
+        score: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        policy_decision: Option<String>,
+        #[arg(long)]
+        evidence_refs_json: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

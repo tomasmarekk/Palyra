@@ -16,6 +16,8 @@ use std::sync::{
     Arc,
 };
 
+use serde::Serialize;
+
 use crate::gateway::ListOrchestratorSessionsRequest;
 use crate::gateway::{current_unix_ms, MEMORY_AUTO_INJECT_MIN_SCORE};
 use crate::journal::{
@@ -25,7 +27,10 @@ use crate::journal::{
 };
 use crate::*;
 use crate::{
-    application::learning::{apply_patch_learning_candidate, apply_preference_candidate},
+    application::learning::{
+        apply_patch_learning_candidate, apply_preference_candidate,
+        shadow_learning_candidate_lifecycle,
+    },
     application::memory_provider::{
         explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
         memory_provider_system_prompt_snapshot, run_memory_provider_reindex,
@@ -123,9 +128,12 @@ pub(crate) async fn console_memory_status_handler(
     let derived = state.channels.derived_stats().map_err(channel_platform_error_response)?;
     let maintenance_interval_ms =
         i64::try_from(MEMORY_MAINTENANCE_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    let scoring_diagnostics = memory_retrieval_scoring_diagnostics(&retrieval_config.scoring);
+    let doctor = memory_doctor_report(&embeddings_status, scoring_diagnostics);
     Ok(Json(json!({
         "usage": maintenance_status.usage,
         "embeddings": embeddings_status,
+        "doctor": doctor,
         "retrieval": {
             "backend": retrieval_backend,
             "external_index": retrieval_backend.external_index.clone(),
@@ -204,6 +212,131 @@ pub(crate) async fn console_memory_status_handler(
         },
         "derived": derived,
     })))
+}
+
+fn memory_doctor_report(
+    embeddings_status: &journal::MemoryEmbeddingsStatus,
+    scoring_diagnostics: Value,
+) -> Value {
+    let coverage_ratio = if embeddings_status.total_count == 0 {
+        1.0
+    } else {
+        embeddings_status.indexed_count as f64 / embeddings_status.total_count as f64
+    };
+    let vector_degraded = !embeddings_status.production_default_active
+        || embeddings_status.mode == journal::MemoryEmbeddingsMode::HashFallback;
+    let stale_or_failed_jobs =
+        embeddings_status.queue.stale_count.saturating_add(embeddings_status.queue.failed_count);
+    let mut findings = Vec::new();
+    if vector_degraded {
+        findings.push(json!({
+            "severity": "warning",
+            "code": "vector_degraded",
+            "message": embeddings_status.warning.clone().unwrap_or_else(|| {
+                "memory vector retrieval is running in degraded mode".to_owned()
+            }),
+        }));
+    }
+    if embeddings_status.pending_count > 0 {
+        findings.push(json!({
+            "severity": "warning",
+            "code": "stale_embeddings",
+            "message": format!("{} memory items need embedding refresh", embeddings_status.pending_count),
+        }));
+    }
+    if stale_or_failed_jobs > 0 {
+        findings.push(json!({
+            "severity": "error",
+            "code": "embedding_jobs_attention_required",
+            "message": format!("{} embedding jobs are stale or failed", stale_or_failed_jobs),
+        }));
+    }
+    if scoring_diagnostics.get("extreme_weight_warning").and_then(Value::as_bool).unwrap_or(false) {
+        findings.push(json!({
+            "severity": "warning",
+            "code": "retrieval_scoring_extreme_weights",
+            "message": "retrieval scoring has an extreme component weight; verify lexical, vector, recency, diversity, and trust balance",
+        }));
+    }
+    let status = if findings
+        .iter()
+        .any(|finding| finding.get("severity").and_then(Value::as_str) == Some("error"))
+    {
+        "error"
+    } else if findings.is_empty() {
+        "healthy"
+    } else {
+        "warning"
+    };
+    json!({
+        "status": status,
+        "checked_at_unix_ms": crate::node_runtime::current_unix_ms().unwrap_or_default(),
+        "indexes": {
+            "fts": {
+                "status": "available",
+                "schema_version": 1,
+                "fallback_ready": true,
+            },
+            "vector": {
+                "status": if vector_degraded { "degraded" } else { "available" },
+                "embedding_model_id": embeddings_status.target_model_id,
+                "embedding_model_version": embeddings_status.target_version,
+                "coverage_ratio": coverage_ratio,
+                "degraded_mode": vector_degraded,
+                "lag_count": embeddings_status.pending_count,
+            },
+            "embedding_queue": embeddings_status.queue,
+        },
+        "reindex": {
+            "single_flight_lock": true,
+            "duplicate_reindex_policy": "reject_concurrent_run",
+            "progress_events": "memory.index.run console events",
+            "batch_limit": embeddings_status.batch_limit,
+        },
+        "scoring": scoring_diagnostics,
+        "support_bundle": {
+            "raw_memory_content_included": false,
+            "redaction": "doctor reports counts, hashes, refs, and safe diagnostics only",
+        },
+        "findings": findings,
+        "remediation": embeddings_status.remediation,
+    })
+}
+
+fn memory_retrieval_scoring_diagnostics<T: Serialize>(scoring: &T) -> Value {
+    let scoring_value = serde_json::to_value(scoring).unwrap_or_else(|_| json!({}));
+    let mut extreme_fields = Vec::new();
+    collect_extreme_scoring_weights("", &scoring_value, &mut extreme_fields);
+    json!({
+        "defaults_validated": true,
+        "components": ["lexical", "vector", "recency", "diversity", "trust"],
+        "extreme_weight_warning": !extreme_fields.is_empty(),
+        "extreme_fields": extreme_fields,
+    })
+}
+
+fn collect_extreme_scoring_weights(prefix: &str, value: &Value, extreme_fields: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let next_prefix =
+                    if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                collect_extreme_scoring_weights(next_prefix.as_str(), child, extreme_fields);
+            }
+        }
+        Value::Number(number) if prefix.ends_with("_bps") => {
+            if let Some(value) = number.as_u64() {
+                let is_primary_weight = prefix.ends_with("lexical_bps")
+                    || prefix.ends_with("vector_bps")
+                    || prefix.ends_with("recency_bps")
+                    || prefix.ends_with("source_quality_bps");
+                if is_primary_weight && (value >= 9_000 || value <= 50) {
+                    extreme_fields.push(prefix.to_owned());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Shallow inventory row for a recall artifact: metadata plus availability
@@ -393,10 +526,14 @@ pub(crate) async fn console_memory_index_handler(
         "scanned_count": scanned_count,
         "updated_count": updated_count,
         "pending_count": provider_reindex.progress.pending_count,
+        "claimed_count": provider_reindex.progress.claimed_count,
+        "failed_count": provider_reindex.progress.failed_count,
+        "stale_count": provider_reindex.progress.stale_count,
         "complete": provider_reindex.progress.complete,
         "target_model_id": provider_reindex.progress.target_model_id,
         "target_dims": provider_reindex.progress.target_dims,
         "target_version": provider_reindex.progress.target_version,
+        "queue": embeddings_status.queue.clone(),
         "until_complete": until_complete,
         "cancel_after_batches": batch_budget.requested_cancel_after_batches,
         "max_batches_per_request": batch_budget.max_batches_per_request,
@@ -739,10 +876,27 @@ pub(crate) async fn console_learning_candidate_history_handler(
         .learning_candidate_history(candidate.candidate_id.clone())
         .await
         .map_err(runtime_status_response)?;
-    let lifecycle = learning_candidate_lifecycle(&candidate, history.as_slice());
+    let evals = state
+        .runtime
+        .list_learning_candidate_evals(candidate.candidate_id.clone(), 64)
+        .await
+        .map_err(runtime_status_response)?;
+    let rollouts = state
+        .runtime
+        .list_learning_candidate_rollouts(candidate.candidate_id.clone(), 64)
+        .await
+        .map_err(runtime_status_response)?;
+    let lifecycle = learning_candidate_lifecycle(
+        &candidate,
+        history.as_slice(),
+        evals.as_slice(),
+        rollouts.as_slice(),
+    );
     Ok(Json(json!({
         "candidate": candidate,
         "history": history,
+        "evals": evals,
+        "rollouts": rollouts,
         "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
@@ -768,18 +922,70 @@ pub(crate) async fn console_learning_candidate_review_handler(
         load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
     let status = normalize_learning_candidate_review_status(payload.status.as_str())
         .map_err(runtime_status_response)?;
+    let action_summary = payload.action_summary.and_then(trim_to_option);
+    let action_payload_json = payload.action_payload_json.and_then(trim_to_option);
+    let apply_preference = payload.apply_preference.unwrap_or(false);
     let reviewed = state
         .runtime
         .review_learning_candidate(journal::LearningCandidateReviewRequest {
             candidate_id: candidate.candidate_id.clone(),
             status,
             reviewed_by_principal: session.context.principal.clone(),
-            action_summary: payload.action_summary.and_then(trim_to_option),
-            action_payload_json: payload.action_payload_json.and_then(trim_to_option),
+            action_summary: action_summary.clone(),
+            action_payload_json: action_payload_json.clone(),
         })
         .await
         .map_err(runtime_status_response)?;
-    let applied_preference = if payload.apply_preference.unwrap_or(false)
+    if reviewed.status == "rolled-back" {
+        let rollback_payload = action_payload_json
+            .as_deref()
+            .and_then(parse_json_object)
+            .map(Value::Object)
+            .unwrap_or_else(|| json!({}));
+        state
+            .runtime
+            .record_learning_candidate_rollout(journal::LearningCandidateRolloutCreateRequest {
+                rollout_id: None,
+                candidate_id: reviewed.candidate_id.clone(),
+                rollout_kind: reviewed.candidate_kind.clone(),
+                state: "rollback".to_owned(),
+                target_ref: reviewed
+                    .target_path
+                    .clone()
+                    .unwrap_or_else(|| reviewed.candidate_id.clone()),
+                previous_version_json: rollback_payload
+                    .get("previous_version")
+                    .or_else(|| rollback_payload.get("previous_state"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
+                    .to_string(),
+                activated_version_json: rollback_payload
+                    .get("activated_version")
+                    .or_else(|| rollback_payload.get("rolled_back_version"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
+                    .to_string(),
+                telemetry_json: json!({
+                    "rollback_reason": action_summary,
+                    "candidate_status": reviewed.status,
+                })
+                .to_string(),
+                reason: action_summary
+                    .clone()
+                    .unwrap_or_else(|| "learning candidate rolled back".to_owned()),
+                actor_principal: session.context.principal.clone(),
+                policy_decision: "operator_rollback".to_owned(),
+                evidence_refs_json: json!([{
+                    "kind": "learning_candidate",
+                    "ref": reviewed.candidate_id,
+                }])
+                .to_string(),
+                rolled_back_at_unix_ms: reviewed.reviewed_at_unix_ms,
+            })
+            .await
+            .map_err(runtime_status_response)?;
+    }
+    let applied_preference = if apply_preference
         || (reviewed.candidate_kind == "preference"
             && matches!(reviewed.status.as_str(), "accepted" | "approved" | "deployed"))
     {
@@ -789,10 +995,90 @@ pub(crate) async fn console_learning_candidate_review_handler(
     } else {
         None
     };
-    let lifecycle = learning_candidate_lifecycle(&reviewed, &[]);
+    let lifecycle = learning_candidate_lifecycle(&reviewed, &[], &[], &[]);
     Ok(Json(json!({
         "candidate": reviewed,
         "applied_preference": applied_preference,
+        "lifecycle": lifecycle,
+        "contract": contract_descriptor(),
+    })))
+}
+
+/// `POST /console/v1/memory/learning/candidates/{candidate_id}/eval` —
+/// appends an evaluation gate result for a learning candidate.
+///
+/// # Errors
+/// Returns a not-found response when the candidate does not exist for the
+/// caller, an invalid-argument response for malformed evidence JSON, and an
+/// error response when authorization or journal writes fail.
+pub(crate) async fn console_learning_candidate_eval_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    Json(payload): Json<ConsoleLearningCandidateEvalRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let candidate =
+        load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
+    let evidence_refs_json =
+        payload.evidence_refs_json.and_then(trim_to_option).unwrap_or_else(|| {
+            json!([{
+                "kind": "learning_candidate",
+                "ref": candidate.candidate_id,
+            }])
+            .to_string()
+        });
+    serde_json::from_str::<Value>(evidence_refs_json.as_str()).map_err(|error| {
+        runtime_status_response(tonic::Status::invalid_argument(format!(
+            "evidence_refs_json must be valid JSON: {error}"
+        )))
+    })?;
+    let eval = state
+        .runtime
+        .record_learning_candidate_eval(journal::LearningCandidateEvalCreateRequest {
+            eval_id: None,
+            candidate_id: candidate.candidate_id.clone(),
+            eval_suite: payload.eval_suite,
+            result: payload.result,
+            threshold: payload.threshold,
+            score: payload.score,
+            decision: normalize_learning_eval_decision(payload.decision.as_str())
+                .map_err(runtime_status_response)?,
+            actor_principal: session.context.principal.clone(),
+            policy_decision: payload
+                .policy_decision
+                .and_then(trim_to_option)
+                .unwrap_or_else(|| "operator_recorded_eval_gate".to_owned()),
+            evidence_refs_json,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let evals = state
+        .runtime
+        .list_learning_candidate_evals(candidate.candidate_id.clone(), 64)
+        .await
+        .map_err(runtime_status_response)?;
+    let rollouts = state
+        .runtime
+        .list_learning_candidate_rollouts(candidate.candidate_id.clone(), 64)
+        .await
+        .map_err(runtime_status_response)?;
+    let history = state
+        .runtime
+        .learning_candidate_history(candidate.candidate_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let lifecycle = learning_candidate_lifecycle(
+        &candidate,
+        history.as_slice(),
+        evals.as_slice(),
+        rollouts.as_slice(),
+    );
+    Ok(Json(json!({
+        "candidate": candidate,
+        "eval": eval,
+        "evals": evals,
+        "rollouts": rollouts,
         "lifecycle": lifecycle,
         "contract": contract_descriptor(),
     })))
@@ -2023,6 +2309,9 @@ fn normalize_learning_candidate_review_status(status: &str) -> Result<String, to
     let accepted = match normalized.as_str() {
         "proposed" | "queued" => normalized,
         "needs-review" | "review" | "pending-review" => "needs-review".to_owned(),
+        "eval" | "evaluating" => "eval".to_owned(),
+        "eval-passed" | "eval-passed-review" => "eval_passed".to_owned(),
+        "eval-failed" | "eval-failed-review" => "eval_failed".to_owned(),
         "approve" | "approved" => "approved".to_owned(),
         "accept" | "accepted" => "accepted".to_owned(),
         "reject" | "rejected" => "rejected".to_owned(),
@@ -2039,6 +2328,16 @@ fn normalize_learning_candidate_review_status(status: &str) -> Result<String, to
         }
     };
     Ok(accepted)
+}
+
+fn normalize_learning_eval_decision(decision: &str) -> Result<String, tonic::Status> {
+    let normalized = decision.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "pass" | "passed" | "approve" | "approved" => Ok("pass".to_owned()),
+        "fail" | "failed" | "reject" | "rejected" => Ok("fail".to_owned()),
+        "hold" | "review" | "needs-review" => Ok("hold".to_owned()),
+        _ => Err(tonic::Status::invalid_argument("eval decision must be pass, fail, or hold")),
+    }
 }
 
 /// Aggregates a candidate list into per-status counts, injection-conflict
@@ -2085,6 +2384,8 @@ fn learning_candidates_lifecycle_summary(candidates: &[journal::LearningCandidat
 fn learning_candidate_lifecycle(
     candidate: &journal::LearningCandidateRecord,
     history: &[journal::LearningCandidateHistoryRecord],
+    evals: &[journal::LearningCandidateEvalRecord],
+    rollouts: &[journal::LearningCandidateRolloutRecord],
 ) -> Value {
     let status = learning_candidate_lifecycle_status(candidate);
     let rollback_seen = status == "rolled-back"
@@ -2122,6 +2423,7 @@ fn learning_candidate_lifecycle(
             "target_path": candidate.target_path,
             "content_json_bytes": candidate.content_json.len(),
         },
+        "state_machine": learning_candidate_state_machine(candidate, history, evals, rollouts),
         "deployment_posture": learning_candidate_deployment_posture(candidate, status),
         "rollback": {
             "available": matches!(status, "approved" | "deployed" | "rolled-back"),
@@ -2135,6 +2437,239 @@ fn learning_candidate_lifecycle(
                 .unwrap_or(false),
         },
     })
+}
+
+fn learning_candidate_state_machine(
+    candidate: &journal::LearningCandidateRecord,
+    history: &[journal::LearningCandidateHistoryRecord],
+    evals: &[journal::LearningCandidateEvalRecord],
+    rollouts: &[journal::LearningCandidateRolloutRecord],
+) -> Value {
+    let requires_review = learning_candidate_requires_review(candidate);
+    let requires_eval = learning_candidate_requires_eval(candidate);
+    let eval_passed =
+        evals.iter().any(|eval| eval.decision == "pass" && eval.score >= eval.threshold);
+    let reviewed = matches!(
+        candidate.status.as_str(),
+        "approved" | "accepted" | "eval_passed" | "applied" | "deployed"
+    );
+    let current_state = learning_candidate_state_for_record(candidate, evals, rollouts);
+    let mut transitions = Vec::new();
+    transitions.push(json!({
+        "state": "observation",
+        "actor": "learning_pipeline",
+        "policy_decision": "candidate_observed",
+        "evidence_refs": learning_candidate_default_evidence_refs(candidate),
+        "timestamp_unix_ms": candidate.created_at_unix_ms,
+    }));
+    transitions.push(json!({
+        "state": "candidate",
+        "actor": "learning_pipeline",
+        "policy_decision": if requires_review { "review_required" } else { "review_optional" },
+        "evidence_refs": learning_candidate_default_evidence_refs(candidate),
+        "timestamp_unix_ms": candidate.created_at_unix_ms,
+    }));
+    if requires_review {
+        transitions.push(json!({
+            "state": "review",
+            "actor": candidate
+                .reviewed_by_principal
+                .as_deref()
+                .unwrap_or("operator_required"),
+            "policy_decision": "operator_review_required",
+            "evidence_refs": learning_candidate_default_evidence_refs(candidate),
+            "timestamp_unix_ms": candidate.reviewed_at_unix_ms.unwrap_or(candidate.updated_at_unix_ms),
+        }));
+    }
+    for entry in history.iter().rev() {
+        transitions.push(json!({
+            "state": learning_state_from_candidate_status(entry.status.as_str()),
+            "actor": entry.reviewed_by_principal,
+            "policy_decision": learning_policy_from_action_payload(entry.action_payload_json.as_deref())
+                .unwrap_or_else(|| "operator_review".to_owned()),
+            "evidence_refs": learning_evidence_refs_from_payload(entry.action_payload_json.as_deref())
+                .unwrap_or_else(|| learning_candidate_default_evidence_refs(candidate)),
+            "timestamp_unix_ms": entry.created_at_unix_ms,
+            "stored_status": entry.status,
+        }));
+    }
+    for eval in evals.iter().rev() {
+        transitions.push(json!({
+            "state": "eval",
+            "actor": eval.actor_principal,
+            "policy_decision": eval.policy_decision,
+            "evidence_refs": learning_parse_json_or_default(
+                eval.evidence_refs_json.as_str(),
+                learning_candidate_default_evidence_refs(candidate),
+            ),
+            "timestamp_unix_ms": eval.created_at_unix_ms,
+            "eval": {
+                "eval_id": eval.eval_id,
+                "suite": eval.eval_suite,
+                "result": eval.result,
+                "threshold": eval.threshold,
+                "score": eval.score,
+                "decision": eval.decision,
+            },
+        }));
+    }
+    for rollout in rollouts.iter().rev() {
+        transitions.push(json!({
+            "state": rollout.state,
+            "actor": rollout.actor_principal,
+            "policy_decision": rollout.policy_decision,
+            "evidence_refs": learning_parse_json_or_default(
+                rollout.evidence_refs_json.as_str(),
+                learning_candidate_default_evidence_refs(candidate),
+            ),
+            "timestamp_unix_ms": rollout.created_at_unix_ms,
+            "rollout": {
+                "rollout_id": rollout.rollout_id,
+                "kind": rollout.rollout_kind,
+                "target_ref": rollout.target_ref,
+                "telemetry": learning_parse_json_or_default(rollout.telemetry_json.as_str(), json!({})),
+                "rolled_back_at_unix_ms": rollout.rolled_back_at_unix_ms,
+            },
+        }));
+    }
+    json!({
+        "states": [
+            "observation",
+            "candidate",
+            "review",
+            "eval",
+            "package",
+            "activation",
+            "monitoring",
+            "rollback",
+            "retirement"
+        ],
+        "current_state": current_state,
+        "candidate_kind": learning_candidate_state_machine_kind(candidate.candidate_kind.as_str()),
+        "requires_review": requires_review,
+        "requires_eval": requires_eval,
+        "eval_passed": eval_passed,
+        "gates_satisfied": (!requires_review || reviewed) && (!requires_eval || eval_passed),
+        "activation_blocked_reason": learning_activation_blocked_reason(
+            requires_review,
+            reviewed,
+            requires_eval,
+            eval_passed,
+        ),
+        "transitions": transitions,
+    })
+}
+
+fn learning_candidate_requires_review(candidate: &journal::LearningCandidateRecord) -> bool {
+    learning_candidate_requires_eval(candidate)
+        || !matches!(candidate.candidate_kind.as_str(), "durable_fact")
+        || candidate.confidence < 0.95
+}
+
+fn learning_candidate_requires_eval(candidate: &journal::LearningCandidateRecord) -> bool {
+    matches!(
+        candidate.candidate_kind.as_str(),
+        "patch_skill" | "patch_procedure" | "write_support_file"
+    ) || matches!(
+        candidate.risk_level.trim().to_ascii_lowercase().as_str(),
+        "high" | "review" | "sensitive" | "poisoned" | "blocked_sensitive" | "blocked_poisoned"
+    )
+}
+
+fn learning_candidate_state_for_record(
+    candidate: &journal::LearningCandidateRecord,
+    evals: &[journal::LearningCandidateEvalRecord],
+    rollouts: &[journal::LearningCandidateRolloutRecord],
+) -> &'static str {
+    let shadow = shadow_learning_candidate_lifecycle(candidate, current_unix_ms());
+    if shadow.expired {
+        return "retirement";
+    }
+    if shadow.shadow_write {
+        return "candidate";
+    }
+    if rollouts.iter().any(|rollout| rollout.state == "rollback") {
+        return "rollback";
+    }
+    if rollouts.iter().any(|rollout| rollout.state == "activation") {
+        return "monitoring";
+    }
+    if !evals.is_empty() {
+        return "eval";
+    }
+    learning_state_from_candidate_status(candidate.status.as_str())
+}
+
+fn learning_state_from_candidate_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "" | "queued" | "proposed" => "candidate",
+        "needs-review" | "review" | "pending-review" => "review",
+        "eval" | "eval-passed" | "eval-failed" => "eval",
+        "approved" | "accepted" => "package",
+        "applied" | "auto-applied" | "deployed" => "activation",
+        "rollback" | "rolled-back" => "rollback",
+        "rejected" | "denied" | "suppressed" | "conflicted" => "retirement",
+        _ => "candidate",
+    }
+}
+
+fn learning_candidate_state_machine_kind(candidate_kind: &str) -> &'static str {
+    match candidate_kind {
+        "durable_fact" => "durable_fact",
+        "preference" => "preference",
+        "patch_skill" => "patch_skill",
+        "patch_procedure" => "patch_procedure",
+        "write_support_file" => "support_file",
+        "commitment_observation" => "commitment_observation",
+        _ => "durable_fact",
+    }
+}
+
+fn learning_activation_blocked_reason(
+    requires_review: bool,
+    reviewed: bool,
+    requires_eval: bool,
+    eval_passed: bool,
+) -> Option<&'static str> {
+    if requires_review && !reviewed {
+        return Some("review_required");
+    }
+    if requires_eval && !eval_passed {
+        return Some("passing_eval_required");
+    }
+    None
+}
+
+fn learning_candidate_default_evidence_refs(candidate: &journal::LearningCandidateRecord) -> Value {
+    let mut refs = vec![json!({
+        "kind": "learning_candidate",
+        "ref": candidate.candidate_id,
+    })];
+    if let Some(source_task_id) = candidate.source_task_id.as_deref() {
+        refs.push(json!({
+            "kind": "background_task",
+            "ref": source_task_id,
+        }));
+    }
+    refs.push(json!({
+        "kind": "provenance_hash",
+        "sha256": crate::sha256_hex(candidate.provenance_json.as_bytes()),
+    }));
+    json!(refs)
+}
+
+fn learning_policy_from_action_payload(payload_json: Option<&str>) -> Option<String> {
+    let payload = payload_json.and_then(parse_json_object)?;
+    payload.get("policy_decision").and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn learning_evidence_refs_from_payload(payload_json: Option<&str>) -> Option<Value> {
+    let payload = payload_json.and_then(parse_json_object)?;
+    payload.get("evidence_refs").cloned()
+}
+
+fn learning_parse_json_or_default(raw: &str, fallback: Value) -> Value {
+    serde_json::from_str::<Value>(raw).unwrap_or(fallback)
 }
 
 /// Lifecycle view variant for the apply endpoint, where the candidate is
@@ -2195,6 +2730,7 @@ fn learning_candidate_status_label(
     match status.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "" | "queued" | "proposed" => "proposed",
         "needs-review" | "review" | "pending-review" => "needs-review",
+        "eval" | "eval-passed" | "eval-failed" => "needs-review",
         "approved" | "accepted" => "approved",
         "rejected" | "denied" | "suppressed" | "conflicted" => "rejected",
         "applied" | "auto-applied" | "deployed" => "deployed",

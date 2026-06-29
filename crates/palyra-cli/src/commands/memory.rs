@@ -98,6 +98,7 @@ pub(crate) fn run_memory(command: MemoryCommand) -> Result<()> {
     let runtime = build_runtime()?;
     match command {
         MemoryCommand::Status { .. }
+        | MemoryCommand::Doctor { .. }
         | MemoryCommand::Index { .. }
         | MemoryCommand::IndexDrift { .. }
         | MemoryCommand::IndexReconcile { .. }
@@ -618,6 +619,7 @@ pub(crate) async fn run_memory_async(
             }
         }
         MemoryCommand::Status { .. }
+        | MemoryCommand::Doctor { .. }
         | MemoryCommand::Index { .. }
         | MemoryCommand::IndexDrift { .. }
         | MemoryCommand::IndexReconcile { .. }
@@ -652,6 +654,10 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
         MemoryCommand::Status { json } => {
             let payload = context.client.get_json_value("console/v1/memory/status").await?;
             emit_memory_status(&payload, output::preferred_json(json))
+        }
+        MemoryCommand::Doctor { json } => {
+            let payload = context.client.get_json_value("console/v1/memory/status").await?;
+            emit_memory_doctor(&payload, output::preferred_json(json))
         }
         MemoryCommand::Index { batch_size, until_complete, run_maintenance, json } => {
             let mut request = json!({
@@ -1124,6 +1130,53 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     &["/candidate", "/preference"],
                 )
             }
+            MemoryLearningCommand::Eval {
+                candidate_id,
+                suite,
+                result,
+                threshold,
+                score,
+                decision,
+                policy_decision,
+                evidence_refs_json,
+                json,
+            } => {
+                let threshold = parse_float_arg(
+                    Some(threshold),
+                    "memory learning eval --threshold",
+                    0.0,
+                    1.0,
+                    None,
+                )?;
+                let score =
+                    parse_float_arg(Some(score), "memory learning eval --score", 0.0, 1.0, None)?;
+                let request = json!({
+                    "eval_suite": suite,
+                    "result": result,
+                    "threshold": threshold,
+                    "score": score,
+                    "decision": decision,
+                    "policy_decision": policy_decision,
+                    "evidence_refs_json": evidence_refs_json,
+                });
+                let payload = context
+                    .client
+                    .post_json_value(
+                        format!(
+                            "console/v1/memory/learning/candidates/{}/eval",
+                            percent_encode_component(candidate_id.as_str())
+                        )
+                        .as_str(),
+                        &request,
+                    )
+                    .await?;
+                emit_admin_payload(
+                    "memory.learning.eval",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/eval", "/lifecycle"],
+                )
+            }
             MemoryLearningCommand::Apply { candidate_id, summary, json } => {
                 let request = json!({
                     "action_summary": summary,
@@ -1301,6 +1354,14 @@ fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {
         payload.pointer("/embeddings/indexed_count").and_then(Value::as_u64).unwrap_or(0);
     let pending_count =
         payload.pointer("/embeddings/pending_count").and_then(Value::as_u64).unwrap_or(0);
+    let queue_pending =
+        payload.pointer("/embeddings/queue/pending_count").and_then(Value::as_u64).unwrap_or(0);
+    let queue_claimed =
+        payload.pointer("/embeddings/queue/claimed_count").and_then(Value::as_u64).unwrap_or(0);
+    let queue_failed =
+        payload.pointer("/embeddings/queue/failed_count").and_then(Value::as_u64).unwrap_or(0);
+    let queue_stale =
+        payload.pointer("/embeddings/queue/stale_count").and_then(Value::as_u64).unwrap_or(0);
     let max_entries = payload
         .pointer("/retention/max_entries")
         .and_then(Value::as_u64)
@@ -1351,6 +1412,10 @@ fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {
         entries, approx_bytes, mode, target_model, target_dims, target_version, indexed_count, pending_count
     );
     println!(
+        "memory.embeddings.queue pending={} claimed={} failed={} stale={}",
+        queue_pending, queue_claimed, queue_failed, queue_stale
+    );
+    println!(
         "memory.retention max_entries={} max_bytes={} ttl_days={} vacuum_schedule={}",
         max_entries, max_bytes, ttl_days, vacuum_schedule
     );
@@ -1367,6 +1432,49 @@ fn emit_memory_status(payload: &Value, json_output: bool) -> Result<()> {
     }
     if let Some(external_index) = memory_external_index_payload(payload) {
         print_external_index_line("memory.external_index", external_index);
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_memory_doctor(payload: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        return output::print_json_pretty(payload, "failed to encode memory doctor as JSON");
+    }
+    let doctor = payload.get("doctor").unwrap_or(&Value::Null);
+    let status = doctor.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let coverage =
+        doctor.pointer("/indexes/vector/coverage_ratio").and_then(Value::as_f64).unwrap_or(0.0);
+    let vector_status =
+        doctor.pointer("/indexes/vector/status").and_then(Value::as_str).unwrap_or("unknown");
+    let lag_count =
+        doctor.pointer("/indexes/vector/lag_count").and_then(Value::as_u64).unwrap_or(0);
+    println!(
+        "memory.doctor status={} vector_status={} coverage_ratio={:.3} lag_count={}",
+        status, vector_status, coverage, lag_count
+    );
+    if let Some(queue) = doctor.pointer("/indexes/embedding_queue") {
+        println!(
+            "memory.doctor.embedding_queue pending={} claimed={} completed={} failed={} stale={} retry_due={}",
+            queue.get("pending_count").and_then(Value::as_u64).unwrap_or(0),
+            queue.get("claimed_count").and_then(Value::as_u64).unwrap_or(0),
+            queue.get("completed_count").and_then(Value::as_u64).unwrap_or(0),
+            queue.get("failed_count").and_then(Value::as_u64).unwrap_or(0),
+            queue.get("stale_count").and_then(Value::as_u64).unwrap_or(0),
+            queue.get("next_retry_due_count").and_then(Value::as_u64).unwrap_or(0)
+        );
+    }
+    if let Some(findings) = doctor.get("findings").and_then(Value::as_array) {
+        for finding in findings {
+            let severity = finding.get("severity").and_then(Value::as_str).unwrap_or("info");
+            let code = finding.get("code").and_then(Value::as_str).unwrap_or("unknown");
+            let message = finding.get("message").and_then(Value::as_str).unwrap_or("");
+            println!(
+                "memory.doctor.finding severity={} code={} message={}",
+                severity,
+                code,
+                quoted_text_field(message)
+            );
+        }
     }
     std::io::stdout().flush().context("stdout flush failed")
 }
@@ -1454,17 +1562,24 @@ fn emit_memory_index(payload: &Value, json_output: bool) -> Result<()> {
         payload.pointer("/index/updated_count").and_then(Value::as_u64).unwrap_or(0);
     let pending_count =
         payload.pointer("/index/pending_count").and_then(Value::as_u64).unwrap_or(0);
+    let claimed_count =
+        payload.pointer("/index/claimed_count").and_then(Value::as_u64).unwrap_or(0);
+    let failed_count = payload.pointer("/index/failed_count").and_then(Value::as_u64).unwrap_or(0);
+    let stale_count = payload.pointer("/index/stale_count").and_then(Value::as_u64).unwrap_or(0);
     let complete = payload.pointer("/index/complete").and_then(Value::as_bool).unwrap_or(false);
     let target_model =
         payload.pointer("/index/target_model_id").and_then(Value::as_str).unwrap_or("unknown");
     let target_dims = payload.pointer("/index/target_dims").and_then(Value::as_u64).unwrap_or(0);
     let mode = payload.pointer("/embeddings/mode").and_then(Value::as_str).unwrap_or("unknown");
     println!(
-        "memory.index batches={} scanned={} updated={} pending={} complete={} embeddings_mode={} target_model={} target_dims={}",
+        "memory.index batches={} scanned={} updated={} pending={} claimed={} failed={} stale={} complete={} embeddings_mode={} target_model={} target_dims={}",
         batches_executed,
         scanned_count,
         updated_count,
         pending_count,
+        claimed_count,
+        failed_count,
+        stale_count,
         complete,
         mode,
         target_model,

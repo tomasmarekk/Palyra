@@ -4,6 +4,7 @@ Commands:
   list
   history
   review
+  eval
   apply
   preferences
   promote-procedure

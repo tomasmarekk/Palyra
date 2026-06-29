@@ -22,6 +22,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use palyra_common::runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState};
@@ -47,7 +48,8 @@ use crate::{
     gateway::{GatewayRuntimeState, LearningRuntimeConfig, RequestContext},
     journal::{
         LearningCandidateCreateRequest, LearningCandidateRecord, LearningCandidateReviewRequest,
-        LearningPreferenceListFilter, LearningPreferenceRecord, LearningPreferenceUpsertRequest,
+        LearningCandidateRolloutCreateRequest, LearningPreferenceListFilter,
+        LearningPreferenceRecord, LearningPreferenceUpsertRequest,
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
         OrchestratorBackgroundTaskRecord, OrchestratorSessionResolveRequest,
         OrchestratorSessionTranscriptRecord, WorkspaceDocumentWriteRequest,
@@ -371,6 +373,110 @@ pub(crate) async fn render_preference_prompt_context(
     Ok(Some(format!("<preference_context>\n{}\n</preference_context>", lines.join("\n"))))
 }
 
+async fn ensure_learning_activation_gate(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    candidate: &LearningCandidateRecord,
+) -> Result<(), Status> {
+    if !learning_candidate_requires_eval(candidate) {
+        return Ok(());
+    }
+    if !matches!(candidate.status.as_str(), "approved" | "accepted" | "eval_passed" | "deployed") {
+        return Err(Status::failed_precondition(
+            "risky learning candidate requires operator review before activation",
+        ));
+    }
+    let evals =
+        runtime_state.list_learning_candidate_evals(candidate.candidate_id.clone(), 16).await?;
+    let passed = evals.iter().any(|eval| {
+        matches!(eval.decision.as_str(), "pass" | "passed" | "approved")
+            && eval.score >= eval.threshold
+    });
+    if !passed {
+        return Err(Status::failed_precondition(
+            "risky learning candidate requires a passing eval before activation",
+        ));
+    }
+    Ok(())
+}
+
+fn learning_candidate_requires_eval(candidate: &LearningCandidateRecord) -> bool {
+    matches!(
+        candidate.candidate_kind.as_str(),
+        PATCH_SKILL_CANDIDATE_KIND
+            | PATCH_PROCEDURE_CANDIDATE_KIND
+            | PATCH_SUPPORT_FILE_CANDIDATE_KIND
+    ) || matches!(
+        candidate.risk_level.trim().to_ascii_lowercase().as_str(),
+        "high" | "review" | "sensitive" | "poisoned" | "blocked_sensitive" | "blocked_poisoned"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_learning_rollout(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    candidate: &LearningCandidateRecord,
+    actor_principal: &str,
+    rollout_kind: &str,
+    state: &str,
+    target_ref: &str,
+    previous_version: Value,
+    activated_version: Value,
+    reason: &str,
+) -> Result<(), Status> {
+    runtime_state
+        .record_learning_candidate_rollout(LearningCandidateRolloutCreateRequest {
+            rollout_id: None,
+            candidate_id: candidate.candidate_id.clone(),
+            rollout_kind: rollout_kind.to_owned(),
+            state: state.to_owned(),
+            target_ref: target_ref.to_owned(),
+            previous_version_json: previous_version.to_string(),
+            activated_version_json: activated_version.to_string(),
+            telemetry_json: json!({
+                "monitoring": "telemetry linked by rollout_id after activation",
+                "candidate_status": candidate.status,
+            })
+            .to_string(),
+            reason: reason.to_owned(),
+            actor_principal: actor_principal.to_owned(),
+            policy_decision: "operator_review_and_eval_gate".to_owned(),
+            evidence_refs_json: learning_candidate_evidence_refs(candidate).to_string(),
+            rolled_back_at_unix_ms: (state == "rollback")
+                .then(learning_current_unix_ms)
+                .transpose()?,
+        })
+        .await?;
+    Ok(())
+}
+
+fn learning_current_unix_ms() -> Result<i64, Status> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Status::internal(format!("system time before unix epoch: {error}")))?;
+    Ok(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn learning_candidate_evidence_refs(candidate: &LearningCandidateRecord) -> Value {
+    let mut refs = Vec::new();
+    refs.push(json!({
+        "kind": "learning_candidate",
+        "ref": candidate.candidate_id,
+    }));
+    if let Some(source_task_id) = candidate.source_task_id.as_deref() {
+        refs.push(json!({
+            "kind": "background_task",
+            "ref": source_task_id,
+        }));
+    }
+    if let Ok(provenance) = serde_json::from_str::<Value>(candidate.provenance_json.as_str()) {
+        refs.push(json!({
+            "kind": "candidate_provenance_hash",
+            "sha256": crate::sha256_hex(provenance.to_string().as_bytes()),
+        }));
+    }
+    json!(refs)
+}
+
 /// Applies a reviewed `preference` candidate: upserts the preference record
 /// and marks the candidate accepted under `reviewed_by_principal`.
 ///
@@ -388,6 +494,7 @@ pub(crate) async fn apply_preference_candidate(
     if candidate.candidate_kind != "preference" {
         return Ok(None);
     }
+    ensure_learning_activation_gate(runtime_state, candidate).await?;
     let content = serde_json::from_str::<Value>(candidate.content_json.as_str())
         .map_err(|error| Status::internal(format!("invalid preference candidate JSON: {error}")))?;
     let key = content
@@ -438,6 +545,24 @@ pub(crate) async fn apply_preference_candidate(
             ),
         })
         .await?;
+    record_learning_rollout(
+        runtime_state,
+        candidate,
+        reviewed_by_principal,
+        "preference",
+        "activation",
+        record.preference_id.as_str(),
+        json!({}),
+        json!({
+            "preference_id": record.preference_id,
+            "scope_kind": record.scope_kind,
+            "scope_id": record.scope_id,
+            "key": record.key,
+            "value_hash": crate::sha256_hex(record.value.as_bytes()),
+        }),
+        "preference activated from reviewed learning candidate",
+    )
+    .await?;
     Ok(Some(record))
 }
 
@@ -1449,6 +1574,7 @@ pub(crate) async fn apply_patch_learning_candidate(
             "patch candidate cannot be applied from its current state",
         ));
     }
+    ensure_learning_activation_gate(runtime_state, candidate).await?;
 
     let content = serde_json::from_str::<Value>(candidate.content_json.as_str())
         .map_err(|error| Status::internal(format!("invalid patch candidate JSON: {error}")))?;
@@ -1555,6 +1681,25 @@ pub(crate) async fn apply_patch_learning_candidate(
             action_payload_json: Some(action_payload),
         })
         .await?;
+    record_learning_rollout(
+        runtime_state,
+        candidate,
+        reviewed_by_principal,
+        candidate.candidate_kind.as_str(),
+        "activation",
+        patch_sha256,
+        json!({
+            "files": files,
+            "base_validated": true,
+        }),
+        json!({
+            "patch_sha256": patch_sha256,
+            "staging": staged,
+            "skill_validation": skill_validation,
+        }),
+        "patch candidate activated after staging and eval gates",
+    )
+    .await?;
     Ok(Some(json!({
         "candidate": reviewed,
         "result": "applied",
@@ -2119,6 +2264,41 @@ fn default_workspace_document_content(path: &str) -> String {
         .unwrap_or_else(|| "# Workspace Note\n".to_owned())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShadowLearningCandidateLifecycle {
+    pub(crate) shadow_write: bool,
+    pub(crate) active_memory_activation: bool,
+    pub(crate) expired: bool,
+    pub(crate) expires_at_unix_ms: Option<i64>,
+}
+
+/// Projects whether a learning candidate is a shadow write and whether it has
+/// expired. Shadow candidates are ranking/eval material only; they must never
+/// be treated as active durable memory activation.
+pub(crate) fn shadow_learning_candidate_lifecycle(
+    candidate: &LearningCandidateRecord,
+    now_unix_ms: i64,
+) -> ShadowLearningCandidateLifecycle {
+    let content = serde_json::from_str::<Value>(candidate.content_json.as_str()).ok();
+    let shadow_write = candidate.status == "shadow"
+        || content
+            .as_ref()
+            .and_then(|value| value.get("shadow_write"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let expires_at_unix_ms = content
+        .as_ref()
+        .and_then(|value| value.get("shadow_expires_at_unix_ms"))
+        .and_then(Value::as_i64);
+    ShadowLearningCandidateLifecycle {
+        shadow_write,
+        active_memory_activation: !shadow_write && candidate.auto_applied,
+        expired: shadow_write
+            && expires_at_unix_ms.is_some_and(|expires_at| expires_at <= now_unix_ms),
+        expires_at_unix_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2174,6 +2354,79 @@ mod tests {
 
     fn learning_config() -> LearningRuntimeConfig {
         LearningRuntimeConfig::default()
+    }
+
+    #[test]
+    fn memory_eval_fixture_covers_shadow_and_safety_cases() {
+        let fixture = include_str!("../../../../fixtures/memory_eval/shadow_write_cases.json");
+        let payload: Value = serde_json::from_str(fixture).expect("fixture should parse");
+        let cases =
+            payload.get("cases").and_then(Value::as_array).expect("fixture should contain cases");
+        let kinds = cases
+            .iter()
+            .filter_map(|case| case.get("kind").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+
+        for required in [
+            "should_remember",
+            "should_not_remember",
+            "secret_leak",
+            "contradiction",
+            "stale_fact",
+            "preference_update",
+        ] {
+            assert!(kinds.contains(required), "fixture should cover {required}");
+        }
+        assert_eq!(
+            payload.pointer("/shadow_write/active_memory_activation"),
+            Some(&json!(false)),
+            "shadow writes must not activate durable memory"
+        );
+    }
+
+    #[test]
+    fn shadow_candidate_lifecycle_expires_without_memory_activation() {
+        let candidate = LearningCandidateRecord {
+            candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FZ1".to_owned(),
+            candidate_kind: "durable_fact".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FZ2".to_owned(),
+            run_id: None,
+            owner_principal: "user:ops".to_owned(),
+            device_id: "dev-01".to_owned(),
+            channel: Some("cli".to_owned()),
+            scope_kind: "profile".to_owned(),
+            scope_id: "user:ops".to_owned(),
+            status: "shadow".to_owned(),
+            auto_applied: false,
+            confidence: 0.74,
+            risk_level: "review".to_owned(),
+            title: "Shadow stale fact".to_owned(),
+            summary: "Candidate held for ranking eval only.".to_owned(),
+            target_path: None,
+            dedupe_key: "shadow:stale".to_owned(),
+            content_json: json!({
+                "shadow_write": true,
+                "shadow_expires_at_unix_ms": 10,
+            })
+            .to_string(),
+            provenance_json: "[]".to_owned(),
+            source_task_id: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            reviewed_at_unix_ms: None,
+            reviewed_by_principal: None,
+            last_action_summary: None,
+            last_action_payload_json: None,
+        };
+
+        let active = shadow_learning_candidate_lifecycle(&candidate, 9);
+        assert!(active.shadow_write);
+        assert!(!active.active_memory_activation);
+        assert!(!active.expired);
+
+        let expired = shadow_learning_candidate_lifecycle(&candidate, 10);
+        assert!(expired.expired);
+        assert!(!expired.active_memory_activation);
     }
 
     #[test]

@@ -240,6 +240,48 @@ fn parse_memory_learning_review() {
 }
 
 #[test]
+fn parse_memory_learning_eval() {
+    let eval = parse_memory_learning_command([
+        "palyra",
+        "memory",
+        "learning",
+        "eval",
+        "01ARZ3NDEKTSV4RRFFQ69G5FBB",
+        "--suite",
+        "skill_patch_smoke",
+        "--result",
+        "passed",
+        "--threshold",
+        "0.80",
+        "--score",
+        "0.91",
+        "--decision",
+        "pass",
+        "--policy-decision",
+        "operator_recorded_eval_gate",
+        "--evidence-refs-json",
+        "[{\"kind\":\"test\",\"ref\":\"skill_patch_smoke\"}]",
+        "--json",
+    ]);
+    assert_eq!(
+        eval,
+        MemoryLearningCommand::Eval {
+            candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FBB".to_owned(),
+            suite: "skill_patch_smoke".to_owned(),
+            result: "passed".to_owned(),
+            threshold: "0.80".to_owned(),
+            score: "0.91".to_owned(),
+            decision: "pass".to_owned(),
+            policy_decision: Some("operator_recorded_eval_gate".to_owned()),
+            evidence_refs_json: Some(
+                "[{\"kind\":\"test\",\"ref\":\"skill_patch_smoke\"}]".to_owned()
+            ),
+            json: true,
+        }
+    );
+}
+
+#[test]
 fn parse_memory_learning_apply() {
     let apply = parse_memory_learning_command([
         "palyra",
@@ -316,6 +358,12 @@ fn parse_memory_learning_promote_procedure_can_leave_candidate_pending() {
             json: false,
         }
     );
+}
+
+#[test]
+fn parse_memory_doctor() {
+    let parsed = Cli::parse_from(["palyra", "memory", "doctor", "--json"]);
+    assert_eq!(parsed.command, Command::Memory { command: MemoryCommand::Doctor { json: true } });
 }
 
 #[test]

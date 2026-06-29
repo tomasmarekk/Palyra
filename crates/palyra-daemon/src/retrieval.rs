@@ -1606,9 +1606,9 @@ mod tests {
         RetrievalSourceProfileKind,
     };
     use crate::journal::{
-        JournalConfig, JournalStore, MemoryEmbeddingProvider, MemoryEmbeddingsMode,
-        MemoryEmbeddingsStatus, MemoryItemCreateRequest, MemorySearchRequest, MemorySource,
-        OrchestratorCheckpointRecord, OrchestratorCompactionArtifactRecord,
+        JournalConfig, JournalStore, MemoryEmbeddingProvider, MemoryEmbeddingQueueStatus,
+        MemoryEmbeddingsMode, MemoryEmbeddingsStatus, MemoryItemCreateRequest, MemorySearchRequest,
+        MemorySource, OrchestratorCheckpointRecord, OrchestratorCompactionArtifactRecord,
         QueryEmbeddingCacheStatus,
     };
     use crate::model_provider::{
@@ -1857,6 +1857,15 @@ mod tests {
                     hits: 0,
                     misses: 0,
                 },
+                queue: MemoryEmbeddingQueueStatus {
+                    pending_count: 0,
+                    claimed_count: 0,
+                    completed_count: 16,
+                    failed_count: 0,
+                    stale_count: 0,
+                    next_retry_due_count: 0,
+                    oldest_pending_age_ms: None,
+                },
             },
         );
         assert_eq!(ready.state, RetrievalBackendState::Ready);
@@ -1895,6 +1904,15 @@ mod tests {
                     entry_count: 0,
                     hits: 0,
                     misses: 0,
+                },
+                queue: MemoryEmbeddingQueueStatus {
+                    pending_count: 12,
+                    claimed_count: 0,
+                    completed_count: 4,
+                    failed_count: 0,
+                    stale_count: 0,
+                    next_retry_due_count: 0,
+                    oldest_pending_age_ms: Some(60_000),
                 },
             },
         );

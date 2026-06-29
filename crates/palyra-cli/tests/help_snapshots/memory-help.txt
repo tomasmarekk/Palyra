@@ -4,6 +4,7 @@ Usage: palyra memory [OPTIONS] <COMMAND>
 
 Commands:
   status            [aliases: list]
+  doctor
   index             [aliases: reindex]
   index-drift
   index-reconcile

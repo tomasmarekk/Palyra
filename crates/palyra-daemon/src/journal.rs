@@ -65,6 +65,10 @@ pub type WorkspaceRetrievalIndexStatus = retrieval_index_status::WorkspaceRetrie
 
 const REDACTED_MARKER: &str = "<redacted>";
 const MAX_RECENT_EVENTS_LIMIT: usize = 500;
+const MEMORY_EMBEDDING_JOB_INDEX_TARGET: &str = "memory_vectors";
+const MEMORY_EMBEDDING_JOB_CLAIM_OWNER: &str = "memory_embeddings_backfill";
+const MEMORY_EMBEDDING_JOB_CLAIM_TIMEOUT_MS: i64 = 15 * 60 * 1000;
+const MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS: i64 = 60_000;
 const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
     "secret",
     "token",
@@ -921,6 +925,18 @@ pub struct QueryEmbeddingCacheStatus {
     pub misses: u64,
 }
 
+/// Durable embedding-job queue counts grouped by lifecycle state.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryEmbeddingQueueStatus {
+    pub pending_count: u64,
+    pub claimed_count: u64,
+    pub completed_count: u64,
+    pub failed_count: u64,
+    pub stale_count: u64,
+    pub next_retry_due_count: u64,
+    pub oldest_pending_age_ms: Option<i64>,
+}
+
 /// Operator-facing report on embedding coverage, quality, and remediation.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MemoryEmbeddingsStatus {
@@ -947,6 +963,7 @@ pub struct MemoryEmbeddingsStatus {
     pub request_timeout_ms: u64,
     pub retry_max: u32,
     pub query_cache: QueryEmbeddingCacheStatus,
+    pub queue: MemoryEmbeddingQueueStatus,
 }
 
 fn memory_embeddings_status_quality(
@@ -1030,6 +1047,9 @@ pub struct MemoryEmbeddingsBackfillOutcome {
     pub scanned_count: u64,
     pub updated_count: u64,
     pub pending_count: u64,
+    pub claimed_count: u64,
+    pub failed_count: u64,
+    pub stale_count: u64,
     pub target_model_id: String,
     pub target_dims: usize,
     pub target_version: i64,
@@ -3179,6 +3199,76 @@ pub struct LearningCandidateHistoryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_payload_json: Option<String>,
     pub created_at_unix_ms: i64,
+}
+
+/// Stored evaluation gate result for a learning candidate.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LearningCandidateEvalRecord {
+    pub eval_id: String,
+    pub candidate_id: String,
+    pub eval_suite: String,
+    pub result: String,
+    pub threshold: f64,
+    pub score: f64,
+    pub decision: String,
+    pub actor_principal: String,
+    pub policy_decision: String,
+    pub evidence_refs_json: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Parameters for appending a learning-candidate evaluation gate result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningCandidateEvalCreateRequest {
+    pub eval_id: Option<String>,
+    pub candidate_id: String,
+    pub eval_suite: String,
+    pub result: String,
+    pub threshold: f64,
+    pub score: f64,
+    pub decision: String,
+    pub actor_principal: String,
+    pub policy_decision: String,
+    pub evidence_refs_json: String,
+}
+
+/// Stored rollout, monitoring, or rollback event for an activated learning candidate.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LearningCandidateRolloutRecord {
+    pub rollout_id: String,
+    pub candidate_id: String,
+    pub rollout_kind: String,
+    pub state: String,
+    pub target_ref: String,
+    pub previous_version_json: String,
+    pub activated_version_json: String,
+    pub telemetry_json: String,
+    pub reason: String,
+    pub actor_principal: String,
+    pub policy_decision: String,
+    pub evidence_refs_json: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolled_back_at_unix_ms: Option<i64>,
+}
+
+/// Parameters for appending a learning rollout, monitoring, or rollback event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningCandidateRolloutCreateRequest {
+    pub rollout_id: Option<String>,
+    pub candidate_id: String,
+    pub rollout_kind: String,
+    pub state: String,
+    pub target_ref: String,
+    pub previous_version_json: String,
+    pub activated_version_json: String,
+    pub telemetry_json: String,
+    pub reason: String,
+    pub actor_principal: String,
+    pub policy_decision: String,
+    pub evidence_refs_json: String,
+    pub rolled_back_at_unix_ms: Option<i64>,
 }
 
 /// Stored learned preference value for a scope and key.
@@ -5642,6 +5732,101 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 36,
+        name: "learning_eval_rollout_and_memory_embedding_jobs",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS learning_candidate_evals (
+                eval_ulid TEXT PRIMARY KEY,
+                candidate_ulid TEXT NOT NULL,
+                eval_suite TEXT NOT NULL,
+                result TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                score REAL NOT NULL,
+                decision TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                policy_decision TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(candidate_ulid) REFERENCES learning_candidates(candidate_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_candidate_evals_candidate
+                ON learning_candidate_evals(candidate_ulid, created_at_unix_ms DESC, eval_ulid DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_learning_candidate_evals_prevent_update
+            BEFORE UPDATE ON learning_candidate_evals
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_candidate_evals is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_learning_candidate_evals_prevent_delete
+            BEFORE DELETE ON learning_candidate_evals
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_candidate_evals is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS learning_candidate_rollouts (
+                rollout_ulid TEXT PRIMARY KEY,
+                candidate_ulid TEXT NOT NULL,
+                rollout_kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                previous_version_json TEXT NOT NULL,
+                activated_version_json TEXT NOT NULL,
+                telemetry_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                policy_decision TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                rolled_back_at_unix_ms INTEGER,
+                FOREIGN KEY(candidate_ulid) REFERENCES learning_candidates(candidate_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_learning_candidate_rollouts_candidate
+                ON learning_candidate_rollouts(candidate_ulid, created_at_unix_ms DESC, rollout_ulid DESC);
+            CREATE INDEX IF NOT EXISTS idx_learning_candidate_rollouts_state
+                ON learning_candidate_rollouts(state, updated_at_unix_ms DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_learning_candidate_rollouts_prevent_delete
+            BEFORE DELETE ON learning_candidate_rollouts
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_candidate_rollouts is append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS memory_embedding_jobs (
+                job_ulid TEXT PRIMARY KEY,
+                source_kind TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dims INTEGER NOT NULL,
+                embedding_version INTEGER NOT NULL,
+                index_target TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claimed_by TEXT,
+                claimed_at_unix_ms INTEGER,
+                last_error TEXT,
+                next_retry_unix_ms INTEGER,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER,
+                UNIQUE (
+                    source_kind,
+                    source_ref,
+                    content_hash,
+                    embedding_model_id,
+                    embedding_dims,
+                    embedding_version,
+                    index_target
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_status_retry
+                ON memory_embedding_jobs(status, next_retry_unix_ms, updated_at_unix_ms);
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_source
+                ON memory_embedding_jobs(source_kind, source_ref, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_target
+                ON memory_embedding_jobs(index_target, embedding_model_id, embedding_dims, embedding_version);
+        "#,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -6326,6 +6511,14 @@ struct QueryEmbeddingCacheEntry {
 struct QueryEmbeddingLookup {
     vector: Vec<f32>,
     cache_hit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimedMemoryEmbeddingJob {
+    job_id: String,
+    memory_id: String,
+    content_hash: String,
+    content_text: String,
 }
 
 #[derive(Debug, Default)]
@@ -14079,6 +14272,222 @@ impl JournalStore {
         Ok(records)
     }
 
+    /// Appends one evaluation gate result for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::LearningCandidateNotFound`] when the candidate
+    /// does not exist, [`JournalError::InvalidArgument`] for malformed JSON or
+    /// empty required fields, or a storage error.
+    pub fn record_learning_candidate_eval(
+        &self,
+        request: &LearningCandidateEvalCreateRequest,
+    ) -> Result<LearningCandidateEvalRecord, JournalError> {
+        ensure_nonempty_field(request.candidate_id.as_str(), "candidate_id")?;
+        ensure_nonempty_field(request.eval_suite.as_str(), "eval_suite")?;
+        ensure_nonempty_field(request.result.as_str(), "result")?;
+        ensure_nonempty_field(request.decision.as_str(), "decision")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.policy_decision.as_str(), "policy_decision")?;
+        ensure_json_field(request.evidence_refs_json.as_str(), "evidence_refs_json")?;
+        let eval_id = request.eval_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        if load_learning_candidate_by_id(&guard, request.candidate_id.as_str())?.is_none() {
+            return Err(JournalError::LearningCandidateNotFound {
+                candidate_id: request.candidate_id.clone(),
+            });
+        }
+        guard.execute(
+            r#"
+                INSERT INTO learning_candidate_evals (
+                    eval_ulid,
+                    candidate_ulid,
+                    eval_suite,
+                    result,
+                    threshold,
+                    score,
+                    decision,
+                    actor_principal,
+                    policy_decision,
+                    evidence_refs_json,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "#,
+            params![
+                eval_id.as_str(),
+                request.candidate_id.as_str(),
+                request.eval_suite.as_str(),
+                request.result.as_str(),
+                request.threshold.clamp(0.0, 1.0),
+                request.score.clamp(0.0, 1.0),
+                request.decision.as_str(),
+                request.actor_principal.as_str(),
+                request.policy_decision.as_str(),
+                request.evidence_refs_json.as_str(),
+                now,
+            ],
+        )?;
+        load_learning_candidate_eval_by_id(&guard, eval_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidArgument(format!("learning candidate eval not found: {eval_id}"))
+        })
+    }
+
+    /// Lists evaluation gate results for a learning candidate, newest first.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn list_learning_candidate_evals(
+        &self,
+        candidate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateEvalRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 256) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    eval_ulid,
+                    candidate_ulid,
+                    eval_suite,
+                    result,
+                    threshold,
+                    score,
+                    decision,
+                    actor_principal,
+                    policy_decision,
+                    evidence_refs_json,
+                    created_at_unix_ms
+                FROM learning_candidate_evals
+                WHERE candidate_ulid = ?1
+                ORDER BY created_at_unix_ms DESC, eval_ulid DESC
+                LIMIT ?2
+            "#,
+        )?;
+        let mut rows = statement.query(params![candidate_id, limit])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_learning_candidate_eval_row(row)?);
+        }
+        Ok(records)
+    }
+
+    /// Appends one rollout, monitoring, or rollback event for a learning candidate.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::LearningCandidateNotFound`] when the candidate
+    /// does not exist, [`JournalError::InvalidArgument`] for malformed JSON or
+    /// empty required fields, or a storage error.
+    pub fn record_learning_candidate_rollout(
+        &self,
+        request: &LearningCandidateRolloutCreateRequest,
+    ) -> Result<LearningCandidateRolloutRecord, JournalError> {
+        ensure_nonempty_field(request.candidate_id.as_str(), "candidate_id")?;
+        ensure_nonempty_field(request.rollout_kind.as_str(), "rollout_kind")?;
+        ensure_nonempty_field(request.state.as_str(), "state")?;
+        ensure_nonempty_field(request.target_ref.as_str(), "target_ref")?;
+        ensure_nonempty_field(request.reason.as_str(), "reason")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.policy_decision.as_str(), "policy_decision")?;
+        ensure_json_field(request.previous_version_json.as_str(), "previous_version_json")?;
+        ensure_json_field(request.activated_version_json.as_str(), "activated_version_json")?;
+        ensure_json_field(request.telemetry_json.as_str(), "telemetry_json")?;
+        ensure_json_field(request.evidence_refs_json.as_str(), "evidence_refs_json")?;
+        let rollout_id = request.rollout_id.clone().unwrap_or_else(|| Ulid::new().to_string());
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        if load_learning_candidate_by_id(&guard, request.candidate_id.as_str())?.is_none() {
+            return Err(JournalError::LearningCandidateNotFound {
+                candidate_id: request.candidate_id.clone(),
+            });
+        }
+        guard.execute(
+            r#"
+                INSERT INTO learning_candidate_rollouts (
+                    rollout_ulid,
+                    candidate_ulid,
+                    rollout_kind,
+                    state,
+                    target_ref,
+                    previous_version_json,
+                    activated_version_json,
+                    telemetry_json,
+                    reason,
+                    actor_principal,
+                    policy_decision,
+                    evidence_refs_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    rolled_back_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
+            "#,
+            params![
+                rollout_id.as_str(),
+                request.candidate_id.as_str(),
+                request.rollout_kind.as_str(),
+                request.state.as_str(),
+                request.target_ref.as_str(),
+                request.previous_version_json.as_str(),
+                request.activated_version_json.as_str(),
+                request.telemetry_json.as_str(),
+                request.reason.as_str(),
+                request.actor_principal.as_str(),
+                request.policy_decision.as_str(),
+                request.evidence_refs_json.as_str(),
+                now,
+                request.rolled_back_at_unix_ms,
+            ],
+        )?;
+        load_learning_candidate_rollout_by_id(&guard, rollout_id.as_str())?.ok_or_else(|| {
+            JournalError::InvalidArgument(format!(
+                "learning candidate rollout not found: {rollout_id}"
+            ))
+        })
+    }
+
+    /// Lists rollout, monitoring, and rollback events for a learning candidate,
+    /// newest first.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn list_learning_candidate_rollouts(
+        &self,
+        candidate_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LearningCandidateRolloutRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 256) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    rollout_ulid,
+                    candidate_ulid,
+                    rollout_kind,
+                    state,
+                    target_ref,
+                    previous_version_json,
+                    activated_version_json,
+                    telemetry_json,
+                    reason,
+                    actor_principal,
+                    policy_decision,
+                    evidence_refs_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    rolled_back_at_unix_ms
+                FROM learning_candidate_rollouts
+                WHERE candidate_ulid = ?1
+                ORDER BY created_at_unix_ms DESC, rollout_ulid DESC
+                LIMIT ?2
+            "#,
+        )?;
+        let mut rows = statement.query(params![candidate_id, limit])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(map_learning_candidate_rollout_row(row)?);
+        }
+        Ok(records)
+    }
+
     /// Creates or updates a learned preference for a scope and key.
     ///
     /// # Errors
@@ -16101,6 +16510,7 @@ impl JournalStore {
             target_dims,
             CURRENT_MEMORY_EMBEDDING_VERSION,
         )?;
+        let queue = query_memory_embedding_queue_status(&guard, now)?;
         Ok(MemoryEmbeddingsStatus {
             mode,
             posture: self.memory_embedding_runtime.posture,
@@ -16124,6 +16534,7 @@ impl JournalStore {
             request_timeout_ms: self.memory_embedding_runtime.request_timeout_ms,
             retry_max: self.memory_embedding_runtime.retry_max,
             query_cache: self.query_embedding_cache_status(now),
+            queue,
         })
     }
 
@@ -16239,8 +16650,17 @@ impl JournalStore {
         let target_version = CURRENT_MEMORY_EMBEDDING_VERSION;
         let effective_batch = batch_size.clamp(1, MAX_MEMORY_SEARCH_CANDIDATES);
 
-        let pending_batch = {
+        let (pending_before, pending_batch, recovered_stale_count) = {
             let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+            sync_memory_embedding_jobs_for_pending_targets(
+                &guard,
+                target_model_id.as_str(),
+                target_dims,
+                target_version,
+                ran_at_unix_ms,
+            )?;
+            let recovered_stale_count =
+                recover_stale_memory_embedding_jobs(&guard, ran_at_unix_ms)?;
             let pending_before = query_pending_memory_embeddings_count(
                 &guard,
                 target_model_id.as_str(),
@@ -16254,19 +16674,24 @@ impl JournalStore {
                     scanned_count: 0,
                     updated_count: 0,
                     pending_count: 0,
+                    claimed_count: 0,
+                    failed_count: 0,
+                    stale_count: recovered_stale_count,
                     target_model_id,
                     target_dims,
                     target_version,
                 });
             }
 
-            load_pending_memory_embeddings_batch(
+            let pending_batch = claim_memory_embedding_jobs(
                 &guard,
                 target_model_id.as_str(),
                 target_dims,
                 target_version,
                 effective_batch,
-            )?
+                ran_at_unix_ms,
+            )?;
+            (pending_before, pending_batch, recovered_stale_count)
         };
         if pending_batch.is_empty() {
             return Ok(MemoryEmbeddingsBackfillOutcome {
@@ -16274,7 +16699,10 @@ impl JournalStore {
                 batch_size: effective_batch,
                 scanned_count: 0,
                 updated_count: 0,
-                pending_count: 0,
+                pending_count: pending_before,
+                claimed_count: 0,
+                failed_count: 0,
+                stale_count: recovered_stale_count,
                 target_model_id,
                 target_dims,
                 target_version,
@@ -16282,17 +16710,33 @@ impl JournalStore {
         }
 
         let mut updates = Vec::with_capacity(pending_batch.len());
-        for (memory_id, content_text) in &pending_batch {
+        let mut failed_jobs = Vec::new();
+        for job in &pending_batch {
             let vector = normalize_embedding_dimensions(
-                self.memory_embedding_provider.embed_text(content_text.as_str()),
+                self.memory_embedding_provider.embed_text(job.content_text.as_str()),
                 target_dims,
             );
-            updates.push((memory_id.clone(), encode_vector_blob(vector.as_slice())));
+            if vector.len() != target_dims {
+                failed_jobs.push((
+                    job.job_id.clone(),
+                    format!(
+                        "embedding provider returned {} dimensions, expected {}",
+                        vector.len(),
+                        target_dims
+                    ),
+                ));
+            } else {
+                updates.push((
+                    job.job_id.clone(),
+                    job.memory_id.clone(),
+                    encode_vector_blob(vector.as_slice()),
+                ));
+            }
         }
 
         let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
         let transaction = guard.transaction()?;
-        for (memory_id, vector_blob) in &updates {
+        for (job_id, memory_id, vector_blob) in &updates {
             transaction.execute(
                 r#"
                     INSERT INTO memory_vectors (
@@ -16330,6 +16774,15 @@ impl JournalStore {
                     ran_at_unix_ms,
                 ],
             )?;
+            complete_memory_embedding_job(&transaction, job_id.as_str(), ran_at_unix_ms)?;
+        }
+        for (job_id, error) in &failed_jobs {
+            fail_memory_embedding_job(
+                &transaction,
+                job_id.as_str(),
+                error.as_str(),
+                ran_at_unix_ms,
+            )?;
         }
         transaction.commit()?;
 
@@ -16345,6 +16798,9 @@ impl JournalStore {
             scanned_count: pending_batch.len() as u64,
             updated_count: updates.len() as u64,
             pending_count: pending_after,
+            claimed_count: pending_batch.len() as u64,
+            failed_count: failed_jobs.len() as u64,
+            stale_count: recovered_stale_count,
             target_model_id,
             target_dims,
             target_version,
@@ -21910,6 +22366,46 @@ fn map_learning_candidate_history_row(
     })
 }
 
+fn map_learning_candidate_eval_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LearningCandidateEvalRecord, rusqlite::Error> {
+    Ok(LearningCandidateEvalRecord {
+        eval_id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        eval_suite: row.get(2)?,
+        result: row.get(3)?,
+        threshold: row.get(4)?,
+        score: row.get(5)?,
+        decision: row.get(6)?,
+        actor_principal: row.get(7)?,
+        policy_decision: row.get(8)?,
+        evidence_refs_json: row.get(9)?,
+        created_at_unix_ms: row.get(10)?,
+    })
+}
+
+fn map_learning_candidate_rollout_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LearningCandidateRolloutRecord, rusqlite::Error> {
+    Ok(LearningCandidateRolloutRecord {
+        rollout_id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        rollout_kind: row.get(2)?,
+        state: row.get(3)?,
+        target_ref: row.get(4)?,
+        previous_version_json: row.get(5)?,
+        activated_version_json: row.get(6)?,
+        telemetry_json: row.get(7)?,
+        reason: row.get(8)?,
+        actor_principal: row.get(9)?,
+        policy_decision: row.get(10)?,
+        evidence_refs_json: row.get(11)?,
+        created_at_unix_ms: row.get(12)?,
+        updated_at_unix_ms: row.get(13)?,
+        rolled_back_at_unix_ms: row.get(14)?,
+    })
+}
+
 fn map_learning_preference_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<LearningPreferenceRecord, rusqlite::Error> {
@@ -21930,6 +22426,68 @@ fn map_learning_preference_row(
         created_at_unix_ms: row.get(13)?,
         updated_at_unix_ms: row.get(14)?,
     })
+}
+
+fn load_learning_candidate_eval_by_id(
+    connection: &Connection,
+    eval_id: &str,
+) -> Result<Option<LearningCandidateEvalRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                eval_ulid,
+                candidate_ulid,
+                eval_suite,
+                result,
+                threshold,
+                score,
+                decision,
+                actor_principal,
+                policy_decision,
+                evidence_refs_json,
+                created_at_unix_ms
+            FROM learning_candidate_evals
+            WHERE eval_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![eval_id], map_learning_candidate_eval_row)
+        .optional()
+        .map_err(Into::into)
+}
+
+fn load_learning_candidate_rollout_by_id(
+    connection: &Connection,
+    rollout_id: &str,
+) -> Result<Option<LearningCandidateRolloutRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                rollout_ulid,
+                candidate_ulid,
+                rollout_kind,
+                state,
+                target_ref,
+                previous_version_json,
+                activated_version_json,
+                telemetry_json,
+                reason,
+                actor_principal,
+                policy_decision,
+                evidence_refs_json,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                rolled_back_at_unix_ms
+            FROM learning_candidate_rollouts
+            WHERE rollout_ulid = ?1
+            LIMIT 1
+        "#,
+    )?;
+    statement
+        .query_row(params![rollout_id], map_learning_candidate_rollout_row)
+        .optional()
+        .map_err(Into::into)
 }
 
 fn load_learning_candidate_by_id(
@@ -22265,18 +22823,18 @@ fn query_pending_memory_embeddings_count(
     Ok(pending_raw.max(0) as u64)
 }
 
-fn load_pending_memory_embeddings_batch(
+fn sync_memory_embedding_jobs_for_pending_targets(
     connection: &Connection,
     target_model_id: &str,
     target_dims: usize,
     target_version: i64,
-    batch_size: usize,
-) -> Result<Vec<(String, String)>, JournalError> {
+    now_unix_ms: i64,
+) -> Result<u64, JournalError> {
     let mut statement = connection.prepare(
         r#"
             SELECT
                 memory.memory_ulid,
-                memory.content_text
+                memory.content_hash
             FROM memory_items AS memory
             LEFT JOIN memory_vectors AS vectors
                 ON vectors.memory_ulid = memory.memory_ulid
@@ -22286,20 +22844,327 @@ fn load_pending_memory_embeddings_batch(
                 COALESCE(vectors.embedding_dims, vectors.dims, 0) != ?2 OR
                 COALESCE(vectors.embedding_version, 0) != ?3
             ORDER BY memory.created_at_unix_ms ASC, memory.memory_ulid ASC
-            LIMIT ?4
+        "#,
+    )?;
+    let mut rows = statement.query(params![target_model_id, target_dims as i64, target_version])?;
+    let mut sources = Vec::new();
+    while let Some(row) = rows.next()? {
+        sources.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut inserted_count = 0_u64;
+    for (memory_id, content_hash) in sources {
+        let inserted = connection.execute(
+            r#"
+                INSERT INTO memory_embedding_jobs (
+                    job_ulid,
+                    source_kind,
+                    source_ref,
+                    content_hash,
+                    embedding_model_id,
+                    embedding_dims,
+                    embedding_version,
+                    index_target,
+                    status,
+                    attempts,
+                    created_at_unix_ms,
+                    updated_at_unix_ms
+                ) VALUES (?1, 'memory_item', ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, ?8)
+                ON CONFLICT (
+                    source_kind,
+                    source_ref,
+                    content_hash,
+                    embedding_model_id,
+                    embedding_dims,
+                    embedding_version,
+                    index_target
+                ) DO UPDATE SET
+                    status = CASE
+                        WHEN memory_embedding_jobs.status = 'completed' THEN 'pending'
+                        ELSE memory_embedding_jobs.status
+                    END,
+                    completed_at_unix_ms = CASE
+                        WHEN memory_embedding_jobs.status = 'completed' THEN NULL
+                        ELSE memory_embedding_jobs.completed_at_unix_ms
+                    END,
+                    updated_at_unix_ms = CASE
+                        WHEN memory_embedding_jobs.status = 'completed' THEN excluded.updated_at_unix_ms
+                        ELSE memory_embedding_jobs.updated_at_unix_ms
+                    END
+            "#,
+            params![
+                Ulid::new().to_string(),
+                memory_id,
+                content_hash,
+                target_model_id,
+                target_dims as i64,
+                target_version,
+                MEMORY_EMBEDDING_JOB_INDEX_TARGET,
+                now_unix_ms,
+            ],
+        )?;
+        inserted_count = inserted_count.saturating_add(inserted as u64);
+    }
+    Ok(inserted_count)
+}
+
+fn recover_stale_memory_embedding_jobs(
+    connection: &Connection,
+    now_unix_ms: i64,
+) -> Result<u64, JournalError> {
+    let stale_before = now_unix_ms.saturating_sub(MEMORY_EMBEDDING_JOB_CLAIM_TIMEOUT_MS);
+    let updated = connection.execute(
+        r#"
+            UPDATE memory_embedding_jobs
+            SET
+                status = 'stale',
+                last_error = 'claim timed out before completion',
+                next_retry_unix_ms = ?1,
+                updated_at_unix_ms = ?1
+            WHERE status = 'claimed'
+              AND claimed_at_unix_ms IS NOT NULL
+              AND claimed_at_unix_ms <= ?2
+        "#,
+        params![now_unix_ms, stale_before],
+    )?;
+    Ok(updated as u64)
+}
+
+fn claim_memory_embedding_jobs(
+    connection: &Connection,
+    target_model_id: &str,
+    target_dims: usize,
+    target_version: i64,
+    batch_size: usize,
+    now_unix_ms: i64,
+) -> Result<Vec<ClaimedMemoryEmbeddingJob>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                job_ulid,
+                source_ref,
+                content_hash
+            FROM memory_embedding_jobs
+            WHERE source_kind = 'memory_item'
+              AND index_target = ?1
+              AND embedding_model_id = ?2
+              AND embedding_dims = ?3
+              AND embedding_version = ?4
+              AND (
+                    status = 'pending'
+                 OR status = 'stale'
+                 OR (status = 'failed' AND COALESCE(next_retry_unix_ms, 0) <= ?5)
+              )
+            ORDER BY created_at_unix_ms ASC, job_ulid ASC
+            LIMIT ?6
         "#,
     )?;
     let mut rows = statement.query(params![
+        MEMORY_EMBEDDING_JOB_INDEX_TARGET,
         target_model_id,
         target_dims as i64,
         target_version,
-        batch_size as i64
+        now_unix_ms,
+        batch_size as i64,
     ])?;
-    let mut batch = Vec::new();
+    let mut selected = Vec::new();
     while let Some(row) = rows.next()? {
-        batch.push((row.get(0)?, row.get(1)?));
+        selected.push((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ));
     }
-    Ok(batch)
+    drop(rows);
+    drop(statement);
+
+    let mut claimed = Vec::new();
+    for (job_id, memory_id, content_hash) in selected {
+        let updated = connection.execute(
+            r#"
+                UPDATE memory_embedding_jobs
+                SET
+                    status = 'claimed',
+                    attempts = attempts + 1,
+                    claimed_by = ?2,
+                    claimed_at_unix_ms = ?3,
+                    last_error = NULL,
+                    updated_at_unix_ms = ?3
+                WHERE job_ulid = ?1
+                  AND status IN ('pending', 'failed', 'stale')
+            "#,
+            params![job_id.as_str(), MEMORY_EMBEDDING_JOB_CLAIM_OWNER, now_unix_ms],
+        )?;
+        if updated == 0 {
+            continue;
+        }
+        let content_text = connection
+            .query_row(
+                r#"
+                    SELECT content_text
+                    FROM memory_items
+                    WHERE memory_ulid = ?1
+                      AND content_hash = ?2
+                    LIMIT 1
+                "#,
+                params![memory_id.as_str(), content_hash.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match content_text {
+            Some(content_text) => claimed.push(ClaimedMemoryEmbeddingJob {
+                job_id,
+                memory_id,
+                content_hash,
+                content_text,
+            }),
+            None => {
+                mark_memory_embedding_job_stale(
+                    connection,
+                    job_id.as_str(),
+                    "source memory content changed or disappeared",
+                    now_unix_ms,
+                )?;
+            }
+        }
+    }
+    Ok(claimed)
+}
+
+fn complete_memory_embedding_job(
+    connection: &Connection,
+    job_id: &str,
+    now_unix_ms: i64,
+) -> Result<(), JournalError> {
+    connection.execute(
+        r#"
+            UPDATE memory_embedding_jobs
+            SET
+                status = 'completed',
+                claimed_by = NULL,
+                claimed_at_unix_ms = NULL,
+                last_error = NULL,
+                next_retry_unix_ms = NULL,
+                completed_at_unix_ms = ?2,
+                updated_at_unix_ms = ?2
+            WHERE job_ulid = ?1
+        "#,
+        params![job_id, now_unix_ms],
+    )?;
+    Ok(())
+}
+
+fn fail_memory_embedding_job(
+    connection: &Connection,
+    job_id: &str,
+    error: &str,
+    now_unix_ms: i64,
+) -> Result<(), JournalError> {
+    connection.execute(
+        r#"
+            UPDATE memory_embedding_jobs
+            SET
+                status = 'failed',
+                claimed_by = NULL,
+                claimed_at_unix_ms = NULL,
+                last_error = ?2,
+                next_retry_unix_ms = ?3,
+                updated_at_unix_ms = ?4
+            WHERE job_ulid = ?1
+        "#,
+        params![
+            job_id,
+            redact_error_text(error),
+            now_unix_ms.saturating_add(MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS),
+            now_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn mark_memory_embedding_job_stale(
+    connection: &Connection,
+    job_id: &str,
+    error: &str,
+    now_unix_ms: i64,
+) -> Result<(), JournalError> {
+    connection.execute(
+        r#"
+            UPDATE memory_embedding_jobs
+            SET
+                status = 'stale',
+                claimed_by = NULL,
+                claimed_at_unix_ms = NULL,
+                last_error = ?2,
+                next_retry_unix_ms = ?3,
+                updated_at_unix_ms = ?4
+            WHERE job_ulid = ?1
+        "#,
+        params![
+            job_id,
+            redact_error_text(error),
+            now_unix_ms.saturating_add(MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS),
+            now_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn query_memory_embedding_queue_status(
+    connection: &Connection,
+    now_unix_ms: i64,
+) -> Result<MemoryEmbeddingQueueStatus, JournalError> {
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut statement = connection.prepare(
+        r#"
+            SELECT status, COUNT(*)
+            FROM memory_embedding_jobs
+            GROUP BY status
+        "#,
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let status: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        counts.insert(status, count.max(0) as u64);
+    }
+    drop(rows);
+    drop(statement);
+
+    let next_retry_due_raw: i64 = connection.query_row(
+        r#"
+            SELECT COUNT(*)
+            FROM memory_embedding_jobs
+            WHERE status = 'failed'
+              AND COALESCE(next_retry_unix_ms, 0) <= ?1
+        "#,
+        params![now_unix_ms],
+        |row| row.get(0),
+    )?;
+    let oldest_pending_created_at: Option<i64> = connection
+        .query_row(
+            r#"
+                SELECT MIN(created_at_unix_ms)
+                FROM memory_embedding_jobs
+                WHERE status IN ('pending', 'failed', 'stale')
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(MemoryEmbeddingQueueStatus {
+        pending_count: *counts.get("pending").unwrap_or(&0),
+        claimed_count: *counts.get("claimed").unwrap_or(&0),
+        completed_count: *counts.get("completed").unwrap_or(&0),
+        failed_count: *counts.get("failed").unwrap_or(&0),
+        stale_count: *counts.get("stale").unwrap_or(&0),
+        next_retry_due_count: next_retry_due_raw.max(0) as u64,
+        oldest_pending_age_ms: oldest_pending_created_at
+            .map(|created_at| now_unix_ms.saturating_sub(created_at).max(0)),
+    })
 }
 
 fn load_memory_maintenance_state(
@@ -29567,6 +30432,69 @@ mod tests {
     }
 
     #[test]
+    fn memory_embedding_jobs_are_idempotent_and_recover_completed_sources() {
+        let db_path = temp_db_path();
+        let provider = Arc::new(FixedMemoryEmbeddingProvider {
+            model_name: "semantic-embed-v4",
+            dimensions: 4,
+            vector: vec![0.2, 0.4, 0.6, 0.8],
+        });
+        let store = JournalStore::open_with_memory_embedding_provider(
+            test_journal_config(db_path, false),
+            provider,
+        )
+        .expect("journal store should open with custom embedding provider");
+        let memory_id = "01ARZ3NDEKTSV4RRFFQ69G5FE5";
+        store
+            .create_memory_item(&sample_memory_request(
+                memory_id,
+                "user:ops",
+                Some("cli"),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FB5"),
+                MemorySource::Manual,
+                "queue idempotence backfill row",
+            ))
+            .expect("memory item should be created");
+        {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute("DELETE FROM memory_vectors WHERE memory_ulid = ?1", params![memory_id])
+                .expect("fixture should delete vector row");
+        }
+
+        let first =
+            store.run_memory_embeddings_backfill(8).expect("first backfill should complete job");
+        assert_eq!(first.claimed_count, 1);
+        assert_eq!(first.updated_count, 1);
+        let status = store
+            .memory_embeddings_status()
+            .expect("embedding status should load after first backfill");
+        assert_eq!(status.queue.completed_count, 1);
+        assert_eq!(status.queue.pending_count, 0);
+
+        let second = store
+            .run_memory_embeddings_backfill(8)
+            .expect("second backfill should not duplicate completed job");
+        assert_eq!(second.claimed_count, 0);
+        let status = store
+            .memory_embeddings_status()
+            .expect("embedding status should load after second backfill");
+        assert_eq!(status.queue.completed_count, 1);
+
+        {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .execute("DELETE FROM memory_vectors WHERE memory_ulid = ?1", params![memory_id])
+                .expect("fixture should delete vector row again");
+        }
+        let recovered = store
+            .run_memory_embeddings_backfill(8)
+            .expect("completed job should reopen when vector row disappears");
+        assert_eq!(recovered.claimed_count, 1);
+        assert_eq!(recovered.pending_count, 0);
+    }
+
+    #[test]
     fn memory_embeddings_backfill_releases_db_lock_before_embedding_calls() {
         let db_path = temp_db_path();
         let (started_tx, started_rx) = mpsc::channel();
@@ -30230,6 +31158,86 @@ mod tests {
         assert_eq!(history.len(), 1, "review should emit a history row");
         assert_eq!(history[0].status, "accepted");
         assert_eq!(history[0].reviewed_by_principal, "user:ops");
+    }
+
+    #[test]
+    fn learning_eval_and_rollout_records_are_append_only_gate_evidence() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5FD1");
+        start_orchestrator_run(&store, "01ARZ3NDEKTSV4RRFFQ69G5FD1", "01ARZ3NDEKTSV4RRFFQ69G5FD2");
+        let created = store
+            .upsert_learning_candidate(&super::LearningCandidateCreateRequest {
+                candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FD3".to_owned(),
+                candidate_kind: "patch_skill".to_owned(),
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FD1".to_owned(),
+                run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FD2".to_owned()),
+                owner_principal: "user:ops".to_owned(),
+                device_id: "dev-01".to_owned(),
+                channel: Some("cli".to_owned()),
+                scope_kind: "workspace".to_owned(),
+                scope_id: "01ARZ3NDEKTSV4RRFFQ69G5FD1".to_owned(),
+                status: "approved".to_owned(),
+                auto_applied: false,
+                confidence: 0.92,
+                risk_level: "review".to_owned(),
+                title: "Patch skill fixture".to_owned(),
+                summary: "Risky skill patch needs eval evidence.".to_owned(),
+                target_path: Some(".agents/skills/example/SKILL.md".to_owned()),
+                dedupe_key: "patch:skill".to_owned(),
+                content_json: "{\"patch\":{\"files\":[]}}".to_owned(),
+                provenance_json: "[{\"run_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FD2\"}]".to_owned(),
+                source_task_id: None,
+            })
+            .expect("learning candidate should be created");
+
+        let eval = store
+            .record_learning_candidate_eval(&super::LearningCandidateEvalCreateRequest {
+                eval_id: None,
+                candidate_id: created.candidate_id.clone(),
+                eval_suite: "skill_patch_smoke".to_owned(),
+                result: "passed".to_owned(),
+                threshold: 0.8,
+                score: 0.91,
+                decision: "pass".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                policy_decision: "operator_recorded_eval_gate".to_owned(),
+                evidence_refs_json: "[{\"kind\":\"test\",\"ref\":\"skill_patch_smoke\"}]"
+                    .to_owned(),
+            })
+            .expect("eval gate should persist");
+        assert_eq!(eval.decision, "pass");
+
+        let rollout = store
+            .record_learning_candidate_rollout(&super::LearningCandidateRolloutCreateRequest {
+                rollout_id: None,
+                candidate_id: created.candidate_id.clone(),
+                rollout_kind: "patch_skill".to_owned(),
+                state: "activation".to_owned(),
+                target_ref: ".agents/skills/example/SKILL.md".to_owned(),
+                previous_version_json: "{\"sha256\":\"before\"}".to_owned(),
+                activated_version_json: "{\"sha256\":\"after\"}".to_owned(),
+                telemetry_json: "{\"rollout_id\":\"fixture\"}".to_owned(),
+                reason: "activated after eval".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                policy_decision: "operator_review_and_eval_gate".to_owned(),
+                evidence_refs_json: "[{\"kind\":\"eval\",\"ref\":\"skill_patch_smoke\"}]"
+                    .to_owned(),
+                rolled_back_at_unix_ms: None,
+            })
+            .expect("rollout event should persist");
+        assert_eq!(rollout.state, "activation");
+
+        let evals = store
+            .list_learning_candidate_evals(created.candidate_id.as_str(), 8)
+            .expect("eval list should load");
+        let rollouts = store
+            .list_learning_candidate_rollouts(created.candidate_id.as_str(), 8)
+            .expect("rollout list should load");
+        assert_eq!(evals.len(), 1);
+        assert_eq!(rollouts.len(), 1);
+        assert_eq!(rollouts[0].policy_decision, "operator_review_and_eval_gate");
     }
 
     #[test]
