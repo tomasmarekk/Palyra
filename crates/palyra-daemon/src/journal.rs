@@ -3282,6 +3282,57 @@ pub struct ProgressDraftListFilter {
     pub limit: usize,
 }
 
+/// Append-only audit event emitted by the turn control plane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnControlAuditEventRecord {
+    pub event_id: String,
+    pub event_type: String,
+    pub operation: String,
+    pub actor_principal: String,
+    pub target_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub outcome: String,
+    pub reason_code: String,
+    pub payload_json: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Request to append a turn control audit event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnControlAuditEventAppendRequest {
+    pub event_id: String,
+    pub event_type: String,
+    pub operation: String,
+    pub actor_principal: String,
+    pub target_kind: String,
+    pub target_id: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub outcome: String,
+    pub reason_code: String,
+    pub payload_json: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+}
+
+/// Filter for reading turn control audit events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnControlAuditEventListFilter {
+    pub actor_principal: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub target_kind: Option<String>,
+    pub target_id: Option<String>,
+    pub limit: usize,
+}
+
 /// Parameters for recording a commitment delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitmentDeliveryAttemptCreateRequest {
@@ -6179,6 +6230,46 @@ const MIGRATIONS: &[Migration] = &[
             BEFORE DELETE ON progress_draft_events
             BEGIN
                 SELECT RAISE(ABORT, 'progress_draft_events is append-only');
+            END;
+        "#,
+    },
+    Migration {
+        version: 39,
+        name: "turn_control_audit_events",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS turn_control_events (
+                event_ulid TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_id TEXT,
+                session_ulid TEXT,
+                run_ulid TEXT,
+                outcome TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                redaction_level TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_turn_control_events_operation_actor
+                ON turn_control_events(operation, actor_principal, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_turn_control_events_session_run
+                ON turn_control_events(session_ulid, run_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_turn_control_events_target
+                ON turn_control_events(target_kind, target_id, created_at_unix_ms DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_turn_control_events_prevent_update
+            BEFORE UPDATE ON turn_control_events
+            BEGIN
+                SELECT RAISE(ABORT, 'turn_control_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_turn_control_events_prevent_delete
+            BEFORE DELETE ON turn_control_events
+            BEGIN
+                SELECT RAISE(ABORT, 'turn_control_events is append-only');
             END;
         "#,
     },
@@ -15111,6 +15202,170 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Appends one turn control audit event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when validation, redaction, or storage fails.
+    pub fn append_turn_control_event(
+        &self,
+        request: &TurnControlAuditEventAppendRequest,
+    ) -> Result<TurnControlAuditEventRecord, JournalError> {
+        ensure_nonempty_field(request.event_id.as_str(), "event_id")?;
+        ensure_nonempty_field(request.event_type.as_str(), "event_type")?;
+        ensure_nonempty_field(request.operation.as_str(), "operation")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.target_kind.as_str(), "target_kind")?;
+        ensure_nonempty_field(request.outcome.as_str(), "outcome")?;
+        ensure_nonempty_field(request.reason_code.as_str(), "reason_code")?;
+        let now = current_unix_ms()?;
+        let mut redacted = false;
+        let actor_principal = sanitize_plan_text_field(
+            request.actor_principal.as_str(),
+            "actor_principal",
+            "turn_control.actor_principal",
+        )?;
+        redacted |= actor_principal != request.actor_principal.trim();
+        let target_id = sanitize_plan_optional_text_field(
+            request.target_id.as_deref(),
+            "target_id",
+            "turn_control.target_id",
+        )?;
+        redacted |= target_id.as_deref() != request.target_id.as_deref();
+        let session_id = sanitize_plan_optional_text_field(
+            request.session_id.as_deref(),
+            "session_id",
+            "turn_control.session_id",
+        )?;
+        redacted |= session_id.as_deref() != request.session_id.as_deref();
+        let run_id = sanitize_plan_optional_text_field(
+            request.run_id.as_deref(),
+            "run_id",
+            "turn_control.run_id",
+        )?;
+        redacted |= run_id.as_deref() != request.run_id.as_deref();
+        let payload_json = sanitize_json_payload_field(
+            request.payload_json.as_str(),
+            "turn_control.payload_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= payload_json != request.payload_json;
+        let evidence_refs_json = sanitize_json_payload_field(
+            request.evidence_refs_json.as_str(),
+            "turn_control.evidence_refs_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= evidence_refs_json != request.evidence_refs_json;
+        let redaction_level = if redacted {
+            crate::application::turn_control::TURN_CONTROL_REDACTION_REDACTED
+        } else {
+            request.redaction_level.as_str()
+        };
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        guard.execute(
+            r#"
+                INSERT INTO turn_control_events (
+                    event_ulid,
+                    event_type,
+                    operation,
+                    actor_principal,
+                    target_kind,
+                    target_id,
+                    session_ulid,
+                    run_ulid,
+                    outcome,
+                    reason_code,
+                    payload_json,
+                    evidence_refs_json,
+                    redaction_level,
+                    created_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                request.event_id,
+                request.event_type,
+                request.operation,
+                actor_principal,
+                request.target_kind,
+                target_id,
+                session_id,
+                run_id,
+                request.outcome,
+                request.reason_code,
+                payload_json,
+                evidence_refs_json,
+                redaction_level,
+                now,
+            ],
+        )?;
+        Ok(TurnControlAuditEventRecord {
+            event_id: request.event_id.clone(),
+            event_type: request.event_type.clone(),
+            operation: request.operation.clone(),
+            actor_principal,
+            target_kind: request.target_kind.clone(),
+            target_id,
+            session_id,
+            run_id,
+            outcome: request.outcome.clone(),
+            reason_code: request.reason_code.clone(),
+            payload_json,
+            evidence_refs_json,
+            redaction_level: redaction_level.to_owned(),
+            created_at_unix_ms: now,
+        })
+    }
+
+    /// Lists recent turn control audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when validation or storage fails.
+    pub fn list_turn_control_events(
+        &self,
+        filter: &TurnControlAuditEventListFilter,
+    ) -> Result<Vec<TurnControlAuditEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    event_type,
+                    operation,
+                    actor_principal,
+                    target_kind,
+                    target_id,
+                    session_ulid,
+                    run_ulid,
+                    outcome,
+                    reason_code,
+                    payload_json,
+                    evidence_refs_json,
+                    redaction_level,
+                    created_at_unix_ms
+                FROM turn_control_events
+                WHERE (?1 IS NULL OR actor_principal = ?1)
+                  AND (?2 IS NULL OR session_ulid = ?2)
+                  AND (?3 IS NULL OR run_ulid = ?3)
+                  AND (?4 IS NULL OR target_kind = ?4)
+                  AND (?5 IS NULL OR target_id = ?5)
+                ORDER BY created_at_unix_ms DESC, event_ulid DESC
+                LIMIT ?6
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.actor_principal,
+                filter.session_id,
+                filter.run_id,
+                filter.target_kind,
+                filter.target_id,
+                limit,
+            ],
+            map_turn_control_event_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
     /// Records a commitment delivery attempt.
     ///
     /// # Errors
@@ -23685,6 +23940,27 @@ fn map_progress_draft_event_row(
     })
 }
 
+fn map_turn_control_event_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<TurnControlAuditEventRecord, rusqlite::Error> {
+    Ok(TurnControlAuditEventRecord {
+        event_id: row.get(0)?,
+        event_type: row.get(1)?,
+        operation: row.get(2)?,
+        actor_principal: row.get(3)?,
+        target_kind: row.get(4)?,
+        target_id: row.get(5)?,
+        session_id: row.get(6)?,
+        run_id: row.get(7)?,
+        outcome: row.get(8)?,
+        reason_code: row.get(9)?,
+        payload_json: row.get(10)?,
+        evidence_refs_json: row.get(11)?,
+        redaction_level: row.get(12)?,
+        created_at_unix_ms: row.get(13)?,
+    })
+}
+
 fn nonnegative_i64_to_u64(value: i64) -> Option<u64> {
     (value >= 0).then_some(value as u64)
 }
@@ -26091,7 +26367,8 @@ mod tests {
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
-        ToolResultArtifactReadRequest, WorkItemCreateRequest, WorkItemUpdateRequest,
+        ToolResultArtifactReadRequest, TurnControlAuditEventAppendRequest,
+        TurnControlAuditEventListFilter, WorkItemCreateRequest, WorkItemUpdateRequest,
         WorkspaceBootstrapRequest, WorkspaceDocumentDeleteRequest, WorkspaceDocumentListFilter,
         WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
         CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
@@ -26422,6 +26699,75 @@ mod tests {
                 ref to,
             } if !draft_id.is_empty() && from == "completed" && to == "running"
         ));
+    }
+
+    #[test]
+    fn turn_control_audit_events_are_append_only_and_filterable() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5TC1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5TC2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let event = store
+            .append_turn_control_event(&TurnControlAuditEventAppendRequest {
+                event_id: "01ARZ3NDEKTSV4RRFFQ69G5TC3".to_owned(),
+                event_type: crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED
+                    .to_owned(),
+                operation: crate::application::turn_control::TurnControlOperation::CancelRun
+                    .as_str()
+                    .to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                target_kind: "run".to_owned(),
+                target_id: Some(run_id.to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: Some(run_id.to_owned()),
+                outcome: "completed".to_owned(),
+                reason_code:
+                    crate::application::turn_control::TurnControlReasonCode::RunCancelSelected
+                        .as_str()
+                        .to_owned(),
+                payload_json: json!({"operation": "cancel_run", "run_id": run_id}).to_string(),
+                evidence_refs_json: json!([{"kind": "run", "run_id": run_id}]).to_string(),
+                redaction_level: crate::application::turn_control::TURN_CONTROL_REDACTION_NONE
+                    .to_owned(),
+            })
+            .expect("turn control event should append");
+
+        assert_eq!(event.operation, "cancel_run");
+        assert_eq!(event.target_id.as_deref(), Some(run_id));
+        assert_eq!(
+            event.reason_code,
+            crate::application::turn_control::TurnControlReasonCode::RunCancelSelected.as_str()
+        );
+        assert_eq!(
+            event.redaction_level,
+            crate::application::turn_control::TURN_CONTROL_REDACTION_NONE
+        );
+
+        let events = store
+            .list_turn_control_events(&TurnControlAuditEventListFilter {
+                actor_principal: Some("user:ops".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: Some(run_id.to_owned()),
+                target_kind: Some("run".to_owned()),
+                target_id: Some(run_id.to_owned()),
+                limit: 10,
+            })
+            .expect("turn control events should list");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event.event_id);
+
+        let guard = store.connection.lock().expect("connection lock should not be poisoned");
+        let update_error = guard
+            .execute(
+                "UPDATE turn_control_events SET outcome = 'tampered' WHERE event_ulid = ?1",
+                params![event.event_id],
+            )
+            .expect_err("turn control events must be append-only");
+        assert!(update_error.to_string().contains("append-only"));
     }
 
     #[test]

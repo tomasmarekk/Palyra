@@ -37,6 +37,7 @@
     "runtime_roadmap",
     "runtime_watchdog",
     "skills",
+    "turn_control",
     "verification",
     "webhooks"
   ],

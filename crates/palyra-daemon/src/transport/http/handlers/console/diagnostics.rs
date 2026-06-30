@@ -147,6 +147,9 @@ pub(crate) async fn console_diagnostics_handler(
     let mut progress_drafts_payload =
         collect_console_progress_draft_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut progress_drafts_payload, None);
+    let mut turn_control_payload =
+        collect_console_turn_control_diagnostics(&state, &session.context).await?;
+    redact_console_diagnostics_value(&mut turn_control_payload, None);
     let mut delegation_payload = collect_console_delegation_diagnostics(&state, &session.context)
         .await
         .map_err(runtime_status_response)?;
@@ -297,6 +300,7 @@ pub(crate) async fn console_diagnostics_handler(
         "flows": flows_payload,
         "agent_plan": agent_plan_payload,
         "progress_drafts": progress_drafts_payload,
+        "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,
@@ -1657,6 +1661,60 @@ async fn collect_console_progress_draft_diagnostics(
 
 fn is_terminal_progress_draft_state_for_console(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "cancelled")
+}
+
+/// Summarizes turn-control capabilities and recent audit decisions.
+#[allow(clippy::result_large_err)]
+async fn collect_console_turn_control_diagnostics(
+    state: &AppState,
+    context: &crate::gateway::RequestContext,
+) -> Result<Value, Response> {
+    let events = state
+        .runtime
+        .list_turn_control_events(crate::journal::TurnControlAuditEventListFilter {
+            actor_principal: Some(context.principal.clone()),
+            session_id: None,
+            run_id: None,
+            target_kind: None,
+            target_id: None,
+            limit: 20,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let recent = events
+        .into_iter()
+        .map(|event| {
+            json!({
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "operation": event.operation,
+                "target_kind": event.target_kind,
+                "target_id": event.target_id,
+                "session_id": event.session_id,
+                "run_id": event.run_id,
+                "outcome": event.outcome,
+                "reason_code": event.reason_code,
+                "redaction_level": event.redaction_level,
+                "created_at_unix_ms": event.created_at_unix_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": crate::application::turn_control::TURN_CONTROL_SCHEMA_VERSION,
+        "operations": [
+            crate::application::turn_control::TurnControlOperation::Status.as_str(),
+            crate::application::turn_control::TurnControlOperation::CancelRun.as_str(),
+            crate::application::turn_control::TurnControlOperation::PauseQueue.as_str(),
+            crate::application::turn_control::TurnControlOperation::ResumeQueue.as_str(),
+            crate::application::turn_control::TurnControlOperation::PrioritizeQueuedInput.as_str(),
+        ],
+        "audit_event_types": {
+            "started": crate::application::turn_control::TURN_CONTROL_EVENT_STARTED,
+            "completed": crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
+            "failed": crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
+        },
+        "recent": recent,
+    }))
 }
 
 /// Probes the browser service health (when enabled) and merges journal-based

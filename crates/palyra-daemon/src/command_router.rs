@@ -30,11 +30,12 @@ use ulid::Ulid;
 
 use crate::{
     app::state::AppState,
+    application::turn_control::{TurnControlOperation, TurnControlRequest},
     gateway::{self, RequestContext},
     journal::{
         self, ApprovalDecision, ApprovalDecisionScope, ApprovalResolveRequest,
         IdempotencyBeginRequest, IdempotencyCompleteRequest, IdempotencyFailRequest,
-        OrchestratorCancelRequest, OrchestratorRunStartRequest,
+        OrchestratorRunStartRequest,
     },
     realtime::{authorize_realtime_command, descriptor_for_command, RealtimeConnectionContext},
 };
@@ -243,15 +244,24 @@ async fn run_abort(
     let reason = optional_str(&envelope.params, "reason")
         .map(str::to_owned)
         .unwrap_or_else(|| "realtime_run_abort".to_owned());
-    let cancel = state
+    let outcome = state
         .runtime
-        .request_orchestrator_cancel(OrchestratorCancelRequest {
-            run_id: run.run_id.clone(),
-            reason,
+        .apply_turn_control(TurnControlRequest {
+            operation: TurnControlOperation::CancelRun,
+            actor_principal: context.request_context.principal.clone(),
+            session_id: Some(run.session_id.clone()),
+            run_id: Some(run.run_id.clone()),
+            queued_input_id: None,
+            priority_lane: None,
+            reason: Some(reason),
+            dry_run: false,
         })
         .await
         .map_err(stable_error_from_status)?;
-    Ok(json!({ "cancel": cancel }))
+    Ok(json!({
+        "cancel": outcome.effect,
+        "turn_control": outcome.decision,
+    }))
 }
 
 async fn run_get(

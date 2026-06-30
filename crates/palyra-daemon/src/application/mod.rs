@@ -38,6 +38,7 @@ pub mod tool_jobs;
 pub mod tool_registry;
 pub mod tool_runtime;
 pub mod tool_security;
+pub mod turn_control;
 pub mod verification;
 pub mod workspace_observability;
 

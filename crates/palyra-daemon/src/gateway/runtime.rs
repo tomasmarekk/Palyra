@@ -37,6 +37,10 @@ use crate::application::{
         CodeIntelRuntimeSnapshotRequest,
     },
     progress_draft::project_progress_draft_tape_event,
+    turn_control::{
+        decide_turn_control_request, TurnControlAction, TurnControlApplyOutcome,
+        TurnControlDecision, TurnControlOperation, TurnControlRequest,
+    },
 };
 use crate::journal::state_health::{
     JournalHashChainVerificationReport, JournalHashVerificationScope, JournalHealthReport,
@@ -75,10 +79,12 @@ use crate::journal::{
     SessionSearchOutcome, SessionSearchRequest, ToolJobAttachRequest, ToolJobCreateRequest,
     ToolJobRecord, ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage,
     ToolJobTailReadRequest, ToolJobTransitionRequest, ToolJobsListFilter,
-    ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest, WorkItemCreateRequest,
-    WorkItemEventRecord, WorkItemListFilter, WorkItemRecord, WorkItemUpdateRequest,
-    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
-    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
+    TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter,
+    TurnControlAuditEventRecord, WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter,
+    WorkItemRecord, WorkItemUpdateRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
+    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
+    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -124,6 +130,7 @@ use palyra_workerd::{
     WorkerFleetSnapshot, WorkerLease, WorkerLeaseRequest, WorkerLifecycleEvent,
 };
 use ring::hmac;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -5608,6 +5615,225 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("progress draft event list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn append_turn_control_event_blocking(
+        &self,
+        request: &TurnControlAuditEventAppendRequest,
+    ) -> Result<TurnControlAuditEventRecord, Status> {
+        self.journal_store
+            .append_turn_control_event(request)
+            .map_err(|error| map_orchestrator_store_error("append turn control audit event", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_turn_control_events_blocking(
+        &self,
+        filter: &TurnControlAuditEventListFilter,
+    ) -> Result<Vec<TurnControlAuditEventRecord>, Status> {
+        self.journal_store
+            .list_turn_control_events(filter)
+            .map_err(|error| map_orchestrator_store_error("list turn control audit events", error))
+    }
+
+    /// Lists recent turn-control audit events.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_turn_control_events(
+        self: &Arc<Self>,
+        filter: TurnControlAuditEventListFilter,
+    ) -> Result<Vec<TurnControlAuditEventRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_turn_control_events_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("turn control audit list worker panicked"))?
+    }
+
+    /// Applies a basic turn-control operation through the existing runtime surfaces.
+    ///
+    /// # Errors
+    /// Returns the mapped journal/runtime error. Audit `started` is fail-closed
+    /// for accepted mutating operations so a control action never happens
+    /// without a durable decision record.
+    #[allow(clippy::result_large_err)]
+    pub async fn apply_turn_control(
+        self: &Arc<Self>,
+        request: TurnControlRequest,
+    ) -> Result<TurnControlApplyOutcome, Status> {
+        let decision = decide_turn_control_request(&request);
+        if !decision.accepted {
+            self.record_turn_control_decision_event(
+                &request,
+                &decision,
+                crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
+                "failed",
+            )
+            .await?;
+            return Ok(TurnControlApplyOutcome { decision, effect: json!({"accepted": false}) });
+        }
+
+        self.record_turn_control_decision_event(
+            &request,
+            &decision,
+            crate::application::turn_control::TURN_CONTROL_EVENT_STARTED,
+            "started",
+        )
+        .await?;
+        let effect = if request.dry_run {
+            json!({"dry_run": true})
+        } else {
+            self.apply_turn_control_effect(&request, &decision).await?
+        };
+        self.record_turn_control_decision_event(
+            &request,
+            &decision,
+            crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
+            "completed",
+        )
+        .await?;
+        Ok(TurnControlApplyOutcome { decision, effect })
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn apply_turn_control_effect(
+        self: &Arc<Self>,
+        request: &TurnControlRequest,
+        decision: &TurnControlDecision,
+    ) -> Result<Value, Status> {
+        match decision.action {
+            TurnControlAction::Observe => self.turn_control_status_effect(request).await,
+            TurnControlAction::RequestRunCancel => {
+                let run_id = decision.target_id.as_deref().ok_or_else(|| {
+                    Status::invalid_argument("turn control cancel decision missing run id")
+                })?;
+                let cancel = self
+                    .request_orchestrator_cancel(OrchestratorCancelRequest {
+                        run_id: run_id.to_owned(),
+                        reason: request
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| decision.reason_code.clone()),
+                    })
+                    .await?;
+                serde_json::to_value(cancel).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to serialize turn control cancel effect: {error}"
+                    ))
+                })
+            }
+            TurnControlAction::SetQueuePaused => {
+                let session_id = decision.target_id.as_deref().ok_or_else(|| {
+                    Status::invalid_argument("turn control queue decision missing session id")
+                })?;
+                let paused = request.operation == TurnControlOperation::PauseQueue;
+                let control = self
+                    .upsert_orchestrator_session_queue_control(
+                        OrchestratorSessionQueueControlUpdateRequest {
+                            session_id: session_id.to_owned(),
+                            paused,
+                            pause_reason: paused.then(|| {
+                                request
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| decision.reason_code.clone())
+                            }),
+                        },
+                    )
+                    .await?;
+                serde_json::to_value(control).map_err(|error| {
+                    Status::internal(format!(
+                        "failed to serialize turn control queue effect: {error}"
+                    ))
+                })
+            }
+            TurnControlAction::SetQueuedInputPriority => {
+                let queued_input_id = decision.target_id.as_deref().ok_or_else(|| {
+                    Status::invalid_argument(
+                        "turn control priority decision missing queued input id",
+                    )
+                })?;
+                let priority_lane = request
+                    .priority_lane
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Status::invalid_argument("turn control priority missing priority lane")
+                    })?;
+                self.prioritize_orchestrator_queued_input(
+                    queued_input_id.to_owned(),
+                    priority_lane.to_owned(),
+                    decision.reason_code.clone(),
+                    decision.journal_projection.payload_json.clone(),
+                )
+                .await?;
+                Ok(json!({
+                    "queued_input_id": queued_input_id,
+                    "priority_lane": priority_lane,
+                    "prioritized": true,
+                }))
+            }
+            TurnControlAction::Reject => Ok(json!({"accepted": false})),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn turn_control_status_effect(
+        self: &Arc<Self>,
+        request: &TurnControlRequest,
+    ) -> Result<Value, Status> {
+        if let Some(run_id) =
+            request.run_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            let snapshot = self.orchestrator_run_status_snapshot(run_id.to_owned()).await?;
+            return serde_json::to_value(snapshot).map_err(|error| {
+                Status::internal(format!("failed to serialize turn control run status: {error}"))
+            });
+        }
+        if let Some(session_id) =
+            request.session_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            let queue_control =
+                self.get_orchestrator_session_queue_control(session_id.to_owned()).await?;
+            return serde_json::to_value(queue_control).map_err(|error| {
+                Status::internal(format!("failed to serialize turn control queue status: {error}"))
+            });
+        }
+        Ok(json!({"status": "ok"}))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn record_turn_control_decision_event(
+        self: &Arc<Self>,
+        request: &TurnControlRequest,
+        decision: &TurnControlDecision,
+        event_type: &str,
+        outcome: &str,
+    ) -> Result<TurnControlAuditEventRecord, Status> {
+        let append_request = TurnControlAuditEventAppendRequest {
+            event_id: ulid::Ulid::new().to_string(),
+            event_type: event_type.to_owned(),
+            operation: decision.operation.as_str().to_owned(),
+            actor_principal: decision.actor_principal.clone(),
+            target_kind: decision.target_kind.clone(),
+            target_id: decision.target_id.clone(),
+            session_id: request.session_id.clone(),
+            run_id: request.run_id.clone(),
+            outcome: outcome.to_owned(),
+            reason_code: decision.reason_code.clone(),
+            payload_json: decision.journal_projection.payload_json.clone(),
+            evidence_refs_json: decision.journal_projection.evidence_refs_json.clone(),
+            redaction_level: decision.journal_projection.redaction_level.clone(),
+        };
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.append_turn_control_event_blocking(&append_request)
+        })
+        .await
+        .map_err(|_| Status::internal("turn control audit append worker panicked"))?
     }
 
     /// Appends one tape event for a run and bumps the tape counter.
