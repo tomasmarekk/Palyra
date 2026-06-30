@@ -822,7 +822,10 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.channel_turn_kernel",
-      "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL"
+      "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
+      "production_path_enabled": true,
+      "rollout_gate_effective": false,
+      "ambient_context_rollout": "context_engine"
     },
     "agent_plan_state": {
       "enabled": false,
