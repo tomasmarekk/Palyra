@@ -38,8 +38,14 @@ const RUST_ANALYZER_CARGO_CHECK_COMMAND: &str = "cargo";
 const RUST_ANALYZER_CARGO_CHECK_ARGS: &[&str] =
     &["check", "--quiet", "--workspace", "--message-format=json", "--all-targets", "--keep-going"];
 const RUST_ANALYZER_ERROR_HINT_CHARS: usize = 512;
+const TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE: &str = "typescript-language-server/tsc";
+const TYPESCRIPT_TSC_COMMAND: &str = "tsc";
+const TYPESCRIPT_TSC_ARGS: &[&str] = &["--noEmit", "--pretty", "false"];
+const TYPESCRIPT_ERROR_HINT_CHARS: usize = 512;
 pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.rust.snapshot_captured";
+pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
+    "code_intel.typescript.snapshot_captured";
 
 /// Normalized diagnostic severity. Higher ranks are worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -181,48 +187,94 @@ pub(crate) async fn capture_diagnostic_snapshot_with_providers(
     if !snapshot.enabled {
         return snapshot;
     }
+    let workspace_root = configured_workspace_root(config, workspace_roots);
     let rust_files = snapshot
         .files
         .iter()
         .filter(|path| CodeIntelLanguage::from_path(path) == Some(CodeIntelLanguage::Rust))
         .cloned()
         .collect::<BTreeSet<_>>();
-    if rust_files.is_empty() || !provider_ready(&snapshot, CodeIntelLanguage::Rust) {
-        return snapshot;
-    }
-    let Some(workspace_root) = configured_workspace_root(config, workspace_roots) else {
-        mark_provider_degraded(
-            &mut snapshot,
-            CodeIntelLanguage::Rust,
-            "code_intel.workspace_root_missing",
-            "No workspace root was available for Rust diagnostics.",
-        );
-        return snapshot;
-    };
-    let provider = RustAnalyzerProvider::from_config(config);
-    match provider.capture(workspace_root.as_path(), &rust_files).await {
-        RustAnalyzerCaptureOutcome::Captured { items, truncated, reason_codes } => {
-            snapshot.items.extend(items);
-            snapshot.truncated |= truncated;
-            snapshot.degraded |= truncated;
-            snapshot.reason_codes.extend(reason_codes);
-            set_provider_status(
-                &mut snapshot,
-                CodeIntelLanguage::Rust,
-                "ready",
-                CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
-                "Rust diagnostics snapshot captured through the rust-analyzer check pipeline.",
-            );
-        }
-        RustAnalyzerCaptureOutcome::Degraded { reason_code, repair_hint } => {
+    if !rust_files.is_empty() && provider_ready(&snapshot, CodeIntelLanguage::Rust) {
+        if let Some(workspace_root) = workspace_root.as_deref() {
+            let provider = RustAnalyzerProvider::from_config(config);
+            match provider.capture(workspace_root, &rust_files).await {
+                RustAnalyzerCaptureOutcome::Captured { items, truncated, reason_codes } => {
+                    snapshot.items.extend(items);
+                    snapshot.truncated |= truncated;
+                    snapshot.degraded |= truncated;
+                    snapshot.reason_codes.extend(reason_codes);
+                    set_provider_status(
+                        &mut snapshot,
+                        CodeIntelLanguage::Rust,
+                        "ready",
+                        CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+                        "Rust diagnostics snapshot captured through the rust-analyzer check pipeline.",
+                    );
+                }
+                RustAnalyzerCaptureOutcome::Degraded { reason_code, repair_hint } => {
+                    mark_provider_degraded(
+                        &mut snapshot,
+                        CodeIntelLanguage::Rust,
+                        reason_code.as_str(),
+                        repair_hint.as_str(),
+                    );
+                }
+            }
+        } else {
             mark_provider_degraded(
                 &mut snapshot,
                 CodeIntelLanguage::Rust,
-                reason_code.as_str(),
-                repair_hint.as_str(),
+                "code_intel.workspace_root_missing",
+                "No workspace root was available for Rust diagnostics.",
             );
         }
     }
+
+    let typescript_files = snapshot
+        .files
+        .iter()
+        .filter(|path| CodeIntelLanguage::from_path(path) == Some(CodeIntelLanguage::TypeScript))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !typescript_files.is_empty() && provider_ready(&snapshot, CodeIntelLanguage::TypeScript) {
+        if let Some(workspace_root) = workspace_root.as_deref() {
+            let provider = TypescriptLanguageServerProvider::from_config(config);
+            match provider.capture(workspace_root, &typescript_files).await {
+                TypescriptCaptureOutcome::Captured { items, truncated, reason_codes } => {
+                    snapshot.items.extend(items);
+                    snapshot.truncated |= truncated;
+                    snapshot.degraded |= truncated;
+                    snapshot.reason_codes.extend(reason_codes);
+                    set_provider_status(
+                        &mut snapshot,
+                        CodeIntelLanguage::TypeScript,
+                        "ready",
+                        CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT,
+                        "TypeScript diagnostics snapshot captured through the language-server compiler diagnostics pipeline.",
+                    );
+                }
+                TypescriptCaptureOutcome::Degraded { reason_code, repair_hint } => {
+                    mark_provider_degraded(
+                        &mut snapshot,
+                        CodeIntelLanguage::TypeScript,
+                        reason_code.as_str(),
+                        repair_hint.as_str(),
+                    );
+                }
+            }
+        } else {
+            mark_provider_degraded(
+                &mut snapshot,
+                CodeIntelLanguage::TypeScript,
+                "code_intel.workspace_root_missing",
+                "No workspace root was available for TypeScript diagnostics.",
+            );
+        }
+    }
+    finish_diagnostic_snapshot(snapshot)
+}
+
+fn finish_diagnostic_snapshot(mut snapshot: DiagnosticSnapshot) -> DiagnosticSnapshot {
     snapshot.reason_codes.sort();
     snapshot.reason_codes.dedup();
     snapshot.items.sort_by(|left, right| {
@@ -648,6 +700,348 @@ impl RustAnalyzerRunError {
     }
 }
 
+/// TypeScript diagnostics provider gated by the configured language server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TypescriptLanguageServerProvider {
+    pub provider: String,
+    pub binary: String,
+    pub check_command: String,
+    pub check_args: Vec<String>,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub max_items: usize,
+    pub redaction_level: String,
+}
+
+impl TypescriptLanguageServerProvider {
+    fn from_config(config: &CodeIntelConfig) -> Self {
+        Self {
+            provider: CodeIntelLanguage::TypeScript.provider_name().to_owned(),
+            binary: config.typescript_server_binary.clone(),
+            check_command: TYPESCRIPT_TSC_COMMAND.to_owned(),
+            check_args: TYPESCRIPT_TSC_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout_ms: config.timeout_ms,
+            max_output_bytes: config.max_output_bytes,
+            max_items: config.max_items,
+            redaction_level: crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                .to_owned(),
+        }
+    }
+
+    async fn capture(
+        &self,
+        workspace_root: &Path,
+        touched_files: &BTreeSet<String>,
+    ) -> TypescriptCaptureOutcome {
+        if !executable_is_available(self.binary.as_str()) {
+            return TypescriptCaptureOutcome::degraded(
+                "code_intel.provider_missing.typescript",
+                "Install typescript-language-server or set tool_call.code_intel.typescript_server_binary to an executable path.",
+            );
+        }
+        if !workspace_root.is_dir() {
+            return TypescriptCaptureOutcome::degraded(
+                "code_intel.typescript.workspace_root_missing",
+                "TypeScript diagnostics require an existing workspace root.",
+            );
+        }
+
+        let project_roots = typescript_project_roots(workspace_root, touched_files);
+        if project_roots.is_empty() {
+            return TypescriptCaptureOutcome::degraded(
+                "code_intel.typescript.project_root_missing",
+                "No tsconfig.json, jsconfig.json, or package.json was found for touched TypeScript files.",
+            );
+        }
+
+        let mut items = Vec::new();
+        let mut truncated = false;
+        let mut failed_without_items_hint = None;
+        for project_root in project_roots {
+            let Some(check_command) =
+                resolve_typescript_check_command(project_root.as_path(), workspace_root)
+            else {
+                return TypescriptCaptureOutcome::degraded(
+                    "code_intel.typescript.tsc_missing",
+                    "Install TypeScript locally or make tsc available on PATH for language-server diagnostics.",
+                );
+            };
+            let output =
+                match self.run_tsc_no_emit(project_root.as_path(), check_command.as_path()).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let repair_hint = error.repair_hint();
+                        return TypescriptCaptureOutcome::degraded(
+                            error.reason_code(),
+                            repair_hint.as_str(),
+                        );
+                    }
+                };
+            let normalizer = TypescriptDiagnosticNormalizer {
+                workspace_root: workspace_root.to_path_buf(),
+                touched_files: touched_files.clone(),
+                max_items: self.max_items.saturating_sub(items.len()),
+            };
+            let combined_output = output.combined_output();
+            let (mut project_items, parse_truncated) =
+                normalizer.normalize_tsc_output(combined_output.as_slice());
+            truncated |= parse_truncated || output.stdout_truncated || output.stderr_truncated;
+            if project_items.is_empty() && !output.status_success {
+                failed_without_items_hint = Some(bounded_typescript_error_hint(&output));
+            }
+            items.append(&mut project_items);
+            if items.len() >= self.max_items {
+                break;
+            }
+        }
+
+        items.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.source.cmp(&right.source))
+                .then(left.message.cmp(&right.message))
+        });
+        items.dedup_by(|left, right| {
+            diagnostic_key_without_severity(left) == diagnostic_key_without_severity(right)
+        });
+        if items.is_empty() {
+            if let Some(hint) = failed_without_items_hint {
+                return TypescriptCaptureOutcome::degraded(
+                    "code_intel.typescript.tsc_failed",
+                    hint.as_str(),
+                );
+            }
+        }
+
+        let mut reason_codes = vec![CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT.to_owned()];
+        if truncated {
+            reason_codes.push("code_intel.typescript.output_truncated".to_owned());
+        }
+        TypescriptCaptureOutcome::Captured { items, truncated, reason_codes }
+    }
+
+    async fn run_tsc_no_emit(
+        &self,
+        project_root: &Path,
+        command_path: &Path,
+    ) -> Result<TypescriptProcessOutput, TypescriptRunError> {
+        let mut command = TokioCommand::new(command_path);
+        command
+            .args(TYPESCRIPT_TSC_ARGS)
+            .current_dir(project_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            TypescriptRunError::Spawn(redact_diagnostic_text(&error.to_string()))
+        })?;
+        let stdout = child.stdout.take().ok_or(TypescriptRunError::MissingPipe("stdout"))?;
+        let stderr = child.stderr.take().ok_or(TypescriptRunError::MissingPipe("stderr"))?;
+        let max_output_bytes = max_output_bytes(self.max_output_bytes);
+        let stdout_task = tokio::spawn(read_bounded_stream(stdout, max_output_bytes));
+        let stderr_task = tokio::spawn(read_bounded_stream(stderr, max_output_bytes));
+        let status = match timeout(Duration::from_millis(self.timeout_ms), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                return Err(TypescriptRunError::Wait(redact_diagnostic_text(&error.to_string())));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(TypescriptRunError::Timeout);
+            }
+        };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| {
+                TypescriptRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?
+            .map_err(|error| {
+                TypescriptRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| {
+                TypescriptRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?
+            .map_err(|error| {
+                TypescriptRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?;
+        Ok(TypescriptProcessOutput {
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            status_success: status.success(),
+        })
+    }
+}
+
+/// Normalizes TypeScript compiler diagnostics into compact LSP-style items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TypescriptDiagnosticNormalizer {
+    pub workspace_root: PathBuf,
+    pub touched_files: BTreeSet<String>,
+    pub max_items: usize,
+}
+
+impl TypescriptDiagnosticNormalizer {
+    fn normalize_tsc_output(&self, raw: &[u8]) -> (Vec<CodeDiagnostic>, bool) {
+        let mut items = Vec::new();
+        let mut truncated = false;
+        for line in String::from_utf8_lossy(raw).lines() {
+            if items.len() >= self.max_items {
+                truncated = true;
+                break;
+            }
+            let Some(item) = self.normalize_tsc_line(line) else {
+                continue;
+            };
+            items.push(item);
+        }
+        items.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.source.cmp(&right.source))
+                .then(left.message.cmp(&right.message))
+        });
+        items.dedup_by(|left, right| {
+            diagnostic_key_without_severity(left) == diagnostic_key_without_severity(right)
+        });
+        (items, truncated)
+    }
+
+    fn normalize_tsc_line(&self, line: &str) -> Option<CodeDiagnostic> {
+        let location = parse_typescript_location(line)?;
+        let path = normalize_diagnostic_path(location.path, self.workspace_root.as_path())?;
+        if !self.touched_files.contains(path.as_str()) {
+            return None;
+        }
+        let (severity, code, message) = parse_typescript_diagnostic_body(location.body)?;
+        Some(CodeDiagnostic {
+            language: CodeIntelLanguage::TypeScript,
+            path,
+            line: location.line,
+            column: location.column,
+            severity,
+            code,
+            message,
+            source: TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypescriptLocation<'a> {
+    path: &'a str,
+    line: u32,
+    column: u32,
+    body: &'a str,
+}
+
+fn parse_typescript_location(line: &str) -> Option<TypescriptLocation<'_>> {
+    let trimmed = line.trim();
+    let (location, body) = trimmed.rsplit_once("): ")?;
+    let position_start = location.rfind('(')?;
+    let path = location[..position_start].trim();
+    let position = &location[position_start + 1..];
+    let (line_raw, column_raw) = position.split_once(',')?;
+    let line = line_raw.trim().parse::<u32>().ok().filter(|value| *value > 0)?;
+    let column = column_raw.trim().parse::<u32>().ok().filter(|value| *value > 0)?;
+    Some(TypescriptLocation { path, line, column, body })
+}
+
+fn parse_typescript_diagnostic_body(
+    body: &str,
+) -> Option<(DiagnosticSeverity, Option<String>, String)> {
+    let (header, message) = body.split_once(':')?;
+    let mut header_parts = header.split_whitespace();
+    let severity = header_parts.next().map(DiagnosticSeverity::parse)?;
+    let code = header_parts
+        .find(|part| part.starts_with("TS"))
+        .map(redact_diagnostic_text)
+        .filter(|value| !value.trim().is_empty());
+    let message = redact_diagnostic_text(message);
+    let message = bound_message(message.as_str());
+    (!message.trim().is_empty()).then_some((severity, code, message))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypescriptCaptureOutcome {
+    Captured { items: Vec<CodeDiagnostic>, truncated: bool, reason_codes: Vec<String> },
+    Degraded { reason_code: String, repair_hint: String },
+}
+
+impl TypescriptCaptureOutcome {
+    fn degraded(reason_code: &str, repair_hint: &str) -> Self {
+        Self::Degraded { reason_code: reason_code.to_owned(), repair_hint: repair_hint.to_owned() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypescriptProcessOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    status_success: bool,
+}
+
+impl TypescriptProcessOutput {
+    fn combined_output(&self) -> Vec<u8> {
+        let mut output = self.stdout.clone();
+        if !self.stderr.is_empty() {
+            if !output.is_empty() {
+                output.push(b'\n');
+            }
+            output.extend_from_slice(self.stderr.as_slice());
+        }
+        output
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypescriptRunError {
+    Spawn(String),
+    MissingPipe(&'static str),
+    Timeout,
+    Wait(String),
+    Output(String),
+}
+
+impl TypescriptRunError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Spawn(_) => "code_intel.typescript.tsc_spawn_failed",
+            Self::MissingPipe(_) => "code_intel.typescript.tsc_pipe_failed",
+            Self::Timeout => "code_intel.typescript.tsc_timeout",
+            Self::Wait(_) | Self::Output(_) => "code_intel.typescript.tsc_failed",
+        }
+    }
+
+    fn repair_hint(&self) -> String {
+        match self {
+            Self::Spawn(error) => {
+                format!("Failed to start tsc for TypeScript diagnostics: {error}")
+            }
+            Self::MissingPipe(pipe) => {
+                format!("Failed to capture tsc {pipe} for TypeScript diagnostics.")
+            }
+            Self::Timeout => "TypeScript diagnostics timed out; increase tool_call.code_intel.timeout_ms or inspect typescript-language-server health.".to_owned(),
+            Self::Wait(error) | Self::Output(error) => {
+                format!("TypeScript diagnostics failed while reading tsc output: {error}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundedStreamOutput {
     bytes: Vec<u8>,
@@ -732,6 +1126,62 @@ fn bounded_error_hint(stderr: &[u8]) -> String {
     } else {
         hint
     }
+}
+
+fn bounded_typescript_error_hint(output: &TypescriptProcessOutput) -> String {
+    let combined = output.combined_output();
+    let text = String::from_utf8_lossy(combined.as_slice());
+    let redacted = redact_diagnostic_text(text.as_ref());
+    let hint = bound_message_with_limit(redacted.as_str(), TYPESCRIPT_ERROR_HINT_CHARS);
+    if hint.trim().is_empty() {
+        "TypeScript diagnostics command failed without emitting a useful output summary.".to_owned()
+    } else {
+        hint
+    }
+}
+
+fn typescript_project_roots(
+    workspace_root: &Path,
+    touched_files: &BTreeSet<String>,
+) -> BTreeSet<PathBuf> {
+    touched_files
+        .iter()
+        .filter_map(|path| nearest_typescript_project_root(workspace_root, path))
+        .collect()
+}
+
+fn nearest_typescript_project_root(workspace_root: &Path, relative_path: &str) -> Option<PathBuf> {
+    let file_path = workspace_root.join(relative_path);
+    let mut current = file_path.parent()?.to_path_buf();
+    let mut package_root = None;
+    loop {
+        if !path_is_within_root(current.as_path(), workspace_root) {
+            return None;
+        }
+        if current.join("tsconfig.json").is_file() || current.join("jsconfig.json").is_file() {
+            return Some(current);
+        }
+        if package_root.is_none() && current.join("package.json").is_file() {
+            package_root = Some(current.clone());
+        }
+        if current == workspace_root {
+            break;
+        }
+        current = current.parent()?.to_path_buf();
+    }
+    package_root
+}
+
+fn resolve_typescript_check_command(project_root: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    for root in [project_root, workspace_root] {
+        for name in executable_candidates(TYPESCRIPT_TSC_COMMAND) {
+            let candidate = root.join("node_modules").join(".bin").join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    executable_is_available(TYPESCRIPT_TSC_COMMAND).then(|| PathBuf::from(TYPESCRIPT_TSC_COMMAND))
 }
 
 /// Parses an LSP-like JSON diagnostic payload used by provider adapters and
@@ -1091,6 +1541,28 @@ mod tests {
     }
 
     #[test]
+    fn typescript_diagnostic_normalizer_filters_touched_files() {
+        let raw = b"apps/web/src/App.tsx(12,8): error TS2304: Cannot find name 'missing'.\napps/web/src/Other.ts(1,1): warning TS6133: 'unused' is declared but its value is never read.";
+        let normalizer = TypescriptDiagnosticNormalizer {
+            workspace_root: PathBuf::from("workspace"),
+            touched_files: BTreeSet::from(["apps/web/src/App.tsx".to_owned()]),
+            max_items: 8,
+        };
+
+        let (items, truncated) = normalizer.normalize_tsc_output(raw);
+
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].language, CodeIntelLanguage::TypeScript);
+        assert_eq!(items[0].path, "apps/web/src/App.tsx");
+        assert_eq!(items[0].line, 12);
+        assert_eq!(items[0].column, 8);
+        assert_eq!(items[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(items[0].code.as_deref(), Some("TS2304"));
+        assert_eq!(items[0].source, TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE);
+    }
+
+    #[test]
     fn rust_diagnostic_delta_reports_new_syntax_error() {
         let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
         let before = DiagnosticSnapshot {
@@ -1125,6 +1597,41 @@ mod tests {
         assert_eq!(delta.items[0].code.as_deref(), Some("E0425"));
     }
 
+    #[test]
+    fn typescript_diagnostic_delta_reports_new_error() {
+        let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
+        let before = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["apps/web/src/App.tsx".to_owned()],
+            provider_status: Vec::new(),
+            items: Vec::new(),
+            truncated: false,
+            degraded: false,
+            reason_codes: vec![CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT.to_owned()],
+        };
+        let after = DiagnosticSnapshot {
+            items: vec![CodeDiagnostic {
+                language: CodeIntelLanguage::TypeScript,
+                path: "apps/web/src/App.tsx".to_owned(),
+                line: 12,
+                column: 8,
+                severity: DiagnosticSeverity::Error,
+                code: Some("TS2304".to_owned()),
+                message: "Cannot find name 'missing'.".to_owned(),
+                source: TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE.to_owned(),
+            }],
+            ..before.clone()
+        };
+
+        let delta = diagnostic_delta(&config, &before, &after);
+
+        assert_eq!(delta.new_errors, 1);
+        assert_eq!(delta.items.len(), 1);
+        assert_eq!(delta.items[0].code.as_deref(), Some("TS2304"));
+    }
+
     #[tokio::test]
     async fn missing_rust_analyzer_degrades_without_failing_snapshot() {
         let config = CodeIntelConfig {
@@ -1146,6 +1653,31 @@ mod tests {
             .find(|status| status.language == CodeIntelLanguage::Rust)
             .expect("rust provider status should be present");
         assert_eq!(rust_status.status, "missing_binary");
+        assert!(snapshot.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_typescript_language_server_degrades_without_failing_snapshot() {
+        let config = CodeIntelConfig {
+            enabled: true,
+            typescript_server_binary: "palyra-typescript-language-server-missing-for-test"
+                .to_owned(),
+            ..CodeIntelConfig::default()
+        };
+
+        let snapshot = capture_diagnostic_snapshot_with_providers(
+            &config,
+            &[PathBuf::from("workspace")],
+            &[touched("apps/web/src/App.tsx")],
+        )
+        .await;
+
+        let typescript_status = snapshot
+            .provider_status
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::TypeScript)
+            .expect("typescript provider status should be present");
+        assert_eq!(typescript_status.status, "missing_binary");
         assert!(snapshot.items.is_empty());
     }
 

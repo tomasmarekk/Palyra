@@ -29,8 +29,8 @@ use ulid::Ulid;
 
 use crate::{
     application::code_intel_runtime::{
-        CodeIntelRuntimeAuditEvent, CodeIntelRuntimeSnapshot, CODE_INTEL_DIAGNOSTICS_DELTA_EVENT,
-        CODE_INTEL_REDACTION_LEVEL,
+        CodeIntelLanguage, CodeIntelRuntimeAuditEvent, CodeIntelRuntimeSnapshot,
+        CODE_INTEL_DIAGNOSTICS_DELTA_EVENT, CODE_INTEL_REDACTION_LEVEL,
     },
     application::project_facts::{
         append_project_facts_output, project_facts_journal_projection, workspace_root_ref,
@@ -350,13 +350,28 @@ pub(super) async fn execute_workspace_patch_mutation(
         code_intel_runtime.audit_events.as_slice(),
     )
     .await;
-    record_code_intel_rust_snapshot_journal_event(
+    record_code_intel_language_snapshot_journal_event(
         runtime_state,
         principal,
         device_id,
         channel,
         session_id,
         run_id,
+        CodeIntelLanguage::Rust,
+        code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+        &diagnostic_after,
+        code_intel_evidence_refs.as_slice(),
+    )
+    .await;
+    record_code_intel_language_snapshot_journal_event(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        CodeIntelLanguage::TypeScript,
+        code_intel::CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT,
         &diagnostic_after,
         code_intel_evidence_refs.as_slice(),
     )
@@ -699,43 +714,30 @@ async fn record_code_intel_runtime_journal_events(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_code_intel_rust_snapshot_journal_event(
+async fn record_code_intel_language_snapshot_journal_event(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
     device_id: &str,
     channel: Option<&str>,
     session_id: &str,
     run_id: &str,
+    language: CodeIntelLanguage,
+    event_type: &str,
     snapshot: &code_intel::DiagnosticSnapshot,
     evidence_refs: &[String],
 ) {
-    if !snapshot
-        .reason_codes
-        .iter()
-        .any(|code| code == code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT)
-    {
+    if !snapshot.reason_codes.iter().any(|code| code == event_type) {
         return;
     }
-    let rust_provider_status = snapshot
-        .provider_status
-        .iter()
-        .find(|status| {
-            status.language == crate::application::code_intel_runtime::CodeIntelLanguage::Rust
-        })
-        .map(|status| {
+    let provider_status =
+        snapshot.provider_status.iter().find(|status| status.language == language).map(|status| {
             json!({
                 "provider": status.provider.as_str(),
                 "status": status.status.as_str(),
                 "reason_code": status.reason_code.as_str(),
             })
         });
-    let rust_items_count = snapshot
-        .items
-        .iter()
-        .filter(|item| {
-            item.language == crate::application::code_intel_runtime::CodeIntelLanguage::Rust
-        })
-        .count();
+    let items_count = snapshot.items.iter().filter(|item| item.language == language).count();
     record_code_intel_journal_payload(
         runtime_state,
         principal,
@@ -745,16 +747,17 @@ async fn record_code_intel_rust_snapshot_journal_event(
         run_id,
         current_unix_ms(),
         json!({
-            "event": code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+            "event": event_type,
             "schema_version": snapshot.schema_version,
             "session_id": session_id,
             "run_id": run_id,
+            "language": language,
             "workspace_root": snapshot.workspace_root.as_deref(),
-            "items_count": rust_items_count,
+            "items_count": items_count,
             "truncated": snapshot.truncated,
             "degraded": snapshot.degraded,
             "reason_codes": snapshot.reason_codes.as_slice(),
-            "provider_status": rust_provider_status,
+            "provider_status": provider_status,
             "evidence_refs": evidence_refs,
             "redaction_level": CODE_INTEL_REDACTION_LEVEL,
         }),
