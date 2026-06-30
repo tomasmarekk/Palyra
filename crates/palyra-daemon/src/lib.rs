@@ -47,6 +47,9 @@ pub(crate) mod test_env {
     }
 }
 
+#[cfg(test)]
+mod planning_objective_regressions;
+
 mod acceptance;
 mod access_control;
 mod acp;
