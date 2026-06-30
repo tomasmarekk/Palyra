@@ -28,6 +28,7 @@ pub mod runtime_contracts;
 pub mod runtime_preview;
 pub mod runtime_roadmap;
 pub mod secret_refs;
+pub mod security_posture;
 pub mod tool_catalog;
 pub mod versioned_json;
 mod webhook;
