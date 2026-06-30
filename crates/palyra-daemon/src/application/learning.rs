@@ -69,6 +69,541 @@ const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 pub(crate) const LEARNING_CURATOR_EVENT_REPORT_CREATED: &str = "learning.curator.report_created";
 const LEARNING_CURATOR_SCHEMA_VERSION: u64 = 1;
 const LEARNING_CURATOR_REDACTION_LEVEL: &str = "metadata_only";
+const LEARNING_AUDIT_METADATA_REDACTION_LEVEL: &str = "metadata_only";
+const LEARNING_MODEL_CONTEXT_TRUST_LABEL: &str = "historical_reference";
+const LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY: &str = "none";
+pub(crate) const SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED: &str =
+    "skill_invocation_hygiene_pro_learning_pipeline.completed";
+const SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION: u64 = 1;
+pub(crate) const CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_EVENT_COMPLETED: &str =
+    "cache_aware_background_learning_review.completed";
+const CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_SCHEMA_VERSION: u64 = 1;
+pub(crate) const PREFERENCE_PROCEDURE_CONFLICT_REPORT_EVENT_COMPLETED: &str =
+    "preference_a_procedure_conflict_reports.completed";
+const PREFERENCE_PROCEDURE_CONFLICT_REPORT_SCHEMA_VERSION: u64 = 1;
+
+/// Candidate-local input for the skill invocation hygiene projection.
+pub(crate) struct SkillInvocationHygieneInput<'a> {
+    pub candidate_kind: &'a str,
+    pub status: &'a str,
+    pub risk_level: &'a str,
+    pub content: &'a Value,
+    pub provenance: &'a Value,
+}
+
+/// Policy decision for a learning candidate that may alter skill or procedure behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SkillInvocationHygieneDecision {
+    NotApplicable,
+    ReviewRequired,
+    Rejected,
+}
+
+/// Stable reason code for skill invocation hygiene decisions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SkillInvocationHygieneReasonCode {
+    #[serde(rename = "skill_invocation_hygiene.non_skill_learning_candidate")]
+    NonSkillLearningCandidate,
+    #[serde(rename = "skill_invocation_hygiene.proposal_only")]
+    ProposalOnly,
+    #[serde(rename = "skill_invocation_hygiene.eval_gate_required")]
+    EvalGateRequired,
+    #[serde(rename = "skill_invocation_hygiene.operator_review_gate_required")]
+    OperatorReviewGateRequired,
+    #[serde(rename = "skill_invocation_hygiene.signed_artifact_gate_required")]
+    SignedArtifactGateRequired,
+    #[serde(rename = "skill_invocation_hygiene.workspace_patch_validated")]
+    WorkspacePatchValidated,
+    #[serde(rename = "skill_invocation_hygiene.invalid_candidate_content")]
+    InvalidCandidateContent,
+    #[serde(rename = "skill_invocation_hygiene.missing_proposal_only")]
+    MissingProposalOnly,
+    #[serde(rename = "skill_invocation_hygiene.missing_eval_gate")]
+    MissingEvalGate,
+    #[serde(rename = "skill_invocation_hygiene.missing_operator_review_gate")]
+    MissingOperatorReviewGate,
+    #[serde(rename = "skill_invocation_hygiene.missing_signed_artifact_gate")]
+    MissingSignedArtifactGate,
+    #[serde(rename = "skill_invocation_hygiene.missing_workspace_patch_validation")]
+    MissingWorkspacePatchValidation,
+    #[serde(rename = "skill_invocation_hygiene.poisoned_context")]
+    PoisonedContext,
+}
+
+/// Observe-only audit projection that proves skill/procedure learning remains proposal-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SkillInvocationHygieneProjection {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: SkillInvocationHygieneDecision,
+    pub reason_codes: Vec<SkillInvocationHygieneReasonCode>,
+    pub candidate_kind: String,
+    pub status: String,
+    pub risk_level: String,
+    pub required_gates: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+    pub trust_label: String,
+    pub instruction_authority: String,
+    pub raw_context_included: bool,
+}
+
+/// Input for the cache-aware background learning review projection.
+pub(crate) struct CacheAwareBackgroundLearningReviewInput<'a> {
+    pub run_id: &'a str,
+    pub source_task_id: &'a str,
+    pub max_candidates_per_run: usize,
+    pub candidates: &'a [LearningCandidateCreateRequest],
+}
+
+/// Cache review decision for one post-run reflection batch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CacheAwareBackgroundLearningReviewDecision {
+    NoCandidates,
+    Ready,
+    Truncated,
+}
+
+/// Stable reason code for cache-aware background learning review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum CacheAwareBackgroundLearningReviewReasonCode {
+    #[serde(rename = "cache_aware_background_learning_review.no_candidates")]
+    NoCandidates,
+    #[serde(rename = "cache_aware_background_learning_review.within_candidate_budget")]
+    WithinCandidateBudget,
+    #[serde(rename = "cache_aware_background_learning_review.max_candidate_budget_exceeded")]
+    MaxCandidateBudgetExceeded,
+    #[serde(rename = "cache_aware_background_learning_review.duplicate_cache_keys_observed")]
+    DuplicateCacheKeysObserved,
+    #[serde(rename = "cache_aware_background_learning_review.suppressed_candidates_present")]
+    SuppressedCandidatesPresent,
+}
+
+/// Observe-only batch review recorded in the reflection task payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CacheAwareBackgroundLearningReviewReport {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: CacheAwareBackgroundLearningReviewDecision,
+    pub reason_codes: Vec<CacheAwareBackgroundLearningReviewReasonCode>,
+    pub run_id: String,
+    pub source_task_id: String,
+    pub candidate_count: u64,
+    pub selected_count: u64,
+    pub skipped_count: u64,
+    pub suppressed_count: u64,
+    pub duplicate_cache_key_count: u64,
+    pub cache_key_hashes: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Decision for the preference/procedure conflict report derived from curator findings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PreferenceProcedureConflictDecision {
+    NoConflicts,
+    ConflictsDetected,
+}
+
+/// Conflict report finding class.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PreferenceProcedureConflictKind {
+    Preference,
+    Procedure,
+}
+
+/// Stable reason code for preference/procedure conflict report entries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PreferenceProcedureConflictReasonCode {
+    #[serde(rename = "preference_procedure_conflict.no_conflicts")]
+    NoConflicts,
+    #[serde(rename = "preference_procedure_conflict.preference_conflict_detected")]
+    PreferenceConflictDetected,
+    #[serde(rename = "preference_procedure_conflict.procedure_merge_suggested")]
+    ProcedureMergeSuggested,
+}
+
+/// One conflict selected out of the broader learning curator report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreferenceProcedureConflictFinding {
+    pub conflict_id: String,
+    pub conflict_kind: PreferenceProcedureConflictKind,
+    pub reason_code: PreferenceProcedureConflictReasonCode,
+    pub severity: String,
+    pub source_finding_id: String,
+    pub candidate_ids: Vec<String>,
+    pub preference_ids: Vec<String>,
+    pub key: Option<String>,
+    pub value_hashes: Vec<String>,
+    pub suggested_action: String,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Operator-facing conflict report for preferences and procedures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreferenceProcedureConflictReport {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: PreferenceProcedureConflictDecision,
+    pub reason_codes: Vec<PreferenceProcedureConflictReasonCode>,
+    pub conflict_count: u64,
+    pub preference_conflict_count: u64,
+    pub procedure_conflict_count: u64,
+    pub conflicts: Vec<PreferenceProcedureConflictFinding>,
+    pub redaction_level: String,
+}
+
+/// Projects whether a learning candidate can only influence skills through
+/// proposal, eval, and operator-review gates. It is observe-only metadata;
+/// activation is still enforced by the existing apply path.
+pub(crate) fn project_skill_invocation_hygiene(
+    input: SkillInvocationHygieneInput<'_>,
+) -> SkillInvocationHygieneProjection {
+    let required_gates =
+        json_pointer_string_array(input.content, "/self_improvement/required_gates");
+    let mut evidence_refs =
+        json_pointer_string_array(input.content, "/self_improvement/source_refs");
+    if let Some(proposal_id) =
+        input.content.pointer("/source_tool/proposal_id").and_then(Value::as_str)
+    {
+        evidence_refs.push(format!("tool_proposal:{proposal_id}"));
+    }
+    if input.provenance.as_array().is_some_and(|items| !items.is_empty()) {
+        evidence_refs.push("learning_candidate.provenance".to_owned());
+    }
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    if !matches!(input.candidate_kind, PATCH_SKILL_CANDIDATE_KIND | PATCH_PROCEDURE_CANDIDATE_KIND)
+    {
+        return SkillInvocationHygieneProjection {
+            schema_version: SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION,
+            event_type: SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED.to_owned(),
+            decision: SkillInvocationHygieneDecision::NotApplicable,
+            reason_codes: vec![SkillInvocationHygieneReasonCode::NonSkillLearningCandidate],
+            candidate_kind: input.candidate_kind.to_owned(),
+            status: input.status.to_owned(),
+            risk_level: input.risk_level.to_owned(),
+            required_gates,
+            evidence_refs,
+            redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+            trust_label: LEARNING_MODEL_CONTEXT_TRUST_LABEL.to_owned(),
+            instruction_authority: LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY.to_owned(),
+            raw_context_included: false,
+        };
+    }
+
+    let mut reason_codes = BTreeSet::new();
+    let proposal_only =
+        input.content.pointer("/self_improvement/activation_state").and_then(Value::as_str)
+            == Some("proposal_only");
+    if proposal_only {
+        reason_codes.insert(SkillInvocationHygieneReasonCode::ProposalOnly);
+    } else {
+        reason_codes.insert(SkillInvocationHygieneReasonCode::MissingProposalOnly);
+    }
+
+    for (gate, present_code, missing_code) in [
+        (
+            "eval",
+            SkillInvocationHygieneReasonCode::EvalGateRequired,
+            SkillInvocationHygieneReasonCode::MissingEvalGate,
+        ),
+        (
+            "operator_review",
+            SkillInvocationHygieneReasonCode::OperatorReviewGateRequired,
+            SkillInvocationHygieneReasonCode::MissingOperatorReviewGate,
+        ),
+        (
+            "signed_artifact",
+            SkillInvocationHygieneReasonCode::SignedArtifactGateRequired,
+            SkillInvocationHygieneReasonCode::MissingSignedArtifactGate,
+        ),
+    ] {
+        if required_gates.iter().any(|required_gate| required_gate == gate) {
+            reason_codes.insert(present_code);
+        } else {
+            reason_codes.insert(missing_code);
+        }
+    }
+
+    let patch_validated = input
+        .content
+        .pointer("/patch/validation/validated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if patch_validated {
+        reason_codes.insert(SkillInvocationHygieneReasonCode::WorkspacePatchValidated);
+    } else {
+        reason_codes.insert(SkillInvocationHygieneReasonCode::MissingWorkspacePatchValidation);
+    }
+
+    if input.risk_level.eq_ignore_ascii_case("poisoned")
+        || input
+            .content
+            .pointer("/reasoning/poison_reasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| !reasons.is_empty())
+    {
+        reason_codes.insert(SkillInvocationHygieneReasonCode::PoisonedContext);
+    }
+
+    let decision = if reason_codes.iter().any(skill_invocation_hygiene_reason_is_rejection) {
+        SkillInvocationHygieneDecision::Rejected
+    } else {
+        SkillInvocationHygieneDecision::ReviewRequired
+    };
+
+    SkillInvocationHygieneProjection {
+        schema_version: SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION,
+        event_type: SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED.to_owned(),
+        decision,
+        reason_codes: reason_codes.into_iter().collect(),
+        candidate_kind: input.candidate_kind.to_owned(),
+        status: input.status.to_owned(),
+        risk_level: input.risk_level.to_owned(),
+        required_gates,
+        evidence_refs,
+        redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+        trust_label: LEARNING_MODEL_CONTEXT_TRUST_LABEL.to_owned(),
+        instruction_authority: LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY.to_owned(),
+        raw_context_included: false,
+    }
+}
+
+/// Convenience wrapper for stored candidates; invalid JSON fails closed only
+/// for skill/procedure candidates and stays not-applicable for other kinds.
+pub(crate) fn project_skill_invocation_hygiene_for_candidate(
+    candidate: &LearningCandidateRecord,
+) -> SkillInvocationHygieneProjection {
+    match serde_json::from_str::<Value>(candidate.content_json.as_str()) {
+        Ok(content) => {
+            let provenance = serde_json::from_str::<Value>(candidate.provenance_json.as_str())
+                .unwrap_or_else(|_| json!([]));
+            project_skill_invocation_hygiene(SkillInvocationHygieneInput {
+                candidate_kind: candidate.candidate_kind.as_str(),
+                status: candidate.status.as_str(),
+                risk_level: candidate.risk_level.as_str(),
+                content: &content,
+                provenance: &provenance,
+            })
+        }
+        Err(_)
+            if matches!(
+                candidate.candidate_kind.as_str(),
+                PATCH_SKILL_CANDIDATE_KIND | PATCH_PROCEDURE_CANDIDATE_KIND
+            ) =>
+        {
+            SkillInvocationHygieneProjection {
+                schema_version: SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION,
+                event_type: SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED.to_owned(),
+                decision: SkillInvocationHygieneDecision::Rejected,
+                reason_codes: vec![SkillInvocationHygieneReasonCode::InvalidCandidateContent],
+                candidate_kind: candidate.candidate_kind.clone(),
+                status: candidate.status.clone(),
+                risk_level: candidate.risk_level.clone(),
+                required_gates: Vec::new(),
+                evidence_refs: vec![format!("learning_candidate:{}", candidate.candidate_id)],
+                redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+                trust_label: LEARNING_MODEL_CONTEXT_TRUST_LABEL.to_owned(),
+                instruction_authority: LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY.to_owned(),
+                raw_context_included: false,
+            }
+        }
+        Err(_) => SkillInvocationHygieneProjection {
+            schema_version: SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION,
+            event_type: SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED.to_owned(),
+            decision: SkillInvocationHygieneDecision::NotApplicable,
+            reason_codes: vec![SkillInvocationHygieneReasonCode::NonSkillLearningCandidate],
+            candidate_kind: candidate.candidate_kind.clone(),
+            status: candidate.status.clone(),
+            risk_level: candidate.risk_level.clone(),
+            required_gates: Vec::new(),
+            evidence_refs: vec![format!("learning_candidate:{}", candidate.candidate_id)],
+            redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+            trust_label: LEARNING_MODEL_CONTEXT_TRUST_LABEL.to_owned(),
+            instruction_authority: LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY.to_owned(),
+            raw_context_included: false,
+        },
+    }
+}
+
+/// Reviews the reflection batch before persistence so replay can distinguish
+/// candidate-budget truncation from dedupe/cache reuse.
+pub(crate) fn review_background_learning_cache(
+    input: CacheAwareBackgroundLearningReviewInput<'_>,
+) -> CacheAwareBackgroundLearningReviewReport {
+    let selected_count = input.candidates.len().min(input.max_candidates_per_run);
+    let skipped_count = input.candidates.len().saturating_sub(selected_count);
+    let suppressed_count =
+        input.candidates.iter().filter(|candidate| candidate.status == "suppressed").count();
+    let mut cache_key_counts = BTreeMap::<String, usize>::new();
+    for candidate in input.candidates {
+        *cache_key_counts.entry(candidate.dedupe_key.clone()).or_insert(0) += 1;
+    }
+    let duplicate_cache_key_count = cache_key_counts
+        .values()
+        .filter(|count| **count > 1)
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    let mut cache_key_hashes =
+        cache_key_counts.keys().map(|key| crate::sha256_hex(key.as_bytes())).collect::<Vec<_>>();
+    cache_key_hashes.sort();
+
+    let decision = if input.candidates.is_empty() {
+        CacheAwareBackgroundLearningReviewDecision::NoCandidates
+    } else if skipped_count > 0 {
+        CacheAwareBackgroundLearningReviewDecision::Truncated
+    } else {
+        CacheAwareBackgroundLearningReviewDecision::Ready
+    };
+    let mut reason_codes = Vec::new();
+    if input.candidates.is_empty() {
+        reason_codes.push(CacheAwareBackgroundLearningReviewReasonCode::NoCandidates);
+    } else if skipped_count > 0 {
+        reason_codes.push(CacheAwareBackgroundLearningReviewReasonCode::MaxCandidateBudgetExceeded);
+    } else {
+        reason_codes.push(CacheAwareBackgroundLearningReviewReasonCode::WithinCandidateBudget);
+    }
+    if duplicate_cache_key_count > 0 {
+        reason_codes.push(CacheAwareBackgroundLearningReviewReasonCode::DuplicateCacheKeysObserved);
+    }
+    if suppressed_count > 0 {
+        reason_codes
+            .push(CacheAwareBackgroundLearningReviewReasonCode::SuppressedCandidatesPresent);
+    }
+
+    CacheAwareBackgroundLearningReviewReport {
+        schema_version: CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_SCHEMA_VERSION,
+        event_type: CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_EVENT_COMPLETED.to_owned(),
+        decision,
+        reason_codes,
+        run_id: input.run_id.to_owned(),
+        source_task_id: input.source_task_id.to_owned(),
+        candidate_count: input.candidates.len() as u64,
+        selected_count: selected_count as u64,
+        skipped_count: skipped_count as u64,
+        suppressed_count: suppressed_count as u64,
+        duplicate_cache_key_count: duplicate_cache_key_count as u64,
+        cache_key_hashes,
+        evidence_refs: vec![
+            format!("run:{}", input.run_id),
+            format!("background_task:{}", input.source_task_id),
+        ],
+        redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+/// Builds the focused preference/procedure conflict report from the broader curator output.
+pub(crate) fn preference_procedure_conflict_report(
+    curator_report: &LearningCuratorReport,
+) -> PreferenceProcedureConflictReport {
+    let mut conflicts = Vec::new();
+    for finding in &curator_report.findings {
+        let Some((conflict_kind, reason_code)) = preference_procedure_conflict_kind(finding) else {
+            continue;
+        };
+        conflicts.push(PreferenceProcedureConflictFinding {
+            conflict_id: finding.finding_id.clone(),
+            conflict_kind,
+            reason_code,
+            severity: finding.severity.clone(),
+            source_finding_id: finding.finding_id.clone(),
+            candidate_ids: finding.candidate_ids.clone(),
+            preference_ids: finding.preference_ids.clone(),
+            key: finding.key.clone(),
+            value_hashes: finding.value_hashes.clone(),
+            suggested_action: finding.suggested_action.clone(),
+            evidence_refs: finding.evidence_refs.clone(),
+            redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+        });
+    }
+    let preference_conflict_count = conflicts
+        .iter()
+        .filter(|conflict| conflict.conflict_kind == PreferenceProcedureConflictKind::Preference)
+        .count() as u64;
+    let procedure_conflict_count = conflicts
+        .iter()
+        .filter(|conflict| conflict.conflict_kind == PreferenceProcedureConflictKind::Procedure)
+        .count() as u64;
+    let mut reason_codes = BTreeSet::new();
+    if preference_conflict_count > 0 {
+        reason_codes.insert(PreferenceProcedureConflictReasonCode::PreferenceConflictDetected);
+    }
+    if procedure_conflict_count > 0 {
+        reason_codes.insert(PreferenceProcedureConflictReasonCode::ProcedureMergeSuggested);
+    }
+    if reason_codes.is_empty() {
+        reason_codes.insert(PreferenceProcedureConflictReasonCode::NoConflicts);
+    }
+
+    PreferenceProcedureConflictReport {
+        schema_version: PREFERENCE_PROCEDURE_CONFLICT_REPORT_SCHEMA_VERSION,
+        event_type: PREFERENCE_PROCEDURE_CONFLICT_REPORT_EVENT_COMPLETED.to_owned(),
+        decision: if conflicts.is_empty() {
+            PreferenceProcedureConflictDecision::NoConflicts
+        } else {
+            PreferenceProcedureConflictDecision::ConflictsDetected
+        },
+        reason_codes: reason_codes.into_iter().collect(),
+        conflict_count: conflicts.len() as u64,
+        preference_conflict_count,
+        procedure_conflict_count,
+        conflicts,
+        redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn skill_invocation_hygiene_reason_is_rejection(reason: &SkillInvocationHygieneReasonCode) -> bool {
+    matches!(
+        reason,
+        SkillInvocationHygieneReasonCode::InvalidCandidateContent
+            | SkillInvocationHygieneReasonCode::MissingProposalOnly
+            | SkillInvocationHygieneReasonCode::MissingEvalGate
+            | SkillInvocationHygieneReasonCode::MissingOperatorReviewGate
+            | SkillInvocationHygieneReasonCode::MissingSignedArtifactGate
+            | SkillInvocationHygieneReasonCode::MissingWorkspacePatchValidation
+            | SkillInvocationHygieneReasonCode::PoisonedContext
+    )
+}
+
+fn preference_procedure_conflict_kind(
+    finding: &LearningCuratorFinding,
+) -> Option<(PreferenceProcedureConflictKind, PreferenceProcedureConflictReasonCode)> {
+    match finding.finding_kind {
+        LearningCuratorFindingKind::PreferenceConflict => Some((
+            PreferenceProcedureConflictKind::Preference,
+            PreferenceProcedureConflictReasonCode::PreferenceConflictDetected,
+        )),
+        LearningCuratorFindingKind::ProcedureMerge => Some((
+            PreferenceProcedureConflictKind::Procedure,
+            PreferenceProcedureConflictReasonCode::ProcedureMergeSuggested,
+        )),
+        LearningCuratorFindingKind::DuplicateCandidate
+        | LearningCuratorFindingKind::StaleCandidate => None,
+    }
+}
+
+fn json_pointer_string_array(content: &Value, pointer: &str) -> Vec<String> {
+    let mut values = content
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
 
 /// Observe-only curator over learning candidates and active preferences.
 #[derive(Debug, Default, Clone, Copy)]
@@ -713,6 +1248,12 @@ pub(crate) async fn process_post_run_reflection_task(
         &learning_config,
         transcript.as_slice(),
     ));
+    let cache_review = review_background_learning_cache(CacheAwareBackgroundLearningReviewInput {
+        run_id: parent_run_id.as_str(),
+        source_task_id: task.task_id.as_str(),
+        max_candidates_per_run: learning_config.max_candidates_per_run,
+        candidates: candidates.as_slice(),
+    });
 
     let mut created = Vec::new();
     let mut auto_applied = Vec::new();
@@ -767,6 +1308,7 @@ pub(crate) async fn process_post_run_reflection_task(
         "auto_applied_count": auto_applied.len(),
         "candidate_ids": created.iter().map(|candidate| candidate.candidate_id.clone()).collect::<Vec<_>>(),
         "auto_applied_ids": auto_applied,
+        "cache_review": cache_review,
         "blocked_reason": plan.blocked_reason,
     }))
 }
@@ -1617,7 +2159,7 @@ fn build_patch_candidates(
             },
         );
         let limits = WorkspacePatchLimits::default();
-        let content_json = json!({
+        let mut content = json!({
             "proposal_type": candidate_kind,
             "source_tool": {
                 "proposal_id": proposal.proposal_id,
@@ -1667,8 +2209,22 @@ fn build_patch_candidates(
                 },
             },
             "self_improvement": self_improvement,
-        })
-        .to_string();
+        });
+        let provenance = json!([proposal.provenance.clone(), result.provenance.clone()]);
+        let hygiene = project_skill_invocation_hygiene(SkillInvocationHygieneInput {
+            candidate_kind,
+            status: status.as_str(),
+            risk_level: risk_level.as_str(),
+            content: &content,
+            provenance: &provenance,
+        });
+        if let Some(content) = content.as_object_mut() {
+            content.insert(
+                "skill_invocation_hygiene".to_owned(),
+                serde_json::to_value(&hygiene).unwrap_or_else(|_| json!({})),
+            );
+        }
+        let content_json = content.to_string();
         // `proposal` is owned and not used past this point, so its provenance
         // moves instead of cloning.
         let mut provenance = vec![proposal.provenance, result.provenance.clone()];
@@ -2856,6 +3412,35 @@ mod tests {
         }
     }
 
+    fn learning_candidate_create_request(
+        candidate_id: &str,
+        dedupe_key: &str,
+        status: &str,
+    ) -> LearningCandidateCreateRequest {
+        LearningCandidateCreateRequest {
+            candidate_id: candidate_id.to_owned(),
+            candidate_kind: "preference".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FD2".to_owned(),
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FD1".to_owned()),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "dev-01".to_owned(),
+            channel: Some("cli".to_owned()),
+            scope_kind: "profile".to_owned(),
+            scope_id: "user:ops".to_owned(),
+            status: status.to_owned(),
+            auto_applied: false,
+            confidence: 0.84,
+            risk_level: "normal".to_owned(),
+            title: "Preference fixture".to_owned(),
+            summary: "Cache fixture".to_owned(),
+            target_path: None,
+            dedupe_key: dedupe_key.to_owned(),
+            content_json: "{}".to_owned(),
+            provenance_json: "[]".to_owned(),
+            source_task_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FT1".to_owned()),
+        }
+    }
+
     #[test]
     fn memory_eval_fixture_covers_shadow_and_safety_cases() {
         let fixture = include_str!("../../../../fixtures/memory_eval/shadow_write_cases.json");
@@ -2937,6 +3522,54 @@ mod tests {
         assert!(learning_sample_included("7f", 50));
         assert!(!learning_sample_included("80", 50));
         assert!(!learning_sample_included("00", 0));
+    }
+
+    #[test]
+    fn cache_aware_background_review_reports_truncation_and_cache_duplicates() {
+        let candidates = vec![
+            learning_candidate_create_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5CA1",
+                "preference:a",
+                "queued",
+            ),
+            learning_candidate_create_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5CA2",
+                "preference:a",
+                "queued",
+            ),
+            learning_candidate_create_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5CA3",
+                "preference:b",
+                "suppressed",
+            ),
+        ];
+
+        let report = review_background_learning_cache(CacheAwareBackgroundLearningReviewInput {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FD1",
+            source_task_id: "01ARZ3NDEKTSV4RRFFQ69G5FT1",
+            max_candidates_per_run: 2,
+            candidates: candidates.as_slice(),
+        });
+        let serialized =
+            serde_json::to_value(&report).expect("cache review report should serialize");
+        let decoded =
+            serde_json::from_value::<CacheAwareBackgroundLearningReviewReport>(serialized)
+                .expect("cache review report should deserialize");
+
+        assert_eq!(decoded.event_type, CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_EVENT_COMPLETED);
+        assert_eq!(decoded.decision, CacheAwareBackgroundLearningReviewDecision::Truncated);
+        assert_eq!(decoded.candidate_count, 3);
+        assert_eq!(decoded.selected_count, 2);
+        assert_eq!(decoded.skipped_count, 1);
+        assert_eq!(decoded.suppressed_count, 1);
+        assert_eq!(decoded.duplicate_cache_key_count, 1);
+        assert_eq!(decoded.cache_key_hashes.len(), 2);
+        assert!(decoded
+            .reason_codes
+            .contains(&CacheAwareBackgroundLearningReviewReasonCode::MaxCandidateBudgetExceeded));
+        assert!(decoded
+            .reason_codes
+            .contains(&CacheAwareBackgroundLearningReviewReasonCode::DuplicateCacheKeysObserved));
     }
 
     #[test]
@@ -3083,6 +3716,82 @@ mod tests {
         let serialized = serde_json::to_string(&report).expect("report JSON should serialize");
         assert!(!serialized.contains("concise"));
         assert!(!serialized.contains("verbose"));
+    }
+
+    #[test]
+    fn preference_procedure_conflict_report_filters_curator_findings() {
+        let candidates = vec![
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LP4",
+                "preference",
+                "queued",
+                "preference:style:concise",
+                json!({
+                    "scope_kind": "profile",
+                    "scope_id": "user:ops",
+                    "key": "interaction.style",
+                    "value": "concise",
+                }),
+                1_700_000_000_000,
+            ),
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LP5",
+                "preference",
+                "queued",
+                "preference:style:verbose",
+                json!({
+                    "scope_kind": "profile",
+                    "scope_id": "user:ops",
+                    "key": "interaction.style",
+                    "value": "verbose",
+                }),
+                1_700_000_000_010,
+            ),
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LQ1",
+                "procedure",
+                "queued",
+                "procedure:one",
+                json!({"signature": "palyra.fs.apply_patch -> palyra.tests.run"}),
+                1_700_000_000_020,
+            ),
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LQ2",
+                "procedure",
+                "queued",
+                "procedure:two",
+                json!({"signature": "palyra.fs.apply_patch -> palyra.tests.run"}),
+                1_700_000_000_030,
+            ),
+        ];
+        let curator = LearningCurator.curate(LearningCuratorInput {
+            report_id: "01ARZ3NDEKTSV4RRFFQ69G5LR4".to_owned(),
+            generated_at_unix_ms: 1_700_000_000_100,
+            stale_after_ms: 60_000,
+            candidates: candidates.as_slice(),
+            preferences: &[],
+        });
+
+        let report = preference_procedure_conflict_report(&curator);
+        let serialized = serde_json::to_value(&report).expect("conflict report should serialize");
+        let decoded = serde_json::from_value::<PreferenceProcedureConflictReport>(serialized)
+            .expect("conflict report should deserialize");
+
+        assert_eq!(decoded.event_type, PREFERENCE_PROCEDURE_CONFLICT_REPORT_EVENT_COMPLETED);
+        assert_eq!(decoded.decision, PreferenceProcedureConflictDecision::ConflictsDetected);
+        assert_eq!(decoded.preference_conflict_count, 1);
+        assert_eq!(decoded.procedure_conflict_count, 1);
+        assert_eq!(decoded.conflict_count, 2);
+        assert!(decoded
+            .reason_codes
+            .contains(&PreferenceProcedureConflictReasonCode::PreferenceConflictDetected));
+        assert!(decoded
+            .reason_codes
+            .contains(&PreferenceProcedureConflictReasonCode::ProcedureMergeSuggested));
+        assert!(decoded
+            .conflicts
+            .iter()
+            .all(|conflict| conflict.redaction_level == LEARNING_AUDIT_METADATA_REDACTION_LEVEL));
     }
 
     #[cfg(unix)]
@@ -3551,6 +4260,62 @@ mod tests {
                 .any(|test| test.get("kind").and_then(Value::as_str) == Some("skill_eval")),
             "skill patch candidates must require generated skill eval"
         );
+        let hygiene = serde_json::from_value::<SkillInvocationHygieneProjection>(
+            content
+                .get("skill_invocation_hygiene")
+                .cloned()
+                .expect("hygiene projection should be embedded"),
+        )
+        .expect("hygiene projection should deserialize");
+        assert_eq!(hygiene.event_type, SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED);
+        assert_eq!(hygiene.decision, SkillInvocationHygieneDecision::ReviewRequired);
+        assert!(hygiene
+            .reason_codes
+            .contains(&SkillInvocationHygieneReasonCode::OperatorReviewGateRequired));
+        assert!(hygiene.reason_codes.contains(&SkillInvocationHygieneReasonCode::EvalGateRequired));
+        assert!(!hygiene.raw_context_included);
+        assert_eq!(hygiene.instruction_authority, LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY);
+    }
+
+    #[test]
+    fn skill_invocation_hygiene_rejects_missing_activation_gates() {
+        let content = json!({
+            "source_tool": {
+                "proposal_id": "patch-missing-gates",
+                "tool_name": WORKSPACE_PATCH_TOOL_NAME,
+            },
+            "patch": {
+                "validation": {
+                    "validated": false,
+                },
+            },
+            "self_improvement": {
+                "activation_state": "active",
+                "required_gates": ["operator_review"],
+                "source_refs": ["run:01ARZ3NDEKTSV4RRFFQ69G5FD1"],
+            },
+        });
+
+        let hygiene = project_skill_invocation_hygiene(SkillInvocationHygieneInput {
+            candidate_kind: PATCH_SKILL_CANDIDATE_KIND,
+            status: "queued",
+            risk_level: "review",
+            content: &content,
+            provenance: &json!([]),
+        });
+        let serialized =
+            serde_json::to_value(&hygiene).expect("hygiene projection should serialize");
+        let decoded = serde_json::from_value::<SkillInvocationHygieneProjection>(serialized)
+            .expect("hygiene projection should deserialize");
+
+        assert_eq!(decoded.decision, SkillInvocationHygieneDecision::Rejected);
+        assert!(decoded
+            .reason_codes
+            .contains(&SkillInvocationHygieneReasonCode::MissingProposalOnly));
+        assert!(decoded.reason_codes.contains(&SkillInvocationHygieneReasonCode::MissingEvalGate));
+        assert!(decoded
+            .reason_codes
+            .contains(&SkillInvocationHygieneReasonCode::MissingWorkspacePatchValidation));
     }
 
     #[test]

@@ -72,6 +72,7 @@ type MemorySectionProps = {
     | "memoryLearningHistory"
     | "memoryLearningPreferences"
     | "memoryLearningCuratorReport"
+    | "memoryLearningConflictReport"
     | "memoryLearningCandidateId"
     | "memoryLearningCandidateKindFilter"
     | "setMemoryLearningCandidateKindFilter"
@@ -223,6 +224,8 @@ export function MemorySection({ app }: MemorySectionProps) {
   const learningHistory = app.memoryLearningHistory;
   const learningCuratorFindingCount =
     readNumber(app.memoryLearningCuratorReport ?? EMPTY_OBJECT, "finding_count") ?? 0;
+  const learningConflictCount =
+    readNumber(app.memoryLearningConflictReport ?? EMPTY_OBJECT, "conflict_count") ?? 0;
   const selectedLearningCandidate =
     learningCandidates.find(
       (candidate) => readString(candidate, "candidate_id") === app.memoryLearningCandidateId,
@@ -459,6 +462,11 @@ export function MemorySection({ app }: MemorySectionProps) {
               {app.memoryLearningCuratorReport !== null ? (
                 <WorkspaceStatusChip tone={learningCuratorFindingCount > 0 ? "warning" : "success"}>
                   Curator {learningCuratorFindingCount}
+                </WorkspaceStatusChip>
+              ) : null}
+              {app.memoryLearningConflictReport !== null ? (
+                <WorkspaceStatusChip tone={learningConflictCount > 0 ? "warning" : "success"}>
+                  Conflicts {learningConflictCount}
                 </WorkspaceStatusChip>
               ) : null}
             </div>

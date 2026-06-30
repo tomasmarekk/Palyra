@@ -455,6 +455,8 @@ export function useConsoleAppState() {
   const [memoryLearningCuratorReport, setMemoryLearningCuratorReport] = useState<JsonObject | null>(
     null,
   );
+  const [memoryLearningConflictReport, setMemoryLearningConflictReport] =
+    useState<JsonObject | null>(null);
   const [memoryLearningCandidateId, setMemoryLearningCandidateId] = useState("");
   const [memoryLearningCandidateKindFilter, setMemoryLearningCandidateKindFilter] = useState("");
   const [memoryLearningStatusFilter, setMemoryLearningStatusFilter] = useState("");
@@ -908,6 +910,7 @@ export function useConsoleAppState() {
     setMemoryLearningHistory([]);
     setMemoryLearningPreferences([]);
     setMemoryLearningCuratorReport(null);
+    setMemoryLearningConflictReport(null);
     setMemoryLearningCandidateId("");
     setMemoryLearningCandidateKindFilter("");
     setMemoryLearningStatusFilter("");
@@ -1243,6 +1246,7 @@ export function useConsoleAppState() {
     try {
       const response = await api.createLearningCuratorReport({ limit: 256 });
       setMemoryLearningCuratorReport(response.report as unknown as JsonObject);
+      setMemoryLearningConflictReport(response.conflict_report as unknown as JsonObject);
       rememberRecallArtifact(response.artifact as unknown as JsonValue | undefined);
       setNotice(
         `Learning curator found ${readNumber(response.report as unknown as JsonObject, "finding_count") ?? 0} issue(s).`,
@@ -1890,6 +1894,7 @@ export function useConsoleAppState() {
     memoryLearningHistory,
     memoryLearningPreferences,
     memoryLearningCuratorReport,
+    memoryLearningConflictReport,
     memoryLearningCandidateId,
     memoryLearningCandidateKindFilter,
     setMemoryLearningCandidateKindFilter,

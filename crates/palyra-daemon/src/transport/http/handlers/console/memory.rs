@@ -33,8 +33,10 @@ use crate::*;
 use crate::{
     application::learning::{
         apply_patch_learning_candidate, apply_preference_candidate,
+        preference_procedure_conflict_report, project_skill_invocation_hygiene_for_candidate,
         shadow_learning_candidate_lifecycle, LearningCurator, LearningCuratorInput,
-        LearningCuratorReport, LEARNING_CURATOR_EVENT_REPORT_CREATED,
+        LearningCuratorReport, PreferenceProcedureConflictReport,
+        LEARNING_CURATOR_EVENT_REPORT_CREATED,
     },
     application::memory_provider::{
         explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
@@ -885,12 +887,14 @@ pub(crate) async fn console_learning_curator_report_handler(
         candidates: candidates.as_slice(),
         preferences: preferences.as_slice(),
     });
+    let conflict_report = preference_procedure_conflict_report(&report);
     let artifact = state
         .runtime
         .create_recall_artifact(build_learning_curator_artifact_request(
             &session.context,
             session.context.channel.clone(),
             &report,
+            &conflict_report,
         ))
         .await
         .map_err(runtime_status_response)?;
@@ -903,6 +907,7 @@ pub(crate) async fn console_learning_curator_report_handler(
                 "artifact_id": artifact.artifact_id,
                 "report_id": report.run.report_id,
                 "finding_count": report.finding_count,
+                "conflict_count": conflict_report.conflict_count,
                 "candidate_count": report.run.candidate_count,
                 "preference_count": report.run.preference_count,
                 "decision": report.decision,
@@ -914,6 +919,7 @@ pub(crate) async fn console_learning_curator_report_handler(
         .map_err(runtime_status_response)?;
     Ok(Json(json!({
         "report": report,
+        "conflict_report": conflict_report,
         "artifact": artifact,
         "contract": contract_descriptor(),
     })))
@@ -2161,6 +2167,7 @@ fn build_learning_curator_artifact_request(
     context: &RequestContext,
     channel: Option<String>,
     report: &LearningCuratorReport,
+    conflict_report: &PreferenceProcedureConflictReport,
 ) -> RecallArtifactCreateRequest {
     RecallArtifactCreateRequest {
         artifact_id: report.run.report_id.clone(),
@@ -2173,6 +2180,7 @@ fn build_learning_curator_artifact_request(
         summary: format!("{} learning curator finding(s)", report.finding_count),
         payload: json!({
             "report": report,
+            "conflict_report": conflict_report,
             "durable_memory_write": false,
         }),
         diagnostics: json!({
@@ -2180,6 +2188,9 @@ fn build_learning_curator_artifact_request(
             "decision": report.decision,
             "reason_code": report.reason_code,
             "finding_count": report.finding_count,
+            "conflict_count": conflict_report.conflict_count,
+            "preference_conflict_count": conflict_report.preference_conflict_count,
+            "procedure_conflict_count": conflict_report.procedure_conflict_count,
             "candidate_count": report.run.candidate_count,
             "preference_count": report.run.preference_count,
             "redaction_level": report.redaction_level,
@@ -2193,6 +2204,12 @@ fn build_learning_curator_artifact_request(
                 .findings
                 .iter()
                 .flat_map(|finding| finding.evidence_refs.iter().cloned())
+                .chain(
+                    conflict_report
+                        .conflicts
+                        .iter()
+                        .flat_map(|conflict| conflict.evidence_refs.iter().cloned()),
+                )
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>(),
@@ -2589,6 +2606,7 @@ fn learning_candidate_lifecycle(
             "content_json_bytes": candidate.content_json.len(),
         },
         "state_machine": learning_candidate_state_machine(candidate, history, evals, rollouts),
+        "skill_invocation_hygiene": project_skill_invocation_hygiene_for_candidate(candidate),
         "deployment_posture": learning_candidate_deployment_posture(candidate, status),
         "rollback": {
             "available": matches!(status, "approved" | "deployed" | "rolled-back"),

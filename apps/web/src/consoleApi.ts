@@ -1685,6 +1685,7 @@ export interface LearningPreferenceRecord {
 
 export interface LearningCuratorReportEnvelope {
   report: JsonValue;
+  conflict_report: JsonValue;
   artifact: RecallArtifactRecord;
   contract: ContractDescriptor;
 }
