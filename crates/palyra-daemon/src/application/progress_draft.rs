@@ -5,7 +5,7 @@
 //! renderers can use without sending a new visible channel message for every
 //! model token or tool event.
 
-use palyra_connectors::providers::discord::{discord_operation_preflight, DiscordMessageOperation};
+use palyra_connectors::{ConnectorApprovalMode, ConnectorOperationPreflight, ConnectorRiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -228,7 +228,7 @@ pub(crate) struct DiscordProgressDraftOutbound {
     pub message_id: Option<String>,
     pub operation: String,
     pub text: String,
-    pub preflight: palyra_connectors::ConnectorOperationPreflight,
+    pub preflight: ConnectorOperationPreflight,
 }
 
 /// Journal-ready projection for auditing the renderer decision.
@@ -373,7 +373,7 @@ impl DiscordProgressDraftRenderer {
             (None, _) => (
                 DiscordProgressDraftRenderAction::CreateMessage,
                 DiscordProgressDraftReasonCode::MessageCreateSelected,
-                DiscordMessageOperation::Send,
+                DiscordProgressDraftOperation::Send,
             ),
             (
                 Some(_),
@@ -383,21 +383,21 @@ impl DiscordProgressDraftRenderer {
             ) => (
                 DiscordProgressDraftRenderAction::FinalizeMessage,
                 DiscordProgressDraftReasonCode::TerminalMessageEditSelected,
-                DiscordMessageOperation::Edit,
+                DiscordProgressDraftOperation::Edit,
             ),
             (Some(_), _) => (
                 DiscordProgressDraftRenderAction::EditMessage,
                 DiscordProgressDraftReasonCode::MessageEditSelected,
-                DiscordMessageOperation::Edit,
+                DiscordProgressDraftOperation::Edit,
             ),
         };
         let outbound = DiscordProgressDraftOutbound {
             connector_id: connector_id_from_progress_channel(channel),
             conversation_id: conversation_id.to_owned(),
             message_id: message_id.map(ToOwned::to_owned),
-            operation: discord_operation_name(operation).to_owned(),
+            operation: discord_progress_draft_operation_name(operation).to_owned(),
             text: discord_progress_message_text(&request.draft, state),
-            preflight: discord_operation_preflight(operation, true, None, None, None),
+            preflight: discord_progress_draft_operation_preflight(operation),
         };
         discord_render_decision(&request.draft, action, reason_code, Some(outbound), false)
     }
@@ -472,17 +472,83 @@ fn connector_id_from_progress_channel(channel: &str) -> String {
     }
 }
 
-fn discord_operation_name(operation: DiscordMessageOperation) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordProgressDraftOperation {
+    Send,
+    Edit,
+}
+
+fn discord_progress_draft_operation_name(operation: DiscordProgressDraftOperation) -> &'static str {
     match operation {
-        DiscordMessageOperation::Send => "send",
-        DiscordMessageOperation::Edit => "edit",
-        DiscordMessageOperation::Thread => "thread",
-        DiscordMessageOperation::Reply => "reply",
-        DiscordMessageOperation::Read => "read",
-        DiscordMessageOperation::Search => "search",
-        DiscordMessageOperation::Delete => "delete",
-        DiscordMessageOperation::ReactAdd => "react_add",
-        DiscordMessageOperation::ReactRemove => "react_remove",
+        DiscordProgressDraftOperation::Send => "send",
+        DiscordProgressDraftOperation::Edit => "edit",
+    }
+}
+
+fn discord_progress_draft_operation_preflight(
+    operation: DiscordProgressDraftOperation,
+) -> ConnectorOperationPreflight {
+    ConnectorOperationPreflight {
+        allowed: true,
+        policy_action: discord_progress_draft_policy_action(operation).to_owned(),
+        approval_mode: discord_progress_draft_approval_mode(operation),
+        risk_level: discord_progress_draft_risk_level(operation),
+        audit_event_type: discord_progress_draft_audit_event_type(operation).to_owned(),
+        required_permissions: discord_progress_draft_required_permissions(operation),
+        reason: None,
+    }
+}
+
+fn discord_progress_draft_policy_action(operation: DiscordProgressDraftOperation) -> &'static str {
+    match operation {
+        DiscordProgressDraftOperation::Send => "channel.send",
+        DiscordProgressDraftOperation::Edit => "channel.message.edit",
+    }
+}
+
+fn discord_progress_draft_audit_event_type(
+    operation: DiscordProgressDraftOperation,
+) -> &'static str {
+    match operation {
+        DiscordProgressDraftOperation::Send => "message.send",
+        DiscordProgressDraftOperation::Edit => "message.edit",
+    }
+}
+
+fn discord_progress_draft_approval_mode(
+    operation: DiscordProgressDraftOperation,
+) -> ConnectorApprovalMode {
+    match operation {
+        DiscordProgressDraftOperation::Send => ConnectorApprovalMode::None,
+        DiscordProgressDraftOperation::Edit => ConnectorApprovalMode::Conditional,
+    }
+}
+
+fn discord_progress_draft_risk_level(
+    operation: DiscordProgressDraftOperation,
+) -> ConnectorRiskLevel {
+    match operation {
+        DiscordProgressDraftOperation::Send => ConnectorRiskLevel::Medium,
+        DiscordProgressDraftOperation::Edit => ConnectorRiskLevel::Conditional,
+    }
+}
+
+fn discord_progress_draft_required_permissions(
+    operation: DiscordProgressDraftOperation,
+) -> Vec<String> {
+    match operation {
+        DiscordProgressDraftOperation::Send => {
+            ["View Channels", "Send Messages", "Read Message History"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        DiscordProgressDraftOperation::Edit => {
+            ["View Channels", "Read Message History", "Send Messages"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
     }
 }
 
