@@ -1615,6 +1615,14 @@ async fn collect_console_progress_draft_diagnostics(
         .iter()
         .take(10)
         .map(|draft| {
+            let discord_render =
+                crate::application::progress_draft::DiscordProgressDraftRenderer::decide(
+                    crate::application::progress_draft::DiscordProgressDraftRenderRequest {
+                        draft: draft.clone(),
+                        rollout_enabled: state.runtime.config.feature_rollouts.progress_drafts.enabled,
+                        allow_channel_side_effects: false,
+                    },
+                );
             json!({
                 "draft_id": draft.draft_id,
                 "session_id": draft.session_id,
@@ -1622,6 +1630,7 @@ async fn collect_console_progress_draft_diagnostics(
                 "state": draft.state,
                 "summary": draft.summary,
                 "operator_summary": crate::application::progress_draft::ProgressDraftRenderer::operator_summary(draft),
+                "discord_render": discord_render,
                 "last_visible_step": draft.last_visible_step,
                 "render_policy": draft.render_policy,
                 "version": draft.version,

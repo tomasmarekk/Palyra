@@ -3200,7 +3200,7 @@ pub struct AgentPlanToolInvocationRequest {
 }
 
 /// Durable backend progress draft for a long-running orchestrator run.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgressDraftRecord {
     pub draft_id: String,
     pub session_id: String,
@@ -3229,7 +3229,7 @@ pub struct ProgressDraftRecord {
 }
 
 /// Append-only progress draft audit event.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgressDraftEventRecord {
     pub event_id: String,
     pub draft_id: String,
@@ -3251,7 +3251,7 @@ pub struct ProgressDraftEventRecord {
 }
 
 /// Progress draft mutation projected from one orchestrator tape event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgressDraftTapeEventRequest {
     pub run_id: String,
     pub source_tape_seq: i64,
@@ -3270,7 +3270,7 @@ pub struct ProgressDraftTapeEventRequest {
 }
 
 /// Filter and pagination options for listing progress drafts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgressDraftListFilter {
     pub owner_principal: Option<String>,
     pub device_id: Option<String>,

@@ -5,6 +5,7 @@
 //! renderers can use without sending a new visible channel message for every
 //! model token or tool event.
 
+use palyra_connectors::providers::discord::{discord_operation_preflight, DiscordMessageOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,8 +25,17 @@ pub(crate) const PROGRESS_DRAFT_REASON_RUN_FAILED: &str = "progress_draft.run_fa
 pub(crate) const PROGRESS_DRAFT_REASON_RUN_CANCELLED: &str = "progress_draft.run_cancelled";
 pub(crate) const PROGRESS_DRAFT_REDACTION_NONE: &str = "none";
 pub(crate) const PROGRESS_DRAFT_REDACTION_REDACTED: &str = "redacted";
+pub(crate) const DISCORD_PROGRESS_DRAFT_RENDERER_SCHEMA_VERSION: i64 = 1;
+pub(crate) const DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_STARTED: &str =
+    "discord_renderer_pro_progress_drafts.started";
+pub(crate) const DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_COMPLETED: &str =
+    "discord_renderer_pro_progress_drafts.completed";
+pub(crate) const DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_FAILED: &str =
+    "discord_renderer_pro_progress_drafts.failed";
 
 const RENDER_POLICY_INTERNAL_ONLY: &str = "internal_only";
+const MAX_DISCORD_PROGRESS_SUMMARY_CHARS: usize = 320;
+const MAX_DISCORD_PROGRESS_STEP_CHARS: usize = 96;
 
 /// Durable progress state persisted in `progress_drafts.state`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +150,382 @@ impl ProgressDraftRenderer {
             |draft| format!("{}: {}", draft.state.as_str(), draft.summary),
         )
     }
+}
+
+/// Request for deriving a Discord progress-draft render decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiscordProgressDraftRenderRequest {
+    pub draft: ProgressDraftRecord,
+    pub rollout_enabled: bool,
+    pub allow_channel_side_effects: bool,
+}
+
+/// Side-effect class a Discord progress-draft decision would use.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiscordProgressDraftRenderAction {
+    Noop,
+    CreateMessage,
+    EditMessage,
+    FinalizeMessage,
+}
+
+impl DiscordProgressDraftRenderAction {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::CreateMessage => "create_message",
+            Self::EditMessage => "edit_message",
+            Self::FinalizeMessage => "finalize_message",
+        }
+    }
+}
+
+/// Stable reason codes for the Discord progress-draft renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscordProgressDraftReasonCode {
+    RolloutDisabled,
+    InternalOnlyPolicy,
+    SuppressedPolicy,
+    NotDiscordChannel,
+    MissingDiscordTarget,
+    SideEffectsDisabled,
+    MessageCreateSelected,
+    MessageEditSelected,
+    TerminalMessageEditSelected,
+    InvalidDraftState,
+    InvalidRenderPolicy,
+}
+
+impl DiscordProgressDraftReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RolloutDisabled => "progress_draft.discord.rollout_disabled",
+            Self::InternalOnlyPolicy => "progress_draft.discord.internal_only_policy",
+            Self::SuppressedPolicy => "progress_draft.discord.suppressed_policy",
+            Self::NotDiscordChannel => "progress_draft.discord.not_discord_channel",
+            Self::MissingDiscordTarget => "progress_draft.discord.missing_discord_target",
+            Self::SideEffectsDisabled => "progress_draft.discord.side_effects_disabled",
+            Self::MessageCreateSelected => "progress_draft.discord.message_create_selected",
+            Self::MessageEditSelected => "progress_draft.discord.message_edit_selected",
+            Self::TerminalMessageEditSelected => {
+                "progress_draft.discord.terminal_message_edit_selected"
+            }
+            Self::InvalidDraftState => "progress_draft.discord.invalid_draft_state",
+            Self::InvalidRenderPolicy => "progress_draft.discord.invalid_render_policy",
+        }
+    }
+}
+
+/// Candidate payload for the existing Discord connector/outbox path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiscordProgressDraftOutbound {
+    pub connector_id: String,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub operation: String,
+    pub text: String,
+    pub preflight: palyra_connectors::ConnectorOperationPreflight,
+}
+
+/// Journal-ready projection for auditing the renderer decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiscordProgressDraftJournalProjection {
+    pub started_event_type: String,
+    pub terminal_event_type: String,
+    pub reason_code: String,
+    pub payload_json: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+}
+
+/// Pure render decision. It does not enqueue or mutate Discord by itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiscordProgressDraftRenderDecision {
+    pub schema_version: i64,
+    pub action: DiscordProgressDraftRenderAction,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<DiscordProgressDraftOutbound>,
+    pub journal_projection: DiscordProgressDraftJournalProjection,
+}
+
+/// Discord renderer for progress drafts.
+///
+/// The renderer only produces an auditable decision and an optional outbound
+/// candidate. The existing connector policy/outbox path must perform any real
+/// Discord side effect in a later integration step.
+pub(crate) struct DiscordProgressDraftRenderer;
+
+impl DiscordProgressDraftRenderer {
+    #[must_use]
+    pub(crate) fn decide(
+        request: DiscordProgressDraftRenderRequest,
+    ) -> DiscordProgressDraftRenderDecision {
+        if !request.rollout_enabled {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::RolloutDisabled,
+                None,
+                false,
+            );
+        }
+
+        let Some(render_policy) =
+            ProgressDraftRenderPolicy::from_str(request.draft.render_policy.as_str())
+        else {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::InvalidRenderPolicy,
+                None,
+                true,
+            );
+        };
+        match render_policy {
+            ProgressDraftRenderPolicy::InternalOnly => {
+                return discord_render_decision(
+                    &request.draft,
+                    DiscordProgressDraftRenderAction::Noop,
+                    DiscordProgressDraftReasonCode::InternalOnlyPolicy,
+                    None,
+                    false,
+                );
+            }
+            ProgressDraftRenderPolicy::Suppressed => {
+                return discord_render_decision(
+                    &request.draft,
+                    DiscordProgressDraftRenderAction::Noop,
+                    DiscordProgressDraftReasonCode::SuppressedPolicy,
+                    None,
+                    false,
+                );
+            }
+            ProgressDraftRenderPolicy::ChannelStatus => {}
+        }
+
+        let Some(channel) = request.draft.channel.as_deref().map(str::trim) else {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::NotDiscordChannel,
+                None,
+                false,
+            );
+        };
+        if !is_discord_progress_channel(channel) {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::NotDiscordChannel,
+                None,
+                false,
+            );
+        }
+
+        let Some(conversation_id) = request
+            .draft
+            .channel_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::MissingDiscordTarget,
+                None,
+                true,
+            );
+        };
+
+        let Some(state) = ProgressDraftState::from_str(request.draft.state.as_str()) else {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::InvalidDraftState,
+                None,
+                true,
+            );
+        };
+
+        if !request.allow_channel_side_effects {
+            return discord_render_decision(
+                &request.draft,
+                DiscordProgressDraftRenderAction::Noop,
+                DiscordProgressDraftReasonCode::SideEffectsDisabled,
+                None,
+                false,
+            );
+        }
+
+        let message_id = request
+            .draft
+            .external_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (action, reason_code, operation) = match (message_id, state) {
+            (None, _) => (
+                DiscordProgressDraftRenderAction::CreateMessage,
+                DiscordProgressDraftReasonCode::MessageCreateSelected,
+                DiscordMessageOperation::Send,
+            ),
+            (
+                Some(_),
+                ProgressDraftState::Completed
+                | ProgressDraftState::Failed
+                | ProgressDraftState::Cancelled,
+            ) => (
+                DiscordProgressDraftRenderAction::FinalizeMessage,
+                DiscordProgressDraftReasonCode::TerminalMessageEditSelected,
+                DiscordMessageOperation::Edit,
+            ),
+            (Some(_), _) => (
+                DiscordProgressDraftRenderAction::EditMessage,
+                DiscordProgressDraftReasonCode::MessageEditSelected,
+                DiscordMessageOperation::Edit,
+            ),
+        };
+        let outbound = DiscordProgressDraftOutbound {
+            connector_id: connector_id_from_progress_channel(channel),
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.map(ToOwned::to_owned),
+            operation: discord_operation_name(operation).to_owned(),
+            text: discord_progress_message_text(&request.draft, state),
+            preflight: discord_operation_preflight(operation, true, None, None, None),
+        };
+        discord_render_decision(&request.draft, action, reason_code, Some(outbound), false)
+    }
+}
+
+fn discord_render_decision(
+    draft: &ProgressDraftRecord,
+    action: DiscordProgressDraftRenderAction,
+    reason_code: DiscordProgressDraftReasonCode,
+    outbound: Option<DiscordProgressDraftOutbound>,
+    failed: bool,
+) -> DiscordProgressDraftRenderDecision {
+    let payload_json = json!({
+        "schema_version": DISCORD_PROGRESS_DRAFT_RENDERER_SCHEMA_VERSION,
+        "draft_id": draft.draft_id.as_str(),
+        "session_id": draft.session_id.as_str(),
+        "run_id": draft.run_id.as_str(),
+        "state": draft.state.as_str(),
+        "action": action.as_str(),
+        "reason_code": reason_code.as_str(),
+        "render_policy": draft.render_policy.as_str(),
+        "channel": draft.channel.as_deref(),
+        "has_external_message_id": draft.external_message_id.is_some(),
+        "outbound": outbound.as_ref(),
+    })
+    .to_string();
+    let evidence_refs_json = json!([{
+        "kind": "progress_draft",
+        "draft_id": draft.draft_id.as_str(),
+        "run_id": draft.run_id.as_str(),
+        "version": draft.version,
+        "updated_at_unix_ms": draft.updated_at_unix_ms,
+    }])
+    .to_string();
+    let reason_code = reason_code.as_str().to_owned();
+    DiscordProgressDraftRenderDecision {
+        schema_version: DISCORD_PROGRESS_DRAFT_RENDERER_SCHEMA_VERSION,
+        action,
+        reason_code: reason_code.clone(),
+        outbound,
+        journal_projection: DiscordProgressDraftJournalProjection {
+            started_event_type: DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_STARTED.to_owned(),
+            terminal_event_type: if failed {
+                DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_FAILED
+            } else {
+                DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_COMPLETED
+            }
+            .to_owned(),
+            reason_code,
+            payload_json,
+            evidence_refs_json,
+            redaction_level: draft.redaction_level.clone(),
+        },
+    }
+}
+
+fn is_discord_progress_channel(channel: &str) -> bool {
+    let normalized = channel.trim().to_ascii_lowercase();
+    normalized == "discord"
+        || normalized.starts_with("discord:")
+        || normalized.starts_with("channel:discord:")
+}
+
+fn connector_id_from_progress_channel(channel: &str) -> String {
+    let normalized = channel.trim().to_ascii_lowercase();
+    if let Some(connector_id) = normalized.strip_prefix("channel:") {
+        connector_id.to_owned()
+    } else if normalized == "discord" {
+        "discord:default".to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn discord_operation_name(operation: DiscordMessageOperation) -> &'static str {
+    match operation {
+        DiscordMessageOperation::Send => "send",
+        DiscordMessageOperation::Edit => "edit",
+        DiscordMessageOperation::Thread => "thread",
+        DiscordMessageOperation::Reply => "reply",
+        DiscordMessageOperation::Read => "read",
+        DiscordMessageOperation::Search => "search",
+        DiscordMessageOperation::Delete => "delete",
+        DiscordMessageOperation::ReactAdd => "react_add",
+        DiscordMessageOperation::ReactRemove => "react_remove",
+    }
+}
+
+fn discord_progress_message_text(draft: &ProgressDraftRecord, state: ProgressDraftState) -> String {
+    let summary = truncate_chars(
+        sanitize_discord_progress_text(draft.summary.as_str()).as_str(),
+        MAX_DISCORD_PROGRESS_SUMMARY_CHARS,
+    );
+    let step = truncate_chars(
+        sanitize_discord_progress_text(draft.last_visible_step.as_str()).as_str(),
+        MAX_DISCORD_PROGRESS_STEP_CHARS,
+    );
+    let state_label = match state {
+        ProgressDraftState::Pending => "queued",
+        ProgressDraftState::Running => "running",
+        ProgressDraftState::WaitingApproval => "waiting for approval",
+        ProgressDraftState::RetryScheduled => "retry scheduled",
+        ProgressDraftState::Compacting => "compacting context",
+        ProgressDraftState::Completed => "completed",
+        ProgressDraftState::Failed => "failed",
+        ProgressDraftState::Cancelled => "cancelled",
+    };
+    format!("Palyra progress: {state_label}\n{summary}\nStep: {step}")
+}
+
+fn sanitize_discord_progress_text(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("@everyone", "@\u{200b}everyone")
+        .replace("@here", "@\u{200b}here")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("...");
+            break;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 /// Builds a journal upsert request from a tape event. Non-progress events and
@@ -409,6 +795,36 @@ mod tests {
         }
     }
 
+    fn draft_record(
+        state: ProgressDraftState,
+        render_policy: ProgressDraftRenderPolicy,
+        external_message_id: Option<&str>,
+    ) -> ProgressDraftRecord {
+        ProgressDraftRecord {
+            draft_id: "01ARZ3NDEKTSV4RRFFQ69G5DR1".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5DS1".to_owned(),
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5RN1".to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device-a".to_owned(),
+            channel: Some("channel:discord:ops".to_owned()),
+            channel_instance_id: Some("1234567890".to_owned()),
+            external_message_id: external_message_id.map(ToOwned::to_owned),
+            state: state.as_str().to_owned(),
+            summary: "Checking deployment status for @everyone".to_owned(),
+            last_visible_step: "model_output".to_owned(),
+            hidden_internal_state_hash:
+                "a63c90cc3684ad8b0a2176a6a8fe9005d9c8b6246502f8ca33767b7f432d3f30".to_owned(),
+            render_policy: render_policy.as_str().to_owned(),
+            version: PROGRESS_DRAFT_SCHEMA_VERSION,
+            reason_code: PROGRESS_DRAFT_REASON_TAPE_UPDATED.to_owned(),
+            evidence_refs_json: "[]".to_owned(),
+            redaction_level: PROGRESS_DRAFT_REDACTION_NONE.to_owned(),
+            created_at_unix_ms: 1_730_000_000_000,
+            updated_at_unix_ms: 1_730_000_001_000,
+            completed_at_unix_ms: None,
+        }
+    }
+
     #[test]
     fn progress_draft_state_serializes_as_snake_case() {
         let encoded =
@@ -463,5 +879,93 @@ mod tests {
         let right = project_progress_draft_tape_event(&request).expect("result should project");
 
         assert_eq!(left.hidden_internal_state_hash, right.hidden_internal_state_hash);
+    }
+
+    #[test]
+    fn discord_renderer_creates_message_candidate_with_audit_projection() {
+        let decision = DiscordProgressDraftRenderer::decide(DiscordProgressDraftRenderRequest {
+            draft: draft_record(
+                ProgressDraftState::Running,
+                ProgressDraftRenderPolicy::ChannelStatus,
+                None,
+            ),
+            rollout_enabled: true,
+            allow_channel_side_effects: true,
+        });
+
+        assert_eq!(decision.action, DiscordProgressDraftRenderAction::CreateMessage);
+        assert_eq!(
+            decision.reason_code,
+            DiscordProgressDraftReasonCode::MessageCreateSelected.as_str()
+        );
+        assert_eq!(
+            decision.journal_projection.started_event_type,
+            DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_STARTED
+        );
+        assert_eq!(
+            decision.journal_projection.terminal_event_type,
+            DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_COMPLETED
+        );
+        let outbound = decision.outbound.as_ref().expect("create decision should carry outbound");
+        assert_eq!(outbound.connector_id, "discord:ops");
+        assert_eq!(outbound.conversation_id, "1234567890");
+        assert_eq!(outbound.operation, "send");
+        assert_eq!(outbound.preflight.policy_action, "channel.send");
+        assert!(outbound.text.contains("@\u{200b}everyone"));
+
+        let encoded = serde_json::to_string(&decision).expect("decision should serialize");
+        let decoded: DiscordProgressDraftRenderDecision =
+            serde_json::from_str(encoded.as_str()).expect("decision should deserialize");
+        assert_eq!(decoded, decision);
+    }
+
+    #[test]
+    fn discord_renderer_finalizes_existing_terminal_message() {
+        let mut draft = draft_record(
+            ProgressDraftState::Completed,
+            ProgressDraftRenderPolicy::ChannelStatus,
+            Some("message-1"),
+        );
+        draft.completed_at_unix_ms = Some(1_730_000_002_000);
+
+        let decision = DiscordProgressDraftRenderer::decide(DiscordProgressDraftRenderRequest {
+            draft,
+            rollout_enabled: true,
+            allow_channel_side_effects: true,
+        });
+
+        assert_eq!(decision.action, DiscordProgressDraftRenderAction::FinalizeMessage);
+        assert_eq!(
+            decision.reason_code,
+            DiscordProgressDraftReasonCode::TerminalMessageEditSelected.as_str()
+        );
+        let outbound = decision.outbound.as_ref().expect("finalize decision should carry outbound");
+        assert_eq!(outbound.operation, "edit");
+        assert_eq!(outbound.message_id.as_deref(), Some("message-1"));
+        assert_eq!(outbound.preflight.policy_action, "channel.message.edit");
+    }
+
+    #[test]
+    fn discord_renderer_skips_internal_only_policy() {
+        let decision = DiscordProgressDraftRenderer::decide(DiscordProgressDraftRenderRequest {
+            draft: draft_record(
+                ProgressDraftState::Running,
+                ProgressDraftRenderPolicy::InternalOnly,
+                None,
+            ),
+            rollout_enabled: true,
+            allow_channel_side_effects: true,
+        });
+
+        assert_eq!(decision.action, DiscordProgressDraftRenderAction::Noop);
+        assert_eq!(
+            decision.reason_code,
+            DiscordProgressDraftReasonCode::InternalOnlyPolicy.as_str()
+        );
+        assert!(decision.outbound.is_none());
+        assert_eq!(
+            decision.journal_projection.terminal_event_type,
+            DISCORD_PROGRESS_DRAFT_RENDERER_EVENT_COMPLETED
+        );
     }
 }
