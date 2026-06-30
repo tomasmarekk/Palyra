@@ -75,6 +75,15 @@ pub const ROUTINE_CAPABILITY_PROFILE_EVENT_FAILED: &str =
     "routinecapabilityprofile_pro_unattended_behy.failed";
 pub const ROUTINE_CAPABILITY_PROFILE_ROLLOUT_OBSERVE_ONLY: &str = "observe_only_read_model";
 pub const ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL: &str = "metadata_only";
+pub const CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION: u64 = 1;
+pub const CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED: &str =
+    "cron_a_routine_preview_failure_policy_a_why_fired_audit.started";
+pub const CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED: &str =
+    "cron_a_routine_preview_failure_policy_a_why_fired_audit.completed";
+pub const CRON_ROUTINE_PREVIEW_AUDIT_EVENT_FAILED: &str =
+    "cron_a_routine_preview_failure_policy_a_why_fired_audit.failed";
+pub const CRON_ROUTINE_PREVIEW_AUDIT_ROLLOUT_OBSERVE_ONLY: &str = "observe_only_read_model";
+pub const CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL: &str = "metadata_only";
 /// Poll interval applied when a file-watch trigger payload omits `poll_interval_ms`.
 pub const DEFAULT_FILE_WATCH_POLL_INTERVAL_MS: u64 = 30 * 1_000;
 /// Lower bound for file-watch polling; faster polling is rejected at validation time.
@@ -1018,6 +1027,186 @@ fn routine_capability_profile_event_types() -> RoutineCapabilityProfileEventType
         completed: ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED.to_owned(),
         failed: ROUTINE_CAPABILITY_PROFILE_EVENT_FAILED.to_owned(),
     }
+}
+
+/// Decision projected from cron preview, failure policy, and why-fired metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRoutinePreviewAuditDecision {
+    PreviewReady,
+    ReviewRequired,
+}
+
+/// Stable reason code for cron/routine preview audit projections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CronRoutinePreviewAuditReasonCode {
+    #[serde(rename = "cron_routine_preview.schedule_preview_ready")]
+    SchedulePreviewReady,
+    #[serde(rename = "cron_routine_preview.trigger_reason_recorded")]
+    TriggerReasonRecorded,
+    #[serde(rename = "cron_routine_preview.trigger_reason_missing")]
+    TriggerReasonMissing,
+    #[serde(rename = "cron_routine_preview.failure_policy_explicit")]
+    FailurePolicyExplicit,
+    #[serde(rename = "cron_routine_preview.preview_metadata_ready")]
+    PreviewMetadataReady,
+}
+
+/// Event names attached to cron/routine preview audit projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CronRoutinePreviewAuditEventTypes {
+    pub started: String,
+    pub completed: String,
+    pub failed: String,
+}
+
+/// Parameter object for [`cron_routine_preview_audit_projection`].
+#[derive(Debug, Clone, Copy)]
+pub struct CronRoutinePreviewAuditInput<'a> {
+    pub routine_id: &'a str,
+    pub trigger_kind: RoutineTriggerKind,
+    pub trigger_reason: Option<&'a str>,
+    pub trigger_payload_json: Option<&'a str>,
+    pub delivery: &'a RoutineDeliveryConfig,
+    pub schedule_type: Option<CronScheduleType>,
+    pub schedule_payload_json: Option<&'a str>,
+    pub require_trigger_reason: bool,
+}
+
+/// Metadata-only projection for schedule preview, failure policy, and why-fired audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CronRoutinePreviewAuditProjection {
+    pub schema_version: u64,
+    pub rollout_mode: String,
+    pub decision: CronRoutinePreviewAuditDecision,
+    pub reason_code: CronRoutinePreviewAuditReasonCode,
+    pub routine_id: String,
+    pub trigger_kind: String,
+    pub trigger_reason_present: bool,
+    pub trigger_payload_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_type: Option<String>,
+    pub schedule_payload_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_mode: Option<String>,
+    pub failure_channel_configured: bool,
+    pub silent_policy: String,
+    pub event_types: CronRoutinePreviewAuditEventTypes,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Builds a metadata-only cron/routine preview audit projection.
+#[must_use]
+pub fn cron_routine_preview_audit_projection(
+    input: CronRoutinePreviewAuditInput<'_>,
+) -> CronRoutinePreviewAuditProjection {
+    let trigger_reason_present =
+        input.trigger_reason.map(str::trim).is_some_and(|value| !value.is_empty());
+    let trigger_payload_keys = json_object_keys(input.trigger_payload_json);
+    let schedule_payload_keys = json_object_keys(input.schedule_payload_json);
+    let (decision, reason_code) = cron_routine_preview_audit_decision(
+        input.require_trigger_reason,
+        trigger_reason_present,
+        input.delivery.failure_mode,
+        input.schedule_type,
+    );
+    CronRoutinePreviewAuditProjection {
+        schema_version: CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION,
+        rollout_mode: CRON_ROUTINE_PREVIEW_AUDIT_ROLLOUT_OBSERVE_ONLY.to_owned(),
+        decision,
+        reason_code,
+        routine_id: input.routine_id.to_owned(),
+        trigger_kind: input.trigger_kind.as_str().to_owned(),
+        trigger_reason_present,
+        trigger_payload_keys,
+        schedule_type: input.schedule_type.map(|schedule_type| schedule_type.as_str().to_owned()),
+        schedule_payload_keys,
+        failure_mode: input.delivery.failure_mode.map(|mode| mode.as_str().to_owned()),
+        failure_channel_configured: input.delivery.failure_channel.is_some()
+            || input.delivery.channel.is_some(),
+        silent_policy: input.delivery.silent_policy.as_str().to_owned(),
+        event_types: cron_routine_preview_audit_event_types(),
+        evidence_refs: cron_routine_preview_audit_evidence_refs(input),
+        redaction_level: CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn cron_routine_preview_audit_decision(
+    require_trigger_reason: bool,
+    trigger_reason_present: bool,
+    failure_mode: Option<RoutineDeliveryMode>,
+    schedule_type: Option<CronScheduleType>,
+) -> (CronRoutinePreviewAuditDecision, CronRoutinePreviewAuditReasonCode) {
+    if require_trigger_reason && !trigger_reason_present {
+        return (
+            CronRoutinePreviewAuditDecision::ReviewRequired,
+            CronRoutinePreviewAuditReasonCode::TriggerReasonMissing,
+        );
+    }
+    if failure_mode.is_some() {
+        return (
+            CronRoutinePreviewAuditDecision::PreviewReady,
+            CronRoutinePreviewAuditReasonCode::FailurePolicyExplicit,
+        );
+    }
+    if schedule_type.is_some() {
+        return (
+            CronRoutinePreviewAuditDecision::PreviewReady,
+            CronRoutinePreviewAuditReasonCode::SchedulePreviewReady,
+        );
+    }
+    if trigger_reason_present {
+        return (
+            CronRoutinePreviewAuditDecision::PreviewReady,
+            CronRoutinePreviewAuditReasonCode::TriggerReasonRecorded,
+        );
+    }
+    (
+        CronRoutinePreviewAuditDecision::PreviewReady,
+        CronRoutinePreviewAuditReasonCode::PreviewMetadataReady,
+    )
+}
+
+fn cron_routine_preview_audit_event_types() -> CronRoutinePreviewAuditEventTypes {
+    CronRoutinePreviewAuditEventTypes {
+        started: CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED.to_owned(),
+        completed: CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED.to_owned(),
+        failed: CRON_ROUTINE_PREVIEW_AUDIT_EVENT_FAILED.to_owned(),
+    }
+}
+
+fn cron_routine_preview_audit_evidence_refs(
+    input: CronRoutinePreviewAuditInput<'_>,
+) -> Vec<String> {
+    let mut refs = vec!["routine.trigger_kind".to_owned(), "routine.delivery".to_owned()];
+    if input.trigger_reason.is_some() {
+        refs.push("routine_run.trigger_reason".to_owned());
+    }
+    if input.trigger_payload_json.is_some() {
+        refs.push("routine_run.trigger_payload_json".to_owned());
+    }
+    if input.schedule_type.is_some() {
+        refs.push("cron.schedule_type".to_owned());
+    }
+    if input.schedule_payload_json.is_some() {
+        refs.push("cron.schedule_payload_json".to_owned());
+    }
+    refs
+}
+
+fn json_object_keys(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys
 }
 
 /// Applies the routine schedule auto-enable guard to an approval policy.
@@ -2274,6 +2463,10 @@ pub fn join_run_metadata(
     let outcome_kind = effective_run_outcome_kind(run.status, metadata);
     let execution = metadata.map(|entry| entry.execution.clone()).unwrap_or_default();
     let delivery = metadata.map(|entry| entry.delivery.clone()).unwrap_or_default();
+    let trigger_kind =
+        metadata.map(|entry| entry.trigger_kind).unwrap_or(RoutineTriggerKind::Schedule);
+    let trigger_reason = metadata.and_then(|entry| entry.trigger_reason.as_deref());
+    let trigger_payload_json = metadata.map(|entry| entry.trigger_payload_json.as_str());
     let output_delivered = terminal
         && metadata
             .and_then(|entry| entry.output_delivered)
@@ -2311,6 +2504,16 @@ pub fn join_run_metadata(
         now_unix_ms.unwrap_or(run.updated_at_unix_ms),
         None,
     );
+    let why_fired_audit = cron_routine_preview_audit_projection(CronRoutinePreviewAuditInput {
+        routine_id,
+        trigger_kind,
+        trigger_reason,
+        trigger_payload_json,
+        delivery: &delivery,
+        schedule_type: None,
+        schedule_payload_json: None,
+        require_trigger_reason: true,
+    });
     json!({
         "routine_id": routine_id,
         "run_id": run.run_id,
@@ -2319,9 +2522,10 @@ pub fn join_run_metadata(
         "outcome_provisional": !terminal,
         "outcome_message": metadata.and_then(|entry| entry.outcome_message.clone()).or_else(|| run.error_message_redacted.clone()),
         "error_kind": run.error_kind,
-        "trigger_kind": metadata.map(|entry| entry.trigger_kind.as_str()).unwrap_or(RoutineTriggerKind::Schedule.as_str()),
+        "trigger_kind": trigger_kind.as_str(),
         "trigger_reason": metadata.and_then(|entry| entry.trigger_reason.clone()),
         "trigger_payload": metadata.and_then(|entry| serde_json::from_str::<Value>(&entry.trigger_payload_json).ok()).unwrap_or_else(|| json!({})),
+        "why_fired_audit": why_fired_audit,
         "run_mode": execution.run_mode.as_str(),
         "execution_posture": execution.execution_posture.as_str(),
         "procedure_profile_id": execution.procedure_profile_id,
@@ -3517,8 +3721,8 @@ fn humanize_duration(duration_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_routine_export_bundle, default_outcome_from_cron_status,
-        heartbeat_delivery_journal_projection, join_run_metadata,
+        build_routine_export_bundle, cron_routine_preview_audit_projection,
+        default_outcome_from_cron_status, heartbeat_delivery_journal_projection, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
         resolve_routines_root, routine_allows_sensitive_tools,
         routine_approval_policy_with_auto_enable_guard, routine_capability_profile_projection,
@@ -3526,6 +3730,8 @@ mod tests {
         routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
         schedule_requires_auto_enable_guard, shadow_manual_schedule_payload_json,
         validate_routine_export_bundle, validate_routine_prompt_self_contained,
+        CronRoutinePreviewAuditDecision, CronRoutinePreviewAuditInput,
+        CronRoutinePreviewAuditProjection, CronRoutinePreviewAuditReasonCode,
         HeartbeatDeliveryDecision, HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode,
         RoutineApprovalGateState, RoutineApprovalMode, RoutineApprovalPolicy,
         RoutineCapabilityProfileDecision, RoutineCapabilityProfileProjection,
@@ -3533,7 +3739,9 @@ mod tests {
         RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
         RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
         RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind, HEARTBEAT_DELIVERY_EVENT_COMPLETED,
+        RoutineSilentPolicy, RoutineTriggerKind, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
+        CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED, CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL,
+        CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION, HEARTBEAT_DELIVERY_EVENT_COMPLETED,
         HEARTBEAT_DELIVERY_EVENT_STARTED, HEARTBEAT_DELIVERY_REDACTION_LEVEL,
         HEARTBEAT_DELIVERY_SCHEMA_VERSION, MIN_AUTO_ENABLE_EVERY_INTERVAL_MS,
         ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED, ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED,
@@ -3858,6 +4066,37 @@ mod tests {
     }
 
     #[test]
+    fn join_run_metadata_exposes_why_fired_audit() {
+        let run = sample_cron_run(CronRunStatus::Succeeded, 3_000);
+        let mut metadata = sample_run_metadata("run-1", "routine-1", 2_000);
+        metadata.trigger_kind = RoutineTriggerKind::FileWatch;
+        metadata.trigger_reason = Some("file changed".to_owned());
+        metadata.trigger_payload_json = json!({
+            "path": "C:\\workspace\\input.txt",
+            "secret": "do-not-copy",
+        })
+        .to_string();
+
+        let value = join_run_metadata(
+            "routine-1",
+            &run,
+            Some(&metadata),
+            Some(&RoutineApprovalPolicy::default()),
+            Some(3_000),
+        );
+        let why_fired = value.get("why_fired_audit").expect("why-fired audit should be present");
+
+        assert_eq!(why_fired.get("decision").and_then(Value::as_str), Some("preview_ready"));
+        assert_eq!(
+            why_fired.get("reason_code").and_then(Value::as_str),
+            Some("cron_routine_preview.trigger_reason_recorded")
+        );
+        assert_eq!(why_fired.get("trigger_reason_present").and_then(Value::as_bool), Some(true));
+        assert_eq!(why_fired.get("trigger_payload_keys"), Some(&json!(["path", "secret"])));
+        assert!(!why_fired.to_string().contains("do-not-copy"), "{why_fired}");
+    }
+
+    #[test]
     fn natural_language_preview_supports_english_inputs() {
         let now = 1_700_000_000_000_i64;
         let english = natural_language_schedule_preview("every 2h", CronTimezoneMode::Utc, now)
@@ -3971,6 +4210,70 @@ mod tests {
         );
 
         assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
+    }
+
+    #[test]
+    fn cron_routine_preview_audit_round_trips_without_payload_values() {
+        let delivery = RoutineDeliveryConfig {
+            mode: RoutineDeliveryMode::SameChannel,
+            channel: Some("ops".to_owned()),
+            failure_mode: Some(RoutineDeliveryMode::LogsOnly),
+            failure_channel: None,
+            silent_policy: RoutineSilentPolicy::FailureOnly,
+        };
+
+        let projection = cron_routine_preview_audit_projection(CronRoutinePreviewAuditInput {
+            routine_id: "routine-1",
+            trigger_kind: RoutineTriggerKind::Schedule,
+            trigger_reason: None,
+            trigger_payload_json: Some(r#"{"source":"cron","secret":"do-not-copy"}"#),
+            delivery: &delivery,
+            schedule_type: Some(CronScheduleType::Every),
+            schedule_payload_json: Some(r#"{"interval_ms":60000,"max_runs":3}"#),
+            require_trigger_reason: false,
+        });
+
+        assert_eq!(projection.schema_version, CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION);
+        assert_eq!(projection.decision, CronRoutinePreviewAuditDecision::PreviewReady);
+        assert_eq!(
+            projection.reason_code,
+            CronRoutinePreviewAuditReasonCode::FailurePolicyExplicit
+        );
+        assert_eq!(projection.trigger_payload_keys, vec!["secret", "source"]);
+        assert_eq!(projection.schedule_payload_keys, vec!["interval_ms", "max_runs"]);
+        assert_eq!(projection.failure_mode.as_deref(), Some("logs_only"));
+        assert!(projection.failure_channel_configured);
+        assert_eq!(projection.event_types.started, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED);
+        assert_eq!(projection.event_types.completed, CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED);
+        assert_eq!(projection.redaction_level, CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL);
+
+        let encoded = serde_json::to_value(&projection).expect("audit should serialize");
+        let serialized = encoded.to_string();
+        assert!(!serialized.contains("do-not-copy"), "{serialized}");
+        let decoded: CronRoutinePreviewAuditProjection =
+            serde_json::from_value(encoded).expect("audit should deserialize");
+        assert_eq!(decoded, projection);
+    }
+
+    #[test]
+    fn cron_routine_preview_audit_requires_trigger_reason_for_run_context() {
+        let delivery = RoutineDeliveryConfig::default();
+
+        let projection = cron_routine_preview_audit_projection(CronRoutinePreviewAuditInput {
+            routine_id: "routine-1",
+            trigger_kind: RoutineTriggerKind::FileWatch,
+            trigger_reason: None,
+            trigger_payload_json: Some(r#"{"path":"C:\\workspace\\input.txt"}"#),
+            delivery: &delivery,
+            schedule_type: None,
+            schedule_payload_json: None,
+            require_trigger_reason: true,
+        });
+
+        assert_eq!(projection.decision, CronRoutinePreviewAuditDecision::ReviewRequired);
+        assert_eq!(projection.reason_code, CronRoutinePreviewAuditReasonCode::TriggerReasonMissing);
+        assert_eq!(projection.trigger_kind, "file_watch");
+        assert_eq!(projection.trigger_payload_keys, vec!["path"]);
     }
 
     #[test]

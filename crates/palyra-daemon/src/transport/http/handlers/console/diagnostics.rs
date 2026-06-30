@@ -154,6 +154,8 @@ pub(crate) async fn console_diagnostics_handler(
     let heartbeat_delivery_payload = collect_console_heartbeat_delivery_diagnostics();
     let routine_capability_profile_payload =
         collect_console_routine_capability_profile_diagnostics();
+    let cron_routine_preview_audit_payload =
+        collect_console_cron_routine_preview_audit_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut turn_control_payload, None);
@@ -313,6 +315,7 @@ pub(crate) async fn console_diagnostics_handler(
         "commitment_inference": commitment_inference_payload,
         "heartbeat_delivery": heartbeat_delivery_payload,
         "routine_capability_profile": routine_capability_profile_payload,
+        "cron_routine_preview_audit": cron_routine_preview_audit_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
@@ -1800,6 +1803,33 @@ fn collect_console_routine_capability_profile_diagnostics() -> Value {
         ],
         "redaction_level": crate::routines::ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL,
         "runtime_behavior": "observe_only_no_dispatch_or_approval_side_effects",
+    })
+}
+
+/// Summarizes the observe-only cron/routine preview audit contract.
+fn collect_console_cron_routine_preview_audit_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_SCHEMA_VERSION,
+        "rollout_mode": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "routine_definition_and_run_read_model",
+        "read_model_endpoints": [
+            "/console/v1/routines",
+            "/console/v1/routines/{routine_id}/runs",
+        ],
+        "event_types": {
+            "started": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_EVENT_STARTED,
+            "completed": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_EVENT_COMPLETED,
+            "failed": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_EVENT_FAILED,
+        },
+        "inputs": [
+            "cron.schedule_type",
+            "cron.schedule_payload_json",
+            "routine.trigger_payload_json",
+            "routine.delivery",
+            "routine_run.trigger_reason",
+        ],
+        "redaction_level": crate::routines::CRON_ROUTINE_PREVIEW_AUDIT_REDACTION_LEVEL,
+        "runtime_behavior": "observe_only_no_dispatch_or_delivery_side_effects",
     })
 }
 

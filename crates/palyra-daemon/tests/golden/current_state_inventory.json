@@ -15,6 +15,7 @@
     "connector_delivery",
     "context_engine",
     "contract",
+    "cron_routine_preview_audit",
     "delegation",
     "deployment",
     "execution_backends",
