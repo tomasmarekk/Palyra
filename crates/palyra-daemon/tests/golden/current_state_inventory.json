@@ -5,6 +5,7 @@
   "catalog_version": "capability-catalog.v2",
   "diagnostics_sections": [
     "access",
+    "agent_plan",
     "agent_runtime_metrics",
     "auth_profiles",
     "browserd",
@@ -837,7 +838,27 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.objective_judge",
-      "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE"
+      "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
+      "contract": {
+        "schema_version": 1,
+        "rollout_enabled": false,
+        "auxiliary_task_kind": "objective_judge",
+        "events": [
+          "objective.judge.started",
+          "objective.judge.completed",
+          "objective.judge.failed"
+        ],
+        "allowed_statuses": [
+          "done",
+          "not_done",
+          "blocked",
+          "needs_user",
+          "wait"
+        ],
+        "parse_failure_backoff_ms": 30000,
+        "reason_code": "objective_judge_auxiliary_loop",
+        "redaction_level": "metadata_only"
+      }
     },
     "verification_runtime": {
       "enabled": false,
