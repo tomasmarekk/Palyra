@@ -41,8 +41,9 @@ use crate::{
     application::tool_runtime::code_intel,
     application::verification::{
         append_verification_stale_output, build_patch_stale_verification_states,
-        verification_state_stale_projection, VerificationJournalProjection, VerificationKind,
-        VerificationPatchStaleRequest, VerificationState,
+        verification_state_stale_projection, VerificationFreshnessStatus,
+        VerificationJournalProjection, VerificationKind, VerificationPatchStaleRequest,
+        VerificationState, VERIFICATION_REDACTION_LEVEL, VERIFICATION_SCHEMA_VERSION,
     },
     application::workspace_observability::{
         capture_workspace_patch_checkpoint, compare_workspace_anchors, WorkspaceCompareAnchor,
@@ -401,8 +402,10 @@ pub(super) async fn execute_workspace_patch_mutation(
         code_intel_evidence_refs.as_slice(),
     )
     .await;
-    code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta);
+    code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta.clone());
     code_intel::append_runtime_output(&mut output_value, &code_intel_runtime.snapshot);
+    let mut project_facts_snapshot = None;
+    let mut verification_states = Vec::new();
     if let Some(project_facts) = capture_project_facts_for_coding_posture(
         runtime_state,
         ProjectFactsPatchCapture {
@@ -431,9 +434,24 @@ pub(super) async fn execute_workspace_patch_mutation(
             },
         )
         .await;
-        append_project_facts_output(&mut output_value, project_facts);
-        append_verification_stale_output(&mut output_value, stale_states);
+        append_project_facts_output(&mut output_value, project_facts.clone());
+        append_verification_stale_output(&mut output_value, stale_states.clone());
+        project_facts_snapshot = Some(project_facts);
+        verification_states = stale_states;
     }
+    append_apply_patch_verification_status_output(
+        &mut output_value,
+        ApplyPatchVerificationStatusContext {
+            diagnostic_delta: &diagnostic_delta,
+            project_facts: project_facts_snapshot.as_ref(),
+            verification_states: verification_states.as_slice(),
+            verification_rollout_enabled: runtime_state
+                .config
+                .feature_rollouts
+                .verification_runtime
+                .enabled,
+        },
+    );
     serialize_workspace_patch_success_value(proposal_id, input_json, output_value)
 }
 
@@ -456,6 +474,138 @@ struct VerificationStalePatchCapture<'a> {
     proposal_id: &'a str,
     mutation_id: &'a str,
     project_facts: &'a ProjectFactsSnapshot,
+}
+
+struct ApplyPatchVerificationStatusContext<'a> {
+    diagnostic_delta: &'a code_intel::DiagnosticDelta,
+    project_facts: Option<&'a ProjectFactsSnapshot>,
+    verification_states: &'a [VerificationState],
+    verification_rollout_enabled: bool,
+}
+
+fn append_apply_patch_verification_status_output(
+    output_value: &mut Value,
+    context: ApplyPatchVerificationStatusContext<'_>,
+) {
+    let Some(payload) = output_value.as_object_mut() else {
+        return;
+    };
+    let Some(diagnostics) = payload.get_mut("diagnostics").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let required_kinds = context
+        .verification_states
+        .iter()
+        .map(|state| state.requirement.required_kind.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let changed_paths = context
+        .verification_states
+        .iter()
+        .flat_map(|state| state.requirement.changed_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let status = apply_patch_verification_status(&context);
+    diagnostics.insert(
+        "verification_status".to_owned(),
+        json!({
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "instruction_authority": "none",
+            "rollout_enabled": context.verification_rollout_enabled,
+            "status": status,
+            "requires_verification": context
+                .project_facts
+                .is_some_and(|facts| facts.coding_posture.requires_verification),
+            "requirements_count": context.verification_states.len(),
+            "required_kinds": required_kinds,
+            "changed_paths": changed_paths,
+            "project_facts_decision": context.project_facts.map(|facts| facts.decision),
+            "diagnostics_delta": {
+                "enabled": context.diagnostic_delta.enabled,
+                "new_errors": context.diagnostic_delta.new_errors,
+                "new_warnings": context.diagnostic_delta.new_warnings,
+                "degraded": context.diagnostic_delta.degraded,
+                "truncated": context.diagnostic_delta.truncated,
+            },
+            "reason_codes": apply_patch_verification_reason_codes(&context),
+            "redaction_level": VERIFICATION_REDACTION_LEVEL,
+        }),
+    );
+}
+
+fn apply_patch_verification_status(
+    context: &ApplyPatchVerificationStatusContext<'_>,
+) -> &'static str {
+    if !context.verification_rollout_enabled {
+        return "unknown";
+    }
+    let Some(project_facts) = context.project_facts else {
+        return "unknown";
+    };
+    if !project_facts.coding_posture.requires_verification {
+        return "not_required";
+    }
+    if context.verification_states.is_empty() {
+        return "unknown";
+    }
+    if context
+        .verification_states
+        .iter()
+        .any(|state| state.freshness.status == VerificationFreshnessStatus::Stale)
+    {
+        return "stale";
+    }
+    if context
+        .verification_states
+        .iter()
+        .any(|state| state.freshness.status == VerificationFreshnessStatus::Unknown)
+    {
+        return "unknown";
+    }
+    "fresh"
+}
+
+fn apply_patch_verification_reason_codes(
+    context: &ApplyPatchVerificationStatusContext<'_>,
+) -> Vec<String> {
+    let mut reason_codes = BTreeSet::new();
+    if !context.verification_rollout_enabled {
+        reason_codes.insert("verification.rollout_disabled".to_owned());
+    }
+    match context.project_facts {
+        Some(project_facts) => {
+            reason_codes.extend(project_facts.reason_codes.iter().cloned());
+            if project_facts.coding_posture.requires_verification {
+                reason_codes.insert("verification.required_after_patch".to_owned());
+            } else {
+                reason_codes.insert("verification.not_required_after_patch".to_owned());
+            }
+        }
+        None => {
+            reason_codes.insert("project_facts.unavailable".to_owned());
+        }
+    }
+    if context.project_facts.is_some_and(|facts| facts.coding_posture.requires_verification)
+        && context.verification_states.is_empty()
+    {
+        reason_codes.insert("verification.requirements_missing".to_owned());
+    }
+    for state in context.verification_states {
+        reason_codes.insert(state.requirement.reason_code.clone());
+        reason_codes.extend(state.freshness.reason_codes.iter().cloned());
+    }
+    if context.diagnostic_delta.new_errors > 0 {
+        reason_codes.insert("code_intel.new_errors_detected".to_owned());
+    }
+    if context.diagnostic_delta.new_warnings > 0 {
+        reason_codes.insert("code_intel.new_warnings_detected".to_owned());
+    }
+    if context.diagnostic_delta.degraded {
+        reason_codes.insert("code_intel.degraded".to_owned());
+    }
+    reason_codes.into_iter().collect()
 }
 
 async fn capture_project_facts_for_coding_posture(
@@ -1329,14 +1479,17 @@ mod tests {
             ProjectFactsSnapshot, ProjectLanguageFamily, ProjectTouchedPathFact,
             ProjectWorkspaceRootRef, PROJECT_FACTS_REDACTION_LEVEL, PROJECT_FACTS_SCHEMA_VERSION,
         },
+        tool_runtime::code_intel,
         verification::{VerificationFreshnessStatus, VerificationKind},
     };
 
     use super::{
-        assess_workspace_mutation_risk, select_project_facts_workspace_root,
-        verification_states_for_project_facts, WorkspaceMutationRiskLevel,
+        append_apply_patch_verification_status_output, assess_workspace_mutation_risk,
+        select_project_facts_workspace_root, verification_states_for_project_facts,
+        ApplyPatchVerificationStatusContext, WorkspaceMutationRiskLevel,
     };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
+    use serde_json::json;
 
     fn attestation(path: &str, operation: &str) -> WorkspacePatchFileAttestation {
         attestation_for_root(path, operation, 0)
@@ -1400,6 +1553,24 @@ mod tests {
             command: "cargo test --workspace --locked".to_owned(),
             source: "Cargo.toml".to_owned(),
             reason_code: "project_facts.test_command".to_owned(),
+        }
+    }
+
+    fn diagnostic_delta(
+        new_errors: usize,
+        new_warnings: usize,
+        degraded: bool,
+    ) -> code_intel::DiagnosticDelta {
+        code_intel::DiagnosticDelta {
+            schema_version: 1,
+            enabled: true,
+            new_errors,
+            new_warnings,
+            items: Vec::new(),
+            truncated: false,
+            provider_status: Vec::new(),
+            degraded,
+            reason_codes: Vec::new(),
         }
     }
 
@@ -1479,5 +1650,63 @@ mod tests {
         let snapshot = project_facts_snapshot(false, Vec::new());
 
         assert!(verification_states_for_project_facts(&snapshot, 500).is_empty());
+    }
+
+    #[test]
+    fn apply_patch_verification_status_unifies_stale_requirements_and_diagnostics() {
+        let snapshot = project_facts_snapshot(true, vec![command_hint(ProjectCommandKind::Test)]);
+        let states = verification_states_for_project_facts(&snapshot, 500);
+        let delta = diagnostic_delta(1, 0, true);
+        let mut output = json!({"diagnostics": {"schema_version": 1}});
+
+        append_apply_patch_verification_status_output(
+            &mut output,
+            ApplyPatchVerificationStatusContext {
+                diagnostic_delta: &delta,
+                project_facts: Some(&snapshot),
+                verification_states: states.as_slice(),
+                verification_rollout_enabled: true,
+            },
+        );
+
+        let status = &output["diagnostics"]["verification_status"];
+        assert_eq!(status["status"], "stale");
+        assert_eq!(status["requires_verification"], true);
+        assert_eq!(status["requirements_count"], 1);
+        assert_eq!(status["required_kinds"][0], "test");
+        assert_eq!(status["diagnostics_delta"]["new_errors"], 1);
+        assert!(status["reason_codes"]
+            .as_array()
+            .expect("reason codes should be an array")
+            .iter()
+            .any(|code| code == "code_intel.new_errors_detected"));
+    }
+
+    #[test]
+    fn apply_patch_verification_status_marks_non_code_changes_not_required() {
+        let snapshot = project_facts_snapshot(false, Vec::new());
+        let states = verification_states_for_project_facts(&snapshot, 500);
+        let delta = diagnostic_delta(0, 0, false);
+        let mut output = json!({"diagnostics": {"schema_version": 1}});
+
+        append_apply_patch_verification_status_output(
+            &mut output,
+            ApplyPatchVerificationStatusContext {
+                diagnostic_delta: &delta,
+                project_facts: Some(&snapshot),
+                verification_states: states.as_slice(),
+                verification_rollout_enabled: true,
+            },
+        );
+
+        let status = &output["diagnostics"]["verification_status"];
+        assert_eq!(status["status"], "not_required");
+        assert_eq!(status["requires_verification"], false);
+        assert_eq!(status["requirements_count"], 0);
+        assert!(status["reason_codes"]
+            .as_array()
+            .expect("reason codes should be an array")
+            .iter()
+            .any(|code| code == "verification.not_required_after_patch"));
     }
 }
