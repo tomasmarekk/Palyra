@@ -432,19 +432,78 @@ pub(crate) async fn handle_routed_route_message(
     .await;
     runtime_state.record_channel_message_routed();
 
-    // Agent resolution only enriches journaling/routing metadata; a failure
-    // here must not reject a message that already passed policy.
+    let preferred_route_agent_id =
+        plan.route_target.as_ref().and_then(|target| target.agent_id.clone());
+    // Default agent resolution only enriches journaling/routing metadata.
+    // A route-target agent is an explicit policy choice, so resolution must
+    // fail closed instead of silently falling back to the default agent.
     let route_agent = match runtime_state
         .resolve_agent_for_context(AgentResolveRequest {
             principal: route_request_context.principal.clone(),
             channel: Some(plan.channel.clone()),
             session_id: Some(session_id.clone()),
-            preferred_agent_id: None,
+            preferred_agent_id: preferred_route_agent_id.clone(),
             persist_session_binding: true,
         })
         .await
     {
         Ok(outcome) => Some(outcome),
+        Err(error) if preferred_route_agent_id.is_some() => {
+            runtime_state.record_denied();
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+            runtime_state.record_channel_reply_failure();
+            runtime_state
+                .update_orchestrator_run_state(
+                    run_id.clone(),
+                    RunLifecycleState::Failed,
+                    Some("route_target_agent_resolution_failed".to_owned()),
+                )
+                .await?;
+            let _ = record_message_router_journal_event(
+                runtime_state,
+                &route_request_context,
+                session_id.as_str(),
+                run_id.as_str(),
+                "message.rejected",
+                common_v1::journal_event::EventActor::System as i32,
+                json!({
+                    "event": "message.rejected",
+                    "envelope_id": input.envelope_id.clone(),
+                    "channel": input.channel.clone(),
+                    "reason": "route_target_agent_resolution_failed",
+                    "agent_resolution_error": {
+                        "code": format!("{:?}", error.code()),
+                        "message": error.message(),
+                    },
+                    "route_target": plan.route_target.clone(),
+                    "queued_for_retry": false,
+                    "quarantined": false,
+                    "binding_id": plan.binding_id.clone(),
+                    "binding_kind": plan.binding_kind.clone(),
+                    "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
+                    "binding_reason": plan.binding_reason.clone(),
+                    "config_hash": route_config_hash,
+                    "actor": {
+                        "connector_channel": actor_connector,
+                        "gateway_principal": actor_gateway_principal,
+                        "gateway_device_id": actor_gateway_device_id,
+                    }
+                }),
+            )
+            .await;
+            return Ok(gateway_v1::RouteMessageResponse {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                accepted: false,
+                queued_for_retry: false,
+                decision_reason: "route_target_agent_resolution_failed".to_owned(),
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                run_id: Some(common_v1::CanonicalId { ulid: run_id }),
+                outputs: Vec::new(),
+                route_key: plan.route_key.clone(),
+                retry_attempt,
+                queue_depth: runtime_state.channel_router.queue_depth() as u32,
+            });
+        }
         Err(error) => {
             warn!(
                 session_id = %session_id,
@@ -484,6 +543,7 @@ pub(crate) async fn handle_routed_route_message(
             "json_mode_requested": json_mode_requested,
             "agent_id": route_agent_id.clone(),
             "agent_resolution_source": route_agent_resolution_source.clone(),
+            "route_target": plan.route_target.clone(),
             "config_hash": route_config_hash,
             "actor": {
                 "connector_channel": actor_connector,
@@ -541,6 +601,7 @@ pub(crate) async fn handle_routed_route_message(
                 "attachments": route_attachment_metadata.clone(),
                 "agent_id": route_agent_id.clone(),
                 "agent_resolution_source": route_agent_resolution_source.clone(),
+                "route_target": plan.route_target.clone(),
             })
             .to_string(),
         })
@@ -913,6 +974,7 @@ pub(crate) async fn handle_routed_route_message(
                 "attachments": route_attachment_metadata.clone(),
                 "agent_id": route_agent_id.clone(),
                 "agent_resolution_source": route_agent_resolution_source.clone(),
+                "route_target": plan.route_target.clone(),
                 "binding_id": plan.binding_id.clone(),
                 "binding_kind": plan.binding_kind.clone(),
                 "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
@@ -942,6 +1004,7 @@ pub(crate) async fn handle_routed_route_message(
             "run_id": run_id.clone(),
             "agent_id": route_agent_id.clone(),
             "agent_resolution_source": route_agent_resolution_source.clone(),
+            "route_target": plan.route_target.clone(),
             "binding_id": plan.binding_id.clone(),
             "binding_kind": plan.binding_kind.clone(),
             "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,
@@ -979,6 +1042,7 @@ pub(crate) async fn handle_routed_route_message(
             "attachments": route_attachment_metadata,
             "agent_id": route_agent_id,
             "agent_resolution_source": route_agent_resolution_source,
+            "route_target": plan.route_target.clone(),
             "binding_id": plan.binding_id.clone(),
             "binding_kind": plan.binding_kind.clone(),
             "binding_expires_at_unix_ms": plan.binding_expires_at_unix_ms,

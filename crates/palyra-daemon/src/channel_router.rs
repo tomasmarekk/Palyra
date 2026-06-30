@@ -16,7 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -196,6 +196,7 @@ pub struct ChannelRoutingRule {
     pub channel: String,
     pub enabled: bool,
     pub mention_patterns: Vec<String>,
+    pub route_targets: Vec<ChannelRouteTargetRule>,
     pub allow_from: Vec<String>,
     pub deny_from: Vec<String>,
     pub allow_direct_messages: bool,
@@ -206,6 +207,56 @@ pub struct ChannelRoutingRule {
     pub auto_reaction: Option<String>,
     pub broadcast_strategy: BroadcastStrategy,
     pub concurrency_limit: Option<usize>,
+}
+
+/// Agent target selected by channel mention aliases and optional sender
+/// role labels. Empty `mention_patterns` never match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelRouteTargetRule {
+    pub agent_id: String,
+    #[serde(default)]
+    pub mention_patterns: Vec<String>,
+    #[serde(default)]
+    pub required_sender_roles: Vec<String>,
+}
+
+/// Stable reason code for route-target decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteTargetReasonCode {
+    #[serde(rename = "route_target_selected")]
+    Selected,
+    #[serde(rename = "route_target_role_scope_denied")]
+    RoleScopeDenied,
+    #[serde(rename = "route_target_ambiguous")]
+    AmbiguousTarget,
+    #[serde(rename = "route_target_agent_invalid")]
+    InvalidTargetAgent,
+}
+
+impl RouteTargetReasonCode {
+    /// Returns the canonical reason string persisted in journals and
+    /// route-preview payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "route_target_selected",
+            Self::RoleScopeDenied => "route_target_role_scope_denied",
+            Self::AmbiguousTarget => "route_target_ambiguous",
+            Self::InvalidTargetAgent => "route_target_agent_invalid",
+        }
+    }
+}
+
+/// Audit-safe target selection details. Sender roles are limited to the
+/// configured required roles, so unrelated role membership is not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTargetDecision {
+    pub reason_code: RouteTargetReasonCode,
+    pub agent_id: Option<String>,
+    pub matched_patterns: Vec<String>,
+    pub required_sender_roles: Vec<String>,
+    pub matched_sender_roles: Vec<String>,
+    pub missing_sender_roles: Vec<String>,
 }
 
 /// Router-wide configuration: global enablement, size and retry budgets,
@@ -294,6 +345,9 @@ pub struct InboundMessage {
     pub sender_handle: Option<String>,
     pub sender_display: Option<String>,
     pub sender_verified: bool,
+    /// Trusted role labels supplied by the authenticated channel adapter,
+    /// not parsed from user-visible message text.
+    pub sender_roles: Vec<String>,
     pub text: String,
     pub max_payload_bytes: u64,
     pub is_direct_message: bool,
@@ -322,6 +376,8 @@ pub struct RoutePlan {
     pub auto_reaction: Option<String>,
     pub in_reply_to_message_id: Option<String>,
     pub reply_thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_target: Option<RouteTargetDecision>,
 }
 
 /// Rejected route with a stable reason string and whether the message was
@@ -330,6 +386,8 @@ pub struct RoutePlan {
 pub struct RouteRejection {
     pub reason: String,
     pub quarantined: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_target: Option<Box<RouteTargetDecision>>,
 }
 
 /// Route deferred by backpressure; the caller should retry after
@@ -353,6 +411,8 @@ pub struct RoutePreview {
     pub session_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_target: Option<RouteTargetDecision>,
     pub config_hash: String,
 }
 
@@ -424,6 +484,7 @@ struct RouteCandidate {
     session_label: Option<String>,
     in_reply_to_message_id: Option<String>,
     reply_thread_id: Option<String>,
+    route_target: Option<RouteTargetDecision>,
 }
 
 /// Stateless-config, stateful-runtime router shared across adapter tasks.
@@ -484,11 +545,24 @@ impl ChannelRouter {
             if !rule.enabled {
                 continue;
             }
-            if rule.mention_patterns.is_empty() && !rule.allow_direct_messages {
+            let has_target_mentions =
+                rule.route_targets.iter().any(|target| !target.mention_patterns.is_empty());
+            if rule.mention_patterns.is_empty()
+                && !has_target_mentions
+                && !rule.allow_direct_messages
+            {
                 warnings.push(format!(
                     "channel '{}' is enabled but has no mention_patterns and direct messages disabled; no inbound text can match",
                     rule.channel
                 ));
+            }
+            for target in &rule.route_targets {
+                if target.mention_patterns.is_empty() {
+                    warnings.push(format!(
+                        "channel '{}' route target '{}' has no mention_patterns and cannot match",
+                        rule.channel, target.agent_id
+                    ));
+                }
             }
             if !rule.allow_direct_messages
                 && !matches!(rule.direct_message_policy, DirectMessagePolicy::Deny)
@@ -545,6 +619,7 @@ impl ChannelRouter {
                 route_key: None,
                 session_key: None,
                 sender_identity: sender_identity(message),
+                route_target: None,
                 config_hash,
             };
         }
@@ -555,6 +630,7 @@ impl ChannelRouter {
                 route_key: None,
                 session_key: None,
                 sender_identity: sender_identity(message),
+                route_target: None,
                 config_hash,
             };
         };
@@ -565,6 +641,7 @@ impl ChannelRouter {
                 route_key: None,
                 session_key: None,
                 sender_identity: sender_identity(message),
+                route_target: None,
                 config_hash,
             };
         }
@@ -575,6 +652,7 @@ impl ChannelRouter {
                 route_key: None,
                 session_key: None,
                 sender_identity: sender_identity(message),
+                route_target: None,
                 config_hash,
             };
         }
@@ -585,6 +663,7 @@ impl ChannelRouter {
                 route_key: Some(candidate.route_key),
                 session_key: Some(candidate.session_key),
                 sender_identity: candidate.sender_identity,
+                route_target: candidate.route_target,
                 config_hash,
             },
             Err(rejection) => RoutePreview {
@@ -593,6 +672,7 @@ impl ChannelRouter {
                 route_key: None,
                 session_key: None,
                 sender_identity: sender_identity(message),
+                route_target: rejection.route_target.map(|target| *target),
                 config_hash,
             },
         }
@@ -872,6 +952,7 @@ impl ChannelRouter {
             return RouteOutcome::Rejected(RouteRejection {
                 reason: "channel_router_disabled".to_owned(),
                 quarantined: false,
+                route_target: None,
             });
         }
         let normalized_channel = normalize_non_empty(message.channel.as_str());
@@ -883,6 +964,7 @@ impl ChannelRouter {
                     "channel_missing",
                     message.retry_attempt,
                 ),
+                route_target: None,
             });
         }
         let channel = normalized_channel.expect("is_none() was rejected just above");
@@ -897,6 +979,7 @@ impl ChannelRouter {
                     "message_empty",
                     message.retry_attempt,
                 ),
+                route_target: None,
             });
         }
         if message_exceeds_size_limit(message, self.config.max_message_bytes) {
@@ -907,6 +990,7 @@ impl ChannelRouter {
                     "message_oversized",
                     message.retry_attempt,
                 ),
+                route_target: None,
             });
         }
         let candidate = match self.evaluate_route_policy(channel.as_str(), message) {
@@ -937,6 +1021,7 @@ impl ChannelRouter {
                             "backpressure_retry_enqueue_failed",
                             message.retry_attempt,
                         ),
+                        route_target: None,
                     });
                 }
                 return RouteOutcome::Rejected(RouteRejection {
@@ -946,6 +1031,7 @@ impl ChannelRouter {
                         "backpressure_poison_quarantine",
                         message.retry_attempt,
                     ),
+                    route_target: None,
                 });
             }
         };
@@ -971,6 +1057,7 @@ impl ChannelRouter {
                 auto_reaction: candidate.rule.auto_reaction.clone(),
                 in_reply_to_message_id: candidate.in_reply_to_message_id,
                 reply_thread_id: candidate.reply_thread_id,
+                route_target: candidate.route_target,
             },
             lease: permit,
         }))
@@ -1062,6 +1149,7 @@ impl ChannelRouter {
                 channel: channel.to_owned(),
                 enabled: self.config.default_channel_enabled,
                 mention_patterns: Vec::new(),
+                route_targets: Vec::new(),
                 allow_from: Vec::new(),
                 deny_from: Vec::new(),
                 allow_direct_messages: self.config.default_allow_direct_messages,
@@ -1088,6 +1176,7 @@ impl ChannelRouter {
             return Err(RouteRejection {
                 reason: "channel_disabled".to_owned(),
                 quarantined: false,
+                route_target: None,
             });
         }
         let sender_identity = sender_identity(message);
@@ -1097,7 +1186,11 @@ impl ChannelRouter {
                 rule.deny_from.iter().any(|blocked| normalize_identifier_match(blocked) == sender)
             })
         {
-            return Err(RouteRejection { reason: "sender_denied".to_owned(), quarantined: false });
+            return Err(RouteRejection {
+                reason: "sender_denied".to_owned(),
+                quarantined: false,
+                route_target: None,
+            });
         }
         let sender_allowlisted = normalized_sender
             .as_deref()
@@ -1114,28 +1207,34 @@ impl ChannelRouter {
                 return Err(RouteRejection {
                     reason: "sender_unverified_for_allowlist".to_owned(),
                     quarantined: false,
+                    route_target: None,
                 });
             }
             let Some(sender) = normalized_sender.as_deref() else {
                 return Err(RouteRejection {
                     reason: "sender_missing_for_allowlist".to_owned(),
                     quarantined: false,
+                    route_target: None,
                 });
             };
             if !self.sender_is_allowlisted(&rule, sender) {
                 return Err(RouteRejection {
                     reason: "sender_not_allowlisted".to_owned(),
                     quarantined: false,
+                    route_target: None,
                 });
             }
         }
+        let route_target = Self::evaluate_route_target(&rule, message)?;
         let mention_match =
-            has_mention_match(message.text.as_str(), rule.mention_patterns.as_slice());
+            has_mention_match(message.text.as_str(), rule.mention_patterns.as_slice())
+                || route_target.is_some();
         if message.is_direct_message {
             if !rule.allow_direct_messages {
                 return Err(RouteRejection {
                     reason: "direct_message_disabled".to_owned(),
                     quarantined: false,
+                    route_target: None,
                 });
             }
             match rule.direct_message_policy {
@@ -1143,6 +1242,7 @@ impl ChannelRouter {
                     return Err(RouteRejection {
                         reason: "direct_message_denied_by_policy".to_owned(),
                         quarantined: false,
+                        route_target: None,
                     });
                 }
                 DirectMessagePolicy::Allow => {}
@@ -1151,18 +1251,21 @@ impl ChannelRouter {
                         return Err(RouteRejection {
                             reason: PairingConsumeReason::SenderMissing.as_str().to_owned(),
                             quarantined: false,
+                            route_target: None,
                         });
                     };
                     if !message.sender_verified {
                         return Err(RouteRejection {
                             reason: "sender_unverified_for_dm_pairing".to_owned(),
                             quarantined: false,
+                            route_target: None,
                         });
                     }
                     if !sender_allowlisted && !self.is_sender_paired(channel, sender) {
                         return Err(RouteRejection {
                             reason: "direct_message_pairing_required".to_owned(),
                             quarantined: false,
+                            route_target: None,
                         });
                     }
                 }
@@ -1171,6 +1274,7 @@ impl ChannelRouter {
             return Err(RouteRejection {
                 reason: "no_matching_mention_or_dm_policy".to_owned(),
                 quarantined: false,
+                route_target: None,
             });
         }
         if message.requested_broadcast {
@@ -1179,12 +1283,14 @@ impl ChannelRouter {
                     return Err(RouteRejection {
                         reason: "broadcast_denied_by_policy".to_owned(),
                         quarantined: false,
+                        route_target: None,
                     });
                 }
                 BroadcastStrategy::MentionOnly if !mention_match => {
                     return Err(RouteRejection {
                         reason: "broadcast_requires_mention_match".to_owned(),
                         quarantined: false,
+                        route_target: None,
                     });
                 }
                 BroadcastStrategy::MentionOnly | BroadcastStrategy::Allow => {}
@@ -1217,7 +1323,76 @@ impl ChannelRouter {
             reply_thread_id: normalize_non_empty(
                 message.adapter_thread_id.as_deref().unwrap_or_default(),
             ),
+            route_target,
         })
+    }
+
+    fn evaluate_route_target(
+        rule: &ChannelRoutingRule,
+        message: &InboundMessage,
+    ) -> Result<Option<RouteTargetDecision>, RouteRejection> {
+        let mut matched_targets = Vec::new();
+        for target in &rule.route_targets {
+            let matched_patterns =
+                matched_mention_patterns(message.text.as_str(), target.mention_patterns.as_slice());
+            if !matched_patterns.is_empty() {
+                matched_targets.push((target, matched_patterns));
+            }
+        }
+        if matched_targets.is_empty() {
+            return Ok(None);
+        }
+        if matched_targets.len() > 1 {
+            return Err(RouteRejection {
+                reason: RouteTargetReasonCode::AmbiguousTarget.as_str().to_owned(),
+                quarantined: false,
+                route_target: None,
+            });
+        }
+
+        let (target, matched_patterns) =
+            matched_targets.pop().expect("single matched target was checked above");
+        let Some(agent_id) = normalize_route_target_agent_id(target.agent_id.as_str()) else {
+            return Err(RouteRejection {
+                reason: RouteTargetReasonCode::InvalidTargetAgent.as_str().to_owned(),
+                quarantined: false,
+                route_target: None,
+            });
+        };
+        let required_sender_roles = normalized_role_labels(target.required_sender_roles.as_slice());
+        let sender_roles = normalized_role_labels(message.sender_roles.as_slice())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let matched_sender_roles = required_sender_roles
+            .iter()
+            .filter(|role| sender_roles.contains(*role))
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_sender_roles = required_sender_roles
+            .iter()
+            .filter(|role| !sender_roles.contains(*role))
+            .cloned()
+            .collect::<Vec<_>>();
+        let decision = RouteTargetDecision {
+            reason_code: if missing_sender_roles.is_empty() {
+                RouteTargetReasonCode::Selected
+            } else {
+                RouteTargetReasonCode::RoleScopeDenied
+            },
+            agent_id: Some(agent_id),
+            matched_patterns,
+            required_sender_roles,
+            matched_sender_roles,
+            missing_sender_roles,
+        };
+        if !decision.missing_sender_roles.is_empty() {
+            return Err(RouteRejection {
+                reason: decision.reason_code.as_str().to_owned(),
+                quarantined: false,
+                route_target: Some(Box::new(decision)),
+            });
+        }
+        Ok(Some(decision))
     }
 
     fn sender_is_allowlisted(&self, rule: &ChannelRoutingRule, sender: &str) -> bool {
@@ -1411,21 +1586,78 @@ impl Drop for ChannelConcurrencyLease {
     }
 }
 
+/// Extracts channel role labels from security labels supplied by an
+/// authenticated adapter. Generic labels such as `json_mode` are ignored
+/// so they cannot satisfy route-target role scopes accidentally.
+#[must_use]
+pub fn sender_roles_from_security_labels(labels: &[String]) -> Vec<String> {
+    let mut roles = Vec::new();
+    for label in labels {
+        let normalized = normalize_identifier_match(label);
+        if !matches!(
+            normalized.split_once(':').map(|(prefix, _)| prefix).unwrap_or_default(),
+            "role" | "sender_role" | "discord_role"
+        ) {
+            continue;
+        }
+        if !roles.iter().any(|existing| existing == &normalized) {
+            roles.push(normalized);
+        }
+    }
+    roles
+}
+
 fn has_mention_match(text: &str, mention_patterns: &[String]) -> bool {
+    !matched_mention_patterns(text, mention_patterns).is_empty()
+}
+
+fn matched_mention_patterns(text: &str, mention_patterns: &[String]) -> Vec<String> {
     if mention_patterns.is_empty() {
-        return false;
+        return Vec::new();
     }
     let normalized_text = normalize_text_for_mention_matching(text, mention_patterns);
-    mention_patterns.iter().any(|pattern| {
-        let normalized_pattern = pattern.trim().to_ascii_lowercase();
-        if normalized_pattern.is_empty() {
-            return false;
+    mention_patterns
+        .iter()
+        .filter_map(|pattern| {
+            let normalized_pattern = pattern.trim().to_ascii_lowercase();
+            if normalized_pattern.is_empty() {
+                return None;
+            }
+            if normalized_pattern == "*" {
+                return (!normalized_text.trim().is_empty()).then_some(normalized_pattern);
+            }
+            contains_boundary_delimited_pattern(
+                normalized_text.as_str(),
+                normalized_pattern.as_str(),
+            )
+            .then_some(normalized_pattern)
+        })
+        .collect()
+}
+
+fn normalized_role_labels(raw_roles: &[String]) -> Vec<String> {
+    let mut roles = Vec::new();
+    for role in raw_roles {
+        let normalized = normalize_identifier_match(role);
+        if normalized.is_empty() {
+            continue;
         }
-        if normalized_pattern == "*" {
-            return !normalized_text.trim().is_empty();
+        if !roles.iter().any(|existing| existing == &normalized) {
+            roles.push(normalized);
         }
-        contains_boundary_delimited_pattern(normalized_text.as_str(), normalized_pattern.as_str())
-    })
+    }
+    roles
+}
+
+fn normalize_route_target_agent_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')) {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
 }
 
 fn normalize_text_for_mention_matching(text: &str, mention_patterns: &[String]) -> String {
@@ -1526,9 +1758,10 @@ fn sha256_hex(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_session_component, BroadcastStrategy, ChannelRouter, ChannelRouterConfig,
-        ChannelRoutingRule, DirectMessagePolicy, InboundCoalescingPolicy, InboundMessage,
-        PairingApprovalOutcome, PairingConsumeOutcome, RetryDisposition, RouteOutcome,
+        normalize_session_component, BroadcastStrategy, ChannelRouteTargetRule, ChannelRouter,
+        ChannelRouterConfig, ChannelRoutingRule, DirectMessagePolicy, InboundCoalescingPolicy,
+        InboundMessage, PairingApprovalOutcome, PairingConsumeOutcome, RetryDisposition,
+        RouteOutcome, RouteTargetReasonCode,
     };
 
     fn baseline_config() -> ChannelRouterConfig {
@@ -1550,6 +1783,7 @@ mod tests {
                 channel: "slack".to_owned(),
                 enabled: true,
                 mention_patterns: vec!["@palyra".to_owned()],
+                route_targets: Vec::new(),
                 allow_from: vec![],
                 deny_from: vec![],
                 allow_direct_messages: false,
@@ -1572,6 +1806,7 @@ mod tests {
             sender_handle: Some("U123".to_owned()),
             sender_display: Some("ops".to_owned()),
             sender_verified: true,
+            sender_roles: Vec::new(),
             text: text.to_owned(),
             max_payload_bytes: 4096,
             is_direct_message: false,
@@ -1613,6 +1848,108 @@ mod tests {
         assert_eq!(routed.plan.session_key, "channel:slack:conversation:C01TEAM");
         assert_eq!(routed.plan.response_prefix.as_deref(), Some("[bot] "));
         routed.lease.release();
+    }
+
+    #[test]
+    fn route_target_alias_selects_agent_and_satisfies_role_scope() {
+        let mut config = baseline_config();
+        config.channels[0].route_targets = vec![ChannelRouteTargetRule {
+            agent_id: "Incident".to_owned(),
+            mention_patterns: vec!["@incident".to_owned()],
+            required_sender_roles: vec!["discord_role:incident".to_owned()],
+        }];
+        let router = ChannelRouter::new(config);
+        let mut message = inbound("page @incident about the outage");
+        message.sender_roles = vec!["discord_role:incident".to_owned()];
+
+        let preview = router.preview_route(&message);
+        assert!(preview.accepted);
+        let preview_target = preview.route_target.expect("preview should expose route target");
+        assert_eq!(preview_target.reason_code, RouteTargetReasonCode::Selected);
+        assert_eq!(preview_target.agent_id.as_deref(), Some("incident"));
+
+        let outcome = router.begin_route(&message);
+        let RouteOutcome::Routed(routed) = outcome else {
+            panic!("target alias with role scope should route");
+        };
+        let route_target = routed.plan.route_target.expect("route plan should carry target");
+        assert_eq!(route_target.agent_id.as_deref(), Some("incident"));
+        assert_eq!(route_target.matched_patterns, vec!["@incident".to_owned()]);
+        assert_eq!(route_target.matched_sender_roles, vec!["discord_role:incident".to_owned()]);
+        assert!(route_target.missing_sender_roles.is_empty());
+        routed.lease.release();
+    }
+
+    #[test]
+    fn route_target_role_scope_denies_matching_alias_without_required_role() {
+        let mut config = baseline_config();
+        config.channels[0].route_targets = vec![ChannelRouteTargetRule {
+            agent_id: "incident".to_owned(),
+            mention_patterns: vec!["@incident".to_owned()],
+            required_sender_roles: vec!["discord_role:incident".to_owned()],
+        }];
+        let router = ChannelRouter::new(config);
+        let message = inbound("page @incident");
+
+        let preview = router.preview_route(&message);
+        assert!(!preview.accepted);
+        let preview_target =
+            preview.route_target.expect("preview should carry target role-scope denial");
+        assert_eq!(preview_target.reason_code, RouteTargetReasonCode::RoleScopeDenied);
+        assert_eq!(preview_target.missing_sender_roles, vec!["discord_role:incident".to_owned()]);
+
+        let outcome = router.begin_route(&message);
+
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Rejected(ref rejection)
+                if rejection.reason == RouteTargetReasonCode::RoleScopeDenied.as_str()
+                    && !rejection.quarantined
+        ));
+    }
+
+    #[test]
+    fn route_target_ambiguous_alias_denies_before_agent_selection() {
+        let mut config = baseline_config();
+        config.channels[0].route_targets = vec![
+            ChannelRouteTargetRule {
+                agent_id: "incident".to_owned(),
+                mention_patterns: vec!["@ops".to_owned()],
+                required_sender_roles: Vec::new(),
+            },
+            ChannelRouteTargetRule {
+                agent_id: "release".to_owned(),
+                mention_patterns: vec!["@ops".to_owned()],
+                required_sender_roles: Vec::new(),
+            },
+        ];
+        let router = ChannelRouter::new(config);
+        let outcome = router.begin_route(&inbound("hello @ops"));
+
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Rejected(ref rejection)
+                if rejection.reason == RouteTargetReasonCode::AmbiguousTarget.as_str()
+                    && !rejection.quarantined
+        ));
+    }
+
+    #[test]
+    fn route_target_decision_round_trips_as_json_contract() {
+        let decision = super::RouteTargetDecision {
+            reason_code: RouteTargetReasonCode::Selected,
+            agent_id: Some("incident".to_owned()),
+            matched_patterns: vec!["@incident".to_owned()],
+            required_sender_roles: vec!["discord_role:incident".to_owned()],
+            matched_sender_roles: vec!["discord_role:incident".to_owned()],
+            missing_sender_roles: Vec::new(),
+        };
+
+        let encoded = serde_json::to_string(&decision).expect("decision should serialize");
+        let decoded: super::RouteTargetDecision =
+            serde_json::from_str(encoded.as_str()).expect("decision should deserialize");
+
+        assert_eq!(decoded, decision);
     }
 
     #[test]

@@ -597,6 +597,117 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_route_target_requires_role_scope_and_selects_agent() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) =
+        spawn_scripted_openai_server(vec![ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"incident agent reply"}}]}"#.to_owned(),
+        )])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_route_targets(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    for (agent_id, set_default) in [("route", true), ("incident", false)] {
+        let mut create_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+            v: 1,
+            agent_id: agent_id.to_owned(),
+            display_name: agent_id.to_owned(),
+            agent_dir: String::new(),
+            workspace_roots: vec!["workspace".to_owned()],
+            default_model_profile: "gpt-4o-mini".to_owned(),
+            execution_backend_preference: String::new(),
+            default_tool_allowlist: vec!["palyra.echo".to_owned()],
+            default_skill_allowlist: vec!["acme.route".to_owned()],
+            set_default,
+            allow_absolute_paths: false,
+        });
+        authorize_metadata_with_principal(create_agent.metadata_mut(), "admin:ops")?;
+        client.create_agent(create_agent).await.with_context(|| {
+            format!("failed to create {agent_id} agent before route target test")
+        })?;
+    }
+
+    let adapter = FakeChannelAdapter::default();
+    let denied = adapter
+        .inject_message_with_envelope_id_attachments_payload_limit_and_security_labels(
+            &mut client,
+            "page @incident for prod outage",
+            false,
+            false,
+            ENVELOPE_ID,
+            Vec::new(),
+            4096,
+            Vec::new(),
+        )
+        .await?;
+    assert!(!denied.accepted, "route target must fail closed without required sender role");
+    assert_eq!(denied.decision_reason, "route_target_role_scope_denied");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        0,
+        "role-scope denial must happen before provider dispatch"
+    );
+
+    let accepted = adapter
+        .inject_message_with_envelope_id_attachments_payload_limit_and_security_labels(
+            &mut client,
+            "page @incident for prod outage",
+            false,
+            false,
+            ENVELOPE_ID_ALT,
+            Vec::new(),
+            4096,
+            vec!["discord_role:incident".to_owned()],
+        )
+        .await?;
+    assert!(accepted.accepted, "route target should route once the sender role is present");
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    let rejected = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("message.rejected")
+                && payload.get("reason").and_then(Value::as_str)
+                    == Some("route_target_role_scope_denied")
+        })
+        .context("role-scope rejection should be journaled")?;
+    assert_eq!(
+        rejected.pointer("/route_target/reason_code").and_then(Value::as_str),
+        Some("route_target_role_scope_denied")
+    );
+    assert_eq!(
+        rejected.pointer("/route_target/missing_sender_roles/0").and_then(Value::as_str),
+        Some("discord_role:incident")
+    );
+
+    let routed = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("message.routed")
+                && payload.get("agent_id").and_then(Value::as_str) == Some("incident")
+        })
+        .context("accepted target route should journal selected agent")?;
+    assert_eq!(
+        routed.pointer("/route_target/reason_code").and_then(Value::as_str),
+        Some("route_target_selected")
+    );
+    assert_eq!(routed.pointer("/route_target/agent_id").and_then(Value::as_str), Some("incident"));
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_debounces_inbound_turns_until_retry_window_elapses() -> Result<()> {
     let (openai_base_url, request_bodies, request_count, server_handle) =
         spawn_scripted_openai_server_with_request_capture(vec![
@@ -12327,6 +12438,33 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
     extra_env: &[(&str, &str)],
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_channel_router_config()?;
+    spawn_palyrad_with_openai_provider_and_channel_router_config(
+        openai_base_url,
+        openai_api_key,
+        config_path,
+        extra_env,
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_route_targets(
+    openai_base_url: &str,
+    openai_api_key: &str,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_channel_router_config_with_route_targets()?;
+    spawn_palyrad_with_openai_provider_and_channel_router_config(
+        openai_base_url,
+        openai_api_key,
+        config_path,
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_config(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    config_path: PathBuf,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
@@ -12903,6 +13041,13 @@ fn write_channel_router_config() -> Result<PathBuf> {
     write_channel_router_config_with_extra_sections("")
 }
 
+fn write_channel_router_config_with_route_targets() -> Result<PathBuf> {
+    write_channel_router_config_with_channel_rule_suffix_and_extra_sections(
+        ", route_targets = [{ agent_id = \"incident\", mention_patterns = [\"@incident\"], required_sender_roles = [\"discord_role:incident\"] }]",
+        "",
+    )
+}
+
 fn write_channel_router_config_with_inbound_coalescing(debounce_ms: u64) -> Result<PathBuf> {
     let extra_sections = format!(
         "\n[channel_router.inbound_coalescing]\nenabled = true\ndebounce_ms = {debounce_ms}\nmax_tracked_keys = 8\nbypass_commands = true\nbypass_media = true\n"
@@ -12911,9 +13056,16 @@ fn write_channel_router_config_with_inbound_coalescing(debounce_ms: u64) -> Resu
 }
 
 fn write_channel_router_config_with_extra_sections(extra_sections: &str) -> Result<PathBuf> {
+    write_channel_router_config_with_channel_rule_suffix_and_extra_sections("", extra_sections)
+}
+
+fn write_channel_router_config_with_channel_rule_suffix_and_extra_sections(
+    channel_rule_suffix: &str,
+    extra_sections: &str,
+) -> Result<PathBuf> {
     let config_path = unique_temp_daemon_config_path();
     #[rustfmt::skip]
-    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1 }}\n]\n{extra_sections}\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
+    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1{channel_rule_suffix} }}\n]\n{extra_sections}\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
     fs::write(&config_path, config_body).with_context(|| {
         format!("failed to write channel router test config at {}", config_path.display())
     })?;

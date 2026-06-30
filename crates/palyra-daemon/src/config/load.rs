@@ -58,7 +58,8 @@ use palyra_vault::VaultRef;
 
 use super::schema::*;
 use crate::channel_router::{
-    BroadcastStrategy, ChannelRouterConfig, ChannelRoutingRule, DirectMessagePolicy,
+    BroadcastStrategy, ChannelRouteTargetRule, ChannelRouterConfig, ChannelRoutingRule,
+    DirectMessagePolicy,
 };
 use crate::cron::CronTimezoneMode;
 use crate::media::MediaRuntimeConfig;
@@ -3986,6 +3987,72 @@ fn parse_mention_patterns(raw: &[String], source_name: &str) -> Result<Vec<Strin
     Ok(patterns)
 }
 
+fn parse_route_target_agent_id(raw: &str, source_name: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    if trimmed.len() > 64 {
+        anyhow::bail!("{source_name} cannot exceed 64 bytes");
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')) {
+        anyhow::bail!(
+            "{source_name} must contain only ASCII letters, digits, hyphens, underscores, or dots"
+        );
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+fn parse_sender_role_scope(raw: &[String], source_name: &str) -> Result<Vec<String>> {
+    if raw.len() > 64 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 64)", raw.len());
+    }
+    let mut roles = Vec::new();
+    for candidate in raw.iter().map(String::as_str).map(str::trim) {
+        if candidate.is_empty() {
+            anyhow::bail!("{source_name} cannot contain empty sender role labels");
+        }
+        if candidate.len() > 128 {
+            anyhow::bail!(
+                "{source_name} contains oversized sender role label ({} > 128)",
+                candidate.len()
+            );
+        }
+        if !candidate.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@' | ':' | '/' | '#')
+        }) {
+            anyhow::bail!("{source_name} contains invalid sender role label '{candidate}'");
+        }
+        let normalized = candidate.to_ascii_lowercase();
+        if !roles.iter().any(|existing| existing == &normalized) {
+            roles.push(normalized);
+        }
+    }
+    Ok(roles)
+}
+
+fn parse_channel_route_target_rule(
+    raw: palyra_common::daemon_config_schema::FileChannelRouteTargetRule,
+    source_name: &str,
+) -> Result<ChannelRouteTargetRule> {
+    let agent_id = parse_route_target_agent_id(
+        raw.agent_id.unwrap_or_default().as_str(),
+        format!("{source_name}.agent_id").as_str(),
+    )?;
+    let mention_patterns = parse_mention_patterns(
+        raw.mention_patterns.unwrap_or_default().as_slice(),
+        format!("{source_name}.mention_patterns").as_str(),
+    )?;
+    if mention_patterns.is_empty() {
+        anyhow::bail!("{source_name}.mention_patterns must contain at least one target alias");
+    }
+    let required_sender_roles = parse_sender_role_scope(
+        raw.required_sender_roles.unwrap_or_default().as_slice(),
+        format!("{source_name}.required_sender_roles").as_str(),
+    )?;
+    Ok(ChannelRouteTargetRule { agent_id, mention_patterns, required_sender_roles })
+}
+
 /// Parses one `channel_router.routing.channels[N]` rule; unset fields fall
 /// back to the router-level `default_*` values already parsed into
 /// `defaults`.
@@ -4010,6 +4077,13 @@ fn parse_channel_routing_rule(
         raw.deny_from.unwrap_or_default().as_slice(),
         format!("{source_name}.deny_from").as_str(),
     )?;
+    let mut route_targets = Vec::new();
+    for (target_index, target) in raw.route_targets.unwrap_or_default().into_iter().enumerate() {
+        route_targets.push(parse_channel_route_target_rule(
+            target,
+            format!("{source_name}.route_targets[{target_index}]").as_str(),
+        )?);
+    }
     let response_prefix = parse_optional_text_field(
         raw.response_prefix.unwrap_or_default(),
         format!("{source_name}.response_prefix").as_str(),
@@ -4051,6 +4125,7 @@ fn parse_channel_routing_rule(
         channel,
         enabled: raw.enabled.unwrap_or(defaults.default_channel_enabled),
         mention_patterns,
+        route_targets,
         allow_from,
         deny_from,
         allow_direct_messages: raw
@@ -4303,25 +4378,25 @@ mod tests {
         apply_feature_rollout_env_override, legacy_process_runner_path_access_mode, load_config,
         parse_anthropic_base_url, parse_anthropic_model, parse_broadcast_strategy,
         parse_browser_service_endpoint, parse_canvas_host_public_base_url,
-        parse_content_type_allowlist, parse_cron_timezone_mode, parse_default_memory_ttl_ms,
-        parse_direct_message_policy, parse_dns_suffix_allowlist, parse_exact_vault_ref_allowlist,
-        parse_host_allowlist, parse_http_header_allowlist, parse_journal_db_path,
-        parse_memory_retention_vacuum_schedule, parse_model_provider_auth_provider_kind,
-        parse_model_provider_registry_entry, parse_model_provider_registry_model,
-        parse_openai_base_url, parse_openai_embeddings_dims, parse_optional_auth_profile_id,
-        parse_optional_browser_state_dir, parse_optional_openai_embeddings_model,
-        parse_optional_sha256_digest_field, parse_optional_vault_ref_field, parse_positive_u32,
-        parse_positive_usize, parse_process_executable_allowlist,
-        parse_process_runner_egress_enforcement_mode, parse_process_runner_path_access_mode,
-        parse_process_runner_tier, parse_provider_reasoning_effort, parse_provider_service_tier,
-        parse_root_file_config, parse_storage_prefix_allowlist, parse_structured_secret_ref_field,
-        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
-        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
-        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
-        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
-        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
-        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
-        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
+        parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
+        parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
+        parse_journal_db_path, parse_memory_retention_vacuum_schedule,
+        parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
+        parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
+        parse_optional_auth_profile_id, parse_optional_browser_state_dir,
+        parse_optional_openai_embeddings_model, parse_optional_sha256_digest_field,
+        parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
+        parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
+        parse_process_runner_path_access_mode, parse_process_runner_tier,
+        parse_provider_reasoning_effort, parse_provider_service_tier, parse_root_file_config,
+        parse_storage_prefix_allowlist, parse_structured_secret_ref_field, parse_tool_allowlist,
+        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
+        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
+        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
+        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
+        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
+        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
         RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
@@ -4879,7 +4954,7 @@ mod tests {
             default_broadcast_strategy = "mention_only"
             default_concurrency_limit = 3
             channels = [
-                { channel = "slack", enabled = true, mention_patterns = ["@palyra"], allow_from = ["U123"], allow_direct_messages = true, direct_message_policy = "allow", broadcast_strategy = "allow", concurrency_limit = 1 }
+                { channel = "slack", enabled = true, mention_patterns = ["@palyra"], route_targets = [{ agent_id = "Incident", mention_patterns = ["@incident"], required_sender_roles = ["discord_role:incident"] }], allow_from = ["U123"], allow_direct_messages = true, direct_message_policy = "allow", broadcast_strategy = "allow", concurrency_limit = 1 }
             ]
             "#,
         )
@@ -4901,6 +4976,20 @@ mod tests {
         assert_eq!(channels[0].channel.as_deref(), Some("slack"));
         assert_eq!(channels[0].direct_message_policy.as_deref(), Some("allow"));
         assert_eq!(channels[0].broadcast_strategy.as_deref(), Some("allow"));
+
+        let channel_rule = parse_channel_routing_rule(
+            channels.into_iter().next().expect("channel rule should exist"),
+            "channel_router.routing.channels[0]",
+            &ChannelRouterConfig::default(),
+        )
+        .expect("route target rule should validate");
+        assert_eq!(channel_rule.route_targets.len(), 1);
+        assert_eq!(channel_rule.route_targets[0].agent_id, "incident");
+        assert_eq!(channel_rule.route_targets[0].mention_patterns, vec!["@incident".to_owned()]);
+        assert_eq!(
+            channel_rule.route_targets[0].required_sender_roles,
+            vec!["discord_role:incident".to_owned()]
+        );
     }
 
     #[test]

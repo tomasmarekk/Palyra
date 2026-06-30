@@ -48,8 +48,8 @@ use crate::{
         service_authorization::{authorize_agent_management_action, authorize_message_action},
     },
     channel_router::{
-        InboundMessage as ChannelInboundMessage, PairingConsumeOutcome, RouteOutcome,
-        RoutedMessage as ChannelRoutedMessage,
+        sender_roles_from_security_labels, InboundMessage as ChannelInboundMessage,
+        PairingConsumeOutcome, RouteOutcome, RoutedMessage as ChannelRoutedMessage,
     },
     execution_backends::{
         build_execution_backend_inventory_with_worker_state,
@@ -701,6 +701,11 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             ));
         }
         let json_mode_requested = security_requests_json_mode(envelope.security.as_ref());
+        let sender_roles = envelope
+            .security
+            .as_ref()
+            .map(|security| sender_roles_from_security_labels(security.labels.as_slice()))
+            .unwrap_or_default();
         let origin = envelope.origin.unwrap_or_default();
         let content = envelope.content.unwrap_or_default();
         let channel = if let Some(value) = non_empty(origin.channel.clone()) {
@@ -735,6 +740,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             sender_handle: non_empty(origin.sender_handle),
             sender_display: non_empty(origin.sender_display),
             sender_verified: origin.sender_verified,
+            sender_roles,
             text: content.text.clone(),
             max_payload_bytes: envelope.max_payload_bytes,
             is_direct_message: payload.is_direct_message,
@@ -1116,6 +1122,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         "envelope_id": input.envelope_id.clone(),
                         "channel": input.channel.clone(),
                         "reason": rejection_reason.clone(),
+                        "route_target": rejection.route_target.clone(),
                         "queued_for_retry": false,
                         "quarantined": rejection.quarantined,
                         "config_hash": route_config_hash.clone(),

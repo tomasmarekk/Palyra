@@ -981,6 +981,7 @@ pub struct FileChannelRoutingRule {
     pub channel: Option<String>,
     pub enabled: Option<bool>,
     pub mention_patterns: Option<Vec<String>>,
+    pub route_targets: Option<Vec<FileChannelRouteTargetRule>>,
     pub allow_from: Option<Vec<String>>,
     pub deny_from: Option<Vec<String>>,
     pub allow_direct_messages: Option<bool>,
@@ -991,6 +992,15 @@ pub struct FileChannelRoutingRule {
     pub auto_reaction: Option<String>,
     pub broadcast_strategy: Option<String>,
     pub concurrency_limit: Option<u64>,
+}
+
+/// One route target inside a `channel_router.routing.channels[*]` rule.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileChannelRouteTargetRule {
+    pub agent_id: Option<String>,
+    pub mention_patterns: Option<Vec<String>>,
+    pub required_sender_roles: Option<Vec<String>>,
 }
 
 /// `[tool_call.process_runner]`: sandboxed process execution policy and

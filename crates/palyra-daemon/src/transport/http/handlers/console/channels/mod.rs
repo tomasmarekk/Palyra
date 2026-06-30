@@ -553,6 +553,7 @@ pub(crate) fn build_channel_router_preview_input(
             }
         }),
         sender_verified: payload.sender_verified.unwrap_or(false),
+        sender_roles: payload.sender_roles.unwrap_or_default(),
         text: payload.text,
         max_payload_bytes: payload.max_payload_bytes.unwrap_or(64 * 1024),
         is_direct_message: payload.is_direct_message.unwrap_or(false),

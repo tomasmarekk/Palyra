@@ -1169,6 +1169,8 @@ struct ChannelRouterPreviewRequest {
     #[serde(default)]
     sender_verified: Option<bool>,
     #[serde(default)]
+    sender_roles: Option<Vec<String>>,
+    #[serde(default)]
     is_direct_message: Option<bool>,
     #[serde(default)]
     requested_broadcast: Option<bool>,
