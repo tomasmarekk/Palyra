@@ -575,6 +575,7 @@ pub struct FileFeatureRolloutsConfig {
     pub verification_runtime: Option<bool>,
     pub progress_drafts: Option<bool>,
     pub compaction_safeguard: Option<bool>,
+    pub provider_backed_evidence_compaction: Option<bool>,
     pub attack_surface_audit: Option<bool>,
 }
 
@@ -1296,6 +1297,7 @@ mod tests {
             verification_runtime = true
             progress_drafts = false
             compaction_safeguard = true
+            provider_backed_evidence_compaction = false
             attack_surface_audit = false
             "#,
         )
@@ -1327,6 +1329,7 @@ mod tests {
         assert_eq!(feature_rollouts.verification_runtime, Some(true));
         assert_eq!(feature_rollouts.progress_drafts, Some(false));
         assert_eq!(feature_rollouts.compaction_safeguard, Some(true));
+        assert_eq!(feature_rollouts.provider_backed_evidence_compaction, Some(false));
         assert_eq!(feature_rollouts.attack_surface_audit, Some(false));
     }
 

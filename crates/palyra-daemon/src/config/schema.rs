@@ -340,6 +340,7 @@ pub struct FeatureRolloutsConfig {
     pub verification_runtime: FeatureRolloutSetting,
     pub progress_drafts: FeatureRolloutSetting,
     pub compaction_safeguard: FeatureRolloutSetting,
+    pub provider_backed_evidence_compaction: FeatureRolloutSetting,
     pub attack_surface_audit: FeatureRolloutSetting,
 }
 

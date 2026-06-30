@@ -69,6 +69,10 @@ pub(crate) const COMPACTION_SAFEGUARD_EVENT_PASSED: &str = "compaction.safeguard
 pub(crate) const COMPACTION_SAFEGUARD_EVENT_FAILED: &str = "compaction.safeguard.failed";
 pub(crate) const COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK: &str = "compaction.rolled_back";
 const COMPACTION_SAFEGUARD_REDACTION_LEVEL: &str = "metadata_only";
+pub(crate) const PROVIDER_BACKED_EVIDENCE_SCHEMA_VERSION: u64 = 1;
+pub(crate) const PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED: &str =
+    "compaction.provider_summary.proposed";
+const PROVIDER_BACKED_EVIDENCE_REDACTION_LEVEL: &str = "metadata_only";
 // The newest text events always stay verbatim so the model keeps the live
 // conversational tail; compaction is skipped entirely unless at least
 // MIN_CONDENSED_EVENTS older events would actually be condensed.
@@ -159,6 +163,7 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) checkpoint_preview: SessionCompactionCheckpointPreview,
     pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
     pub(crate) safeguard: CompactionSafeguardProjection,
+    pub(crate) provider_evidence: ProviderBackedEvidenceProjection,
 }
 
 impl SessionCompactionPlan {
@@ -198,6 +203,7 @@ impl SessionCompactionPlan {
                 .unwrap_or_else(|_| json!({ "summary_text": self.summary_text })),
             "checkpoint_pair": self.checkpoint_pair,
             "compaction_safeguard": self.safeguard,
+            "provider_evidence": self.provider_evidence,
         })
     }
 }
@@ -450,6 +456,63 @@ pub(crate) struct PostCompactionArtifact {
     pub summary_hash: String,
 }
 
+/// Strictly validated provider summary claim with source event references.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct EvidenceBackedClaim {
+    pub claim_id: String,
+    pub text: String,
+    pub source_event_refs: Vec<String>,
+    pub confidence: f64,
+    pub historical_reference: bool,
+}
+
+/// Provider-backed summary decision after strict evidence validation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ProviderBackedEvidenceDecision {
+    #[serde(rename = "accepted")]
+    Accepted,
+    #[serde(rename = "fallback")]
+    Fallback,
+    #[serde(rename = "rejected")]
+    Rejected,
+}
+
+/// Stable reason code for provider-backed evidence compaction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ProviderBackedEvidenceReasonCode {
+    #[serde(rename = "provider_backed_evidence.rollout_disabled")]
+    RolloutDisabled,
+    #[serde(rename = "provider_backed_evidence.claims_accepted")]
+    ClaimsAccepted,
+    #[serde(rename = "provider_backed_evidence.provider_summary_unavailable")]
+    ProviderSummaryUnavailable,
+    #[serde(rename = "provider_backed_evidence.invalid_json")]
+    InvalidJson,
+    #[serde(rename = "provider_backed_evidence.empty_claims")]
+    EmptyClaims,
+    #[serde(rename = "provider_backed_evidence.missing_source_refs")]
+    MissingSourceRefs,
+    #[serde(rename = "provider_backed_evidence.source_refs_out_of_scope")]
+    SourceRefsOutOfScope,
+}
+
+/// Audit projection for the provider-backed evidence compressor layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ProviderBackedEvidenceProjection {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: ProviderBackedEvidenceDecision,
+    pub reason_code: ProviderBackedEvidenceReasonCode,
+    pub provider_summary_available: bool,
+    pub accepted_claims: Vec<EvidenceBackedClaim>,
+    pub rejected_claim_count: u64,
+    pub source_event_refs: Vec<String>,
+    pub fallback_used: bool,
+    pub degraded_reason: Option<String>,
+    pub redaction_level: String,
+    pub summary_trust_label: String,
+}
+
 /// Structured "what was I doing" digest carried across the compaction cut.
 ///
 /// Rendered into the summary text inside an `<active_task_summary>` wrapper
@@ -578,6 +641,7 @@ struct CompactionSummaryJsonInput<'a> {
     checkpoint_preview: &'a SessionCompactionCheckpointPreview,
     checkpoint_pair: &'a PreAPostCompactionCheckpoints,
     safeguard: &'a CompactionSafeguardProjection,
+    provider_evidence: &'a ProviderBackedEvidenceProjection,
     lifecycle_state: &'a str,
     review_candidate_count: usize,
     compressor_mode: Option<&'a str>,
@@ -674,6 +738,62 @@ impl ContextCompressor for HybridSessionContextCompressor {
     }
 }
 
+/// Provider-backed evidence layer over the deterministic compressor.
+///
+/// The provider output is optional and must already be strict JSON. When it
+/// is absent, malformed, or has unevidenced claims, the deterministic
+/// summary remains authoritative and the provider layer records a fallback
+/// projection only.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ProviderBackedEvidenceSessionContextCompressor {
+    fallback: HybridSessionContextCompressor,
+    provider_summary_json: Option<String>,
+    rollout_enabled: bool,
+}
+
+impl ProviderBackedEvidenceSessionContextCompressor {
+    fn with_rollout_enabled(rollout_enabled: bool) -> Self {
+        Self {
+            fallback: HybridSessionContextCompressor::default(),
+            provider_summary_json: None,
+            rollout_enabled,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_provider_summary_json(provider_summary_json: impl Into<String>) -> Self {
+        Self {
+            fallback: HybridSessionContextCompressor::default(),
+            provider_summary_json: Some(provider_summary_json.into()),
+            rollout_enabled: true,
+        }
+    }
+}
+
+impl ContextCompressor for ProviderBackedEvidenceSessionContextCompressor {
+    fn strategy(&self) -> &'static str {
+        SESSION_COMPACTION_STRATEGY
+    }
+
+    fn compress(&self, input: SessionContextCompressionInput<'_>) -> SessionCompactionPlan {
+        let mut plan = self.fallback.compress(input);
+        if self.rollout_enabled {
+            annotate_provider_backed_evidence_plan(
+                &mut plan,
+                self.provider_summary_json.as_deref(),
+            );
+        } else {
+            plan.provider_evidence = provider_backed_evidence_fallback_projection(
+                ProviderBackedEvidenceReasonCode::RolloutDisabled,
+                "provider_backed_evidence_rollout_disabled",
+                plan.evidence_refs.as_slice(),
+            );
+            annotate_compaction_json(&mut plan);
+        }
+        plan
+    }
+}
+
 /// Builds a compaction plan for `session` without persisting anything.
 ///
 /// # Errors
@@ -693,17 +813,19 @@ pub(crate) async fn preview_session_compaction(
         .list_orchestrator_compaction_artifacts(session.session_id.clone())
         .await?
         .len();
-    let mut plan =
-        HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
-            session,
-            transcript: transcript.as_slice(),
-            pins: pins.as_slice(),
-            workspace_documents: workspace_documents.as_slice(),
-            trigger_reason,
-            trigger_policy,
-            mode: "preview",
-            previous_compaction_count,
-        });
+    let mut plan = ProviderBackedEvidenceSessionContextCompressor::with_rollout_enabled(
+        runtime_state.config.feature_rollouts.provider_backed_evidence_compaction.enabled,
+    )
+    .compress(SessionContextCompressionInput {
+        session,
+        transcript: transcript.as_slice(),
+        pins: pins.as_slice(),
+        workspace_documents: workspace_documents.as_slice(),
+        trigger_reason,
+        trigger_policy,
+        mode: "preview",
+        previous_compaction_count,
+    });
     refresh_compaction_safeguard_rollout(
         &mut plan,
         runtime_state.config.feature_rollouts.compaction_safeguard.enabled,
@@ -735,17 +857,19 @@ pub(crate) async fn apply_session_compaction(
         .list_orchestrator_compaction_artifacts(request.session.session_id.clone())
         .await?
         .len();
-    let mut plan =
-        HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
-            session: request.session,
-            transcript: transcript.as_slice(),
-            pins: pins.as_slice(),
-            workspace_documents: workspace_documents.as_slice(),
-            trigger_reason: request.trigger_reason,
-            trigger_policy: request.trigger_policy,
-            mode: request.mode,
-            previous_compaction_count,
-        });
+    let mut plan = ProviderBackedEvidenceSessionContextCompressor::with_rollout_enabled(
+        request.runtime_state.config.feature_rollouts.provider_backed_evidence_compaction.enabled,
+    )
+    .compress(SessionContextCompressionInput {
+        session: request.session,
+        transcript: transcript.as_slice(),
+        pins: pins.as_slice(),
+        workspace_documents: workspace_documents.as_slice(),
+        trigger_reason: request.trigger_reason,
+        trigger_policy: request.trigger_policy,
+        mode: request.mode,
+        previous_compaction_count,
+    });
     let safeguard_rollout_enabled =
         request.runtime_state.config.feature_rollouts.compaction_safeguard.enabled;
     refresh_compaction_safeguard_rollout(&mut plan, safeguard_rollout_enabled);
@@ -974,6 +1098,7 @@ pub(crate) async fn apply_session_compaction(
                 checkpoint_preview: &plan.checkpoint_preview,
                 checkpoint_pair: &applied_checkpoint_pair,
                 safeguard: &applied_safeguard,
+                provider_evidence: &plan.provider_evidence,
                 lifecycle_state,
                 review_candidate_count: pending_review_count,
                 compressor_mode: Some(plan.compressor_mode.as_str()),
@@ -1243,6 +1368,11 @@ fn build_session_compaction_plan_with_metadata(
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         rollout_enabled: false,
     });
+    let provider_evidence = provider_backed_evidence_fallback_projection(
+        ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable,
+        "provider_summary_unavailable",
+        evidence_refs.as_slice(),
+    );
     let summary_json = build_compaction_summary_json(CompactionSummaryJsonInput {
         session,
         eligible,
@@ -1254,6 +1384,7 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_preview: &checkpoint_preview,
         checkpoint_pair: &checkpoint_pair,
         safeguard: &safeguard,
+        provider_evidence: &provider_evidence,
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         review_candidate_count,
         compressor_mode: Some("deterministic"),
@@ -1278,6 +1409,7 @@ fn build_session_compaction_plan_with_metadata(
         "checkpoint_metadata": checkpoint_metadata,
         "checkpoint_pair": checkpoint_pair,
         "compaction_safeguard": safeguard,
+        "provider_evidence": provider_evidence,
     })
     .to_string();
 
@@ -1307,6 +1439,7 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_preview,
         checkpoint_pair,
         safeguard,
+        provider_evidence,
     }
 }
 
@@ -1349,6 +1482,215 @@ fn collect_plan_evidence_refs(plan: &SessionCompactionPlan) -> Vec<String> {
     refs
 }
 
+fn annotate_provider_backed_evidence_plan(
+    plan: &mut SessionCompactionPlan,
+    provider_summary_json: Option<&str>,
+) {
+    plan.provider_evidence = build_provider_backed_evidence_projection(
+        provider_summary_json,
+        plan.evidence_refs.as_slice(),
+    );
+    if plan.provider_evidence.decision == ProviderBackedEvidenceDecision::Accepted {
+        plan.compressor_mode = "provider_backed_evidence".to_owned();
+        plan.fallback_used = false;
+        plan.degraded_reason = None;
+    } else {
+        plan.compressor_mode = "deterministic_fallback".to_owned();
+        plan.fallback_used = true;
+        plan.degraded_reason = plan.provider_evidence.degraded_reason.clone();
+    }
+    annotate_compaction_json(plan);
+}
+
+fn build_provider_backed_evidence_projection(
+    provider_summary_json: Option<&str>,
+    allowed_source_refs: &[String],
+) -> ProviderBackedEvidenceProjection {
+    let Some(provider_summary_json) =
+        provider_summary_json.map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return provider_backed_evidence_fallback_projection(
+            ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable,
+            "provider_summary_unavailable",
+            allowed_source_refs,
+        );
+    };
+    let Ok(value) = serde_json::from_str::<Value>(provider_summary_json) else {
+        return provider_backed_evidence_fallback_projection(
+            ProviderBackedEvidenceReasonCode::InvalidJson,
+            "provider_summary_invalid_json",
+            allowed_source_refs,
+        );
+    };
+    let Some(claim_values) = value.get("claims").and_then(Value::as_array) else {
+        return provider_backed_evidence_fallback_projection(
+            ProviderBackedEvidenceReasonCode::EmptyClaims,
+            "provider_summary_empty_claims",
+            allowed_source_refs,
+        );
+    };
+    if claim_values.is_empty() {
+        return provider_backed_evidence_fallback_projection(
+            ProviderBackedEvidenceReasonCode::EmptyClaims,
+            "provider_summary_empty_claims",
+            allowed_source_refs,
+        );
+    }
+
+    let allowed = allowed_source_refs.iter().cloned().collect::<BTreeSet<_>>();
+    let mut accepted_claims = Vec::new();
+    let mut rejected_claim_count = 0_u64;
+    let mut first_rejection = None;
+    for (index, claim_value) in claim_values.iter().enumerate() {
+        match parse_evidence_backed_claim(claim_value, index, &allowed) {
+            Ok(claim) => accepted_claims.push(claim),
+            Err(reason_code) => {
+                rejected_claim_count = rejected_claim_count.saturating_add(1);
+                first_rejection.get_or_insert(reason_code);
+            }
+        }
+    }
+
+    if accepted_claims.is_empty() {
+        let reason_code = first_rejection.unwrap_or(ProviderBackedEvidenceReasonCode::EmptyClaims);
+        return provider_backed_evidence_fallback_projection(
+            reason_code,
+            provider_backed_evidence_degraded_reason(reason_code),
+            allowed_source_refs,
+        );
+    }
+    let source_event_refs = accepted_claims
+        .iter()
+        .flat_map(|claim| claim.source_event_refs.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    ProviderBackedEvidenceProjection {
+        schema_version: PROVIDER_BACKED_EVIDENCE_SCHEMA_VERSION,
+        event_type: PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED.to_owned(),
+        decision: ProviderBackedEvidenceDecision::Accepted,
+        reason_code: ProviderBackedEvidenceReasonCode::ClaimsAccepted,
+        provider_summary_available: true,
+        accepted_claims,
+        rejected_claim_count,
+        source_event_refs,
+        fallback_used: false,
+        degraded_reason: None,
+        redaction_level: PROVIDER_BACKED_EVIDENCE_REDACTION_LEVEL.to_owned(),
+        summary_trust_label: "historical_reference_not_instruction".to_owned(),
+    }
+}
+
+fn parse_evidence_backed_claim(
+    value: &Value,
+    index: usize,
+    allowed_source_refs: &BTreeSet<String>,
+) -> Result<EvidenceBackedClaim, ProviderBackedEvidenceReasonCode> {
+    let object = value.as_object().ok_or(ProviderBackedEvidenceReasonCode::EmptyClaims)?;
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(provider_claim_text)
+        .filter(|text| !text.is_empty())
+        .ok_or(ProviderBackedEvidenceReasonCode::EmptyClaims)?;
+    let Some(source_refs) = object.get("source_event_refs").and_then(Value::as_array) else {
+        return Err(ProviderBackedEvidenceReasonCode::MissingSourceRefs);
+    };
+    if source_refs.is_empty() {
+        return Err(ProviderBackedEvidenceReasonCode::MissingSourceRefs);
+    }
+    let mut normalized_refs = Vec::new();
+    for source_ref in source_refs {
+        let source_ref = source_ref
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(ProviderBackedEvidenceReasonCode::MissingSourceRefs)?;
+        if !allowed_source_refs.contains(source_ref) {
+            return Err(ProviderBackedEvidenceReasonCode::SourceRefsOutOfScope);
+        }
+        if !normalized_refs.iter().any(|existing| existing == source_ref) {
+            normalized_refs.push(source_ref.to_owned());
+        }
+    }
+    let confidence =
+        object.get("confidence").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1.0);
+    Ok(EvidenceBackedClaim {
+        claim_id: object
+            .get("claim_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("provider-claim-{}", index + 1)),
+        text,
+        source_event_refs: normalized_refs,
+        confidence,
+        historical_reference: true,
+    })
+}
+
+fn provider_claim_text(raw: &str) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_url_segments_in_text(redact_auth_error(normalized.as_str()).as_str());
+    truncate_console_text(redacted.as_str(), 600)
+}
+
+fn provider_backed_evidence_fallback_projection(
+    reason_code: ProviderBackedEvidenceReasonCode,
+    degraded_reason: &str,
+    source_event_refs: &[String],
+) -> ProviderBackedEvidenceProjection {
+    ProviderBackedEvidenceProjection {
+        schema_version: PROVIDER_BACKED_EVIDENCE_SCHEMA_VERSION,
+        event_type: PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED.to_owned(),
+        decision: if matches!(
+            reason_code,
+            ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable
+                | ProviderBackedEvidenceReasonCode::RolloutDisabled
+        ) {
+            ProviderBackedEvidenceDecision::Fallback
+        } else {
+            ProviderBackedEvidenceDecision::Rejected
+        },
+        reason_code,
+        provider_summary_available: !matches!(
+            reason_code,
+            ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable
+                | ProviderBackedEvidenceReasonCode::RolloutDisabled
+        ),
+        accepted_claims: Vec::new(),
+        rejected_claim_count: 0,
+        source_event_refs: source_event_refs.to_vec(),
+        fallback_used: true,
+        degraded_reason: Some(degraded_reason.to_owned()),
+        redaction_level: PROVIDER_BACKED_EVIDENCE_REDACTION_LEVEL.to_owned(),
+        summary_trust_label: "deterministic_historical_reference".to_owned(),
+    }
+}
+
+fn provider_backed_evidence_degraded_reason(
+    reason_code: ProviderBackedEvidenceReasonCode,
+) -> &'static str {
+    match reason_code {
+        ProviderBackedEvidenceReasonCode::RolloutDisabled => {
+            "provider_backed_evidence_rollout_disabled"
+        }
+        ProviderBackedEvidenceReasonCode::ClaimsAccepted => "provider_claims_accepted",
+        ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable => {
+            "provider_summary_unavailable"
+        }
+        ProviderBackedEvidenceReasonCode::InvalidJson => "provider_summary_invalid_json",
+        ProviderBackedEvidenceReasonCode::EmptyClaims => "provider_summary_empty_claims",
+        ProviderBackedEvidenceReasonCode::MissingSourceRefs => {
+            "provider_summary_missing_source_refs"
+        }
+        ProviderBackedEvidenceReasonCode::SourceRefsOutOfScope => {
+            "provider_summary_source_refs_out_of_scope"
+        }
+    }
+}
+
 fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     plan.checkpoint_pair.journal_projection.evidence_refs = plan.evidence_refs.clone();
     plan.safeguard.pre_checkpoint.evidence_refs = plan.evidence_refs.clone();
@@ -1363,6 +1705,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("compression".to_owned(), compression.clone());
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
             object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
+            object.insert("provider_evidence".to_owned(), json!(&plan.provider_evidence));
         }
         plan.summary_json = summary.to_string();
     }
@@ -1372,6 +1715,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("compression".to_owned(), compression);
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
             object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
+            object.insert("provider_evidence".to_owned(), json!(&plan.provider_evidence));
         }
         plan.trigger_inputs_json = trigger_inputs.to_string();
     }
@@ -1747,7 +2091,7 @@ pub(crate) fn render_compaction_prompt_block(
     summary_text: &str,
 ) -> String {
     format!(
-        "<session_compaction_summary artifact_id=\"{artifact_id}\" mode=\"{mode}\" trigger_reason=\"{trigger_reason}\">\n{summary_text}\n</session_compaction_summary>"
+        "<session_compaction_summary artifact_id=\"{artifact_id}\" mode=\"{mode}\" trigger_reason=\"{trigger_reason}\" trust_label=\"historical_reference\" instruction_authority=\"none\">\n{summary_text}\n</session_compaction_summary>"
     )
 }
 
@@ -2615,6 +2959,7 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         "checkpoint_preview": input.checkpoint_preview,
         "checkpoint_pair": input.checkpoint_pair,
         "compaction_safeguard": input.safeguard,
+        "provider_evidence": input.provider_evidence,
         "quality_gates": quality_gates,
         "compression": {
             "compressor_mode": input.compressor_mode.unwrap_or("deterministic"),
@@ -3409,11 +3754,13 @@ mod tests {
         session_compaction_summary_hash, CompactionSafeguardDecision,
         CompactionSafeguardProjection, CompactionSafeguardReasonCode, ContextCompressor,
         HybridSessionContextCompressor, PreAPostCompactionCheckpoints, PreAPostCompactionDecision,
-        PreAPostCompactionReasonCode, SessionContextCompressionInput,
+        PreAPostCompactionReasonCode, ProviderBackedEvidenceDecision,
+        ProviderBackedEvidenceProjection, ProviderBackedEvidenceReasonCode,
+        ProviderBackedEvidenceSessionContextCompressor, SessionContextCompressionInput,
         COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED, COMPACTION_SAFEGUARD_EVENT_PASSED,
         COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
         PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED,
-        PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED,
+        PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED, PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED,
     };
     use crate::journal::{
         OrchestratorSessionPinRecord, OrchestratorSessionRecord,
@@ -4635,6 +4982,226 @@ Open action items:
     }
 
     #[test]
+    fn provider_backed_evidence_compressor_accepts_sourced_claims() {
+        let transcript = vec![
+            transcript_record(
+                0,
+                "message.received",
+                r#"{"text":"Decision: keep compaction audit records in the journal."}"#,
+            ),
+            transcript_record(
+                1,
+                "message.replied",
+                r#"{"reply_text":"Next action: wire durable writes into MEMORY.md."}"#,
+            ),
+            transcript_record(
+                2,
+                "message.replied",
+                r#"{"reply_text":"Use GH CLI for GitHub operations in this repo."}"#,
+            ),
+            transcript_record(
+                3,
+                "message.received",
+                r#"{"text":"Decision: disable remote dashboard access by default."}"#,
+            ),
+            transcript_record(
+                4,
+                "message.replied",
+                r#"{"reply_text":"Decision: preserve deterministic fixtures."}"#,
+            ),
+            transcript_record(
+                5,
+                "message.received",
+                r#"{"text":"Next action: expose compaction diffs in the operator UI."}"#,
+            ),
+            transcript_record(6, "message.received", r#"{"text":"Recent context one."}"#),
+            transcript_record(7, "message.replied", r#"{"reply_text":"Recent context two."}"#),
+            transcript_record(8, "message.received", r#"{"text":"Recent context three."}"#),
+            transcript_record(9, "message.replied", r#"{"reply_text":"Recent context four."}"#),
+            transcript_record(10, "message.received", r#"{"text":"Recent context five."}"#),
+        ];
+        let baseline =
+            HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
+                session: &session_record(),
+                transcript: transcript.as_slice(),
+                pins: &[],
+                workspace_documents: &[],
+                trigger_reason: Some("test_compaction"),
+                trigger_policy: Some("test_policy"),
+                mode: "manual",
+                previous_compaction_count: 0,
+            });
+        let source_ref =
+            baseline.evidence_refs.first().expect("baseline should expose evidence refs").clone();
+        let provider_summary = serde_json::json!({
+            "claims": [{
+                "claim_id": "claim-audit",
+                "text": "Compaction audit records remain journal backed.",
+                "source_event_refs": [source_ref],
+                "confidence": 0.91
+            }]
+        })
+        .to_string();
+
+        let plan = ProviderBackedEvidenceSessionContextCompressor::with_provider_summary_json(
+            provider_summary,
+        )
+        .compress(SessionContextCompressionInput {
+            session: &session_record(),
+            transcript: transcript.as_slice(),
+            pins: &[],
+            workspace_documents: &[],
+            trigger_reason: Some("test_compaction"),
+            trigger_policy: Some("test_policy"),
+            mode: "manual",
+            previous_compaction_count: 0,
+        });
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert_eq!(plan.compressor_mode, "provider_backed_evidence");
+        assert!(!plan.fallback_used);
+        assert_eq!(plan.provider_evidence.decision, ProviderBackedEvidenceDecision::Accepted);
+        assert_eq!(
+            plan.provider_evidence.reason_code,
+            ProviderBackedEvidenceReasonCode::ClaimsAccepted
+        );
+        assert_eq!(plan.provider_evidence.accepted_claims.len(), 1);
+        assert!(plan.provider_evidence.accepted_claims[0].historical_reference);
+        assert_eq!(plan.provider_evidence.event_type, PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED);
+        let serialized_projection = serde_json::to_value(&plan.provider_evidence)
+            .expect("provider evidence projection should serialize");
+        let decoded_projection =
+            serde_json::from_value::<ProviderBackedEvidenceProjection>(serialized_projection)
+                .expect("provider evidence projection should deserialize");
+        assert_eq!(decoded_projection, plan.provider_evidence);
+        assert_eq!(
+            summary.pointer("/provider_evidence/decision").and_then(serde_json::Value::as_str),
+            Some("accepted")
+        );
+        assert_eq!(
+            summary
+                .pointer("/provider_evidence/summary_trust_label")
+                .and_then(serde_json::Value::as_str),
+            Some("historical_reference_not_instruction")
+        );
+    }
+
+    #[test]
+    fn provider_backed_evidence_rejects_claims_without_source_refs() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload = format!(r#"{{"text":"Evidence compressor reference event {seq}."}}"#);
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        let provider_summary = serde_json::json!({
+            "claims": [{
+                "claim_id": "claim-missing-refs",
+                "text": "This claim is not backed by source refs.",
+                "source_event_refs": [],
+                "confidence": 0.88
+            }]
+        })
+        .to_string();
+
+        let plan = ProviderBackedEvidenceSessionContextCompressor::with_provider_summary_json(
+            provider_summary,
+        )
+        .compress(SessionContextCompressionInput {
+            session: &session_record(),
+            transcript: transcript.as_slice(),
+            pins: &[],
+            workspace_documents: &[],
+            trigger_reason: Some("test_compaction"),
+            trigger_policy: Some("test_policy"),
+            mode: "manual",
+            previous_compaction_count: 0,
+        });
+
+        assert_eq!(plan.compressor_mode, "deterministic_fallback");
+        assert!(plan.fallback_used);
+        assert_eq!(plan.provider_evidence.decision, ProviderBackedEvidenceDecision::Rejected);
+        assert_eq!(
+            plan.provider_evidence.reason_code,
+            ProviderBackedEvidenceReasonCode::MissingSourceRefs
+        );
+        assert!(plan.provider_evidence.accepted_claims.is_empty());
+        assert_eq!(plan.degraded_reason.as_deref(), Some("provider_summary_missing_source_refs"));
+    }
+
+    #[test]
+    fn provider_backed_evidence_default_rollout_preserves_hybrid_mode() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload =
+                    format!(r#"{{"text":"Default provider fallback reference event {seq}."}}"#);
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        let plan = ProviderBackedEvidenceSessionContextCompressor::default().compress(
+            SessionContextCompressionInput {
+                session: &session_record(),
+                transcript: transcript.as_slice(),
+                pins: &[],
+                workspace_documents: &[],
+                trigger_reason: Some("test_compaction"),
+                trigger_policy: Some("test_policy"),
+                mode: "manual",
+                previous_compaction_count: 0,
+            },
+        );
+
+        assert_eq!(plan.compressor_mode, "hybrid_evidence_backed");
+        assert!(!plan.fallback_used);
+        assert_eq!(plan.provider_evidence.decision, ProviderBackedEvidenceDecision::Fallback);
+        assert_eq!(
+            plan.provider_evidence.reason_code,
+            ProviderBackedEvidenceReasonCode::RolloutDisabled
+        );
+        assert_eq!(
+            plan.provider_evidence.degraded_reason.as_deref(),
+            Some("provider_backed_evidence_rollout_disabled")
+        );
+    }
+
+    #[test]
+    fn provider_backed_evidence_rollout_uses_fallback_without_provider_summary() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload =
+                    format!(r#"{{"text":"Enabled provider fallback reference event {seq}."}}"#);
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        let plan = ProviderBackedEvidenceSessionContextCompressor::with_rollout_enabled(true)
+            .compress(SessionContextCompressionInput {
+                session: &session_record(),
+                transcript: transcript.as_slice(),
+                pins: &[],
+                workspace_documents: &[],
+                trigger_reason: Some("test_compaction"),
+                trigger_policy: Some("test_policy"),
+                mode: "manual",
+                previous_compaction_count: 0,
+            });
+
+        assert_eq!(plan.compressor_mode, "deterministic_fallback");
+        assert!(plan.fallback_used);
+        assert_eq!(plan.provider_evidence.decision, ProviderBackedEvidenceDecision::Fallback);
+        assert_eq!(
+            plan.provider_evidence.reason_code,
+            ProviderBackedEvidenceReasonCode::ProviderSummaryUnavailable
+        );
+        assert_eq!(
+            plan.provider_evidence.degraded_reason.as_deref(),
+            Some("provider_summary_unavailable")
+        );
+    }
+
+    #[test]
     fn planner_filters_duplicates_conflicts_and_poison() {
         let transcript = vec![
             transcript_record(
@@ -4770,6 +5337,8 @@ Open action items:
 
         assert!(block.starts_with("<session_compaction_summary"));
         assert!(block.contains("budget_guard_v1"));
+        assert!(block.contains("trust_label=\"historical_reference\""));
+        assert!(block.contains("instruction_authority=\"none\""));
         assert!(block.ends_with("</session_compaction_summary>"));
     }
 }

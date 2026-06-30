@@ -33,6 +33,8 @@ use palyra_common::feature_rollouts::{
     NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH, NETWORKED_WORKERS_ROLLOUT_ENV,
     OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH, OBJECTIVE_JUDGE_ROLLOUT_ENV,
     PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH, PROGRESS_DRAFTS_ROLLOUT_ENV,
+    PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_CONFIG_PATH,
+    PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
     PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
     PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
     REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH, REPLAY_CAPTURE_ROLLOUT_ENV,
@@ -1208,6 +1210,12 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.compaction_safeguard.source,
             "config_path": COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH,
             "env_var": COMPACTION_SAFEGUARD_ROLLOUT_ENV,
+        },
+        "provider_backed_evidence_compaction": {
+            "enabled": feature_rollouts.provider_backed_evidence_compaction.enabled,
+            "source": feature_rollouts.provider_backed_evidence_compaction.source,
+            "config_path": PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_CONFIG_PATH,
+            "env_var": PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
         },
         "attack_surface_audit": {
             "enabled": feature_rollouts.attack_surface_audit.enabled,

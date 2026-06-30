@@ -41,9 +41,9 @@ use palyra_common::{
         EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
         FLOW_ORCHESTRATION_ROLLOUT_ENV, NETWORKED_WORKERS_ROLLOUT_ENV, OBJECTIVE_JUDGE_ROLLOUT_ENV,
-        PROGRESS_DRAFTS_ROLLOUT_ENV, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
-        PRUNING_POLICY_MATRIX_ROLLOUT_ENV, REPLAY_CAPTURE_ROLLOUT_ENV,
-        RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
+        PROGRESS_DRAFTS_ROLLOUT_ENV, PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
+        PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
+        REPLAY_CAPTURE_ROLLOUT_ENV, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
         SESSION_QUEUE_POLICY_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV,
         VERIFICATION_RUNTIME_ROLLOUT_ENV,
     },
@@ -302,6 +302,10 @@ pub fn load_config() -> Result<LoadedConfig> {
             }
             if let Some(enabled) = file_feature_rollouts.compaction_safeguard {
                 feature_rollouts.compaction_safeguard = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.provider_backed_evidence_compaction {
+                feature_rollouts.provider_backed_evidence_compaction =
+                    FeatureRolloutSetting::from_config(enabled);
             }
             if let Some(enabled) = file_feature_rollouts.attack_surface_audit {
                 feature_rollouts.attack_surface_audit = FeatureRolloutSetting::from_config(enabled);
@@ -2262,6 +2266,11 @@ pub fn load_config() -> Result<LoadedConfig> {
     feature_rollouts.compaction_safeguard = apply_feature_rollout_env_override(
         feature_rollouts.compaction_safeguard,
         COMPACTION_SAFEGUARD_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.provider_backed_evidence_compaction = apply_feature_rollout_env_override(
+        feature_rollouts.provider_backed_evidence_compaction,
+        PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
         &mut source,
     )?;
     feature_rollouts.attack_surface_audit = apply_feature_rollout_env_override(
@@ -4597,6 +4606,7 @@ mod tests {
             verification_runtime = true
             progress_drafts = false
             compaction_safeguard = true
+            provider_backed_evidence_compaction = false
             attack_surface_audit = false
             "#,
         )
@@ -4627,6 +4637,7 @@ mod tests {
         assert_eq!(feature_rollouts.verification_runtime, Some(true));
         assert_eq!(feature_rollouts.progress_drafts, Some(false));
         assert_eq!(feature_rollouts.compaction_safeguard, Some(true));
+        assert_eq!(feature_rollouts.provider_backed_evidence_compaction, Some(false));
         assert_eq!(feature_rollouts.attack_surface_audit, Some(false));
     }
 

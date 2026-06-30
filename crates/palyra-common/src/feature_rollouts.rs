@@ -62,6 +62,9 @@ pub const VERIFICATION_RUNTIME_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_VERIFICA
 pub const PROGRESS_DRAFTS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS";
 /// Env toggle for the experimental compaction safeguard.
 pub const COMPACTION_SAFEGUARD_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD";
+/// Env toggle for experimental provider-backed evidence compaction.
+pub const PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV: &str =
+    "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION";
 /// Env toggle for the experimental attack-surface audit.
 pub const ATTACK_SURFACE_AUDIT_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT";
 
@@ -120,6 +123,9 @@ pub const VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.ver
 pub const PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.progress_drafts";
 /// Config path for [`COMPACTION_SAFEGUARD_ROLLOUT_ENV`].
 pub const COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.compaction_safeguard";
+/// Config path for [`PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV`].
+pub const PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.provider_backed_evidence_compaction";
 /// Config path for [`ATTACK_SURFACE_AUDIT_ROLLOUT_ENV`].
 pub const ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.attack_surface_audit";
 
