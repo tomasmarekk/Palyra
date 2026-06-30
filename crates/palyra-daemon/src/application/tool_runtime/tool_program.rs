@@ -24,6 +24,7 @@ use palyra_common::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
@@ -37,12 +38,19 @@ use crate::{
         ToolJobTailStream, ToolJobTransitionRequest, ToolResultArtifactCreateRequest,
     },
     tool_protocol::{build_tool_execution_outcome, tool_metadata, ToolExecutionOutcome},
+    transport::grpc::proto::palyra::common::v1 as common_v1,
 };
 
 use super::artifacts::bounded_tool_result_artifact_content;
 use super::process_registry::{
     BackgroundTaskRecord, BackgroundTaskRegistry, CleanupPolicy, ProcessRegistry,
-    RuntimeProcessRecord, RuntimeProcessState,
+    RuntimeProcessDiagnostic, RuntimeProcessRecord, RuntimeProcessState,
+    EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT, EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT,
+    EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION, EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
+};
+use super::process_registry::{
+    ExecutionEnvironmentHealthJournalProjection, ExecutionEnvironmentHealthLongCommandHeartbeat,
+    ExecutionEnvironmentResourceKind,
 };
 use super::tool_rpc::{
     build_python_tool_rpc_bridge_context, execute_granted_tool_rpc_call,
@@ -193,8 +201,8 @@ struct ToolProgramRunResponse {
     budget: ToolProgramBudgetReport,
     python_bridge: PythonToolRpcBridgeContext,
     python_sdk_bytes: usize,
-    process_diagnostics: Vec<Value>,
-    background_task_diagnostics: Vec<Value>,
+    process_diagnostics: Vec<RuntimeProcessDiagnostic>,
+    background_task_diagnostics: Vec<RuntimeProcessDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -203,6 +211,16 @@ enum ToolProgramStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl ToolProgramStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,20 +379,45 @@ async fn execute_validated_program(
         let mut process_registry = ProcessRegistry::default();
         let mut background_registry = BackgroundTaskRegistry::default();
         let cleanup_policy = CleanupPolicy::tool_program_default();
+        let background_task_id = format!("tool-program:{}", request.program_id);
+        let background_started_at_unix_ms = current_unix_ms();
         background_registry.register(BackgroundTaskRecord {
-            task_id: format!("tool-program:{}", request.program_id),
+            task_id: background_task_id.clone(),
             owner: context.run_id.to_owned(),
             purpose: "palyra.tool_program.run".to_owned(),
-            started_at_unix_ms: current_unix_ms(),
+            started_at_unix_ms: background_started_at_unix_ms,
+            last_heartbeat_at_unix_ms: Some(background_started_at_unix_ms),
             cancellation_handle: format!("cancel:{proposal_id}"),
             cleanup_policy: cleanup_policy.clone(),
             state: RuntimeProcessState::Running,
         })?;
+        let started_health = background_registry
+            .heartbeat(background_task_id.as_str(), background_started_at_unix_ms)?;
+        record_execution_environment_health_journal_projection(
+            runtime_state,
+            context,
+            execution_environment_health_journal_projection(
+                EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
+                context,
+                request.program_id.as_str(),
+                ExecutionEnvironmentResourceKind::ToolProgram,
+                started_health,
+                background_started_at_unix_ms,
+                execution_environment_health_evidence_refs(
+                    proposal_id,
+                    job_id.as_str(),
+                    request.program_id.as_str(),
+                    "running",
+                ),
+            ),
+        )
+        .await;
 
         let execution_plan = build_execution_plan(&request)?;
         let mut final_status = ToolProgramStatus::Completed;
         let mut final_error = String::new();
         'program: for level in execution_plan {
+            background_registry.heartbeat(background_task_id.as_str(), current_unix_ms())?;
             if runtime_state
                 .is_orchestrator_cancel_requested(context.run_id.to_owned())
                 .await
@@ -416,11 +459,13 @@ async fn execute_validated_program(
             for step_index in &level {
                 let step = &request.steps[*step_index];
                 let process_id = format!("{}:{}", request.program_id, step.step_id);
+                let process_started_at_unix_ms = current_unix_ms();
                 process_registry.register(RuntimeProcessRecord {
                     process_id,
                     owner: context.run_id.to_owned(),
                     purpose: format!("tool-program-step:{}", step.tool),
-                    started_at_unix_ms: current_unix_ms(),
+                    started_at_unix_ms: process_started_at_unix_ms,
+                    last_heartbeat_at_unix_ms: Some(process_started_at_unix_ms),
                     cancellation_handle: format!("cancel:{proposal_id}:{}", step.step_id),
                     cleanup_policy: cleanup_policy.clone(),
                     state: RuntimeProcessState::Running,
@@ -492,6 +537,8 @@ async fn execute_validated_program(
                         ),
                     })
                     .await;
+                process_registry.heartbeat(process_id.as_str(), current_unix_ms())?;
+                background_registry.heartbeat(background_task_id.as_str(), current_unix_ms())?;
                 if step_result.status == ToolProgramStepStatus::Cancelled {
                     process_registry.cancel(process_id.as_str(), elapsed_millis(started_at))?;
                 } else {
@@ -515,9 +562,36 @@ async fn execute_validated_program(
             }
         }
 
+        let completed_at_unix_ms = current_unix_ms();
+        let final_health =
+            background_registry.heartbeat(background_task_id.as_str(), completed_at_unix_ms)?;
+        let final_event_type = if final_status == ToolProgramStatus::Completed {
+            EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT
+        } else {
+            EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT
+        };
+        record_execution_environment_health_journal_projection(
+            runtime_state,
+            context,
+            execution_environment_health_journal_projection(
+                final_event_type,
+                context,
+                request.program_id.as_str(),
+                ExecutionEnvironmentResourceKind::ToolProgram,
+                final_health,
+                completed_at_unix_ms,
+                execution_environment_health_evidence_refs(
+                    proposal_id,
+                    job_id.as_str(),
+                    request.program_id.as_str(),
+                    final_status.as_str(),
+                ),
+            ),
+        )
+        .await;
+        let process_diagnostics = process_registry.diagnostics(current_unix_ms());
         let _shutdown = process_registry.shutdown(elapsed_millis(started_at));
-        let _ =
-            background_registry.complete(format!("tool-program:{}", request.program_id).as_str());
+        let _ = background_registry.complete(background_task_id.as_str());
         Ok(ToolProgramExecution {
             response: ToolProgramRunResponse {
                 schema_version: TOOL_PROGRAM_SCHEMA_VERSION,
@@ -528,16 +602,8 @@ async fn execute_validated_program(
                 budget,
                 python_bridge,
                 python_sdk_bytes,
-                process_diagnostics: process_registry
-                    .diagnostics(current_unix_ms())
-                    .into_iter()
-                    .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
-                    .collect(),
-                background_task_diagnostics: background_registry
-                    .diagnostics(current_unix_ms())
-                    .into_iter()
-                    .map(|diagnostic| json!({ "id": diagnostic.id, "purpose": diagnostic.purpose }))
-                    .collect(),
+                process_diagnostics,
+                background_task_diagnostics: background_registry.diagnostics(current_unix_ms()),
             },
             final_error,
         })
@@ -545,6 +611,85 @@ async fn execute_validated_program(
     .await;
     transition_tool_program_job(runtime_state, job_id.as_str(), &execution).await;
     execution.map(|execution| (execution.response, execution.final_error))
+}
+
+fn execution_environment_health_journal_projection(
+    event_type: &str,
+    context: ToolRuntimeExecutionContext<'_>,
+    resource_id: &str,
+    resource_kind: ExecutionEnvironmentResourceKind,
+    health: ExecutionEnvironmentHealthLongCommandHeartbeat,
+    created_at_unix_ms: i64,
+    evidence_refs: Vec<String>,
+) -> ExecutionEnvironmentHealthJournalProjection {
+    ExecutionEnvironmentHealthJournalProjection {
+        schema_version: EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION,
+        event_type: event_type.to_owned(),
+        session_id: context.session_id.to_owned(),
+        run_id: context.run_id.to_owned(),
+        resource_id: resource_id.to_owned(),
+        resource_kind,
+        decision: health.decision,
+        reason_codes: health.reason_codes,
+        created_at_unix_ms,
+        evidence_refs,
+        redaction_level: health.redaction_level,
+    }
+}
+
+async fn record_execution_environment_health_journal_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    projection: ExecutionEnvironmentHealthJournalProjection,
+) {
+    let payload_json = match serde_json::to_string(&projection) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(
+                event_type = %projection.event_type,
+                error = %error,
+                "failed to serialize execution environment health journal projection"
+            );
+            return;
+        }
+    };
+    let event_type = projection.event_type.clone();
+    if let Err(error) = runtime_state
+        .record_journal_event(crate::journal::JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: projection.session_id.clone(),
+            run_id: projection.run_id.clone(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: projection.created_at_unix_ms,
+            payload_json: payload_json.into_bytes(),
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            event_type = %event_type,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "execution environment health journal write failed"
+        );
+    }
+}
+
+fn execution_environment_health_evidence_refs(
+    proposal_id: &str,
+    job_id: &str,
+    program_id: &str,
+    status: &str,
+) -> Vec<String> {
+    vec![
+        format!("tool_call:{proposal_id}"),
+        format!("tool_job:{job_id}"),
+        format!("tool_program:{program_id}"),
+        format!("status:{status}"),
+    ]
 }
 
 async fn transition_tool_program_job(

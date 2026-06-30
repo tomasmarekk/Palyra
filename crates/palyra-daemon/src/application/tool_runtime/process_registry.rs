@@ -8,6 +8,38 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+/// Schema version for execution-environment health snapshots.
+pub(crate) const EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION: u32 = 1;
+/// Audit event name for a tracked execution environment starting work.
+pub(crate) const EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT: &str =
+    "execution_environment_health_a_long_command_heartbeat.started";
+/// Audit event name for a tracked execution environment completing work.
+pub(crate) const EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT: &str =
+    "execution_environment_health_a_long_command_heartbeat.completed";
+/// Audit event name for a tracked execution environment failing work.
+pub(crate) const EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT: &str =
+    "execution_environment_health_a_long_command_heartbeat.failed";
+/// Metadata-only redaction posture for execution environment health payloads.
+pub(crate) const EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL: &str = "metadata_only";
+/// Default age after which a live process is treated as a long-running command.
+pub(crate) const DEFAULT_LONG_COMMAND_AFTER_MS: i64 = 30_000;
+/// Default heartbeat age after which a live process is treated as stale.
+pub(crate) const DEFAULT_HEARTBEAT_STALE_AFTER_MS: i64 = 15_000;
+/// Stable reason code for a fresh heartbeat on ordinary live work.
+pub(crate) const EXECUTION_ENVIRONMENT_REASON_HEALTHY: &str =
+    "execution_environment.health.healthy";
+/// Stable reason code for live work whose total age crosses the long-command threshold.
+pub(crate) const EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING: &str =
+    "execution_environment.health.long_running";
+/// Stable reason code for live work whose heartbeat is older than the stale threshold.
+pub(crate) const EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE: &str =
+    "execution_environment.health.heartbeat_stale";
+/// Stable reason code for live work with no heartbeat evidence.
+pub(crate) const EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_MISSING: &str =
+    "execution_environment.health.heartbeat_missing";
+
 /// Bookkeeping record for one tracked tool-runtime process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeProcessRecord {
@@ -15,6 +47,7 @@ pub(crate) struct RuntimeProcessRecord {
     pub(crate) owner: String,
     pub(crate) purpose: String,
     pub(crate) started_at_unix_ms: i64,
+    pub(crate) last_heartbeat_at_unix_ms: Option<i64>,
     pub(crate) cancellation_handle: String,
     pub(crate) cleanup_policy: CleanupPolicy,
     pub(crate) state: RuntimeProcessState,
@@ -27,6 +60,7 @@ pub(crate) struct BackgroundTaskRecord {
     pub(crate) owner: String,
     pub(crate) purpose: String,
     pub(crate) started_at_unix_ms: i64,
+    pub(crate) last_heartbeat_at_unix_ms: Option<i64>,
     pub(crate) cancellation_handle: String,
     pub(crate) cleanup_policy: CleanupPolicy,
     pub(crate) state: RuntimeProcessState,
@@ -36,7 +70,7 @@ pub(crate) struct BackgroundTaskRecord {
 ///
 /// Invariant (enforced by [`ProcessRegistry::register`]):
 /// `graceful_timeout_ms <= hard_kill_after_ms`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CleanupPolicy {
     pub(crate) graceful_timeout_ms: u64,
     pub(crate) hard_kill_after_ms: u64,
@@ -56,7 +90,8 @@ impl CleanupPolicy {
 }
 
 /// Lifecycle state of a tracked process or background task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RuntimeProcessState {
     Running,
     Cancelling,
@@ -72,8 +107,54 @@ impl RuntimeProcessState {
     }
 }
 
+/// Operator-facing health decision for one live execution environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionEnvironmentHealthDecision {
+    Healthy,
+    LongRunning,
+    StaleHeartbeat,
+    Unknown,
+}
+
+/// Health snapshot carried by process and background-task diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionEnvironmentHealthLongCommandHeartbeat {
+    pub(crate) schema_version: u32,
+    pub(crate) decision: ExecutionEnvironmentHealthDecision,
+    pub(crate) age_ms: i64,
+    pub(crate) heartbeat_age_ms: Option<i64>,
+    pub(crate) long_command_after_ms: i64,
+    pub(crate) heartbeat_stale_after_ms: i64,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Resource family represented by an execution-environment journal projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionEnvironmentResourceKind {
+    ToolProgram,
+}
+
+/// Metadata-only journal projection for execution-environment health events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionEnvironmentHealthJournalProjection {
+    pub(crate) schema_version: u32,
+    pub(crate) event_type: String,
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) resource_id: String,
+    pub(crate) resource_kind: ExecutionEnvironmentResourceKind,
+    pub(crate) decision: ExecutionEnvironmentHealthDecision,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
 /// Read-only snapshot of one live (non-terminal) record for diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeProcessDiagnostic {
     pub(crate) id: String,
     pub(crate) owner: String,
@@ -81,6 +162,7 @@ pub(crate) struct RuntimeProcessDiagnostic {
     pub(crate) state: RuntimeProcessState,
     pub(crate) age_ms: i64,
     pub(crate) cleanup_policy: CleanupPolicy,
+    pub(crate) health: ExecutionEnvironmentHealthLongCommandHeartbeat,
 }
 
 /// Per-state counts produced by [`ProcessRegistry::shutdown`].
@@ -136,6 +218,23 @@ impl ProcessRegistry {
         Ok(())
     }
 
+    /// Records a process heartbeat and returns the current health snapshot.
+    ///
+    /// # Errors
+    /// Returns an error when `process_id` is not registered.
+    pub(crate) fn heartbeat(
+        &mut self,
+        process_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<ExecutionEnvironmentHealthLongCommandHeartbeat, String> {
+        let record = self
+            .records
+            .get_mut(process_id)
+            .ok_or_else(|| format!("process '{process_id}' is not registered"))?;
+        record.last_heartbeat_at_unix_ms = Some(now_unix_ms);
+        Ok(process_health(record, now_unix_ms))
+    }
+
     /// Records a cancellation attempt, escalating the state by how long the
     /// cancellation has already been in flight (`elapsed_ms`).
     ///
@@ -167,8 +266,9 @@ impl ProcessRegistry {
                 owner: record.owner.clone(),
                 purpose: record.purpose.clone(),
                 state: record.state,
-                age_ms: now_unix_ms.saturating_sub(record.started_at_unix_ms),
+                age_ms: non_negative_elapsed_ms(now_unix_ms, record.started_at_unix_ms),
                 cleanup_policy: record.cleanup_policy.clone(),
+                health: process_health(record, now_unix_ms),
             })
             .collect()
     }
@@ -233,6 +333,23 @@ impl BackgroundTaskRegistry {
         Ok(())
     }
 
+    /// Records a background task heartbeat and returns the current health snapshot.
+    ///
+    /// # Errors
+    /// Returns an error when `task_id` is not registered.
+    pub(crate) fn heartbeat(
+        &mut self,
+        task_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<ExecutionEnvironmentHealthLongCommandHeartbeat, String> {
+        let record = self
+            .records
+            .get_mut(task_id)
+            .ok_or_else(|| format!("background task '{task_id}' is not registered"))?;
+        record.last_heartbeat_at_unix_ms = Some(now_unix_ms);
+        Ok(background_task_health(record, now_unix_ms))
+    }
+
     /// Returns snapshots of all non-terminal tasks, aged against
     /// `now_unix_ms`.
     pub(crate) fn diagnostics(&self, now_unix_ms: i64) -> Vec<RuntimeProcessDiagnostic> {
@@ -244,11 +361,80 @@ impl BackgroundTaskRegistry {
                 owner: record.owner.clone(),
                 purpose: record.purpose.clone(),
                 state: record.state,
-                age_ms: now_unix_ms.saturating_sub(record.started_at_unix_ms),
+                age_ms: non_negative_elapsed_ms(now_unix_ms, record.started_at_unix_ms),
                 cleanup_policy: record.cleanup_policy.clone(),
+                health: background_task_health(record, now_unix_ms),
             })
             .collect()
     }
+}
+
+fn process_health(
+    record: &RuntimeProcessRecord,
+    now_unix_ms: i64,
+) -> ExecutionEnvironmentHealthLongCommandHeartbeat {
+    execution_environment_health(
+        record.started_at_unix_ms,
+        record.last_heartbeat_at_unix_ms,
+        now_unix_ms,
+    )
+}
+
+fn background_task_health(
+    record: &BackgroundTaskRecord,
+    now_unix_ms: i64,
+) -> ExecutionEnvironmentHealthLongCommandHeartbeat {
+    execution_environment_health(
+        record.started_at_unix_ms,
+        record.last_heartbeat_at_unix_ms,
+        now_unix_ms,
+    )
+}
+
+fn execution_environment_health(
+    started_at_unix_ms: i64,
+    last_heartbeat_at_unix_ms: Option<i64>,
+    now_unix_ms: i64,
+) -> ExecutionEnvironmentHealthLongCommandHeartbeat {
+    let age_ms = non_negative_elapsed_ms(now_unix_ms, started_at_unix_ms);
+    let heartbeat_age_ms = last_heartbeat_at_unix_ms
+        .map(|heartbeat_at| non_negative_elapsed_ms(now_unix_ms, heartbeat_at));
+    let long_running = age_ms >= DEFAULT_LONG_COMMAND_AFTER_MS;
+    let heartbeat_stale =
+        heartbeat_age_ms.is_some_and(|age| age >= DEFAULT_HEARTBEAT_STALE_AFTER_MS);
+
+    let mut reason_codes = Vec::new();
+    let decision = if last_heartbeat_at_unix_ms.is_none() {
+        reason_codes.push(EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_MISSING.to_owned());
+        ExecutionEnvironmentHealthDecision::Unknown
+    } else if heartbeat_stale {
+        if long_running {
+            reason_codes.push(EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING.to_owned());
+        }
+        reason_codes.push(EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE.to_owned());
+        ExecutionEnvironmentHealthDecision::StaleHeartbeat
+    } else if long_running {
+        reason_codes.push(EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING.to_owned());
+        ExecutionEnvironmentHealthDecision::LongRunning
+    } else {
+        reason_codes.push(EXECUTION_ENVIRONMENT_REASON_HEALTHY.to_owned());
+        ExecutionEnvironmentHealthDecision::Healthy
+    };
+
+    ExecutionEnvironmentHealthLongCommandHeartbeat {
+        schema_version: EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION,
+        decision,
+        age_ms,
+        heartbeat_age_ms,
+        long_command_after_ms: DEFAULT_LONG_COMMAND_AFTER_MS,
+        heartbeat_stale_after_ms: DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+        reason_codes,
+        redaction_level: EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn non_negative_elapsed_ms(now_unix_ms: i64, then_unix_ms: i64) -> i64 {
+    now_unix_ms.saturating_sub(then_unix_ms).max(0)
 }
 
 fn validate_record_fields(
@@ -275,8 +461,13 @@ fn validate_record_fields(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundTaskRecord, BackgroundTaskRegistry, CleanupPolicy, ProcessRegistry,
-        RuntimeProcessRecord, RuntimeProcessState,
+        BackgroundTaskRecord, BackgroundTaskRegistry, CleanupPolicy,
+        ExecutionEnvironmentHealthDecision, ExecutionEnvironmentHealthJournalProjection,
+        ExecutionEnvironmentResourceKind, ProcessRegistry, RuntimeProcessRecord,
+        RuntimeProcessState, EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL,
+        EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION, EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
+        EXECUTION_ENVIRONMENT_REASON_HEALTHY, EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE,
+        EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING,
     };
 
     #[test]
@@ -288,6 +479,7 @@ mod tests {
                 owner: "run-1".to_owned(),
                 purpose: "tool-program-step".to_owned(),
                 started_at_unix_ms: 1_000,
+                last_heartbeat_at_unix_ms: Some(1_000),
                 cancellation_handle: "cancel-proc-1".to_owned(),
                 cleanup_policy: CleanupPolicy::tool_program_default(),
                 state: RuntimeProcessState::Running,
@@ -297,10 +489,113 @@ mod tests {
         let diagnostics = registry.diagnostics(1_250);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].age_ms, 250);
+        assert_eq!(diagnostics[0].health.decision, ExecutionEnvironmentHealthDecision::Healthy);
+        assert_eq!(diagnostics[0].health.heartbeat_age_ms, Some(250));
+        assert_eq!(
+            diagnostics[0].health.reason_codes,
+            vec![EXECUTION_ENVIRONMENT_REASON_HEALTHY.to_owned()]
+        );
 
         let shutdown = registry.shutdown(6_000);
         assert_eq!(shutdown.hard_killed, 1);
         assert!(registry.diagnostics(7_000).is_empty());
+    }
+
+    #[test]
+    fn process_registry_marks_long_running_and_stale_heartbeat() {
+        let mut registry = ProcessRegistry::default();
+        registry
+            .register(RuntimeProcessRecord {
+                process_id: "proc-1".to_owned(),
+                owner: "run-1".to_owned(),
+                purpose: "tool-program-step".to_owned(),
+                started_at_unix_ms: 1_000,
+                last_heartbeat_at_unix_ms: Some(2_000),
+                cancellation_handle: "cancel-proc-1".to_owned(),
+                cleanup_policy: CleanupPolicy::tool_program_default(),
+                state: RuntimeProcessState::Running,
+            })
+            .expect("process should register");
+
+        let diagnostics = registry.diagnostics(40_000);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].health.decision,
+            ExecutionEnvironmentHealthDecision::StaleHeartbeat
+        );
+        assert_eq!(
+            diagnostics[0].health.reason_codes,
+            vec![
+                EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING.to_owned(),
+                EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE.to_owned()
+            ]
+        );
+
+        let refreshed = registry
+            .heartbeat("proc-1", 39_500)
+            .expect("heartbeat should update registered process");
+        assert_eq!(refreshed.decision, ExecutionEnvironmentHealthDecision::LongRunning);
+        assert_eq!(refreshed.heartbeat_age_ms, Some(0));
+
+        let diagnostics = registry.diagnostics(40_000);
+        assert_eq!(diagnostics[0].health.decision, ExecutionEnvironmentHealthDecision::LongRunning);
+        assert_eq!(diagnostics[0].health.heartbeat_age_ms, Some(500));
+    }
+
+    #[test]
+    fn execution_environment_health_snapshot_round_trips_as_json() {
+        let mut registry = ProcessRegistry::default();
+        registry
+            .register(RuntimeProcessRecord {
+                process_id: "proc-1".to_owned(),
+                owner: "run-1".to_owned(),
+                purpose: "tool-program-step".to_owned(),
+                started_at_unix_ms: 1_000,
+                last_heartbeat_at_unix_ms: Some(1_000),
+                cancellation_handle: "cancel-proc-1".to_owned(),
+                cleanup_policy: CleanupPolicy::tool_program_default(),
+                state: RuntimeProcessState::Running,
+            })
+            .expect("process should register");
+        let snapshot = registry
+            .diagnostics(1_250)
+            .into_iter()
+            .next()
+            .expect("registered process should produce diagnostics")
+            .health;
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        let decoded: super::ExecutionEnvironmentHealthLongCommandHeartbeat =
+            serde_json::from_str(encoded.as_str()).expect("snapshot should deserialize");
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(decoded.schema_version, EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn execution_environment_health_journal_projection_serializes_stable_contract() {
+        let projection = ExecutionEnvironmentHealthJournalProjection {
+            schema_version: EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION,
+            event_type: EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT.to_owned(),
+            session_id: "session-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            resource_id: "program-1".to_owned(),
+            resource_kind: ExecutionEnvironmentResourceKind::ToolProgram,
+            decision: ExecutionEnvironmentHealthDecision::Healthy,
+            reason_codes: vec![EXECUTION_ENVIRONMENT_REASON_HEALTHY.to_owned()],
+            created_at_unix_ms: 1_000,
+            evidence_refs: vec!["tool_call:proposal-1".to_owned()],
+            redaction_level: EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL.to_owned(),
+        };
+
+        let encoded = serde_json::to_value(&projection).expect("projection should serialize");
+        assert_eq!(encoded["event_type"], EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT);
+        assert_eq!(encoded["resource_kind"], "tool_program");
+        assert_eq!(encoded["redaction_level"], EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL);
+
+        let decoded: ExecutionEnvironmentHealthJournalProjection =
+            serde_json::from_value(encoded).expect("projection should deserialize");
+        assert_eq!(decoded, projection);
     }
 
     #[test]
@@ -312,6 +607,7 @@ mod tests {
                 owner: "run-1".to_owned(),
                 purpose: "tool-program".to_owned(),
                 started_at_unix_ms: 1_000,
+                last_heartbeat_at_unix_ms: Some(1_000),
                 cancellation_handle: String::new(),
                 cleanup_policy: CleanupPolicy::tool_program_default(),
                 state: RuntimeProcessState::Running,

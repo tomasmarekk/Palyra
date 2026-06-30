@@ -2573,6 +2573,31 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
             "tool_output_source": "palyra.fs.apply_patch.diagnostics.runtime",
             "redaction_level": crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL,
         },
+        "execution_environment_health": {
+            "schema_version": crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION,
+            "rollout_mode": "observe_only",
+            "runtime_behavior": "metadata_only_diagnostics",
+            "journal_events": [
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT,
+            ],
+            "tool_output_sources": [
+                "palyra.tool_program.run.process_diagnostics",
+                "palyra.tool_program.run.background_task_diagnostics",
+            ],
+            "thresholds": {
+                "long_command_after_ms": crate::application::tool_runtime::process_registry::DEFAULT_LONG_COMMAND_AFTER_MS,
+                "heartbeat_stale_after_ms": crate::application::tool_runtime::process_registry::DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+            },
+            "reason_codes": [
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_HEALTHY,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_MISSING,
+            ],
+            "redaction_level": crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL,
+        },
         "replay_bundle_metadata": build_replay_support_observability(),
         "worker_diagnostics": networked_workers,
     })
