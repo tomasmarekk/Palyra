@@ -14,6 +14,8 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use toml::{map::Entry, Value};
 
@@ -21,6 +23,10 @@ use toml::{map::Entry, Value};
 pub const CONFIG_VERSION_V1: u32 = 1;
 /// Default number of rotating `.bak.N` copies kept beside a config file.
 pub const DEFAULT_CONFIG_BACKUP_ROTATION: usize = 5;
+/// Audit event emitted after an operator promotes a validated config baseline.
+pub const CONFIG_LAST_GOOD_PROMOTED_EVENT_TYPE: &str = "config.last_good.promoted";
+/// Audit event emitted before applying a last-known-good restore.
+pub const CONFIG_LAST_GOOD_RESTORE_PLANNED_EVENT_TYPE: &str = "config.last_good.restore_planned";
 // Rejected defensively: config paths round-trip through JSON/JS consumers
 // (web console, import/export), where these keys enable prototype pollution.
 const FORBIDDEN_PATH_SEGMENTS: &[&str] = &["__proto__", "prototype", "constructor"];
@@ -96,6 +102,60 @@ pub enum ConfigSystemError {
     InvalidBackupIndex,
     #[error("backup file not found: {path}")]
     BackupNotFound { path: PathBuf },
+    #[error("last-known-good config restore rejected: {reason}")]
+    LastKnownGoodRestoreRejected { reason: String },
+}
+
+/// Metadata for a config backup promoted or inspected as a last-known-good candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastKnownGoodConfig {
+    /// Schema version of this metadata record.
+    pub schema_version: u32,
+    /// Active config path the backup belongs to.
+    pub source_path: String,
+    /// Backup file path used as the candidate.
+    pub backup_path: String,
+    /// Numbered `.bak.N` slot used by the candidate.
+    pub backup_index: usize,
+    /// Config schema version after parsing and supported migration.
+    pub config_version: u32,
+    /// Original version when parsing had to migrate the candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migrated_from_version: Option<u32>,
+    /// SHA-256 of the candidate bytes before migration.
+    pub content_sha256: String,
+    /// Filesystem modification time for the candidate, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_modified_at_unix_ms: Option<i64>,
+    /// Event type to record when this candidate is promoted.
+    pub promoted_event_type: String,
+    /// Event type to record before restoring this candidate.
+    pub restore_planned_event_type: String,
+}
+
+/// Restore status for a last-known-good config candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastKnownGoodRestoreStatus {
+    /// Candidate may be restored without a schema migration.
+    Restorable,
+    /// Candidate is valid but needs explicit migration before restore.
+    MigrationRequired,
+    /// Candidate schema does not match the active runtime contract.
+    Rejected,
+}
+
+/// Plan for restoring a last-known-good config candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastKnownGoodRestorePlan {
+    /// Candidate metadata.
+    pub candidate: LastKnownGoodConfig,
+    /// Restore verdict.
+    pub status: LastKnownGoodRestoreStatus,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Operator-facing remediation hint.
+    pub remediation_hint: String,
 }
 
 /// Parses TOML config content and migrates it to the supported version.
@@ -417,6 +477,101 @@ pub fn backup_path(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// Inspects a numbered config backup as a last-known-good candidate.
+///
+/// The returned metadata contains a SHA-256 of the original backup bytes and
+/// records whether parsing required a schema migration. Call
+/// [`plan_last_known_good_restore`] before any restore so candidates with a
+/// mismatched schema are rejected explicitly instead of being applied silently.
+///
+/// # Errors
+/// Returns an error when `backup_index` is zero, the backup is missing, the
+/// bytes are not UTF-8, or the candidate is not a supported config document.
+pub fn inspect_last_known_good_config(
+    path: &Path,
+    backup_index: usize,
+) -> Result<LastKnownGoodConfig, ConfigSystemError> {
+    if backup_index == 0 {
+        return Err(ConfigSystemError::InvalidBackupIndex);
+    }
+    let candidate_path = backup_path(path, backup_index);
+    if !candidate_path.exists() {
+        return Err(ConfigSystemError::BackupNotFound { path: candidate_path });
+    }
+    let bytes = fs::read(&candidate_path)
+        .map_err(|source| ConfigSystemError::ReadFile { path: candidate_path.clone(), source })?;
+    let content = std::str::from_utf8(bytes.as_slice()).map_err(|source| {
+        ConfigSystemError::LastKnownGoodRestoreRejected {
+            reason: format!("candidate backup is not valid UTF-8 TOML: {source}"),
+        }
+    })?;
+    let (_, migration) = parse_document_with_migration(content)?;
+    let metadata = fs::metadata(&candidate_path).ok();
+    Ok(LastKnownGoodConfig {
+        schema_version: 1,
+        source_path: path.display().to_string(),
+        backup_path: candidate_path.display().to_string(),
+        backup_index,
+        config_version: migration.target_version,
+        migrated_from_version: migration.migrated.then_some(migration.source_version),
+        content_sha256: sha256_hex(bytes.as_slice()),
+        candidate_modified_at_unix_ms: metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_unix_ms),
+        promoted_event_type: CONFIG_LAST_GOOD_PROMOTED_EVENT_TYPE.to_owned(),
+        restore_planned_event_type: CONFIG_LAST_GOOD_RESTORE_PLANNED_EVENT_TYPE.to_owned(),
+    })
+}
+
+/// Plans a last-known-good restore without mutating the config file.
+///
+/// A candidate is restorable only when its config schema version exactly
+/// matches the active runtime version and parsing did not require migration.
+#[must_use]
+pub fn plan_last_known_good_restore(
+    candidate: LastKnownGoodConfig,
+    active_config_version: u32,
+) -> LastKnownGoodRestorePlan {
+    if candidate.config_version != active_config_version {
+        return LastKnownGoodRestorePlan {
+            candidate,
+            status: LastKnownGoodRestoreStatus::Rejected,
+            reason_code: "config.last_good.schema_version_mismatch".to_owned(),
+            remediation_hint:
+                "Validate and migrate the backup explicitly before restoring it as last-known-good."
+                    .to_owned(),
+        };
+    }
+    if candidate.migrated_from_version.is_some() {
+        return LastKnownGoodRestorePlan {
+            candidate,
+            status: LastKnownGoodRestoreStatus::MigrationRequired,
+            reason_code: "config.last_good.migration_required".to_owned(),
+            remediation_hint:
+                "Run config migration on the candidate, then promote the migrated document."
+                    .to_owned(),
+        };
+    }
+    LastKnownGoodRestorePlan {
+        candidate,
+        status: LastKnownGoodRestoreStatus::Restorable,
+        reason_code: "config.last_good.restorable".to_owned(),
+        remediation_hint: "Restore can proceed after the operator confirms the selected backup."
+            .to_owned(),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn system_time_to_unix_ms(time: SystemTime) -> Option<i64> {
+    let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok()
+}
+
 fn parse_version(value: &Value) -> Result<u32, ConfigSystemError> {
     let raw = value.as_integer().ok_or(ConfigSystemError::InvalidVersionType)?;
     if raw <= 0 {
@@ -574,10 +729,12 @@ mod tests {
     use toml::Value;
 
     use super::{
-        backup_path, format_toml_value, get_value_at_path, parse_document_with_migration,
-        parse_toml_value_literal, recover_config_from_backup, set_value_at_path,
-        unset_value_at_path, write_document_with_backups, write_secret_document_with_backups,
-        ConfigMigrationInfo, ConfigSystemError, CONFIG_VERSION_V1,
+        backup_path, format_toml_value, get_value_at_path, inspect_last_known_good_config,
+        parse_document_with_migration, parse_toml_value_literal, plan_last_known_good_restore,
+        recover_config_from_backup, set_value_at_path, unset_value_at_path,
+        write_document_with_backups, write_secret_document_with_backups, ConfigMigrationInfo,
+        ConfigSystemError, LastKnownGoodRestoreStatus, CONFIG_LAST_GOOD_PROMOTED_EVENT_TYPE,
+        CONFIG_LAST_GOOD_RESTORE_PLANNED_EVENT_TYPE, CONFIG_VERSION_V1,
     };
 
     #[test]
@@ -784,6 +941,49 @@ mod tests {
         assert_eq!(recovered, backup_path(&config_path, 2));
         let restored = fs::read_to_string(&config_path)?;
         assert!(restored.contains("7000"), "recover should restore the selected backup content");
+        Ok(())
+    }
+
+    #[test]
+    fn last_known_good_inspection_reports_restorable_backup_metadata() -> Result<()> {
+        let tempdir = TempDir::new().expect("failed to create tempdir");
+        let config_path = tempdir.path().join("palyra.toml");
+        fs::write(&config_path, "version = 1\n[daemon]\nport = 7000\n")?;
+        let (mut document, _) = parse_document_with_migration(&fs::read_to_string(&config_path)?)?;
+        set_value_at_path(&mut document, "daemon.port", Value::Integer(7001))?;
+        write_document_with_backups(&config_path, &document, 2)?;
+
+        let candidate = inspect_last_known_good_config(&config_path, 1)?;
+        let plan = plan_last_known_good_restore(candidate.clone(), CONFIG_VERSION_V1);
+
+        assert_eq!(candidate.backup_index, 1);
+        assert_eq!(candidate.config_version, CONFIG_VERSION_V1);
+        assert_eq!(candidate.migrated_from_version, None);
+        assert_eq!(candidate.content_sha256.len(), 64);
+        assert_eq!(candidate.promoted_event_type, CONFIG_LAST_GOOD_PROMOTED_EVENT_TYPE);
+        assert_eq!(
+            candidate.restore_planned_event_type,
+            CONFIG_LAST_GOOD_RESTORE_PLANNED_EVENT_TYPE
+        );
+        assert_eq!(plan.status, LastKnownGoodRestoreStatus::Restorable);
+        assert_eq!(plan.reason_code, "config.last_good.restorable");
+        Ok(())
+    }
+
+    #[test]
+    fn last_known_good_restore_plan_rejects_migration_required_candidate() -> Result<()> {
+        let tempdir = TempDir::new().expect("failed to create tempdir");
+        let config_path = tempdir.path().join("palyra.toml");
+        fs::write(&config_path, "[daemon]\nport = 7000\n")?;
+        let mut document = Value::Table(Default::default());
+        set_value_at_path(&mut document, "daemon.port", Value::Integer(7001))?;
+        write_document_with_backups(&config_path, &document, 2)?;
+
+        let candidate = inspect_last_known_good_config(&config_path, 1)?;
+        let plan = plan_last_known_good_restore(candidate, CONFIG_VERSION_V1);
+
+        assert_eq!(plan.status, LastKnownGoodRestoreStatus::MigrationRequired);
+        assert_eq!(plan.reason_code, "config.last_good.migration_required");
         Ok(())
     }
 }
