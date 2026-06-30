@@ -24,6 +24,7 @@ use palyra_common::workspace_patch::{
     compute_patch_sha256, redact_patch_preview, WorkspacePatchError, WorkspacePatchLimits,
     WorkspacePatchOutcome, WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -52,6 +53,8 @@ use checkpoint_flow::WorkspacePatchMutationRequest;
 /// Model-facing patch grammar primer attached to every failure payload so
 /// the model can self-repair; pinned verbatim by tests.
 const WORKSPACE_PATCH_GRAMMAR_HINT: &str = "Use a complete Palyra patch document: begin with exactly '*** Begin Patch', then operation headers like '*** Add File: path', '*** Replace File: path', '*** Replace Line: path', or '*** Update File: path', end with exactly one '*** End Patch'. Never send a partial or truncated patch. For large file creation or multi-file changes, split work into multiple smaller complete apply_patch calls. Add-file and replace-file content lines may start with '+', and a bare '+' or '+ ' writes a blank line. Use Add File only for missing files. If search/read_file confirmed one exact target line, use Replace Line with exactly one '-' old line and one '+' new line. If an Update File hunk fails with context not found, read the current file and retry with Replace Line for a unique exact line, fresh context hunks, or Replace File plus the full intended file content. Update-file hunks must start with '@@'; hunk lines should start with ' ', '+', or '-', and a bare empty hunk line is accepted as blank context. To edit file content that itself begins with '-' or '+', prefix it directly with the hunk marker, for example '-- markdown item' removes '- markdown item' and '++value' adds '+value'. JSON files are validated after patch planning; if JSON validation fails, retry with the complete valid JSON file content.";
+const WORKSPACE_PATCH_FAILURE_SCHEMA_VERSION: u32 = 1;
+const WORKSPACE_PATCH_FAILURE_REDACTION_LEVEL: &str = "metadata_and_redacted_preview";
 
 /// Borrowed execution context for one apply_patch invocation.
 pub(crate) struct WorkspacePatchToolRequest<'a> {
@@ -1219,6 +1222,7 @@ fn workspace_patch_error_outcome(
         "parse_error": error
             .parse_location()
             .map(|(line, column)| json!({ "line": line, "column": column })),
+        "failure_tracker": workspace_patch_failure_tracker(error),
         "recovery_hint": workspace_patch_recovery_hint(error),
         "grammar_hint": WORKSPACE_PATCH_GRAMMAR_HINT,
         "error": error.to_string(),
@@ -1234,6 +1238,131 @@ fn workspace_patch_error_outcome(
             workspace_patch_recovery_hint(error)
         ),
     )
+}
+
+/// Compact failure tracker included in failed patch outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkspacePatchFailureTracker {
+    schema_version: u32,
+    failure_class: WorkspacePatchFailureClass,
+    reason_code: String,
+    stale_view_possible: bool,
+    retry_recommended: bool,
+    remediation_hints: Vec<String>,
+    redaction_level: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspacePatchFailureClass {
+    Bounds,
+    Io,
+    Parse,
+    StaleView,
+    Validation,
+}
+
+fn workspace_patch_failure_tracker(error: &WorkspacePatchError) -> WorkspacePatchFailureTracker {
+    let stale_view_possible = workspace_patch_stale_view_possible(error);
+    WorkspacePatchFailureTracker {
+        schema_version: WORKSPACE_PATCH_FAILURE_SCHEMA_VERSION,
+        failure_class: workspace_patch_failure_class(error),
+        reason_code: workspace_patch_failure_reason_code(error).to_owned(),
+        stale_view_possible,
+        retry_recommended: workspace_patch_retry_recommended(error),
+        remediation_hints: workspace_patch_remediation_hints(error, stale_view_possible),
+        redaction_level: WORKSPACE_PATCH_FAILURE_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn workspace_patch_failure_class(error: &WorkspacePatchError) -> WorkspacePatchFailureClass {
+    match error {
+        WorkspacePatchError::PatchTooLarge { .. }
+        | WorkspacePatchError::TooManyFiles { .. }
+        | WorkspacePatchError::FileTooLarge { .. } => WorkspacePatchFailureClass::Bounds,
+        WorkspacePatchError::Io { .. } | WorkspacePatchError::ExecutionFailed { .. } => {
+            WorkspacePatchFailureClass::Io
+        }
+        WorkspacePatchError::Parse { .. } => WorkspacePatchFailureClass::Parse,
+        WorkspacePatchError::HunkApplyFailed { .. }
+        | WorkspacePatchError::MissingFile { .. }
+        | WorkspacePatchError::FileAlreadyExists { .. }
+        | WorkspacePatchError::SuspiciousPartialReplace { .. } => {
+            WorkspacePatchFailureClass::StaleView
+        }
+        WorkspacePatchError::EmptyWorkspaceRoots
+        | WorkspacePatchError::InvalidWorkspaceRoot { .. }
+        | WorkspacePatchError::InvalidPatchPath { .. }
+        | WorkspacePatchError::PathOutsideWorkspace { .. }
+        | WorkspacePatchError::NotARegularFile { .. }
+        | WorkspacePatchError::InvalidUtf8File { .. }
+        | WorkspacePatchError::InvalidJsonFile { .. }
+        | WorkspacePatchError::RedactionPlaceholderInSecretFile { .. } => {
+            WorkspacePatchFailureClass::Validation
+        }
+    }
+}
+
+fn workspace_patch_failure_reason_code(error: &WorkspacePatchError) -> &'static str {
+    match error {
+        WorkspacePatchError::PatchTooLarge { .. } => "workspace_patch.patch_too_large",
+        WorkspacePatchError::TooManyFiles { .. } => "workspace_patch.too_many_files",
+        WorkspacePatchError::EmptyWorkspaceRoots => "workspace_patch.empty_workspace_roots",
+        WorkspacePatchError::InvalidWorkspaceRoot { .. } => {
+            "workspace_patch.invalid_workspace_root"
+        }
+        WorkspacePatchError::Parse { .. } => "workspace_patch.parse_error",
+        WorkspacePatchError::InvalidPatchPath { .. } => "workspace_patch.invalid_patch_path",
+        WorkspacePatchError::PathOutsideWorkspace { .. } => {
+            "workspace_patch.path_outside_workspace"
+        }
+        WorkspacePatchError::MissingFile { .. } => "workspace_patch.missing_file",
+        WorkspacePatchError::FileAlreadyExists { .. } => "workspace_patch.file_already_exists",
+        WorkspacePatchError::FileTooLarge { .. } => "workspace_patch.file_too_large",
+        WorkspacePatchError::NotARegularFile { .. } => "workspace_patch.not_regular_file",
+        WorkspacePatchError::InvalidUtf8File { .. } => "workspace_patch.invalid_utf8_file",
+        WorkspacePatchError::InvalidJsonFile { .. } => "workspace_patch.invalid_json_file",
+        WorkspacePatchError::RedactionPlaceholderInSecretFile { .. } => {
+            "workspace_patch.redaction_placeholder_in_secret_file"
+        }
+        WorkspacePatchError::SuspiciousPartialReplace { .. } => {
+            "workspace_patch.suspicious_partial_replace"
+        }
+        WorkspacePatchError::HunkApplyFailed { .. } => "workspace_patch.hunk_apply_failed",
+        WorkspacePatchError::Io { .. } => "workspace_patch.io_error",
+        WorkspacePatchError::ExecutionFailed { .. } => "workspace_patch.execution_failed",
+    }
+}
+
+fn workspace_patch_stale_view_possible(error: &WorkspacePatchError) -> bool {
+    matches!(
+        error,
+        WorkspacePatchError::HunkApplyFailed { .. }
+            | WorkspacePatchError::MissingFile { .. }
+            | WorkspacePatchError::FileAlreadyExists { .. }
+            | WorkspacePatchError::SuspiciousPartialReplace { .. }
+    )
+}
+
+fn workspace_patch_retry_recommended(error: &WorkspacePatchError) -> bool {
+    !matches!(
+        error,
+        WorkspacePatchError::PathOutsideWorkspace { .. }
+            | WorkspacePatchError::RedactionPlaceholderInSecretFile { .. }
+    )
+}
+
+fn workspace_patch_remediation_hints(
+    error: &WorkspacePatchError,
+    stale_view_possible: bool,
+) -> Vec<String> {
+    let mut hints = vec![workspace_patch_recovery_hint(error).to_owned()];
+    if stale_view_possible {
+        hints.push(
+            "Refresh the current file view before retrying, then target one exact current line or provide a complete file replacement.".to_owned(),
+        );
+    }
+    hints
 }
 
 /// Picks the model-facing recovery instruction for an error class; hints are
@@ -1913,6 +2042,18 @@ mod tests {
             Some(WORKSPACE_PATCH_GRAMMAR_HINT)
         );
         assert_eq!(payload.pointer("/parse_error/line").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            payload.pointer("/failure_tracker/reason_code").and_then(Value::as_str),
+            Some("workspace_patch.parse_error")
+        );
+        assert_eq!(
+            payload.pointer("/failure_tracker/failure_class").and_then(Value::as_str),
+            Some("parse")
+        );
+        assert_eq!(
+            payload.pointer("/failure_tracker/stale_view_possible").and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1943,5 +2084,38 @@ mod tests {
         let payload: Value =
             serde_json::from_slice(outcome.output_json.as_slice()).expect("valid failure json");
         assert_eq!(payload.get("recovery_hint").and_then(Value::as_str), Some(expected_hint));
+    }
+
+    #[test]
+    fn hunk_apply_failure_tracker_surfaces_stale_view_remediation() {
+        let error = WorkspacePatchError::HunkApplyFailed {
+            path: "src/lib.rs".to_owned(),
+            message: "context not found".to_owned(),
+        };
+
+        let outcome = workspace_patch_error_outcome(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            br#"{"patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"}"#,
+            false,
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n",
+            &Default::default(),
+            &WorkspacePatchLimits::default(),
+            &error,
+        );
+
+        let payload: Value =
+            serde_json::from_slice(outcome.output_json.as_slice()).expect("valid failure json");
+        let tracker = &payload["failure_tracker"];
+        assert_eq!(tracker["failure_class"], "stale_view");
+        assert_eq!(tracker["reason_code"], "workspace_patch.hunk_apply_failed");
+        assert_eq!(tracker["stale_view_possible"], true);
+        assert_eq!(tracker["retry_recommended"], true);
+        assert!(tracker["remediation_hints"]
+            .as_array()
+            .expect("remediation hints should be an array")
+            .iter()
+            .any(|hint| hint
+                .as_str()
+                .is_some_and(|hint| hint.contains("Refresh the current file view"))));
     }
 }
