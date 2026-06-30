@@ -2545,6 +2545,20 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
             "tool_output_source": "palyra.fs.apply_patch.coding_posture.project_facts",
             "redaction_level": crate::application::project_facts::PROJECT_FACTS_REDACTION_LEVEL,
         },
+        "verification_ledger": {
+            "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+            "rollout_enabled": state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            "rollout_source": state.runtime.config.feature_rollouts.verification_runtime.source,
+            "journal_events": [
+                crate::application::verification::VERIFICATION_EVENT_RECORDED,
+                crate::application::verification::VERIFICATION_STATE_STALE,
+                crate::application::verification::VERIFICATION_FRESHNESS_CHECKED,
+            ],
+            "statuses": ["passed", "failed", "timed_out", "cancelled", "skipped", "unknown"],
+            "freshness_statuses": ["fresh", "stale", "unknown"],
+            "coverage_policy": "unknown_scope_never_counts_as_fresh",
+            "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
+        },
         "replay_bundle_metadata": build_replay_support_observability(),
         "worker_diagnostics": networked_workers,
     })
