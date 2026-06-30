@@ -27,6 +27,15 @@ use crate::{
 
 const TASK_RUNTIME_LIMIT: usize = 200;
 const TASK_EVENT_LIMIT: usize = 512;
+pub(crate) const TASK_PROJECTION_SCHEMA_VERSION: i64 = 1;
+pub(crate) const TASK_PROJECTION_EVENT_STARTED: &str =
+    "taskprojectionstore_nad_background_tasks_flows_jobs_a_commitments.started";
+pub(crate) const TASK_PROJECTION_EVENT_COMPLETED: &str =
+    "taskprojectionstore_nad_background_tasks_flows_jobs_a_commitments.completed";
+pub(crate) const TASK_PROJECTION_EVENT_FAILED: &str =
+    "taskprojectionstore_nad_background_tasks_flows_jobs_a_commitments.failed";
+pub(crate) const TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY: &str = "observe_only";
+pub(crate) const TASK_PROJECTION_REDACTION_METADATA_ONLY: &str = "metadata_only";
 
 /// Source store represented by a normalized task id.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +61,18 @@ impl TaskSourceKind {
         }
     }
 
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "background_task" => Some(Self::BackgroundTask),
+            "flow" => Some(Self::Flow),
+            "tool_job" => Some(Self::ToolJob),
+            "work_item" => Some(Self::WorkItem),
+            "commitment" => Some(Self::Commitment),
+            "agent_plan_item" => Some(Self::AgentPlanItem),
+            _ => None,
+        }
+    }
+
     const fn prefix(self) -> &'static str {
         match self {
             Self::BackgroundTask => "background",
@@ -60,6 +81,60 @@ impl TaskSourceKind {
             Self::WorkItem => "work_item",
             Self::Commitment => "commitment",
             Self::AgentPlanItem => "agent_plan",
+        }
+    }
+}
+
+fn task_projection_source_kinds() -> [TaskSourceKind; 6] {
+    [
+        TaskSourceKind::BackgroundTask,
+        TaskSourceKind::Flow,
+        TaskSourceKind::ToolJob,
+        TaskSourceKind::WorkItem,
+        TaskSourceKind::Commitment,
+        TaskSourceKind::AgentPlanItem,
+    ]
+}
+
+/// Projection policy decision for one source task row.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskProjectionDecisionKind {
+    Project,
+    Skip,
+}
+
+impl TaskProjectionDecisionKind {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+/// Stable reason codes emitted by the normalized task projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskProjectionReasonCode {
+    Projected,
+    NoVisibleTasks,
+    FilteredTerminal,
+    FilteredStateMismatch,
+    AccessDenied,
+    InvalidSource,
+}
+
+impl TaskProjectionReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Projected => "task_projection.projected",
+            Self::NoVisibleTasks => "task_projection.no_visible_tasks",
+            Self::FilteredTerminal => "task_projection.filtered_terminal",
+            Self::FilteredStateMismatch => "task_projection.filtered_state_mismatch",
+            Self::AccessDenied => "task_projection.access_denied",
+            Self::InvalidSource => "task_projection.invalid_source",
         }
     }
 }
@@ -196,11 +271,87 @@ pub(crate) struct TaskRuntimeSummary {
     pub terminal: usize,
 }
 
+/// Projection decision for one source row considered by the task read model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskProjectionDecision {
+    pub(crate) decision: TaskProjectionDecisionKind,
+    pub(crate) reason_code: String,
+    pub(crate) task_id: String,
+    pub(crate) source_kind: String,
+    pub(crate) source_id: String,
+    pub(crate) state: String,
+    pub(crate) redaction_level: String,
+}
+
+/// Per-source coverage summary for a normalized task projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskProjectionSourceSummary {
+    pub(crate) source_kind: String,
+    pub(crate) projected: usize,
+    pub(crate) active: usize,
+    pub(crate) blocked: usize,
+    pub(crate) failed: usize,
+    pub(crate) terminal: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latest_update_unix_ms: Option<i64>,
+}
+
+impl TaskProjectionSourceSummary {
+    #[must_use]
+    fn empty(kind: TaskSourceKind) -> Self {
+        Self {
+            source_kind: kind.as_str().to_owned(),
+            projected: 0,
+            active: 0,
+            blocked: 0,
+            failed: 0,
+            terminal: 0,
+            latest_update_unix_ms: None,
+        }
+    }
+
+    fn observe(&mut self, task: &TaskRun) {
+        self.projected += 1;
+        self.latest_update_unix_ms = self.latest_update_unix_ms.max(Some(task.updated_at_unix_ms));
+        if is_terminal_task_state(task.state.as_str()) {
+            self.terminal += 1;
+        } else {
+            self.active += 1;
+        }
+        if is_blocked_task_state(task.state.as_str()) {
+            self.blocked += 1;
+        }
+        if is_failed_task_state(task.state.as_str()) {
+            self.failed += 1;
+        }
+    }
+}
+
+/// Journal/read-model projection for the normalized task snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskProjectionJournalProjection {
+    pub(crate) schema_version: i64,
+    pub(crate) event_type: String,
+    pub(crate) rollout_mode: String,
+    pub(crate) decision: TaskProjectionDecisionKind,
+    pub(crate) reason_code: String,
+    pub(crate) total_projected: usize,
+    pub(crate) limit: usize,
+    pub(crate) include_terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) state_filter: Option<String>,
+    pub(crate) source_summaries: Vec<TaskProjectionSourceSummary>,
+    pub(crate) payload_json: String,
+    pub(crate) evidence_refs_json: String,
+    pub(crate) redaction_level: String,
+}
+
 /// Snapshot returned by `GET /console/v1/tasks`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TaskRuntimeSnapshot {
     pub tasks: Vec<TaskRun>,
     pub summary: TaskRuntimeSummary,
+    pub projection: TaskProjectionJournalProjection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_progress: Option<TaskPlanProgressCheckpoint>,
 }
@@ -220,6 +371,99 @@ pub(crate) struct TaskPlanProgressCheckpoint {
     pub cancelled: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_update_unix_ms: Option<i64>,
+}
+
+/// Stateless projection policy for the normalized task read model.
+pub(crate) struct TaskProjectionStore;
+
+impl TaskProjectionStore {
+    /// Decides whether one normalized source row is visible in the requested task view.
+    #[must_use]
+    pub(crate) fn decide(task: &TaskRun, filter: &TaskRuntimeFilter) -> TaskProjectionDecision {
+        let reason = if task.source_id.trim().is_empty()
+            || TaskSourceKind::from_str(task.source_kind.as_str()).is_none()
+            || ParsedTaskId::parse(task.task_id.as_str()).is_none()
+        {
+            TaskProjectionReasonCode::InvalidSource
+        } else if !filter.access.allows(
+            task.owner_principal.as_str(),
+            task.device_id.as_str(),
+            task.channel.as_deref(),
+        ) {
+            TaskProjectionReasonCode::AccessDenied
+        } else if !filter.include_terminal && is_terminal_task_state(task.state.as_str()) {
+            TaskProjectionReasonCode::FilteredTerminal
+        } else if filter.state.as_deref().is_some_and(|state| state != task.state) {
+            TaskProjectionReasonCode::FilteredStateMismatch
+        } else {
+            TaskProjectionReasonCode::Projected
+        };
+        let decision = match reason {
+            TaskProjectionReasonCode::Projected => TaskProjectionDecisionKind::Project,
+            _ => TaskProjectionDecisionKind::Skip,
+        };
+        TaskProjectionDecision {
+            decision,
+            reason_code: reason.as_str().to_owned(),
+            task_id: task.task_id.clone(),
+            source_kind: task.source_kind.clone(),
+            source_id: task.source_id.clone(),
+            state: task.state.clone(),
+            redaction_level: TASK_PROJECTION_REDACTION_METADATA_ONLY.to_owned(),
+        }
+    }
+
+    /// Builds a journal-ready projection summary from the visible normalized tasks.
+    #[must_use]
+    pub(crate) fn project_snapshot(
+        tasks: &[TaskRun],
+        filter: &TaskRuntimeFilter,
+        limit: usize,
+    ) -> TaskProjectionJournalProjection {
+        let source_summaries = task_projection_source_summaries(tasks);
+        let evidence_refs = task_projection_evidence_refs(source_summaries.as_slice());
+        let reason = if tasks.is_empty() {
+            TaskProjectionReasonCode::NoVisibleTasks
+        } else {
+            TaskProjectionReasonCode::Projected
+        };
+        let decision = if tasks.is_empty() {
+            TaskProjectionDecisionKind::Skip
+        } else {
+            TaskProjectionDecisionKind::Project
+        };
+        let evidence_refs_json = evidence_refs.to_string();
+        let payload_json = json!({
+            "event": TASK_PROJECTION_EVENT_COMPLETED,
+            "schema_version": TASK_PROJECTION_SCHEMA_VERSION,
+            "rollout_mode": TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY,
+            "decision": decision.as_str(),
+            "reason_code": reason.as_str(),
+            "total_projected": tasks.len(),
+            "limit": limit,
+            "include_terminal": filter.include_terminal,
+            "state_filter": filter.state.as_deref(),
+            "source_summaries": task_projection_source_summary_payload(source_summaries.as_slice()),
+            "evidence_refs": evidence_refs,
+            "redaction_level": TASK_PROJECTION_REDACTION_METADATA_ONLY,
+        })
+        .to_string();
+        TaskProjectionJournalProjection {
+            schema_version: TASK_PROJECTION_SCHEMA_VERSION,
+            event_type: TASK_PROJECTION_EVENT_COMPLETED.to_owned(),
+            rollout_mode: TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY.to_owned(),
+            decision,
+            reason_code: reason.as_str().to_owned(),
+            total_projected: tasks.len(),
+            limit,
+            include_terminal: filter.include_terminal,
+            state_filter: filter.state.clone(),
+            source_summaries,
+            payload_json,
+            evidence_refs_json,
+            redaction_level: TASK_PROJECTION_REDACTION_METADATA_ONLY.to_owned(),
+        }
+    }
 }
 
 /// Stateless facade over the runtime's source stores.
@@ -334,7 +578,8 @@ impl TaskRuntime {
         });
         tasks.truncate(limit);
         let summary = summarize_tasks(tasks.as_slice());
-        Ok(TaskRuntimeSnapshot { tasks, summary, plan_progress })
+        let projection = TaskProjectionStore::project_snapshot(tasks.as_slice(), &filter, limit);
+        Ok(TaskRuntimeSnapshot { tasks, summary, projection, plan_progress })
     }
 
     /// Loads one normalized task by id.
@@ -461,13 +706,61 @@ impl<'a> ParsedTaskId<'a> {
 }
 
 fn push_if_visible(tasks: &mut Vec<TaskRun>, task: TaskRun, filter: &TaskRuntimeFilter) {
-    if !filter.include_terminal && is_terminal_task_state(task.state.as_str()) {
-        return;
+    if TaskProjectionStore::decide(&task, filter).decision == TaskProjectionDecisionKind::Project {
+        tasks.push(task);
     }
-    if filter.state.as_deref().is_some_and(|state| state != task.state) {
-        return;
+}
+
+fn task_projection_source_summaries(tasks: &[TaskRun]) -> Vec<TaskProjectionSourceSummary> {
+    let mut summaries = task_projection_source_kinds()
+        .into_iter()
+        .map(TaskProjectionSourceSummary::empty)
+        .collect::<Vec<_>>();
+    for task in tasks {
+        let Some(kind) = TaskSourceKind::from_str(task.source_kind.as_str()) else {
+            continue;
+        };
+        if let Some(summary) =
+            summaries.iter_mut().find(|summary| summary.source_kind == kind.as_str())
+        {
+            summary.observe(task);
+        }
     }
-    tasks.push(task);
+    summaries
+}
+
+fn task_projection_source_summary_payload(
+    source_summaries: &[TaskProjectionSourceSummary],
+) -> Vec<Value> {
+    source_summaries
+        .iter()
+        .map(|summary| {
+            json!({
+                "source_kind": summary.source_kind.as_str(),
+                "projected": summary.projected,
+                "active": summary.active,
+                "blocked": summary.blocked,
+                "failed": summary.failed,
+                "terminal": summary.terminal,
+                "latest_update_unix_ms": summary.latest_update_unix_ms,
+            })
+        })
+        .collect()
+}
+
+fn task_projection_evidence_refs(source_summaries: &[TaskProjectionSourceSummary]) -> Value {
+    json!(source_summaries
+        .iter()
+        .map(|summary| {
+            json!({
+                "kind": "journal_read_model",
+                "source_kind": summary.source_kind.as_str(),
+                "projected": summary.projected,
+                "latest_update_unix_ms": summary.latest_update_unix_ms,
+                "redaction_level": TASK_PROJECTION_REDACTION_METADATA_ONLY,
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1056,10 +1349,10 @@ fn summarize_tasks(tasks: &[TaskRun]) -> TaskRuntimeSummary {
         } else {
             summary.active += 1;
         }
-        if matches!(task.state.as_str(), "blocked" | "waiting" | "waiting_for_approval") {
+        if is_blocked_task_state(task.state.as_str()) {
             summary.blocked += 1;
         }
-        if matches!(task.state.as_str(), "failed" | "expired" | "timed_out" | "orphaned") {
+        if is_failed_task_state(task.state.as_str()) {
             summary.failed += 1;
         }
     }
@@ -1078,6 +1371,14 @@ fn is_terminal_task_state(state: &str) -> bool {
             | "delivered"
             | "dismissed"
     )
+}
+
+fn is_blocked_task_state(state: &str) -> bool {
+    matches!(state, "blocked" | "waiting" | "waiting_for_approval")
+}
+
+fn is_failed_task_state(state: &str) -> bool {
+    matches!(state, "failed" | "expired" | "timed_out" | "orphaned")
 }
 
 #[cfg(test)]
@@ -1160,6 +1461,47 @@ mod tests {
         }
     }
 
+    fn task(
+        kind: TaskSourceKind,
+        source_id: &str,
+        state: &str,
+        updated_at_unix_ms: i64,
+    ) -> TaskRun {
+        TaskRun {
+            task_id: normalized_task_id(kind, source_id),
+            source_id: source_id.to_owned(),
+            source_kind: kind.as_str().to_owned(),
+            owner_principal: "user:one".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+            owner: task_owner("user:one", "device", Some("cli".to_owned())),
+            session_id: None,
+            run_id: None,
+            objective_id: None,
+            routine_id: None,
+            state: state.to_owned(),
+            title: "secret task title".to_owned(),
+            summary: "secret task summary".to_owned(),
+            priority: 0,
+            steps: Vec::new(),
+            artifacts: Vec::new(),
+            retry_policy: TaskRetryPolicy {
+                attempt_count: 0,
+                max_attempts: None,
+                retry_allowed: !is_terminal_task_state(state),
+                policy_json: "{}".to_owned(),
+            },
+            artifact_refs_json: "{}".to_owned(),
+            retry_policy_json: "{}".to_owned(),
+            access_policy_json: "{}".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms,
+            started_at_unix_ms: None,
+            heartbeat_at_unix_ms: None,
+            completed_at_unix_ms: is_terminal_task_state(state).then_some(updated_at_unix_ms),
+        }
+    }
+
     #[test]
     fn access_policy_rejects_foreign_principal_device_or_channel() {
         let policy = access("user:one");
@@ -1228,6 +1570,93 @@ mod tests {
         assert_eq!(checkpoint.cancelled, 1);
         assert_eq!(checkpoint.latest_update_unix_ms, Some(20));
         assert_eq!(checkpoint.reason_code, "agent_plan_task_runtime_checkpoint");
+    }
+
+    #[test]
+    fn task_projection_decision_filters_by_access_state_and_terminal_policy() {
+        let filter = TaskRuntimeFilter {
+            access: access("user:one"),
+            state: None,
+            include_terminal: false,
+            limit: 10,
+        };
+        let running = task(TaskSourceKind::BackgroundTask, "task-1", "running", 10);
+        let decision = TaskProjectionStore::decide(&running, &filter);
+        assert_eq!(decision.decision, TaskProjectionDecisionKind::Project);
+        assert_eq!(decision.reason_code, TaskProjectionReasonCode::Projected.as_str());
+
+        let delivered = task(TaskSourceKind::Commitment, "commitment-1", "delivered", 20);
+        let decision = TaskProjectionStore::decide(&delivered, &filter);
+        assert_eq!(decision.decision, TaskProjectionDecisionKind::Skip);
+        assert_eq!(decision.reason_code, TaskProjectionReasonCode::FilteredTerminal.as_str());
+
+        let mut foreign = running.clone();
+        foreign.owner_principal = "user:two".to_owned();
+        let decision = TaskProjectionStore::decide(&foreign, &filter);
+        assert_eq!(decision.reason_code, TaskProjectionReasonCode::AccessDenied.as_str());
+
+        let state_filter =
+            TaskRuntimeFilter { state: Some("blocked".to_owned()), ..filter.clone() };
+        let decision = TaskProjectionStore::decide(&running, &state_filter);
+        assert_eq!(decision.reason_code, TaskProjectionReasonCode::FilteredStateMismatch.as_str());
+
+        let mut invalid = running;
+        invalid.task_id = "unknown:task-1".to_owned();
+        let decision = TaskProjectionStore::decide(&invalid, &filter);
+        assert_eq!(decision.reason_code, TaskProjectionReasonCode::InvalidSource.as_str());
+    }
+
+    #[test]
+    fn task_projection_store_builds_metadata_only_journal_projection() {
+        let filter = TaskRuntimeFilter {
+            access: access("user:one"),
+            state: None,
+            include_terminal: true,
+            limit: 50,
+        };
+        let tasks = vec![
+            task(TaskSourceKind::BackgroundTask, "background-1", "running", 10),
+            task(TaskSourceKind::Flow, "flow-1", "blocked", 20),
+            task(TaskSourceKind::Commitment, "commitment-1", "delivered", 30),
+        ];
+
+        let projection = TaskProjectionStore::project_snapshot(tasks.as_slice(), &filter, 50);
+
+        assert_eq!(projection.schema_version, TASK_PROJECTION_SCHEMA_VERSION);
+        assert_eq!(projection.event_type, TASK_PROJECTION_EVENT_COMPLETED);
+        assert_eq!(projection.decision, TaskProjectionDecisionKind::Project);
+        assert_eq!(projection.total_projected, 3);
+        let background = projection
+            .source_summaries
+            .iter()
+            .find(|summary| summary.source_kind == "background_task")
+            .expect("background summary should exist");
+        assert_eq!(background.projected, 1);
+        assert_eq!(background.active, 1);
+        let flow = projection
+            .source_summaries
+            .iter()
+            .find(|summary| summary.source_kind == "flow")
+            .expect("flow summary should exist");
+        assert_eq!(flow.blocked, 1);
+        let commitment = projection
+            .source_summaries
+            .iter()
+            .find(|summary| summary.source_kind == "commitment")
+            .expect("commitment summary should exist");
+        assert_eq!(commitment.terminal, 1);
+
+        let payload = serde_json::from_str::<Value>(projection.payload_json.as_str())
+            .expect("projection payload should be json");
+        assert_eq!(payload["event"], TASK_PROJECTION_EVENT_COMPLETED);
+        assert_eq!(payload["redaction_level"], TASK_PROJECTION_REDACTION_METADATA_ONLY);
+        assert!(!projection.payload_json.contains("secret task title"));
+        assert!(!projection.payload_json.contains("secret task summary"));
+
+        let roundtrip: TaskProjectionJournalProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(roundtrip, projection);
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub(crate) async fn console_tasks_list_handler(
         "contract": task_contract_descriptor(),
         "page": build_page_info(limit, snapshot.tasks.len(), next_cursor),
         "summary": snapshot.summary,
+        "projection": snapshot.projection,
         "tasks": snapshot.tasks,
     })))
 }
@@ -558,8 +559,19 @@ fn action_reason(reason: Option<String>, default_reason: &str) -> String {
 fn task_contract_descriptor() -> Value {
     json!({
         "schema": "palyra.console.tasks.v1",
-        "sources": ["background_task", "flow", "tool_job", "work_item", "commitment"],
+        "sources": ["background_task", "flow", "tool_job", "work_item", "commitment", "agent_plan_item"],
         "id_format": "<source-prefix>:<source-id>",
+        "projection": {
+            "schema_version": crate::task_runtime::TASK_PROJECTION_SCHEMA_VERSION,
+            "rollout_mode": crate::task_runtime::TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY,
+            "audit_ledger": "journal_read_model",
+            "event_types": {
+                "started": crate::task_runtime::TASK_PROJECTION_EVENT_STARTED,
+                "completed": crate::task_runtime::TASK_PROJECTION_EVENT_COMPLETED,
+                "failed": crate::task_runtime::TASK_PROJECTION_EVENT_FAILED,
+            },
+            "redaction_level": crate::task_runtime::TASK_PROJECTION_REDACTION_METADATA_ONLY,
+        },
     })
 }
 

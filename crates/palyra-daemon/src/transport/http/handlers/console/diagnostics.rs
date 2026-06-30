@@ -147,6 +147,7 @@ pub(crate) async fn console_diagnostics_handler(
     let mut progress_drafts_payload =
         collect_console_progress_draft_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut progress_drafts_payload, None);
+    let task_projection_payload = collect_console_task_projection_diagnostics();
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
@@ -301,6 +302,7 @@ pub(crate) async fn console_diagnostics_handler(
         "flows": flows_payload,
         "agent_plan": agent_plan_payload,
         "progress_drafts": progress_drafts_payload,
+        "task_projection": task_projection_payload,
         "replay_continuity": replay_continuity_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
@@ -1663,6 +1665,24 @@ async fn collect_console_progress_draft_diagnostics(
 
 fn is_terminal_progress_draft_state_for_console(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "cancelled")
+}
+
+/// Summarizes the task projection read-model contract for operators.
+fn collect_console_task_projection_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::task_runtime::TASK_PROJECTION_SCHEMA_VERSION,
+        "rollout_mode": crate::task_runtime::TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "journal_read_model",
+        "read_model_endpoint": "/console/v1/tasks",
+        "event_types": {
+            "started": crate::task_runtime::TASK_PROJECTION_EVENT_STARTED,
+            "completed": crate::task_runtime::TASK_PROJECTION_EVENT_COMPLETED,
+            "failed": crate::task_runtime::TASK_PROJECTION_EVENT_FAILED,
+        },
+        "sources": ["background_task", "flow", "tool_job", "work_item", "commitment", "agent_plan_item"],
+        "redaction_level": crate::task_runtime::TASK_PROJECTION_REDACTION_METADATA_ONLY,
+        "runtime_behavior": "observe_only_journal_read_model",
+    })
 }
 
 /// Summarizes the observe-only replay-continuity contract for operators.
