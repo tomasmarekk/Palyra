@@ -29,10 +29,10 @@ use crate::{
         WorkspaceDocumentWriteRequest,
     },
     objectives::{
-        ObjectiveApproachKind, ObjectiveApproachRecord, ObjectiveAttemptRecord,
-        ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveKind, ObjectiveLifecycleRecord,
-        ObjectivePriority, ObjectiveRecord, ObjectiveRegistryError, ObjectiveState,
-        ObjectiveUpsert, ObjectiveWorkspaceBinding,
+        render_objective_contract_context_block, ObjectiveApproachKind, ObjectiveApproachRecord,
+        ObjectiveAttemptRecord, ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveContract,
+        ObjectiveKind, ObjectiveLifecycleRecord, ObjectivePriority, ObjectiveRecord,
+        ObjectiveRegistryError, ObjectiveState, ObjectiveUpsert, ObjectiveWorkspaceBinding,
     },
     routines::{
         default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
@@ -140,6 +140,8 @@ pub(crate) struct ConsoleObjectiveUpsertRequest {
     current_focus: Option<String>,
     #[serde(default)]
     success_criteria: Option<String>,
+    #[serde(default)]
+    contract: Option<ObjectiveContract>,
     #[serde(default)]
     exit_condition: Option<String>,
     #[serde(default)]
@@ -443,6 +445,14 @@ pub(crate) async fn console_objective_upsert_handler(
             success_criteria: payload
                 .success_criteria
                 .or_else(|| existing.as_ref().and_then(|entry| entry.success_criteria.clone())),
+            contract: payload
+                .contract
+                .or_else(|| existing.as_ref().map(|entry| entry.contract.clone()))
+                .unwrap_or_default(),
+            contract_history: existing
+                .as_ref()
+                .map(|entry| entry.contract_history.clone())
+                .unwrap_or_default(),
             exit_condition: payload
                 .exit_condition
                 .or_else(|| existing.as_ref().and_then(|entry| entry.exit_condition.clone())),
@@ -858,6 +868,7 @@ async fn build_objective_view(
     let health = compute_objective_health(&objective, routine.as_ref(), latest_run.as_ref());
     let (last_attempt, attempt_history) =
         objective_attempts_for_view(&objective, latest_run.as_ref());
+    let contract_context = render_objective_contract_context_block(&objective);
     Ok(json!({
         "objective_id": objective.objective_id,
         "kind": objective.kind.as_str(),
@@ -874,6 +885,9 @@ async fn build_objective_view(
         },
         "current_focus": objective.current_focus,
         "success_criteria": objective.success_criteria,
+        "contract": objective.contract,
+        "contract_context": contract_context,
+        "contract_history": objective.contract_history,
         "exit_condition": objective.exit_condition,
         "next_recommended_step": objective.next_recommended_step,
         "standing_order": objective.standing_order,
@@ -2503,8 +2517,9 @@ mod tests {
         sync_workspace_managed_block, WorkspaceManagedBlockError, WorkspaceManagedBlockUpdate,
     };
     use crate::objectives::{
-        ObjectiveAttemptRecord, ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveKind,
-        ObjectivePriority, ObjectiveRecord, ObjectiveState, ObjectiveWorkspaceBinding,
+        ObjectiveAttemptRecord, ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveContract,
+        ObjectiveKind, ObjectivePriority, ObjectiveRecord, ObjectiveState,
+        ObjectiveWorkspaceBinding,
     };
     use crate::routines::{
         shadow_manual_schedule_payload_json, RoutineApprovalPolicy, RoutineDeliveryConfig,
@@ -2526,6 +2541,8 @@ mod tests {
             budget: ObjectiveBudget::default(),
             current_focus: Some("Keep the board current.".to_owned()),
             success_criteria: Some("Operators can see the latest summary.".to_owned()),
+            contract: ObjectiveContract::default(),
+            contract_history: vec![],
             exit_condition: None,
             next_recommended_step: Some("Review the newest summary.".to_owned()),
             standing_order: None,
