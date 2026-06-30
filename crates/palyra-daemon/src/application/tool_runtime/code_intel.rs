@@ -42,10 +42,16 @@ const TYPESCRIPT_LANGUAGE_SERVER_TSC_SOURCE: &str = "typescript-language-server/
 const TYPESCRIPT_TSC_COMMAND: &str = "tsc";
 const TYPESCRIPT_TSC_ARGS: &[&str] = &["--noEmit", "--pretty", "false"];
 const TYPESCRIPT_ERROR_HINT_CHARS: usize = 512;
+const PYRIGHT_SOURCE: &str = "pyright";
+const PYRIGHT_CLI_COMMAND: &str = "pyright";
+const PYRIGHT_ARGS: &[&str] = &["--outputjson"];
+const PYRIGHT_ERROR_HINT_CHARS: usize = 512;
 pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.rust.snapshot_captured";
 pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.typescript.snapshot_captured";
+pub(crate) const CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT: &str =
+    "code_intel.python.snapshot_captured";
 
 /// Normalized diagnostic severity. Higher ranks are worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -268,6 +274,48 @@ pub(crate) async fn capture_diagnostic_snapshot_with_providers(
                 CodeIntelLanguage::TypeScript,
                 "code_intel.workspace_root_missing",
                 "No workspace root was available for TypeScript diagnostics.",
+            );
+        }
+    }
+
+    let python_files = snapshot
+        .files
+        .iter()
+        .filter(|path| CodeIntelLanguage::from_path(path) == Some(CodeIntelLanguage::Python))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !python_files.is_empty() && provider_ready(&snapshot, CodeIntelLanguage::Python) {
+        if let Some(workspace_root) = workspace_root.as_deref() {
+            let provider = PyrightProvider::from_config(config);
+            match provider.capture(workspace_root, &python_files).await {
+                PyrightCaptureOutcome::Captured { items, truncated, reason_codes } => {
+                    snapshot.items.extend(items);
+                    snapshot.truncated |= truncated;
+                    snapshot.degraded |= truncated;
+                    snapshot.reason_codes.extend(reason_codes);
+                    set_provider_status(
+                        &mut snapshot,
+                        CodeIntelLanguage::Python,
+                        "ready",
+                        CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT,
+                        "Python diagnostics snapshot captured through the pyright diagnostics pipeline.",
+                    );
+                }
+                PyrightCaptureOutcome::Degraded { reason_code, repair_hint } => {
+                    mark_provider_degraded(
+                        &mut snapshot,
+                        CodeIntelLanguage::Python,
+                        reason_code.as_str(),
+                        repair_hint.as_str(),
+                    );
+                }
+            }
+        } else {
+            mark_provider_degraded(
+                &mut snapshot,
+                CodeIntelLanguage::Python,
+                "code_intel.workspace_root_missing",
+                "No workspace root was available for Python diagnostics.",
             );
         }
     }
@@ -1042,6 +1090,295 @@ impl TypescriptRunError {
     }
 }
 
+/// Python diagnostics provider backed by Pyright JSON output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PyrightProvider {
+    pub provider: String,
+    pub binary: String,
+    pub check_command: String,
+    pub check_args: Vec<String>,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub max_items: usize,
+    pub redaction_level: String,
+}
+
+impl PyrightProvider {
+    fn from_config(config: &CodeIntelConfig) -> Self {
+        Self {
+            provider: CodeIntelLanguage::Python.provider_name().to_owned(),
+            binary: config.pyright_binary.clone(),
+            check_command: PYRIGHT_CLI_COMMAND.to_owned(),
+            check_args: PYRIGHT_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout_ms: config.timeout_ms,
+            max_output_bytes: config.max_output_bytes,
+            max_items: config.max_items,
+            redaction_level: crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                .to_owned(),
+        }
+    }
+
+    async fn capture(
+        &self,
+        workspace_root: &Path,
+        touched_files: &BTreeSet<String>,
+    ) -> PyrightCaptureOutcome {
+        if !executable_is_available(self.binary.as_str()) {
+            return PyrightCaptureOutcome::degraded(
+                "code_intel.provider_missing.python",
+                "Install pyright-langserver or set tool_call.code_intel.pyright_binary to an executable path.",
+            );
+        }
+        if !workspace_root.is_dir() {
+            return PyrightCaptureOutcome::degraded(
+                "code_intel.python.workspace_root_missing",
+                "Python diagnostics require an existing workspace root.",
+            );
+        }
+        let Some(check_command) =
+            resolve_pyright_check_command(self.binary.as_str(), workspace_root)
+        else {
+            return PyrightCaptureOutcome::degraded(
+                "code_intel.python.pyright_cli_missing",
+                "Install the pyright CLI next to pyright-langserver or make pyright available on PATH.",
+            );
+        };
+
+        let output = match self
+            .run_pyright_json(workspace_root, check_command.as_path(), touched_files)
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let repair_hint = error.repair_hint();
+                return PyrightCaptureOutcome::degraded(error.reason_code(), repair_hint.as_str());
+            }
+        };
+        let normalizer = PyrightDiagnosticNormalizer {
+            workspace_root: workspace_root.to_path_buf(),
+            touched_files: touched_files.clone(),
+            max_items: self.max_items,
+        };
+        let (items, parse_truncated) = normalizer.normalize_pyright_json(output.stdout.as_slice());
+        let truncated = parse_truncated || output.stdout_truncated || output.stderr_truncated;
+        if items.is_empty() && !output.status_success {
+            let hint = bounded_pyright_error_hint(&output);
+            return PyrightCaptureOutcome::degraded(
+                "code_intel.python.pyright_failed",
+                hint.as_str(),
+            );
+        }
+
+        let mut reason_codes = vec![CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT.to_owned()];
+        if truncated {
+            reason_codes.push("code_intel.python.output_truncated".to_owned());
+        }
+        PyrightCaptureOutcome::Captured { items, truncated, reason_codes }
+    }
+
+    async fn run_pyright_json(
+        &self,
+        workspace_root: &Path,
+        command_path: &Path,
+        touched_files: &BTreeSet<String>,
+    ) -> Result<PyrightProcessOutput, PyrightRunError> {
+        let mut command = TokioCommand::new(command_path);
+        command
+            .args(PYRIGHT_ARGS)
+            .args(touched_files)
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|error| PyrightRunError::Spawn(redact_diagnostic_text(&error.to_string())))?;
+        let stdout = child.stdout.take().ok_or(PyrightRunError::MissingPipe("stdout"))?;
+        let stderr = child.stderr.take().ok_or(PyrightRunError::MissingPipe("stderr"))?;
+        let max_output_bytes = max_output_bytes(self.max_output_bytes);
+        let stdout_task = tokio::spawn(read_bounded_stream(stdout, max_output_bytes));
+        let stderr_task = tokio::spawn(read_bounded_stream(stderr, max_output_bytes));
+        let status = match timeout(Duration::from_millis(self.timeout_ms), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                return Err(PyrightRunError::Wait(redact_diagnostic_text(&error.to_string())));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(PyrightRunError::Timeout);
+            }
+        };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| PyrightRunError::Output(redact_diagnostic_text(&error.to_string())))?
+            .map_err(|error| PyrightRunError::Output(redact_diagnostic_text(&error.to_string())))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| PyrightRunError::Output(redact_diagnostic_text(&error.to_string())))?
+            .map_err(|error| PyrightRunError::Output(redact_diagnostic_text(&error.to_string())))?;
+        Ok(PyrightProcessOutput {
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            status_success: status.success(),
+        })
+    }
+}
+
+/// Normalizes Pyright JSON diagnostics into compact LSP-style items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PyrightDiagnosticNormalizer {
+    pub workspace_root: PathBuf,
+    pub touched_files: BTreeSet<String>,
+    pub max_items: usize,
+}
+
+impl PyrightDiagnosticNormalizer {
+    fn normalize_pyright_json(&self, raw: &[u8]) -> (Vec<CodeDiagnostic>, bool) {
+        let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+            return (Vec::new(), false);
+        };
+        let Some(diagnostics) = value.get("generalDiagnostics").and_then(Value::as_array) else {
+            return (Vec::new(), false);
+        };
+        let mut items = Vec::new();
+        let mut truncated = false;
+        for entry in diagnostics {
+            if items.len() >= self.max_items {
+                truncated = true;
+                break;
+            }
+            let Some(item) = self.normalize_pyright_entry(entry) else {
+                continue;
+            };
+            items.push(item);
+        }
+        items.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.source.cmp(&right.source))
+                .then(left.message.cmp(&right.message))
+        });
+        items.dedup_by(|left, right| {
+            diagnostic_key_without_severity(left) == diagnostic_key_without_severity(right)
+        });
+        (items, truncated)
+    }
+
+    fn normalize_pyright_entry(&self, entry: &Value) -> Option<CodeDiagnostic> {
+        let file = entry.get("file").and_then(Value::as_str)?;
+        let path = normalize_diagnostic_path(file, self.workspace_root.as_path())?;
+        if !self.touched_files.contains(path.as_str()) {
+            return None;
+        }
+        let range_start = entry.get("range")?.get("start")?;
+        let line = read_zero_based_u32(range_start, "line").unwrap_or(0).saturating_add(1);
+        let column = read_zero_based_u32(range_start, "character").unwrap_or(0).saturating_add(1);
+        let message = entry
+            .get("message")
+            .and_then(Value::as_str)
+            .map(redact_diagnostic_text)
+            .map(|text| bound_message(text.as_str()))
+            .filter(|value| !value.trim().is_empty())?;
+        let code = entry
+            .get("rule")
+            .or_else(|| entry.get("code"))
+            .and_then(Value::as_str)
+            .map(redact_diagnostic_text)
+            .filter(|value| !value.trim().is_empty());
+        Some(CodeDiagnostic {
+            language: CodeIntelLanguage::Python,
+            path,
+            line,
+            column,
+            severity: entry
+                .get("severity")
+                .and_then(Value::as_str)
+                .map(DiagnosticSeverity::parse)
+                .unwrap_or(DiagnosticSeverity::Warning),
+            code,
+            message,
+            source: PYRIGHT_SOURCE.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PyrightCaptureOutcome {
+    Captured { items: Vec<CodeDiagnostic>, truncated: bool, reason_codes: Vec<String> },
+    Degraded { reason_code: String, repair_hint: String },
+}
+
+impl PyrightCaptureOutcome {
+    fn degraded(reason_code: &str, repair_hint: &str) -> Self {
+        Self::Degraded { reason_code: reason_code.to_owned(), repair_hint: repair_hint.to_owned() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PyrightProcessOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    status_success: bool,
+}
+
+impl PyrightProcessOutput {
+    fn combined_output(&self) -> Vec<u8> {
+        let mut output = self.stdout.clone();
+        if !self.stderr.is_empty() {
+            if !output.is_empty() {
+                output.push(b'\n');
+            }
+            output.extend_from_slice(self.stderr.as_slice());
+        }
+        output
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PyrightRunError {
+    Spawn(String),
+    MissingPipe(&'static str),
+    Timeout,
+    Wait(String),
+    Output(String),
+}
+
+impl PyrightRunError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Spawn(_) => "code_intel.python.pyright_spawn_failed",
+            Self::MissingPipe(_) => "code_intel.python.pyright_pipe_failed",
+            Self::Timeout => "code_intel.python.pyright_timeout",
+            Self::Wait(_) | Self::Output(_) => "code_intel.python.pyright_failed",
+        }
+    }
+
+    fn repair_hint(&self) -> String {
+        match self {
+            Self::Spawn(error) => {
+                format!("Failed to start pyright for Python diagnostics: {error}")
+            }
+            Self::MissingPipe(pipe) => {
+                format!("Failed to capture pyright {pipe} for Python diagnostics.")
+            }
+            Self::Timeout => "Python diagnostics timed out; increase tool_call.code_intel.timeout_ms or inspect pyright health.".to_owned(),
+            Self::Wait(error) | Self::Output(error) => {
+                format!("Python diagnostics failed while reading pyright output: {error}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundedStreamOutput {
     bytes: Vec<u8>,
@@ -1140,6 +1477,18 @@ fn bounded_typescript_error_hint(output: &TypescriptProcessOutput) -> String {
     }
 }
 
+fn bounded_pyright_error_hint(output: &PyrightProcessOutput) -> String {
+    let combined = output.combined_output();
+    let text = String::from_utf8_lossy(combined.as_slice());
+    let redacted = redact_diagnostic_text(text.as_ref());
+    let hint = bound_message_with_limit(redacted.as_str(), PYRIGHT_ERROR_HINT_CHARS);
+    if hint.trim().is_empty() {
+        "Pyright diagnostics command failed without emitting a useful output summary.".to_owned()
+    } else {
+        hint
+    }
+}
+
 fn typescript_project_roots(
     workspace_root: &Path,
     touched_files: &BTreeSet<String>,
@@ -1182,6 +1531,36 @@ fn resolve_typescript_check_command(project_root: &Path, workspace_root: &Path) 
         }
     }
     executable_is_available(TYPESCRIPT_TSC_COMMAND).then(|| PathBuf::from(TYPESCRIPT_TSC_COMMAND))
+}
+
+fn resolve_pyright_check_command(
+    configured_binary: &str,
+    workspace_root: &Path,
+) -> Option<PathBuf> {
+    if !configured_binary.to_ascii_lowercase().contains("langserver")
+        && executable_is_available(configured_binary)
+    {
+        return Some(PathBuf::from(configured_binary));
+    }
+
+    let configured_path = Path::new(configured_binary);
+    if configured_path.components().count() > 1 || configured_path.is_absolute() {
+        if let Some(parent) = configured_path.parent() {
+            for name in executable_candidates(PYRIGHT_CLI_COMMAND) {
+                let candidate = parent.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    for name in executable_candidates(PYRIGHT_CLI_COMMAND) {
+        let candidate = workspace_root.join("node_modules").join(".bin").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    executable_is_available(PYRIGHT_CLI_COMMAND).then(|| PathBuf::from(PYRIGHT_CLI_COMMAND))
 }
 
 /// Parses an LSP-like JSON diagnostic payload used by provider adapters and
@@ -1270,6 +1649,12 @@ fn read_u32(entry: &Value, keys: &[&str]) -> Option<u32> {
         let parsed = value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok())?;
         u32::try_from(parsed).ok().filter(|value| *value > 0)
     })
+}
+
+fn read_zero_based_u32(entry: &Value, key: &str) -> Option<u32> {
+    let value = entry.get(key)?;
+    let parsed = value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok())?;
+    u32::try_from(parsed).ok()
 }
 
 fn configured_workspace_root(
@@ -1563,6 +1948,45 @@ mod tests {
     }
 
     #[test]
+    fn pyright_diagnostic_normalizer_filters_touched_files() {
+        let raw = br#"{
+            "generalDiagnostics": [
+                {
+                    "file": "src/app.py",
+                    "severity": "error",
+                    "message": "\"missing\" is not defined",
+                    "range": {"start": {"line": 4, "character": 8}},
+                    "rule": "reportUndefinedVariable"
+                },
+                {
+                    "file": "src/other.py",
+                    "severity": "warning",
+                    "message": "Import is not accessed",
+                    "range": {"start": {"line": 1, "character": 0}},
+                    "rule": "reportUnusedImport"
+                }
+            ]
+        }"#;
+        let normalizer = PyrightDiagnosticNormalizer {
+            workspace_root: PathBuf::from("workspace"),
+            touched_files: BTreeSet::from(["src/app.py".to_owned()]),
+            max_items: 8,
+        };
+
+        let (items, truncated) = normalizer.normalize_pyright_json(raw);
+
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].language, CodeIntelLanguage::Python);
+        assert_eq!(items[0].path, "src/app.py");
+        assert_eq!(items[0].line, 5);
+        assert_eq!(items[0].column, 9);
+        assert_eq!(items[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(items[0].code.as_deref(), Some("reportUndefinedVariable"));
+        assert_eq!(items[0].source, PYRIGHT_SOURCE);
+    }
+
+    #[test]
     fn rust_diagnostic_delta_reports_new_syntax_error() {
         let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
         let before = DiagnosticSnapshot {
@@ -1632,6 +2056,41 @@ mod tests {
         assert_eq!(delta.items[0].code.as_deref(), Some("TS2304"));
     }
 
+    #[test]
+    fn python_diagnostic_delta_reports_new_error() {
+        let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
+        let before = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/app.py".to_owned()],
+            provider_status: Vec::new(),
+            items: Vec::new(),
+            truncated: false,
+            degraded: false,
+            reason_codes: vec![CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT.to_owned()],
+        };
+        let after = DiagnosticSnapshot {
+            items: vec![CodeDiagnostic {
+                language: CodeIntelLanguage::Python,
+                path: "src/app.py".to_owned(),
+                line: 5,
+                column: 9,
+                severity: DiagnosticSeverity::Error,
+                code: Some("reportUndefinedVariable".to_owned()),
+                message: "\"missing\" is not defined".to_owned(),
+                source: PYRIGHT_SOURCE.to_owned(),
+            }],
+            ..before.clone()
+        };
+
+        let delta = diagnostic_delta(&config, &before, &after);
+
+        assert_eq!(delta.new_errors, 1);
+        assert_eq!(delta.items.len(), 1);
+        assert_eq!(delta.items[0].code.as_deref(), Some("reportUndefinedVariable"));
+    }
+
     #[tokio::test]
     async fn missing_rust_analyzer_degrades_without_failing_snapshot() {
         let config = CodeIntelConfig {
@@ -1678,6 +2137,30 @@ mod tests {
             .find(|status| status.language == CodeIntelLanguage::TypeScript)
             .expect("typescript provider status should be present");
         assert_eq!(typescript_status.status, "missing_binary");
+        assert!(snapshot.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_pyright_degrades_without_failing_snapshot() {
+        let config = CodeIntelConfig {
+            enabled: true,
+            pyright_binary: "palyra-pyright-missing-for-test".to_owned(),
+            ..CodeIntelConfig::default()
+        };
+
+        let snapshot = capture_diagnostic_snapshot_with_providers(
+            &config,
+            &[PathBuf::from("workspace")],
+            &[touched("src/app.py")],
+        )
+        .await;
+
+        let python_status = snapshot
+            .provider_status
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::Python)
+            .expect("python provider status should be present");
+        assert_eq!(python_status.status, "missing_binary");
         assert!(snapshot.items.is_empty());
     }
 

@@ -376,6 +376,19 @@ pub(super) async fn execute_workspace_patch_mutation(
         code_intel_evidence_refs.as_slice(),
     )
     .await;
+    record_code_intel_language_snapshot_journal_event(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        CodeIntelLanguage::Python,
+        code_intel::CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT,
+        &diagnostic_after,
+        code_intel_evidence_refs.as_slice(),
+    )
+    .await;
     record_code_intel_diagnostics_delta_journal_event(
         runtime_state,
         principal,
