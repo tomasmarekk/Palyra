@@ -150,6 +150,7 @@ pub(crate) async fn console_diagnostics_handler(
     let task_projection_payload = collect_console_task_projection_diagnostics();
     let task_reconciler_payload = collect_console_task_reconciler_diagnostics();
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
+    let commitment_inference_payload = collect_console_commitment_inference_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut turn_control_payload, None);
@@ -306,6 +307,7 @@ pub(crate) async fn console_diagnostics_handler(
         "task_projection": task_projection_payload,
         "task_reconciler": task_reconciler_payload,
         "replay_continuity": replay_continuity_payload,
+        "commitment_inference": commitment_inference_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
@@ -1726,6 +1728,27 @@ fn collect_console_replay_continuity_diagnostics() -> Value {
         ],
         "redaction_level": crate::application::replay_continuity::REPLAY_CONTINUITY_REDACTION_NONE,
         "runtime_behavior": "observe_only_no_provider_dispatch_change",
+    })
+}
+
+/// Summarizes the opt-in inferred commitment candidate contract for operators.
+fn collect_console_commitment_inference_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::commitments::HYBRID_INFERRED_COMMITMENTS_SCHEMA_VERSION,
+        "rollout_mode": crate::commitments::HYBRID_INFERRED_COMMITMENTS_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "commitments_source_evidence",
+        "read_model_endpoint": "/console/v1/commitments",
+        "extract_request_field": "include_inferred",
+        "default_enabled": false,
+        "candidate_status": "proposed",
+        "approval_requirement": "manual_review",
+        "event_types": {
+            "started": crate::commitments::HYBRID_INFERRED_COMMITMENTS_EVENT_STARTED,
+            "completed": crate::commitments::HYBRID_INFERRED_COMMITMENTS_EVENT_COMPLETED,
+            "failed": crate::commitments::HYBRID_INFERRED_COMMITMENTS_EVENT_FAILED,
+        },
+        "redaction_level": crate::commitments::HYBRID_INFERRED_COMMITMENTS_REDACTION_LEVEL,
+        "runtime_behavior": "operator_opt_in_review_candidates_only",
     })
 }
 

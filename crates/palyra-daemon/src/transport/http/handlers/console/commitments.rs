@@ -17,7 +17,13 @@ use ulid::Ulid;
 use super::diagnostics::{authorize_console_session, build_page_info};
 use crate::{
     app::state::{AppState, ConsoleSession},
-    commitments::{build_commitment_create_requests, CommitmentExtractionInput},
+    commitments::{
+        build_commitment_create_plan, CommitmentExtractionInput,
+        HYBRID_INFERRED_COMMITMENTS_EVENT_COMPLETED, HYBRID_INFERRED_COMMITMENTS_EVENT_FAILED,
+        HYBRID_INFERRED_COMMITMENTS_EVENT_STARTED, HYBRID_INFERRED_COMMITMENTS_REDACTION_LEVEL,
+        HYBRID_INFERRED_COMMITMENTS_ROLLOUT_OBSERVE_ONLY,
+        HYBRID_INFERRED_COMMITMENTS_SCHEMA_VERSION,
+    },
     gateway::current_unix_ms,
     journal::{
         CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter, CommitmentRecord,
@@ -73,6 +79,8 @@ pub(crate) struct ConsoleCommitmentExtractRequest {
     run_id: Option<String>,
     #[serde(default)]
     extraction_model: Option<String>,
+    #[serde(default)]
+    include_inferred: bool,
 }
 
 /// Lists commitments for the caller.
@@ -201,14 +209,17 @@ pub(crate) async fn console_commitments_extract_handler(
         run_id: body.run_id,
         source_text: body.source_text,
         extraction_model: body.extraction_model,
+        include_inferred: body.include_inferred,
     };
+    let plan = build_commitment_create_plan(&input, session.context.principal.as_str());
     let mut commitments = Vec::new();
-    for request in build_commitment_create_requests(&input, session.context.principal.as_str()) {
+    for request in plan.requests {
         commitments
             .push(state.runtime.create_commitment(request).await.map_err(runtime_status_response)?);
     }
     Ok(Json(json!({
         "contract": commitment_contract_descriptor(),
+        "hybrid_inference": plan.inference,
         "extracted_count": commitments.len(),
         "commitments": commitments,
     })))
@@ -460,5 +471,19 @@ fn commitment_contract_descriptor() -> Value {
         "schema": "palyra.console.commitments.v1",
         "statuses": ["proposed", "approved", "scheduled", "snoozed", "delivered", "dismissed", "failed"],
         "review_required": true,
+        "hybrid_inferred_candidates": {
+            "schema_version": HYBRID_INFERRED_COMMITMENTS_SCHEMA_VERSION,
+            "request_field": "include_inferred",
+            "default_enabled": false,
+            "rollout_mode": HYBRID_INFERRED_COMMITMENTS_ROLLOUT_OBSERVE_ONLY,
+            "candidate_status": "proposed",
+            "approval_requirement": "manual_review",
+            "event_types": {
+                "started": HYBRID_INFERRED_COMMITMENTS_EVENT_STARTED,
+                "completed": HYBRID_INFERRED_COMMITMENTS_EVENT_COMPLETED,
+                "failed": HYBRID_INFERRED_COMMITMENTS_EVENT_FAILED,
+            },
+            "redaction_level": HYBRID_INFERRED_COMMITMENTS_REDACTION_LEVEL,
+        },
     })
 }

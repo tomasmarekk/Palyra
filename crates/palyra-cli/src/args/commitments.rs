@@ -45,6 +45,8 @@ pub enum CommitmentsCommand {
         #[arg(long)]
         extraction_model: Option<String>,
         #[arg(long, default_value_t = false)]
+        include_inferred: bool,
+        #[arg(long, default_value_t = false)]
         json: bool,
     },
     Approve {

@@ -47,7 +47,14 @@ pub(crate) async fn run_commitments_async(command: CommitmentsCommand) -> Result
             let payload = commitment_explain_value(&context.client, id.as_str()).await?;
             emit_commitment_explain(&payload, output::preferred_json(json))
         }
-        CommitmentsCommand::Extract { text, session_id, run_id, extraction_model, json } => {
+        CommitmentsCommand::Extract {
+            text,
+            session_id,
+            run_id,
+            extraction_model,
+            include_inferred,
+            json,
+        } => {
             let payload = context
                 .client
                 .post_json_value(
@@ -57,6 +64,7 @@ pub(crate) async fn run_commitments_async(command: CommitmentsCommand) -> Result
                         "session_id": session_id,
                         "run_id": run_id,
                         "extraction_model": extraction_model,
+                        "include_inferred": include_inferred,
                     }),
                 )
                 .await?;

@@ -11,6 +11,7 @@
     "browserd",
     "budget_gates",
     "canvas_experiments",
+    "commitment_inference",
     "connector_delivery",
     "context_engine",
     "contract",
