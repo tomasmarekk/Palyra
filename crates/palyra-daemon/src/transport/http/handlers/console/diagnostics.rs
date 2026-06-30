@@ -1089,6 +1089,9 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.objective_judge.source,
             "config_path": OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH,
             "env_var": OBJECTIVE_JUDGE_ROLLOUT_ENV,
+            "contract": crate::objective_judge::objective_judge_diagnostics_payload(
+                feature_rollouts.objective_judge.enabled,
+            ),
         },
         "verification_runtime": {
             "enabled": feature_rollouts.verification_runtime.enabled,

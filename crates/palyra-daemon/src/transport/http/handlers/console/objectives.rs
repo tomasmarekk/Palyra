@@ -28,6 +28,7 @@ use crate::{
         CronMisfirePolicy, CronRetryPolicy, CronScheduleType, OrchestratorCancelRequest,
         WorkspaceDocumentWriteRequest,
     },
+    objective_judge::ObjectiveJudgeInput,
     objectives::{
         render_objective_contract_context_block, ObjectiveApproachKind, ObjectiveApproachRecord,
         ObjectiveAttemptRecord, ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveContract,
@@ -869,6 +870,7 @@ async fn build_objective_view(
     let (last_attempt, attempt_history) =
         objective_attempts_for_view(&objective, latest_run.as_ref());
     let contract_context = render_objective_contract_context_block(&objective);
+    let judge_input_preview = ObjectiveJudgeInput::from_objective(&objective, None, Vec::new());
     Ok(json!({
         "objective_id": objective.objective_id,
         "kind": objective.kind.as_str(),
@@ -888,6 +890,11 @@ async fn build_objective_view(
         "contract": objective.contract,
         "contract_context": contract_context,
         "contract_history": objective.contract_history,
+        "objective_judge": {
+            "rollout_enabled": state.runtime.config.feature_rollouts.objective_judge.enabled,
+            "auxiliary_task_kind": "objective_judge",
+            "input_preview": judge_input_preview,
+        },
         "exit_condition": objective.exit_condition,
         "next_recommended_step": objective.next_recommended_step,
         "standing_order": objective.standing_order,

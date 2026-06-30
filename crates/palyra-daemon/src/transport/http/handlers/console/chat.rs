@@ -2572,6 +2572,7 @@ fn resolve_console_background_task_kind(value: Option<&str>) -> Result<String, t
             Err(tonic::Status::invalid_argument("task_kind=delegation_prompt requires delegation"))
         }
         AuxiliaryTaskKind::AttachmentDerivation
+        | AuxiliaryTaskKind::ObjectiveJudge
         | AuxiliaryTaskKind::AttachmentRecompute
         | AuxiliaryTaskKind::PostRunReflection => Err(tonic::Status::invalid_argument(
             "requested task_kind is reserved for internal runtime tasks",

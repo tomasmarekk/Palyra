@@ -22,6 +22,10 @@ use tonic::Status;
 use crate::{
     gateway::{GatewayRuntimeState, RequestContext},
     model_provider::{ProviderImageInput, ProviderRequest, ProviderResponse},
+    objective_judge::{
+        OBJECTIVE_JUDGE_COMPLETED_EVENT, OBJECTIVE_JUDGE_FAILED_EVENT,
+        OBJECTIVE_JUDGE_STARTED_EVENT,
+    },
     provider_leases::ProviderLeaseExecutionContext,
     usage_governance::{
         plan_usage_routing, resolve_provider_binding_for_model, RoutingDecision, RoutingTaskClass,
@@ -33,6 +37,7 @@ const SUMMARY_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
 const RECALL_SEARCH_DEFAULT_BUDGET_TOKENS: u64 = 1_600;
 const CLASSIFICATION_DEFAULT_BUDGET_TOKENS: u64 = 600;
 const EXTRACTION_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
+const OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS: u64 = 900;
 const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
 
 /// Auxiliary task families this executor can run; a strict subset of
@@ -44,6 +49,7 @@ pub(crate) enum AuxiliaryTaskType {
     RecallSearch,
     Classification,
     Extraction,
+    ObjectiveJudge,
     Vision,
 }
 
@@ -57,6 +63,7 @@ impl AuxiliaryTaskType {
             AuxiliaryTaskKind::RecallSearch => Some(Self::RecallSearch),
             AuxiliaryTaskKind::Classification => Some(Self::Classification),
             AuxiliaryTaskKind::Extraction => Some(Self::Extraction),
+            AuxiliaryTaskKind::ObjectiveJudge => Some(Self::ObjectiveJudge),
             AuxiliaryTaskKind::Vision => Some(Self::Vision),
             AuxiliaryTaskKind::BackgroundPrompt
             | AuxiliaryTaskKind::DelegationPrompt
@@ -74,6 +81,7 @@ impl AuxiliaryTaskType {
             Self::RecallSearch => "recall_search",
             Self::Classification => "classification",
             Self::Extraction => "extraction",
+            Self::ObjectiveJudge => "objective_judge",
             Self::Vision => "vision",
         }
     }
@@ -124,6 +132,17 @@ impl AuxiliaryTaskType {
                 model_preference: AuxiliaryModelPreference::LowCost,
                 fallback_policy: AuxiliaryFallbackPolicy::DegradeToDefaultModel,
                 routing_task_class: RoutingTaskClass::AuxiliaryExtraction,
+                json_mode: true,
+                accepts_vision: false,
+            },
+            Self::ObjectiveJudge => AuxiliaryTaskContract {
+                task_type: self,
+                input_contract: "objective_judge_input_json",
+                output_contract: "objective_judge_strict_json",
+                default_budget_tokens: OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS,
+                model_preference: AuxiliaryModelPreference::LowLatency,
+                fallback_policy: AuxiliaryFallbackPolicy::FailClosed,
+                routing_task_class: RoutingTaskClass::AuxiliaryClassification,
                 json_mode: true,
                 accepts_vision: false,
             },
@@ -306,6 +325,11 @@ pub(crate) async fn execute_auxiliary_task(
         model_profile_override: None,
     })
     .await?;
+    let started_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
+        OBJECTIVE_JUDGE_STARTED_EVENT
+    } else {
+        "auxiliary executor acquired usage routing plan"
+    };
     record_auxiliary_lifecycle_event(
         runtime_state,
         &request.context,
@@ -315,7 +339,7 @@ pub(crate) async fn execute_auxiliary_task(
             task_id: request.task_id.as_str(),
             task_type: request.task_type.as_str(),
             phase: "started",
-            reason: "auxiliary executor acquired usage routing plan",
+            reason: started_reason,
             token_budget: Some(effective_budget),
             details: json!({
                 "contract": contract,
@@ -371,6 +395,11 @@ pub(crate) async fn execute_auxiliary_task(
                 routing,
                 response,
             );
+            let completed_reason = if result.task_type == AuxiliaryTaskType::ObjectiveJudge {
+                OBJECTIVE_JUDGE_COMPLETED_EVENT
+            } else {
+                "auxiliary executor completed provider request"
+            };
             record_auxiliary_lifecycle_event(
                 runtime_state,
                 &request.context,
@@ -380,7 +409,7 @@ pub(crate) async fn execute_auxiliary_task(
                     task_id: result.task_id.as_str(),
                     task_type: result.task_type.as_str(),
                     phase: "completed",
-                    reason: "auxiliary executor completed provider request",
+                    reason: completed_reason,
                     token_budget: Some(effective_budget),
                     details: result.to_result_json(),
                 },
@@ -392,6 +421,11 @@ pub(crate) async fn execute_auxiliary_task(
             // Best-effort by design: surfacing the provider error to the
             // caller matters more than the failure journal entry, so a
             // journaling error here is deliberately discarded.
+            let failed_reason = if request.task_type == AuxiliaryTaskType::ObjectiveJudge {
+                OBJECTIVE_JUDGE_FAILED_EVENT
+            } else {
+                "auxiliary executor provider request failed"
+            };
             let _ = record_auxiliary_lifecycle_event(
                 runtime_state,
                 &request.context,
@@ -401,7 +435,7 @@ pub(crate) async fn execute_auxiliary_task(
                     task_id: request.task_id.as_str(),
                     task_type: request.task_type.as_str(),
                     phase: "failed",
-                    reason: "auxiliary executor provider request failed",
+                    reason: failed_reason,
                     token_budget: Some(effective_budget),
                     details: json!({
                         "status_code": format!("{:?}", error.code()),
@@ -503,6 +537,10 @@ mod tests {
             AuxiliaryTaskType::from_task_kind_str("recall_search"),
             Some(AuxiliaryTaskType::RecallSearch)
         );
+        assert_eq!(
+            AuxiliaryTaskType::from_task_kind_str("objective_judge"),
+            Some(AuxiliaryTaskType::ObjectiveJudge)
+        );
         assert_eq!(AuxiliaryTaskType::from_task_kind_str("background_prompt"), None);
     }
 
@@ -519,6 +557,12 @@ mod tests {
         assert_eq!(classification.model_preference, AuxiliaryModelPreference::LowLatency);
         assert_eq!(classification.fallback_policy, AuxiliaryFallbackPolicy::FailClosed);
         assert!(classification.json_mode);
+
+        let objective_judge = AuxiliaryTaskType::ObjectiveJudge.contract();
+        assert_eq!(objective_judge.default_budget_tokens, 900);
+        assert_eq!(objective_judge.model_preference, AuxiliaryModelPreference::LowLatency);
+        assert_eq!(objective_judge.fallback_policy, AuxiliaryFallbackPolicy::FailClosed);
+        assert!(objective_judge.json_mode);
 
         let vision = AuxiliaryTaskType::Vision.contract();
         assert!(vision.accepts_vision);

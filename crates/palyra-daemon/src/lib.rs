@@ -74,6 +74,7 @@ mod media_derived;
 mod model_provider;
 mod node_rpc;
 mod node_runtime;
+mod objective_judge;
 mod objectives;
 mod observability;
 mod openai_auth;

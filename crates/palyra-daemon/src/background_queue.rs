@@ -63,6 +63,10 @@ use crate::{
         OrchestratorBackgroundTaskRecord, OrchestratorBackgroundTaskUpdateRequest,
         OrchestratorRunMetadataUpdateRequest, OrchestratorTapeAppendRequest,
     },
+    objective_judge::{
+        build_objective_judge_prompt_from_payload, invalid_objective_judge_input_result,
+        materialize_objective_judge_result,
+    },
     self_healing::{WorkHeartbeatKind, WorkHeartbeatUpdate},
 };
 
@@ -527,19 +531,63 @@ async fn dispatch_auxiliary_executor_task(
     let runtime = Arc::clone(runtime);
     let task = task.clone();
     tokio::spawn(async move {
-        let parameter_delta_json = extract_parameter_delta_value(task.payload_json.as_deref())
-            .ok()
-            .flatten()
-            .map(|value| value.to_string());
+        let parameter_delta_json = if task_type == AuxiliaryTaskType::ObjectiveJudge {
+            None
+        } else {
+            extract_parameter_delta_value(task.payload_json.as_deref())
+                .ok()
+                .flatten()
+                .map(|value| value.to_string())
+        };
         let context = RequestContext {
             principal: task.owner_principal.clone(),
             device_id: task.device_id.clone(),
             channel: task.channel.clone(),
         };
-        let input_text = task
-            .input_text
-            .clone()
-            .unwrap_or_else(|| format!("Auxiliary task {} ({})", task.task_id, task.task_kind));
+        let input_text = if task_type == AuxiliaryTaskType::ObjectiveJudge {
+            match build_objective_judge_prompt_from_payload(task.payload_json.as_deref()) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    warn!(
+                        task_id = %task.task_id,
+                        status_message = %error,
+                        "objective judge input rejected before auxiliary provider call"
+                    );
+                    let materialized = invalid_objective_judge_input_result(
+                        error.clone(),
+                        json!({
+                            "status": "failed",
+                            "task_id": task.task_id.as_str(),
+                            "task_type": task_type.as_str(),
+                            "error": error,
+                        }),
+                    );
+                    let _ = runtime
+                        .update_orchestrator_background_task(
+                            OrchestratorBackgroundTaskUpdateRequest {
+                                task_id: task.task_id.clone(),
+                                state: Some(AuxiliaryTaskState::Failed.as_str().to_owned()),
+                                target_run_id: Some(None),
+                                increment_attempt_count: false,
+                                last_error: Some(materialized.last_error.clone()),
+                                result_json: Some(Some(materialized.result_json.to_string())),
+                                started_at_unix_ms: None,
+                                completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
+                            },
+                        )
+                        .await;
+                    runtime.clear_self_healing_heartbeat(
+                        WorkHeartbeatKind::BackgroundTask,
+                        task.task_id.as_str(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            task.input_text
+                .clone()
+                .unwrap_or_else(|| format!("Auxiliary task {} ({})", task.task_id, task.task_kind))
+        };
         match execute_auxiliary_task(
             &runtime,
             AuxiliaryExecutionRequest {
@@ -557,14 +605,30 @@ async fn dispatch_auxiliary_executor_task(
         .await
         {
             Ok(result) => {
+                let materialized = (task_type == AuxiliaryTaskType::ObjectiveJudge).then(|| {
+                    materialize_objective_judge_result(
+                        task.payload_json.as_deref(),
+                        result.output_text.as_str(),
+                        result.to_result_json(),
+                    )
+                });
+                let task_state = if materialized.as_ref().is_some_and(|entry| entry.parse_failed) {
+                    AuxiliaryTaskState::Failed
+                } else {
+                    AuxiliaryTaskState::Succeeded
+                };
+                let last_error = materialized.as_ref().and_then(|entry| entry.last_error.clone());
+                let result_json = materialized
+                    .map(|entry| entry.result_json)
+                    .unwrap_or_else(|| result.to_result_json());
                 let _ = runtime
                     .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
                         task_id: task.task_id.clone(),
-                        state: Some(AuxiliaryTaskState::Succeeded.as_str().to_owned()),
+                        state: Some(task_state.as_str().to_owned()),
                         target_run_id: Some(None),
                         increment_attempt_count: false,
-                        last_error: Some(None),
-                        result_json: Some(Some(result.to_result_json().to_string())),
+                        last_error: Some(last_error),
+                        result_json: Some(Some(result_json.to_string())),
                         started_at_unix_ms: None,
                         completed_at_unix_ms: Some(Some(crate::gateway::current_unix_ms())),
                     })
