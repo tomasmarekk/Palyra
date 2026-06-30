@@ -8,6 +8,7 @@ pub mod auth;
 pub mod channel_commands;
 pub mod channel_turn;
 pub mod channels;
+pub mod code_intel_runtime;
 pub mod context_compression;
 pub mod context_engine;
 pub mod context_references;

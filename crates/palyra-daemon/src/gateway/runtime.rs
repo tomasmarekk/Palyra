@@ -29,7 +29,14 @@ use crate::agents::{
     AgentRecord, AgentResolveOutcome, AgentResolveRequest, AgentSetDefaultOutcome,
     AgentUnbindOutcome, AgentUnbindRequest, SessionAgentBinding,
 };
-use crate::application::auth::map_auth_profile_error;
+use crate::application::{
+    auth::map_auth_profile_error,
+    code_intel_runtime::{
+        CodeIntelProviderObservation, CodeIntelRuntime, CodeIntelRuntimeObservationOutcome,
+        CodeIntelRuntimeObservationRequest, CodeIntelRuntimeSnapshot,
+        CodeIntelRuntimeSnapshotRequest,
+    },
+};
 use crate::journal::state_health::{
     JournalHashChainVerificationReport, JournalHashVerificationScope, JournalHealthReport,
     JournalStateRepairReport, JournalStateRepairRequest, JournalWalCheckpointMode,
@@ -737,6 +744,7 @@ pub struct GatewayRuntimeState {
     pub(crate) learning_config: RwLock<LearningRuntimeConfig>,
     pub(crate) memory_search_cache: Mutex<HashMap<String, CachedMemorySearchEntry>>,
     pub(crate) http_fetch_cache: Mutex<HashMap<String, CachedHttpFetchEntry>>,
+    code_intel_runtime: Mutex<CodeIntelRuntime>,
     recent_context_assembly_traces: Mutex<Vec<Value>>,
     tool_approval_cache: Mutex<ToolApprovalCacheState>,
     run_parameter_delta_cache: Mutex<RunParameterDeltaCache>,
@@ -1772,6 +1780,7 @@ impl GatewayRuntimeState {
             learning_config: RwLock::new(LearningRuntimeConfig::default()),
             memory_search_cache: Mutex::new(HashMap::new()),
             http_fetch_cache: Mutex::new(HashMap::new()),
+            code_intel_runtime: Mutex::new(CodeIntelRuntime::new()),
             recent_context_assembly_traces: Mutex::new(Vec::new()),
             tool_approval_cache: Mutex::new(ToolApprovalCacheState::default()),
             run_parameter_delta_cache: Mutex::new(RunParameterDeltaCache::default()),
@@ -8951,6 +8960,53 @@ impl GatewayRuntimeState {
             Err(poisoned) => {
                 warn!("memory config lock poisoned while reading runtime config");
                 poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    /// Current code-intelligence runtime lifecycle snapshot.
+    #[must_use]
+    pub(crate) fn code_intel_runtime_snapshot(&self) -> CodeIntelRuntimeSnapshot {
+        let request =
+            CodeIntelRuntimeSnapshotRequest {
+                enabled: self.config.code_intel.enabled,
+                workspace_root: self.config.code_intel.workspace_root.as_deref().and_then(|path| {
+                    path.to_str().map(str::trim).filter(|value| !value.is_empty())
+                }),
+                timeout_ms: self.config.code_intel.timeout_ms,
+                idle_reap_ms: self.config.code_intel.idle_reap_ms,
+                now_unix_ms: current_unix_ms(),
+            };
+        match self.code_intel_runtime.lock() {
+            Ok(mut runtime) => runtime.snapshot(request),
+            Err(poisoned) => {
+                warn!("code-intelligence runtime lock poisoned while reading snapshot");
+                poisoned.into_inner().snapshot(request)
+            }
+        }
+    }
+
+    /// Applies provider observations to the code-intelligence runtime read model.
+    pub(crate) fn observe_code_intel_runtime(
+        &self,
+        workspace_root: Option<&str>,
+        observations: &[CodeIntelProviderObservation],
+        evidence_refs: &[String],
+    ) -> CodeIntelRuntimeObservationOutcome {
+        let request = CodeIntelRuntimeObservationRequest {
+            enabled: self.config.code_intel.enabled,
+            workspace_root,
+            observations,
+            timeout_ms: self.config.code_intel.timeout_ms,
+            idle_reap_ms: self.config.code_intel.idle_reap_ms,
+            now_unix_ms: current_unix_ms(),
+            evidence_refs,
+        };
+        match self.code_intel_runtime.lock() {
+            Ok(mut runtime) => runtime.observe(request),
+            Err(poisoned) => {
+                warn!("code-intelligence runtime lock poisoned while applying observations");
+                poisoned.into_inner().observe(request)
             }
         }
     }

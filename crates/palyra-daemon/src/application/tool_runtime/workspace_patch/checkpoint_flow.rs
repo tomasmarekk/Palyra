@@ -28,6 +28,10 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::{
+    application::code_intel_runtime::{
+        CodeIntelRuntimeAuditEvent, CodeIntelRuntimeSnapshot, CODE_INTEL_DIAGNOSTICS_DELTA_EVENT,
+        CODE_INTEL_REDACTION_LEVEL,
+    },
     application::project_facts::{
         append_project_facts_output, project_facts_journal_projection, workspace_root_ref,
         ProjectCommandKind, ProjectFactsCaptureRequest, ProjectFactsDecision,
@@ -327,7 +331,37 @@ pub(super) async fn execute_workspace_patch_mutation(
         &diagnostic_baseline,
         &diagnostic_after,
     );
+    let code_intel_evidence_refs = code_intel_evidence_refs(proposal_id, mutation_id.as_str());
+    let provider_observations = code_intel::provider_runtime_observations(&diagnostic_after);
+    let code_intel_runtime = runtime_state.observe_code_intel_runtime(
+        diagnostic_after.workspace_root.as_deref(),
+        provider_observations.as_slice(),
+        code_intel_evidence_refs.as_slice(),
+    );
+    record_code_intel_runtime_journal_events(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        code_intel_runtime.audit_events.as_slice(),
+    )
+    .await;
+    record_code_intel_diagnostics_delta_journal_event(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        &diagnostic_delta,
+        &code_intel_runtime.snapshot,
+        code_intel_evidence_refs.as_slice(),
+    )
+    .await;
     code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta);
+    code_intel::append_runtime_output(&mut output_value, &code_intel_runtime.snapshot);
     if let Some(project_facts) = capture_project_facts_for_coding_posture(
         runtime_state,
         ProjectFactsPatchCapture {
@@ -607,6 +641,138 @@ async fn record_verification_journal_projection(
             status_code = ?error.code(),
             status_message = %error.message(),
             "verification journal write failed"
+        );
+    }
+}
+
+fn code_intel_evidence_refs(proposal_id: &str, mutation_id: &str) -> Vec<String> {
+    vec![format!("tool_proposal:{proposal_id}"), format!("workspace_mutation:{mutation_id}")]
+}
+
+async fn record_code_intel_runtime_journal_events(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    events: &[CodeIntelRuntimeAuditEvent],
+) {
+    for event in events {
+        record_code_intel_journal_payload(
+            runtime_state,
+            principal,
+            device_id,
+            channel,
+            session_id,
+            run_id,
+            event.created_at_unix_ms,
+            json!({
+                "event": event.event_type.as_str(),
+                "schema_version": event.schema_version,
+                "session_id": session_id,
+                "run_id": run_id,
+                "provider": event.provider.as_str(),
+                "language": event.language,
+                "status": event.status,
+                "reason_code": event.reason_code.as_str(),
+                "workspace_root": event.workspace_root.as_deref(),
+                "evidence_refs": event.evidence_refs.as_slice(),
+                "redaction_level": event.redaction_level.as_str(),
+            }),
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_code_intel_diagnostics_delta_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    delta: &code_intel::DiagnosticDelta,
+    runtime_snapshot: &CodeIntelRuntimeSnapshot,
+    evidence_refs: &[String],
+) {
+    if !delta.enabled {
+        return;
+    }
+    let provider_status = delta
+        .provider_status
+        .iter()
+        .map(|status| {
+            json!({
+                "provider": status.provider.as_str(),
+                "language": status.language,
+                "status": status.status.as_str(),
+                "reason_code": status.reason_code.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    record_code_intel_journal_payload(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        current_unix_ms(),
+        json!({
+            "event": CODE_INTEL_DIAGNOSTICS_DELTA_EVENT,
+            "schema_version": delta.schema_version,
+            "session_id": session_id,
+            "run_id": run_id,
+            "new_errors": delta.new_errors,
+            "new_warnings": delta.new_warnings,
+            "items_count": delta.items.len(),
+            "truncated": delta.truncated,
+            "degraded": delta.degraded,
+            "reason_codes": delta.reason_codes.as_slice(),
+            "provider_status": provider_status,
+            "runtime_status": runtime_snapshot.status,
+            "runtime_mode": runtime_snapshot.mode,
+            "runtime_client_count": runtime_snapshot.clients.len(),
+            "broken_server_cache_count": runtime_snapshot.broken_server_cache.len(),
+            "evidence_refs": evidence_refs,
+            "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+        }),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_code_intel_journal_payload(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    timestamp_unix_ms: i64,
+    payload: Value,
+) {
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: session_id.to_owned(),
+            run_id: run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms,
+            payload_json: payload.to_string().into_bytes(),
+            principal: principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "code-intelligence journal write failed"
         );
     }
 }

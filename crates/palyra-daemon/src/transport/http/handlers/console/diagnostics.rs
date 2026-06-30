@@ -2560,6 +2560,16 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
             "coverage_policy": "unknown_scope_never_counts_as_fresh",
             "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
         },
+        "code_intel_runtime": {
+            "snapshot": state.runtime.code_intel_runtime_snapshot(),
+            "journal_events": [
+                crate::application::code_intel_runtime::CODE_INTEL_PROVIDER_STARTED_EVENT,
+                crate::application::code_intel_runtime::CODE_INTEL_PROVIDER_DEGRADED_EVENT,
+                crate::application::code_intel_runtime::CODE_INTEL_DIAGNOSTICS_DELTA_EVENT,
+            ],
+            "tool_output_source": "palyra.fs.apply_patch.diagnostics.runtime",
+            "redaction_level": crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL,
+        },
         "replay_bundle_metadata": build_replay_support_observability(),
         "worker_diagnostics": networked_workers,
     })

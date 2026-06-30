@@ -16,57 +16,16 @@ use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::CodeIntelConfig;
+use crate::{
+    application::code_intel_runtime::{
+        CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelRuntimeSnapshot,
+    },
+    config::CodeIntelConfig,
+};
 
 const CODE_INTEL_SCHEMA_VERSION: u32 = 1;
 #[cfg(test)]
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 320;
-
-/// Language/provider family used for code diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CodeIntelLanguage {
-    Rust,
-    TypeScript,
-    Python,
-}
-
-impl CodeIntelLanguage {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::TypeScript => "typescript",
-            Self::Python => "python",
-        }
-    }
-
-    const fn provider_name(self) -> &'static str {
-        match self {
-            Self::Rust => "rust-analyzer",
-            Self::TypeScript => "typescript-language-server",
-            Self::Python => "pyright",
-        }
-    }
-
-    fn from_path(path: &str) -> Option<Self> {
-        let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".rs") {
-            Some(Self::Rust)
-        } else if lower.ends_with(".ts")
-            || lower.ends_with(".tsx")
-            || lower.ends_with(".js")
-            || lower.ends_with(".jsx")
-            || lower.ends_with(".mjs")
-            || lower.ends_with(".cjs")
-        {
-            Some(Self::TypeScript)
-        } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
-            Some(Self::Python)
-        } else {
-            None
-        }
-    }
-}
 
 /// Normalized diagnostic severity. Higher ranks are worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -291,6 +250,54 @@ pub(crate) fn append_diagnostics_output(output_value: &mut Value, delta: Diagnos
         })
     });
     payload.insert("diagnostics".to_owned(), diagnostics);
+}
+
+/// Converts provider statuses from a diagnostics snapshot into runtime
+/// supervisor observations.
+pub(crate) fn provider_runtime_observations(
+    snapshot: &DiagnosticSnapshot,
+) -> Vec<CodeIntelProviderObservation> {
+    snapshot
+        .provider_status
+        .iter()
+        .map(|status| {
+            CodeIntelProviderObservation::from_status_fields(
+                status.provider.as_str(),
+                status.language,
+                status.status.as_str(),
+                status.binary.as_str(),
+                status.reason_code.as_str(),
+                status.repair_hint.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Inserts code-intelligence runtime lifecycle details into the diagnostics
+/// output block.
+pub(crate) fn append_runtime_output(
+    output_value: &mut Value,
+    runtime_snapshot: &CodeIntelRuntimeSnapshot,
+) {
+    let Some(payload) = output_value.as_object_mut() else {
+        return;
+    };
+    let runtime_value = serde_json::to_value(runtime_snapshot).unwrap_or_else(|error| {
+        serde_json::json!({
+            "schema_version": crate::application::code_intel_runtime::CODE_INTEL_RUNTIME_SCHEMA_VERSION,
+            "enabled": false,
+            "mode": "disabled",
+            "status": "degraded",
+            "clients": [],
+            "broken_server_cache": [],
+            "reason_codes": ["code_intel.runtime_serialize_failed"],
+            "error": error.to_string(),
+            "redaction_level": crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL,
+        })
+    });
+    if let Some(diagnostics) = payload.get_mut("diagnostics").and_then(Value::as_object_mut) {
+        diagnostics.insert("runtime".to_owned(), runtime_value);
+    }
 }
 
 /// Parses an LSP-like JSON diagnostic payload used by provider adapters and
