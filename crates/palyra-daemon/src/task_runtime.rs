@@ -16,7 +16,7 @@ use crate::{
         AgentPlanEvent, AgentPlanItem, AgentPlanQuery, AgentPlanStatus, AgentPlanStore,
         AGENT_PLAN_SCHEMA_VERSION,
     },
-    gateway::GatewayRuntimeState,
+    gateway::{current_unix_ms, GatewayRuntimeState},
     journal::{
         self, CommitmentEventRecord, CommitmentListFilter, CommitmentRecord, FlowEventRecord,
         FlowListFilter, FlowRecord, OrchestratorBackgroundTaskListFilter,
@@ -36,6 +36,17 @@ pub(crate) const TASK_PROJECTION_EVENT_FAILED: &str =
     "taskprojectionstore_nad_background_tasks_flows_jobs_a_commitments.failed";
 pub(crate) const TASK_PROJECTION_ROLLOUT_OBSERVE_ONLY: &str = "observe_only";
 pub(crate) const TASK_PROJECTION_REDACTION_METADATA_ONLY: &str = "metadata_only";
+pub(crate) const TASK_RECONCILER_SCHEMA_VERSION: i64 = 1;
+pub(crate) const TASK_RECONCILER_EVENT_STARTED: &str =
+    "taskreconciler_a_repair_plans_pro_stuck_tasks.started";
+pub(crate) const TASK_RECONCILER_EVENT_COMPLETED: &str =
+    "taskreconciler_a_repair_plans_pro_stuck_tasks.completed";
+pub(crate) const TASK_RECONCILER_EVENT_FAILED: &str =
+    "taskreconciler_a_repair_plans_pro_stuck_tasks.failed";
+pub(crate) const TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY: &str = "observe_only";
+pub(crate) const TASK_RECONCILER_REDACTION_METADATA_ONLY: &str = "metadata_only";
+pub(crate) const DEFAULT_TASK_RECONCILER_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
+pub(crate) const DEFAULT_TASK_RECONCILER_BLOCKED_AFTER_MS: i64 = 60 * 60 * 1_000;
 
 /// Source store represented by a normalized task id.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +146,86 @@ impl TaskProjectionReasonCode {
             Self::FilteredStateMismatch => "task_projection.filtered_state_mismatch",
             Self::AccessDenied => "task_projection.access_denied",
             Self::InvalidSource => "task_projection.invalid_source",
+        }
+    }
+}
+
+/// Repair-plan decision emitted by the task reconciler.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskRepairDecisionKind {
+    NoRepairNeeded,
+    RepairRecommended,
+    ManualReviewRequired,
+    Blocked,
+}
+
+impl TaskRepairDecisionKind {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRepairNeeded => "no_repair_needed",
+            Self::RepairRecommended => "repair_recommended",
+            Self::ManualReviewRequired => "manual_review_required",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    #[must_use]
+    const fn requires_plan(self) -> bool {
+        !matches!(self, Self::NoRepairNeeded)
+    }
+}
+
+/// Suggested operator action for a stuck task repair plan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskRepairAction {
+    None,
+    RetrySource,
+    RecoverStaleLease,
+    InspectBlocker,
+    ManualReview,
+}
+
+impl TaskRepairAction {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RetrySource => "retry_source",
+            Self::RecoverStaleLease => "recover_stale_lease",
+            Self::InspectBlocker => "inspect_blocker",
+            Self::ManualReview => "manual_review",
+        }
+    }
+}
+
+/// Stable reason codes for task repair plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskRepairReasonCode {
+    Healthy,
+    InvalidTask,
+    StaleHeartbeat,
+    MissingHeartbeat,
+    ExpiredLease,
+    BlockedTooLong,
+    TerminalRetryAvailable,
+    TerminalRetryUnavailable,
+}
+
+impl TaskRepairReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "task_reconciler.healthy",
+            Self::InvalidTask => "task_reconciler.invalid_task",
+            Self::StaleHeartbeat => "task_reconciler.stale_heartbeat",
+            Self::MissingHeartbeat => "task_reconciler.missing_heartbeat",
+            Self::ExpiredLease => "task_reconciler.expired_lease",
+            Self::BlockedTooLong => "task_reconciler.blocked_too_long",
+            Self::TerminalRetryAvailable => "task_reconciler.terminal_retry_available",
+            Self::TerminalRetryUnavailable => "task_reconciler.terminal_retry_unavailable",
         }
     }
 }
@@ -346,12 +437,69 @@ pub(crate) struct TaskProjectionJournalProjection {
     pub(crate) redaction_level: String,
 }
 
+/// Tunables for observe-only stuck task detection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskReconcilerConfig {
+    pub(crate) stale_after_ms: i64,
+    pub(crate) blocked_after_ms: i64,
+    pub(crate) allow_automatic_repair: bool,
+}
+
+impl Default for TaskReconcilerConfig {
+    fn default() -> Self {
+        Self {
+            stale_after_ms: DEFAULT_TASK_RECONCILER_STALE_AFTER_MS,
+            blocked_after_ms: DEFAULT_TASK_RECONCILER_BLOCKED_AFTER_MS,
+            allow_automatic_repair: false,
+        }
+    }
+}
+
+/// Metadata-only repair plan for one stuck normalized task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskRepairPlan {
+    pub(crate) schema_version: i64,
+    pub(crate) task_id: String,
+    pub(crate) source_kind: String,
+    pub(crate) source_id: String,
+    pub(crate) state: String,
+    pub(crate) decision: TaskRepairDecisionKind,
+    pub(crate) reason_code: String,
+    pub(crate) action: TaskRepairAction,
+    pub(crate) safe_to_auto_apply: bool,
+    pub(crate) requires_operator_confirmation: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) age_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) heartbeat_age_ms: Option<i64>,
+    pub(crate) evidence_refs_json: String,
+    pub(crate) payload_json: String,
+    pub(crate) redaction_level: String,
+}
+
+/// Snapshot-level repair-plan projection for stuck tasks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskRepairPlanProjection {
+    pub(crate) schema_version: i64,
+    pub(crate) event_type: String,
+    pub(crate) rollout_mode: String,
+    pub(crate) evaluated_count: usize,
+    pub(crate) repair_plan_count: usize,
+    pub(crate) blocked_count: usize,
+    pub(crate) manual_review_count: usize,
+    pub(crate) payload_json: String,
+    pub(crate) evidence_refs_json: String,
+    pub(crate) redaction_level: String,
+    pub(crate) plans: Vec<TaskRepairPlan>,
+}
+
 /// Snapshot returned by `GET /console/v1/tasks`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TaskRuntimeSnapshot {
     pub tasks: Vec<TaskRun>,
     pub summary: TaskRuntimeSummary,
     pub projection: TaskProjectionJournalProjection,
+    pub repair_plans: TaskRepairPlanProjection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_progress: Option<TaskPlanProgressCheckpoint>,
 }
@@ -462,6 +610,134 @@ impl TaskProjectionStore {
             payload_json,
             evidence_refs_json,
             redaction_level: TASK_PROJECTION_REDACTION_METADATA_ONLY.to_owned(),
+        }
+    }
+}
+
+/// Observe-only reconciler that suggests repair plans for stuck normalized tasks.
+pub(crate) struct TaskReconciler;
+
+impl TaskReconciler {
+    /// Builds one repair plan from a normalized task row.
+    #[must_use]
+    pub(crate) fn plan_task(
+        task: &TaskRun,
+        now_unix_ms: i64,
+        config: &TaskReconcilerConfig,
+    ) -> TaskRepairPlan {
+        let age_ms = age_from(now_unix_ms, task.updated_at_unix_ms);
+        let heartbeat_age_ms =
+            task.heartbeat_at_unix_ms.map(|heartbeat| age_from(now_unix_ms, heartbeat));
+        let (decision, action, reason) =
+            task_repair_decision(task, now_unix_ms, age_ms, heartbeat_age_ms, config);
+        let evidence_refs = task_repair_evidence_refs(task, age_ms, heartbeat_age_ms);
+        let evidence_refs_json = evidence_refs.to_string();
+        let safe_to_auto_apply = config.allow_automatic_repair
+            && matches!(decision, TaskRepairDecisionKind::RepairRecommended)
+            && matches!(action, TaskRepairAction::RecoverStaleLease);
+        let requires_operator_confirmation =
+            !matches!(decision, TaskRepairDecisionKind::NoRepairNeeded) && !safe_to_auto_apply;
+        let payload_json = json!({
+            "event": TASK_RECONCILER_EVENT_COMPLETED,
+            "schema_version": TASK_RECONCILER_SCHEMA_VERSION,
+            "rollout_mode": TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY,
+            "task_id": task.task_id.as_str(),
+            "source_kind": task.source_kind.as_str(),
+            "source_id": task.source_id.as_str(),
+            "state": task.state.as_str(),
+            "decision": decision.as_str(),
+            "reason_code": reason.as_str(),
+            "action": action.as_str(),
+            "safe_to_auto_apply": safe_to_auto_apply,
+            "requires_operator_confirmation": requires_operator_confirmation,
+            "age_ms": age_ms,
+            "heartbeat_age_ms": heartbeat_age_ms,
+            "thresholds": {
+                "stale_after_ms": config.stale_after_ms,
+                "blocked_after_ms": config.blocked_after_ms,
+            },
+            "evidence_refs": evidence_refs,
+            "redaction_level": TASK_RECONCILER_REDACTION_METADATA_ONLY,
+        })
+        .to_string();
+        TaskRepairPlan {
+            schema_version: TASK_RECONCILER_SCHEMA_VERSION,
+            task_id: task.task_id.clone(),
+            source_kind: task.source_kind.clone(),
+            source_id: task.source_id.clone(),
+            state: task.state.clone(),
+            decision,
+            reason_code: reason.as_str().to_owned(),
+            action,
+            safe_to_auto_apply,
+            requires_operator_confirmation,
+            age_ms: Some(age_ms),
+            heartbeat_age_ms,
+            evidence_refs_json,
+            payload_json,
+            redaction_level: TASK_RECONCILER_REDACTION_METADATA_ONLY.to_owned(),
+        }
+    }
+
+    /// Builds a snapshot-level projection containing only actionable repair plans.
+    #[must_use]
+    pub(crate) fn plan_snapshot(
+        tasks: &[TaskRun],
+        now_unix_ms: i64,
+        config: &TaskReconcilerConfig,
+    ) -> TaskRepairPlanProjection {
+        let plans = tasks
+            .iter()
+            .map(|task| Self::plan_task(task, now_unix_ms, config))
+            .filter(|plan| plan.decision.requires_plan())
+            .collect::<Vec<_>>();
+        let blocked_count =
+            plans.iter().filter(|plan| plan.decision == TaskRepairDecisionKind::Blocked).count();
+        let manual_review_count = plans
+            .iter()
+            .filter(|plan| plan.decision == TaskRepairDecisionKind::ManualReviewRequired)
+            .count();
+        let evidence_refs = json!(plans
+            .iter()
+            .map(|plan| {
+                json!({
+                    "kind": "task_repair_plan",
+                    "task_id": plan.task_id.as_str(),
+                    "source_kind": plan.source_kind.as_str(),
+                    "reason_code": plan.reason_code.as_str(),
+                    "redaction_level": TASK_RECONCILER_REDACTION_METADATA_ONLY,
+                })
+            })
+            .collect::<Vec<_>>());
+        let evidence_refs_json = evidence_refs.to_string();
+        let payload_json = json!({
+            "event": TASK_RECONCILER_EVENT_COMPLETED,
+            "schema_version": TASK_RECONCILER_SCHEMA_VERSION,
+            "rollout_mode": TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY,
+            "evaluated_count": tasks.len(),
+            "repair_plan_count": plans.len(),
+            "blocked_count": blocked_count,
+            "manual_review_count": manual_review_count,
+            "thresholds": {
+                "stale_after_ms": config.stale_after_ms,
+                "blocked_after_ms": config.blocked_after_ms,
+            },
+            "evidence_refs": evidence_refs,
+            "redaction_level": TASK_RECONCILER_REDACTION_METADATA_ONLY,
+        })
+        .to_string();
+        TaskRepairPlanProjection {
+            schema_version: TASK_RECONCILER_SCHEMA_VERSION,
+            event_type: TASK_RECONCILER_EVENT_COMPLETED.to_owned(),
+            rollout_mode: TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY.to_owned(),
+            evaluated_count: tasks.len(),
+            repair_plan_count: plans.len(),
+            blocked_count,
+            manual_review_count,
+            payload_json,
+            evidence_refs_json,
+            redaction_level: TASK_RECONCILER_REDACTION_METADATA_ONLY.to_owned(),
+            plans,
         }
     }
 }
@@ -579,7 +855,12 @@ impl TaskRuntime {
         tasks.truncate(limit);
         let summary = summarize_tasks(tasks.as_slice());
         let projection = TaskProjectionStore::project_snapshot(tasks.as_slice(), &filter, limit);
-        Ok(TaskRuntimeSnapshot { tasks, summary, projection, plan_progress })
+        let repair_plans = TaskReconciler::plan_snapshot(
+            tasks.as_slice(),
+            current_unix_ms(),
+            &TaskReconcilerConfig::default(),
+        );
+        Ok(TaskRuntimeSnapshot { tasks, summary, projection, repair_plans, plan_progress })
     }
 
     /// Loads one normalized task by id.
@@ -761,6 +1042,118 @@ fn task_projection_evidence_refs(source_summaries: &[TaskProjectionSourceSummary
             })
         })
         .collect::<Vec<_>>())
+}
+
+fn task_repair_decision(
+    task: &TaskRun,
+    now_unix_ms: i64,
+    age_ms: i64,
+    heartbeat_age_ms: Option<i64>,
+    config: &TaskReconcilerConfig,
+) -> (TaskRepairDecisionKind, TaskRepairAction, TaskRepairReasonCode) {
+    if task.source_id.trim().is_empty()
+        || TaskSourceKind::from_str(task.source_kind.as_str()).is_none()
+        || ParsedTaskId::parse(task.task_id.as_str()).is_none()
+    {
+        return (
+            TaskRepairDecisionKind::Blocked,
+            TaskRepairAction::ManualReview,
+            TaskRepairReasonCode::InvalidTask,
+        );
+    }
+    if is_terminal_task_state(task.state.as_str()) {
+        return terminal_repair_decision(task);
+    }
+    if lease_is_expired(task.access_policy_json.as_str(), now_unix_ms) {
+        return (
+            TaskRepairDecisionKind::RepairRecommended,
+            TaskRepairAction::RecoverStaleLease,
+            TaskRepairReasonCode::ExpiredLease,
+        );
+    }
+    if let Some(heartbeat_age_ms) = heartbeat_age_ms {
+        if heartbeat_age_ms > config.stale_after_ms {
+            return (
+                TaskRepairDecisionKind::RepairRecommended,
+                TaskRepairAction::RecoverStaleLease,
+                TaskRepairReasonCode::StaleHeartbeat,
+            );
+        }
+    } else if is_heartbeat_expected_source(task.source_kind.as_str())
+        && age_ms > config.stale_after_ms
+        && is_active_task_state(task.state.as_str())
+    {
+        return (
+            TaskRepairDecisionKind::ManualReviewRequired,
+            TaskRepairAction::ManualReview,
+            TaskRepairReasonCode::MissingHeartbeat,
+        );
+    }
+    if is_blocked_task_state(task.state.as_str()) && age_ms > config.blocked_after_ms {
+        return (
+            TaskRepairDecisionKind::ManualReviewRequired,
+            TaskRepairAction::InspectBlocker,
+            TaskRepairReasonCode::BlockedTooLong,
+        );
+    }
+    (TaskRepairDecisionKind::NoRepairNeeded, TaskRepairAction::None, TaskRepairReasonCode::Healthy)
+}
+
+fn terminal_repair_decision(
+    task: &TaskRun,
+) -> (TaskRepairDecisionKind, TaskRepairAction, TaskRepairReasonCode) {
+    if !is_failed_task_state(task.state.as_str()) {
+        return (
+            TaskRepairDecisionKind::NoRepairNeeded,
+            TaskRepairAction::None,
+            TaskRepairReasonCode::Healthy,
+        );
+    }
+    if task.retry_policy.retry_allowed {
+        (
+            TaskRepairDecisionKind::RepairRecommended,
+            TaskRepairAction::RetrySource,
+            TaskRepairReasonCode::TerminalRetryAvailable,
+        )
+    } else {
+        (
+            TaskRepairDecisionKind::ManualReviewRequired,
+            TaskRepairAction::ManualReview,
+            TaskRepairReasonCode::TerminalRetryUnavailable,
+        )
+    }
+}
+
+fn task_repair_evidence_refs(task: &TaskRun, age_ms: i64, heartbeat_age_ms: Option<i64>) -> Value {
+    json!([{
+        "kind": "task_runtime_snapshot",
+        "task_id": task.task_id.as_str(),
+        "source_kind": task.source_kind.as_str(),
+        "source_id": task.source_id.as_str(),
+        "state": task.state.as_str(),
+        "age_ms": age_ms,
+        "heartbeat_age_ms": heartbeat_age_ms,
+        "redaction_level": TASK_RECONCILER_REDACTION_METADATA_ONLY,
+    }])
+}
+
+fn age_from(now_unix_ms: i64, observed_unix_ms: i64) -> i64 {
+    now_unix_ms.saturating_sub(observed_unix_ms).max(0)
+}
+
+fn is_heartbeat_expected_source(source_kind: &str) -> bool {
+    matches!(source_kind, "tool_job" | "work_item" | "agent_plan_item")
+}
+
+fn lease_is_expired(access_policy_json: &str, now_unix_ms: i64) -> bool {
+    serde_json::from_str::<Value>(access_policy_json)
+        .ok()
+        .and_then(|value| value.get("lease_expires_at_unix_ms").and_then(Value::as_i64))
+        .is_some_and(|lease_expires_at| lease_expires_at <= now_unix_ms)
+}
+
+fn is_active_task_state(state: &str) -> bool {
+    !is_terminal_task_state(state) && !is_blocked_task_state(state)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1657,6 +2050,87 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&projection).expect("serializes"))
                 .expect("deserializes");
         assert_eq!(roundtrip, projection);
+    }
+
+    #[test]
+    fn task_reconciler_builds_repair_plans_for_stuck_tasks() {
+        let config = TaskReconcilerConfig {
+            stale_after_ms: 1_000,
+            blocked_after_ms: 5_000,
+            allow_automatic_repair: false,
+        };
+        let mut stale_job = task(TaskSourceKind::ToolJob, "job-1", "running", 9_000);
+        stale_job.heartbeat_at_unix_ms = Some(8_500);
+        stale_job.access_policy_json = json!({"lease_expires_at_unix_ms": 9_500}).to_string();
+        let plan = TaskReconciler::plan_task(&stale_job, 10_000, &config);
+        assert_eq!(plan.decision, TaskRepairDecisionKind::RepairRecommended);
+        assert_eq!(plan.action, TaskRepairAction::RecoverStaleLease);
+        assert_eq!(plan.reason_code, TaskRepairReasonCode::ExpiredLease.as_str());
+        assert!(plan.requires_operator_confirmation);
+        assert!(!plan.safe_to_auto_apply);
+
+        let blocked = task(TaskSourceKind::Flow, "flow-1", "blocked", 1_000);
+        let plan = TaskReconciler::plan_task(&blocked, 10_000, &config);
+        assert_eq!(plan.decision, TaskRepairDecisionKind::ManualReviewRequired);
+        assert_eq!(plan.action, TaskRepairAction::InspectBlocker);
+        assert_eq!(plan.reason_code, TaskRepairReasonCode::BlockedTooLong.as_str());
+
+        let mut failed = task(TaskSourceKind::BackgroundTask, "task-1", "failed", 9_500);
+        failed.retry_policy.retry_allowed = true;
+        let plan = TaskReconciler::plan_task(&failed, 10_000, &config);
+        assert_eq!(plan.decision, TaskRepairDecisionKind::RepairRecommended);
+        assert_eq!(plan.action, TaskRepairAction::RetrySource);
+        assert_eq!(plan.reason_code, TaskRepairReasonCode::TerminalRetryAvailable.as_str());
+
+        let roundtrip: TaskRepairPlan =
+            serde_json::from_str(&serde_json::to_string(&plan).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(roundtrip, plan);
+    }
+
+    #[test]
+    fn task_reconciler_blocks_invalid_tasks_and_hides_raw_task_text() {
+        let config = TaskReconcilerConfig {
+            stale_after_ms: 1_000,
+            blocked_after_ms: 5_000,
+            allow_automatic_repair: false,
+        };
+        let mut invalid = task(TaskSourceKind::WorkItem, "work-1", "running", 9_500);
+        invalid.task_id = "unknown:work-1".to_owned();
+
+        let plan = TaskReconciler::plan_task(&invalid, 10_000, &config);
+
+        assert_eq!(plan.decision, TaskRepairDecisionKind::Blocked);
+        assert_eq!(plan.action, TaskRepairAction::ManualReview);
+        assert_eq!(plan.reason_code, TaskRepairReasonCode::InvalidTask.as_str());
+        assert!(!plan.payload_json.contains("secret task title"));
+        assert!(!plan.payload_json.contains("secret task summary"));
+    }
+
+    #[test]
+    fn task_reconciler_snapshot_contains_only_actionable_plans() {
+        let config = TaskReconcilerConfig {
+            stale_after_ms: 1_000,
+            blocked_after_ms: 5_000,
+            allow_automatic_repair: false,
+        };
+        let healthy = task(TaskSourceKind::BackgroundTask, "healthy", "running", 9_900);
+        let mut stale = task(TaskSourceKind::WorkItem, "stale", "running", 9_900);
+        stale.heartbeat_at_unix_ms = Some(8_000);
+        let blocked = task(TaskSourceKind::Flow, "blocked", "blocked", 1_000);
+
+        let projection = TaskReconciler::plan_snapshot(&[healthy, stale, blocked], 10_000, &config);
+
+        assert_eq!(projection.schema_version, TASK_RECONCILER_SCHEMA_VERSION);
+        assert_eq!(projection.event_type, TASK_RECONCILER_EVENT_COMPLETED);
+        assert_eq!(projection.evaluated_count, 3);
+        assert_eq!(projection.repair_plan_count, 2);
+        assert_eq!(projection.manual_review_count, 1);
+        assert_eq!(projection.redaction_level, TASK_RECONCILER_REDACTION_METADATA_ONLY);
+        let payload = serde_json::from_str::<Value>(projection.payload_json.as_str())
+            .expect("repair projection payload should be json");
+        assert_eq!(payload["event"], TASK_RECONCILER_EVENT_COMPLETED);
+        assert_eq!(payload["repair_plan_count"], 2);
     }
 
     #[test]

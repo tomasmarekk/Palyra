@@ -113,6 +113,7 @@ pub(crate) async fn console_tasks_list_handler(
         "page": build_page_info(limit, snapshot.tasks.len(), next_cursor),
         "summary": snapshot.summary,
         "projection": snapshot.projection,
+        "repair_plans": snapshot.repair_plans,
         "tasks": snapshot.tasks,
     })))
 }
@@ -571,6 +572,18 @@ fn task_contract_descriptor() -> Value {
                 "failed": crate::task_runtime::TASK_PROJECTION_EVENT_FAILED,
             },
             "redaction_level": crate::task_runtime::TASK_PROJECTION_REDACTION_METADATA_ONLY,
+        },
+        "reconciler": {
+            "schema_version": crate::task_runtime::TASK_RECONCILER_SCHEMA_VERSION,
+            "rollout_mode": crate::task_runtime::TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY,
+            "audit_ledger": "journal_read_model",
+            "event_types": {
+                "started": crate::task_runtime::TASK_RECONCILER_EVENT_STARTED,
+                "completed": crate::task_runtime::TASK_RECONCILER_EVENT_COMPLETED,
+                "failed": crate::task_runtime::TASK_RECONCILER_EVENT_FAILED,
+            },
+            "redaction_level": crate::task_runtime::TASK_RECONCILER_REDACTION_METADATA_ONLY,
+            "runtime_behavior": "observe_only_repair_plan_generation",
         },
     })
 }

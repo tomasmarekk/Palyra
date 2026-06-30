@@ -39,6 +39,7 @@
     "runtime_watchdog",
     "skills",
     "task_projection",
+    "task_reconciler",
     "turn_control",
     "verification",
     "webhooks"

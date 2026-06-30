@@ -148,6 +148,7 @@ pub(crate) async fn console_diagnostics_handler(
         collect_console_progress_draft_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut progress_drafts_payload, None);
     let task_projection_payload = collect_console_task_projection_diagnostics();
+    let task_reconciler_payload = collect_console_task_reconciler_diagnostics();
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
@@ -303,6 +304,7 @@ pub(crate) async fn console_diagnostics_handler(
         "agent_plan": agent_plan_payload,
         "progress_drafts": progress_drafts_payload,
         "task_projection": task_projection_payload,
+        "task_reconciler": task_reconciler_payload,
         "replay_continuity": replay_continuity_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
@@ -1682,6 +1684,27 @@ fn collect_console_task_projection_diagnostics() -> Value {
         "sources": ["background_task", "flow", "tool_job", "work_item", "commitment", "agent_plan_item"],
         "redaction_level": crate::task_runtime::TASK_PROJECTION_REDACTION_METADATA_ONLY,
         "runtime_behavior": "observe_only_journal_read_model",
+    })
+}
+
+/// Summarizes the observe-only task reconciler and repair-plan contract.
+fn collect_console_task_reconciler_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::task_runtime::TASK_RECONCILER_SCHEMA_VERSION,
+        "rollout_mode": crate::task_runtime::TASK_RECONCILER_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "journal_read_model",
+        "read_model_endpoint": "/console/v1/tasks",
+        "event_types": {
+            "started": crate::task_runtime::TASK_RECONCILER_EVENT_STARTED,
+            "completed": crate::task_runtime::TASK_RECONCILER_EVENT_COMPLETED,
+            "failed": crate::task_runtime::TASK_RECONCILER_EVENT_FAILED,
+        },
+        "thresholds": {
+            "stale_after_ms": crate::task_runtime::DEFAULT_TASK_RECONCILER_STALE_AFTER_MS,
+            "blocked_after_ms": crate::task_runtime::DEFAULT_TASK_RECONCILER_BLOCKED_AFTER_MS,
+        },
+        "redaction_level": crate::task_runtime::TASK_RECONCILER_REDACTION_METADATA_ONLY,
+        "runtime_behavior": "observe_only_repair_plan_generation",
     })
 }
 
