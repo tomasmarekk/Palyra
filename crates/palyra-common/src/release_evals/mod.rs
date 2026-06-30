@@ -6,6 +6,7 @@
 
 mod catalog;
 mod evaluator;
+mod projections;
 mod schema;
 
 pub use catalog::{
@@ -15,6 +16,19 @@ pub use catalog::{
 pub use evaluator::{
     ensure_release_eval_report_passed, evaluate_release_eval_manifest, parse_release_eval_manifest,
     release_eval_issue_counts_by_code, release_eval_replay_bundle_filename,
+};
+pub use projections::{
+    build_palyra_trajectory_export, build_regression_eval_pack_index,
+    build_release_eval_maturity_scorecard, PalyraTrajectoryExport, PalyraTrajectoryExportSummary,
+    PalyraTrajectoryRunExport, RegressionEvalPack, RegressionEvalPackIndex,
+    RegressionEvalPackReasonCode, RegressionEvalPackReplayBundleRef, RegressionEvalPackSummary,
+    ReleaseEvalMaturityCategory, ReleaseEvalMaturityCategoryScore, ReleaseEvalMaturityDecision,
+    ReleaseEvalMaturityLevel, ReleaseEvalMaturityReasonCode, ReleaseEvalMaturityScorecard,
+    PALYRA_TRAJECTORY_EXPORT_COMPLETED_EVENT_TYPE, PALYRA_TRAJECTORY_EXPORT_FAILED_EVENT_TYPE,
+    PALYRA_TRAJECTORY_EXPORT_STARTED_EVENT_TYPE, REGRESSION_EVAL_PACKS_COMPLETED_EVENT_TYPE,
+    REGRESSION_EVAL_PACKS_FAILED_EVENT_TYPE, REGRESSION_EVAL_PACKS_STARTED_EVENT_TYPE,
+    RELEASE_EVAL_MATURITY_COMPLETED_EVENT_TYPE, RELEASE_EVAL_MATURITY_FAILED_EVENT_TYPE,
+    RELEASE_EVAL_MATURITY_STARTED_EVENT_TYPE,
 };
 pub use schema::*;
 
