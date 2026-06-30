@@ -31,11 +31,12 @@ use crate::{
         channel_turn::{
             channel_turn_admission_record, channel_turn_admission_terminal_record,
             channel_turn_delivered_record, channel_turn_dispatched_record,
-            channel_turn_received_record, decide_channel_turn_admission, ChannelTurnAdmissionInput,
-            ChannelTurnBindingFacts, ChannelTurnBotFacts, ChannelTurnDeliveryOutcome,
-            ChannelTurnDispatchOutcome, ChannelTurnEnvelope, ChannelTurnEnvelopeInput,
-            ChannelTurnHistory, ChannelTurnJournalRecord, ChannelTurnMediaFacts,
-            ChannelTurnMentionState, ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
+            channel_turn_history_record, channel_turn_received_record,
+            decide_channel_turn_admission, ChannelTurnAdmissionInput, ChannelTurnBindingFacts,
+            ChannelTurnBotFacts, ChannelTurnDeliveryOutcome, ChannelTurnDispatchOutcome,
+            ChannelTurnEnvelope, ChannelTurnEnvelopeInput, ChannelTurnHistory,
+            ChannelTurnJournalRecord, ChannelTurnMediaFacts, ChannelTurnMentionState,
+            ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
         },
         conversation_bindings::ConversationBindingResolveRequest,
         route_message::orchestration::handle_routed_route_message,
@@ -244,7 +245,9 @@ async fn record_channel_turn_intake_events(
     run_id: &str,
 ) {
     let admission = decide_channel_turn_admission(admission_input);
-    let mut history = ChannelTurnHistory::new(3);
+    let history_decision =
+        state.channel_turn_history.record(envelope, &admission, envelope.received_at_unix_ms);
+    let mut history = ChannelTurnHistory::new(4);
     history.push(channel_turn_received_record(envelope, Some(session_id), Some(run_id)));
     history.push(channel_turn_admission_record(
         envelope,
@@ -256,6 +259,12 @@ async fn record_channel_turn_intake_events(
     history.push(channel_turn_admission_terminal_record(
         envelope,
         &admission,
+        Some(session_id),
+        Some(run_id),
+    ));
+    history.push(channel_turn_history_record(
+        envelope,
+        &history_decision,
         Some(session_id),
         Some(run_id),
     ));

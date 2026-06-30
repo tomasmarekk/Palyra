@@ -510,6 +510,7 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
         "channel.turn.received",
         "channel.turn.admission_decided",
         "channel.turn.admitted",
+        "channel.history.recorded",
         "channel.turn.dispatched",
         "channel.turn.delivered",
     ] {
@@ -529,6 +530,20 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
     assert_eq!(
         admission_event.pointer("/payload/admission/reason_code").and_then(Value::as_str),
         Some("channel.admission.dispatch.mention")
+    );
+    let history_event = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.history.recorded")
+        })
+        .context("channel history recorded event should be present")?;
+    assert_eq!(
+        history_event.pointer("/payload/history/reason_code").and_then(Value::as_str),
+        Some("channel.history.recorded")
+    );
+    assert_eq!(
+        history_event.pointer("/payload/history/record_count").and_then(Value::as_u64),
+        Some(1)
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -1668,6 +1683,16 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
     assert_eq!(
         dropped_turn.pointer("/payload/admission/reason_code").and_then(Value::as_str),
         Some("channel.admission.drop.router_rejected")
+    );
+    let skipped_history = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.history.skipped")
+        })
+        .context("router rejection flow should skip channel history retention")?;
+    assert_eq!(
+        skipped_history.pointer("/payload/history/reason_code").and_then(Value::as_str),
+        Some("channel.history.skipped.durable_history_denied")
     );
     assert!(
         !message_events
@@ -11152,6 +11177,7 @@ fn load_message_router_journal_events(journal_db_path: &PathBuf) -> Result<Vec<V
         if payload.get("event").and_then(Value::as_str).is_some_and(|event| {
             event.starts_with("message.")
                 || event.starts_with("channel.turn.")
+                || event.starts_with("channel.history.")
                 || event.starts_with("channel.command.")
                 || event.starts_with("conversation.binding.")
                 || event.starts_with("inbound.coalescing.")

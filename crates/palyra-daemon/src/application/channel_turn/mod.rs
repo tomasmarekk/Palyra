@@ -5,7 +5,7 @@
 //! vocabulary: an inbound envelope, a pure admission decision, dispatch and
 //! delivery outcomes, and bounded journal projections.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Mutex};
 
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 const CHANNEL_TURN_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
+const DEFAULT_CHANNEL_HISTORY_MAX_RECORDS: usize = 512;
 
 pub(crate) const CHANNEL_TURN_RECEIVED_EVENT: &str = "channel.turn.received";
 pub(crate) const CHANNEL_TURN_ADMISSION_DECIDED_EVENT: &str = "channel.turn.admission_decided";
@@ -20,6 +21,8 @@ pub(crate) const CHANNEL_TURN_ADMITTED_EVENT: &str = "channel.turn.admitted";
 pub(crate) const CHANNEL_TURN_DISPATCHED_EVENT: &str = "channel.turn.dispatched";
 pub(crate) const CHANNEL_TURN_DELIVERED_EVENT: &str = "channel.turn.delivered";
 pub(crate) const CHANNEL_TURN_DROPPED_EVENT: &str = "channel.turn.dropped";
+pub(crate) const CHANNEL_HISTORY_RECORDED_EVENT: &str = "channel.history.recorded";
+pub(crate) const CHANNEL_HISTORY_SKIPPED_EVENT: &str = "channel.history.skipped";
 
 /// User or connector identity that submitted a channel turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,6 +628,220 @@ impl ChannelTurnHistory {
     }
 }
 
+/// Scope used to retain nearby channel turns without crossing channel,
+/// conversation, thread, or sender boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelHistoryScope {
+    pub(crate) channel: String,
+    pub(crate) conversation_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) sender_handle: Option<String>,
+}
+
+impl ChannelHistoryScope {
+    #[must_use]
+    fn from_envelope(envelope: &ChannelTurnEnvelope) -> Self {
+        Self {
+            channel: envelope.receiver.channel.clone(),
+            conversation_id: envelope.receiver.conversation_id.clone(),
+            thread_id: envelope.receiver.thread_id.clone(),
+            sender_handle: envelope.sender.handle.clone(),
+        }
+    }
+}
+
+/// One redacted channel turn retained for later ambient-context assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelHistoryEntry {
+    pub(crate) schema_version: u32,
+    pub(crate) sequence: u64,
+    pub(crate) scope: ChannelHistoryScope,
+    pub(crate) envelope: ChannelTurnEnvelope,
+    pub(crate) admission_kind: ChannelTurnAdmissionKind,
+    pub(crate) admission_reason_code: String,
+    pub(crate) stored_at_unix_ms: i64,
+    pub(crate) redaction_level: String,
+}
+
+/// Whether the bounded channel history store retained a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChannelHistoryDecisionKind {
+    Recorded,
+    Skipped,
+}
+
+impl ChannelHistoryDecisionKind {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// Audit-safe result of attempting to retain a channel turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelHistoryDecision {
+    pub(crate) schema_version: u32,
+    pub(crate) kind: ChannelHistoryDecisionKind,
+    pub(crate) reason_code: String,
+    pub(crate) sequence: Option<u64>,
+    pub(crate) record_count: usize,
+    pub(crate) max_records: usize,
+    pub(crate) evicted_count: usize,
+    pub(crate) redaction_level: String,
+}
+
+impl ChannelHistoryDecision {
+    fn recorded(
+        sequence: u64,
+        record_count: usize,
+        max_records: usize,
+        evicted_count: usize,
+    ) -> Self {
+        Self {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            kind: ChannelHistoryDecisionKind::Recorded,
+            reason_code: "channel.history.recorded".to_owned(),
+            sequence: Some(sequence),
+            record_count,
+            max_records,
+            evicted_count,
+            redaction_level: "redacted_text_preview".to_owned(),
+        }
+    }
+
+    fn skipped(reason_code: &str, record_count: usize, max_records: usize) -> Self {
+        Self {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            kind: ChannelHistoryDecisionKind::Skipped,
+            reason_code: reason_code.to_owned(),
+            sequence: None,
+            record_count,
+            max_records,
+            evicted_count: 0,
+            redaction_level: "metadata_only".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChannelHistoryStoreState {
+    next_sequence: u64,
+    records: VecDeque<ChannelHistoryEntry>,
+}
+
+/// Bounded in-memory history of redacted channel turns.
+///
+/// The store intentionally keeps only `ChannelTurnEnvelope` previews and
+/// admission metadata. M21 can read this for ambient context without giving
+/// unmentioned channel chatter instruction authority or persisting raw text.
+#[derive(Debug)]
+pub(crate) struct ChannelHistoryStore {
+    max_records: usize,
+    state: Mutex<ChannelHistoryStoreState>,
+}
+
+impl Default for ChannelHistoryStore {
+    fn default() -> Self {
+        Self::new(DEFAULT_CHANNEL_HISTORY_MAX_RECORDS)
+    }
+}
+
+impl ChannelHistoryStore {
+    /// Creates an empty bounded history store. Zero capacity is normalized
+    /// to one record so the eviction invariant stays simple.
+    #[must_use]
+    pub(crate) fn new(max_records: usize) -> Self {
+        Self {
+            max_records: max_records.max(1),
+            state: Mutex::new(ChannelHistoryStoreState::default()),
+        }
+    }
+
+    /// Records `envelope` when admission permits durable history.
+    ///
+    /// Drop decisions are skipped to avoid retaining policy-denied or bot-loop
+    /// traffic for future model context.
+    pub(crate) fn record(
+        &self,
+        envelope: &ChannelTurnEnvelope,
+        admission: &ChannelTurnAdmission,
+        stored_at_unix_ms: i64,
+    ) -> ChannelHistoryDecision {
+        let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !admission.durable_history_permitted {
+            return ChannelHistoryDecision::skipped(
+                "channel.history.skipped.durable_history_denied",
+                guard.records.len(),
+                self.max_records,
+            );
+        }
+
+        let sequence = guard.next_sequence;
+        guard.next_sequence = guard.next_sequence.saturating_add(1);
+        let mut evicted_count = 0;
+        while guard.records.len() >= self.max_records {
+            guard.records.pop_front();
+            evicted_count += 1;
+        }
+        guard.records.push_back(ChannelHistoryEntry {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            sequence,
+            scope: ChannelHistoryScope::from_envelope(envelope),
+            envelope: envelope.clone(),
+            admission_kind: admission.kind,
+            admission_reason_code: admission.reason_code.clone(),
+            stored_at_unix_ms,
+            redaction_level: "redacted_text_preview".to_owned(),
+        });
+        ChannelHistoryDecision::recorded(
+            sequence,
+            guard.records.len(),
+            self.max_records,
+            evicted_count,
+        )
+    }
+
+    #[cfg(test)]
+    fn records(&self) -> Vec<ChannelHistoryEntry> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .records
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Builds the `channel.history.*` projection payload.
+#[must_use]
+pub(crate) fn channel_turn_history_record(
+    envelope: &ChannelTurnEnvelope,
+    decision: &ChannelHistoryDecision,
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+) -> ChannelTurnJournalRecord {
+    let event_type = match decision.kind {
+        ChannelHistoryDecisionKind::Recorded => CHANNEL_HISTORY_RECORDED_EVENT,
+        ChannelHistoryDecisionKind::Skipped => CHANNEL_HISTORY_SKIPPED_EVENT,
+    };
+    ChannelTurnJournalRecord::new(
+        event_type,
+        envelope,
+        session_id,
+        run_id,
+        decision.reason_code.as_str(),
+        json!({
+            "history": decision,
+            "history_kind": decision.kind.as_str(),
+        }),
+    )
+}
+
 /// Builds the `channel.turn.received` projection payload.
 #[must_use]
 pub(crate) fn channel_turn_received_record(
@@ -940,6 +1157,67 @@ mod tests {
         assert_eq!(records[0].reason_code, "second");
         assert_eq!(records[1].reason_code, "third");
         assert_eq!(history.safe_snapshot_json()["record_count"], 2);
+    }
+
+    #[test]
+    fn channel_history_store_records_bounded_redacted_turns() {
+        let store = ChannelHistoryStore::new(2);
+        let admission = decide_channel_turn_admission(&admission_input());
+        let first = envelope();
+        let mut second = envelope();
+        second.envelope_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned();
+        second.correlation_id = format!("channel_turn:{}", second.envelope_id);
+        let mut third = envelope();
+        third.envelope_id = "01ARZ3NDEKTSV4RRFFQ69G5FAX".to_owned();
+        third.correlation_id = format!("channel_turn:{}", third.envelope_id);
+
+        let first_decision = store.record(&first, &admission, 10);
+        let second_decision = store.record(&second, &admission, 20);
+        let third_decision = store.record(&third, &admission, 30);
+
+        assert_eq!(first_decision.kind, ChannelHistoryDecisionKind::Recorded);
+        assert_eq!(second_decision.sequence, Some(1));
+        assert_eq!(third_decision.sequence, Some(2));
+        assert_eq!(third_decision.evicted_count, 1);
+        let records = store.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[1].sequence, 2);
+        assert_eq!(records[1].scope.channel, "discord:ops");
+        assert_eq!(records[1].admission_reason_code, "channel.admission.dispatch.mention");
+
+        let serialized =
+            serde_json::to_string(&records[1]).expect("history entry should serialize");
+        assert!(!serialized.contains("sk-secret-token"));
+        assert!(serialized.contains("token=<redacted>"));
+        let roundtrip: ChannelHistoryEntry =
+            serde_json::from_str(serialized.as_str()).expect("history entry should deserialize");
+        assert_eq!(roundtrip, records[1]);
+
+        let payload =
+            channel_turn_history_record(&third, &third_decision, Some("session-1"), Some("run-1"))
+                .payload_json();
+        assert_eq!(payload["event"], CHANNEL_HISTORY_RECORDED_EVENT);
+        assert_eq!(payload["payload"]["history_kind"], "recorded");
+    }
+
+    #[test]
+    fn channel_history_store_skips_drop_admissions() {
+        let store = ChannelHistoryStore::new(2);
+        let mut input = admission_input();
+        input.bot.sender_is_self = true;
+        let admission = decide_channel_turn_admission(&input);
+        let envelope = envelope();
+
+        let decision = store.record(&envelope, &admission, 10);
+
+        assert_eq!(decision.kind, ChannelHistoryDecisionKind::Skipped);
+        assert_eq!(decision.reason_code, "channel.history.skipped.durable_history_denied");
+        assert_eq!(decision.record_count, 0);
+        assert!(store.records().is_empty());
+        let payload = channel_turn_history_record(&envelope, &decision, None, None).payload_json();
+        assert_eq!(payload["event"], CHANNEL_HISTORY_SKIPPED_EVENT);
+        assert_eq!(payload["payload"]["history_kind"], "skipped");
     }
 
     #[test]
