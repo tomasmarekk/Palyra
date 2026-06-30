@@ -28,7 +28,11 @@ use crate::{
             ConversationBindingCreateRequest, ConversationBindingKind, ConversationBindingLifecycle,
         },
         delivery_arbitration::resolve_delivery_policy,
-        inbound_coalescer::InboundCoalescingRequest,
+        inbound_coalescer::{
+            InboundCoalescingDecision, InboundCoalescingDecisionKind, InboundCoalescingRequest,
+            INBOUND_COALESCING_BYPASSED_EVENT, INBOUND_COALESCING_CONSUMED_EVENT,
+            INBOUND_COALESCING_PENDING_EVENT, INBOUND_COALESCING_READY_EVENT,
+        },
         outbound_lifecycle::{
             ChannelOutboundCapabilities, OutboundLifecycle, OutboundLifecycleStart,
         },
@@ -69,6 +73,48 @@ use crate::{
 use super::response::{
     build_route_message_outputs, process_route_provider_response, RouteMessageOutputTemplate,
 };
+
+fn inbound_coalescing_event_type(kind: InboundCoalescingDecisionKind) -> &'static str {
+    match kind {
+        InboundCoalescingDecisionKind::Bypassed => INBOUND_COALESCING_BYPASSED_EVENT,
+        InboundCoalescingDecisionKind::Consumed => INBOUND_COALESCING_CONSUMED_EVENT,
+        InboundCoalescingDecisionKind::Pending => INBOUND_COALESCING_PENDING_EVENT,
+        InboundCoalescingDecisionKind::Ready => INBOUND_COALESCING_READY_EVENT,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_inbound_coalescing_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    input: &ChannelInboundMessage,
+    plan: &ChannelRoutePlan,
+    route_config_hash: &str,
+    coalescing_decision: &InboundCoalescingDecision,
+) {
+    let event_type = inbound_coalescing_event_type(coalescing_decision.kind);
+    let _ = record_message_router_journal_event(
+        runtime_state,
+        request_context,
+        session_id,
+        run_id,
+        event_type,
+        common_v1::journal_event::EventActor::System as i32,
+        json!({
+            "event": event_type,
+            "envelope_id": input.envelope_id.clone(),
+            "channel": input.channel.clone(),
+            "route_key": plan.route_key.clone(),
+            "session_key": plan.session_key.clone(),
+            "config_hash": route_config_hash,
+            "coalescing": coalescing_decision
+                .safe_snapshot_json(runtime_state.inbound_coalescer.policy()),
+        }),
+    )
+    .await;
+}
 
 /// Builds the model-visible tool catalog for this routed run and records it
 /// on the tape so replays see exactly what the model was offered.
@@ -265,33 +311,78 @@ pub(crate) async fn handle_routed_route_message(
             ChannelCommandParseOutcome::Malformed(_) => (true, false),
             ChannelCommandParseOutcome::NotCommand => (false, false),
         };
-    let coalescing_decision = runtime_state
-        .inbound_coalescer
-        .submit_for_immediate_route(InboundCoalescingRequest {
-            message_id: input
-                .adapter_message_id
-                .clone()
-                .unwrap_or_else(|| input.envelope_id.clone()),
-            principal: route_request_context.principal.clone(),
-            device_id: route_request_context.device_id.clone(),
-            session_id: session_id.clone(),
-            policy_scope: policy_resource.clone(),
-            binding_id: plan.binding_id.clone(),
-            channel: plan.channel.clone(),
-            conversation_id: input.conversation_id.clone(),
-            thread_id: plan.reply_thread_id.clone().or_else(|| input.adapter_thread_id.clone()),
-            sender_identity: plan.sender_identity.clone(),
-            text: input.text.clone(),
-            received_at_unix_ms: current_unix_ms(),
-            has_media: !content.attachments.is_empty(),
-            is_command: input_is_command,
-            urgent_stop: input_urgent_stop,
-        })
-        .map_err(|error| {
-            Status::resource_exhausted(format!("{}: {}", error.code(), error.safe_message()))
-        })?;
+    let coalescing_request = InboundCoalescingRequest {
+        message_id: input.adapter_message_id.clone().unwrap_or_else(|| input.envelope_id.clone()),
+        principal: route_request_context.principal.clone(),
+        device_id: route_request_context.device_id.clone(),
+        session_id: session_id.clone(),
+        policy_scope: policy_resource.clone(),
+        binding_id: plan.binding_id.clone(),
+        channel: plan.channel.clone(),
+        conversation_id: input.conversation_id.clone(),
+        thread_id: plan.reply_thread_id.clone().or_else(|| input.adapter_thread_id.clone()),
+        sender_identity: plan.sender_identity.clone(),
+        text: input.text.clone(),
+        received_at_unix_ms: current_unix_ms(),
+        has_media: !content.attachments.is_empty(),
+        is_command: input_is_command,
+        urgent_stop: input_urgent_stop,
+    };
+    let deferred_coalescing_enabled =
+        runtime_state.config.feature_rollouts.channel_turn_kernel.enabled
+            && runtime_state.inbound_coalescer.policy().active();
+    let coalescing_decision = if deferred_coalescing_enabled {
+        runtime_state.inbound_coalescer.submit_deferred(coalescing_request)
+    } else {
+        runtime_state.inbound_coalescer.submit_for_immediate_route(coalescing_request)
+    }
+    .map_err(|error| {
+        Status::resource_exhausted(format!("{}: {}", error.code(), error.safe_message()))
+    })?;
     let inbound_coalescing_snapshot =
         coalescing_decision.safe_snapshot_json(runtime_state.inbound_coalescer.policy());
+    record_inbound_coalescing_journal_event(
+        runtime_state,
+        &route_request_context,
+        session_id.as_str(),
+        run_id.as_str(),
+        input,
+        &plan,
+        route_config_hash,
+        &coalescing_decision,
+    )
+    .await;
+    if coalescing_decision.kind == InboundCoalescingDecisionKind::Pending {
+        // Connector-backed channel ingress persists the envelope and retries
+        // this same RouteMessage path; the retry is what flushes a ready
+        // bucket with the original route/session/lease context intact.
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: true,
+            decision_reason: "inbound_coalescing_pending".to_owned(),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: None,
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt: retry_attempt.saturating_add(1),
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
+    if coalescing_decision.kind == InboundCoalescingDecisionKind::Consumed {
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: false,
+            queued_for_retry: false,
+            decision_reason: "inbound_coalescing_already_dispatched".to_owned(),
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: None,
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: runtime_state.channel_router.queue_depth() as u32,
+        });
+    }
     // When the coalescer merged rapid-fire messages, the merged text becomes
     // the model input; a blank merge falls back to the original message.
     let effective_input_text = coalescing_decision

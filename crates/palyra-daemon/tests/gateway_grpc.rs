@@ -350,6 +350,50 @@ impl FakeChannelAdapter {
     }
 }
 
+async fn route_message_with_ids(
+    client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+        tonic::transport::Channel,
+    >,
+    text: &str,
+    envelope_id: &str,
+    adapter_message_id: &str,
+    retry_attempt: u32,
+) -> Result<gateway_v1::RouteMessageResponse> {
+    let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
+        v: 1,
+        envelope: Some(common_v1::MessageEnvelope {
+            v: 1,
+            envelope_id: Some(common_v1::CanonicalId { ulid: envelope_id.to_owned() }),
+            origin: Some(common_v1::EnvelopeOrigin {
+                r#type: common_v1::envelope_origin::OriginType::Channel as i32,
+                channel: "cli".to_owned(),
+                conversation_id: "adapter-conv-1".to_owned(),
+                sender_display: "Ops".to_owned(),
+                sender_handle: "user:ops".to_owned(),
+                sender_verified: true,
+            }),
+            content: Some(common_v1::MessageContent {
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            }),
+            max_payload_bytes: 4096,
+            ..Default::default()
+        }),
+        is_direct_message: false,
+        request_broadcast: false,
+        adapter_message_id: adapter_message_id.to_owned(),
+        adapter_thread_id: "thread-1".to_owned(),
+        retry_attempt,
+        session_label: "Adapter".to_owned(),
+    });
+    authorize_metadata(request.metadata_mut())?;
+    Ok(client
+        .route_message(request)
+        .await
+        .context("failed to call RouteMessage with explicit ids")?
+        .into_inner())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -> Result<()> {
     let (openai_base_url, request_count, server_handle) =
@@ -485,6 +529,173 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
     assert_eq!(
         admission_event.pointer("/payload/admission/reason_code").and_then(Value::as_str),
         Some("channel.admission.dispatch.mention")
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_debounces_inbound_turns_until_retry_window_elapses() -> Result<()> {
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                200,
+                r#"{"choices":[{"message":{"content":"merged provider reply"}}]}"#.to_owned(),
+            ),
+        ])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_inbound_coalescing(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        execution_backend_preference: String::new(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before inbound coalescing test")?;
+
+    let first = route_message_with_ids(
+        &mut client,
+        "hey @palyra first fragment",
+        ENVELOPE_ID,
+        "msg-coalesce-1",
+        0,
+    )
+    .await?;
+    assert!(!first.accepted, "first fragment should wait for the debounce retry");
+    assert!(first.queued_for_retry);
+    assert_eq!(first.decision_reason, "inbound_coalescing_pending");
+    assert_eq!(first.retry_attempt, 1);
+    assert!(first.run_id.is_none(), "pending coalescing must not allocate a provider run");
+
+    let second = route_message_with_ids(
+        &mut client,
+        "hey @palyra second fragment",
+        ENVELOPE_ID_ALT,
+        "msg-coalesce-2",
+        0,
+    )
+    .await?;
+    assert!(!second.accepted, "second fragment should extend the debounce window");
+    assert!(second.queued_for_retry);
+    assert_eq!(second.decision_reason, "inbound_coalescing_pending");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        0,
+        "pending fragments must not call the provider"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let ready = route_message_with_ids(
+        &mut client,
+        "hey @palyra first fragment",
+        ENVELOPE_ID,
+        "msg-coalesce-1",
+        first.retry_attempt,
+    )
+    .await?;
+    assert!(ready.accepted, "retry after debounce should dispatch the merged input");
+    assert!(!ready.queued_for_retry);
+    assert_eq!(ready.decision_reason, "routed");
+    assert!(ready.run_id.is_some());
+    let outbound =
+        ready.outputs.first().context("ready coalesced route should emit a provider reply")?;
+    assert!(outbound.text.contains("merged provider reply"));
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+
+    let consumed = route_message_with_ids(
+        &mut client,
+        "hey @palyra second fragment",
+        ENVELOPE_ID_ALT,
+        "msg-coalesce-2",
+        second.retry_attempt,
+    )
+    .await?;
+    assert!(!consumed.accepted, "sibling retry should not dispatch twice");
+    assert!(!consumed.queued_for_retry);
+    assert_eq!(consumed.decision_reason, "inbound_coalescing_already_dispatched");
+    assert!(consumed.run_id.is_none());
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        1,
+        "consumed sibling retry must not call the provider again"
+    );
+
+    let captured_request_bodies =
+        request_bodies.lock().expect("captured request bodies lock should not poison").clone();
+    assert_eq!(captured_request_bodies.len(), 1);
+    let provider_payload: Value = serde_json::from_str(captured_request_bodies[0].as_str())
+        .context("coalesced provider request payload should be valid JSON")?;
+    let provider_payload_text = provider_payload.to_string();
+    assert!(
+        provider_payload_text.contains("first fragment")
+            && provider_payload_text.contains("second fragment"),
+        "provider payload should contain both coalesced fragments: {provider_payload_text}"
+    );
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    for event in
+        ["inbound.coalescing.pending", "inbound.coalescing.ready", "inbound.coalescing.consumed"]
+    {
+        assert!(
+            message_events
+                .iter()
+                .any(|payload| payload.get("event").and_then(Value::as_str) == Some(event)),
+            "coalescing flow should persist {event}"
+        );
+    }
+    let ready_event = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("inbound.coalescing.ready")
+        })
+        .context("coalescing ready event should be present")?;
+    assert_eq!(
+        ready_event.pointer("/coalescing/coalesced/message_count").and_then(Value::as_u64),
+        Some(2),
+        "ready coalescing event should explain both merged messages"
+    );
+    let dispatch_events = message_events
+        .iter()
+        .filter(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dispatched")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        dispatch_events.iter().any(|payload| {
+            payload.pointer("/payload/dispatch/kind").and_then(Value::as_str) == Some("queued")
+        }),
+        "pending responses should record a queued dispatch outcome"
+    );
+    assert!(
+        dispatch_events.iter().any(|payload| {
+            payload.pointer("/payload/dispatch/kind").and_then(Value::as_str)
+                == Some("not_dispatched")
+        }),
+        "consumed retries should record a terminal non-dispatch outcome"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -10943,6 +11154,7 @@ fn load_message_router_journal_events(journal_db_path: &PathBuf) -> Result<Vec<V
                 || event.starts_with("channel.turn.")
                 || event.starts_with("channel.command.")
                 || event.starts_with("conversation.binding.")
+                || event.starts_with("inbound.coalescing.")
         }) {
             events.push(payload);
         }
@@ -11810,6 +12022,56 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
     Ok((child, admin_port, grpc_port, journal_db_path, config_path))
 }
 
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_inbound_coalescing(
+    openai_base_url: &str,
+    openai_api_key: &str,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    let config_path = write_channel_router_config_with_inbound_coalescing(100)?;
+    let journal_db_path = unique_temp_journal_db_path();
+    let identity_store_dir = unique_temp_identity_store_dir();
+    let vault_dir = unique_temp_vault_dir();
+    prepare_test_vault_dir(&vault_dir)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
+    let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
+        .args([
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--grpc-bind",
+            "127.0.0.1",
+            "--grpc-port",
+            "0",
+        ])
+        .env("PALYRA_ADMIN_TOKEN", ADMIN_TOKEN)
+        .env("PALYRA_GATEWAY_QUIC_BIND_ADDR", "127.0.0.1")
+        .env("PALYRA_GATEWAY_QUIC_PORT", "0")
+        .env("PALYRA_JOURNAL_DB_PATH", journal_db_path.to_string_lossy().to_string())
+        .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
+        .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
+        .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
+        .env("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true")
+        .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
+        .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_API_KEY", openai_api_key)
+        .env("PALYRA_MODEL_PROVIDER_OPENAI_MODEL", OPENAI_TEST_MODEL)
+        .env("PALYRA_OFFLINE", "true")
+        .env("PALYRA_MODEL_PROVIDER_MAX_RETRIES", "0")
+        .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
+        .env("PALYRA_MEMORY_AUTO_INJECT_ENABLED", "false")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start palyrad with channel-router inbound coalescing config")?;
+    let stdout = child.stdout.take().context("failed to capture palyrad stdout")?;
+    let (admin_port, grpc_port) = wait_for_listen_ports(stdout, &mut child)?;
+    Ok((child, admin_port, grpc_port, journal_db_path, config_path))
+}
+
 fn spawn_palyrad_with_openai_provider_and_channel_router_with_tool_policy(
     openai_base_url: &str,
     openai_api_key: &str,
@@ -12284,9 +12546,20 @@ allowed_channels = {allowed_channels}
 }
 
 fn write_channel_router_config() -> Result<PathBuf> {
+    write_channel_router_config_with_extra_sections("")
+}
+
+fn write_channel_router_config_with_inbound_coalescing(debounce_ms: u64) -> Result<PathBuf> {
+    let extra_sections = format!(
+        "\n[channel_router.inbound_coalescing]\nenabled = true\ndebounce_ms = {debounce_ms}\nmax_tracked_keys = 8\nbypass_commands = true\nbypass_media = true\n"
+    );
+    write_channel_router_config_with_extra_sections(extra_sections.as_str())
+}
+
+fn write_channel_router_config_with_extra_sections(extra_sections: &str) -> Result<PathBuf> {
     let config_path = unique_temp_daemon_config_path();
     #[rustfmt::skip]
-    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1 }}\n]\n\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
+    let config_body = format!("[channel_router]\nenabled = true\nmax_message_bytes = 8192\nmax_retry_queue_depth_per_channel = 4\nmax_retry_attempts = 2\nretry_backoff_ms = 25\n\n[channel_router.routing]\ndefault_channel_enabled = false\ndefault_allow_direct_messages = false\ndefault_direct_message_policy = \"deny\"\ndefault_isolate_session_by_sender = false\ndefault_broadcast_strategy = \"deny\"\ndefault_concurrency_limit = 2\nchannels = [\n  {{ channel = \"cli\", enabled = true, mention_patterns = [\"@palyra\"], allow_direct_messages = true, direct_message_policy = \"allow\", isolate_session_by_sender = false, response_prefix = \"[cli] \", auto_ack_text = \"processing\", auto_reaction = \"eyes\", broadcast_strategy = \"mention_only\", concurrency_limit = 1 }}\n]\n{extra_sections}\n[tool_call.process_runner]\nenabled = true\negress_enforcement_mode = \"preflight\"\nworkspace_root = {}\nallowed_executables = []\nallowed_egress_hosts = []\nallowed_dns_suffixes = []\ncpu_time_limit_ms = 2000\nmemory_limit_bytes = 134217728\nmax_output_bytes = 65536\n", toml_string(std::env::current_dir().context("failed to resolve workspace root for channel router process runner test config")?.to_string_lossy().as_ref()));
     fs::write(&config_path, config_body).with_context(|| {
         format!("failed to write channel router test config at {}", config_path.display())
     })?;

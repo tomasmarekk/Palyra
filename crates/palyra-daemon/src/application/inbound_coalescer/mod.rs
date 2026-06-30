@@ -20,6 +20,12 @@ use crate::channel_router::InboundCoalescingPolicy;
 
 const INBOUND_COALESCING_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
+const CONSUMED_MESSAGE_TTL_MS: i64 = 5 * 60_000;
+
+pub(crate) const INBOUND_COALESCING_PENDING_EVENT: &str = "inbound.coalescing.pending";
+pub(crate) const INBOUND_COALESCING_READY_EVENT: &str = "inbound.coalescing.ready";
+pub(crate) const INBOUND_COALESCING_BYPASSED_EVENT: &str = "inbound.coalescing.bypassed";
+pub(crate) const INBOUND_COALESCING_CONSUMED_EVENT: &str = "inbound.coalescing.consumed";
 
 /// Normalized identity of one coalescing bucket; messages merge only when
 /// every component matches. Empty required components normalize to
@@ -69,6 +75,7 @@ pub(crate) struct InboundMessageProvenance {
 /// lines plus the provenance of every contributing message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InboundCoalescedInput {
+    pub(crate) coalescing_id: String,
     pub(crate) key: InboundCoalescingKey,
     pub(crate) text: String,
     pub(crate) provenance: Vec<InboundMessageProvenance>,
@@ -83,6 +90,7 @@ impl InboundCoalescedInput {
     pub(crate) fn safe_snapshot_json(&self) -> Value {
         json!({
             "schema_version": INBOUND_COALESCING_SCHEMA_VERSION,
+            "coalescing_id": self.coalescing_id,
             "key": self.key,
             "text_preview": safe_preview(self.text.as_str()),
             "text_bytes": self.text.len(),
@@ -101,6 +109,7 @@ impl InboundCoalescedInput {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InboundCoalescingDecisionKind {
     Bypassed,
+    Consumed,
     Pending,
     Ready,
 }
@@ -111,6 +120,7 @@ impl InboundCoalescingDecisionKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Bypassed => "bypassed",
+            Self::Consumed => "consumed",
             Self::Pending => "pending",
             Self::Ready => "ready",
         }
@@ -124,6 +134,7 @@ pub(crate) struct InboundCoalescingDecision {
     pub(crate) kind: InboundCoalescingDecisionKind,
     pub(crate) reason: String,
     pub(crate) key: InboundCoalescingKey,
+    pub(crate) coalescing_id: Option<String>,
     pub(crate) coalesced: Option<InboundCoalescedInput>,
     pub(crate) ready_at_unix_ms: Option<i64>,
     pub(crate) tracked_key_count: usize,
@@ -140,6 +151,7 @@ impl InboundCoalescingDecision {
             "reason": self.reason,
             "policy": policy_snapshot_json(policy),
             "key": self.key,
+            "coalescing_id": self.coalescing_id,
             "coalesced": self.coalesced.as_ref().map(InboundCoalescedInput::safe_snapshot_json),
             "ready_at_unix_ms": self.ready_at_unix_ms,
             "tracked_key_count": self.tracked_key_count,
@@ -196,14 +208,14 @@ impl InboundCoalescingError {
 #[derive(Debug, Clone)]
 pub(crate) struct InboundCoalescer {
     policy: InboundCoalescingPolicy,
-    pending: Arc<Mutex<BTreeMap<InboundCoalescingKey, PendingCoalescingBucket>>>,
+    state: Arc<Mutex<InboundCoalescerState>>,
 }
 
 impl InboundCoalescer {
     /// Creates an empty coalescer governed by `policy`.
     #[must_use]
     pub(crate) fn new(policy: InboundCoalescingPolicy) -> Self {
-        Self { policy, pending: Arc::new(Mutex::new(BTreeMap::new())) }
+        Self { policy, state: Arc::new(Mutex::new(InboundCoalescerState::default())) }
     }
 
     /// Returns the policy this coalescer was built with.
@@ -212,12 +224,19 @@ impl InboundCoalescer {
         &self.policy
     }
 
-    // Deferred debounce path (buffer until the window elapses, then drain).
-    // Production currently routes through submit_for_immediate_route only,
-    // so this and drain_ready stay exercised by tests until a scheduler
-    // flushes pending buckets asynchronously.
-    #[cfg(test)]
-    fn submit(
+    /// Submits a message to the deferred debounce path.
+    ///
+    /// Active policies return `Pending` while the bucket window is open,
+    /// `Ready` once the merged bucket should dispatch, and `Consumed` for a
+    /// retried message that was already included in a previously dispatched
+    /// merged bucket. Commands, urgent stops, media, and inactive policies
+    /// bypass immediately.
+    ///
+    /// # Errors
+    /// Returns `inbound_coalescing/state_unavailable` when the state lock is
+    /// poisoned and `inbound_coalescing/max_tracked_keys_exceeded` when a
+    /// new key would exceed the policy key limit.
+    pub(crate) fn submit_deferred(
         &self,
         request: InboundCoalescingRequest,
     ) -> Result<InboundCoalescingDecision, InboundCoalescingError> {
@@ -232,58 +251,91 @@ impl InboundCoalescer {
             return Ok(self.bypass(request, key, "media_bypass"));
         }
 
-        let mut guard = self.pending.lock().map_err(|_| InboundCoalescingError {
+        let mut guard = self.state.lock().map_err(|_| InboundCoalescingError {
             code: "inbound_coalescing/state_unavailable",
             message: "inbound coalescer state lock is unavailable".to_owned(),
         })?;
-        if !guard.contains_key(&key) && guard.len() >= self.policy.max_tracked_keys {
+        prune_consumed_messages(&mut guard, request.received_at_unix_ms);
+        let message_ref = coalescing_message_ref(&key, request.message_id.as_str());
+        if let Some(consumed) = guard.consumed_messages.get(message_ref.as_str()) {
+            return Ok(InboundCoalescingDecision {
+                kind: InboundCoalescingDecisionKind::Consumed,
+                reason: "coalesced_message_already_dispatched".to_owned(),
+                key,
+                coalescing_id: Some(consumed.coalescing_id.clone()),
+                coalesced: None,
+                ready_at_unix_ms: Some(consumed.ready_at_unix_ms),
+                tracked_key_count: guard.pending.len(),
+            });
+        }
+        if !guard.pending.contains_key(&key) && guard.pending.len() >= self.policy.max_tracked_keys
+        {
             return Err(InboundCoalescingError {
                 code: "inbound_coalescing/max_tracked_keys_exceeded",
                 message: format!(
                     "inbound coalescer is tracking {} keys, max_tracked_keys={}",
-                    guard.len(),
+                    guard.pending.len(),
                     self.policy.max_tracked_keys
                 ),
             });
         }
 
         let received_at_unix_ms = request.received_at_unix_ms;
+        let message_id = normalize_required_component(request.message_id.as_str(), "unknown");
         let ready_at_unix_ms = {
-            let bucket = guard.entry(key.clone()).or_insert_with(|| PendingCoalescingBucket {
-                key: key.clone(),
-                messages: Vec::new(),
-                first_received_at_unix_ms: received_at_unix_ms,
-                ready_at_unix_ms: received_at_unix_ms
-                    .saturating_add(self.policy.debounce_ms as i64),
+            let bucket = guard.pending.entry(key.clone()).or_insert_with(|| {
+                PendingCoalescingBucket::new(
+                    key.clone(),
+                    message_id.as_str(),
+                    received_at_unix_ms,
+                    self.policy.debounce_ms,
+                )
             });
             // push() slides ready_at forward: every new message restarts the
-            // debounce window from its own arrival time.
-            bucket.push(request, self.policy.debounce_ms);
+            // debounce window from its own arrival time. Retries for a
+            // message already in the bucket are idempotent and do not slide.
+            if !bucket.contains_message_id(message_id.as_str()) {
+                bucket.push(request, self.policy.debounce_ms);
+            }
             bucket.ready_at_unix_ms
         };
-        let tracked_key_count = guard.len();
+        let tracked_key_count = guard.pending.len();
         if received_at_unix_ms >= ready_at_unix_ms {
             let bucket = guard
+                .pending
                 .remove(&key)
                 .expect("bucket inserted above cannot vanish while the lock is held");
+            let coalesced = bucket.coalesced();
+            remember_consumed_messages(&mut guard, &coalesced, ready_at_unix_ms);
             return Ok(InboundCoalescingDecision {
                 kind: InboundCoalescingDecisionKind::Ready,
                 reason: "debounce_window_elapsed".to_owned(),
                 key,
-                coalesced: Some(bucket.coalesced()),
+                coalescing_id: Some(coalesced.coalescing_id.clone()),
+                coalesced: Some(coalesced),
                 ready_at_unix_ms: Some(ready_at_unix_ms),
-                tracked_key_count: guard.len(),
+                tracked_key_count: guard.pending.len(),
             });
         }
 
+        let coalescing_id = guard.pending.get(&key).map(|bucket| bucket.coalescing_id.clone());
         Ok(InboundCoalescingDecision {
             kind: InboundCoalescingDecisionKind::Pending,
             reason: "debounce_window_open".to_owned(),
             key,
+            coalescing_id,
             coalesced: None,
             ready_at_unix_ms: Some(ready_at_unix_ms),
             tracked_key_count,
         })
+    }
+
+    #[cfg(test)]
+    fn submit(
+        &self,
+        request: InboundCoalescingRequest,
+    ) -> Result<InboundCoalescingDecision, InboundCoalescingError> {
+        self.submit_deferred(request)
     }
 
     /// Submits a message and flushes its bucket in the same call, merging
@@ -311,39 +363,47 @@ impl InboundCoalescer {
             return Ok(self.bypass(request, key, "media_bypass"));
         }
 
-        let mut guard = self.pending.lock().map_err(|_| InboundCoalescingError {
+        let mut guard = self.state.lock().map_err(|_| InboundCoalescingError {
             code: "inbound_coalescing/state_unavailable",
             message: "inbound coalescer state lock is unavailable".to_owned(),
         })?;
-        if !guard.contains_key(&key) && guard.len() >= self.policy.max_tracked_keys {
+        if !guard.pending.contains_key(&key) && guard.pending.len() >= self.policy.max_tracked_keys
+        {
             return Err(InboundCoalescingError {
                 code: "inbound_coalescing/max_tracked_keys_exceeded",
                 message: format!(
                     "inbound coalescer is tracking {} keys, max_tracked_keys={}",
-                    guard.len(),
+                    guard.pending.len(),
                     self.policy.max_tracked_keys
                 ),
             });
         }
         let received_at_unix_ms = request.received_at_unix_ms;
-        let bucket = guard.entry(key.clone()).or_insert_with(|| PendingCoalescingBucket {
-            key: key.clone(),
-            messages: Vec::new(),
-            first_received_at_unix_ms: received_at_unix_ms,
-            ready_at_unix_ms: received_at_unix_ms.saturating_add(self.policy.debounce_ms as i64),
+        let message_id = normalize_required_component(request.message_id.as_str(), "unknown");
+        let bucket = guard.pending.entry(key.clone()).or_insert_with(|| {
+            PendingCoalescingBucket::new(
+                key.clone(),
+                message_id.as_str(),
+                received_at_unix_ms,
+                self.policy.debounce_ms,
+            )
         });
         bucket.push(request, self.policy.debounce_ms);
         let ready_at_unix_ms = bucket.ready_at_unix_ms;
-        let bucket =
-            guard.remove(&key).expect("bucket inserted above cannot vanish while the lock is held");
+        let bucket = guard
+            .pending
+            .remove(&key)
+            .expect("bucket inserted above cannot vanish while the lock is held");
         let coalesced = bucket.coalesced();
+        let coalescing_id = coalesced.coalescing_id.clone();
         Ok(InboundCoalescingDecision {
             kind: InboundCoalescingDecisionKind::Ready,
             reason: "route_message_immediate_flush".to_owned(),
             key,
+            coalescing_id: Some(coalescing_id),
             coalesced: Some(coalesced),
             ready_at_unix_ms: Some(ready_at_unix_ms),
-            tracked_key_count: guard.len(),
+            tracked_key_count: guard.pending.len(),
         })
     }
 
@@ -357,27 +417,32 @@ impl InboundCoalescer {
         &self,
         now_unix_ms: i64,
     ) -> Result<Vec<InboundCoalescingDecision>, InboundCoalescingError> {
-        let mut guard = self.pending.lock().map_err(|_| InboundCoalescingError {
+        let mut guard = self.state.lock().map_err(|_| InboundCoalescingError {
             code: "inbound_coalescing/state_unavailable",
             message: "inbound coalescer state lock is unavailable".to_owned(),
         })?;
+        prune_consumed_messages(&mut guard, now_unix_ms);
         let ready_keys = guard
+            .pending
             .iter()
             .filter(|(_, bucket)| now_unix_ms >= bucket.ready_at_unix_ms)
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let mut decisions = Vec::with_capacity(ready_keys.len());
         for key in ready_keys {
-            let Some(bucket) = guard.remove(&key) else {
+            let Some(bucket) = guard.pending.remove(&key) else {
                 continue;
             };
+            let coalesced = bucket.coalesced();
+            remember_consumed_messages(&mut guard, &coalesced, now_unix_ms);
             decisions.push(InboundCoalescingDecision {
                 kind: InboundCoalescingDecisionKind::Ready,
                 reason: "debounce_window_elapsed".to_owned(),
                 key,
-                coalesced: Some(bucket.coalesced()),
+                coalescing_id: Some(coalesced.coalescing_id.clone()),
+                coalesced: Some(coalesced),
                 ready_at_unix_ms: Some(now_unix_ms),
-                tracked_key_count: guard.len(),
+                tracked_key_count: guard.pending.len(),
             });
         }
         Ok(decisions)
@@ -393,20 +458,18 @@ impl InboundCoalescer {
         reason: &str,
     ) -> InboundCoalescingDecision {
         let received_at_unix_ms = request.received_at_unix_ms;
-        let mut bucket = PendingCoalescingBucket {
-            key: key.clone(),
-            messages: Vec::new(),
-            first_received_at_unix_ms: received_at_unix_ms,
-            ready_at_unix_ms: received_at_unix_ms,
-        };
+        let message_id = normalize_required_component(request.message_id.as_str(), "unknown");
+        let mut bucket =
+            PendingCoalescingBucket::new(key.clone(), message_id.as_str(), received_at_unix_ms, 0);
         bucket.push(request, 0);
         InboundCoalescingDecision {
             kind: InboundCoalescingDecisionKind::Bypassed,
             reason: reason.to_owned(),
             key,
+            coalescing_id: Some(bucket.coalescing_id.clone()),
             coalesced: Some(bucket.coalesced()),
             ready_at_unix_ms: Some(received_at_unix_ms),
-            tracked_key_count: self.pending.lock().map_or(0, |guard| guard.len()),
+            tracked_key_count: self.state.lock().map_or(0, |guard| guard.pending.len()),
         }
     }
 }
@@ -426,6 +489,7 @@ struct PendingCoalescingMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingCoalescingBucket {
+    coalescing_id: String,
     key: InboundCoalescingKey,
     messages: Vec<PendingCoalescingMessage>,
     first_received_at_unix_ms: i64,
@@ -433,6 +497,25 @@ struct PendingCoalescingBucket {
 }
 
 impl PendingCoalescingBucket {
+    fn new(
+        key: InboundCoalescingKey,
+        first_message_id: &str,
+        first_received_at_unix_ms: i64,
+        debounce_ms: u64,
+    ) -> Self {
+        Self {
+            coalescing_id: build_coalescing_id(&key, first_message_id),
+            key,
+            messages: Vec::new(),
+            first_received_at_unix_ms,
+            ready_at_unix_ms: first_received_at_unix_ms.saturating_add(debounce_ms as i64),
+        }
+    }
+
+    fn contains_message_id(&self, message_id: &str) -> bool {
+        self.messages.iter().any(|message| message.provenance.message_id.as_str() == message_id)
+    }
+
     fn push(&mut self, request: InboundCoalescingRequest, debounce_ms: u64) {
         let order = u32::try_from(self.messages.len()).unwrap_or(u32::MAX);
         // Sliding window: each message restarts the debounce from its own
@@ -464,6 +547,7 @@ impl PendingCoalescingBucket {
             .join("\n\n");
         let provenance = self.messages.into_iter().map(|message| message.provenance).collect();
         InboundCoalescedInput {
+            coalescing_id: self.coalescing_id,
             key: self.key,
             text,
             provenance,
@@ -471,6 +555,19 @@ impl PendingCoalescingBucket {
             last_received_at_unix_ms,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct InboundCoalescerState {
+    pending: BTreeMap<InboundCoalescingKey, PendingCoalescingBucket>,
+    consumed_messages: BTreeMap<String, ConsumedCoalescingMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsumedCoalescingMessage {
+    coalescing_id: String,
+    ready_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
 }
 
 #[must_use]
@@ -495,6 +592,49 @@ fn normalize_required_component(value: &str, fallback: &str) -> String {
 
 fn normalize_optional_component(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+
+fn build_coalescing_id(key: &InboundCoalescingKey, first_message_id: &str) -> String {
+    let payload = serde_json::json!({
+        "schema_version": INBOUND_COALESCING_SCHEMA_VERSION,
+        "key": key,
+        "first_message_id": first_message_id,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    format!("inbound_coalescing:{}", &crate::sha256_hex(bytes.as_slice())[..24])
+}
+
+fn coalescing_message_ref(key: &InboundCoalescingKey, message_id: &str) -> String {
+    let normalized_message_id = normalize_required_component(message_id, "unknown");
+    let payload = serde_json::json!({
+        "schema_version": INBOUND_COALESCING_SCHEMA_VERSION,
+        "key": key,
+        "message_id": normalized_message_id,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    format!("message:{}", crate::sha256_hex(bytes.as_slice()))
+}
+
+fn prune_consumed_messages(state: &mut InboundCoalescerState, now_unix_ms: i64) {
+    state.consumed_messages.retain(|_, consumed| consumed.expires_at_unix_ms > now_unix_ms);
+}
+
+fn remember_consumed_messages(
+    state: &mut InboundCoalescerState,
+    coalesced: &InboundCoalescedInput,
+    ready_at_unix_ms: i64,
+) {
+    let expires_at_unix_ms = ready_at_unix_ms.saturating_add(CONSUMED_MESSAGE_TTL_MS);
+    for provenance in &coalesced.provenance {
+        state.consumed_messages.insert(
+            coalescing_message_ref(&coalesced.key, provenance.message_id.as_str()),
+            ConsumedCoalescingMessage {
+                coalescing_id: coalesced.coalescing_id.clone(),
+                ready_at_unix_ms,
+                expires_at_unix_ms,
+            },
+        );
+    }
 }
 
 // Redaction must run before truncation so a cut never re-exposes a secret
@@ -622,6 +762,30 @@ mod tests {
         assert_eq!(second.coalesced.as_ref().expect("second coalesced").text, "second");
         assert_eq!(first.tracked_key_count, 0);
         assert_eq!(second.tracked_key_count, 0);
+    }
+
+    #[test]
+    fn deferred_retry_dispatches_merged_bucket_once_and_consumes_siblings() {
+        let coalescer = InboundCoalescer::new(policy());
+        let first = coalescer.submit(request("m-1", "first", 1_000)).expect("first submit");
+        let second = coalescer.submit(request("m-2", "second", 1_050)).expect("second submit");
+
+        assert_eq!(first.kind, InboundCoalescingDecisionKind::Pending);
+        assert_eq!(second.kind, InboundCoalescingDecisionKind::Pending);
+
+        let ready =
+            coalescer.submit(request("m-1", "first", 1_150)).expect("retry should dispatch");
+        assert_eq!(ready.kind, InboundCoalescingDecisionKind::Ready);
+        let coalesced = ready.coalesced.as_ref().expect("ready should include coalesced input");
+        assert_eq!(coalesced.text, "first\n\nsecond");
+        assert_eq!(coalesced.provenance.len(), 2);
+
+        let consumed =
+            coalescer.submit(request("m-2", "second", 1_151)).expect("sibling retry should finish");
+        assert_eq!(consumed.kind, InboundCoalescingDecisionKind::Consumed);
+        assert_eq!(consumed.coalescing_id, ready.coalescing_id);
+        assert_eq!(consumed.reason, "coalesced_message_already_dispatched");
+        assert!(consumed.coalesced.is_none());
     }
 
     #[test]

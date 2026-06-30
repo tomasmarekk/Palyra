@@ -315,7 +315,13 @@ async fn record_channel_turn_dispatch_response(
     response: &gateway_v1::RouteMessageResponse,
 ) {
     let (session_id, run_id) = route_message_response_session_run(response);
-    let dispatch = ChannelTurnDispatchOutcome::dispatched(route_key.to_owned(), session_id, run_id);
+    let dispatch = if response.accepted && run_id.is_some() {
+        ChannelTurnDispatchOutcome::dispatched(route_key.to_owned(), session_id, run_id)
+    } else if response.queued_for_retry {
+        ChannelTurnDispatchOutcome::queued(response.decision_reason.clone())
+    } else {
+        ChannelTurnDispatchOutcome::not_dispatched(response.decision_reason.clone())
+    };
     record_channel_turn_record(
         state,
         context,
