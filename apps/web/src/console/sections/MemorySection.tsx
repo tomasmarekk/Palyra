@@ -192,6 +192,7 @@ export function MemorySection({ app }: MemorySectionProps) {
   const unifiedCounts =
     readObject(app.memorySearchAllResults ?? EMPTY_OBJECT, "counts") ?? EMPTY_OBJECT;
   const sessionSearchGroups = readObjectArray(app.memorySessionSearchResults, "groups");
+  const sessionSearchSourceRefs = readObjectArray(app.memorySessionSearchResults, "source_refs");
   const sessionSearchDiagnostics =
     readObject(app.memorySessionSearchResults ?? EMPTY_OBJECT, "diagnostics") ?? EMPTY_OBJECT;
   const sessionSearchArtifact = readObject(
@@ -1795,6 +1796,11 @@ export function MemorySection({ app }: MemorySectionProps) {
                   <WorkspaceStatusChip tone={sessionSearchWindowCount > 0 ? "success" : "default"}>
                     Windows {sessionSearchWindowCount}
                   </WorkspaceStatusChip>
+                  <WorkspaceStatusChip
+                    tone={sessionSearchSourceRefs.length > 0 ? "accent" : "default"}
+                  >
+                    Source refs {sessionSearchSourceRefs.length}
+                  </WorkspaceStatusChip>
                   <WorkspaceStatusChip tone="default">
                     Transcript branch{" "}
                     {readNumber(sessionSearchDiagnostics, "total_latency_ms") ?? 0}
@@ -1818,13 +1824,26 @@ export function MemorySection({ app }: MemorySectionProps) {
                       readString(sessionRecord, "session_id") ?? `session-window-${index + 1}`;
                     const windows = readObjectArray(item, "windows");
                     const firstWindow = windows[0] ?? EMPTY_OBJECT;
+                    const firstSourceRef =
+                      readString(firstWindow, "source_ref") ??
+                      readString(
+                        readObject(firstWindow, "provenance") ?? EMPTY_OBJECT,
+                        "source_ref",
+                      );
+                    const firstSourceRefLabel = readString(
+                      sessionSearchSourceRefs.find(
+                        (sourceRef) => readString(sourceRef, "source_ref") === firstSourceRef,
+                      ) ?? EMPTY_OBJECT,
+                      "source_label",
+                    );
                     return (
                       <article key={sessionId} className="chat-ops-card">
                         <div className="chat-ops-card__copy">
                           <strong>{readString(sessionRecord, "title") ?? sessionId}</strong>
                           <span>
                             {sessionId} · {windows.length} window
-                            {windows.length === 1 ? "" : "s"}
+                            {windows.length === 1 ? "" : "s"} ·{" "}
+                            {firstSourceRefLabel ?? firstSourceRef ?? "No source ref"}
                           </span>
                           <p>
                             {readString(firstWindow, "snippet") ?? "No window snippet returned."}

@@ -3681,6 +3681,12 @@ pub struct SessionSearchRequest {
 pub const RECALL_ARTIFACT_KIND_PREVIEW: &str = "recall_preview";
 /// Artifact kind for persisted session-search results.
 pub const RECALL_ARTIFACT_KIND_SESSION_SEARCH: &str = "session_search";
+/// Stable schema for session-search source-ref UX projections.
+pub const SESSION_SEARCH_UX_SOURCE_REFS_SCHEMA_VERSION: u64 = 1;
+/// Audit event emitted when session-search source refs are projected.
+pub const SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED: &str =
+    "session_search_ux_a_source_refs_polish.completed";
+const SESSION_SEARCH_UX_SOURCE_REFS_REDACTION_LEVEL: &str = "metadata_only";
 
 /// Parameters for persisting a recall artifact.
 #[derive(Debug, Clone, PartialEq)]
@@ -3774,6 +3780,7 @@ pub struct SessionSearchRunRef {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SessionSearchWindow {
     pub window_id: String,
+    pub source_ref: String,
     pub session_id: String,
     pub run_id: String,
     pub match_seq: i64,
@@ -3813,6 +3820,102 @@ pub struct SessionSearchProvenanceRef {
     pub tape_seq: i64,
     pub event_type: String,
     pub created_at_unix_ms: i64,
+}
+
+/// Source-ref projection for one bounded session-search window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSearchSourceRef {
+    pub source_ref: String,
+    pub source_label: String,
+    pub source_type: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub tape_seq: i64,
+    pub event_type: String,
+    pub created_at_unix_ms: i64,
+    pub redaction_level: String,
+}
+
+/// Session-search UX source-ref projection decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchUxSourceRefsDecision {
+    Completed,
+    Empty,
+}
+
+/// Stable reason code for session-search source-ref projection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionSearchUxSourceRefsReasonCode {
+    #[serde(rename = "session_search_source_refs.matched_windows")]
+    MatchedWindows,
+    #[serde(rename = "session_search_source_refs.no_windows")]
+    NoWindows,
+}
+
+/// Auditable source-ref projection shared by console responses and artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSearchUxSourceRefsProjection {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: SessionSearchUxSourceRefsDecision,
+    pub reason_code: SessionSearchUxSourceRefsReasonCode,
+    pub source_refs: Vec<SessionSearchSourceRef>,
+    pub source_ref_count: u64,
+    pub redaction_level: String,
+}
+
+/// Builds the stable source ref used for one transcript-backed search hit.
+pub fn session_search_window_source_ref(
+    session_id: &str,
+    run_id: &str,
+    tape_seq: i64,
+    event_type: &str,
+) -> String {
+    format!("orchestrator_tape:{session_id}:{run_id}:{tape_seq}:{event_type}")
+}
+
+/// Projects bounded session-search windows into citation refs for UI, recall
+/// artifacts, and replay/audit review without storing raw payload text.
+pub fn session_search_source_refs_projection(
+    outcome: &SessionSearchOutcome,
+) -> SessionSearchUxSourceRefsProjection {
+    let mut seen = BTreeSet::new();
+    let mut source_refs = Vec::new();
+    for window in outcome.groups.iter().flat_map(|group| group.windows.iter()) {
+        if !seen.insert(window.source_ref.clone()) {
+            continue;
+        }
+        source_refs.push(SessionSearchSourceRef {
+            source_ref: window.source_ref.clone(),
+            source_label: format!("session_window_{}", source_refs.len().saturating_add(1)),
+            source_type: window.provenance.source_type.clone(),
+            session_id: window.provenance.session_id.clone(),
+            run_id: window.provenance.run_id.clone(),
+            tape_seq: window.provenance.tape_seq,
+            event_type: window.provenance.event_type.clone(),
+            created_at_unix_ms: window.provenance.created_at_unix_ms,
+            redaction_level: SESSION_SEARCH_UX_SOURCE_REFS_REDACTION_LEVEL.to_owned(),
+        });
+    }
+    let has_refs = !source_refs.is_empty();
+    SessionSearchUxSourceRefsProjection {
+        schema_version: SESSION_SEARCH_UX_SOURCE_REFS_SCHEMA_VERSION,
+        event_type: SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED.to_owned(),
+        decision: if has_refs {
+            SessionSearchUxSourceRefsDecision::Completed
+        } else {
+            SessionSearchUxSourceRefsDecision::Empty
+        },
+        reason_code: if has_refs {
+            SessionSearchUxSourceRefsReasonCode::MatchedWindows
+        } else {
+            SessionSearchUxSourceRefsReasonCode::NoWindows
+        },
+        source_ref_count: source_refs.len() as u64,
+        source_refs,
+        redaction_level: SESSION_SEARCH_UX_SOURCE_REFS_REDACTION_LEVEL.to_owned(),
+    }
 }
 
 /// Branch lineage update for a session.
@@ -21054,11 +21157,18 @@ fn search_orchestrator_session_windows(
         let mut matched = events[match_index].clone();
         matched.is_match = true;
         let after = events[match_index.saturating_add(1)..].to_vec();
+        let source_ref = session_search_window_source_ref(
+            candidate.event.session_id.as_str(),
+            candidate.event.run_id.as_str(),
+            candidate.event.seq,
+            candidate.event.event_type.as_str(),
+        );
         let window = SessionSearchWindow {
             window_id: format!(
                 "session:{}:run:{}:seq:{}",
                 candidate.event.session_id, candidate.event.run_id, candidate.event.seq
             ),
+            source_ref,
             session_id: candidate.event.session_id.clone(),
             run_id: candidate.event.run_id.clone(),
             match_seq: candidate.event.seq,
@@ -26508,7 +26618,7 @@ mod tests {
         RunLifecyclePhase, ToolResultSensitivity, ToolResultVisibility,
     };
     use rusqlite::{params, Connection};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use crate::{
         domain::workspace::{WorkspaceDocumentState, WorkspaceRiskState},
@@ -26518,7 +26628,8 @@ mod tests {
 
     use super::{
         build_fts_query, build_memory_fts_queries, current_unix_ms, encode_vector_blob,
-        memory_query_embedding_cache_scope, query_embedding_cache_key, sha256_hex,
+        memory_query_embedding_cache_scope, query_embedding_cache_key,
+        session_search_source_refs_projection, session_search_window_source_ref, sha256_hex,
         workspace_query_embedding_cache_scope, AgentPlanCreateRequest, AgentPlanListFilter,
         AgentPlanUpdateRequest, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
         ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
@@ -26536,6 +26647,7 @@ mod tests {
         OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
         ProgressDraftListFilter, ProgressDraftTapeEventRequest, RecallArtifactCreateRequest,
         RecallArtifactListFilter, SessionProjectContextStateUpsertRequest, SessionSearchRequest,
+        SessionSearchUxSourceRefsProjection, SessionSearchUxSourceRefsReasonCode,
         SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
@@ -26546,7 +26658,7 @@ mod tests {
         WorkspaceDocumentMoveRequest, WorkspaceDocumentWriteRequest, WorkspaceSearchRequest,
         CURRENT_MEMORY_EMBEDDING_VERSION, MEMORY_RETENTION_DAY_MS, MIGRATIONS,
         MIN_VECTOR_ONLY_COSINE_SIMILARITY, RECALL_ARTIFACT_KIND_PREVIEW,
-        RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+        RECALL_ARTIFACT_KIND_SESSION_SEARCH, SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED,
     };
 
     static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -29591,6 +29703,33 @@ mod tests {
             "matched event should carry the search text"
         );
         assert_eq!(first_window.provenance.source_type, "orchestrator_tape");
+        assert_eq!(
+            first_window.source_ref,
+            session_search_window_source_ref(
+                first_window.session_id.as_str(),
+                first_window.run_id.as_str(),
+                first_window.match_seq,
+                first_window.match_event_type.as_str()
+            )
+        );
+        let source_refs_projection = session_search_source_refs_projection(&outcome);
+        assert_eq!(source_refs_projection.source_ref_count, 2);
+        assert_eq!(
+            source_refs_projection.reason_code,
+            SessionSearchUxSourceRefsReasonCode::MatchedWindows
+        );
+        assert_eq!(source_refs_projection.source_refs[0].source_label, "session_window_1");
+        assert_eq!(source_refs_projection.source_refs[0].redaction_level, "metadata_only");
+        let serialized_projection = serde_json::to_value(&source_refs_projection)
+            .expect("source refs projection should serialize");
+        assert_eq!(
+            serialized_projection.get("event_type").and_then(Value::as_str),
+            Some(SESSION_SEARCH_UX_SOURCE_REFS_EVENT_COMPLETED)
+        );
+        let decoded_projection =
+            serde_json::from_value::<SessionSearchUxSourceRefsProjection>(serialized_projection)
+                .expect("source refs projection should deserialize");
+        assert_eq!(decoded_projection, source_refs_projection);
         assert_eq!(outcome.diagnostics.source_kind, "transcript");
         assert_eq!(outcome.diagnostics.vector_candidate_count, 0);
         assert_eq!(

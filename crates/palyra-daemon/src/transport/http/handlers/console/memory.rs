@@ -21,9 +21,9 @@ use serde::Serialize;
 use crate::gateway::ListOrchestratorSessionsRequest;
 use crate::gateway::{current_unix_ms, MEMORY_AUTO_INJECT_MIN_SCORE};
 use crate::journal::{
-    MemoryRetentionPolicy, RecallArtifactCreateRequest, RecallArtifactListFilter,
-    RecallArtifactRecord, SessionSearchOutcome, SessionSearchRequest, RECALL_ARTIFACT_KIND_PREVIEW,
-    RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+    session_search_source_refs_projection, MemoryRetentionPolicy, RecallArtifactCreateRequest,
+    RecallArtifactListFilter, RecallArtifactRecord, SessionSearchOutcome, SessionSearchRequest,
+    RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
 };
 use crate::*;
 use crate::{
@@ -1905,6 +1905,7 @@ pub(crate) async fn console_session_search_handler(
                     .map(|group| group.windows.len())
                     .sum::<usize>(),
                 "diagnostics": outcome.diagnostics.clone(),
+                "source_refs_projection": session_search_source_refs_projection(&outcome),
                 "artifact_id": artifact.artifact_id,
             }),
         )
@@ -1917,6 +1918,8 @@ pub(crate) async fn console_session_search_handler(
         "query": outcome.query,
         "groups": outcome.groups,
         "synthesis": session_search_synthesis(&outcome),
+        "source_refs": session_search_source_refs_projection(&outcome).source_refs,
+        "source_refs_projection": session_search_source_refs_projection(&outcome),
         "diagnostics": outcome.diagnostics,
         "artifact": artifact,
         "contract": contract_descriptor(),
@@ -2014,6 +2017,7 @@ fn build_session_search_artifact_request(
     channel: Option<String>,
     outcome: &SessionSearchOutcome,
 ) -> RecallArtifactCreateRequest {
+    let source_refs_projection = session_search_source_refs_projection(outcome);
     RecallArtifactCreateRequest {
         artifact_id: Ulid::new().to_string(),
         artifact_kind: RECALL_ARTIFACT_KIND_SESSION_SEARCH.to_owned(),
@@ -2028,6 +2032,8 @@ fn build_session_search_artifact_request(
             "query": outcome.query,
             "groups": outcome.groups,
             "synthesis": session_search_synthesis(outcome),
+            "source_refs": &source_refs_projection.source_refs,
+            "source_refs_projection": &source_refs_projection,
             "diagnostics": outcome.diagnostics,
             "durable_memory_write": false,
         }),
@@ -2039,8 +2045,10 @@ fn build_session_search_artifact_request(
             "latency_budget_exceeded": outcome.diagnostics.latency_budget_exceeded,
             "degraded_reason": outcome.diagnostics.degraded_reason,
             "synthesis_hash": session_search_synthesis_hash(outcome),
+            "source_ref_count": source_refs_projection.source_ref_count,
+            "source_refs_decision": source_refs_projection.decision,
         }),
-        provenance: session_search_provenance(outcome),
+        provenance: session_search_provenance(outcome, &source_refs_projection),
         created_by_principal: context.principal.clone(),
     }
 }
@@ -2110,11 +2118,16 @@ fn recall_preview_provenance(preview: &RecallPreviewEnvelope) -> Value {
     })
 }
 
-fn session_search_provenance(outcome: &SessionSearchOutcome) -> Value {
+fn session_search_provenance(
+    outcome: &SessionSearchOutcome,
+    source_refs_projection: &crate::journal::SessionSearchUxSourceRefsProjection,
+) -> Value {
     json!({
         "source": "session_search",
         "synthesis_hash": session_search_synthesis_hash(outcome),
         "provider_usage": session_search_provider_usage(outcome),
+        "source_refs_projection": source_refs_projection,
+        "source_refs": &source_refs_projection.source_refs,
         "windows": outcome
             .groups
             .iter()
@@ -2128,6 +2141,7 @@ fn session_search_provenance(outcome: &SessionSearchOutcome) -> Value {
 /// confidence, contradictions, and up to 12 citation-bearing evidence rows
 /// (capped so synthesis stays prompt-budget friendly).
 fn session_search_synthesis(outcome: &SessionSearchOutcome) -> Value {
+    let source_refs_projection = session_search_source_refs_projection(outcome);
     let evidence = outcome
         .groups
         .iter()
@@ -2138,7 +2152,7 @@ fn session_search_synthesis(outcome: &SessionSearchOutcome) -> Value {
             json!({
                 "evidence_id": format!("session-evidence-{}", index + 1),
                 "source_kind": "transcript",
-                "source_ref": format!("{}:{}", window.run_id, window.match_seq),
+                "source_ref": &window.source_ref,
                 "citation": {
                     "source_type": window.provenance.source_type,
                     "session_id": window.provenance.session_id,
@@ -2175,6 +2189,8 @@ fn session_search_synthesis(outcome: &SessionSearchOutcome) -> Value {
         },
         "contradictions": session_search_contradictions(outcome),
         "evidence": evidence,
+        "source_refs": &source_refs_projection.source_refs,
+        "source_refs_projection": &source_refs_projection,
         "provider_usage": session_search_provider_usage(outcome),
         "synthesis_hash": session_search_synthesis_hash(outcome),
     })

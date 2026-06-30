@@ -1988,8 +1988,21 @@ export interface SessionSearchEvent {
   is_match: boolean;
 }
 
+export interface SessionSearchSourceRef {
+  source_ref: string;
+  source_label: string;
+  source_type: string;
+  session_id: string;
+  run_id: string;
+  tape_seq: number;
+  event_type: string;
+  created_at_unix_ms: number;
+  redaction_level: string;
+}
+
 export interface SessionSearchWindow {
   window_id: string;
+  source_ref: string;
   session_id: string;
   run_id: string;
   match_seq: number;
@@ -2015,6 +2028,9 @@ export interface SessionSearchEnvelope {
   capability: "palyra.recall.session_search";
   query: string;
   groups: SessionSearchGroup[];
+  synthesis?: JsonValue;
+  source_refs?: SessionSearchSourceRef[];
+  source_refs_projection?: JsonValue;
   diagnostics: RetrievalBranchDiagnostics;
   artifact?: RecallArtifactRecord;
   contract: ContractDescriptor;

@@ -439,6 +439,7 @@ pub(crate) fn memory_session_search_tool_output_payload(
     let window_count = outcome.groups.iter().map(|group| group.windows.len()).sum::<usize>();
     let evidence_count = window_count.saturating_add(session_hits.len());
     let labels = session_search_output_labels(outcome, session_hits);
+    let source_refs = session_search_labeled_source_refs(outcome, &labels);
     json!({
         "query": outcome.query,
         "group_count": outcome.groups.len(),
@@ -453,6 +454,8 @@ pub(crate) fn memory_session_search_tool_output_payload(
         } else {
             SESSION_SEARCH_HITS_PRESENT_CLAIM_BOUNDARY
         },
+        "source_ref_count": source_refs.len(),
+        "source_refs": source_refs,
         "session_hits": session_hits
             .iter()
             .map(|session| session_search_session_hit_payload(session, &labels))
@@ -544,6 +547,31 @@ fn session_search_output_labels(
         collect_session_record_refs(&mut labels, session);
     }
     labels
+}
+
+fn session_search_labeled_source_refs(
+    outcome: &SessionSearchOutcome,
+    labels: &SessionSearchOutputLabels,
+) -> Vec<Value> {
+    outcome
+        .groups
+        .iter()
+        .flat_map(|group| group.windows.iter())
+        .enumerate()
+        .map(|(index, window)| {
+            json!({
+                "source_ref": session_search_labeled_window_source_ref(window, labels),
+                "source_label": format!("session_window_{}", index + 1),
+                "source_type": window.provenance.source_type,
+                "session_id": labels.session_label(window.provenance.session_id.as_str()),
+                "run_id": labels.run_label(window.provenance.run_id.as_str()),
+                "tape_seq": window.provenance.tape_seq,
+                "event_type": window.provenance.event_type,
+                "created_at_unix_ms": window.provenance.created_at_unix_ms,
+                "redaction_level": "metadata_only",
+            })
+        })
+        .collect()
 }
 
 fn collect_session_record_refs(
@@ -682,6 +710,7 @@ fn session_search_window_payload(
     let run_label = labels.run_label(window.run_id.as_str());
     json!({
         "window_id": format!("session:{session_label}:run:{run_label}:seq:{}", window.match_seq),
+        "source_ref": session_search_labeled_window_source_ref(window, labels),
         "session_id": session_label,
         "run_id": run_label,
         "match_seq": window.match_seq,
@@ -728,12 +757,32 @@ fn session_search_provenance_payload(
 ) -> Value {
     json!({
         "source_type": provenance.source_type,
+        "source_ref": session_search_labeled_provenance_source_ref(provenance, labels),
         "session_id": labels.session_label(provenance.session_id.as_str()),
         "run_id": labels.run_label(provenance.run_id.as_str()),
         "tape_seq": provenance.tape_seq,
         "event_type": provenance.event_type,
         "created_at_unix_ms": provenance.created_at_unix_ms,
     })
+}
+
+fn session_search_labeled_window_source_ref(
+    window: &SessionSearchWindow,
+    labels: &SessionSearchOutputLabels,
+) -> String {
+    session_search_labeled_provenance_source_ref(&window.provenance, labels)
+}
+
+fn session_search_labeled_provenance_source_ref(
+    provenance: &SessionSearchProvenanceRef,
+    labels: &SessionSearchOutputLabels,
+) -> String {
+    format!(
+        "orchestrator_tape:{}:{}:seq:{}",
+        labels.session_label(provenance.session_id.as_str()),
+        labels.run_label(provenance.run_id.as_str()),
+        provenance.tape_seq
+    )
 }
 
 fn session_search_session_hit_payload(
@@ -4953,6 +5002,9 @@ mod tests {
                 },
                 windows: vec![SessionSearchWindow {
                     window_id: format!("session:{session_id}:run:{run_id}:seq:4"),
+                    source_ref: format!(
+                        "orchestrator_tape:{session_id}:{run_id}:4:assistant_final"
+                    ),
                     session_id: session_id.to_owned(),
                     run_id: run_id.to_owned(),
                     match_seq: 4,
@@ -5000,6 +5052,15 @@ mod tests {
             payload["groups"][0]["windows"][0]["window_id"],
             "session:prior_session_1:run:prior_run_1:seq:4"
         );
+        assert_eq!(
+            payload["groups"][0]["windows"][0]["source_ref"],
+            "orchestrator_tape:prior_session_1:prior_run_1:seq:4"
+        );
+        assert_eq!(
+            payload["source_refs"][0]["source_ref"],
+            "orchestrator_tape:prior_session_1:prior_run_1:seq:4"
+        );
+        assert_eq!(payload["source_ref_count"], 1);
         assert!(!serialized.contains(session_id), "{serialized}");
         assert!(!serialized.contains(run_id), "{serialized}");
         assert!(!serialized.contains(origin_run_id), "{serialized}");
