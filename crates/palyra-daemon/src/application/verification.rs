@@ -12,6 +12,7 @@
 use std::{collections::BTreeSet, fmt, path::Component};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::application::project_facts::ProjectWorkspaceRootRef;
 use palyra_common::{
@@ -127,6 +128,7 @@ pub(crate) enum VerificationReasonCode {
     InvalidCommand,
     NoChangedPaths,
     NoPassingEvidence,
+    RequiredAfterPatch,
     ScopeUnknown,
     StateStale,
     WorkspaceMismatch,
@@ -146,6 +148,7 @@ impl VerificationReasonCode {
             Self::InvalidCommand => "verification.invalid_command",
             Self::NoChangedPaths => "verification.no_changed_paths",
             Self::NoPassingEvidence => "verification.no_passing_evidence",
+            Self::RequiredAfterPatch => "verification.required_after_patch",
             Self::ScopeUnknown => "verification.scope_unknown",
             Self::StateStale => "verification.state_stale",
             Self::WorkspaceMismatch => "verification.workspace_mismatch",
@@ -368,6 +371,14 @@ pub(crate) struct VerificationRequirement {
     pub(crate) reason_code: String,
 }
 
+/// Inputs used to mark patch-touched paths as requiring fresh verification.
+pub(crate) struct VerificationPatchStaleRequest {
+    pub(crate) workspace_root: ProjectWorkspaceRootRef,
+    pub(crate) required_kinds: Vec<VerificationKind>,
+    pub(crate) changed_paths: Vec<String>,
+    pub(crate) changed_at_unix_ms: i64,
+}
+
 impl VerificationRequirement {
     #[must_use]
     pub(crate) fn new(
@@ -518,13 +529,15 @@ pub(crate) fn verification_state_stale_projection(
     run_id: &str,
     state: VerificationState,
 ) -> VerificationJournalProjection {
+    let mut reason_codes = state.freshness.reason_codes.clone();
+    reason_codes.push(state.requirement.reason_code.clone());
     VerificationJournalProjection {
         schema_version: VERIFICATION_SCHEMA_VERSION,
         event_type: VERIFICATION_STATE_STALE.to_owned(),
         session_id: session_id.to_owned(),
         run_id: run_id.to_owned(),
         created_at_unix_ms: state.freshness.checked_at_unix_ms,
-        reason_codes: state.freshness.reason_codes.clone(),
+        reason_codes: normalize_string_set(reason_codes),
         evidence_refs: state
             .latest_event_id
             .as_ref()
@@ -536,6 +549,64 @@ pub(crate) fn verification_state_stale_projection(
         state: Some(state),
         freshness: None,
     }
+}
+
+/// Builds stale verification states after a successful workspace mutation.
+#[must_use]
+pub(crate) fn build_patch_stale_verification_states(
+    request: VerificationPatchStaleRequest,
+) -> Vec<VerificationState> {
+    let changed_paths = normalize_string_set(request.changed_paths);
+    if changed_paths.is_empty() {
+        return Vec::new();
+    }
+    normalize_verification_kinds(request.required_kinds)
+        .into_iter()
+        .map(|required_kind| {
+            let requirement = VerificationRequirement::new(
+                format!("verification.required_after_patch.{}", required_kind.as_str()).as_str(),
+                request.workspace_root.clone(),
+                required_kind,
+                changed_paths.clone(),
+                request.changed_at_unix_ms,
+                VerificationReasonCode::RequiredAfterPatch.as_str(),
+            );
+            build_verification_state(requirement, &[], request.changed_at_unix_ms)
+        })
+        .collect()
+}
+
+/// Adds model-visible, non-instructional verification freshness metadata to a patch output.
+pub(crate) fn append_verification_stale_output(
+    output_value: &mut Value,
+    states: Vec<VerificationState>,
+) {
+    if states.is_empty() {
+        return;
+    }
+    let Some(payload) = output_value.as_object_mut() else {
+        return;
+    };
+    let coding_posture = payload.entry("coding_posture").or_insert_with(|| {
+        json!({
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "instruction_authority": "none",
+            "redaction_level": VERIFICATION_REDACTION_LEVEL,
+        })
+    });
+    let Some(coding_posture) = coding_posture.as_object_mut() else {
+        return;
+    };
+    coding_posture.insert(
+        "verification".to_owned(),
+        json!({
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "instruction_authority": "none",
+            "freshness_status": VerificationFreshnessStatus::Stale,
+            "requirements": states,
+            "redaction_level": VERIFICATION_REDACTION_LEVEL,
+        }),
+    );
 }
 
 #[must_use]
@@ -891,6 +962,15 @@ fn command_arg_has_inline_value(arg: &str) -> bool {
     arg.contains('=') || arg.contains(':')
 }
 
+fn normalize_verification_kinds(kinds: Vec<VerificationKind>) -> Vec<VerificationKind> {
+    kinds
+        .into_iter()
+        .filter(|kind| *kind != VerificationKind::Unknown)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 #[must_use]
 pub(crate) fn canonicalize_verification_command(command: &str) -> Option<String> {
     let tokens = command.split_whitespace().filter(|token| !token.is_empty()).collect::<Vec<_>>();
@@ -946,13 +1026,15 @@ mod tests {
     use crate::application::project_facts::ProjectWorkspaceRootRef;
 
     use super::{
+        append_verification_stale_output, build_patch_stale_verification_states,
         build_verification_state, canonicalize_verification_command,
         verification_command_classified_projection, verification_event_recorded_projection,
         verification_state_stale_projection, VerificationCommandClassifier, VerificationEvent,
         VerificationEventCreateRequest, VerificationFreshnessStatus, VerificationKind,
-        VerificationOutputSummary, VerificationRequirement, VerificationScope, VerificationStatus,
-        VERIFICATION_COMMAND_CLASSIFIED, VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL,
-        VERIFICATION_SCHEMA_VERSION, VERIFICATION_STATE_STALE,
+        VerificationOutputSummary, VerificationPatchStaleRequest, VerificationRequirement,
+        VerificationScope, VerificationStatus, VERIFICATION_COMMAND_CLASSIFIED,
+        VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL, VERIFICATION_SCHEMA_VERSION,
+        VERIFICATION_STATE_STALE,
     };
     use palyra_common::process_runner_input::ProcessRunnerToolInput;
 
@@ -1216,6 +1298,60 @@ mod tests {
         assert_eq!(value["event_type"], VERIFICATION_STATE_STALE);
         assert_eq!(value["redaction_level"], VERIFICATION_REDACTION_LEVEL);
         assert_eq!(value["state"]["freshness"]["status"], "stale");
+    }
+
+    #[test]
+    fn patch_stale_builder_marks_changed_paths_for_required_kinds() {
+        let states = build_patch_stale_verification_states(VerificationPatchStaleRequest {
+            workspace_root: root_ref("root-a"),
+            required_kinds: vec![
+                VerificationKind::Unknown,
+                VerificationKind::Test,
+                VerificationKind::Test,
+                VerificationKind::Lint,
+            ],
+            changed_paths: vec![
+                " src/lib.rs ".to_owned(),
+                "./src/lib.rs".to_owned(),
+                "../outside.rs".to_owned(),
+            ],
+            changed_at_unix_ms: 500,
+        });
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].requirement.required_kind, VerificationKind::Lint);
+        assert_eq!(states[1].requirement.required_kind, VerificationKind::Test);
+        assert_eq!(states[0].freshness.status, VerificationFreshnessStatus::Stale);
+        assert_eq!(
+            states[0].requirement.changed_paths,
+            vec!["_outside_workspace/outside.rs", "src/lib.rs"]
+        );
+        assert!(states[0]
+            .freshness
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.state_stale"));
+    }
+
+    #[test]
+    fn stale_output_projection_is_non_instructional() {
+        let states = build_patch_stale_verification_states(VerificationPatchStaleRequest {
+            workspace_root: root_ref("root-a"),
+            required_kinds: vec![VerificationKind::Test],
+            changed_paths: vec!["src/lib.rs".to_owned()],
+            changed_at_unix_ms: 500,
+        });
+        let mut output = serde_json::json!({"ok": true});
+
+        append_verification_stale_output(&mut output, states);
+
+        assert_eq!(output["coding_posture"]["instruction_authority"], "none");
+        assert_eq!(output["coding_posture"]["verification"]["freshness_status"], "stale");
+        assert_eq!(
+            output["coding_posture"]["verification"]["requirements"][0]["requirement"]
+                ["required_kind"],
+            "test"
+        );
     }
 
     #[test]

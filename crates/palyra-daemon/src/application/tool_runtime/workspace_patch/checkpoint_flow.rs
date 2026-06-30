@@ -11,6 +11,7 @@
 //! fixtures; keep them byte-identical.
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -29,11 +30,16 @@ use ulid::Ulid;
 use crate::{
     application::project_facts::{
         append_project_facts_output, project_facts_journal_projection, workspace_root_ref,
-        ProjectFactsCaptureRequest, ProjectFactsDecision, ProjectFactsJournalProjection,
-        ProjectFactsService, ProjectFactsSnapshot, PROJECT_FACTS_COMPLETED_EVENT,
-        PROJECT_FACTS_FAILED_EVENT, PROJECT_FACTS_STARTED_EVENT,
+        ProjectCommandKind, ProjectFactsCaptureRequest, ProjectFactsDecision,
+        ProjectFactsJournalProjection, ProjectFactsService, ProjectFactsSnapshot,
+        PROJECT_FACTS_COMPLETED_EVENT, PROJECT_FACTS_FAILED_EVENT, PROJECT_FACTS_STARTED_EVENT,
     },
     application::tool_runtime::code_intel,
+    application::verification::{
+        append_verification_stale_output, build_patch_stale_verification_states,
+        verification_state_stale_projection, VerificationJournalProjection, VerificationKind,
+        VerificationPatchStaleRequest, VerificationState,
+    },
     application::workspace_observability::{
         capture_workspace_patch_checkpoint, compare_workspace_anchors, WorkspaceCompareAnchor,
         WorkspacePatchCheckpointCapture, WorkspacePatchCheckpointStage,
@@ -336,7 +342,22 @@ pub(super) async fn execute_workspace_patch_mutation(
     )
     .await
     {
+        let stale_states = capture_verification_stale_state_after_patch(
+            runtime_state,
+            VerificationStalePatchCapture {
+                principal,
+                device_id,
+                channel,
+                session_id,
+                run_id,
+                proposal_id,
+                mutation_id: mutation_id.as_str(),
+                project_facts: &project_facts,
+            },
+        )
+        .await;
         append_project_facts_output(&mut output_value, project_facts);
+        append_verification_stale_output(&mut output_value, stale_states);
     }
     serialize_workspace_patch_success_value(proposal_id, input_json, output_value)
 }
@@ -349,6 +370,17 @@ struct ProjectFactsPatchCapture<'a> {
     run_id: &'a str,
     workspace_roots: &'a [PathBuf],
     files_touched: &'a [WorkspacePatchFileAttestation],
+}
+
+struct VerificationStalePatchCapture<'a> {
+    principal: &'a str,
+    device_id: &'a str,
+    channel: Option<&'a str>,
+    session_id: &'a str,
+    run_id: &'a str,
+    proposal_id: &'a str,
+    mutation_id: &'a str,
+    project_facts: &'a ProjectFactsSnapshot,
 }
 
 async fn capture_project_facts_for_coding_posture(
@@ -413,6 +445,88 @@ async fn capture_project_facts_for_coding_posture(
     Some(snapshot)
 }
 
+async fn capture_verification_stale_state_after_patch(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request: VerificationStalePatchCapture<'_>,
+) -> Vec<VerificationState> {
+    if !runtime_state.config.feature_rollouts.verification_runtime.enabled {
+        return Vec::new();
+    }
+    let states = verification_states_for_project_facts(request.project_facts, current_unix_ms());
+    for state in states.iter().cloned() {
+        let mut projection =
+            verification_state_stale_projection(request.session_id, request.run_id, state);
+        projection.evidence_refs = verification_stale_evidence_refs(
+            request.proposal_id,
+            request.mutation_id,
+            request.project_facts,
+        );
+        record_verification_journal_projection(
+            runtime_state,
+            request.principal,
+            request.device_id,
+            request.channel,
+            projection,
+        )
+        .await;
+    }
+    states
+}
+
+fn verification_states_for_project_facts(
+    project_facts: &ProjectFactsSnapshot,
+    changed_at_unix_ms: i64,
+) -> Vec<VerificationState> {
+    if !project_facts.coding_posture.requires_verification {
+        return Vec::new();
+    }
+    build_patch_stale_verification_states(VerificationPatchStaleRequest {
+        workspace_root: project_facts.workspace_root.clone(),
+        required_kinds: required_verification_kinds_from_project_facts(project_facts),
+        changed_paths: project_facts.touched_paths.iter().map(|path| path.path.clone()).collect(),
+        changed_at_unix_ms,
+    })
+}
+
+fn required_verification_kinds_from_project_facts(
+    project_facts: &ProjectFactsSnapshot,
+) -> Vec<VerificationKind> {
+    let mut kinds = project_facts
+        .coding_posture
+        .suggested_commands
+        .iter()
+        .map(|command| verification_kind_from_project_command_kind(command.kind))
+        .collect::<BTreeSet<_>>();
+    if kinds.is_empty() && project_facts.coding_posture.requires_verification {
+        kinds.insert(VerificationKind::Check);
+    }
+    kinds.into_iter().collect()
+}
+
+fn verification_kind_from_project_command_kind(kind: ProjectCommandKind) -> VerificationKind {
+    match kind {
+        ProjectCommandKind::Format => VerificationKind::Format,
+        ProjectCommandKind::Lint => VerificationKind::Lint,
+        ProjectCommandKind::Test => VerificationKind::Test,
+        ProjectCommandKind::Build => VerificationKind::Build,
+        ProjectCommandKind::Check => VerificationKind::Check,
+    }
+}
+
+fn verification_stale_evidence_refs(
+    proposal_id: &str,
+    mutation_id: &str,
+    project_facts: &ProjectFactsSnapshot,
+) -> Vec<String> {
+    let mut refs = BTreeSet::new();
+    refs.insert(format!("tool_call:{proposal_id}"));
+    refs.insert(format!("patch_mutation:{mutation_id}"));
+    for path in &project_facts.touched_paths {
+        refs.insert(format!("touched_path:{}", path.path));
+    }
+    refs.into_iter().collect()
+}
+
 async fn record_project_facts_journal_projection(
     runtime_state: &Arc<GatewayRuntimeState>,
     principal: &str,
@@ -451,6 +565,48 @@ async fn record_project_facts_journal_projection(
             status_code = ?error.code(),
             status_message = %error.message(),
             "project facts journal write failed"
+        );
+    }
+}
+
+async fn record_verification_journal_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    projection: VerificationJournalProjection,
+) {
+    let payload_json = match serde_json::to_string(&projection) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(
+                event_type = %projection.event_type,
+                error = %error,
+                "failed to serialize verification journal projection"
+            );
+            return;
+        }
+    };
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: projection.session_id,
+            run_id: projection.run_id,
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: projection.created_at_unix_ms,
+            payload_json: payload_json.into_bytes(),
+            principal: principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            event_type = %projection.event_type,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "verification journal write failed"
         );
     }
 }
@@ -908,9 +1064,18 @@ fn workspace_patch_preflight_failure_outcome(
 mod tests {
     use std::path::PathBuf;
 
+    use crate::application::{
+        project_facts::{
+            ProjectCodingPosture, ProjectCommandHint, ProjectCommandKind, ProjectFactsDecision,
+            ProjectFactsSnapshot, ProjectLanguageFamily, ProjectTouchedPathFact,
+            ProjectWorkspaceRootRef, PROJECT_FACTS_REDACTION_LEVEL, PROJECT_FACTS_SCHEMA_VERSION,
+        },
+        verification::{VerificationFreshnessStatus, VerificationKind},
+    };
+
     use super::{
         assess_workspace_mutation_risk, select_project_facts_workspace_root,
-        WorkspaceMutationRiskLevel,
+        verification_states_for_project_facts, WorkspaceMutationRiskLevel,
     };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
 
@@ -932,6 +1097,50 @@ mod tests {
             before_size_bytes: None,
             after_sha256: Some("sha256".to_owned()),
             after_size_bytes: Some(1),
+        }
+    }
+
+    fn project_facts_snapshot(
+        requires_verification: bool,
+        suggested_commands: Vec<ProjectCommandHint>,
+    ) -> ProjectFactsSnapshot {
+        ProjectFactsSnapshot {
+            schema_version: PROJECT_FACTS_SCHEMA_VERSION,
+            generated_at_unix_ms: 100,
+            rollout_enabled: true,
+            decision: ProjectFactsDecision::Ready,
+            workspace_root: ProjectWorkspaceRootRef {
+                index: 0,
+                root_id_sha256: "root-a".to_owned(),
+                display_name: "workspace".to_owned(),
+                exists: true,
+            },
+            manifests: Vec::new(),
+            languages: vec![ProjectLanguageFamily::Rust],
+            touched_paths: vec![ProjectTouchedPathFact {
+                path: "src/lib.rs".to_owned(),
+                operation: "update".to_owned(),
+                language: ProjectLanguageFamily::Rust,
+                high_risk: false,
+                generated: false,
+            }],
+            coding_posture: ProjectCodingPosture {
+                requires_verification,
+                high_risk_change: false,
+                generated_path_change: false,
+                suggested_commands,
+            },
+            reason_codes: vec!["project_facts.captured".to_owned()],
+            redaction_level: PROJECT_FACTS_REDACTION_LEVEL.to_owned(),
+        }
+    }
+
+    fn command_hint(kind: ProjectCommandKind) -> ProjectCommandHint {
+        ProjectCommandHint {
+            kind,
+            command: "cargo test --workspace --locked".to_owned(),
+            source: "Cargo.toml".to_owned(),
+            reason_code: "project_facts.test_command".to_owned(),
         }
     }
 
@@ -972,5 +1181,44 @@ mod tests {
 
         assert_eq!(selected.0, 1);
         assert_eq!(selected.1, roots[1].as_path());
+    }
+
+    #[test]
+    fn patch_verification_states_follow_project_facts_command_hints() {
+        let snapshot = project_facts_snapshot(
+            true,
+            vec![command_hint(ProjectCommandKind::Test), command_hint(ProjectCommandKind::Lint)],
+        );
+
+        let states = verification_states_for_project_facts(&snapshot, 500);
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].requirement.required_kind, VerificationKind::Lint);
+        assert_eq!(states[1].requirement.required_kind, VerificationKind::Test);
+        assert_eq!(states[0].requirement.changed_paths, vec!["src/lib.rs"]);
+        assert_eq!(states[0].freshness.status, VerificationFreshnessStatus::Stale);
+        assert!(states[0]
+            .freshness
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.no_passing_evidence"));
+    }
+
+    #[test]
+    fn patch_verification_states_default_to_check_without_command_hints() {
+        let snapshot = project_facts_snapshot(true, Vec::new());
+
+        let states = verification_states_for_project_facts(&snapshot, 500);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].requirement.required_kind, VerificationKind::Check);
+        assert_eq!(states[0].freshness.status, VerificationFreshnessStatus::Stale);
+    }
+
+    #[test]
+    fn patch_verification_states_skip_non_code_posture() {
+        let snapshot = project_facts_snapshot(false, Vec::new());
+
+        assert!(verification_states_for_project_facts(&snapshot, 500).is_empty());
     }
 }
