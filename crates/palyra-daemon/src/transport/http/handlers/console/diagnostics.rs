@@ -2550,6 +2550,7 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
             "rollout_enabled": state.runtime.config.feature_rollouts.verification_runtime.enabled,
             "rollout_source": state.runtime.config.feature_rollouts.verification_runtime.source,
             "journal_events": [
+                crate::application::verification::VERIFICATION_COMMAND_CLASSIFIED,
                 crate::application::verification::VERIFICATION_EVENT_RECORDED,
                 crate::application::verification::VERIFICATION_STATE_STALE,
                 crate::application::verification::VERIFICATION_FRESHNESS_CHECKED,

@@ -36,8 +36,8 @@ use palyra_auth::{
     OAuthRefreshOutcome,
 };
 use palyra_common::{
-    build_metadata, process_runner_input::parse_process_runner_tool_input, validate_canonical_id,
-    CANONICAL_PROTOCOL_MAJOR,
+    build_metadata, process_runner_input::parse_process_runner_tool_input,
+    redaction::redact_diagnostic_text, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 #[cfg(test)]
@@ -1036,6 +1036,15 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
             &outcome,
         );
+        record_process_run_verification_classification(
+            runtime_state,
+            context,
+            proposal_id,
+            &config,
+            execution_input_json.as_slice(),
+            &outcome,
+        )
+        .await;
         outcome
     } else if matches!(tool_name, PROCESS_STOP_TOOL_NAME | PROCESS_STATUS_TOOL_NAME) {
         let config =
@@ -1112,6 +1121,227 @@ fn record_run_cleanup_resource_from_tool_outcome(
         }
         _ => {}
     }
+}
+
+async fn record_process_run_verification_classification(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    config: &ToolCallConfig,
+    input_json: &[u8],
+    outcome: &ToolExecutionOutcome,
+) {
+    if !runtime_state.config.feature_rollouts.verification_runtime.enabled {
+        return;
+    }
+    let Ok(input) = parse_process_runner_tool_input(input_json) else {
+        return;
+    };
+    let classification =
+        crate::application::verification::VerificationCommandClassifier::classify_process_run(
+            &input,
+        );
+    let mut classification_projection =
+        crate::application::verification::verification_command_classified_projection(
+            context.session_id,
+            context.run_id,
+            current_unix_ms(),
+            classification.clone(),
+        );
+    classification_projection.evidence_refs =
+        process_run_verification_evidence_refs(proposal_id, outcome);
+    record_verification_journal_projection(runtime_state, context, classification_projection).await;
+
+    if !classification.is_verification {
+        return;
+    }
+    let status = verification_status_from_tool_outcome(outcome);
+    let event = match crate::application::verification::VerificationEvent::create(
+        crate::application::verification::VerificationEventCreateRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: context.session_id.to_owned(),
+            run_id: context.run_id.to_owned(),
+            workspace_root: crate::application::project_facts::workspace_root_ref(
+                0,
+                config.process_runner.workspace_root.as_path(),
+                config.process_runner.workspace_root.exists(),
+            ),
+            command: classification.canonical_command.display.clone(),
+            kind: classification.kind,
+            scope: classification.scope,
+            status,
+            exit_code: process_run_exit_code(outcome.output_json.as_slice()),
+            changed_paths: Vec::new(),
+            output_summary: process_run_verification_output_summary(outcome),
+            created_at_unix_ms: outcome.attestation.executed_at_unix_ms,
+            evidence_refs: process_run_verification_evidence_refs(proposal_id, outcome),
+        },
+    ) {
+        Ok(event) => event,
+        Err(error) => {
+            warn!(
+                proposal_id,
+                error = %error,
+                "failed to build process-run verification event"
+            );
+            return;
+        }
+    };
+    let projection =
+        crate::application::verification::verification_event_recorded_projection(event);
+    record_verification_journal_projection(runtime_state, context, projection).await;
+}
+
+async fn record_verification_journal_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    projection: crate::application::verification::VerificationJournalProjection,
+) {
+    let payload_json = match serde_json::to_string(&projection) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(
+                event_type = %projection.event_type,
+                error = %error,
+                "failed to serialize verification journal projection"
+            );
+            return;
+        }
+    };
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: projection.session_id,
+            run_id: projection.run_id,
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: projection.created_at_unix_ms,
+            payload_json: payload_json.into_bytes(),
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            event_type = %projection.event_type,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "verification journal write failed"
+        );
+    }
+}
+
+fn verification_status_from_tool_outcome(
+    outcome: &ToolExecutionOutcome,
+) -> crate::application::verification::VerificationStatus {
+    if outcome.attestation.timed_out {
+        return crate::application::verification::VerificationStatus::TimedOut;
+    }
+    if outcome.success {
+        return crate::application::verification::VerificationStatus::Passed;
+    }
+    let lower_error = outcome.error.to_ascii_lowercase();
+    if lower_error.contains("cancelled") || lower_error.contains("canceled") {
+        crate::application::verification::VerificationStatus::Cancelled
+    } else {
+        crate::application::verification::VerificationStatus::Failed
+    }
+}
+
+fn process_run_exit_code(output_json: &[u8]) -> Option<i32> {
+    serde_json::from_slice::<Value>(output_json)
+        .ok()?
+        .get("exit_code")?
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn process_run_verification_output_summary(
+    outcome: &ToolExecutionOutcome,
+) -> crate::application::verification::VerificationOutputSummary {
+    let payload = serde_json::from_slice::<Value>(outcome.output_json.as_slice()).ok();
+    let stdout_tail = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/streams/stdout/tail"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr_tail = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/streams/stderr/tail"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut summary = String::new();
+    let mut redacted_by_summary = false;
+    if !stdout_tail.trim().is_empty() {
+        let trimmed = stdout_tail.trim();
+        let redacted_tail = redact_diagnostic_text(trimmed);
+        redacted_by_summary |= redacted_tail != trimmed;
+        summary.push_str("stdout_tail: ");
+        summary.push_str(redacted_tail.as_str());
+    }
+    if !stderr_tail.trim().is_empty() {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        let trimmed = stderr_tail.trim();
+        let redacted_tail = redact_diagnostic_text(trimmed);
+        redacted_by_summary |= redacted_tail != trimmed;
+        summary.push_str("stderr_tail: ");
+        summary.push_str(redacted_tail.as_str());
+    }
+    if summary.is_empty() {
+        let fallback = if outcome.error.trim().is_empty() {
+            "process completed without textual summary".to_owned()
+        } else {
+            outcome.error.trim().to_owned()
+        };
+        summary = redact_diagnostic_text(fallback.as_str());
+        redacted_by_summary |= summary != fallback;
+    }
+    let redacted = payload.as_ref().is_some_and(|value| {
+        value.get("stdout_redacted").and_then(Value::as_bool).unwrap_or(false)
+            || value.get("stderr_redacted").and_then(Value::as_bool).unwrap_or(false)
+            || value.pointer("/streams/stdout/redacted").and_then(Value::as_bool).unwrap_or(false)
+            || value.pointer("/streams/stderr/redacted").and_then(Value::as_bool).unwrap_or(false)
+    }) || redacted_by_summary;
+    crate::application::verification::VerificationOutputSummary::from_redacted_text(
+        summary.as_str(),
+        redacted,
+        process_run_output_artifact_refs(payload.as_ref()),
+    )
+}
+
+fn process_run_verification_evidence_refs(
+    proposal_id: &str,
+    outcome: &ToolExecutionOutcome,
+) -> Vec<String> {
+    let mut refs = vec![
+        format!("tool_call:{proposal_id}"),
+        format!("tool_attestation:{}", outcome.attestation.attestation_id),
+        format!("tool_execution_sha256:{}", outcome.attestation.execution_sha256),
+    ];
+    if let Ok(payload) = serde_json::from_slice::<Value>(outcome.output_json.as_slice()) {
+        refs.extend(process_run_output_artifact_refs(Some(&payload)));
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn process_run_output_artifact_refs(payload: Option<&Value>) -> Vec<String> {
+    let Some(payload) = payload else {
+        return Vec::new();
+    };
+    ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|stream| {
+            payload
+                .pointer(format!("/streams/{stream}/sha256").as_str())
+                .and_then(Value::as_str)
+                .map(|sha256| format!("process_{stream}_sha256:{sha256}"))
+        })
+        .collect()
 }
 
 fn background_process_pid_from_tool_output(output_json: &[u8]) -> Option<u32> {

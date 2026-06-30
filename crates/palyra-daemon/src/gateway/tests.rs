@@ -62,11 +62,12 @@ use super::{
     approval_failure_decision, best_effort_mark_approval_error, common_v1, constant_time_eq,
     enforce_vault_get_approval_policy, enforce_vault_scope_access,
     has_windows_absolute_path_prefix, ingest_memory_best_effort,
-    matching_tool_approval_response_id, process_runner_input_should_use_active_root,
-    process_runner_input_should_use_launch_root, process_runner_input_with_path_env,
-    process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
-    process_runner_workspace_roots_within_configured_root, resolve_cron_job_channel_for_create,
-    tool_approval_response_proposal_id, workspace_patch_metrics_from_output,
+    matching_tool_approval_response_id, process_run_verification_output_summary,
+    process_runner_input_should_use_active_root, process_runner_input_should_use_launch_root,
+    process_runner_input_with_path_env, process_runner_tool_config_for_session,
+    process_runner_workspace_root_for_input, process_runner_workspace_roots_within_configured_root,
+    resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
+    verification_status_from_tool_outcome, workspace_patch_metrics_from_output,
     CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
     GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest,
     RequestContext, ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS,
@@ -1248,6 +1249,63 @@ fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecuti
             sandbox_enforcement: "test".to_owned(),
         },
     }
+}
+
+#[test]
+fn process_run_verification_summary_reuses_redacted_stream_metadata() {
+    let outcome = cleanup_test_tool_outcome(
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_redacted": false,
+            "stderr_redacted": true,
+            "streams": {
+                "stdout": {
+                    "tail": "test result: ok",
+                    "sha256": "stdout-hash",
+                    "redacted": false
+                },
+                "stderr": {
+                    "tail": "token=<redacted>",
+                    "sha256": "stderr-hash",
+                    "redacted": true
+                }
+            }
+        }),
+    );
+
+    let summary = process_run_verification_output_summary(&outcome);
+
+    assert!(summary.text.contains("stdout_tail: test result: ok"));
+    assert!(summary.text.contains("stderr_tail: token=<redacted>"));
+    assert!(summary.redacted);
+    assert_eq!(
+        summary.artifact_refs,
+        vec!["process_stderr_sha256:stderr-hash", "process_stdout_sha256:stdout-hash"]
+    );
+}
+
+#[test]
+fn process_run_verification_summary_redacts_error_fallback() {
+    let mut outcome = cleanup_test_tool_outcome(false, json!({}));
+    outcome.error = "process failed: token=sk-secret".to_owned();
+
+    let summary = process_run_verification_output_summary(&outcome);
+
+    assert!(!summary.text.contains("sk-secret"));
+    assert!(summary.text.contains("token=<redacted>"));
+    assert!(summary.redacted);
+}
+
+#[test]
+fn process_run_verification_status_maps_attested_timeout() {
+    let mut outcome = cleanup_test_tool_outcome(false, json!({}));
+    outcome.attestation.timed_out = true;
+
+    assert_eq!(
+        verification_status_from_tool_outcome(&outcome),
+        crate::application::verification::VerificationStatus::TimedOut
+    );
 }
 
 struct CleanupTestProcess {

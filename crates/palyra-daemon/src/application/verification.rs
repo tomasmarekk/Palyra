@@ -14,8 +14,13 @@ use std::{collections::BTreeSet, fmt, path::Component};
 use serde::{Deserialize, Serialize};
 
 use crate::application::project_facts::ProjectWorkspaceRootRef;
+use palyra_common::{
+    process_runner_input::ProcessRunnerToolInput,
+    redaction::{is_sensitive_key, redact_diagnostic_text, REDACTED},
+};
 
 pub(crate) const VERIFICATION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const VERIFICATION_COMMAND_CLASSIFIED: &str = "verification.command.classified";
 pub(crate) const VERIFICATION_EVENT_RECORDED: &str = "verification.event.recorded";
 pub(crate) const VERIFICATION_STATE_STALE: &str = "verification.state.stale";
 pub(crate) const VERIFICATION_FRESHNESS_CHECKED: &str = "verification.freshness.checked";
@@ -111,6 +116,9 @@ pub(crate) enum VerificationFreshnessStatus {
 /// Stable reason codes used by verification journal payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerificationReasonCode {
+    CommandClassified,
+    CommandNotVerification,
+    CommandSupported,
     EventRecorded,
     EventStatusFailed,
     EventStatusPassed,
@@ -127,6 +135,9 @@ pub(crate) enum VerificationReasonCode {
 impl VerificationReasonCode {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::CommandClassified => "verification.command_classified",
+            Self::CommandNotVerification => "verification.command_not_verification",
+            Self::CommandSupported => "verification.command_supported",
             Self::EventRecorded => "verification.event_recorded",
             Self::EventStatusFailed => "verification.event_status_failed",
             Self::EventStatusPassed => "verification.event_status_passed",
@@ -138,6 +149,62 @@ impl VerificationReasonCode {
             Self::ScopeUnknown => "verification.scope_unknown",
             Self::StateStale => "verification.state_stale",
             Self::WorkspaceMismatch => "verification.workspace_mismatch",
+        }
+    }
+}
+
+/// Canonical command tokens derived from `palyra.process.run` input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CanonicalCommand {
+    pub(crate) executable: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) display: String,
+}
+
+/// Passive classification for one process-run command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationCommandClassification {
+    pub(crate) schema_version: u32,
+    pub(crate) canonical_command: CanonicalCommand,
+    pub(crate) is_verification: bool,
+    pub(crate) kind: VerificationKind,
+    pub(crate) scope: VerificationScope,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Classifies `palyra.process.run` commands without executing anything.
+pub(crate) struct VerificationCommandClassifier;
+
+impl VerificationCommandClassifier {
+    #[must_use]
+    pub(crate) fn classify_process_run(
+        input: &ProcessRunnerToolInput,
+    ) -> VerificationCommandClassification {
+        let canonical_command = canonical_command_from_process_input(input);
+        let classification_args = normalized_command_args(input.args.as_slice());
+        let (kind, scope) = classify_command_parts(
+            canonical_command.executable.as_str(),
+            classification_args.as_slice(),
+        );
+        let is_verification = kind != VerificationKind::Unknown;
+        let mut reason_codes = BTreeSet::new();
+        reason_codes.insert(VerificationReasonCode::CommandClassified);
+        if is_verification {
+            reason_codes.insert(VerificationReasonCode::CommandSupported);
+        } else {
+            reason_codes.insert(VerificationReasonCode::CommandNotVerification);
+        }
+        VerificationCommandClassification {
+            schema_version: VERIFICATION_SCHEMA_VERSION,
+            canonical_command,
+            is_verification,
+            kind,
+            scope,
+            reason_codes: render_reason_codes(reason_codes),
+            redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
         }
     }
 }
@@ -367,11 +434,36 @@ pub(crate) struct VerificationJournalProjection {
     pub(crate) evidence_refs: Vec<String>,
     pub(crate) redaction_level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) classification: Option<VerificationCommandClassification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) event: Option<VerificationEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) state: Option<VerificationState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) freshness: Option<VerificationFreshnessDecision>,
+}
+
+#[must_use]
+pub(crate) fn verification_command_classified_projection(
+    session_id: &str,
+    run_id: &str,
+    created_at_unix_ms: i64,
+    classification: VerificationCommandClassification,
+) -> VerificationJournalProjection {
+    VerificationJournalProjection {
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        event_type: VERIFICATION_COMMAND_CLASSIFIED.to_owned(),
+        session_id: session_id.to_owned(),
+        run_id: run_id.to_owned(),
+        created_at_unix_ms,
+        reason_codes: classification.reason_codes.clone(),
+        evidence_refs: Vec::new(),
+        redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+        classification: Some(classification),
+        event: None,
+        state: None,
+        freshness: None,
+    }
 }
 
 #[must_use]
@@ -387,6 +479,7 @@ pub(crate) fn verification_event_recorded_projection(
         reason_codes: event.reason_codes.clone(),
         evidence_refs: event.evidence_refs.clone(),
         redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+        classification: None,
         event: Some(event),
         state: None,
         freshness: None,
@@ -412,6 +505,7 @@ pub(crate) fn verification_freshness_checked_projection(
             .map(|event_id| vec![format!("verification_event:{event_id}")])
             .unwrap_or_default(),
         redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+        classification: None,
         event: None,
         state: None,
         freshness: Some(decision),
@@ -437,6 +531,7 @@ pub(crate) fn verification_state_stale_projection(
             .map(|event_id| vec![format!("verification_event:{event_id}")])
             .unwrap_or_default(),
         redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+        classification: None,
         event: None,
         state: Some(state),
         freshness: None,
@@ -566,6 +661,236 @@ fn verification_event_covers_requirement(
     }
 }
 
+fn canonical_command_from_process_input(input: &ProcessRunnerToolInput) -> CanonicalCommand {
+    let executable = normalize_executable_token(input.command.as_str());
+    let args = redacted_command_args(input.args.as_slice());
+    let display = std::iter::once(executable.as_str())
+        .chain(args.iter().map(String::as_str))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    CanonicalCommand { executable, args, display }
+}
+
+fn classify_command_parts(
+    executable: &str,
+    args: &[String],
+) -> (VerificationKind, VerificationScope) {
+    match executable {
+        "cargo" => classify_cargo(args),
+        "npm" | "pnpm" | "yarn" => classify_node_package_script(args),
+        "pytest" => (VerificationKind::Test, VerificationScope::Workspace),
+        "ruff" => classify_ruff(args),
+        "mypy" | "tsc" => (VerificationKind::Typecheck, VerificationScope::Workspace),
+        "go" => classify_go(args),
+        "gradle" | "gradlew" => classify_gradle(args),
+        "make" => classify_make(args),
+        "python" | "python3" | "py" => classify_python_module(args),
+        _ => (VerificationKind::Unknown, VerificationScope::Unknown),
+    }
+}
+
+fn classify_cargo(args: &[String]) -> (VerificationKind, VerificationScope) {
+    match first_non_option_arg(args).as_deref() {
+        Some("test") => (VerificationKind::Test, VerificationScope::Workspace),
+        Some("check") => (VerificationKind::Check, VerificationScope::Workspace),
+        Some("clippy") => (VerificationKind::Lint, VerificationScope::Workspace),
+        Some("fmt") => (VerificationKind::Format, VerificationScope::Workspace),
+        Some("build") => (VerificationKind::Build, VerificationScope::Workspace),
+        _ => (VerificationKind::Unknown, VerificationScope::Unknown),
+    }
+}
+
+fn classify_node_package_script(args: &[String]) -> (VerificationKind, VerificationScope) {
+    let Some(script) = node_script_name(args) else {
+        return (VerificationKind::Unknown, VerificationScope::Unknown);
+    };
+    classify_script_name(script.as_str())
+}
+
+fn classify_ruff(args: &[String]) -> (VerificationKind, VerificationScope) {
+    match first_non_option_arg(args).as_deref() {
+        Some("format") => (VerificationKind::Format, VerificationScope::Workspace),
+        Some("check") | None => (VerificationKind::Lint, VerificationScope::Workspace),
+        _ => (VerificationKind::Lint, VerificationScope::Workspace),
+    }
+}
+
+fn classify_go(args: &[String]) -> (VerificationKind, VerificationScope) {
+    match first_non_option_arg(args).as_deref() {
+        Some("test") => (VerificationKind::Test, VerificationScope::Workspace),
+        Some("build") => (VerificationKind::Build, VerificationScope::Workspace),
+        _ => (VerificationKind::Unknown, VerificationScope::Unknown),
+    }
+}
+
+fn classify_gradle(args: &[String]) -> (VerificationKind, VerificationScope) {
+    let tasks = args.iter().filter(|arg| !arg.starts_with('-')).collect::<Vec<_>>();
+    if tasks.iter().any(|task| task.as_str() == "test" || task.ends_with(":test")) {
+        return (VerificationKind::Test, VerificationScope::Workspace);
+    }
+    if tasks.iter().any(|task| task.as_str() == "check" || task.ends_with(":check")) {
+        return (VerificationKind::Check, VerificationScope::Workspace);
+    }
+    if tasks.iter().any(|task| task.as_str() == "build" || task.ends_with(":build")) {
+        return (VerificationKind::Build, VerificationScope::Workspace);
+    }
+    (VerificationKind::Unknown, VerificationScope::Unknown)
+}
+
+fn classify_make(args: &[String]) -> (VerificationKind, VerificationScope) {
+    let target = first_non_option_arg(args).unwrap_or_else(|| "all".to_owned());
+    classify_script_name(target.as_str())
+}
+
+fn classify_python_module(args: &[String]) -> (VerificationKind, VerificationScope) {
+    let module = args.windows(2).find(|window| window[0] == "-m").map(|window| window[1].as_str());
+    match module {
+        Some("pytest") => (VerificationKind::Test, VerificationScope::Workspace),
+        Some("mypy") => (VerificationKind::Typecheck, VerificationScope::Workspace),
+        Some("ruff") => (VerificationKind::Lint, VerificationScope::Workspace),
+        _ => (VerificationKind::Unknown, VerificationScope::Unknown),
+    }
+}
+
+fn classify_script_name(script: &str) -> (VerificationKind, VerificationScope) {
+    let normalized = script.to_ascii_lowercase();
+    if normalized == "test" || normalized.starts_with("test:") || normalized.ends_with(":test") {
+        (VerificationKind::Test, VerificationScope::Workspace)
+    } else if normalized == "lint"
+        || normalized.starts_with("lint:")
+        || normalized.ends_with(":lint")
+    {
+        (VerificationKind::Lint, VerificationScope::Workspace)
+    } else if normalized == "typecheck"
+        || normalized == "type-check"
+        || normalized == "tsc"
+        || normalized.contains("typecheck")
+    {
+        (VerificationKind::Typecheck, VerificationScope::Workspace)
+    } else if normalized == "format"
+        || normalized == "fmt"
+        || normalized.starts_with("format:")
+        || normalized.ends_with(":format")
+    {
+        (VerificationKind::Format, VerificationScope::Workspace)
+    } else if normalized == "build"
+        || normalized.starts_with("build:")
+        || normalized.ends_with(":build")
+    {
+        (VerificationKind::Build, VerificationScope::Workspace)
+    } else if normalized == "check"
+        || normalized.starts_with("check:")
+        || normalized.ends_with(":check")
+        || normalized.ends_with(":ci")
+    {
+        (VerificationKind::Check, VerificationScope::Workspace)
+    } else {
+        (VerificationKind::Unknown, VerificationScope::Unknown)
+    }
+}
+
+fn node_script_name(args: &[String]) -> Option<String> {
+    let first = first_non_option_arg(args)?;
+    if first == "run" || first == "run-script" {
+        args.iter().skip_while(|arg| arg.as_str() != first).nth(1).cloned()
+    } else {
+        Some(first)
+    }
+}
+
+fn first_non_option_arg(args: &[String]) -> Option<String> {
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--" {
+            continue;
+        }
+        if arg.starts_with('-') {
+            skip_next = command_option_takes_value(arg.as_str());
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
+}
+
+fn normalize_executable_token(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('"').trim_matches('\'');
+    let file_name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let file_name = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    file_name
+        .strip_prefix("./")
+        .unwrap_or(file_name)
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase()
+}
+
+fn normalize_command_arg(value: &str) -> String {
+    value.trim().trim_matches('"').trim_matches('\'').to_owned()
+}
+
+fn normalized_command_args(args: &[String]) -> Vec<String> {
+    args.iter().map(|arg| normalize_command_arg(arg)).collect()
+}
+
+fn redacted_command_args(args: &[String]) -> Vec<String> {
+    let mut redacted_args = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in normalized_command_args(args) {
+        if redact_next {
+            redacted_args.push(REDACTED.to_owned());
+            redact_next = false;
+            continue;
+        }
+        redact_next =
+            command_option_takes_value(arg.as_str()) && !command_arg_has_inline_value(arg.as_str());
+        redacted_args.push(redact_diagnostic_text(arg.as_str()));
+    }
+    redacted_args
+}
+
+fn command_option_takes_value(arg: &str) -> bool {
+    if command_arg_has_inline_value(arg) {
+        return false;
+    }
+    let key = arg.trim_start_matches('-').trim_start_matches('/');
+    if key.is_empty() {
+        return false;
+    }
+    if is_sensitive_key(key) {
+        return true;
+    }
+    matches!(
+        key,
+        "C" | "c"
+            | "config"
+            | "cwd"
+            | "dir"
+            | "directory"
+            | "f"
+            | "file"
+            | "filter"
+            | "manifest-path"
+            | "o"
+            | "output"
+            | "p"
+            | "package"
+            | "prefix"
+            | "project"
+            | "target"
+            | "workspace"
+    )
+}
+
+fn command_arg_has_inline_value(arg: &str) -> bool {
+    arg.contains('=') || arg.contains(':')
+}
+
 #[must_use]
 pub(crate) fn canonicalize_verification_command(command: &str) -> Option<String> {
     let tokens = command.split_whitespace().filter(|token| !token.is_empty()).collect::<Vec<_>>();
@@ -622,12 +947,14 @@ mod tests {
 
     use super::{
         build_verification_state, canonicalize_verification_command,
-        verification_event_recorded_projection, verification_state_stale_projection,
-        VerificationEvent, VerificationEventCreateRequest, VerificationFreshnessStatus,
-        VerificationKind, VerificationOutputSummary, VerificationRequirement, VerificationScope,
-        VerificationStatus, VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL,
+        verification_command_classified_projection, verification_event_recorded_projection,
+        verification_state_stale_projection, VerificationCommandClassifier, VerificationEvent,
+        VerificationEventCreateRequest, VerificationFreshnessStatus, VerificationKind,
+        VerificationOutputSummary, VerificationRequirement, VerificationScope, VerificationStatus,
+        VERIFICATION_COMMAND_CLASSIFIED, VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL,
         VERIFICATION_SCHEMA_VERSION, VERIFICATION_STATE_STALE,
     };
+    use palyra_common::process_runner_input::ProcessRunnerToolInput;
 
     fn root_ref(id: &str) -> ProjectWorkspaceRootRef {
         ProjectWorkspaceRootRef {
@@ -665,6 +992,93 @@ mod tests {
             evidence_refs: vec!["tool_call:process-1".to_owned()],
         })
         .expect("event should be valid")
+    }
+
+    fn process_input(command: &str, args: &[&str]) -> ProcessRunnerToolInput {
+        ProcessRunnerToolInput {
+            command: command.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            cwd: None,
+            env: Default::default(),
+            prepend_path: Vec::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: false,
+            lifetime_mode: Default::default(),
+            keep_running_after_run: false,
+        }
+    }
+
+    #[test]
+    fn process_run_classifier_recognizes_required_verification_commands() {
+        for (command, args, expected_kind) in [
+            ("cargo", vec!["test"], VerificationKind::Test),
+            ("cargo", vec!["check"], VerificationKind::Check),
+            ("npm", vec!["test"], VerificationKind::Test),
+            ("pnpm", vec!["test"], VerificationKind::Test),
+            ("yarn", vec!["test"], VerificationKind::Test),
+            ("pytest", vec![], VerificationKind::Test),
+            ("ruff", vec!["check"], VerificationKind::Lint),
+            ("mypy", vec!["src"], VerificationKind::Typecheck),
+            ("tsc", vec!["--noEmit"], VerificationKind::Typecheck),
+            ("go", vec!["test", "./..."], VerificationKind::Test),
+            ("./gradlew", vec!["test"], VerificationKind::Test),
+            ("make", vec!["check"], VerificationKind::Check),
+        ] {
+            let classification = VerificationCommandClassifier::classify_process_run(
+                &process_input(command, args.as_slice()),
+            );
+            assert!(
+                classification.is_verification,
+                "{command} {args:?} should be classified as verification"
+            );
+            assert_eq!(classification.kind, expected_kind, "{command} {args:?}");
+            assert_eq!(classification.scope, VerificationScope::Workspace);
+        }
+    }
+
+    #[test]
+    fn process_run_classifier_distinguishes_non_verification_commands() {
+        let classification = VerificationCommandClassifier::classify_process_run(&process_input(
+            "npm",
+            &["install"],
+        ));
+
+        assert!(!classification.is_verification);
+        assert_eq!(classification.kind, VerificationKind::Unknown);
+        assert_eq!(classification.scope, VerificationScope::Unknown);
+        assert!(classification
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.command_not_verification"));
+    }
+
+    #[test]
+    fn process_run_classifier_redacts_secret_args_without_losing_classification() {
+        let classification = VerificationCommandClassifier::classify_process_run(&process_input(
+            "npm",
+            &["--token", "sk-secret-token", "test"],
+        ));
+
+        assert!(classification.is_verification);
+        assert_eq!(classification.kind, VerificationKind::Test);
+        assert_eq!(classification.canonical_command.args, vec!["--token", "<redacted>", "test"]);
+        assert!(!classification.canonical_command.display.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn command_classified_projection_keeps_unknown_as_classification_only() {
+        let classification = VerificationCommandClassifier::classify_process_run(&process_input(
+            "npm",
+            &["install"],
+        ));
+        let projection =
+            verification_command_classified_projection("session-1", "run-1", 100, classification);
+        let value = serde_json::to_value(&projection).expect("projection should serialize");
+
+        assert_eq!(value["event_type"], VERIFICATION_COMMAND_CLASSIFIED);
+        assert_eq!(value["classification"]["is_verification"], false);
+        assert!(value.get("event").is_none());
     }
 
     #[test]
