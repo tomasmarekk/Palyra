@@ -47,6 +47,10 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
+    application::resume_classifier::{
+        classify_resume, summarize_resume_tape_observations, ResumeClassifierInput, ResumeDecision,
+        ResumeTapeObservation, DEFAULT_RESUME_FRESHNESS_TTL_MS, RUN_RESUME_DECISION_RECORDED_EVENT,
+    },
     delegation::{DelegationMergeResult, DelegationSnapshot},
     domain::workspace::{
         curated_workspace_templates, normalize_workspace_path,
@@ -6388,28 +6392,30 @@ fn append_run_lifecycle_event_tx(
 fn append_startup_recovery_tape_event_tx(
     connection: &Connection,
     max_payload_bytes: usize,
-    run_id: &str,
-    session_id: &str,
-    previous_state: &str,
+    candidate: &StartupResumeCandidate,
     reason: &str,
+    resume_decision: &ResumeDecision,
     now: i64,
 ) -> Result<(), JournalError> {
-    let seq = next_orchestrator_tape_seq(connection, run_id)?;
+    let seq = next_orchestrator_tape_seq(connection, candidate.run_id.as_str())?;
     append_orchestrator_tape_event_tx(
         connection,
         max_payload_bytes,
         &OrchestratorTapeAppendRequest {
-            run_id: run_id.to_owned(),
+            run_id: candidate.run_id.clone(),
             seq,
             event_type: "run.recovery".to_owned(),
             payload_json: json!({
                 "event": "run.recovery",
                 "recovery_kind": "startup_orphaned_active_run",
                 "recovery_state": "manual_resume_required",
-                "run_id": run_id,
-                "session_id": session_id,
-                "previous_state": previous_state,
+                "run_id": candidate.run_id.as_str(),
+                "session_id": candidate.session_id.as_str(),
+                "previous_state": candidate.previous_state.as_str(),
                 "terminal_state": RunLifecycleState::Failed.as_str(),
+                "resume_decision": resume_decision.decision.as_str(),
+                "resume_reason_code": resume_decision.reason_code.as_str(),
+                "resume_freshness_age_ms": resume_decision.freshness_age_ms,
                 "reason": reason,
                 "operator_guidance": "Inspect the failed run tape, then start a new run in the same session if continuation is required."
             })
@@ -6417,6 +6423,90 @@ fn append_startup_recovery_tape_event_tx(
         },
         now,
     )
+}
+
+fn append_resume_decision_tape_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    decision: &ResumeDecision,
+    now: i64,
+) -> Result<(), JournalError> {
+    let seq = next_orchestrator_tape_seq(connection, decision.run_id.as_str())?;
+    append_orchestrator_tape_event_tx(
+        connection,
+        max_payload_bytes,
+        &OrchestratorTapeAppendRequest {
+            run_id: decision.run_id.clone(),
+            seq,
+            event_type: RUN_RESUME_DECISION_RECORDED_EVENT.to_owned(),
+            payload_json: decision.payload_json.clone(),
+        },
+        now,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct StartupResumeCandidate {
+    run_id: String,
+    session_id: String,
+    previous_state: String,
+    parent_run_id: Option<String>,
+    principal: String,
+    channel: Option<String>,
+    origin_kind: String,
+}
+
+fn startup_resume_classifier_input(
+    connection: &Connection,
+    candidate: &StartupResumeCandidate,
+    now: i64,
+) -> Result<ResumeClassifierInput, JournalError> {
+    let observations = load_resume_tape_observations(connection, candidate.run_id.as_str())?;
+    let signals = summarize_resume_tape_observations(observations.as_slice());
+    Ok(ResumeClassifierInput {
+        run_id: candidate.run_id.clone(),
+        session_id: candidate.session_id.clone(),
+        run_state: candidate.previous_state.clone(),
+        run_principal: candidate.principal.clone(),
+        reconnect_principal: None,
+        run_channel: candidate.channel.clone(),
+        reconnect_channel: None,
+        channel_exists: candidate
+            .channel
+            .as_deref()
+            .is_none_or(|channel| !channel.trim().is_empty()),
+        observed_at_unix_ms: now,
+        max_freshness_age_ms: DEFAULT_RESUME_FRESHNESS_TTL_MS,
+        last_transcript_event_unix_ms: signals.last_transcript_event_unix_ms,
+        last_model_turn_unix_ms: signals.last_model_turn_unix_ms,
+        mutating_tool_in_flight: signals.mutating_tool_in_flight,
+        read_only_tool_wait: signals.read_only_tool_wait,
+        pending_approval: signals.pending_approval,
+        routine_lease_active: matches!(candidate.origin_kind.as_str(), "routine" | "cron"),
+        workspace_mutation_checkpoint_clean: signals.workspace_mutation_checkpoint_clean,
+    })
+}
+
+fn load_resume_tape_observations(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Vec<ResumeTapeObservation>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT event_type, payload_json, created_at_unix_ms
+            FROM orchestrator_tape
+            WHERE run_ulid = ?1
+            ORDER BY seq ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![run_id], |row| {
+        Ok(ResumeTapeObservation {
+            event_type: row.get(0)?,
+            payload_json: row.get(1)?,
+            created_at_unix_ms: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
 }
 
 fn next_orchestrator_tape_seq(connection: &Connection, run_id: &str) -> Result<i64, JournalError> {
@@ -8854,10 +8944,19 @@ impl JournalStore {
         let active_runs = {
             let mut statement = guard.prepare(
                 r#"
-                    SELECT run_ulid, session_ulid, state, parent_run_ulid
-                    FROM orchestrator_runs
-                    WHERE state IN (?1, ?2)
-                    ORDER BY started_at_unix_ms ASC, run_ulid ASC
+                    SELECT
+                        runs.run_ulid,
+                        runs.session_ulid,
+                        runs.state,
+                        runs.parent_run_ulid,
+                        sessions.principal,
+                        sessions.channel,
+                        COALESCE(runs.origin_kind, 'manual')
+                    FROM orchestrator_runs AS runs
+                    JOIN orchestrator_sessions AS sessions
+                        ON sessions.session_ulid = runs.session_ulid
+                    WHERE runs.state IN (?1, ?2)
+                    ORDER BY runs.started_at_unix_ms ASC, runs.run_ulid ASC
                 "#,
             )?;
             let rows = statement.query_map(
@@ -8866,12 +8965,15 @@ impl JournalStore {
                     RunLifecycleState::InProgress.as_str(),
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
+                    Ok(StartupResumeCandidate {
+                        run_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        previous_state: row.get(2)?,
+                        parent_run_id: row.get(3)?,
+                        principal: row.get(4)?,
+                        channel: row.get(5)?,
+                        origin_kind: row.get(6)?,
+                    })
                 },
             )?;
             let mut records = Vec::new();
@@ -8881,7 +8983,15 @@ impl JournalStore {
             records
         };
         let mut terminalized_run_ids = Vec::new();
-        for (run_id, session_id, previous_state, parent_run_id) in active_runs {
+        for candidate in active_runs {
+            let resume_input = startup_resume_classifier_input(&guard, &candidate, now)?;
+            let resume_decision = classify_resume(&resume_input);
+            append_resume_decision_tape_event_tx(
+                &guard,
+                self.config.max_payload_bytes,
+                &resume_decision,
+                now,
+            )?;
             let updated = guard.execute(
                 r#"
                     UPDATE orchestrator_runs
@@ -8894,7 +9004,7 @@ impl JournalStore {
                       AND state IN (?5, ?6)
                 "#,
                 params![
-                    run_id,
+                    candidate.run_id.as_str(),
                     RunLifecycleState::Failed.as_str(),
                     now,
                     reason,
@@ -8909,22 +9019,24 @@ impl JournalStore {
                 &guard,
                 &RunLifecycleEventAppendRequest {
                     event_id: Ulid::new().to_string(),
-                    run_id: run_id.clone(),
-                    session_id: session_id.clone(),
-                    from_state: RunLifecyclePhase::parse(previous_state.as_str()),
+                    run_id: candidate.run_id.clone(),
+                    session_id: candidate.session_id.clone(),
+                    from_state: RunLifecyclePhase::parse(candidate.previous_state.as_str()),
                     to_state: canonical_run_lifecycle_phase(RunLifecycleState::Failed),
                     actor: RuntimeActorRef {
                         kind: RuntimeActorKind::System,
                         id: "system".to_owned(),
                     },
-                    correlation_id: run_id.clone(),
-                    parent_run_id,
+                    correlation_id: candidate.run_id.clone(),
+                    parent_run_id: candidate.parent_run_id.clone(),
                     idempotency_key: None,
                     reason: reason.to_owned(),
                     payload_json: json!({
                         "legacy_state": RunLifecycleState::Failed.as_str(),
                         "error": reason,
                         "recovery": "startup_orphaned_run",
+                        "resume_decision": resume_decision.decision.as_str(),
+                        "resume_reason_code": resume_decision.reason_code.as_str(),
                     })
                     .to_string(),
                 },
@@ -8933,13 +9045,12 @@ impl JournalStore {
             append_startup_recovery_tape_event_tx(
                 &guard,
                 self.config.max_payload_bytes,
-                &run_id,
-                &session_id,
-                previous_state.as_str(),
+                &candidate,
                 reason,
+                &resume_decision,
                 now,
             )?;
-            terminalized_run_ids.push(run_id);
+            terminalized_run_ids.push(candidate.run_id);
         }
         Ok(OrchestratorStartupRunRecoveryReport {
             terminalized_count: terminalized_run_ids.len() as u64,
@@ -27047,7 +27158,7 @@ mod tests {
         assert_eq!(in_progress.state, RunLifecycleState::Failed.as_str());
         assert_eq!(in_progress.last_error.as_deref(), Some(reason));
         assert!(in_progress.completed_at_unix_ms.is_some());
-        assert_eq!(in_progress.tape_events, 2);
+        assert_eq!(in_progress.tape_events, 3);
 
         let accepted = store
             .orchestrator_run_status_snapshot(accepted_run_id)
@@ -27056,7 +27167,7 @@ mod tests {
         assert_eq!(accepted.state, RunLifecycleState::Failed.as_str());
         assert_eq!(accepted.last_error.as_deref(), Some(reason));
         assert!(accepted.completed_at_unix_ms.is_some());
-        assert_eq!(accepted.tape_events, 1);
+        assert_eq!(accepted.tape_events, 2);
 
         let done = store
             .orchestrator_run_status_snapshot(done_run_id)
@@ -27075,9 +27186,27 @@ mod tests {
         let in_progress_tape = store
             .orchestrator_tape(in_progress_run_id)
             .expect("startup recovery tape should be readable");
+        let resume_decision = in_progress_tape
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == crate::application::resume_classifier::RUN_RESUME_DECISION_RECORDED_EVENT
+            })
+            .expect("startup recovery should record resume classifier decision");
+        assert_eq!(resume_decision.seq, 1);
+        let resume_payload =
+            serde_json::from_str::<serde_json::Value>(resume_decision.payload_json.as_str())
+                .expect("resume decision payload should be JSON");
+        assert_eq!(
+            resume_payload["event"],
+            crate::application::resume_classifier::RUN_RESUME_DECISION_RECORDED_EVENT
+        );
+        assert_eq!(resume_payload["decision"], "stale_do_not_resume");
+        assert_eq!(resume_payload["reason_code"], "resume.missing_freshness_evidence");
+
         let recovery =
             in_progress_tape.last().expect("startup recovery should append a final tape event");
-        assert_eq!(recovery.seq, 1);
+        assert_eq!(recovery.seq, 2);
         assert_eq!(recovery.event_type, "run.recovery");
         let recovery_payload =
             serde_json::from_str::<serde_json::Value>(recovery.payload_json.as_str())
@@ -27087,14 +27216,21 @@ mod tests {
         assert_eq!(recovery_payload["recovery_state"], "manual_resume_required");
         assert_eq!(recovery_payload["previous_state"], RunLifecycleState::InProgress.as_str());
         assert_eq!(recovery_payload["terminal_state"], RunLifecycleState::Failed.as_str());
+        assert_eq!(recovery_payload["resume_decision"], "stale_do_not_resume");
+        assert_eq!(recovery_payload["resume_reason_code"], "resume.missing_freshness_evidence");
         assert_eq!(recovery_payload["reason"], reason);
 
         let accepted_tape = store
             .orchestrator_tape(accepted_run_id)
             .expect("accepted recovery tape should be readable");
-        assert_eq!(accepted_tape.len(), 1);
+        assert_eq!(accepted_tape.len(), 2);
         assert_eq!(accepted_tape[0].seq, 0);
-        assert_eq!(accepted_tape[0].event_type, "run.recovery");
+        assert_eq!(
+            accepted_tape[0].event_type,
+            crate::application::resume_classifier::RUN_RESUME_DECISION_RECORDED_EVENT
+        );
+        assert_eq!(accepted_tape[1].seq, 1);
+        assert_eq!(accepted_tape[1].event_type, "run.recovery");
     }
 
     #[test]

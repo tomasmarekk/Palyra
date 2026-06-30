@@ -30,6 +30,7 @@ pub mod project_facts;
 pub mod provider_events;
 pub mod provider_input;
 pub mod recall;
+pub mod resume_classifier;
 pub mod service_authorization;
 pub mod session_compaction;
 pub mod session_pruning;
