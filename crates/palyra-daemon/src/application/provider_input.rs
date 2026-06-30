@@ -1452,7 +1452,7 @@ async fn maybe_apply_automatic_session_compaction(
         return Ok(existing.into_iter().next());
     }
 
-    let artifact = apply_session_compaction(SessionCompactionApplyRequest {
+    let execution = apply_session_compaction(SessionCompactionApplyRequest {
         runtime_state,
         session: &session,
         actor_principal: context.principal.as_str(),
@@ -1463,8 +1463,8 @@ async fn maybe_apply_automatic_session_compaction(
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })
-    .await?
-    .artifact;
+    .await?;
+    let artifact = execution.artifact.clone();
     runtime_state
         .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
             run_id: run_id.to_owned(),
@@ -1475,6 +1475,10 @@ async fn maybe_apply_automatic_session_compaction(
                 "artifact_id": artifact.artifact_id,
                 "session_id": session_id,
                 "policy": "budget_guard_v1",
+                "checkpoint_id": execution.checkpoint.checkpoint_id,
+                "pre_checkpoint_id": execution.pre_checkpoint.checkpoint_id,
+                "post_checkpoint_id": execution.post_checkpoint.checkpoint_id,
+                "checkpoint_pair": execution.checkpoint_pair.journal_projection,
                 "estimated_input_tokens": artifact.estimated_input_tokens,
                 "estimated_output_tokens": artifact.estimated_output_tokens,
             })

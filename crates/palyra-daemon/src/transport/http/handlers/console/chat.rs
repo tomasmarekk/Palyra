@@ -1742,7 +1742,10 @@ pub(crate) async fn console_chat_compaction_apply_handler(
             ))
             .with_details(json!({
                 "checkpoint_id": execution.checkpoint.checkpoint_id,
+                "pre_checkpoint_id": execution.pre_checkpoint.checkpoint_id,
+                "post_checkpoint_id": execution.post_checkpoint.checkpoint_id,
                 "artifact_id": execution.artifact.artifact_id,
+                "checkpoint_pair": execution.checkpoint_pair.journal_projection,
                 "candidate_count": execution.plan.candidates.len(),
                 "write_count": execution.writes.len(),
                 "mode": "manual",
@@ -1754,6 +1757,9 @@ pub(crate) async fn console_chat_compaction_apply_handler(
         "session": session_record,
         "artifact": execution.artifact,
         "checkpoint": execution.checkpoint,
+        "pre_checkpoint": execution.pre_checkpoint,
+        "post_checkpoint": execution.post_checkpoint,
+        "checkpoint_pair": execution.checkpoint_pair,
         "preview": execution.plan.to_response_json(),
         "contract": contract_descriptor(),
     })))
@@ -1785,6 +1791,7 @@ pub(crate) async fn console_chat_compaction_detail_handler(
     let session_record =
         load_console_chat_session(&state, &session.context, artifact.session_id.as_str(), false)
             .await?;
+    let checkpoint_pair_id = compaction_checkpoint_pair_id(artifact.summary_json.as_str());
     let related_checkpoints = state
         .runtime
         .list_orchestrator_checkpoints(artifact.session_id.clone())
@@ -1792,19 +1799,52 @@ pub(crate) async fn console_chat_compaction_detail_handler(
         .map_err(runtime_status_response)?
         .into_iter()
         .filter(|checkpoint| {
-            serde_json::from_str::<Vec<String>>(checkpoint.referenced_compaction_ids_json.as_str())
-                .ok()
-                .is_some_and(|references| {
-                    references.iter().any(|value| value == &artifact.artifact_id)
-                })
+            checkpoint_matches_compaction_artifact(
+                checkpoint,
+                &artifact,
+                checkpoint_pair_id.as_deref(),
+            )
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "session": session_record,
         "artifact": artifact,
+        "checkpoint_pair_id": checkpoint_pair_id,
         "related_checkpoints": related_checkpoints,
         "contract": contract_descriptor(),
     })))
+}
+
+fn compaction_checkpoint_pair_id(summary_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(summary_json)
+        .ok()?
+        .pointer("/checkpoint_pair/journal_projection/pair_id")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn checkpoint_matches_compaction_artifact(
+    checkpoint: &journal::OrchestratorCheckpointRecord,
+    artifact: &journal::OrchestratorCompactionArtifactRecord,
+    checkpoint_pair_id: Option<&str>,
+) -> bool {
+    let references_artifact =
+        serde_json::from_str::<Vec<String>>(checkpoint.referenced_compaction_ids_json.as_str())
+            .ok()
+            .is_some_and(|references| {
+                references.iter().any(|value| value == &artifact.artifact_id)
+            });
+    references_artifact
+        || checkpoint_pair_id.is_some_and(|pair_id| checkpoint_tags_include(checkpoint, pair_id))
+}
+
+fn checkpoint_tags_include(
+    checkpoint: &journal::OrchestratorCheckpointRecord,
+    value: &str,
+) -> bool {
+    serde_json::from_str::<Vec<String>>(checkpoint.tags_json.as_str())
+        .ok()
+        .is_some_and(|tags| tags.iter().any(|tag| tag == value))
 }
 
 /// `POST /console/v1/chat/sessions/{session_id}/checkpoints` - creates a

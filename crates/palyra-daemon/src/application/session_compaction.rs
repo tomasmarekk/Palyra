@@ -9,8 +9,9 @@
 //! decisions, and open action items, gating each candidate through noise,
 //! secret, prompt-injection, duplicate, and contradiction checks before it
 //! may be written into curated workspace documents.
-//! [`apply_session_compaction`] persists the artifact plus a checkpoint and
-//! rolls back partial workspace writes on failure. Unlike the ephemeral
+//! [`apply_session_compaction`] persists the artifact plus pre/post
+//! compaction checkpoints and rolls back partial workspace writes on failure.
+//! Unlike the ephemeral
 //! prompt pruning in `application::session_pruning`, compaction durably
 //! changes what future prompts see; consumers include `provider_input`,
 //! `context_engine`, `recall`, `run_stream::tape`, and the console handlers.
@@ -51,6 +52,16 @@ use crate::{
 pub(crate) const SESSION_COMPACTION_STRATEGY: &str = "session_window_v1";
 /// Compressor version recorded on artifacts and in summary-ref hashes.
 pub(crate) const SESSION_COMPACTION_VERSION: &str = "palyra-session-compaction-v1";
+pub(crate) const PRE_POST_COMPACTION_CHECKPOINTS_SCHEMA_VERSION: u64 = 1;
+pub(crate) const PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED: &str =
+    "pre_a_post_compaction_checkpoints.started";
+pub(crate) const PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED: &str =
+    "pre_a_post_compaction_checkpoints.completed";
+pub(crate) const PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED: &str =
+    "pre_a_post_compaction_checkpoints.failed";
+const PRE_POST_COMPACTION_CHECKPOINTS_TAG: &str = "pre_post_compaction_checkpoints";
+const PRE_POST_COMPACTION_CHECKPOINTS_ROLLOUT_MODE: &str = "enabled_existing_checkpoint_journal";
+const PRE_POST_COMPACTION_CHECKPOINTS_REDACTION_LEVEL: &str = "metadata_only";
 // The newest text events always stay verbatim so the model keeps the live
 // conversational tail; compaction is skipped entirely unless at least
 // MIN_CONDENSED_EVENTS older events would actually be condensed.
@@ -137,6 +148,7 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) checkpoint_metadata: SessionCompactionCheckpointMetadata,
     pub(crate) candidates: Vec<SessionCompactionCandidate>,
     pub(crate) checkpoint_preview: SessionCompactionCheckpointPreview,
+    pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
 }
 
 impl SessionCompactionPlan {
@@ -174,6 +186,7 @@ impl SessionCompactionPlan {
                 .unwrap_or_else(|_| json!({ "records": [] })),
             "summary": serde_json::from_str::<Value>(self.summary_json.as_str())
                 .unwrap_or_else(|_| json!({ "summary_text": self.summary_text })),
+            "checkpoint_pair": self.checkpoint_pair,
         })
     }
 }
@@ -201,6 +214,10 @@ pub(crate) struct SessionCompactionApplyRequest<'a> {
 pub(crate) struct SessionCompactionExecution {
     pub(crate) plan: SessionCompactionPlan,
     pub(crate) artifact: OrchestratorCompactionArtifactRecord,
+    pub(crate) pre_checkpoint: OrchestratorCheckpointRecord,
+    pub(crate) post_checkpoint: OrchestratorCheckpointRecord,
+    pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
+    /// Backward-compatible alias for the post-compaction checkpoint.
     pub(crate) checkpoint: OrchestratorCheckpointRecord,
     /// Workspace writes that were applied (or were no-ops), in path order.
     pub(crate) writes: Vec<SessionCompactionWritePreview>,
@@ -259,6 +276,70 @@ pub(crate) struct SessionCompactionCheckpointPreview {
     pub name: String,
     pub note: String,
     pub workspace_paths: Vec<String>,
+}
+
+/// Preview or persisted pairing contract for a compaction checkpoint pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreAPostCompactionCheckpoints {
+    pub decision: PreAPostCompactionDecision,
+    pub reason_code: PreAPostCompactionReasonCode,
+    pub pre_checkpoint: SessionCompactionCheckpointPreview,
+    pub post_checkpoint: SessionCompactionCheckpointPreview,
+    pub journal_projection: PreAPostCompactionJournalProjection,
+}
+
+/// High-level checkpoint-pair decision recorded in API and journal payloads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum PreAPostCompactionDecision {
+    #[serde(rename = "pair_ready")]
+    Ready,
+    #[serde(rename = "pair_blocked")]
+    Blocked,
+    #[serde(rename = "pair_created")]
+    Created,
+}
+
+/// Stable reason code for checkpoint-pair previews and persisted applies.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum PreAPostCompactionReasonCode {
+    #[serde(rename = "pre_a_post_compaction_checkpoints.ready")]
+    Ready,
+    #[serde(rename = "pre_a_post_compaction_checkpoints.not_enough_history")]
+    NotEnoughHistory,
+    #[serde(rename = "pre_a_post_compaction_checkpoints.blocked")]
+    Blocked,
+    #[serde(rename = "pre_a_post_compaction_checkpoints.created")]
+    Created,
+}
+
+/// Event names exposed for replay and audit consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreAPostCompactionEventTypes {
+    pub started: String,
+    pub completed: String,
+    pub failed: String,
+}
+
+/// Metadata-only journal projection for compaction checkpoint pairs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreAPostCompactionJournalProjection {
+    pub schema_version: u64,
+    pub rollout_mode: String,
+    pub pair_id: Option<String>,
+    pub decision: PreAPostCompactionDecision,
+    pub reason_code: PreAPostCompactionReasonCode,
+    pub event_types: PreAPostCompactionEventTypes,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub mode: String,
+    pub trigger_reason: String,
+    pub trigger_policy: Option<String>,
+    pub artifact_id: Option<String>,
+    pub pre_checkpoint_id: Option<String>,
+    pub post_checkpoint_id: Option<String>,
+    pub workspace_paths: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
 }
 
 /// Structured "what was I doing" digest carried across the compaction cut.
@@ -387,12 +468,29 @@ struct CompactionSummaryJsonInput<'a> {
     candidates: &'a [SessionCompactionCandidate],
     writes: &'a [SessionCompactionWritePreview],
     checkpoint_preview: &'a SessionCompactionCheckpointPreview,
+    checkpoint_pair: &'a PreAPostCompactionCheckpoints,
     lifecycle_state: &'a str,
     review_candidate_count: usize,
     compressor_mode: Option<&'a str>,
     fallback_used: bool,
     degraded_reason: Option<&'a str>,
     evidence_refs: &'a [String],
+}
+
+struct PrePostCompactionCheckpointBuildInput<'a> {
+    session: &'a OrchestratorSessionRecord,
+    run_id: Option<&'a str>,
+    mode: &'a str,
+    trigger_reason: &'a str,
+    trigger_policy: Option<&'a str>,
+    workspace_paths: Vec<String>,
+    evidence_refs: &'a [String],
+    decision: PreAPostCompactionDecision,
+    reason_code: PreAPostCompactionReasonCode,
+    pair_id: Option<String>,
+    artifact_id: Option<String>,
+    pre_checkpoint_id: Option<String>,
+    post_checkpoint_id: Option<String>,
 }
 
 /// Inputs a [`ContextCompressor`] needs to build a compaction plan.
@@ -535,6 +633,47 @@ pub(crate) async fn apply_session_compaction(
     let write_inputs =
         build_write_inputs(effective_candidates.as_slice(), workspace_documents.as_slice())?;
 
+    let artifact_id = Ulid::new().to_string();
+    let pair_id = Ulid::new().to_string();
+    let pre_checkpoint_id = Ulid::new().to_string();
+    let post_checkpoint_id = Ulid::new().to_string();
+    let planned_checkpoint_pair =
+        build_pre_post_compaction_checkpoints(PrePostCompactionCheckpointBuildInput {
+            session: request.session,
+            run_id: request.run_id,
+            mode: request.mode,
+            trigger_reason: plan.trigger_reason.as_str(),
+            trigger_policy: plan.trigger_policy.as_deref(),
+            workspace_paths: plan.checkpoint_pair.journal_projection.workspace_paths.clone(),
+            evidence_refs: plan.evidence_refs.as_slice(),
+            decision: PreAPostCompactionDecision::Ready,
+            reason_code: PreAPostCompactionReasonCode::Ready,
+            pair_id: Some(pair_id.clone()),
+            artifact_id: Some(artifact_id.clone()),
+            pre_checkpoint_id: Some(pre_checkpoint_id.clone()),
+            post_checkpoint_id: Some(post_checkpoint_id.clone()),
+        });
+    let pre_checkpoint = request
+        .runtime_state
+        .create_orchestrator_checkpoint(OrchestratorCheckpointCreateRequest {
+            checkpoint_id: pre_checkpoint_id,
+            session_id: request.session.session_id.clone(),
+            run_id: request.run_id.map(ToOwned::to_owned),
+            name: planned_checkpoint_pair.pre_checkpoint.name.clone(),
+            note: Some(planned_checkpoint_pair.pre_checkpoint.note.clone()),
+            tags_json: compaction_checkpoint_tags(request.mode, "pre_compaction", pair_id.as_str()),
+            branch_state: request.session.branch_state.clone(),
+            parent_session_id: request.session.parent_session_id.clone(),
+            referenced_compaction_ids_json: json!([]).to_string(),
+            workspace_paths_json: json!(planned_checkpoint_pair
+                .pre_checkpoint
+                .workspace_paths
+                .clone())
+            .to_string(),
+            created_by_principal: request.actor_principal.to_owned(),
+        })
+        .await?;
+
     let mut applied_rollbacks = Vec::new();
     let mut applied_writes = Vec::new();
     for input in write_inputs {
@@ -625,10 +764,28 @@ pub(crate) async fn apply_session_compaction(
     } else {
         "applied"
     };
+    let applied_workspace_paths =
+        applied_writes.iter().map(|write| write.target_path.clone()).collect::<Vec<_>>();
+    let applied_checkpoint_pair =
+        build_pre_post_compaction_checkpoints(PrePostCompactionCheckpointBuildInput {
+            session: request.session,
+            run_id: request.run_id,
+            mode: request.mode,
+            trigger_reason: plan.trigger_reason.as_str(),
+            trigger_policy: plan.trigger_policy.as_deref(),
+            workspace_paths: applied_workspace_paths.clone(),
+            evidence_refs: plan.evidence_refs.as_slice(),
+            decision: PreAPostCompactionDecision::Created,
+            reason_code: PreAPostCompactionReasonCode::Created,
+            pair_id: Some(pair_id.clone()),
+            artifact_id: Some(artifact_id.clone()),
+            pre_checkpoint_id: Some(pre_checkpoint.checkpoint_id.clone()),
+            post_checkpoint_id: Some(post_checkpoint_id.clone()),
+        });
     let artifact = request
         .runtime_state
         .create_orchestrator_compaction_artifact(OrchestratorCompactionArtifactCreateRequest {
-            artifact_id: Ulid::new().to_string(),
+            artifact_id,
             session_id: request.session.session_id.clone(),
             run_id: request.run_id.map(ToOwned::to_owned),
             mode: request.mode.to_owned(),
@@ -655,6 +812,7 @@ pub(crate) async fn apply_session_compaction(
                 candidates: plan.candidates.as_slice(),
                 writes: applied_writes.as_slice(),
                 checkpoint_preview: &plan.checkpoint_preview,
+                checkpoint_pair: &applied_checkpoint_pair,
                 lifecycle_state,
                 review_candidate_count: pending_review_count,
                 compressor_mode: Some(plan.compressor_mode.as_str()),
@@ -665,28 +823,36 @@ pub(crate) async fn apply_session_compaction(
             created_by_principal: request.actor_principal.to_owned(),
         })
         .await?;
-    let checkpoint = request
+    let post_checkpoint = request
         .runtime_state
         .create_orchestrator_checkpoint(OrchestratorCheckpointCreateRequest {
-            checkpoint_id: Ulid::new().to_string(),
+            checkpoint_id: post_checkpoint_id,
             session_id: request.session.session_id.clone(),
             run_id: request.run_id.map(ToOwned::to_owned),
-            name: plan.checkpoint_preview.name.clone(),
-            note: Some(plan.checkpoint_preview.note.clone()),
-            tags_json: json!(["compaction", request.mode]).to_string(),
+            name: applied_checkpoint_pair.post_checkpoint.name.clone(),
+            note: Some(applied_checkpoint_pair.post_checkpoint.note.clone()),
+            tags_json: compaction_checkpoint_tags(
+                request.mode,
+                "post_compaction",
+                pair_id.as_str(),
+            ),
             branch_state: request.session.branch_state.clone(),
             parent_session_id: request.session.parent_session_id.clone(),
             referenced_compaction_ids_json: json!([artifact.artifact_id.clone()]).to_string(),
-            workspace_paths_json: json!(applied_writes
-                .iter()
-                .map(|write| write.target_path.clone())
-                .collect::<Vec<_>>())
-            .to_string(),
+            workspace_paths_json: json!(applied_workspace_paths).to_string(),
             created_by_principal: request.actor_principal.to_owned(),
         })
         .await?;
 
-    Ok(SessionCompactionExecution { plan, artifact, checkpoint, writes: applied_writes })
+    Ok(SessionCompactionExecution {
+        plan,
+        artifact,
+        pre_checkpoint,
+        checkpoint: post_checkpoint.clone(),
+        post_checkpoint,
+        checkpoint_pair: applied_checkpoint_pair,
+        writes: applied_writes,
+    })
 }
 
 /// Test-only shorthand for building a manual-mode plan with no prior
@@ -868,13 +1034,18 @@ fn build_session_compaction_plan_with_metadata(
         estimated_output_tokens,
         summary_text.as_str(),
     );
+    let trigger_reason = trigger_reason_input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("operator_requested_compaction")
+        .to_owned();
+    let trigger_policy = trigger_policy_input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let checkpoint_preview = SessionCompactionCheckpointPreview {
         name: "Compaction checkpoint".to_owned(),
-        note: format!(
-            "{} compaction anchor for session {}.",
-            trigger_reason_input.unwrap_or("Automatic"),
-            session.session_id
-        ),
+        note: format!("{} compaction anchor for session {}.", trigger_reason, session.session_id),
         workspace_paths: write_previews.iter().map(|write| write.target_path.clone()).collect(),
     };
     let evidence_refs = condensed_records
@@ -882,6 +1053,22 @@ fn build_session_compaction_plan_with_metadata(
         .chain(protected_records.iter())
         .map(compaction_record_evidence_ref)
         .collect::<Vec<_>>();
+    let checkpoint_pair =
+        build_pre_post_compaction_checkpoints(PrePostCompactionCheckpointBuildInput {
+            session,
+            run_id: session.last_run_id.as_deref(),
+            mode: input.mode,
+            trigger_reason: trigger_reason.as_str(),
+            trigger_policy: trigger_policy.as_deref(),
+            workspace_paths: checkpoint_preview.workspace_paths.clone(),
+            evidence_refs: evidence_refs.as_slice(),
+            decision: pre_post_compaction_decision_for_plan(eligible),
+            reason_code: pre_post_compaction_reason_for_plan(eligible, blocked_reason.as_deref()),
+            pair_id: None,
+            artifact_id: None,
+            pre_checkpoint_id: None,
+            post_checkpoint_id: None,
+        });
     let summary_json = build_compaction_summary_json(CompactionSummaryJsonInput {
         session,
         eligible,
@@ -891,6 +1078,7 @@ fn build_session_compaction_plan_with_metadata(
         candidates: candidates.as_slice(),
         writes: write_previews.as_slice(),
         checkpoint_preview: &checkpoint_preview,
+        checkpoint_pair: &checkpoint_pair,
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         review_candidate_count,
         compressor_mode: Some("deterministic"),
@@ -903,15 +1091,6 @@ fn build_session_compaction_plan_with_metadata(
         "protected": protected_records.iter().map(compaction_record_json).collect::<Vec<_>>(),
     })
     .to_string();
-    let trigger_reason = trigger_reason_input
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("operator_requested_compaction")
-        .to_owned();
-    let trigger_policy = trigger_policy_input
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
     let trigger_inputs_json = json!({
         "source_event_count": source_event_count,
         "protected_event_count": protected_event_count,
@@ -922,6 +1101,7 @@ fn build_session_compaction_plan_with_metadata(
         "review_candidate_count": review_candidate_count,
         "blocked_reason": blocked_reason,
         "checkpoint_metadata": checkpoint_metadata,
+        "checkpoint_pair": checkpoint_pair,
     })
     .to_string();
 
@@ -949,6 +1129,7 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_metadata,
         candidates,
         checkpoint_preview,
+        checkpoint_pair,
     }
 }
 
@@ -992,6 +1173,7 @@ fn collect_plan_evidence_refs(plan: &SessionCompactionPlan) -> Vec<String> {
 }
 
 fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
+    plan.checkpoint_pair.journal_projection.evidence_refs = plan.evidence_refs.clone();
     let compression = json!({
         "compressor_mode": plan.compressor_mode,
         "fallback_used": plan.fallback_used,
@@ -1001,6 +1183,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     if let Ok(mut summary) = serde_json::from_str::<Value>(plan.summary_json.as_str()) {
         if let Some(object) = summary.as_object_mut() {
             object.insert("compression".to_owned(), compression.clone());
+            object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
         }
         plan.summary_json = summary.to_string();
     }
@@ -1008,9 +1191,87 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     {
         if let Some(object) = trigger_inputs.as_object_mut() {
             object.insert("compression".to_owned(), compression);
+            object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
         }
         plan.trigger_inputs_json = trigger_inputs.to_string();
     }
+}
+
+fn build_pre_post_compaction_checkpoints(
+    input: PrePostCompactionCheckpointBuildInput<'_>,
+) -> PreAPostCompactionCheckpoints {
+    let pre_checkpoint = SessionCompactionCheckpointPreview {
+        name: "Pre-compaction checkpoint".to_owned(),
+        note: format!(
+            "{} pre-compaction anchor for session {}.",
+            input.trigger_reason, input.session.session_id
+        ),
+        workspace_paths: input.workspace_paths.clone(),
+    };
+    let post_checkpoint = SessionCompactionCheckpointPreview {
+        name: "Compaction checkpoint".to_owned(),
+        note: format!(
+            "{} compaction anchor for session {}.",
+            input.trigger_reason, input.session.session_id
+        ),
+        workspace_paths: input.workspace_paths.clone(),
+    };
+    let journal_projection = PreAPostCompactionJournalProjection {
+        schema_version: PRE_POST_COMPACTION_CHECKPOINTS_SCHEMA_VERSION,
+        rollout_mode: PRE_POST_COMPACTION_CHECKPOINTS_ROLLOUT_MODE.to_owned(),
+        pair_id: input.pair_id,
+        decision: input.decision,
+        reason_code: input.reason_code,
+        event_types: PreAPostCompactionEventTypes {
+            started: PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED.to_owned(),
+            completed: PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED.to_owned(),
+            failed: PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED.to_owned(),
+        },
+        session_id: input.session.session_id.clone(),
+        run_id: input.run_id.map(ToOwned::to_owned),
+        mode: input.mode.to_owned(),
+        trigger_reason: input.trigger_reason.to_owned(),
+        trigger_policy: input.trigger_policy.map(ToOwned::to_owned),
+        artifact_id: input.artifact_id,
+        pre_checkpoint_id: input.pre_checkpoint_id,
+        post_checkpoint_id: input.post_checkpoint_id,
+        workspace_paths: input.workspace_paths,
+        evidence_refs: input.evidence_refs.to_vec(),
+        redaction_level: PRE_POST_COMPACTION_CHECKPOINTS_REDACTION_LEVEL.to_owned(),
+    };
+    PreAPostCompactionCheckpoints {
+        decision: input.decision,
+        reason_code: input.reason_code,
+        pre_checkpoint,
+        post_checkpoint,
+        journal_projection,
+    }
+}
+
+fn pre_post_compaction_decision_for_plan(eligible: bool) -> PreAPostCompactionDecision {
+    if eligible {
+        PreAPostCompactionDecision::Ready
+    } else {
+        PreAPostCompactionDecision::Blocked
+    }
+}
+
+fn pre_post_compaction_reason_for_plan(
+    eligible: bool,
+    blocked_reason: Option<&str>,
+) -> PreAPostCompactionReasonCode {
+    if eligible {
+        return PreAPostCompactionReasonCode::Ready;
+    }
+    if blocked_reason == Some("not_enough_history") {
+        PreAPostCompactionReasonCode::NotEnoughHistory
+    } else {
+        PreAPostCompactionReasonCode::Blocked
+    }
+}
+
+fn compaction_checkpoint_tags(mode: &str, stage: &str, pair_id: &str) -> String {
+    json!(["compaction", mode, PRE_POST_COMPACTION_CHECKPOINTS_TAG, stage, pair_id,]).to_string()
 }
 
 /// Wraps a compaction summary in the `<session_compaction_summary>` tags
@@ -1888,6 +2149,7 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         },
         "writes": input.writes,
         "checkpoint_preview": input.checkpoint_preview,
+        "checkpoint_pair": input.checkpoint_pair,
         "quality_gates": quality_gates,
         "compression": {
             "compressor_mode": input.compressor_mode.unwrap_or("deterministic"),
@@ -2680,7 +2942,10 @@ mod tests {
     use super::{
         build_session_compaction_plan, render_compaction_prompt_block,
         session_compaction_summary_hash, ContextCompressor, HybridSessionContextCompressor,
-        SessionContextCompressionInput,
+        PreAPostCompactionCheckpoints, PreAPostCompactionDecision, PreAPostCompactionReasonCode,
+        SessionContextCompressionInput, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
+        PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED,
+        PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED,
     };
     use crate::journal::{
         OrchestratorSessionPinRecord, OrchestratorSessionRecord,
@@ -2888,6 +3153,103 @@ mod tests {
             .any(|candidate| candidate.category == "decision"
                 && candidate.target_path == "MEMORY.md"));
         assert!(plan.candidates.iter().any(|candidate| candidate.category == "current_focus"));
+    }
+
+    #[test]
+    fn pre_post_checkpoint_pair_projection_serializes_stable_contract() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let (event_type, payload) = if seq % 2 == 0 {
+                    (
+                        "message.received",
+                        format!(
+                        r#"{{"text":"Decision: checkpoint pair contract item {seq} stays durable."}}"#
+                        ),
+                    )
+                } else {
+                    (
+                        "message.replied",
+                        format!(
+                            r#"{{"reply_text":"Next action: verify checkpoint pair event {seq}."}}"#
+                        ),
+                    )
+                };
+                transcript_record(seq, event_type, payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("unit_checkpoint_pair"),
+            Some("unit_policy"),
+        );
+
+        assert!(plan.eligible);
+        assert_eq!(plan.checkpoint_pair.decision, PreAPostCompactionDecision::Ready);
+        assert_eq!(plan.checkpoint_pair.reason_code, PreAPostCompactionReasonCode::Ready);
+        assert_eq!(
+            plan.checkpoint_pair.journal_projection.event_types.started,
+            PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED
+        );
+        assert_eq!(
+            plan.checkpoint_pair.journal_projection.event_types.completed,
+            PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED
+        );
+        assert_eq!(
+            plan.checkpoint_pair.journal_projection.event_types.failed,
+            PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED
+        );
+        assert_eq!(plan.checkpoint_pair.journal_projection.redaction_level, "metadata_only");
+        assert!(plan.checkpoint_pair.journal_projection.pair_id.is_none());
+        assert!(plan
+            .checkpoint_pair
+            .journal_projection
+            .evidence_refs
+            .iter()
+            .all(|reference| !reference.contains("Decision: checkpoint pair")));
+
+        let value =
+            serde_json::to_value(&plan.checkpoint_pair).expect("pair should serialize to JSON");
+        assert_eq!(
+            value.pointer("/reason_code").and_then(serde_json::Value::as_str),
+            Some("pre_a_post_compaction_checkpoints.ready")
+        );
+        assert_eq!(
+            value
+                .pointer("/journal_projection/event_types/started")
+                .and_then(serde_json::Value::as_str),
+            Some(PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED)
+        );
+        let roundtrip = serde_json::from_value::<PreAPostCompactionCheckpoints>(value)
+            .expect("pair should deserialize from JSON");
+        assert_eq!(roundtrip, plan.checkpoint_pair);
+
+        let response = plan.to_response_json();
+        assert_eq!(
+            response
+                .pointer("/checkpoint_pair/journal_projection/rollout_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("enabled_existing_checkpoint_journal")
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should parse");
+        assert_eq!(
+            summary
+                .pointer("/checkpoint_pair/journal_projection/redaction_level")
+                .and_then(serde_json::Value::as_str),
+            Some("metadata_only")
+        );
+        let trigger_inputs =
+            serde_json::from_str::<serde_json::Value>(plan.trigger_inputs_json.as_str())
+                .expect("trigger input JSON should parse");
+        assert_eq!(
+            trigger_inputs
+                .pointer("/checkpoint_pair/journal_projection/event_types/failed")
+                .and_then(serde_json::Value::as_str),
+            Some(PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED)
+        );
     }
 
     #[test]

@@ -517,6 +517,9 @@ async fn session_compact_apply(
         "plan": execution.plan.to_response_json(),
         "artifact": execution.artifact,
         "checkpoint": execution.checkpoint,
+        "pre_checkpoint": execution.pre_checkpoint,
+        "post_checkpoint": execution.post_checkpoint,
+        "checkpoint_pair": execution.checkpoint_pair,
         "writes": execution.writes,
     }))
 }

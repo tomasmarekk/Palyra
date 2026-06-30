@@ -11697,7 +11697,7 @@ impl JournalStore {
                     last_restored_at_unix_ms
                 FROM orchestrator_checkpoints
                 WHERE session_ulid = ?1
-                ORDER BY created_at_unix_ms DESC
+                ORDER BY created_at_unix_ms DESC, checkpoint_ulid DESC
             "#,
         )?;
         let mut rows = statement.query(params![session_id])?;

@@ -9372,6 +9372,31 @@ async fn model_token_tape_compaction_emits_real_lifecycle_event() {
     );
 }
 
+fn checkpoint_tags(record: &crate::journal::OrchestratorCheckpointRecord) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(record.tags_json.as_str())
+        .expect("checkpoint tags should be valid JSON")
+}
+
+fn checkpoint_references_compaction(
+    record: &crate::journal::OrchestratorCheckpointRecord,
+    artifact_id: &str,
+) -> bool {
+    serde_json::from_str::<Vec<String>>(record.referenced_compaction_ids_json.as_str())
+        .expect("checkpoint compaction refs should be valid JSON")
+        .iter()
+        .any(|reference| reference == artifact_id)
+}
+
+fn checkpoint_with_tag<'a>(
+    records: &'a [crate::journal::OrchestratorCheckpointRecord],
+    tag: &str,
+) -> &'a crate::journal::OrchestratorCheckpointRecord {
+    records
+        .iter()
+        .find(|record| checkpoint_tags(record).iter().any(|candidate| candidate == tag))
+        .unwrap_or_else(|| panic!("checkpoint with tag {tag:?} should exist: {records:?}"))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn session_compaction_manual_apply_persists_durable_writes_and_quality_gates() {
     let _test_guard = lock_session_compaction_test_guard().await;
@@ -9466,11 +9491,47 @@ async fn session_compaction_manual_apply_persists_durable_writes_and_quality_gat
         .list_orchestrator_checkpoints(session_id.to_owned())
         .await
         .expect("checkpoint list should succeed");
-    assert_eq!(checkpoints.len(), 1, "one checkpoint should be stored");
+    assert_eq!(checkpoints.len(), 2, "pre and post compaction checkpoints should be stored");
     assert_eq!(
-        checkpoints[0].referenced_compaction_ids_json,
-        format!(r#"["{}"]"#, execution.artifact.artifact_id),
-        "checkpoint should reference the compaction artifact"
+        execution.checkpoint.checkpoint_id, execution.post_checkpoint.checkpoint_id,
+        "legacy checkpoint alias should point at the post-compaction checkpoint"
+    );
+    let pair_id = artifact_summary
+        .pointer("/checkpoint_pair/journal_projection/pair_id")
+        .and_then(Value::as_str)
+        .expect("artifact summary should expose checkpoint pair id");
+    assert_eq!(
+        artifact_summary
+            .pointer("/checkpoint_pair/journal_projection/reason_code")
+            .and_then(Value::as_str),
+        Some("pre_a_post_compaction_checkpoints.created"),
+        "artifact summary should persist the applied checkpoint-pair reason"
+    );
+    let pre_checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "pre_compaction");
+    let post_checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "post_compaction");
+    assert_eq!(
+        pre_checkpoint.checkpoint_id, execution.pre_checkpoint.checkpoint_id,
+        "execution should expose the stored pre checkpoint"
+    );
+    assert_eq!(
+        post_checkpoint.checkpoint_id, execution.post_checkpoint.checkpoint_id,
+        "execution should expose the stored post checkpoint"
+    );
+    assert!(
+        checkpoint_tags(pre_checkpoint).iter().any(|tag| tag == pair_id),
+        "pre checkpoint should be paired through the metadata-only pair id"
+    );
+    assert!(
+        checkpoint_tags(post_checkpoint).iter().any(|tag| tag == pair_id),
+        "post checkpoint should be paired through the metadata-only pair id"
+    );
+    assert!(
+        !checkpoint_references_compaction(pre_checkpoint, execution.artifact.artifact_id.as_str()),
+        "pre checkpoint should not forward-reference the artifact"
+    );
+    assert!(
+        checkpoint_references_compaction(post_checkpoint, execution.artifact.artifact_id.as_str()),
+        "post checkpoint should reference the compaction artifact"
     );
 }
 
@@ -9573,10 +9634,20 @@ async fn session_compaction_automatic_apply_requires_review_before_durable_write
         .list_orchestrator_checkpoints(session_id.to_owned())
         .await
         .expect("checkpoint list should succeed");
-    assert_eq!(checkpoints.len(), 1, "automatic compaction checkpoint should still be stored");
+    assert_eq!(checkpoints.len(), 2, "automatic compaction should store pre and post checkpoints");
+    let pre_checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "pre_compaction");
+    let post_checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "post_compaction");
     assert_eq!(
-        checkpoints[0].workspace_paths_json, "[]",
-        "automatic checkpoint should not claim unreviewed workspace writes"
+        post_checkpoint.checkpoint_id, execution.post_checkpoint.checkpoint_id,
+        "automatic execution should expose the post checkpoint"
+    );
+    assert_eq!(
+        post_checkpoint.workspace_paths_json, "[]",
+        "automatic post checkpoint should not claim unreviewed workspace writes"
+    );
+    assert!(
+        checkpoint_tags(pre_checkpoint).iter().any(|tag| tag == "automatic"),
+        "automatic pre checkpoint should retain mode in tags"
     );
 }
 
@@ -9650,7 +9721,20 @@ async fn session_compaction_manual_apply_rolls_back_workspace_writes_on_partial_
         .list_orchestrator_checkpoints(session_id.to_owned())
         .await
         .expect("checkpoint list should succeed");
-    assert!(checkpoints.is_empty(), "no checkpoint should persist after a failed write step");
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "failed apply should retain only the pre-compaction audit checkpoint"
+    );
+    let checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "pre_compaction");
+    assert!(
+        checkpoint_tags(checkpoint).iter().any(|tag| tag == "pre_post_compaction_checkpoints"),
+        "failed pre checkpoint should identify the checkpoint-pair rollout"
+    );
+    assert_eq!(
+        checkpoint.referenced_compaction_ids_json, "[]",
+        "failed pre checkpoint must not reference a missing artifact"
+    );
 }
 
 fn workspace_patch_test_request<'a>(
