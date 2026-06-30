@@ -47,6 +47,11 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
+    application::replay_continuity::{
+        project_replay_continuity_policy, summarize_replay_transcript_observations,
+        ReplayContinuityPolicyInput, ReplayContinuityPolicyProjection, ReplayTranscriptSignals,
+        REPLAY_CONTINUITY_EVENT_COMPLETED,
+    },
     application::resume_classifier::{
         classify_resume, summarize_resume_tape_observations, ResumeClassifierInput, ResumeDecision,
         ResumeTapeObservation, DEFAULT_RESUME_FRESHNESS_TTL_MS, RUN_RESUME_DECISION_RECORDED_EVENT,
@@ -6395,6 +6400,7 @@ fn append_startup_recovery_tape_event_tx(
     candidate: &StartupResumeCandidate,
     reason: &str,
     resume_decision: &ResumeDecision,
+    replay_projection: &ReplayContinuityPolicyProjection,
     now: i64,
 ) -> Result<(), JournalError> {
     let seq = next_orchestrator_tape_seq(connection, candidate.run_id.as_str())?;
@@ -6416,6 +6422,15 @@ fn append_startup_recovery_tape_event_tx(
                 "resume_decision": resume_decision.decision.as_str(),
                 "resume_reason_code": resume_decision.reason_code.as_str(),
                 "resume_freshness_age_ms": resume_decision.freshness_age_ms,
+                "replay_continuity": {
+                    "event_type": REPLAY_CONTINUITY_EVENT_COMPLETED,
+                    "provider_transcript_decision": replay_projection.provider_transcript.decision.as_str(),
+                    "provider_transcript_reason_code": replay_projection.provider_transcript.reason_code.as_str(),
+                    "user_transcript_decision": replay_projection.user_transcript.decision.as_str(),
+                    "user_transcript_reason_code": replay_projection.user_transcript.reason_code.as_str(),
+                    "rollout_mode": replay_projection.rollout_mode.as_str(),
+                    "redaction_level": replay_projection.redaction_level.as_str(),
+                },
                 "reason": reason,
                 "operator_guidance": "Inspect the failed run tape, then start a new run in the same session if continuation is required."
             })
@@ -6445,6 +6460,26 @@ fn append_resume_decision_tape_event_tx(
     )
 }
 
+fn append_replay_continuity_policy_tape_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    projection: &ReplayContinuityPolicyProjection,
+    now: i64,
+) -> Result<(), JournalError> {
+    let seq = next_orchestrator_tape_seq(connection, projection.run_id.as_str())?;
+    append_orchestrator_tape_event_tx(
+        connection,
+        max_payload_bytes,
+        &OrchestratorTapeAppendRequest {
+            run_id: projection.run_id.clone(),
+            seq,
+            event_type: REPLAY_CONTINUITY_EVENT_COMPLETED.to_owned(),
+            payload_json: projection.payload_json.clone(),
+        },
+        now,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct StartupResumeCandidate {
     run_id: String,
@@ -6460,31 +6495,36 @@ fn startup_resume_classifier_input(
     connection: &Connection,
     candidate: &StartupResumeCandidate,
     now: i64,
-) -> Result<ResumeClassifierInput, JournalError> {
+) -> Result<(ResumeClassifierInput, ReplayTranscriptSignals), JournalError> {
     let observations = load_resume_tape_observations(connection, candidate.run_id.as_str())?;
     let signals = summarize_resume_tape_observations(observations.as_slice());
-    Ok(ResumeClassifierInput {
-        run_id: candidate.run_id.clone(),
-        session_id: candidate.session_id.clone(),
-        run_state: candidate.previous_state.clone(),
-        run_principal: candidate.principal.clone(),
-        reconnect_principal: None,
-        run_channel: candidate.channel.clone(),
-        reconnect_channel: None,
-        channel_exists: candidate
-            .channel
-            .as_deref()
-            .is_none_or(|channel| !channel.trim().is_empty()),
-        observed_at_unix_ms: now,
-        max_freshness_age_ms: DEFAULT_RESUME_FRESHNESS_TTL_MS,
-        last_transcript_event_unix_ms: signals.last_transcript_event_unix_ms,
-        last_model_turn_unix_ms: signals.last_model_turn_unix_ms,
-        mutating_tool_in_flight: signals.mutating_tool_in_flight,
-        read_only_tool_wait: signals.read_only_tool_wait,
-        pending_approval: signals.pending_approval,
-        routine_lease_active: matches!(candidate.origin_kind.as_str(), "routine" | "cron"),
-        workspace_mutation_checkpoint_clean: signals.workspace_mutation_checkpoint_clean,
-    })
+    let replay_transcript_signals =
+        summarize_replay_transcript_observations(observations.as_slice());
+    Ok((
+        ResumeClassifierInput {
+            run_id: candidate.run_id.clone(),
+            session_id: candidate.session_id.clone(),
+            run_state: candidate.previous_state.clone(),
+            run_principal: candidate.principal.clone(),
+            reconnect_principal: None,
+            run_channel: candidate.channel.clone(),
+            reconnect_channel: None,
+            channel_exists: candidate
+                .channel
+                .as_deref()
+                .is_none_or(|channel| !channel.trim().is_empty()),
+            observed_at_unix_ms: now,
+            max_freshness_age_ms: DEFAULT_RESUME_FRESHNESS_TTL_MS,
+            last_transcript_event_unix_ms: signals.last_transcript_event_unix_ms,
+            last_model_turn_unix_ms: signals.last_model_turn_unix_ms,
+            mutating_tool_in_flight: signals.mutating_tool_in_flight,
+            read_only_tool_wait: signals.read_only_tool_wait,
+            pending_approval: signals.pending_approval,
+            routine_lease_active: matches!(candidate.origin_kind.as_str(), "routine" | "cron"),
+            workspace_mutation_checkpoint_clean: signals.workspace_mutation_checkpoint_clean,
+        },
+        replay_transcript_signals,
+    ))
 }
 
 fn load_resume_tape_observations(
@@ -8984,12 +9024,27 @@ impl JournalStore {
         };
         let mut terminalized_run_ids = Vec::new();
         for candidate in active_runs {
-            let resume_input = startup_resume_classifier_input(&guard, &candidate, now)?;
+            let (resume_input, replay_transcript_signals) =
+                startup_resume_classifier_input(&guard, &candidate, now)?;
             let resume_decision = classify_resume(&resume_input);
             append_resume_decision_tape_event_tx(
                 &guard,
                 self.config.max_payload_bytes,
                 &resume_decision,
+                now,
+            )?;
+            let replay_projection = project_replay_continuity_policy(
+                &ReplayContinuityPolicyInput::from_resume_decision(
+                    &resume_decision,
+                    now,
+                    DEFAULT_RESUME_FRESHNESS_TTL_MS,
+                    replay_transcript_signals,
+                ),
+            );
+            append_replay_continuity_policy_tape_event_tx(
+                &guard,
+                self.config.max_payload_bytes,
+                &replay_projection,
                 now,
             )?;
             let updated = guard.execute(
@@ -9037,6 +9092,12 @@ impl JournalStore {
                         "recovery": "startup_orphaned_run",
                         "resume_decision": resume_decision.decision.as_str(),
                         "resume_reason_code": resume_decision.reason_code.as_str(),
+                        "replay_continuity": {
+                            "event_type": REPLAY_CONTINUITY_EVENT_COMPLETED,
+                            "provider_transcript_decision": replay_projection.provider_transcript.decision.as_str(),
+                            "user_transcript_decision": replay_projection.user_transcript.decision.as_str(),
+                            "rollout_mode": replay_projection.rollout_mode.as_str(),
+                        },
                     })
                     .to_string(),
                 },
@@ -9048,6 +9109,7 @@ impl JournalStore {
                 &candidate,
                 reason,
                 &resume_decision,
+                &replay_projection,
                 now,
             )?;
             terminalized_run_ids.push(candidate.run_id);
@@ -27158,7 +27220,7 @@ mod tests {
         assert_eq!(in_progress.state, RunLifecycleState::Failed.as_str());
         assert_eq!(in_progress.last_error.as_deref(), Some(reason));
         assert!(in_progress.completed_at_unix_ms.is_some());
-        assert_eq!(in_progress.tape_events, 3);
+        assert_eq!(in_progress.tape_events, 4);
 
         let accepted = store
             .orchestrator_run_status_snapshot(accepted_run_id)
@@ -27167,7 +27229,7 @@ mod tests {
         assert_eq!(accepted.state, RunLifecycleState::Failed.as_str());
         assert_eq!(accepted.last_error.as_deref(), Some(reason));
         assert!(accepted.completed_at_unix_ms.is_some());
-        assert_eq!(accepted.tape_events, 2);
+        assert_eq!(accepted.tape_events, 3);
 
         let done = store
             .orchestrator_run_status_snapshot(done_run_id)
@@ -27204,9 +27266,32 @@ mod tests {
         assert_eq!(resume_payload["decision"], "stale_do_not_resume");
         assert_eq!(resume_payload["reason_code"], "resume.missing_freshness_evidence");
 
+        let replay_continuity = in_progress_tape
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_COMPLETED
+            })
+            .expect("startup recovery should record replay continuity projection");
+        assert_eq!(replay_continuity.seq, 2);
+        let replay_payload =
+            serde_json::from_str::<serde_json::Value>(replay_continuity.payload_json.as_str())
+                .expect("replay continuity payload should be JSON");
+        assert_eq!(
+            replay_payload["event"],
+            crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_COMPLETED
+        );
+        assert_eq!(replay_payload["rollout_mode"], "observe_only");
+        assert_eq!(replay_payload["provider_transcript"]["decision"], "block_replay");
+        assert_eq!(
+            replay_payload["provider_transcript"]["reason_code"],
+            "replay.resume_forbids_replay"
+        );
+        assert_eq!(replay_payload["redaction_level"], "none");
+
         let recovery =
             in_progress_tape.last().expect("startup recovery should append a final tape event");
-        assert_eq!(recovery.seq, 2);
+        assert_eq!(recovery.seq, 3);
         assert_eq!(recovery.event_type, "run.recovery");
         let recovery_payload =
             serde_json::from_str::<serde_json::Value>(recovery.payload_json.as_str())
@@ -27218,19 +27303,32 @@ mod tests {
         assert_eq!(recovery_payload["terminal_state"], RunLifecycleState::Failed.as_str());
         assert_eq!(recovery_payload["resume_decision"], "stale_do_not_resume");
         assert_eq!(recovery_payload["resume_reason_code"], "resume.missing_freshness_evidence");
+        assert_eq!(
+            recovery_payload["replay_continuity"]["event_type"],
+            crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_COMPLETED
+        );
+        assert_eq!(
+            recovery_payload["replay_continuity"]["provider_transcript_decision"],
+            "block_replay"
+        );
         assert_eq!(recovery_payload["reason"], reason);
 
         let accepted_tape = store
             .orchestrator_tape(accepted_run_id)
             .expect("accepted recovery tape should be readable");
-        assert_eq!(accepted_tape.len(), 2);
+        assert_eq!(accepted_tape.len(), 3);
         assert_eq!(accepted_tape[0].seq, 0);
         assert_eq!(
             accepted_tape[0].event_type,
             crate::application::resume_classifier::RUN_RESUME_DECISION_RECORDED_EVENT
         );
         assert_eq!(accepted_tape[1].seq, 1);
-        assert_eq!(accepted_tape[1].event_type, "run.recovery");
+        assert_eq!(
+            accepted_tape[1].event_type,
+            crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_COMPLETED
+        );
+        assert_eq!(accepted_tape[2].seq, 2);
+        assert_eq!(accepted_tape[2].event_type, "run.recovery");
     }
 
     #[test]

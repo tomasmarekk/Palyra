@@ -147,6 +147,7 @@ pub(crate) async fn console_diagnostics_handler(
     let mut progress_drafts_payload =
         collect_console_progress_draft_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut progress_drafts_payload, None);
+    let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut turn_control_payload, None);
@@ -300,6 +301,7 @@ pub(crate) async fn console_diagnostics_handler(
         "flows": flows_payload,
         "agent_plan": agent_plan_payload,
         "progress_drafts": progress_drafts_payload,
+        "replay_continuity": replay_continuity_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
@@ -1661,6 +1663,27 @@ async fn collect_console_progress_draft_diagnostics(
 
 fn is_terminal_progress_draft_state_for_console(state: &str) -> bool {
     matches!(state, "completed" | "failed" | "cancelled")
+}
+
+/// Summarizes the observe-only replay-continuity contract for operators.
+fn collect_console_replay_continuity_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::application::replay_continuity::REPLAY_CONTINUITY_SCHEMA_VERSION,
+        "rollout_mode": crate::application::replay_continuity::REPLAY_CONTINUITY_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "orchestrator_tape",
+        "event_types": {
+            "started": crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_STARTED,
+            "completed": crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_COMPLETED,
+            "failed": crate::application::replay_continuity::REPLAY_CONTINUITY_EVENT_FAILED,
+        },
+        "surfaces": [
+            crate::application::replay_continuity::ReplayTranscriptSurface::ProviderTranscript
+                .as_str(),
+            crate::application::replay_continuity::ReplayTranscriptSurface::UserTranscript.as_str(),
+        ],
+        "redaction_level": crate::application::replay_continuity::REPLAY_CONTINUITY_REDACTION_NONE,
+        "runtime_behavior": "observe_only_no_provider_dispatch_change",
+    })
 }
 
 /// Summarizes turn-control capabilities and recent audit decisions.
