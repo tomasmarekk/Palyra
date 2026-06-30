@@ -376,6 +376,64 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.plan.manage",
+            "Read or update the current run's bounded agent plan state. Use read to inspect active plan items; use upsert, reorder, block, complete, cancel, or clear_active only for explicit planning state changes.",
+            object_schema(
+                &["operation"],
+                vec![
+                    (
+                        "operation",
+                        json!({"type":"string","enum":["read","upsert","reorder","block","complete","cancel","clear_active"]}),
+                    ),
+                    (
+                        "item_id",
+                        json!({"type":"string","maxLength":128,"description":"Canonical plan item id returned by this tool. Omit for upsert creates."}),
+                    ),
+                    ("title", json!({"type":"string","maxLength":160})),
+                    (
+                        "details",
+                        json!({"type":"object","properties":{},"additionalProperties":true,"description":"Small structured item details; runtime caps encoded size."}),
+                    ),
+                    (
+                        "status",
+                        json!({"type":"string","enum":["pending","in_progress","blocked","completed","cancelled"]}),
+                    ),
+                    ("priority", json!({"type":"integer","minimum":-100,"maximum":100})),
+                    ("blocked_reason", json!({"type":"string","maxLength":512})),
+                    (
+                        "evidence_refs",
+                        json!({"type":"array","items":{"type":"string","maxLength":256},"maxItems":16}),
+                    ),
+                    (
+                        "items",
+                        json!({
+                            "type":"array",
+                            "maxItems":20,
+                            "items":{
+                                "type":"object",
+                                "additionalProperties":false,
+                                "properties":{
+                                    "item_id":{"type":"string","maxLength":128},
+                                    "title":{"type":"string","maxLength":160},
+                                    "details":{"type":"object","properties":{},"additionalProperties":true},
+                                    "status":{"type":"string","enum":["pending","in_progress","blocked","completed","cancelled"]},
+                                    "priority":{"type":"integer","minimum":-100,"maximum":100},
+                                    "blocked_reason":{"type":"string","maxLength":512},
+                                    "evidence_refs":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":16}
+                                }
+                            }
+                        }),
+                    ),
+                    ("include_terminal", json!({"type":"boolean"})),
+                    ("limit", json!({"type":"integer","minimum":1,"maximum":50})),
+                    ("reason_code", json!({"type":"string","maxLength":96})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.routines.query",
             "Inspect routine definitions, run history, schedule previews, and bounded scheduler completion. Use operation=schedule_preview with phrase such as 'every 40 seconds' or a timezone such as Europe/Prague before creating scheduled monitors. Use operation=wait_terminal with routine_id and expected_successful_runs for capped recurring routines instead of polling list_runs across many model turns.",
             object_schema(

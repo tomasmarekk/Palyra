@@ -21,6 +21,7 @@ pub mod mcp_broker;
 pub mod memory;
 pub mod memory_provider;
 pub mod outbound_lifecycle;
+pub mod plan_state;
 pub mod project_context;
 pub mod project_context_summary;
 pub mod provider_events;

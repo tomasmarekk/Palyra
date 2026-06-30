@@ -142,6 +142,8 @@ pub(crate) async fn console_diagnostics_handler(
     let mut flows_payload =
         collect_console_flows_diagnostics(&state, session.context.principal.as_str()).await?;
     redact_console_diagnostics_value(&mut flows_payload, None);
+    let mut agent_plan_payload = collect_console_agent_plan_diagnostics(&state, &session.context)?;
+    redact_console_diagnostics_value(&mut agent_plan_payload, None);
     let mut delegation_payload = collect_console_delegation_diagnostics(&state, &session.context)
         .await
         .map_err(runtime_status_response)?;
@@ -289,6 +291,7 @@ pub(crate) async fn console_diagnostics_handler(
         "media": media_payload,
         "objectives": objectives_payload,
         "flows": flows_payload,
+        "agent_plan": agent_plan_payload,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,
@@ -1353,6 +1356,107 @@ async fn collect_console_flows_diagnostics(
         },
         "adapters": crate::flows::flow_adapter_contracts(),
         "recent": recent,
+    }))
+}
+
+/// Summarizes journal-backed agent plan state for the requesting console identity.
+#[allow(clippy::result_large_err)]
+fn collect_console_agent_plan_diagnostics(
+    state: &AppState,
+    context: &crate::gateway::RequestContext,
+) -> Result<Value, Response> {
+    let store = crate::application::plan_state::AgentPlanStore::new(&state.runtime.journal_store);
+    let active = store
+        .list_items(&crate::application::plan_state::AgentPlanQuery {
+            owner_principal: Some(context.principal.clone()),
+            device_id: Some(context.device_id.clone()),
+            channel: context.channel.clone(),
+            session_id: None,
+            run_id: None,
+            status: None,
+            include_terminal: false,
+            limit: 50,
+        })
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to collect agent plan diagnostics: {error}"
+            )))
+        })?;
+    let terminal = store
+        .list_items(&crate::application::plan_state::AgentPlanQuery {
+            owner_principal: Some(context.principal.clone()),
+            device_id: Some(context.device_id.clone()),
+            channel: context.channel.clone(),
+            session_id: None,
+            run_id: None,
+            status: None,
+            include_terminal: true,
+            limit: 50,
+        })
+        .map_err(|error| {
+            runtime_status_response(tonic::Status::internal(format!(
+                "failed to collect agent plan diagnostics: {error}"
+            )))
+        })?;
+
+    let mut by_status = std::collections::BTreeMap::<String, u64>::new();
+    for item in &terminal {
+        *by_status.entry(item.status.as_str().to_owned()).or_default() += 1;
+    }
+
+    let mut recent_events = Vec::new();
+    if let Some(first_active) = active.first() {
+        recent_events = store
+            .list_events(first_active.plan_item_id.as_str(), 5)
+            .map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to collect agent plan diagnostics: {error}"
+                )))
+            })?
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "event_id": event.event_id,
+                    "plan_item_id": event.plan_item_id,
+                    "event_type": event.event_type,
+                    "from_status": event.from_status.map(|status| status.as_str()),
+                    "to_status": event.to_status.map(|status| status.as_str()),
+                    "reason_code": event.reason_code,
+                    "created_at_unix_ms": event.created_at_unix_ms,
+                })
+            })
+            .collect();
+    }
+
+    let recent_items = active
+        .iter()
+        .take(10)
+        .map(|item| {
+            json!({
+                "plan_item_id": item.plan_item_id,
+                "session_id": item.session_id,
+                "run_id": item.run_id,
+                "parent_run_id": item.parent_run_id,
+                "title": item.title,
+                "status": item.status.as_str(),
+                "priority": item.priority,
+                "blocked": item.status == crate::application::plan_state::AgentPlanStatus::Blocked,
+                "reason_code": item.reason_code,
+                "redaction_level": item.redaction_level,
+                "updated_at_unix_ms": item.updated_at_unix_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "schema_version": crate::application::plan_state::AGENT_PLAN_SCHEMA_VERSION,
+        "rollout_enabled": state.runtime.config.feature_rollouts.agent_plan_state.enabled,
+        "rollout_source": state.runtime.config.feature_rollouts.agent_plan_state.source,
+        "active_count": active.len(),
+        "sampled_count": terminal.len(),
+        "by_status": by_status,
+        "recent": recent_items,
+        "recent_events": recent_events,
     }))
 }
 

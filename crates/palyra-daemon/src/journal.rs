@@ -1,7 +1,7 @@
 //! SQLite-backed daemon journal: the hash-chained audit event log plus durable
 //! state for orchestrator sessions/runs/tape, approvals, cron, memory and
-//! workspace retrieval, tool jobs and result artifacts, flows, learning, usage
-//! accounting, and canvas state.
+//! workspace retrieval, tool jobs and result artifacts, flows, agent plans,
+//! learning, usage accounting, and canvas state.
 //!
 //! Storage model: a single SQLite database (WAL mode, foreign keys on,
 //! owner-only file permissions) behind one mutex-guarded connection inside
@@ -3082,6 +3082,123 @@ pub struct CommitmentListFilter {
     pub limit: usize,
 }
 
+/// Durable model-visible plan item scoped to an orchestrator session or run.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentPlanItemRecord {
+    pub plan_item_id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    pub title: String,
+    pub details_json: String,
+    pub status: String,
+    pub priority: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+    pub reason_code: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_at_unix_ms: Option<i64>,
+}
+
+/// Append-only audit event for a plan item mutation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentPlanEventRecord {
+    pub event_id: String,
+    pub plan_item_id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub event_type: String,
+    pub actor_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_status: Option<String>,
+    pub reason_code: String,
+    pub summary: String,
+    pub payload_json: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+    pub created_at_unix_ms: i64,
+}
+
+/// Parameters for creating one durable agent plan item and its initial event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPlanCreateRequest {
+    pub plan_item_id: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub title: String,
+    pub details_json: String,
+    pub status: String,
+    pub priority: i64,
+    pub blocked_reason: Option<String>,
+    pub evidence_refs_json: String,
+    pub reason_code: String,
+    pub actor_principal: String,
+    pub payload_json: String,
+}
+
+/// Partial update to an agent plan item plus audit event metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentPlanUpdateRequest {
+    pub plan_item_id: String,
+    pub expected_status: Option<String>,
+    pub status: Option<String>,
+    pub title: Option<String>,
+    pub details_json: Option<String>,
+    pub priority: Option<i64>,
+    pub blocked_reason: Option<Option<String>>,
+    pub evidence_refs_json: Option<String>,
+    pub reason_code: String,
+    pub actor_principal: String,
+    pub summary: String,
+    pub payload_json: String,
+}
+
+/// Filter and pagination options for listing agent plan items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPlanListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub status: Option<String>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
+/// Audit marker emitted when the model-visible plan management tool runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPlanToolInvocationRequest {
+    pub run_id: String,
+    pub session_id: String,
+    pub operation: String,
+    pub actor_principal: String,
+    pub success: bool,
+    pub changed_count: usize,
+    pub rejected_count: usize,
+    pub reason_code: String,
+    pub payload_json: String,
+}
+
 /// Parameters for recording a commitment delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitmentDeliveryAttemptCreateRequest {
@@ -4016,6 +4133,12 @@ pub enum JournalError {
     CommitmentNotFound { commitment_id: String },
     #[error("invalid commitment transition for {commitment_id}: {from} -> {to}")]
     InvalidCommitmentTransition { commitment_id: String, from: String, to: String },
+    #[error("agent plan item already exists: {plan_item_id}")]
+    DuplicateAgentPlanItemId { plan_item_id: String },
+    #[error("agent plan item not found: {plan_item_id}")]
+    AgentPlanItemNotFound { plan_item_id: String },
+    #[error("invalid agent plan transition for {plan_item_id}: {from} -> {to}")]
+    InvalidAgentPlanTransition { plan_item_id: String, from: String, to: String },
     #[error("canvas state not found: {canvas_id}")]
     CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
@@ -5825,6 +5948,78 @@ const MIGRATIONS: &[Migration] = &[
                 ON memory_embedding_jobs(source_kind, source_ref, updated_at_unix_ms DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_embedding_jobs_target
                 ON memory_embedding_jobs(index_target, embedding_model_id, embedding_dims, embedding_version);
+        "#,
+    },
+    Migration {
+        version: 37,
+        name: "agent_plan_state",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS agent_plan_items (
+                plan_item_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT,
+                parent_run_ulid TEXT,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                title TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                blocked_reason TEXT,
+                evidence_refs_json TEXT NOT NULL,
+                redaction_level TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER,
+                cancelled_at_unix_ms INTEGER,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid),
+                FOREIGN KEY(parent_run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_items_session_status
+                ON agent_plan_items(session_ulid, status, priority DESC, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_items_run
+                ON agent_plan_items(run_ulid, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_items_parent_run
+                ON agent_plan_items(parent_run_ulid, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_items_owner_status
+                ON agent_plan_items(owner_principal, device_id, channel, status, updated_at_unix_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS agent_plan_events (
+                event_ulid TEXT PRIMARY KEY,
+                plan_item_ulid TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                reason_code TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                redaction_level TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(plan_item_ulid) REFERENCES agent_plan_items(plan_item_ulid),
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_events_item
+                ON agent_plan_events(plan_item_ulid, created_at_unix_ms ASC, event_ulid ASC);
+            CREATE INDEX IF NOT EXISTS idx_agent_plan_events_session_run
+                ON agent_plan_events(session_ulid, run_ulid, created_at_unix_ms ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_agent_plan_events_prevent_update
+            BEFORE UPDATE ON agent_plan_events
+            BEGIN
+                SELECT RAISE(ABORT, 'agent_plan_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_agent_plan_events_prevent_delete
+            BEFORE DELETE ON agent_plan_events
+            BEGIN
+                SELECT RAISE(ABORT, 'agent_plan_events is append-only');
+            END;
         "#,
     },
 ];
@@ -13900,6 +14095,535 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Creates a durable agent plan item with its initial audit and tape event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::DuplicateAgentPlanItemId`] for duplicate ids,
+    /// [`JournalError::InvalidArgument`] for invalid JSON/status fields, or a
+    /// storage error.
+    pub fn create_agent_plan_item(
+        &self,
+        request: &AgentPlanCreateRequest,
+    ) -> Result<AgentPlanItemRecord, JournalError> {
+        ensure_nonempty_field(request.plan_item_id.as_str(), "plan_item_id")?;
+        ensure_nonempty_field(request.session_id.as_str(), "session_id")?;
+        ensure_nonempty_field(request.owner_principal.as_str(), "owner_principal")?;
+        ensure_nonempty_field(request.device_id.as_str(), "device_id")?;
+        ensure_nonempty_field(request.title.as_str(), "title")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.reason_code.as_str(), "reason_code")?;
+        ensure_valid_agent_plan_status(request.status.as_str())?;
+        ensure_agent_plan_priority(request.priority)?;
+
+        let mut redacted = false;
+        let title = sanitize_plan_text_field(request.title.as_str(), "title", "agent_plan.title")?;
+        redacted |= title != request.title.trim();
+        let details_json = sanitize_json_payload_field(
+            request.details_json.as_str(),
+            "agent_plan.details_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= details_json != request.details_json;
+        let evidence_refs_json = sanitize_json_payload_field(
+            request.evidence_refs_json.as_str(),
+            "agent_plan.evidence_refs_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= evidence_refs_json != request.evidence_refs_json;
+        let event_payload_json = sanitize_json_payload_field(
+            request.payload_json.as_str(),
+            "agent_plan.payload_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= event_payload_json != request.payload_json;
+        let blocked_reason = sanitize_plan_optional_text_field(
+            request.blocked_reason.as_deref(),
+            "blocked_reason",
+            "agent_plan.blocked_reason",
+        )?;
+        redacted |= blocked_reason.as_deref() != request.blocked_reason.as_deref().map(str::trim);
+        ensure_agent_plan_blocked_reason(request.status.as_str(), blocked_reason.as_deref())?;
+        let redaction_level = if redacted { "redacted" } else { "none" };
+
+        let now = current_unix_ms()?;
+        let completed_at_unix_ms = (request.status == "completed").then_some(now);
+        let cancelled_at_unix_ms = (request.status == "cancelled").then_some(now);
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        match transaction.execute(
+            r#"
+                INSERT INTO agent_plan_items (
+                    plan_item_ulid,
+                    session_ulid,
+                    run_ulid,
+                    parent_run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    title,
+                    details_json,
+                    status,
+                    priority,
+                    blocked_reason,
+                    evidence_refs_json,
+                    redaction_level,
+                    reason_code,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms,
+                    cancelled_at_unix_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16, ?17, ?18
+                )
+            "#,
+            params![
+                request.plan_item_id,
+                request.session_id,
+                request.run_id,
+                request.parent_run_id,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                title,
+                details_json,
+                request.status,
+                request.priority,
+                blocked_reason,
+                evidence_refs_json,
+                redaction_level,
+                request.reason_code,
+                now,
+                completed_at_unix_ms,
+                cancelled_at_unix_ms,
+            ],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(error, message))
+                if error.code == ErrorCode::ConstraintViolation
+                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || message
+                            .as_deref()
+                            .is_some_and(|value| value.contains("agent_plan_items"))) =>
+            {
+                return Err(JournalError::DuplicateAgentPlanItemId {
+                    plan_item_id: request.plan_item_id.clone(),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        }
+        insert_agent_plan_event(
+            &transaction,
+            AgentPlanEventInsert {
+                event_id: Ulid::new().to_string(),
+                plan_item_id: request.plan_item_id.as_str(),
+                session_id: request.session_id.as_str(),
+                run_id: request.run_id.as_deref(),
+                event_type: "agent.plan.created",
+                actor_principal: request.actor_principal.as_str(),
+                from_status: None,
+                to_status: Some(request.status.as_str()),
+                reason_code: request.reason_code.as_str(),
+                summary: "agent plan item created",
+                payload_json: event_payload_json.as_str(),
+                evidence_refs_json: evidence_refs_json.as_str(),
+                redaction_level,
+                created_at_unix_ms: now,
+            },
+        )?;
+        append_agent_plan_tape_event_if_scoped(
+            &transaction,
+            self.config.max_payload_bytes,
+            request.run_id.as_deref(),
+            "agent.plan.created",
+            AgentPlanTapeEvent {
+                plan_item_id: request.plan_item_id.as_str(),
+                session_id: request.session_id.as_str(),
+                event_type: "agent.plan.created",
+                from_status: None,
+                to_status: Some(request.status.as_str()),
+                reason_code: request.reason_code.as_str(),
+                redaction_level,
+                payload_json: event_payload_json.as_str(),
+                evidence_refs_json: evidence_refs_json.as_str(),
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_agent_plan_item(request.plan_item_id.as_str())?.ok_or_else(|| {
+            JournalError::AgentPlanItemNotFound { plan_item_id: request.plan_item_id.clone() }
+        })
+    }
+
+    /// Applies a partial agent plan update with an append-only audit and tape event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::AgentPlanItemNotFound`],
+    /// [`JournalError::InvalidAgentPlanTransition`], or a storage error.
+    pub fn update_agent_plan_item(
+        &self,
+        request: &AgentPlanUpdateRequest,
+    ) -> Result<AgentPlanItemRecord, JournalError> {
+        ensure_nonempty_field(request.plan_item_id.as_str(), "plan_item_id")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.reason_code.as_str(), "reason_code")?;
+        ensure_nonempty_field(request.summary.as_str(), "summary")?;
+        if let Some(status) = request.status.as_deref() {
+            ensure_valid_agent_plan_status(status)?;
+        }
+        if let Some(priority) = request.priority {
+            ensure_agent_plan_priority(priority)?;
+        }
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let existing = query_agent_plan_item_by_id(&transaction, request.plan_item_id.as_str())?
+            .ok_or_else(|| JournalError::AgentPlanItemNotFound {
+                plan_item_id: request.plan_item_id.clone(),
+            })?;
+        if let Some(expected) = request.expected_status.as_deref() {
+            if existing.status != expected {
+                return Err(JournalError::InvalidAgentPlanTransition {
+                    plan_item_id: request.plan_item_id.clone(),
+                    from: existing.status,
+                    to: request.status.clone().unwrap_or_else(|| expected.to_owned()),
+                });
+            }
+        }
+        let next_status = request.status.as_deref().unwrap_or(existing.status.as_str());
+        validate_agent_plan_transition(
+            request.plan_item_id.as_str(),
+            existing.status.as_str(),
+            next_status,
+        )?;
+
+        let mut redacted = existing.redaction_level == "redacted";
+        let title = request
+            .title
+            .as_deref()
+            .map(|raw| sanitize_plan_text_field(raw, "title", "agent_plan.title"))
+            .transpose()?;
+        redacted |=
+            title.as_deref() != request.title.as_deref().map(str::trim) && request.title.is_some();
+        let details_json = request
+            .details_json
+            .as_deref()
+            .map(|raw| {
+                sanitize_json_payload_field(
+                    raw,
+                    "agent_plan.details_json",
+                    self.config.max_payload_bytes,
+                )
+            })
+            .transpose()?;
+        redacted |= details_json.as_deref() != request.details_json.as_deref()
+            && request.details_json.is_some();
+        let evidence_refs_json = request
+            .evidence_refs_json
+            .as_deref()
+            .map(|raw| {
+                sanitize_json_payload_field(
+                    raw,
+                    "agent_plan.evidence_refs_json",
+                    self.config.max_payload_bytes,
+                )
+            })
+            .transpose()?;
+        redacted |= evidence_refs_json.as_deref() != request.evidence_refs_json.as_deref()
+            && request.evidence_refs_json.is_some();
+        let event_payload_json = sanitize_json_payload_field(
+            request.payload_json.as_str(),
+            "agent_plan.payload_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= event_payload_json != request.payload_json;
+        let blocked_reason = match request.blocked_reason.as_ref() {
+            Some(Some(raw)) => Some(Some(sanitize_plan_text_field(
+                raw.as_str(),
+                "blocked_reason",
+                "agent_plan.blocked_reason",
+            )?)),
+            Some(None) => Some(None),
+            None => None,
+        };
+        if let Some(Some(sanitized)) = blocked_reason.as_ref() {
+            redacted |=
+                request.blocked_reason.as_ref().and_then(|value| value.as_deref()).map(str::trim)
+                    != Some(sanitized.as_str());
+        }
+        let effective_blocked_reason =
+            blocked_reason.clone().flatten().or_else(|| existing.blocked_reason.clone());
+        ensure_agent_plan_blocked_reason(next_status, effective_blocked_reason.as_deref())?;
+        let redaction_level = if redacted { "redacted" } else { "none" };
+        let completed_at_unix_ms =
+            (next_status == "completed" && existing.completed_at_unix_ms.is_none()).then_some(now);
+        let cancelled_at_unix_ms =
+            (next_status == "cancelled" && existing.cancelled_at_unix_ms.is_none()).then_some(now);
+        let clear_blocked_reason =
+            blocked_reason.is_some() && blocked_reason.as_ref().is_some_and(Option::is_none);
+        let blocked_reason_value = blocked_reason.flatten();
+        let event_evidence_refs_json =
+            evidence_refs_json.clone().unwrap_or_else(|| existing.evidence_refs_json.clone());
+
+        transaction.execute(
+            r#"
+                UPDATE agent_plan_items
+                SET
+                    title = COALESCE(?2, title),
+                    details_json = COALESCE(?3, details_json),
+                    status = COALESCE(?4, status),
+                    priority = COALESCE(?5, priority),
+                    blocked_reason = CASE
+                        WHEN ?6 = 1 THEN NULL
+                        ELSE COALESCE(?7, blocked_reason)
+                    END,
+                    evidence_refs_json = COALESCE(?8, evidence_refs_json),
+                    redaction_level = ?9,
+                    reason_code = ?10,
+                    completed_at_unix_ms = COALESCE(?11, completed_at_unix_ms),
+                    cancelled_at_unix_ms = COALESCE(?12, cancelled_at_unix_ms),
+                    updated_at_unix_ms = ?13
+                WHERE plan_item_ulid = ?1
+            "#,
+            params![
+                request.plan_item_id,
+                title,
+                details_json,
+                request.status,
+                request.priority,
+                if clear_blocked_reason { 1_i64 } else { 0_i64 },
+                blocked_reason_value,
+                evidence_refs_json,
+                redaction_level,
+                request.reason_code,
+                completed_at_unix_ms,
+                cancelled_at_unix_ms,
+                now,
+            ],
+        )?;
+        let event_type = agent_plan_update_event_type(next_status);
+        insert_agent_plan_event(
+            &transaction,
+            AgentPlanEventInsert {
+                event_id: Ulid::new().to_string(),
+                plan_item_id: request.plan_item_id.as_str(),
+                session_id: existing.session_id.as_str(),
+                run_id: existing.run_id.as_deref(),
+                event_type,
+                actor_principal: request.actor_principal.as_str(),
+                from_status: Some(existing.status.as_str()),
+                to_status: Some(next_status),
+                reason_code: request.reason_code.as_str(),
+                summary: request.summary.as_str(),
+                payload_json: event_payload_json.as_str(),
+                evidence_refs_json: event_evidence_refs_json.as_str(),
+                redaction_level,
+                created_at_unix_ms: now,
+            },
+        )?;
+        append_agent_plan_tape_event_if_scoped(
+            &transaction,
+            self.config.max_payload_bytes,
+            existing.run_id.as_deref(),
+            event_type,
+            AgentPlanTapeEvent {
+                plan_item_id: request.plan_item_id.as_str(),
+                session_id: existing.session_id.as_str(),
+                event_type,
+                from_status: Some(existing.status.as_str()),
+                to_status: Some(next_status),
+                reason_code: request.reason_code.as_str(),
+                redaction_level,
+                payload_json: event_payload_json.as_str(),
+                evidence_refs_json: event_evidence_refs_json.as_str(),
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_agent_plan_item(request.plan_item_id.as_str())?.ok_or_else(|| {
+            JournalError::AgentPlanItemNotFound { plan_item_id: request.plan_item_id.clone() }
+        })
+    }
+
+    /// Lists agent plan items matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_agent_plan_items(
+        &self,
+        filter: &AgentPlanListFilter,
+    ) -> Result<Vec<AgentPlanItemRecord>, JournalError> {
+        if let Some(status) = filter.status.as_deref() {
+            ensure_valid_agent_plan_status(status)?;
+        }
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    plan_item_ulid,
+                    session_ulid,
+                    run_ulid,
+                    parent_run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    title,
+                    details_json,
+                    status,
+                    priority,
+                    blocked_reason,
+                    evidence_refs_json,
+                    redaction_level,
+                    reason_code,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms,
+                    cancelled_at_unix_ms
+                FROM agent_plan_items
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR session_ulid = ?4)
+                  AND (?5 IS NULL OR run_ulid = ?5)
+                  AND (?6 IS NULL OR status = ?6)
+                  AND (?7 = 1 OR status NOT IN ('completed', 'cancelled'))
+                ORDER BY
+                    CASE status
+                        WHEN 'in_progress' THEN 0
+                        WHEN 'blocked' THEN 1
+                        WHEN 'pending' THEN 2
+                        WHEN 'completed' THEN 3
+                        WHEN 'cancelled' THEN 4
+                        ELSE 5
+                    END,
+                    priority DESC,
+                    updated_at_unix_ms DESC,
+                    plan_item_ulid DESC
+                LIMIT ?8
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.owner_principal,
+                filter.device_id,
+                filter.channel,
+                filter.session_id,
+                filter.run_id,
+                filter.status,
+                if filter.include_terminal { 1_i64 } else { 0_i64 },
+                limit,
+            ],
+            map_agent_plan_item_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Returns one agent plan item, or `None` if absent.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn get_agent_plan_item(
+        &self,
+        plan_item_id: &str,
+    ) -> Result<Option<AgentPlanItemRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_agent_plan_item_by_id(&guard, plan_item_id)
+    }
+
+    /// Lists agent plan audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_agent_plan_events(
+        &self,
+        plan_item_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentPlanEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    plan_item_ulid,
+                    session_ulid,
+                    run_ulid,
+                    event_type,
+                    actor_principal,
+                    from_status,
+                    to_status,
+                    reason_code,
+                    summary,
+                    payload_json,
+                    evidence_refs_json,
+                    redaction_level,
+                    created_at_unix_ms
+                FROM agent_plan_events
+                WHERE plan_item_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, rowid ASC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![plan_item_id, limit], map_agent_plan_event_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Appends a tool-invocation marker for the agent plan runtime.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidArgument`] for malformed identifiers or
+    /// payload JSON, [`JournalError::PayloadTooLarge`] for oversized payloads,
+    /// or a storage error.
+    pub fn append_agent_plan_tool_invocation(
+        &self,
+        request: &AgentPlanToolInvocationRequest,
+    ) -> Result<(), JournalError> {
+        ensure_nonempty_field(request.run_id.as_str(), "run_id")?;
+        ensure_nonempty_field(request.session_id.as_str(), "session_id")?;
+        ensure_nonempty_field(request.operation.as_str(), "operation")?;
+        ensure_nonempty_field(request.actor_principal.as_str(), "actor_principal")?;
+        ensure_nonempty_field(request.reason_code.as_str(), "reason_code")?;
+        let payload_json = sanitize_json_payload_field(
+            request.payload_json.as_str(),
+            "agent_plan_tool_invocation.payload_json",
+            self.config.max_payload_bytes,
+        )?;
+        let payload: Value = serde_json::from_str(payload_json.as_str())?;
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        append_orchestrator_tape_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &OrchestratorTapeAppendRequest {
+                run_id: request.run_id.clone(),
+                seq: next_orchestrator_tape_seq(&transaction, request.run_id.as_str())?,
+                event_type: "agent.plan.tool_invoked".to_owned(),
+                payload_json: json!({
+                    "event": "agent.plan.tool_invoked",
+                    "schema_version": 1,
+                    "session_id": request.session_id.as_str(),
+                    "run_id": request.run_id.as_str(),
+                    "operation": request.operation.as_str(),
+                    "actor_principal": request.actor_principal.as_str(),
+                    "success": request.success,
+                    "changed_count": request.changed_count,
+                    "rejected_count": request.rejected_count,
+                    "reason_code": request.reason_code.as_str(),
+                    "payload": payload,
+                })
+                .to_string(),
+            },
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Records a commitment delivery attempt.
     ///
     /// # Errors
@@ -21325,6 +22049,112 @@ fn validate_commitment_transition(
     Ok(())
 }
 
+fn ensure_valid_agent_plan_status(status: &str) -> Result<(), JournalError> {
+    if is_known_agent_plan_status(status) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument(format!("unknown agent plan status: {status}")))
+    }
+}
+
+fn is_known_agent_plan_status(status: &str) -> bool {
+    matches!(status, "pending" | "in_progress" | "blocked" | "completed" | "cancelled")
+}
+
+fn is_terminal_agent_plan_status(status: &str) -> bool {
+    matches!(status, "completed" | "cancelled")
+}
+
+fn ensure_agent_plan_priority(priority: i64) -> Result<(), JournalError> {
+    if (-100..=100).contains(&priority) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument("agent plan priority must be in -100..=100".to_owned()))
+    }
+}
+
+fn ensure_agent_plan_blocked_reason(
+    status: &str,
+    blocked_reason: Option<&str>,
+) -> Result<(), JournalError> {
+    if status == "blocked" && blocked_reason.is_none_or(|reason| reason.trim().is_empty()) {
+        return Err(JournalError::InvalidArgument(
+            "blocked agent plan item requires blocked_reason".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_plan_transition(
+    plan_item_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), JournalError> {
+    ensure_valid_agent_plan_status(to)?;
+    if from == to {
+        return Ok(());
+    }
+    if is_terminal_agent_plan_status(from) {
+        return Err(JournalError::InvalidAgentPlanTransition {
+            plan_item_id: plan_item_id.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn agent_plan_update_event_type(status: &str) -> &'static str {
+    match status {
+        "blocked" => "agent.plan.blocked",
+        "completed" => "agent.plan.completed",
+        _ => "agent.plan.updated",
+    }
+}
+
+fn sanitize_json_payload_field(
+    raw: &str,
+    field: &'static str,
+    max_payload_bytes: usize,
+) -> Result<String, JournalError> {
+    ensure_json_field(raw, field)?;
+    if raw.len() > max_payload_bytes {
+        return Err(JournalError::PayloadTooLarge {
+            payload_kind: field,
+            actual_bytes: raw.len(),
+            max_bytes: max_payload_bytes,
+        });
+    }
+    let (sanitized, _) = sanitize_payload(raw.as_bytes())?;
+    if sanitized.len() > max_payload_bytes {
+        return Err(JournalError::PayloadTooLarge {
+            payload_kind: field,
+            actual_bytes: sanitized.len(),
+            max_bytes: max_payload_bytes,
+        });
+    }
+    Ok(sanitized)
+}
+
+fn sanitize_plan_text_field(
+    raw: &str,
+    key: &str,
+    field: &'static str,
+) -> Result<String, JournalError> {
+    ensure_nonempty_field(raw, field)?;
+    let sanitized = sanitize_object_text_field(key, raw)?.trim().to_owned();
+    ensure_nonempty_field(sanitized.as_str(), field)?;
+    Ok(sanitized)
+}
+
+fn sanitize_plan_optional_text_field(
+    raw: Option<&str>,
+    key: &str,
+    field: &'static str,
+) -> Result<Option<String>, JournalError> {
+    raw.map(|value| sanitize_plan_text_field(value, key, field)).transpose()
+}
+
 struct FlowEventInsert<'a> {
     event_id: String,
     flow_id: &'a str,
@@ -21551,6 +22381,116 @@ fn insert_commitment_event(
         ],
     )?;
     Ok(())
+}
+
+struct AgentPlanEventInsert<'a> {
+    event_id: String,
+    plan_item_id: &'a str,
+    session_id: &'a str,
+    run_id: Option<&'a str>,
+    event_type: &'a str,
+    actor_principal: &'a str,
+    from_status: Option<&'a str>,
+    to_status: Option<&'a str>,
+    reason_code: &'a str,
+    summary: &'a str,
+    payload_json: &'a str,
+    evidence_refs_json: &'a str,
+    redaction_level: &'a str,
+    created_at_unix_ms: i64,
+}
+
+fn insert_agent_plan_event(
+    transaction: &Transaction<'_>,
+    event: AgentPlanEventInsert<'_>,
+) -> Result<(), JournalError> {
+    ensure_json_field(event.payload_json, "agent_plan_event.payload_json")?;
+    ensure_json_field(event.evidence_refs_json, "agent_plan_event.evidence_refs_json")?;
+    transaction.execute(
+        r#"
+            INSERT INTO agent_plan_events (
+                event_ulid,
+                plan_item_ulid,
+                session_ulid,
+                run_ulid,
+                event_type,
+                actor_principal,
+                from_status,
+                to_status,
+                reason_code,
+                summary,
+                payload_json,
+                evidence_refs_json,
+                redaction_level,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "#,
+        params![
+            event.event_id,
+            event.plan_item_id,
+            event.session_id,
+            event.run_id,
+            event.event_type,
+            event.actor_principal,
+            event.from_status,
+            event.to_status,
+            event.reason_code,
+            event.summary,
+            event.payload_json,
+            event.evidence_refs_json,
+            event.redaction_level,
+            event.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+struct AgentPlanTapeEvent<'a> {
+    plan_item_id: &'a str,
+    session_id: &'a str,
+    event_type: &'a str,
+    from_status: Option<&'a str>,
+    to_status: Option<&'a str>,
+    reason_code: &'a str,
+    redaction_level: &'a str,
+    payload_json: &'a str,
+    evidence_refs_json: &'a str,
+}
+
+fn append_agent_plan_tape_event_if_scoped(
+    transaction: &Transaction<'_>,
+    max_payload_bytes: usize,
+    run_id: Option<&str>,
+    event_type: &str,
+    event: AgentPlanTapeEvent<'_>,
+    now: i64,
+) -> Result<(), JournalError> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let payload = json!({
+        "event": event.event_type,
+        "plan_item_id": event.plan_item_id,
+        "session_id": event.session_id,
+        "run_id": run_id,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "reason_code": event.reason_code,
+        "redaction_level": event.redaction_level,
+        "payload": serde_json::from_str::<Value>(event.payload_json).unwrap_or_else(|_| json!({"redacted": true, "reason": "invalid_plan_event_payload"})),
+        "evidence_refs": serde_json::from_str::<Value>(event.evidence_refs_json).unwrap_or_else(|_| json!([])),
+    });
+    append_orchestrator_tape_event_tx(
+        transaction,
+        max_payload_bytes,
+        &OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: next_orchestrator_tape_seq(transaction, run_id)?,
+            event_type: event_type.to_owned(),
+            payload_json: payload.to_string(),
+        },
+        now,
+    )
 }
 
 fn query_flow_by_id(
@@ -21917,6 +22857,90 @@ fn map_commitment_delivery_attempt_row(
         result_json: row.get(6)?,
         created_at_unix_ms: row.get(7)?,
         updated_at_unix_ms: row.get(8)?,
+    })
+}
+
+fn query_agent_plan_item_by_id(
+    connection: &Connection,
+    plan_item_id: &str,
+) -> Result<Option<AgentPlanItemRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    plan_item_ulid,
+                    session_ulid,
+                    run_ulid,
+                    parent_run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    title,
+                    details_json,
+                    status,
+                    priority,
+                    blocked_reason,
+                    evidence_refs_json,
+                    redaction_level,
+                    reason_code,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms,
+                    cancelled_at_unix_ms
+                FROM agent_plan_items
+                WHERE plan_item_ulid = ?1
+            "#,
+            params![plan_item_id],
+            map_agent_plan_item_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn map_agent_plan_item_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<AgentPlanItemRecord, rusqlite::Error> {
+    Ok(AgentPlanItemRecord {
+        plan_item_id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        parent_run_id: row.get(3)?,
+        owner_principal: row.get(4)?,
+        device_id: row.get(5)?,
+        channel: row.get(6)?,
+        title: row.get(7)?,
+        details_json: row.get(8)?,
+        status: row.get(9)?,
+        priority: row.get(10)?,
+        blocked_reason: row.get(11)?,
+        evidence_refs_json: row.get(12)?,
+        redaction_level: row.get(13)?,
+        reason_code: row.get(14)?,
+        created_at_unix_ms: row.get(15)?,
+        updated_at_unix_ms: row.get(16)?,
+        completed_at_unix_ms: row.get(17)?,
+        cancelled_at_unix_ms: row.get(18)?,
+    })
+}
+
+fn map_agent_plan_event_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<AgentPlanEventRecord, rusqlite::Error> {
+    Ok(AgentPlanEventRecord {
+        event_id: row.get(0)?,
+        plan_item_id: row.get(1)?,
+        session_id: row.get(2)?,
+        run_id: row.get(3)?,
+        event_type: row.get(4)?,
+        actor_principal: row.get(5)?,
+        from_status: row.get(6)?,
+        to_status: row.get(7)?,
+        reason_code: row.get(8)?,
+        summary: row.get(9)?,
+        payload_json: row.get(10)?,
+        evidence_refs_json: row.get(11)?,
+        redaction_level: row.get(12)?,
+        created_at_unix_ms: row.get(13)?,
     })
 }
 
@@ -24305,23 +25329,24 @@ mod tests {
     use super::{
         build_fts_query, build_memory_fts_queries, current_unix_ms, encode_vector_blob,
         memory_query_embedding_cache_scope, query_embedding_cache_key, sha256_hex,
-        workspace_query_embedding_cache_scope, ApprovalCreateRequest, ApprovalDecision,
-        ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord,
-        ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter,
-        CanvasStateTransitionRequest, CommitmentCreateRequest,
-        CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter, CommitmentUpdateRequest,
-        CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy,
-        CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus,
-        CronRunsListFilter, CronScheduleType, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
-        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
-        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
-        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
-        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
-        OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
-        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
-        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, RecallArtifactCreateRequest,
-        RecallArtifactListFilter, SessionProjectContextStateUpsertRequest, SessionSearchRequest,
-        SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+        workspace_query_embedding_cache_scope, AgentPlanCreateRequest, AgentPlanListFilter,
+        AgentPlanUpdateRequest, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
+        ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
+        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStateTransitionRequest,
+        CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter,
+        CommitmentUpdateRequest, CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter,
+        CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest,
+        CronRunStatus, CronRunsListFilter, CronScheduleType, HashMemoryEmbeddingProvider,
+        IdempotencyBeginRequest, IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig,
+        JournalError, JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest,
+        MemoryItemsListFilter, MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy,
+        MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
+        OrchestratorQueuedInputCreateRequest, OrchestratorRunStartRequest,
+        OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
+        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
+        RecallArtifactCreateRequest, RecallArtifactListFilter,
+        SessionProjectContextStateUpsertRequest, SessionSearchRequest, SkillExecutionStatus,
+        SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
@@ -25205,6 +26230,148 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn agent_plan_items_record_sanitized_events_and_tape() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5AP1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5AP2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let created = store
+            .create_agent_plan_item(&AgentPlanCreateRequest {
+                plan_item_id: "plan-item-1".to_owned(),
+                session_id: session_id.to_owned(),
+                run_id: Some(run_id.to_owned()),
+                parent_run_id: None,
+                owner_principal: "user:ops".to_owned(),
+                device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                channel: Some("cli".to_owned()),
+                title: "Investigate rollout".to_owned(),
+                details_json: r#"{"notes":"token=secret-value"}"#.to_owned(),
+                status: "pending".to_owned(),
+                priority: 20,
+                blocked_reason: None,
+                evidence_refs_json: r#"[{"kind":"tape","run_id":"01ARZ3NDEKTSV4RRFFQ69G5AP2"}]"#
+                    .to_owned(),
+                reason_code: "agent_plan_created".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                payload_json: r#"{"source":"unit_test","api_key":"abc"}"#.to_owned(),
+            })
+            .expect("agent plan item should be created");
+        assert_eq!(created.status, "pending");
+        assert_eq!(created.redaction_level, "redacted");
+        assert!(!created.details_json.contains("secret-value"));
+        assert!(created.details_json.contains("<redacted>"));
+
+        let completed = store
+            .update_agent_plan_item(&AgentPlanUpdateRequest {
+                plan_item_id: "plan-item-1".to_owned(),
+                expected_status: Some("pending".to_owned()),
+                status: Some("completed".to_owned()),
+                title: None,
+                details_json: None,
+                priority: None,
+                blocked_reason: None,
+                evidence_refs_json: None,
+                reason_code: "agent_plan_completed".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                summary: "done".to_owned(),
+                payload_json: r#"{"result":"ok"}"#.to_owned(),
+            })
+            .expect("agent plan item should complete");
+        assert_eq!(completed.status, "completed");
+        assert!(completed.completed_at_unix_ms.is_some());
+
+        let reopen = store.update_agent_plan_item(&AgentPlanUpdateRequest {
+            plan_item_id: "plan-item-1".to_owned(),
+            expected_status: Some("completed".to_owned()),
+            status: Some("in_progress".to_owned()),
+            reason_code: "agent_plan_reopen".to_owned(),
+            actor_principal: "user:ops".to_owned(),
+            summary: "reopen".to_owned(),
+            payload_json: "{}".to_owned(),
+            ..AgentPlanUpdateRequest::default()
+        });
+        assert!(matches!(reopen, Err(JournalError::InvalidAgentPlanTransition { .. })));
+
+        let active = store
+            .list_agent_plan_items(&AgentPlanListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: Some(run_id.to_owned()),
+                status: None,
+                include_terminal: false,
+                limit: 10,
+            })
+            .expect("active agent plan items should list");
+        assert!(active.is_empty(), "completed plan items are not active by default");
+
+        let events =
+            store.list_agent_plan_events("plan-item-1", 10).expect("agent plan events should list");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "agent.plan.created");
+        assert_eq!(events[1].event_type, "agent.plan.completed");
+        assert!(!events[0].payload_json.contains("abc"));
+
+        let tape = store.orchestrator_tape(run_id).expect("run tape should load");
+        assert_eq!(tape.len(), 2);
+        assert_eq!(tape[0].event_type, "agent.plan.created");
+        assert_eq!(tape[1].event_type, "agent.plan.completed");
+    }
+
+    #[test]
+    fn agent_plan_items_reject_invalid_json_and_missing_blocked_reason() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        upsert_orchestrator_session(&store, "01ARZ3NDEKTSV4RRFFQ69G5AP3");
+
+        let invalid_json = store.create_agent_plan_item(&AgentPlanCreateRequest {
+            plan_item_id: "plan-item-invalid-json".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5AP3".to_owned(),
+            run_id: None,
+            parent_run_id: None,
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: None,
+            title: "Broken details".to_owned(),
+            details_json: "{not-json".to_owned(),
+            status: "pending".to_owned(),
+            priority: 0,
+            blocked_reason: None,
+            evidence_refs_json: "[]".to_owned(),
+            reason_code: "agent_plan_created".to_owned(),
+            actor_principal: "user:ops".to_owned(),
+            payload_json: "{}".to_owned(),
+        });
+        assert!(matches!(invalid_json, Err(JournalError::InvalidArgument(_))));
+
+        let missing_reason = store.create_agent_plan_item(&AgentPlanCreateRequest {
+            plan_item_id: "plan-item-missing-blocker".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5AP3".to_owned(),
+            run_id: None,
+            parent_run_id: None,
+            owner_principal: "user:ops".to_owned(),
+            device_id: "device-1".to_owned(),
+            channel: None,
+            title: "Blocked item".to_owned(),
+            details_json: "{}".to_owned(),
+            status: "blocked".to_owned(),
+            priority: 0,
+            blocked_reason: None,
+            evidence_refs_json: "[]".to_owned(),
+            reason_code: "agent_plan_blocked".to_owned(),
+            actor_principal: "user:ops".to_owned(),
+            payload_json: "{}".to_owned(),
+        });
+        assert!(matches!(missing_reason, Err(JournalError::InvalidArgument(_))));
     }
 
     #[test]

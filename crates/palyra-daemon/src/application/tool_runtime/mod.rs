@@ -14,6 +14,7 @@ pub(crate) mod image_observe;
 pub(crate) mod memory;
 pub(crate) mod networked_worker;
 pub(crate) mod os_file;
+pub(crate) mod plan;
 pub(crate) mod process_registry;
 pub(crate) mod routines;
 pub(crate) mod tool_program;

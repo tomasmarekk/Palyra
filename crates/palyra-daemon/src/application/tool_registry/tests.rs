@@ -811,6 +811,26 @@ fn routines_query_schema_exposes_scheduler_wait_terminal_operation() {
 }
 
 #[test]
+fn plan_manage_schema_bounds_mutating_plan_operations() {
+    let entry = registry_entry("palyra.plan.manage").expect("plan manage tool entry");
+    let operation_values = entry.input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("operation enum should be an array");
+
+    assert!(operation_values.iter().any(|value| value.as_str() == Some("clear_active")));
+    assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
+    assert_eq!(entry.projection_policy, ToolResultProjectionPolicy::InlineUnlessLarge);
+    assert_eq!(entry.input_schema["properties"]["items"]["maxItems"], 20);
+    assert_eq!(
+        entry.input_schema["properties"]["items"]["items"]["properties"]["evidence_refs"]
+            ["maxItems"],
+        16
+    );
+    assert_eq!(entry.input_schema["properties"]["title"]["maxLength"], 160);
+    assert!(entry.description.contains("explicit planning state changes"));
+}
+
+#[test]
 fn delegation_control_schema_does_not_expose_parent_run_id() {
     let control =
         registry_entry("palyra.delegation.control").expect("delegation control should register");

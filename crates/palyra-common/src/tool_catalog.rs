@@ -438,6 +438,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.delegation.control" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "palyra.plan.manage" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
         "palyra.artifact.read" => Some(ToolMetadata {
             capabilities: ARTIFACT_READ_CAPABILITIES,
             default_sensitive: false,
