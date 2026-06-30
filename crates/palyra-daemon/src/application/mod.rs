@@ -23,6 +23,7 @@ pub mod memory;
 pub mod memory_provider;
 pub mod outbound_lifecycle;
 pub mod plan_state;
+pub mod progress_draft;
 pub mod project_context;
 pub mod project_context_summary;
 pub mod project_facts;

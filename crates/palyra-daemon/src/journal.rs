@@ -3199,6 +3199,89 @@ pub struct AgentPlanToolInvocationRequest {
     pub payload_json: String,
 }
 
+/// Durable backend progress draft for a long-running orchestrator run.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProgressDraftRecord {
+    pub draft_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_message_id: Option<String>,
+    pub state: String,
+    pub summary: String,
+    pub last_visible_step: String,
+    pub hidden_internal_state_hash: String,
+    pub render_policy: String,
+    pub version: i64,
+    pub reason_code: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at_unix_ms: Option<i64>,
+}
+
+/// Append-only progress draft audit event.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProgressDraftEventRecord {
+    pub event_id: String,
+    pub draft_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub actor_principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_state: Option<String>,
+    pub reason_code: String,
+    pub summary: String,
+    pub payload_json: String,
+    pub evidence_refs_json: String,
+    pub redaction_level: String,
+    pub source_tape_seq: i64,
+    pub created_at_unix_ms: i64,
+}
+
+/// Progress draft mutation projected from one orchestrator tape event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressDraftTapeEventRequest {
+    pub run_id: String,
+    pub source_tape_seq: i64,
+    pub source_event_type: String,
+    pub state: String,
+    pub summary: String,
+    pub last_visible_step: String,
+    pub hidden_internal_state_hash: String,
+    pub render_policy: String,
+    pub version: i64,
+    pub channel_instance_id: Option<String>,
+    pub external_message_id: Option<String>,
+    pub reason_code: String,
+    pub evidence_refs_json: String,
+    pub payload_json: String,
+}
+
+/// Filter and pagination options for listing progress drafts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressDraftListFilter {
+    pub owner_principal: Option<String>,
+    pub device_id: Option<String>,
+    pub channel: Option<String>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    pub state: Option<String>,
+    pub include_terminal: bool,
+    pub limit: usize,
+}
+
 /// Parameters for recording a commitment delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitmentDeliveryAttemptCreateRequest {
@@ -4139,6 +4222,12 @@ pub enum JournalError {
     AgentPlanItemNotFound { plan_item_id: String },
     #[error("invalid agent plan transition for {plan_item_id}: {from} -> {to}")]
     InvalidAgentPlanTransition { plan_item_id: String, from: String, to: String },
+    #[error("progress draft already exists: {draft_id}")]
+    DuplicateProgressDraftId { draft_id: String },
+    #[error("progress draft not found: {draft_id}")]
+    ProgressDraftNotFound { draft_id: String },
+    #[error("invalid progress draft transition for {draft_id}: {from} -> {to}")]
+    InvalidProgressDraftTransition { draft_id: String, from: String, to: String },
     #[error("canvas state not found: {canvas_id}")]
     CanvasStateNotFound { canvas_id: String },
     #[error("orchestrator run not found: {run_id}")]
@@ -6019,6 +6108,77 @@ const MIGRATIONS: &[Migration] = &[
             BEFORE DELETE ON agent_plan_events
             BEGIN
                 SELECT RAISE(ABORT, 'agent_plan_events is append-only');
+            END;
+        "#,
+    },
+    Migration {
+        version: 38,
+        name: "progress_draft_storage",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS progress_drafts (
+                draft_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL UNIQUE,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                channel_instance_id TEXT,
+                external_message_id TEXT,
+                state TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                last_visible_step TEXT NOT NULL,
+                hidden_internal_state_hash TEXT NOT NULL,
+                render_policy TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                reason_code TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                redaction_level TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_progress_drafts_owner_state
+                ON progress_drafts(owner_principal, device_id, channel, state, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_progress_drafts_session_state
+                ON progress_drafts(session_ulid, state, updated_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_progress_drafts_channel_message
+                ON progress_drafts(channel, channel_instance_id, external_message_id);
+
+            CREATE TABLE IF NOT EXISTS progress_draft_events (
+                event_ulid TEXT PRIMARY KEY,
+                draft_ulid TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                from_state TEXT,
+                to_state TEXT,
+                reason_code TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                evidence_refs_json TEXT NOT NULL,
+                redaction_level TEXT NOT NULL,
+                source_tape_seq INTEGER NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(draft_ulid) REFERENCES progress_drafts(draft_ulid),
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_progress_draft_events_draft
+                ON progress_draft_events(draft_ulid, created_at_unix_ms ASC, event_ulid ASC);
+            CREATE INDEX IF NOT EXISTS idx_progress_draft_events_run
+                ON progress_draft_events(run_ulid, source_tape_seq ASC, event_ulid ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_progress_draft_events_prevent_update
+            BEFORE UPDATE ON progress_draft_events
+            BEGIN
+                SELECT RAISE(ABORT, 'progress_draft_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_progress_draft_events_prevent_delete
+            BEFORE DELETE ON progress_draft_events
+            BEGIN
+                SELECT RAISE(ABORT, 'progress_draft_events is append-only');
             END;
         "#,
     },
@@ -14624,6 +14784,333 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Upserts the run-scoped progress draft projected from one tape event.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::RunNotFound`] when the run is missing,
+    /// [`JournalError::InvalidProgressDraftTransition`] for terminal-state
+    /// regressions, or a storage/redaction error.
+    pub fn upsert_progress_draft_from_tape_event(
+        &self,
+        request: &ProgressDraftTapeEventRequest,
+    ) -> Result<ProgressDraftRecord, JournalError> {
+        ensure_nonempty_field(request.run_id.as_str(), "run_id")?;
+        ensure_nonempty_field(request.source_event_type.as_str(), "source_event_type")?;
+        ensure_valid_progress_draft_state(request.state.as_str())?;
+        ensure_nonempty_field(
+            request.hidden_internal_state_hash.as_str(),
+            "hidden_internal_state_hash",
+        )?;
+        ensure_nonempty_field(request.render_policy.as_str(), "render_policy")?;
+        ensure_nonempty_field(request.reason_code.as_str(), "reason_code")?;
+
+        let now = current_unix_ms()?;
+        let mut redacted = false;
+        let summary = sanitize_plan_text_field(
+            request.summary.as_str(),
+            "summary",
+            "progress_draft.summary",
+        )?;
+        redacted |= summary != request.summary.trim();
+        let last_visible_step = sanitize_plan_text_field(
+            request.last_visible_step.as_str(),
+            "last_visible_step",
+            "progress_draft.last_visible_step",
+        )?;
+        redacted |= last_visible_step != request.last_visible_step.trim();
+        let channel_instance_id = sanitize_progress_draft_optional_text(
+            request.channel_instance_id.as_deref(),
+            "channel_instance_id",
+            "progress_draft.channel_instance_id",
+        )?;
+        redacted |= channel_instance_id.as_deref() != request.channel_instance_id.as_deref();
+        let external_message_id = sanitize_progress_draft_optional_text(
+            request.external_message_id.as_deref(),
+            "external_message_id",
+            "progress_draft.external_message_id",
+        )?;
+        redacted |= external_message_id.as_deref() != request.external_message_id.as_deref();
+        let evidence_refs_json = sanitize_json_payload_field(
+            request.evidence_refs_json.as_str(),
+            "progress_draft.evidence_refs_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= evidence_refs_json != request.evidence_refs_json;
+        let payload_json = sanitize_json_payload_field(
+            request.payload_json.as_str(),
+            "progress_draft.payload_json",
+            self.config.max_payload_bytes,
+        )?;
+        redacted |= payload_json != request.payload_json;
+        let redaction_level = if redacted {
+            crate::application::progress_draft::PROGRESS_DRAFT_REDACTION_REDACTED
+        } else {
+            crate::application::progress_draft::PROGRESS_DRAFT_REDACTION_NONE
+        };
+
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let scope = query_progress_draft_run_scope(&transaction, request.run_id.as_str())?
+            .ok_or_else(|| JournalError::RunNotFound { run_id: request.run_id.clone() })?;
+        let existing = query_progress_draft_by_run_id(&transaction, request.run_id.as_str())?;
+        let (draft_id, from_state, event_type) = if let Some(existing) = existing {
+            validate_progress_draft_transition(
+                existing.draft_id.as_str(),
+                existing.state.as_str(),
+                request.state.as_str(),
+            )?;
+            let completed_at_unix_ms = (is_terminal_progress_draft_state(request.state.as_str())
+                && existing.completed_at_unix_ms.is_none())
+            .then_some(now);
+            transaction.execute(
+                r#"
+                        UPDATE progress_drafts
+                        SET
+                            channel_instance_id = COALESCE(?2, channel_instance_id),
+                            external_message_id = COALESCE(?3, external_message_id),
+                            state = ?4,
+                            summary = ?5,
+                            last_visible_step = ?6,
+                            hidden_internal_state_hash = ?7,
+                            render_policy = ?8,
+                            version = ?9,
+                            reason_code = ?10,
+                            evidence_refs_json = ?11,
+                            redaction_level = ?12,
+                            updated_at_unix_ms = ?13,
+                            completed_at_unix_ms = COALESCE(?14, completed_at_unix_ms)
+                        WHERE draft_ulid = ?1
+                    "#,
+                params![
+                    existing.draft_id,
+                    channel_instance_id,
+                    external_message_id,
+                    request.state,
+                    summary,
+                    last_visible_step,
+                    request.hidden_internal_state_hash,
+                    request.render_policy,
+                    request.version,
+                    request.reason_code,
+                    evidence_refs_json,
+                    redaction_level,
+                    now,
+                    completed_at_unix_ms,
+                ],
+            )?;
+            (
+                existing.draft_id,
+                Some(existing.state),
+                progress_draft_update_event_type(request.state.as_str()),
+            )
+        } else {
+            let draft_id = Ulid::new().to_string();
+            let completed_at_unix_ms =
+                is_terminal_progress_draft_state(request.state.as_str()).then_some(now);
+            match transaction.execute(
+                    r#"
+                        INSERT INTO progress_drafts (
+                            draft_ulid,
+                            session_ulid,
+                            run_ulid,
+                            owner_principal,
+                            device_id,
+                            channel,
+                            channel_instance_id,
+                            external_message_id,
+                            state,
+                            summary,
+                            last_visible_step,
+                            hidden_internal_state_hash,
+                            render_policy,
+                            version,
+                            reason_code,
+                            evidence_refs_json,
+                            redaction_level,
+                            created_at_unix_ms,
+                            updated_at_unix_ms,
+                            completed_at_unix_ms
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18, ?19)
+                    "#,
+                    params![
+                        draft_id,
+                        scope.session_id,
+                        request.run_id,
+                        scope.owner_principal,
+                        scope.device_id,
+                        scope.channel,
+                        channel_instance_id,
+                        external_message_id,
+                        request.state,
+                        summary,
+                        last_visible_step,
+                        request.hidden_internal_state_hash,
+                        request.render_policy,
+                        request.version,
+                        request.reason_code,
+                        evidence_refs_json,
+                        redaction_level,
+                        now,
+                        completed_at_unix_ms,
+                    ],
+                ) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(error, message))
+                        if error.code == ErrorCode::ConstraintViolation
+                            && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                                || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                                || message.as_deref().is_some_and(|value| {
+                                    value.contains("progress_drafts")
+                                })) =>
+                    {
+                        return Err(JournalError::DuplicateProgressDraftId { draft_id });
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            (draft_id, None, crate::application::progress_draft::PROGRESS_DRAFT_EVENT_CREATED)
+        };
+
+        insert_progress_draft_event(
+            &transaction,
+            ProgressDraftEventInsert {
+                event_id: Ulid::new().to_string(),
+                draft_id: draft_id.as_str(),
+                session_id: scope.session_id.as_str(),
+                run_id: request.run_id.as_str(),
+                event_type,
+                actor_principal: "system",
+                from_state: from_state.as_deref(),
+                to_state: Some(request.state.as_str()),
+                reason_code: request.reason_code.as_str(),
+                summary: summary.as_str(),
+                payload_json: payload_json.as_str(),
+                evidence_refs_json: evidence_refs_json.as_str(),
+                redaction_level,
+                source_tape_seq: request.source_tape_seq,
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.progress_draft_for_run(request.run_id.as_str())?
+            .ok_or_else(|| JournalError::ProgressDraftNotFound { draft_id: draft_id.clone() })
+    }
+
+    /// Lists progress drafts matching the filter.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when validation or storage fails.
+    pub fn list_progress_drafts(
+        &self,
+        filter: &ProgressDraftListFilter,
+    ) -> Result<Vec<ProgressDraftRecord>, JournalError> {
+        if let Some(state) = filter.state.as_deref() {
+            ensure_valid_progress_draft_state(state)?;
+        }
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    draft_ulid,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    channel_instance_id,
+                    external_message_id,
+                    state,
+                    summary,
+                    last_visible_step,
+                    hidden_internal_state_hash,
+                    render_policy,
+                    version,
+                    reason_code,
+                    evidence_refs_json,
+                    redaction_level,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM progress_drafts
+                WHERE (?1 IS NULL OR owner_principal = ?1)
+                  AND (?2 IS NULL OR device_id = ?2)
+                  AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
+                  AND (?4 IS NULL OR session_ulid = ?4)
+                  AND (?5 IS NULL OR run_ulid = ?5)
+                  AND (?6 IS NULL OR state = ?6)
+                  AND (?7 = 1 OR state NOT IN ('completed', 'failed', 'cancelled'))
+                ORDER BY updated_at_unix_ms DESC, draft_ulid DESC
+                LIMIT ?8
+            "#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                filter.owner_principal,
+                filter.device_id,
+                filter.channel,
+                filter.session_id,
+                filter.run_id,
+                filter.state,
+                if filter.include_terminal { 1_i64 } else { 0_i64 },
+                limit,
+            ],
+            map_progress_draft_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
+    /// Returns the progress draft for one run, if present.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn progress_draft_for_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ProgressDraftRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        query_progress_draft_by_run_id(&guard, run_id)
+    }
+
+    /// Lists append-only progress draft audit events.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when the storage query fails.
+    pub fn list_progress_draft_events(
+        &self,
+        draft_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProgressDraftEventRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    event_ulid,
+                    draft_ulid,
+                    session_ulid,
+                    run_ulid,
+                    event_type,
+                    actor_principal,
+                    from_state,
+                    to_state,
+                    reason_code,
+                    summary,
+                    payload_json,
+                    evidence_refs_json,
+                    redaction_level,
+                    source_tape_seq,
+                    created_at_unix_ms
+                FROM progress_draft_events
+                WHERE draft_ulid = ?1
+                ORDER BY created_at_unix_ms ASC, event_ulid ASC
+                LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![draft_id, limit], map_progress_draft_event_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
     /// Records a commitment delivery attempt.
     ///
     /// # Errors
@@ -22112,6 +22599,59 @@ fn agent_plan_update_event_type(status: &str) -> &'static str {
     }
 }
 
+fn ensure_valid_progress_draft_state(state: &str) -> Result<(), JournalError> {
+    if is_known_progress_draft_state(state) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument(format!("unknown progress draft state: {state}")))
+    }
+}
+
+fn is_known_progress_draft_state(state: &str) -> bool {
+    matches!(
+        state,
+        "pending"
+            | "running"
+            | "waiting_approval"
+            | "retry_scheduled"
+            | "compacting"
+            | "completed"
+            | "failed"
+            | "cancelled"
+    )
+}
+
+fn is_terminal_progress_draft_state(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled")
+}
+
+fn validate_progress_draft_transition(
+    draft_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), JournalError> {
+    ensure_valid_progress_draft_state(to)?;
+    if from == to {
+        return Ok(());
+    }
+    if is_terminal_progress_draft_state(from) {
+        return Err(JournalError::InvalidProgressDraftTransition {
+            draft_id: draft_id.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn progress_draft_update_event_type(state: &str) -> &'static str {
+    if is_terminal_progress_draft_state(state) {
+        crate::application::progress_draft::PROGRESS_DRAFT_EVENT_COMPLETED
+    } else {
+        crate::application::progress_draft::PROGRESS_DRAFT_EVENT_UPDATED
+    }
+}
+
 fn sanitize_json_payload_field(
     raw: &str,
     field: &'static str,
@@ -22153,6 +22693,19 @@ fn sanitize_plan_optional_text_field(
     field: &'static str,
 ) -> Result<Option<String>, JournalError> {
     raw.map(|value| sanitize_plan_text_field(value, key, field)).transpose()
+}
+
+fn sanitize_progress_draft_optional_text(
+    raw: Option<&str>,
+    key: &str,
+    field: &'static str,
+) -> Result<Option<String>, JournalError> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+    .map(|value| sanitize_plan_text_field(value, key, field))
+    .transpose()
 }
 
 struct FlowEventInsert<'a> {
@@ -22491,6 +23044,109 @@ fn append_agent_plan_tape_event_if_scoped(
         },
         now,
     )
+}
+
+struct ProgressDraftRunScope {
+    session_id: String,
+    owner_principal: String,
+    device_id: String,
+    channel: Option<String>,
+}
+
+fn query_progress_draft_run_scope(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ProgressDraftRunScope>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    sessions.session_ulid,
+                    sessions.principal,
+                    sessions.device_id,
+                    sessions.channel
+                FROM orchestrator_runs AS runs
+                INNER JOIN orchestrator_sessions AS sessions
+                    ON sessions.session_ulid = runs.session_ulid
+                WHERE runs.run_ulid = ?1
+            "#,
+            params![run_id],
+            |row| {
+                Ok(ProgressDraftRunScope {
+                    session_id: row.get(0)?,
+                    owner_principal: row.get(1)?,
+                    device_id: row.get(2)?,
+                    channel: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+struct ProgressDraftEventInsert<'a> {
+    event_id: String,
+    draft_id: &'a str,
+    session_id: &'a str,
+    run_id: &'a str,
+    event_type: &'a str,
+    actor_principal: &'a str,
+    from_state: Option<&'a str>,
+    to_state: Option<&'a str>,
+    reason_code: &'a str,
+    summary: &'a str,
+    payload_json: &'a str,
+    evidence_refs_json: &'a str,
+    redaction_level: &'a str,
+    source_tape_seq: i64,
+    created_at_unix_ms: i64,
+}
+
+fn insert_progress_draft_event(
+    transaction: &Transaction<'_>,
+    event: ProgressDraftEventInsert<'_>,
+) -> Result<(), JournalError> {
+    ensure_json_field(event.payload_json, "progress_draft_event.payload_json")?;
+    ensure_json_field(event.evidence_refs_json, "progress_draft_event.evidence_refs_json")?;
+    transaction.execute(
+        r#"
+            INSERT INTO progress_draft_events (
+                event_ulid,
+                draft_ulid,
+                session_ulid,
+                run_ulid,
+                event_type,
+                actor_principal,
+                from_state,
+                to_state,
+                reason_code,
+                summary,
+                payload_json,
+                evidence_refs_json,
+                redaction_level,
+                source_tape_seq,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "#,
+        params![
+            event.event_id,
+            event.draft_id,
+            event.session_id,
+            event.run_id,
+            event.event_type,
+            event.actor_principal,
+            event.from_state,
+            event.to_state,
+            event.reason_code,
+            event.summary,
+            event.payload_json,
+            event.evidence_refs_json,
+            event.redaction_level,
+            event.source_tape_seq,
+            event.created_at_unix_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn query_flow_by_id(
@@ -22941,6 +23597,91 @@ fn map_agent_plan_event_row(
         evidence_refs_json: row.get(11)?,
         redaction_level: row.get(12)?,
         created_at_unix_ms: row.get(13)?,
+    })
+}
+
+fn query_progress_draft_by_run_id(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ProgressDraftRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    draft_ulid,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    channel_instance_id,
+                    external_message_id,
+                    state,
+                    summary,
+                    last_visible_step,
+                    hidden_internal_state_hash,
+                    render_policy,
+                    version,
+                    reason_code,
+                    evidence_refs_json,
+                    redaction_level,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM progress_drafts
+                WHERE run_ulid = ?1
+            "#,
+            params![run_id],
+            map_progress_draft_row,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn map_progress_draft_row(row: &rusqlite::Row<'_>) -> Result<ProgressDraftRecord, rusqlite::Error> {
+    Ok(ProgressDraftRecord {
+        draft_id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        owner_principal: row.get(3)?,
+        device_id: row.get(4)?,
+        channel: row.get(5)?,
+        channel_instance_id: row.get(6)?,
+        external_message_id: row.get(7)?,
+        state: row.get(8)?,
+        summary: row.get(9)?,
+        last_visible_step: row.get(10)?,
+        hidden_internal_state_hash: row.get(11)?,
+        render_policy: row.get(12)?,
+        version: row.get(13)?,
+        reason_code: row.get(14)?,
+        evidence_refs_json: row.get(15)?,
+        redaction_level: row.get(16)?,
+        created_at_unix_ms: row.get(17)?,
+        updated_at_unix_ms: row.get(18)?,
+        completed_at_unix_ms: row.get(19)?,
+    })
+}
+
+fn map_progress_draft_event_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<ProgressDraftEventRecord, rusqlite::Error> {
+    Ok(ProgressDraftEventRecord {
+        event_id: row.get(0)?,
+        draft_id: row.get(1)?,
+        session_id: row.get(2)?,
+        run_id: row.get(3)?,
+        event_type: row.get(4)?,
+        actor_principal: row.get(5)?,
+        from_state: row.get(6)?,
+        to_state: row.get(7)?,
+        reason_code: row.get(8)?,
+        summary: row.get(9)?,
+        payload_json: row.get(10)?,
+        evidence_refs_json: row.get(11)?,
+        redaction_level: row.get(12)?,
+        source_tape_seq: row.get(13)?,
+        created_at_unix_ms: row.get(14)?,
     })
 }
 
@@ -25344,9 +26085,9 @@ mod tests {
         OrchestratorQueuedInputCreateRequest, OrchestratorRunStartRequest,
         OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
         OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
-        RecallArtifactCreateRequest, RecallArtifactListFilter,
-        SessionProjectContextStateUpsertRequest, SessionSearchRequest, SkillExecutionStatus,
-        SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+        ProgressDraftListFilter, ProgressDraftTapeEventRequest, RecallArtifactCreateRequest,
+        RecallArtifactListFilter, SessionProjectContextStateUpsertRequest, SessionSearchRequest,
+        SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
         ToolJobTransitionRequest, ToolJobsListFilter, ToolResultArtifactCreateRequest,
@@ -25491,6 +26232,196 @@ mod tests {
                 payload_json: "{}".to_owned(),
             })
             .expect("orchestrator tape event should be appended");
+    }
+
+    fn progress_draft_request(
+        run_id: &str,
+        seq: i64,
+        state: &str,
+        summary: &str,
+        reason_code: &str,
+    ) -> ProgressDraftTapeEventRequest {
+        ProgressDraftTapeEventRequest {
+            run_id: run_id.to_owned(),
+            source_tape_seq: seq,
+            source_event_type: "status".to_owned(),
+            state: state.to_owned(),
+            summary: summary.to_owned(),
+            last_visible_step: "running".to_owned(),
+            hidden_internal_state_hash:
+                "a63c90cc3684ad8b0a2176a6a8fe9005d9c8b6246502f8ca33767b7f432d3f30".to_owned(),
+            render_policy: "internal_only".to_owned(),
+            version: crate::application::progress_draft::PROGRESS_DRAFT_SCHEMA_VERSION,
+            channel_instance_id: Some("discord:ops".to_owned()),
+            external_message_id: Some("message-1".to_owned()),
+            reason_code: reason_code.to_owned(),
+            evidence_refs_json: json!([{
+                "kind": "orchestrator_tape",
+                "run_id": run_id,
+                "seq": seq,
+            }])
+            .to_string(),
+            payload_json: json!({
+                "state": state,
+                "summary": summary,
+                "source_tape_seq": seq,
+            })
+            .to_string(),
+        }
+    }
+
+    #[test]
+    fn progress_draft_lifecycle_persists_record_and_events() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PD1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PD2";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let running = store
+            .upsert_progress_draft_from_tape_event(&progress_draft_request(
+                run_id,
+                0,
+                "running",
+                "Waiting for model provider response",
+                crate::application::progress_draft::PROGRESS_DRAFT_REASON_TAPE_UPDATED,
+            ))
+            .expect("running draft should persist");
+
+        assert_eq!(running.session_id, session_id);
+        assert_eq!(running.run_id, run_id);
+        assert_eq!(running.owner_principal, "user:ops");
+        assert_eq!(running.device_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(running.channel.as_deref(), Some("cli"));
+        assert_eq!(running.channel_instance_id.as_deref(), Some("discord:ops"));
+        assert_eq!(running.external_message_id.as_deref(), Some("message-1"));
+        assert_eq!(running.state, "running");
+        assert_eq!(
+            running.reason_code,
+            crate::application::progress_draft::PROGRESS_DRAFT_REASON_TAPE_UPDATED
+        );
+        assert_eq!(
+            running.redaction_level,
+            crate::application::progress_draft::PROGRESS_DRAFT_REDACTION_NONE
+        );
+        assert!(running.completed_at_unix_ms.is_none());
+
+        let active = store
+            .list_progress_drafts(&ProgressDraftListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                run_id: None,
+                state: None,
+                include_terminal: false,
+                limit: 10,
+            })
+            .expect("active draft list should load");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].draft_id, running.draft_id);
+
+        let completed = store
+            .upsert_progress_draft_from_tape_event(&progress_draft_request(
+                run_id,
+                1,
+                "completed",
+                "Run reply recorded",
+                crate::application::progress_draft::PROGRESS_DRAFT_REASON_RUN_COMPLETED,
+            ))
+            .expect("completed draft should persist");
+
+        assert_eq!(completed.draft_id, running.draft_id);
+        assert_eq!(completed.state, "completed");
+        assert!(completed.completed_at_unix_ms.is_some());
+        assert!(completed.updated_at_unix_ms >= running.created_at_unix_ms);
+
+        let active_after_completion = store
+            .list_progress_drafts(&ProgressDraftListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                channel: Some("cli".to_owned()),
+                session_id: None,
+                run_id: None,
+                state: None,
+                include_terminal: false,
+                limit: 10,
+            })
+            .expect("active draft list should load after completion");
+        assert!(active_after_completion.is_empty());
+
+        let all = store
+            .list_progress_drafts(&ProgressDraftListFilter {
+                owner_principal: Some("user:ops".to_owned()),
+                device_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+                channel: Some("cli".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: None,
+                state: None,
+                include_terminal: true,
+                limit: 10,
+            })
+            .expect("terminal-inclusive draft list should load");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, "completed");
+
+        let events = store
+            .list_progress_draft_events(completed.draft_id.as_str(), 10)
+            .expect("draft events should load");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.event_type == crate::application::progress_draft::PROGRESS_DRAFT_EVENT_CREATED
+                && event.from_state.is_none()
+                && event.to_state.as_deref() == Some("running")
+                && event.source_tape_seq == 0
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == crate::application::progress_draft::PROGRESS_DRAFT_EVENT_COMPLETED
+                && event.from_state.as_deref() == Some("running")
+                && event.to_state.as_deref() == Some("completed")
+                && event.source_tape_seq == 1
+        }));
+    }
+
+    #[test]
+    fn progress_draft_rejects_terminal_state_regression() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5PD3";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5PD4";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+        store
+            .upsert_progress_draft_from_tape_event(&progress_draft_request(
+                run_id,
+                0,
+                "completed",
+                "Run reply recorded",
+                crate::application::progress_draft::PROGRESS_DRAFT_REASON_RUN_COMPLETED,
+            ))
+            .expect("terminal draft should persist");
+
+        let error = store
+            .upsert_progress_draft_from_tape_event(&progress_draft_request(
+                run_id,
+                1,
+                "running",
+                "Retrying model provider call",
+                crate::application::progress_draft::PROGRESS_DRAFT_REASON_TAPE_UPDATED,
+            ))
+            .expect_err("terminal draft must not regress to running");
+
+        assert!(matches!(
+            error,
+            JournalError::InvalidProgressDraftTransition {
+                ref draft_id,
+                ref from,
+                ref to,
+            } if !draft_id.is_empty() && from == "completed" && to == "running"
+        ));
     }
 
     #[test]

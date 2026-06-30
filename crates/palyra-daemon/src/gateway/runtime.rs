@@ -36,6 +36,7 @@ use crate::application::{
         CodeIntelRuntimeObservationRequest, CodeIntelRuntimeSnapshot,
         CodeIntelRuntimeSnapshotRequest,
     },
+    progress_draft::project_progress_draft_tape_event,
 };
 use crate::journal::state_health::{
     JournalHashChainVerificationReport, JournalHashVerificationScope, JournalHealthReport,
@@ -66,17 +67,18 @@ use crate::journal::{
     OrchestratorSessionQueueControlUpdateRequest, OrchestratorSessionRecord,
     OrchestratorSessionTitleUpdateRequest, OrchestratorSessionTranscriptRecord,
     OrchestratorStartupRunRecoveryReport, OrchestratorUsageQuery, OrchestratorUsageRunRecord,
-    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, RecallArtifactCreateRequest,
-    RecallArtifactListFilter, RecallArtifactRecord, RetrievalBranchDiagnostics,
-    SessionProjectContextStateCopyRequest, SessionProjectContextStateRecord,
-    SessionProjectContextStateUpsertRequest, SessionSearchOutcome, SessionSearchRequest,
-    ToolJobAttachRequest, ToolJobCreateRequest, ToolJobRecord, ToolJobRetryRequest,
-    ToolJobTailAppendRequest, ToolJobTailPage, ToolJobTailReadRequest, ToolJobTransitionRequest,
-    ToolJobsListFilter, ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
-    WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter, WorkItemRecord,
-    WorkItemUpdateRequest, WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest,
-    WorkspaceCheckpointCreateRequest, WorkspaceCheckpointFilePayload,
-    WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
+    OrchestratorUsageSessionRecord, OrchestratorUsageSummary, ProgressDraftEventRecord,
+    ProgressDraftListFilter, ProgressDraftRecord, ProgressDraftTapeEventRequest,
+    RecallArtifactCreateRequest, RecallArtifactListFilter, RecallArtifactRecord,
+    RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
+    SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
+    SessionSearchOutcome, SessionSearchRequest, ToolJobAttachRequest, ToolJobCreateRequest,
+    ToolJobRecord, ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage,
+    ToolJobTailReadRequest, ToolJobTransitionRequest, ToolJobsListFilter,
+    ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest, WorkItemCreateRequest,
+    WorkItemEventRecord, WorkItemListFilter, WorkItemRecord, WorkItemUpdateRequest,
+    WorkspaceBootstrapOutcome, WorkspaceBootstrapRequest, WorkspaceCheckpointCreateRequest,
+    WorkspaceCheckpointFilePayload, WorkspaceCheckpointFileRecord, WorkspaceCheckpointListFilter,
     WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
     WorkspaceCheckpointRestoreMarkRequest, WorkspaceDocumentDeleteRequest,
     WorkspaceDocumentListFilter, WorkspaceDocumentMoveRequest, WorkspaceDocumentRecord,
@@ -5544,6 +5546,70 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("append orchestrator tape event", error))
     }
 
+    #[allow(clippy::result_large_err)]
+    fn upsert_progress_draft_from_tape_event_blocking(
+        &self,
+        request: &ProgressDraftTapeEventRequest,
+    ) -> Result<ProgressDraftRecord, Status> {
+        self.journal_store
+            .upsert_progress_draft_from_tape_event(request)
+            .map_err(|error| map_orchestrator_store_error("upsert progress draft", error))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_progress_drafts_blocking(
+        &self,
+        filter: &ProgressDraftListFilter,
+    ) -> Result<Vec<ProgressDraftRecord>, Status> {
+        self.journal_store
+            .list_progress_drafts(filter)
+            .map_err(|error| map_orchestrator_store_error("list progress drafts", error))
+    }
+
+    /// Lists progress drafts matching the filter.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_progress_drafts(
+        self: &Arc<Self>,
+        filter: ProgressDraftListFilter,
+    ) -> Result<Vec<ProgressDraftRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_progress_drafts_blocking(&filter))
+            .await
+            .map_err(|_| Status::internal("progress draft list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn list_progress_draft_events_blocking(
+        &self,
+        draft_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ProgressDraftEventRecord>, Status> {
+        self.journal_store
+            .list_progress_draft_events(draft_id, limit)
+            .map_err(|error| map_orchestrator_store_error("list progress draft events", error))
+    }
+
+    /// Lists append-only progress draft audit events.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_progress_draft_events(
+        self: &Arc<Self>,
+        draft_id: String,
+        limit: usize,
+    ) -> Result<Vec<ProgressDraftEventRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.list_progress_draft_events_blocking(draft_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("progress draft event list worker panicked"))?
+    }
+
     /// Appends one tape event for a run and bumps the tape counter.
     ///
     /// # Errors
@@ -5553,9 +5619,29 @@ impl GatewayRuntimeState {
         self: &Arc<Self>,
         request: OrchestratorTapeAppendRequest,
     ) -> Result<(), Status> {
+        let progress_request = self
+            .config
+            .feature_rollouts
+            .progress_drafts
+            .enabled
+            .then(|| project_progress_draft_tape_event(&request))
+            .flatten();
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            state.append_orchestrator_tape_event_blocking(&request)
+            state.append_orchestrator_tape_event_blocking(&request)?;
+            if let Some(progress_request) = progress_request.as_ref() {
+                if let Err(error) =
+                    state.upsert_progress_draft_from_tape_event_blocking(progress_request)
+                {
+                    warn!(
+                        run_id = %progress_request.run_id,
+                        source_tape_seq = progress_request.source_tape_seq,
+                        error = %error,
+                        "progress draft update failed after tape append"
+                    );
+                }
+            }
+            Ok::<(), Status>(())
         })
         .await
         .map_err(|_| Status::internal("orchestrator tape worker panicked"))??;

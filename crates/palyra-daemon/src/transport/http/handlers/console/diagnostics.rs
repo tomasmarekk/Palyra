@@ -144,6 +144,9 @@ pub(crate) async fn console_diagnostics_handler(
     redact_console_diagnostics_value(&mut flows_payload, None);
     let mut agent_plan_payload = collect_console_agent_plan_diagnostics(&state, &session.context)?;
     redact_console_diagnostics_value(&mut agent_plan_payload, None);
+    let mut progress_drafts_payload =
+        collect_console_progress_draft_diagnostics(&state, &session.context).await?;
+    redact_console_diagnostics_value(&mut progress_drafts_payload, None);
     let mut delegation_payload = collect_console_delegation_diagnostics(&state, &session.context)
         .await
         .map_err(runtime_status_response)?;
@@ -293,6 +296,7 @@ pub(crate) async fn console_diagnostics_handler(
         "objectives": objectives_payload,
         "flows": flows_payload,
         "agent_plan": agent_plan_payload,
+        "progress_drafts": progress_drafts_payload,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,
@@ -1535,6 +1539,115 @@ fn collect_console_agent_plan_diagnostics(
         "recent": recent_items,
         "recent_events": recent_events,
     }))
+}
+
+/// Summarizes journal-backed progress drafts for the requesting console identity.
+#[allow(clippy::result_large_err)]
+async fn collect_console_progress_draft_diagnostics(
+    state: &AppState,
+    context: &crate::gateway::RequestContext,
+) -> Result<Value, Response> {
+    let active = state
+        .runtime
+        .list_progress_drafts(crate::journal::ProgressDraftListFilter {
+            owner_principal: Some(context.principal.clone()),
+            device_id: Some(context.device_id.clone()),
+            channel: context.channel.clone(),
+            session_id: None,
+            run_id: None,
+            state: None,
+            include_terminal: false,
+            limit: 50,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let sampled = state
+        .runtime
+        .list_progress_drafts(crate::journal::ProgressDraftListFilter {
+            owner_principal: Some(context.principal.clone()),
+            device_id: Some(context.device_id.clone()),
+            channel: context.channel.clone(),
+            session_id: None,
+            run_id: None,
+            state: None,
+            include_terminal: true,
+            limit: 50,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+
+    let mut by_state = std::collections::BTreeMap::<String, u64>::new();
+    let mut terminal_count = 0_usize;
+    for draft in &sampled {
+        *by_state.entry(draft.state.clone()).or_default() += 1;
+        if is_terminal_progress_draft_state_for_console(draft.state.as_str()) {
+            terminal_count = terminal_count.saturating_add(1);
+        }
+    }
+
+    let event_target = active.first().or_else(|| sampled.first());
+    let recent_events = if let Some(draft) = event_target {
+        state
+            .runtime
+            .list_progress_draft_events(draft.draft_id.clone(), 5)
+            .await
+            .map_err(runtime_status_response)?
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "event_id": event.event_id,
+                    "draft_id": event.draft_id,
+                    "run_id": event.run_id,
+                    "event_type": event.event_type,
+                    "from_state": event.from_state,
+                    "to_state": event.to_state,
+                    "reason_code": event.reason_code,
+                    "source_tape_seq": event.source_tape_seq,
+                    "created_at_unix_ms": event.created_at_unix_ms,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let recent = active
+        .iter()
+        .take(10)
+        .map(|draft| {
+            json!({
+                "draft_id": draft.draft_id,
+                "session_id": draft.session_id,
+                "run_id": draft.run_id,
+                "state": draft.state,
+                "summary": draft.summary,
+                "operator_summary": crate::application::progress_draft::ProgressDraftRenderer::operator_summary(draft),
+                "last_visible_step": draft.last_visible_step,
+                "render_policy": draft.render_policy,
+                "version": draft.version,
+                "reason_code": draft.reason_code,
+                "redaction_level": draft.redaction_level,
+                "updated_at_unix_ms": draft.updated_at_unix_ms,
+                "completed_at_unix_ms": draft.completed_at_unix_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "schema_version": crate::application::progress_draft::PROGRESS_DRAFT_SCHEMA_VERSION,
+        "rollout_enabled": state.runtime.config.feature_rollouts.progress_drafts.enabled,
+        "rollout_source": state.runtime.config.feature_rollouts.progress_drafts.source,
+        "active_count": active.len(),
+        "sampled_count": sampled.len(),
+        "terminal_count": terminal_count,
+        "by_state": by_state,
+        "recent": recent,
+        "recent_events": recent_events,
+    }))
+}
+
+fn is_terminal_progress_draft_state_for_console(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled")
 }
 
 /// Probes the browser service health (when enabled) and merges journal-based

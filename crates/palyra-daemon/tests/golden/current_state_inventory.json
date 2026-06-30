@@ -30,6 +30,7 @@
     "observability",
     "opentelemetry",
     "plugins",
+    "progress_drafts",
     "rate_limits",
     "runtime_controls",
     "runtime_health",
