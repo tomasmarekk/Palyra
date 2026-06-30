@@ -25,8 +25,17 @@ use crate::{
     application::{
         channel_commands::{
             build_channel_command_response, build_malformed_command_response,
-            build_policy_denied_command_response, ChannelCommandParseOutcome,
+            build_policy_denied_command_response, ChannelCommandName, ChannelCommandParseOutcome,
             ChannelCommandRegistry, ChannelCommandRuntimeView, ChannelCommandScope,
+        },
+        channel_turn::{
+            channel_turn_admission_record, channel_turn_admission_terminal_record,
+            channel_turn_delivered_record, channel_turn_dispatched_record,
+            channel_turn_received_record, decide_channel_turn_admission, ChannelTurnAdmissionInput,
+            ChannelTurnBindingFacts, ChannelTurnBotFacts, ChannelTurnDeliveryOutcome,
+            ChannelTurnDispatchOutcome, ChannelTurnEnvelope, ChannelTurnEnvelopeInput,
+            ChannelTurnHistory, ChannelTurnJournalRecord, ChannelTurnMediaFacts,
+            ChannelTurnMentionState, ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
         },
         conversation_bindings::ConversationBindingResolveRequest,
         route_message::orchestration::handle_routed_route_message,
@@ -106,6 +115,216 @@ fn command_route_response(
         retry_attempt,
         queue_depth,
     }
+}
+
+fn build_channel_turn_envelope(
+    input: &ChannelInboundMessage,
+    content: &common_v1::MessageContent,
+    json_mode_requested: bool,
+    route_config_hash: &str,
+    actor_gateway_principal: &str,
+    actor_gateway_device_id: &str,
+    observed_at_unix_ms: i64,
+) -> ChannelTurnEnvelope {
+    ChannelTurnEnvelope::from_input(ChannelTurnEnvelopeInput {
+        envelope_id: input.envelope_id.clone(),
+        channel: input.channel.clone(),
+        conversation_id: input.conversation_id.clone(),
+        thread_id: input.adapter_thread_id.clone(),
+        sender_handle: input.sender_handle.clone(),
+        sender_display: input.sender_display.clone(),
+        sender_verified: input.sender_verified,
+        gateway_principal: actor_gateway_principal.to_owned(),
+        gateway_device_id: actor_gateway_device_id.to_owned(),
+        text: input.text.clone(),
+        max_payload_bytes: input.max_payload_bytes,
+        is_direct_message: input.is_direct_message,
+        requested_broadcast: input.requested_broadcast,
+        adapter_message_id: input.adapter_message_id.clone(),
+        retry_attempt: input.retry_attempt,
+        attachment_count: content.attachments.len(),
+        json_mode_requested,
+        route_config_hash: route_config_hash.to_owned(),
+        received_at_unix_ms: observed_at_unix_ms,
+    })
+}
+
+fn channel_turn_command_facts(outcome: &ChannelCommandParseOutcome) -> (bool, bool) {
+    match outcome {
+        ChannelCommandParseOutcome::Parsed(invocation) => (
+            true,
+            matches!(
+                invocation.command,
+                ChannelCommandName::Stop | ChannelCommandName::DelegationInterrupt
+            ),
+        ),
+        ChannelCommandParseOutcome::Malformed(_) => (true, false),
+        ChannelCommandParseOutcome::NotCommand => (false, false),
+    }
+}
+
+fn channel_turn_mention_state(
+    input: &ChannelInboundMessage,
+    router_outcome: ChannelTurnRouterOutcomeKind,
+    router_reason: Option<&str>,
+) -> ChannelTurnMentionState {
+    if input.is_direct_message {
+        return ChannelTurnMentionState::DirectMessage;
+    }
+    if router_reason == Some("no_matching_mention_or_dm_policy") {
+        return ChannelTurnMentionState::NotMatched;
+    }
+    if router_outcome == ChannelTurnRouterOutcomeKind::Routed {
+        return ChannelTurnMentionState::Matched;
+    }
+    ChannelTurnMentionState::Unknown
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_channel_turn_admission_input(
+    input: &ChannelInboundMessage,
+    content: &common_v1::MessageContent,
+    binding_id: Option<String>,
+    binding_kind: Option<String>,
+    command_parse_outcome: &ChannelCommandParseOutcome,
+    router_outcome: ChannelTurnRouterOutcomeKind,
+    router_reason: Option<&str>,
+    queued_for_retry: bool,
+) -> ChannelTurnAdmissionInput {
+    let (is_channel_command, urgent_command) = channel_turn_command_facts(command_parse_outcome);
+    ChannelTurnAdmissionInput {
+        mention: channel_turn_mention_state(input, router_outcome, router_reason),
+        bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+        policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
+        binding: ChannelTurnBindingFacts {
+            binding_present: binding_id.is_some(),
+            binding_id,
+            binding_kind,
+        },
+        media: ChannelTurnMediaFacts {
+            attachment_count: content.attachments.len(),
+            has_media: !content.attachments.is_empty(),
+        },
+        router_outcome,
+        router_reason: router_reason.map(str::to_owned),
+        queued_for_retry,
+        is_channel_command,
+        urgent_command,
+        ambient_context_enabled: false,
+    }
+}
+
+async fn record_channel_turn_record(
+    state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    session_id: &str,
+    run_id: &str,
+    actor: i32,
+    record: ChannelTurnJournalRecord,
+) {
+    let event_type = record.event_type.clone();
+    let _ = record_message_router_journal_event(
+        state,
+        context,
+        session_id,
+        run_id,
+        event_type.as_str(),
+        actor,
+        record.payload_json(),
+    )
+    .await;
+}
+
+async fn record_channel_turn_intake_events(
+    state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    envelope: &ChannelTurnEnvelope,
+    admission_input: &ChannelTurnAdmissionInput,
+    session_id: &str,
+    run_id: &str,
+) {
+    let admission = decide_channel_turn_admission(admission_input);
+    let mut history = ChannelTurnHistory::new(3);
+    history.push(channel_turn_received_record(envelope, Some(session_id), Some(run_id)));
+    history.push(channel_turn_admission_record(
+        envelope,
+        &admission,
+        admission_input,
+        Some(session_id),
+        Some(run_id),
+    ));
+    history.push(channel_turn_admission_terminal_record(
+        envelope,
+        &admission,
+        Some(session_id),
+        Some(run_id),
+    ));
+    for record in history.records() {
+        let actor = if record.event_type == "channel.turn.received" {
+            common_v1::journal_event::EventActor::User as i32
+        } else {
+            common_v1::journal_event::EventActor::System as i32
+        };
+        record_channel_turn_record(state, context, session_id, run_id, actor, record).await;
+    }
+}
+
+fn route_message_response_session_run(
+    response: &gateway_v1::RouteMessageResponse,
+) -> (Option<String>, Option<String>) {
+    (
+        response.session_id.as_ref().map(|value| value.ulid.clone()),
+        response.run_id.as_ref().map(|value| value.ulid.clone()),
+    )
+}
+
+async fn record_channel_turn_delivery_response(
+    state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    envelope: &ChannelTurnEnvelope,
+    response: &gateway_v1::RouteMessageResponse,
+) {
+    let (session_id, run_id) = route_message_response_session_run(response);
+    let delivery = ChannelTurnDeliveryOutcome::from_route_response(
+        response.accepted,
+        response.queued_for_retry,
+        response.outputs.len(),
+        response.decision_reason.as_str(),
+    );
+    record_channel_turn_record(
+        state,
+        context,
+        session_id.as_deref().unwrap_or(envelope.envelope_id.as_str()),
+        run_id.as_deref().unwrap_or(envelope.envelope_id.as_str()),
+        common_v1::journal_event::EventActor::System as i32,
+        channel_turn_delivered_record(
+            envelope,
+            &delivery,
+            session_id.as_deref(),
+            run_id.as_deref(),
+        ),
+    )
+    .await;
+}
+
+async fn record_channel_turn_dispatch_response(
+    state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    envelope: &ChannelTurnEnvelope,
+    route_key: &str,
+    response: &gateway_v1::RouteMessageResponse,
+) {
+    let (session_id, run_id) = route_message_response_session_run(response);
+    let dispatch = ChannelTurnDispatchOutcome::dispatched(route_key.to_owned(), session_id, run_id);
+    record_channel_turn_record(
+        state,
+        context,
+        dispatch.session_id.as_deref().unwrap_or(envelope.envelope_id.as_str()),
+        dispatch.run_id.as_deref().unwrap_or(envelope.envelope_id.as_str()),
+        common_v1::journal_event::EventActor::System as i32,
+        channel_turn_dispatched_record(envelope, &dispatch),
+    )
+    .await;
 }
 
 impl GatewayServiceImpl {
@@ -484,6 +703,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             observed_at_unix_ms,
         };
         let command_parse_outcome = command_registry.parse_text(input.text.as_str());
+        let channel_turn_envelope = build_channel_turn_envelope(
+            &input,
+            &content,
+            json_mode_requested,
+            route_config_hash.as_str(),
+            actor_gateway_principal.as_str(),
+            actor_gateway_device_id.as_str(),
+            observed_at_unix_ms,
+        );
 
         if input.is_direct_message {
             if let Some(pairing_code) = extract_pairing_code_command(input.text.as_str()) {
@@ -746,6 +974,25 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
                 let journal_session_id = Ulid::new().to_string();
                 let journal_run_id = Ulid::new().to_string();
+                let channel_turn_admission_input = build_channel_turn_admission_input(
+                    &input,
+                    &content,
+                    binding_record.as_ref().map(|record| record.binding_id.clone()),
+                    binding_record.as_ref().map(|record| record.binding_kind.as_str().to_owned()),
+                    &command_parse_outcome,
+                    ChannelTurnRouterOutcomeKind::Rejected,
+                    Some(rejection_reason.as_str()),
+                    false,
+                );
+                record_channel_turn_intake_events(
+                    &self.state,
+                    &context,
+                    &channel_turn_envelope,
+                    &channel_turn_admission_input,
+                    journal_session_id.as_str(),
+                    journal_run_id.as_str(),
+                )
+                .await;
                 let _ = record_message_router_journal_event(
                     &self.state,
                     &context,
@@ -813,6 +1060,36 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
                 let journal_session_id = Ulid::new().to_string();
                 let journal_run_id = Ulid::new().to_string();
+                let channel_turn_admission_input = build_channel_turn_admission_input(
+                    &input,
+                    &content,
+                    binding_record.as_ref().map(|record| record.binding_id.clone()),
+                    binding_record.as_ref().map(|record| record.binding_kind.as_str().to_owned()),
+                    &command_parse_outcome,
+                    ChannelTurnRouterOutcomeKind::Queued,
+                    Some(queue_reason.as_str()),
+                    true,
+                );
+                record_channel_turn_intake_events(
+                    &self.state,
+                    &context,
+                    &channel_turn_envelope,
+                    &channel_turn_admission_input,
+                    journal_session_id.as_str(),
+                    journal_run_id.as_str(),
+                )
+                .await;
+                let channel_turn_dispatch =
+                    ChannelTurnDispatchOutcome::queued(queue_reason.clone());
+                record_channel_turn_record(
+                    &self.state,
+                    &context,
+                    journal_session_id.as_str(),
+                    journal_run_id.as_str(),
+                    common_v1::journal_event::EventActor::System as i32,
+                    channel_turn_dispatched_record(&channel_turn_envelope, &channel_turn_dispatch),
+                )
+                .await;
                 let _ = record_message_router_journal_event(
                     &self.state,
                     &context,
@@ -874,6 +1151,16 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             }
             RouteOutcome::Routed(routed) => {
                 let ChannelRoutedMessage { plan, lease: route_lease } = *routed;
+                let channel_turn_admission_input = build_channel_turn_admission_input(
+                    &input,
+                    &content,
+                    binding_record.as_ref().map(|record| record.binding_id.clone()),
+                    binding_record.as_ref().map(|record| record.binding_kind.as_str().to_owned()),
+                    &command_parse_outcome,
+                    ChannelTurnRouterOutcomeKind::Routed,
+                    None,
+                    false,
+                );
                 match command_parse_outcome {
                     ChannelCommandParseOutcome::NotCommand => {}
                     ChannelCommandParseOutcome::Malformed(error) => {
@@ -889,6 +1176,29 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         );
                         let session_id = Ulid::new().to_string();
                         let run_id = Ulid::new().to_string();
+                        record_channel_turn_intake_events(
+                            &self.state,
+                            &context,
+                            &channel_turn_envelope,
+                            &channel_turn_admission_input,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                        )
+                        .await;
+                        let channel_turn_dispatch =
+                            ChannelTurnDispatchOutcome::not_dispatched(response.code.clone());
+                        record_channel_turn_record(
+                            &self.state,
+                            &context,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            common_v1::journal_event::EventActor::System as i32,
+                            channel_turn_dispatched_record(
+                                &channel_turn_envelope,
+                                &channel_turn_dispatch,
+                            ),
+                        )
+                        .await;
                         let _ = record_message_router_journal_event(
                             &self.state,
                             &context,
@@ -899,13 +1209,34 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             response.audit_json.clone(),
                         )
                         .await;
-                        return Ok(Response::new(command_route_response(
+                        let route_response = command_route_response(
                             &input,
                             response.text,
                             response.code,
                             retry_attempt,
                             self.state.channel_router.queue_depth() as u32,
-                        )));
+                        );
+                        let delivery = ChannelTurnDeliveryOutcome::from_route_response(
+                            route_response.accepted,
+                            route_response.queued_for_retry,
+                            route_response.outputs.len(),
+                            route_response.decision_reason.as_str(),
+                        );
+                        record_channel_turn_record(
+                            &self.state,
+                            &context,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            common_v1::journal_event::EventActor::System as i32,
+                            channel_turn_delivered_record(
+                                &channel_turn_envelope,
+                                &delivery,
+                                Some(session_id.as_str()),
+                                Some(run_id.as_str()),
+                            ),
+                        )
+                        .await;
+                        return Ok(Response::new(route_response));
                     }
                     ChannelCommandParseOutcome::Parsed(invocation) => {
                         drop(route_lease);
@@ -943,6 +1274,29 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         }
                         let session_id = Ulid::new().to_string();
                         let run_id = Ulid::new().to_string();
+                        record_channel_turn_intake_events(
+                            &self.state,
+                            &context,
+                            &channel_turn_envelope,
+                            &channel_turn_admission_input,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                        )
+                        .await;
+                        let channel_turn_dispatch =
+                            ChannelTurnDispatchOutcome::not_dispatched(response.code.clone());
+                        record_channel_turn_record(
+                            &self.state,
+                            &context,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            common_v1::journal_event::EventActor::System as i32,
+                            channel_turn_dispatched_record(
+                                &channel_turn_envelope,
+                                &channel_turn_dispatch,
+                            ),
+                        )
+                        .await;
                         let _ = record_message_router_journal_event(
                             &self.state,
                             &context,
@@ -974,13 +1328,34 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                             response.audit_json.clone(),
                         )
                         .await;
-                        return Ok(Response::new(command_route_response(
+                        let route_response = command_route_response(
                             &input,
                             response.text,
                             response.code,
                             retry_attempt,
                             self.state.channel_router.queue_depth() as u32,
-                        )));
+                        );
+                        let delivery = ChannelTurnDeliveryOutcome::from_route_response(
+                            route_response.accepted,
+                            route_response.queued_for_retry,
+                            route_response.outputs.len(),
+                            route_response.decision_reason.as_str(),
+                        );
+                        record_channel_turn_record(
+                            &self.state,
+                            &context,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            common_v1::journal_event::EventActor::System as i32,
+                            channel_turn_delivered_record(
+                                &channel_turn_envelope,
+                                &delivery,
+                                Some(session_id.as_str()),
+                                Some(run_id.as_str()),
+                            ),
+                        )
+                        .await;
+                        return Ok(Response::new(route_response));
                     }
                 }
                 let response = handle_routed_route_message(
@@ -999,6 +1374,31 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     retry_attempt,
                 )
                 .await?;
+                let (session_id, run_id) = route_message_response_session_run(&response);
+                record_channel_turn_intake_events(
+                    &self.state,
+                    &context,
+                    &channel_turn_envelope,
+                    &channel_turn_admission_input,
+                    session_id.as_deref().unwrap_or(channel_turn_envelope.envelope_id.as_str()),
+                    run_id.as_deref().unwrap_or(channel_turn_envelope.envelope_id.as_str()),
+                )
+                .await;
+                record_channel_turn_dispatch_response(
+                    &self.state,
+                    &context,
+                    &channel_turn_envelope,
+                    plan.route_key.as_str(),
+                    &response,
+                )
+                .await;
+                record_channel_turn_delivery_response(
+                    &self.state,
+                    &context,
+                    &channel_turn_envelope,
+                    &response,
+                )
+                .await;
                 drop(route_lease);
                 return Ok(Response::new(response));
             }

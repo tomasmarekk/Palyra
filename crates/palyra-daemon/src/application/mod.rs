@@ -6,6 +6,7 @@
 pub mod approvals;
 pub mod auth;
 pub mod channel_commands;
+pub mod channel_turn;
 pub mod channels;
 pub mod context_compression;
 pub mod context_engine;

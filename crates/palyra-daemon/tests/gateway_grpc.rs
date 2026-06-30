@@ -462,6 +462,30 @@ async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -
             .any(|payload| payload.get("event").and_then(Value::as_str) == Some("message.replied")),
         "router flow should persist message.replied journal event"
     );
+    for event in [
+        "channel.turn.received",
+        "channel.turn.admission_decided",
+        "channel.turn.admitted",
+        "channel.turn.dispatched",
+        "channel.turn.delivered",
+    ] {
+        assert!(
+            message_events
+                .iter()
+                .any(|payload| payload.get("event").and_then(Value::as_str) == Some(event)),
+            "router flow should persist {event} journal event"
+        );
+    }
+    let admission_event = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.admission_decided")
+        })
+        .context("channel-turn admission event should be present")?;
+    assert_eq!(
+        admission_event.pointer("/payload/admission/reason_code").and_then(Value::as_str),
+        Some("channel.admission.dispatch.mention")
+    );
 
     server_handle.join().expect("scripted openai server thread should exit");
     Ok(())
@@ -1423,6 +1447,16 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
                     == Some("no_matching_mention_or_dm_policy")
         }),
         "router rejection flow should persist message.rejected with policy reason"
+    );
+    let dropped_turn = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dropped")
+        })
+        .context("router rejection flow should persist channel.turn.dropped")?;
+    assert_eq!(
+        dropped_turn.pointer("/payload/admission/reason_code").and_then(Value::as_str),
+        Some("channel.admission.drop.router_rejected")
     );
     assert!(
         !message_events
@@ -10906,6 +10940,7 @@ fn load_message_router_journal_events(journal_db_path: &PathBuf) -> Result<Vec<V
             .context("message router journal payload_json must be valid json")?;
         if payload.get("event").and_then(Value::as_str).is_some_and(|event| {
             event.starts_with("message.")
+                || event.starts_with("channel.turn.")
                 || event.starts_with("channel.command.")
                 || event.starts_with("conversation.binding.")
         }) {
