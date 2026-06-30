@@ -1706,6 +1706,97 @@ async fn grpc_route_message_rejects_without_mention_and_records_reason() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_injects_observe_only_channel_context() -> Result<()> {
+    let (openai_base_url, request_bodies, request_count, server_handle) =
+        spawn_scripted_openai_server_with_request_capture(vec![
+            ScriptedOpenAiResponse::immediate(
+                200,
+                r#"{"choices":[{"message":{"content":"provider saw ambient context"}}]}"#
+                    .to_owned(),
+            ),
+        ])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_context_rollouts(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let adapter = FakeChannelAdapter::default();
+    let observe_response = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "Release freeze moves to 18:00 UTC",
+            false,
+            false,
+            ENVELOPE_ID_ALT,
+        )
+        .await?;
+    assert!(!observe_response.accepted);
+    assert_eq!(observe_response.decision_reason, "no_matching_mention_or_dm_policy");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        0,
+        "observe-only channel turns must not call the provider"
+    );
+
+    let dispatch_response = adapter
+        .inject_message_with_envelope_id(
+            &mut client,
+            "@palyra summarize release context",
+            false,
+            false,
+            ENVELOPE_ID,
+        )
+        .await?;
+    assert!(dispatch_response.accepted);
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    let captured_request_bodies =
+        request_bodies.lock().expect("captured request bodies lock should not poison").clone();
+    assert_eq!(captured_request_bodies.len(), 1);
+    assert!(
+        captured_request_bodies[0].contains("Ambient observe-only channel context"),
+        "provider request should include the ambient context segment: {}",
+        captured_request_bodies[0]
+    );
+    assert!(
+        captured_request_bodies[0].contains("Release freeze moves to 18:00 UTC"),
+        "provider request should include the redacted observe-only message: {}",
+        captured_request_bodies[0]
+    );
+    assert!(
+        captured_request_bodies[0].contains("instruction_authority=none"),
+        "ambient context should be marked non-instructional"
+    );
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.admitted")
+                && payload.pointer("/payload/admission/reason_code").and_then(Value::as_str)
+                    == Some("channel.admission.observe.ambient")
+        }),
+        "observe-only admission should be journaled"
+    );
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.history.recorded")
+                && payload.pointer("/payload/history/sequence").and_then(Value::as_u64) == Some(0)
+        }),
+        "observe-only history should be retained for the next dispatch"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_routes_safe_image_attachment_into_provider_vision_input() -> Result<()>
 {
     let (openai_base_url, request_bodies, request_count, server_handle) =
@@ -12003,13 +12094,40 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
     openai_base_url: &str,
     openai_api_key: &str,
 ) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
+        openai_base_url,
+        openai_api_key,
+        &[],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_context_rollouts(
+    openai_base_url: &str,
+    openai_api_key: &str,
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
+    spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
+        openai_base_url,
+        openai_api_key,
+        &[
+            ("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true"),
+            ("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true"),
+        ],
+    )
+}
+
+fn spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
+    openai_base_url: &str,
+    openai_api_key: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<(Child, u16, u16, PathBuf, PathBuf)> {
     let config_path = write_channel_router_config()?;
     let journal_db_path = unique_temp_journal_db_path();
     let identity_store_dir = unique_temp_identity_store_dir();
     let vault_dir = unique_temp_vault_dir();
     prepare_test_vault_dir(&vault_dir)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_palyrad"));
-    let mut child = apply_isolated_daemon_test_env(&mut command, &config_path)
+    let command = apply_isolated_daemon_test_env(&mut command, &config_path);
+    command
         .args([
             "--bind",
             "127.0.0.1",
@@ -12037,7 +12155,11 @@ fn spawn_palyrad_with_openai_provider_and_channel_router(
         .env("PALYRA_MODEL_PROVIDER_RETRY_BACKOFF_MS", "1")
         .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
         .env("PALYRA_MODEL_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS", "30000")
-        .env("PALYRA_MEMORY_AUTO_INJECT_ENABLED", "false")
+        .env("PALYRA_MEMORY_AUTO_INJECT_ENABLED", "false");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

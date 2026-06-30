@@ -24,6 +24,7 @@ use crate::{
         channel_commands::{
             ChannelCommandName, ChannelCommandParseOutcome, ChannelCommandRegistry,
         },
+        channel_turn::ChannelTurnEnvelope,
         conversation_bindings::{
             ConversationBindingCreateRequest, ConversationBindingKind, ConversationBindingLifecycle,
         },
@@ -188,6 +189,7 @@ pub(crate) async fn handle_routed_route_message(
     actor_connector: &str,
     actor_gateway_principal: &str,
     actor_gateway_device_id: &str,
+    channel_turn_envelope: &ChannelTurnEnvelope,
     retry_attempt: u32,
 ) -> Result<gateway_v1::RouteMessageResponse, Status> {
     // Cloned because binding metadata is filled in below for journaling and
@@ -590,6 +592,7 @@ pub(crate) async fn handle_routed_route_message(
             previous_run_id: previous_run_id_for_context.as_deref(),
             parameter_delta_json: None,
             input_text: effective_input_text.as_str(),
+            channel_turn_envelope: Some(channel_turn_envelope),
             attachments: content.attachments.as_slice(),
             provider_kind_hint: Some(routing_decision.provider_kind.as_str()),
             provider_model_id_hint: Some(routing_decision.actual_model_id.as_str()),

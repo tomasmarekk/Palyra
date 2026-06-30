@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::{
     agents::AgentResolveRequest,
+    application::channel_turn::ChannelTurnEnvelope,
     application::context_references::{
         render_context_reference_prompt, ContextReferencePreviewEnvelope,
     },
@@ -247,6 +248,7 @@ pub(crate) struct PrepareModelProviderInputRequest<'a> {
     pub(crate) previous_run_id: Option<&'a str>,
     pub(crate) parameter_delta_json: Option<&'a str>,
     pub(crate) input_text: &'a str,
+    pub(crate) channel_turn_envelope: Option<&'a ChannelTurnEnvelope>,
     pub(crate) attachments: &'a [common_v1::MessageAttachment],
     pub(crate) provider_kind_hint: Option<&'a str>,
     pub(crate) provider_model_id_hint: Option<&'a str>,
@@ -1591,6 +1593,7 @@ async fn prepare_model_provider_input_legacy(
         previous_run_id,
         parameter_delta_json,
         input_text,
+        channel_turn_envelope: _,
         attachments,
         provider_kind_hint: _,
         provider_model_id_hint: _,

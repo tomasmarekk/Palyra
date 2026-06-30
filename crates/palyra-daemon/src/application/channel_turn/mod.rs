@@ -357,6 +357,15 @@ pub(crate) fn decide_channel_turn_admission(
         return ChannelTurnAdmission::new(ChannelAdmissionReason::HandledCommand);
     }
     if input.router_outcome == ChannelTurnRouterOutcomeKind::Rejected {
+        if input.ambient_context_enabled
+            && input.router_reason.as_deref() == Some("no_matching_mention_or_dm_policy")
+            && matches!(
+                input.mention,
+                ChannelTurnMentionState::NotMatched | ChannelTurnMentionState::Unknown
+            )
+        {
+            return ChannelTurnAdmission::new(ChannelAdmissionReason::ObserveAmbient);
+        }
         return ChannelTurnAdmission::new(ChannelAdmissionReason::DropRouterRejected);
     }
     match input.mention {
@@ -648,6 +657,11 @@ impl ChannelHistoryScope {
             sender_handle: envelope.sender.handle.clone(),
         }
     }
+
+    #[must_use]
+    fn matches_envelope(&self, envelope: &ChannelTurnEnvelope) -> bool {
+        self == &Self::from_envelope(envelope)
+    }
 }
 
 /// One redacted channel turn retained for later ambient-context assembly.
@@ -660,6 +674,48 @@ pub(crate) struct ChannelHistoryEntry {
     pub(crate) admission_kind: ChannelTurnAdmissionKind,
     pub(crate) admission_reason_code: String,
     pub(crate) stored_at_unix_ms: i64,
+    pub(crate) redaction_level: String,
+}
+
+/// One redacted observe-only turn selected for model-visible ambient context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelHistoryAmbientContextEntry {
+    pub(crate) sequence: u64,
+    pub(crate) envelope_id: String,
+    pub(crate) sender_handle: Option<String>,
+    pub(crate) received_at_unix_ms: i64,
+    pub(crate) stored_at_unix_ms: i64,
+    pub(crate) admission_reason_code: String,
+    pub(crate) text_preview: String,
+    pub(crate) source_refs: Vec<String>,
+}
+
+impl ChannelHistoryAmbientContextEntry {
+    #[must_use]
+    fn from_record(record: &ChannelHistoryEntry) -> Self {
+        Self {
+            sequence: record.sequence,
+            envelope_id: record.envelope.envelope_id.clone(),
+            sender_handle: record.envelope.sender.handle.clone(),
+            received_at_unix_ms: record.envelope.received_at_unix_ms,
+            stored_at_unix_ms: record.stored_at_unix_ms,
+            admission_reason_code: record.admission_reason_code.clone(),
+            text_preview: record.envelope.message.text_preview.clone(),
+            source_refs: vec![
+                format!("channel_history:sequence:{}", record.sequence),
+                format!("channel_envelope:{}", record.envelope.envelope_id),
+            ],
+        }
+    }
+}
+
+/// Bounded, redacted observe-only history selected for context assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelHistoryAmbientContext {
+    pub(crate) schema_version: u32,
+    pub(crate) scope: ChannelHistoryScope,
+    pub(crate) entries: Vec<ChannelHistoryAmbientContextEntry>,
+    pub(crate) reason_code: String,
     pub(crate) redaction_level: String,
 }
 
@@ -736,8 +792,9 @@ struct ChannelHistoryStoreState {
 /// Bounded in-memory history of redacted channel turns.
 ///
 /// The store intentionally keeps only `ChannelTurnEnvelope` previews and
-/// admission metadata. M21 can read this for ambient context without giving
-/// unmentioned channel chatter instruction authority or persisting raw text.
+/// admission metadata. Context assembly can read this for ambient context
+/// without giving unmentioned channel chatter instruction authority or
+/// persisting raw text.
 #[derive(Debug)]
 pub(crate) struct ChannelHistoryStore {
     max_records: usize,
@@ -803,6 +860,39 @@ impl ChannelHistoryStore {
             self.max_records,
             evicted_count,
         )
+    }
+
+    /// Selects recent observe-only turns from the same channel scope.
+    ///
+    /// The current envelope is excluded so a dispatch turn never re-injects
+    /// its own text through the ambient path.
+    #[must_use]
+    pub(crate) fn ambient_observe_only_context(
+        &self,
+        current_envelope: &ChannelTurnEnvelope,
+        max_entries: usize,
+    ) -> Option<ChannelHistoryAmbientContext> {
+        let scope = ChannelHistoryScope::from_envelope(current_envelope);
+        let limit = max_entries.max(1);
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = guard
+            .records
+            .iter()
+            .rev()
+            .filter(|record| record.admission_kind == ChannelTurnAdmissionKind::ObserveOnly)
+            .filter(|record| record.scope.matches_envelope(current_envelope))
+            .filter(|record| record.envelope.envelope_id != current_envelope.envelope_id)
+            .take(limit)
+            .map(ChannelHistoryAmbientContextEntry::from_record)
+            .collect::<Vec<_>>();
+        entries.reverse();
+        (!entries.is_empty()).then(|| ChannelHistoryAmbientContext {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            scope,
+            entries,
+            reason_code: "channel.history.ambient_context.selected".to_owned(),
+            redaction_level: "redacted_text_preview".to_owned(),
+        })
     }
 
     #[cfg(test)]
@@ -1107,15 +1197,14 @@ mod tests {
 
         let admission = decide_channel_turn_admission(&input);
 
-        assert_eq!(admission.kind, ChannelTurnAdmissionKind::Drop);
+        assert_eq!(admission.kind, ChannelTurnAdmissionKind::ObserveOnly);
         assert!(!admission.model_request_permitted);
+        assert_eq!(admission.reason_code, "channel.admission.observe.ambient");
 
-        input.router_outcome = ChannelTurnRouterOutcomeKind::Routed;
-        input.router_reason = None;
-        let observe = decide_channel_turn_admission(&input);
-        assert_eq!(observe.kind, ChannelTurnAdmissionKind::ObserveOnly);
-        assert!(!observe.model_request_permitted);
-        assert_eq!(observe.reason_code, "channel.admission.observe.ambient");
+        input.router_reason = Some("sender_denied".to_owned());
+        let denied = decide_channel_turn_admission(&input);
+        assert_eq!(denied.kind, ChannelTurnAdmissionKind::Drop);
+        assert_eq!(denied.reason_code, "channel.admission.drop.router_rejected");
     }
 
     #[test]
@@ -1218,6 +1307,45 @@ mod tests {
         let payload = channel_turn_history_record(&envelope, &decision, None, None).payload_json();
         assert_eq!(payload["event"], CHANNEL_HISTORY_SKIPPED_EVENT);
         assert_eq!(payload["payload"]["history_kind"], "skipped");
+    }
+
+    #[test]
+    fn channel_history_selects_recent_observe_only_context_by_scope() {
+        let store = ChannelHistoryStore::new(4);
+        let mut input = admission_input();
+        input.mention = ChannelTurnMentionState::NotMatched;
+        input.router_outcome = ChannelTurnRouterOutcomeKind::Rejected;
+        input.router_reason = Some("no_matching_mention_or_dm_policy".to_owned());
+        input.ambient_context_enabled = true;
+        let observe = decide_channel_turn_admission(&input);
+        assert_eq!(observe.kind, ChannelTurnAdmissionKind::ObserveOnly);
+
+        let mut first = envelope();
+        first.envelope_id = "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned();
+        first.message.text_preview = "ambient one".to_owned();
+        let mut second = envelope();
+        second.envelope_id = "01ARZ3NDEKTSV4RRFFQ69G5FB1".to_owned();
+        second.message.text_preview = "ambient two".to_owned();
+        let mut other_sender = envelope();
+        other_sender.envelope_id = "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned();
+        other_sender.sender.handle = Some("U999".to_owned());
+        other_sender.message.text_preview = "different sender".to_owned();
+        let current = envelope();
+
+        store.record(&first, &observe, 10);
+        store.record(&second, &observe, 20);
+        store.record(&other_sender, &observe, 30);
+        let context =
+            store.ambient_observe_only_context(&current, 1).expect("matching context should exist");
+
+        assert_eq!(context.reason_code, "channel.history.ambient_context.selected");
+        assert_eq!(context.entries.len(), 1);
+        assert_eq!(context.entries[0].text_preview, "ambient two");
+        assert_eq!(context.entries[0].source_refs[0], "channel_history:sequence:1");
+        let serialized = serde_json::to_string(&context).expect("ambient context should serialize");
+        let roundtrip: ChannelHistoryAmbientContext =
+            serde_json::from_str(serialized.as_str()).expect("ambient context should deserialize");
+        assert_eq!(roundtrip, context);
     }
 
     #[test]

@@ -1688,6 +1688,7 @@ pub(crate) async fn process_run_stream_message(
             previous_run_id: previous_run_id_for_context.as_deref(),
             parameter_delta_json: parameter_delta_json.as_deref(),
             input_text: input_text.as_str(),
+            channel_turn_envelope: None,
             attachments: input_content.attachments.as_slice(),
             provider_kind_hint: Some(lease_provider_kind.as_str()),
             provider_model_id_hint: provider_model_override

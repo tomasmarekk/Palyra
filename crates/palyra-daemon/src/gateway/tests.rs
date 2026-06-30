@@ -82,6 +82,11 @@ use crate::application::tool_security::ToolProposalBackendSelection;
 use crate::application::{
     approvals::{apply_tool_approval_outcome, approval_risk_for_tool},
     auth::record_auth_refresh_journal_event,
+    channel_turn::{
+        decide_channel_turn_admission, ChannelTurnAdmissionInput, ChannelTurnBindingFacts,
+        ChannelTurnBotFacts, ChannelTurnEnvelope, ChannelTurnEnvelopeInput, ChannelTurnMediaFacts,
+        ChannelTurnMentionState, ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
+    },
     memory::{
         enforce_memory_item_scope, memory_item_message, memory_search_hit_message,
         redact_memory_text_for_output,
@@ -2526,6 +2531,7 @@ async fn prepare_model_provider_input_collects_vision_inputs_for_image_attachmen
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: "summarize screenshot",
+            channel_turn_envelope: None,
             attachments: attachments.as_slice(),
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -2627,6 +2633,7 @@ async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows()
             previous_run_id: None,
             parameter_delta_json: None,
             input_text,
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -2681,6 +2688,7 @@ async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows()
             previous_run_id: None,
             parameter_delta_json: None,
             input_text,
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -2725,6 +2733,166 @@ async fn prepare_model_provider_input_supports_legacy_and_context_engine_flows()
             .iter()
             .any(|segment| { segment.get("kind").and_then(Value::as_str) == Some("user_input") })),
         "plan explain payload should surface the selected user input segment"
+    );
+}
+
+fn channel_turn_envelope_for_context_test(envelope_id: &str, text: &str) -> ChannelTurnEnvelope {
+    ChannelTurnEnvelope::from_input(ChannelTurnEnvelopeInput {
+        envelope_id: envelope_id.to_owned(),
+        channel: "cli".to_owned(),
+        conversation_id: Some("C01".to_owned()),
+        thread_id: Some("T01".to_owned()),
+        sender_handle: Some("U123".to_owned()),
+        sender_display: Some("Ops User".to_owned()),
+        sender_verified: true,
+        gateway_principal: "user:ops".to_owned(),
+        gateway_device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        text: text.to_owned(),
+        max_payload_bytes: 4_096,
+        is_direct_message: false,
+        requested_broadcast: false,
+        adapter_message_id: Some(format!("msg-{envelope_id}")),
+        retry_attempt: 0,
+        attachment_count: 0,
+        json_mode_requested: false,
+        route_config_hash: "route-hash".to_owned(),
+        received_at_unix_ms: 1_800_000_000_000,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn context_engine_injects_observe_only_channel_history() {
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        channel: Some("cli".to_owned()),
+    };
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FC1";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FC2";
+    let state = build_test_runtime_state_with_runtime_overrides(
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig {
+            context_engine: palyra_common::feature_rollouts::FeatureRolloutSetting::from_config(
+                true,
+            ),
+            channel_turn_kernel:
+                palyra_common::feature_rollouts::FeatureRolloutSetting::from_config(true),
+            ..crate::config::FeatureRolloutsConfig::default()
+        },
+    );
+    upsert_test_orchestrator_session(&state, &context, session_id);
+    state
+        .journal_store
+        .start_orchestrator_run(&OrchestratorRunStartRequest {
+            run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
+            origin_kind: String::new(),
+            origin_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+        })
+        .expect("context-engine run should start");
+
+    let observe_envelope = channel_turn_envelope_for_context_test(
+        "01ARZ3NDEKTSV4RRFFQ69G5FC3",
+        "Release freeze moves to 18:00 UTC",
+    );
+    let observe_input = ChannelTurnAdmissionInput {
+        mention: ChannelTurnMentionState::NotMatched,
+        bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+        policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
+        binding: ChannelTurnBindingFacts {
+            binding_id: None,
+            binding_kind: None,
+            binding_present: false,
+        },
+        media: ChannelTurnMediaFacts { attachment_count: 0, has_media: false },
+        router_outcome: ChannelTurnRouterOutcomeKind::Rejected,
+        router_reason: Some("no_matching_mention_or_dm_policy".to_owned()),
+        queued_for_retry: false,
+        is_channel_command: false,
+        urgent_command: false,
+        ambient_context_enabled: true,
+    };
+    let observe_admission = decide_channel_turn_admission(&observe_input);
+    state.channel_turn_history.record(&observe_envelope, &observe_admission, 1_800_000_000_100);
+
+    let current_envelope = channel_turn_envelope_for_context_test(
+        "01ARZ3NDEKTSV4RRFFQ69G5FC4",
+        "@palyra summarize current release context",
+    );
+    let mut tape_seq = 1_i64;
+    let prepared = prepare_model_provider_input(
+        &state,
+        &context,
+        PrepareModelProviderInputRequest {
+            run_id,
+            tape_seq: &mut tape_seq,
+            session_id,
+            previous_run_id: None,
+            parameter_delta_json: None,
+            input_text: "@palyra summarize current release context",
+            channel_turn_envelope: Some(&current_envelope),
+            attachments: &[],
+            provider_kind_hint: None,
+            provider_model_id_hint: None,
+            tool_catalog_snapshot: None,
+            memory_ingest_reason: "context_engine_ambient_observe_only_test",
+            memory_prompt_failure_mode: MemoryPromptFailureMode::Fail,
+            channel_for_log: "cli",
+        },
+    )
+    .await
+    .expect("context engine should inject observe-only channel context");
+
+    assert!(
+        prepared.provider_input_text.contains("Ambient observe-only channel context"),
+        "provider text should include the ambient context header: {}",
+        prepared.provider_input_text
+    );
+    assert!(
+        prepared.provider_input_text.contains("Release freeze moves to 18:00 UTC"),
+        "provider text should include the redacted observe-only preview: {}",
+        prepared.provider_input_text
+    );
+    assert!(
+        prepared.provider_input_text.contains("instruction_authority=none"),
+        "ambient context must be labeled as non-instructional"
+    );
+
+    let tape = state.journal_store.orchestrator_tape(run_id).expect("test tape should load");
+    let plan_event = tape
+        .iter()
+        .find(|event| event.event_type == "context.engine.plan")
+        .expect("context engine should emit an assembly plan");
+    let payload: Value =
+        serde_json::from_str(plan_event.payload_json.as_str()).expect("plan payload should decode");
+    let reason_codes = payload.get("reason_codes").and_then(Value::as_array).expect("reason codes");
+    assert!(
+        reason_codes
+            .iter()
+            .any(|reason| reason.as_str() == Some("ambient_observe_only_context_injected")),
+        "plan should explain ambient context injection: {payload}"
+    );
+    let selected_segments =
+        payload.get("selected_segments").and_then(Value::as_array).expect("segments");
+    let ambient_segment = selected_segments
+        .iter()
+        .find(|segment| {
+            segment.get("kind").and_then(Value::as_str) == Some("channel_ambient_context")
+        })
+        .expect("ambient channel segment should be selected");
+    assert_eq!(ambient_segment.get("source_kind").and_then(Value::as_str), Some("channel_history"));
+    assert_eq!(
+        ambient_segment.get("trust_label").and_then(Value::as_str),
+        Some("external_untrusted")
+    );
+    assert!(
+        ambient_segment.get("source_refs").and_then(Value::as_array).is_some_and(|refs| refs
+            .iter()
+            .any(|value| { value.as_str() == Some("channel_history:sequence:0") })),
+        "ambient segment should expose source refs for audit: {ambient_segment}"
     );
 }
 
@@ -2786,6 +2954,7 @@ async fn prepare_model_provider_input_fallback_mode_returns_raw_input_when_tape_
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: "rollback checklist",
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -2845,6 +3014,7 @@ async fn prepare_model_provider_input_fail_mode_propagates_tape_append_error() {
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: "rollback checklist",
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -3039,6 +3209,7 @@ async fn default_memory_auto_inject_adds_manual_preference_to_fresh_session_prom
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: "Create a small regression-testing utility in the sandbox. Answer in one concise sentence. Do not use tools unless needed.",
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -3119,6 +3290,7 @@ async fn memory_auto_inject_does_not_use_broad_ui_query_expansion() {
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: "Please explain browser privacy in one sentence.",
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,
@@ -3201,6 +3373,7 @@ async fn sparse_ui_smoke_recall_uses_replaced_durable_preference() {
             previous_run_id: None,
             parameter_delta_json: None,
             input_text: sparse_prompt,
+            channel_turn_envelope: None,
             attachments: &[],
             provider_kind_hint: None,
             provider_model_id_hint: None,

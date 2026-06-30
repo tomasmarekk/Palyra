@@ -29,6 +29,7 @@ use tracing::warn;
 
 use crate::{
     application::{
+        channel_turn::{ChannelHistoryAmbientContext, ChannelTurnEnvelope},
         context_compression::{shrink_json_value, JsonShrinkConfig},
         context_references::{render_context_reference_block, ContextReferencePreviewEnvelope},
         instruction_compiler::{
@@ -73,6 +74,7 @@ const CONTEXT_BUDGET_SAFETY_MARGIN_TOKENS: u64 = 256;
 const TOOL_SCHEMA_BASE_OVERHEAD_TOKENS: u64 = 24;
 const TOOL_SCHEMA_PER_TOOL_OVERHEAD_TOKENS: u64 = 12;
 const SEGMENT_PREVIEW_CHARS: usize = 180;
+const AMBIENT_OBSERVE_ONLY_CONTEXT_MAX_TURNS: usize = 4;
 /// Orchestrator tape event type under which the assembly trace is journaled.
 pub(crate) const CONTEXT_ENGINE_PLAN_EVENT: &str = "context.engine.plan";
 /// Schema version stamped into [`ContextEngineExplain`] and its trace hash.
@@ -122,6 +124,7 @@ pub(crate) enum ContextSegmentKind {
     AttachmentRecall,
     ExplicitRecall,
     MemoryRecall,
+    ChannelAmbientContext,
     SessionTail,
     ToolExchange,
     UserInput,
@@ -140,6 +143,7 @@ impl ContextSegmentKind {
             Self::AttachmentRecall => "attachment_recall",
             Self::ExplicitRecall => "explicit_recall",
             Self::MemoryRecall => "memory_recall",
+            Self::ChannelAmbientContext => "channel_ambient_context",
             Self::SessionTail => "session_tail",
             Self::ToolExchange => "tool_exchange",
             Self::UserInput => "user_input",
@@ -162,6 +166,7 @@ pub(crate) enum ContextSourceKind {
     Workspace,
     Memory,
     Retrieval,
+    ChannelHistory,
     Attachment,
     ToolResult,
 }
@@ -314,6 +319,7 @@ struct ContextSegment {
     trust_label: TrustLabel,
     safety_action: SafetyAction,
     safety_findings: Vec<String>,
+    source_refs: Vec<String>,
 }
 
 impl ContextSegment {
@@ -339,6 +345,7 @@ impl ContextSegment {
             trust_label: TrustLabel::TrustedLocal,
             safety_action: SafetyAction::Allow,
             safety_findings: Vec::new(),
+            source_refs: Vec::new(),
         }
     }
 
@@ -353,6 +360,11 @@ impl ContextSegment {
         self.trust_label = trust_label;
         self.safety_action = safety_action;
         self.safety_findings = safety_findings;
+        self
+    }
+
+    fn with_source_refs(mut self, source_refs: Vec<String>) -> Self {
+        self.source_refs = source_refs;
         self
     }
 
@@ -379,6 +391,7 @@ impl ContextSegment {
             trust_label: TrustLabel::TrustedLocal,
             safety_action: SafetyAction::Allow,
             safety_findings: Vec::new(),
+            source_refs: Vec::new(),
         }
     }
 }
@@ -475,6 +488,7 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         previous_run_id,
         parameter_delta_json,
         input_text,
+        channel_turn_envelope,
         attachments,
         provider_kind_hint,
         provider_model_id_hint,
@@ -692,6 +706,12 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
                 None,
             ),
         );
+    }
+
+    if let Some(segment) =
+        build_ambient_observe_only_channel_segment(runtime_state, channel_turn_envelope)
+    {
+        push_segment(&mut segments, segment);
     }
 
     push_segment(
@@ -1305,6 +1325,12 @@ fn context_assembly_reason_codes(
     if selected.iter().any(|segment| !segment.safety_findings.is_empty()) {
         reasons.push("prompt_injection_signal_present".to_owned());
     }
+    if selected.iter().any(|segment| segment.kind == ContextSegmentKind::ChannelAmbientContext) {
+        reasons.push("ambient_observe_only_context_injected".to_owned());
+    }
+    if dropped.iter().any(|segment| segment.kind == ContextSegmentKind::ChannelAmbientContext) {
+        reasons.push("ambient_observe_only_context_dropped_by_budget".to_owned());
+    }
     if let Some(summary_quality) = summary_quality {
         reasons.push(format!("summary_quality_{}", summary_quality.verdict));
         reasons.extend(summary_quality.reasons.iter().cloned());
@@ -1832,6 +1858,84 @@ fn clean_segment_content(raw: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+fn build_ambient_observe_only_channel_segment(
+    runtime_state: &GatewayRuntimeState,
+    channel_turn_envelope: Option<&ChannelTurnEnvelope>,
+) -> Option<ContextSegment> {
+    if !runtime_state.config.feature_rollouts.channel_turn_kernel.enabled {
+        return None;
+    }
+    let envelope = channel_turn_envelope?;
+    let ambient_context = runtime_state
+        .channel_turn_history
+        .ambient_observe_only_context(envelope, AMBIENT_OBSERVE_ONLY_CONTEXT_MAX_TURNS)?;
+    let content = render_ambient_observe_only_channel_context(&ambient_context)?;
+    let transformed = transform_text_for_prompt(
+        content.as_str(),
+        SafetySourceKind::Webhook,
+        SafetyContentKind::PlainText,
+        TrustLabel::ExternalUntrusted,
+    );
+    let source_refs = ambient_context
+        .entries
+        .iter()
+        .flat_map(|entry| entry.source_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    Some(
+        ContextSegment::trusted(
+            ContextSegmentKind::ChannelAmbientContext,
+            "channel_ambient_observe_only",
+            transformed.transformed_text,
+            58,
+            false,
+            false,
+            Some("channel_history:ambient_observe_only".to_owned()),
+        )
+        .with_safety(
+            transformed.scan.trust_label,
+            transformed.scan.recommended_action,
+            transformed.scan.finding_codes(),
+        )
+        .with_source_refs(source_refs),
+    )
+}
+
+fn render_ambient_observe_only_channel_context(
+    ambient_context: &ChannelHistoryAmbientContext,
+) -> Option<String> {
+    if ambient_context.entries.is_empty() {
+        return None;
+    }
+    let entries = ambient_context
+        .entries
+        .iter()
+        .map(render_ambient_observe_only_entry)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Ambient observe-only channel context (redacted; instruction_authority=none; reason_code={}):\n{entries}",
+        ambient_context.reason_code
+    ))
+}
+
+fn render_ambient_observe_only_entry(
+    entry: &crate::application::channel_turn::ChannelHistoryAmbientContextEntry,
+) -> String {
+    let sender = entry.sender_handle.as_deref().unwrap_or("unknown");
+    let text_preview = serde_json::to_string(entry.text_preview.as_str())
+        .unwrap_or_else(|_| "\"<unrenderable>\"".to_owned());
+    format!(
+        "- sequence={} envelope={} sender={} received_at_unix_ms={} stored_at_unix_ms={} admission={} text_preview={}",
+        entry.sequence,
+        entry.envelope_id,
+        sender,
+        entry.received_at_unix_ms,
+        entry.stored_at_unix_ms,
+        entry.admission_reason_code,
+        text_preview
+    )
+}
+
 /// Trace-safe segment preview plus the redaction label describing how it
 /// was sanitized.
 #[derive(Debug, Clone)]
@@ -1889,6 +1993,7 @@ fn source_refs_for_segment(segment: &ContextSegment) -> Vec<String> {
     if let Some(group_id) = segment.group_id.as_deref() {
         refs.push(format!("group:{group_id}"));
     }
+    refs.extend(segment.source_refs.iter().cloned());
     refs
 }
 
@@ -1905,6 +2010,7 @@ fn assembly_step_for_kind(kind: ContextSegmentKind) -> &'static str {
         }
         ContextSegmentKind::ContextReferences => "active_task",
         ContextSegmentKind::MemoryRecall => "memory",
+        ContextSegmentKind::ChannelAmbientContext => "channel_history",
         ContextSegmentKind::ToolExchange => "tool_previews",
         ContextSegmentKind::AttachmentRecall => "artifact_refs",
         ContextSegmentKind::ExplicitRecall | ContextSegmentKind::SessionTail => {
@@ -1927,6 +2033,7 @@ fn source_kind_for_segment(segment: &ContextSegment) -> ContextSourceKind {
         ContextSegmentKind::ContextReferences
         | ContextSegmentKind::ExplicitRecall
         | ContextSegmentKind::SessionTail => ContextSourceKind::Retrieval,
+        ContextSegmentKind::ChannelAmbientContext => ContextSourceKind::ChannelHistory,
         ContextSegmentKind::AttachmentRecall => ContextSourceKind::Attachment,
         ContextSegmentKind::ToolExchange => ContextSourceKind::ToolResult,
         ContextSegmentKind::UserInput => ContextSourceKind::User,

@@ -181,6 +181,19 @@ fn channel_turn_mention_state(
     ChannelTurnMentionState::Unknown
 }
 
+fn channel_turn_ambient_context_enabled(
+    state: &GatewayRuntimeState,
+    input: &ChannelInboundMessage,
+    router_outcome: ChannelTurnRouterOutcomeKind,
+    router_reason: Option<&str>,
+) -> bool {
+    state.config.feature_rollouts.channel_turn_kernel.enabled
+        && router_outcome == ChannelTurnRouterOutcomeKind::Rejected
+        && router_reason == Some("no_matching_mention_or_dm_policy")
+        && !input.is_direct_message
+        && !input.requested_broadcast
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_channel_turn_admission_input(
     input: &ChannelInboundMessage,
@@ -191,6 +204,7 @@ fn build_channel_turn_admission_input(
     router_outcome: ChannelTurnRouterOutcomeKind,
     router_reason: Option<&str>,
     queued_for_retry: bool,
+    ambient_context_enabled: bool,
 ) -> ChannelTurnAdmissionInput {
     let (is_channel_command, urgent_command) = channel_turn_command_facts(command_parse_outcome);
     ChannelTurnAdmissionInput {
@@ -211,7 +225,7 @@ fn build_channel_turn_admission_input(
         queued_for_retry,
         is_channel_command,
         urgent_command,
-        ambient_context_enabled: false,
+        ambient_context_enabled,
     }
 }
 
@@ -976,6 +990,12 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
         match self.state.channel_router.begin_route(&input) {
             RouteOutcome::Rejected(rejection) => {
                 let rejection_reason = rejection.reason.clone();
+                let ambient_context_enabled = channel_turn_ambient_context_enabled(
+                    self.state.as_ref(),
+                    &input,
+                    ChannelTurnRouterOutcomeKind::Rejected,
+                    Some(rejection_reason.as_str()),
+                );
                 self.state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
                 if rejection.quarantined {
                     self.state
@@ -998,6 +1018,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     ChannelTurnRouterOutcomeKind::Rejected,
                     Some(rejection_reason.as_str()),
                     false,
+                    ambient_context_enabled,
                 );
                 record_channel_turn_intake_events(
                     &self.state,
@@ -1084,6 +1105,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     ChannelTurnRouterOutcomeKind::Queued,
                     Some(queue_reason.as_str()),
                     true,
+                    false,
                 );
                 record_channel_turn_intake_events(
                     &self.state,
@@ -1174,6 +1196,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     &command_parse_outcome,
                     ChannelTurnRouterOutcomeKind::Routed,
                     None,
+                    false,
                     false,
                 );
                 match command_parse_outcome {
@@ -1386,6 +1409,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     actor_connector.as_str(),
                     actor_gateway_principal.as_str(),
                     actor_gateway_device_id.as_str(),
+                    &channel_turn_envelope,
                     retry_attempt,
                 )
                 .await?;
