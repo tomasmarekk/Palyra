@@ -35,6 +35,7 @@
     "progress_drafts",
     "rate_limits",
     "replay_continuity",
+    "routine_capability_profile",
     "runtime_controls",
     "runtime_health",
     "runtime_roadmap",

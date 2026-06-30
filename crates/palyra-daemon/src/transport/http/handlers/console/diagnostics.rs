@@ -152,6 +152,8 @@ pub(crate) async fn console_diagnostics_handler(
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
     let commitment_inference_payload = collect_console_commitment_inference_diagnostics();
     let heartbeat_delivery_payload = collect_console_heartbeat_delivery_diagnostics();
+    let routine_capability_profile_payload =
+        collect_console_routine_capability_profile_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut turn_control_payload, None);
@@ -310,6 +312,7 @@ pub(crate) async fn console_diagnostics_handler(
         "replay_continuity": replay_continuity_payload,
         "commitment_inference": commitment_inference_payload,
         "heartbeat_delivery": heartbeat_delivery_payload,
+        "routine_capability_profile": routine_capability_profile_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
@@ -1774,6 +1777,29 @@ fn collect_console_heartbeat_delivery_diagnostics() -> Value {
         ],
         "redaction_level": crate::routines::HEARTBEAT_DELIVERY_REDACTION_LEVEL,
         "runtime_behavior": "observe_only_no_dispatch_or_delivery_side_effects",
+    })
+}
+
+/// Summarizes the observe-only unattended routine capability profile contract.
+fn collect_console_routine_capability_profile_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::routines::ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION,
+        "rollout_mode": crate::routines::ROUTINE_CAPABILITY_PROFILE_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "routine_definition_read_model",
+        "read_model_endpoint": "/console/v1/routines",
+        "event_types": {
+            "started": crate::routines::ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED,
+            "completed": crate::routines::ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED,
+            "failed": crate::routines::ROUTINE_CAPABILITY_PROFILE_EVENT_FAILED,
+        },
+        "inputs": [
+            "routine.trigger_kind",
+            "routine.execution.run_mode",
+            "routine.execution.execution_posture",
+            "routine.approval_policy.mode",
+        ],
+        "redaction_level": crate::routines::ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL,
+        "runtime_behavior": "observe_only_no_dispatch_or_approval_side_effects",
     })
 }
 

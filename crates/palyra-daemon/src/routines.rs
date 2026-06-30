@@ -66,6 +66,15 @@ pub const HEARTBEAT_DELIVERY_EVENT_FAILED: &str =
     "heartbeat_delivery_pres_routines_cron_a_objectives.failed";
 pub const HEARTBEAT_DELIVERY_ROLLOUT_OBSERVE_ONLY: &str = "observe_only_read_model";
 pub const HEARTBEAT_DELIVERY_REDACTION_LEVEL: &str = "metadata_only";
+pub const ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION: u64 = 1;
+pub const ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED: &str =
+    "routinecapabilityprofile_pro_unattended_behy.started";
+pub const ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED: &str =
+    "routinecapabilityprofile_pro_unattended_behy.completed";
+pub const ROUTINE_CAPABILITY_PROFILE_EVENT_FAILED: &str =
+    "routinecapabilityprofile_pro_unattended_behy.failed";
+pub const ROUTINE_CAPABILITY_PROFILE_ROLLOUT_OBSERVE_ONLY: &str = "observe_only_read_model";
+pub const ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL: &str = "metadata_only";
 /// Poll interval applied when a file-watch trigger payload omits `poll_interval_ms`.
 pub const DEFAULT_FILE_WATCH_POLL_INTERVAL_MS: u64 = 30 * 1_000;
 /// Lower bound for file-watch polling; faster polling is rejected at validation time.
@@ -864,6 +873,151 @@ pub fn routine_allows_sensitive_tools(
 ) -> bool {
     execution.execution_posture == RoutineExecutionPosture::SensitiveTools
         && approval_policy.mode != RoutineApprovalMode::None
+}
+
+/// Routine capability posture projected for unattended run review.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineCapabilityProfileDecision {
+    Interactive,
+    UnattendedReady,
+    ApprovalGated,
+    ReviewRequired,
+}
+
+/// Stable reason code for routine capability profile projections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoutineCapabilityProfileReasonCode {
+    #[serde(rename = "routine_capability_profile.manual_interactive")]
+    ManualInteractive,
+    #[serde(rename = "routine_capability_profile.fresh_session_unattended")]
+    FreshSessionUnattended,
+    #[serde(rename = "routine_capability_profile.sensitive_tools_approval_gated")]
+    SensitiveToolsApprovalGated,
+    #[serde(rename = "routine_capability_profile.sensitive_tools_missing_approval")]
+    SensitiveToolsMissingApproval,
+    #[serde(rename = "routine_capability_profile.same_session_unattended_review")]
+    SameSessionUnattendedReview,
+}
+
+/// Event names attached to routine capability profile projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineCapabilityProfileEventTypes {
+    pub started: String,
+    pub completed: String,
+    pub failed: String,
+}
+
+/// Metadata-only profile explaining unattended routine execution posture.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineCapabilityProfileProjection {
+    pub schema_version: u64,
+    pub rollout_mode: String,
+    pub profile_id: String,
+    pub decision: RoutineCapabilityProfileDecision,
+    pub reason_code: RoutineCapabilityProfileReasonCode,
+    pub trigger_kind: String,
+    pub run_mode: String,
+    pub execution_posture: String,
+    pub approval_mode: String,
+    pub unattended_trigger: bool,
+    pub allow_sensitive_tools: bool,
+    pub event_types: RoutineCapabilityProfileEventTypes,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Builds the observe-only capability profile for a routine definition.
+#[must_use]
+pub fn routine_capability_profile_projection(
+    trigger_kind: RoutineTriggerKind,
+    execution: &RoutineExecutionConfig,
+    approval_policy: &RoutineApprovalPolicy,
+) -> RoutineCapabilityProfileProjection {
+    let unattended_trigger = routine_trigger_is_unattended(trigger_kind);
+    let allow_sensitive_tools = routine_allows_sensitive_tools(execution, approval_policy);
+    let (decision, reason_code) = routine_capability_profile_decision(
+        unattended_trigger,
+        execution.run_mode,
+        execution.execution_posture,
+        approval_policy.mode,
+    );
+    RoutineCapabilityProfileProjection {
+        schema_version: ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION,
+        rollout_mode: ROUTINE_CAPABILITY_PROFILE_ROLLOUT_OBSERVE_ONLY.to_owned(),
+        profile_id: format!(
+            "{}:{}:{}:{}",
+            trigger_kind.as_str(),
+            execution.run_mode.as_str(),
+            execution.execution_posture.as_str(),
+            approval_policy.mode.as_str()
+        ),
+        decision,
+        reason_code,
+        trigger_kind: trigger_kind.as_str().to_owned(),
+        run_mode: execution.run_mode.as_str().to_owned(),
+        execution_posture: execution.execution_posture.as_str().to_owned(),
+        approval_mode: approval_policy.mode.as_str().to_owned(),
+        unattended_trigger,
+        allow_sensitive_tools,
+        event_types: routine_capability_profile_event_types(),
+        evidence_refs: vec![
+            "routine.trigger_kind".to_owned(),
+            "routine.execution".to_owned(),
+            "routine.approval_policy".to_owned(),
+        ],
+        redaction_level: ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn routine_capability_profile_decision(
+    unattended_trigger: bool,
+    run_mode: RoutineRunMode,
+    execution_posture: RoutineExecutionPosture,
+    approval_mode: RoutineApprovalMode,
+) -> (RoutineCapabilityProfileDecision, RoutineCapabilityProfileReasonCode) {
+    if execution_posture == RoutineExecutionPosture::SensitiveTools {
+        if approval_mode == RoutineApprovalMode::None {
+            return (
+                RoutineCapabilityProfileDecision::ReviewRequired,
+                RoutineCapabilityProfileReasonCode::SensitiveToolsMissingApproval,
+            );
+        }
+        return (
+            RoutineCapabilityProfileDecision::ApprovalGated,
+            RoutineCapabilityProfileReasonCode::SensitiveToolsApprovalGated,
+        );
+    }
+    if unattended_trigger && run_mode == RoutineRunMode::SameSession {
+        return (
+            RoutineCapabilityProfileDecision::ReviewRequired,
+            RoutineCapabilityProfileReasonCode::SameSessionUnattendedReview,
+        );
+    }
+    if unattended_trigger {
+        return (
+            RoutineCapabilityProfileDecision::UnattendedReady,
+            RoutineCapabilityProfileReasonCode::FreshSessionUnattended,
+        );
+    }
+    (
+        RoutineCapabilityProfileDecision::Interactive,
+        RoutineCapabilityProfileReasonCode::ManualInteractive,
+    )
+}
+
+fn routine_trigger_is_unattended(trigger_kind: RoutineTriggerKind) -> bool {
+    !matches!(trigger_kind, RoutineTriggerKind::Manual)
+}
+
+fn routine_capability_profile_event_types() -> RoutineCapabilityProfileEventTypes {
+    RoutineCapabilityProfileEventTypes {
+        started: ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED.to_owned(),
+        completed: ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED.to_owned(),
+        failed: ROUTINE_CAPABILITY_PROFILE_EVENT_FAILED.to_owned(),
+    }
 }
 
 /// Applies the routine schedule auto-enable guard to an approval policy.
@@ -3367,20 +3521,24 @@ mod tests {
         heartbeat_delivery_journal_projection, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
         resolve_routines_root, routine_allows_sensitive_tools,
-        routine_approval_policy_with_auto_enable_guard, routine_delivery_contract,
-        routine_delivery_preview, routine_retention_dry_run, routine_run_lifecycle_snapshot,
-        routine_runtime_backfill_plan, schedule_requires_auto_enable_guard,
-        shadow_manual_schedule_payload_json, validate_routine_export_bundle,
-        validate_routine_prompt_self_contained, HeartbeatDeliveryDecision,
-        HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode, RoutineApprovalGateState,
-        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig,
-        RoutineDeliveryContractKind, RoutineDeliveryMode, RoutineExecutionConfig,
-        RoutineExecutionPosture, RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy,
-        RoutineRunLeaseState, RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode,
-        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
-        HEARTBEAT_DELIVERY_EVENT_COMPLETED, HEARTBEAT_DELIVERY_EVENT_STARTED,
-        HEARTBEAT_DELIVERY_REDACTION_LEVEL, HEARTBEAT_DELIVERY_SCHEMA_VERSION,
-        MIN_AUTO_ENABLE_EVERY_INTERVAL_MS, ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
+        routine_approval_policy_with_auto_enable_guard, routine_capability_profile_projection,
+        routine_delivery_contract, routine_delivery_preview, routine_retention_dry_run,
+        routine_run_lifecycle_snapshot, routine_runtime_backfill_plan,
+        schedule_requires_auto_enable_guard, shadow_manual_schedule_payload_json,
+        validate_routine_export_bundle, validate_routine_prompt_self_contained,
+        HeartbeatDeliveryDecision, HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode,
+        RoutineApprovalGateState, RoutineApprovalMode, RoutineApprovalPolicy,
+        RoutineCapabilityProfileDecision, RoutineCapabilityProfileProjection,
+        RoutineCapabilityProfileReasonCode, RoutineDeliveryConfig, RoutineDeliveryContractKind,
+        RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
+        RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
+        RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
+        RoutineSilentPolicy, RoutineTriggerKind, HEARTBEAT_DELIVERY_EVENT_COMPLETED,
+        HEARTBEAT_DELIVERY_EVENT_STARTED, HEARTBEAT_DELIVERY_REDACTION_LEVEL,
+        HEARTBEAT_DELIVERY_SCHEMA_VERSION, MIN_AUTO_ENABLE_EVERY_INTERVAL_MS,
+        ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED, ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED,
+        ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL, ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION,
+        ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
     };
     use crate::{
         cron::CronTimezoneMode,
@@ -3813,6 +3971,76 @@ mod tests {
         );
 
         assert_eq!(guarded.mode, RoutineApprovalMode::BeforeEnable);
+    }
+
+    #[test]
+    fn routine_capability_profile_marks_fresh_unattended_as_ready() {
+        let execution = RoutineExecutionConfig {
+            run_mode: RoutineRunMode::FreshSession,
+            ..RoutineExecutionConfig::default()
+        };
+
+        let profile = routine_capability_profile_projection(
+            RoutineTriggerKind::Schedule,
+            &execution,
+            &RoutineApprovalPolicy::default(),
+        );
+
+        assert_eq!(profile.schema_version, ROUTINE_CAPABILITY_PROFILE_SCHEMA_VERSION);
+        assert_eq!(profile.decision, RoutineCapabilityProfileDecision::UnattendedReady);
+        assert_eq!(profile.reason_code, RoutineCapabilityProfileReasonCode::FreshSessionUnattended);
+        assert!(profile.unattended_trigger);
+        assert!(!profile.allow_sensitive_tools);
+        assert_eq!(profile.event_types.started, ROUTINE_CAPABILITY_PROFILE_EVENT_STARTED);
+    }
+
+    #[test]
+    fn routine_capability_profile_requires_review_for_missing_sensitive_approval() {
+        let execution = RoutineExecutionConfig {
+            execution_posture: RoutineExecutionPosture::SensitiveTools,
+            ..RoutineExecutionConfig::default()
+        };
+
+        let profile = routine_capability_profile_projection(
+            RoutineTriggerKind::FileWatch,
+            &execution,
+            &RoutineApprovalPolicy::default(),
+        );
+
+        assert_eq!(profile.decision, RoutineCapabilityProfileDecision::ReviewRequired);
+        assert_eq!(
+            profile.reason_code,
+            RoutineCapabilityProfileReasonCode::SensitiveToolsMissingApproval
+        );
+        assert!(!profile.allow_sensitive_tools);
+    }
+
+    #[test]
+    fn routine_capability_profile_round_trips_approval_gated_sensitive_profile() {
+        let execution = RoutineExecutionConfig {
+            execution_posture: RoutineExecutionPosture::SensitiveTools,
+            ..RoutineExecutionConfig::default()
+        };
+        let approval_policy = RoutineApprovalPolicy { mode: RoutineApprovalMode::BeforeFirstRun };
+
+        let profile = routine_capability_profile_projection(
+            RoutineTriggerKind::Webhook,
+            &execution,
+            &approval_policy,
+        );
+
+        assert_eq!(profile.decision, RoutineCapabilityProfileDecision::ApprovalGated);
+        assert_eq!(
+            profile.reason_code,
+            RoutineCapabilityProfileReasonCode::SensitiveToolsApprovalGated
+        );
+        assert!(profile.allow_sensitive_tools);
+        assert_eq!(profile.redaction_level, ROUTINE_CAPABILITY_PROFILE_REDACTION_LEVEL);
+        let encoded = serde_json::to_value(&profile).expect("profile should serialize");
+        assert_eq!(encoded["event_types"]["completed"], ROUTINE_CAPABILITY_PROFILE_EVENT_COMPLETED);
+        let decoded: RoutineCapabilityProfileProjection =
+            serde_json::from_value(encoded).expect("profile should deserialize");
+        assert_eq!(decoded, profile);
     }
 
     #[test]
