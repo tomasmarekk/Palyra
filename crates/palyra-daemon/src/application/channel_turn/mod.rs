@@ -5,7 +5,10 @@
 //! vocabulary: an inbound envelope, a pure admission decision, dispatch and
 //! delivery outcomes, and bounded journal projections.
 
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+};
 
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
 use serde::{Deserialize, Serialize};
@@ -14,6 +17,10 @@ use serde_json::{json, Value};
 const CHANNEL_TURN_SCHEMA_VERSION: u32 = 1;
 const MAX_SAFE_TEXT_PREVIEW_CHARS: usize = 240;
 const DEFAULT_CHANNEL_HISTORY_MAX_RECORDS: usize = 512;
+const DEFAULT_CHANNEL_BOT_LOOP_THRESHOLD: u32 = 2;
+const DEFAULT_CHANNEL_BOT_LOOP_WINDOW_MS: u64 = 30_000;
+const DEFAULT_CHANNEL_BOT_LOOP_COOLDOWN_MS: u64 = 60_000;
+const DEFAULT_CHANNEL_BOT_LOOP_MAX_PAIRS: usize = 1_024;
 
 pub(crate) const CHANNEL_TURN_RECEIVED_EVENT: &str = "channel.turn.received";
 pub(crate) const CHANNEL_TURN_ADMISSION_DECIDED_EVENT: &str = "channel.turn.admission_decided";
@@ -23,6 +30,8 @@ pub(crate) const CHANNEL_TURN_DELIVERED_EVENT: &str = "channel.turn.delivered";
 pub(crate) const CHANNEL_TURN_DROPPED_EVENT: &str = "channel.turn.dropped";
 pub(crate) const CHANNEL_HISTORY_RECORDED_EVENT: &str = "channel.history.recorded";
 pub(crate) const CHANNEL_HISTORY_SKIPPED_EVENT: &str = "channel.history.skipped";
+pub(crate) const CHANNEL_BOT_LOOP_OBSERVED_EVENT: &str = "channel.bot_loop.observed";
+pub(crate) const CHANNEL_BOT_LOOP_DROPPED_EVENT: &str = "channel.bot_loop.dropped";
 
 /// User or connector identity that submitted a channel turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +183,265 @@ pub(crate) struct ChannelTurnBotFacts {
     pub(crate) sender_is_bot: bool,
 }
 
+/// Provider-agnostic pair key used to detect tight channel bot loops.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct BotPairKey {
+    pub(crate) connector_id: String,
+    pub(crate) channel: String,
+    pub(crate) conversation_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) sender_id: String,
+    pub(crate) receiver_id: String,
+}
+
+impl BotPairKey {
+    /// Builds a key from normalized channel routing identities.
+    #[must_use]
+    pub(crate) fn new(
+        connector_id: impl Into<String>,
+        channel: impl Into<String>,
+        conversation_id: Option<String>,
+        thread_id: Option<String>,
+        sender_id: impl Into<String>,
+        receiver_id: impl Into<String>,
+    ) -> Option<Self> {
+        Some(Self {
+            connector_id: normalize_required_identity(connector_id.into())?,
+            channel: normalize_required_identity(channel.into())?,
+            conversation_id: normalize_optional(conversation_id),
+            thread_id: normalize_optional(thread_id),
+            sender_id: normalize_required_identity(sender_id.into())?,
+            receiver_id: normalize_required_identity(receiver_id.into())?,
+        })
+    }
+
+    #[must_use]
+    fn key_hash_sha256(&self) -> String {
+        let mut canonical = String::new();
+        append_key_field(&mut canonical, self.connector_id.as_str());
+        append_key_field(&mut canonical, self.channel.as_str());
+        append_key_option(&mut canonical, self.conversation_id.as_deref());
+        append_key_option(&mut canonical, self.thread_id.as_deref());
+        append_key_field(&mut canonical, self.sender_id.as_str());
+        append_key_field(&mut canonical, self.receiver_id.as_str());
+        format!("sha256:{}", crate::sha256_hex(canonical.as_bytes()))
+    }
+}
+
+/// Conservative bot-loop guard policy for the first channel-turn rollout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelBotLoopGuardConfig {
+    pub(crate) threshold: u32,
+    pub(crate) window_ms: u64,
+    pub(crate) cooldown_ms: u64,
+    pub(crate) max_tracked_pairs: usize,
+}
+
+impl Default for ChannelBotLoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            threshold: DEFAULT_CHANNEL_BOT_LOOP_THRESHOLD,
+            window_ms: DEFAULT_CHANNEL_BOT_LOOP_WINDOW_MS,
+            cooldown_ms: DEFAULT_CHANNEL_BOT_LOOP_COOLDOWN_MS,
+            max_tracked_pairs: DEFAULT_CHANNEL_BOT_LOOP_MAX_PAIRS,
+        }
+    }
+}
+
+impl ChannelBotLoopGuardConfig {
+    #[must_use]
+    fn normalized(self) -> Self {
+        Self {
+            threshold: self.threshold.max(1),
+            window_ms: self.window_ms.max(1),
+            cooldown_ms: self.cooldown_ms.max(1),
+            max_tracked_pairs: self.max_tracked_pairs.max(1),
+        }
+    }
+}
+
+/// Stable outcome labels emitted by [`ChannelBotLoopGuard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BotLoopDecisionKind {
+    Bypassed,
+    Observed,
+    Dropped,
+}
+
+impl BotLoopDecisionKind {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bypassed => "bypassed",
+            Self::Observed => "observed",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// Audit-safe decision emitted by the provider-agnostic bot loop guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BotLoopDecision {
+    pub(crate) schema_version: u32,
+    pub(crate) kind: BotLoopDecisionKind,
+    pub(crate) reason_code: String,
+    pub(crate) key_hash_sha256: Option<String>,
+    pub(crate) occurrence_count: u32,
+    pub(crate) threshold: u32,
+    pub(crate) window_ms: u64,
+    pub(crate) cooldown_ms: u64,
+    pub(crate) cooldown_until_unix_ms: Option<i64>,
+    pub(crate) redaction_level: String,
+}
+
+impl BotLoopDecision {
+    #[must_use]
+    pub(crate) fn bypassed(reason_code: impl Into<String>) -> Self {
+        let config = ChannelBotLoopGuardConfig::default().normalized();
+        Self {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            kind: BotLoopDecisionKind::Bypassed,
+            reason_code: reason_code.into(),
+            key_hash_sha256: None,
+            occurrence_count: 0,
+            threshold: config.threshold,
+            window_ms: config.window_ms,
+            cooldown_ms: config.cooldown_ms,
+            cooldown_until_unix_ms: None,
+            redaction_level: "metadata_only".to_owned(),
+        }
+    }
+
+    #[must_use]
+    fn observed(
+        key: &BotPairKey,
+        bucket: &BotLoopBucket,
+        config: ChannelBotLoopGuardConfig,
+    ) -> Self {
+        Self {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            kind: BotLoopDecisionKind::Observed,
+            reason_code: "channel.bot_loop.observed".to_owned(),
+            key_hash_sha256: Some(key.key_hash_sha256()),
+            occurrence_count: bucket.occurrence_count,
+            threshold: config.threshold,
+            window_ms: config.window_ms,
+            cooldown_ms: config.cooldown_ms,
+            cooldown_until_unix_ms: bucket.cooldown_until_unix_ms,
+            redaction_level: "metadata_only".to_owned(),
+        }
+    }
+
+    #[must_use]
+    fn dropped(
+        key: &BotPairKey,
+        bucket: &BotLoopBucket,
+        config: ChannelBotLoopGuardConfig,
+    ) -> Self {
+        Self {
+            schema_version: CHANNEL_TURN_SCHEMA_VERSION,
+            kind: BotLoopDecisionKind::Dropped,
+            reason_code: "channel.bot_loop.dropped.bot_loop_protection".to_owned(),
+            key_hash_sha256: Some(key.key_hash_sha256()),
+            occurrence_count: bucket.occurrence_count,
+            threshold: config.threshold,
+            window_ms: config.window_ms,
+            cooldown_ms: config.cooldown_ms,
+            cooldown_until_unix_ms: bucket.cooldown_until_unix_ms,
+            redaction_level: "metadata_only".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BotLoopBucket {
+    first_seen_unix_ms: i64,
+    last_seen_unix_ms: i64,
+    occurrence_count: u32,
+    cooldown_until_unix_ms: Option<i64>,
+}
+
+impl BotLoopBucket {
+    fn new(now_unix_ms: i64) -> Self {
+        Self {
+            first_seen_unix_ms: now_unix_ms,
+            last_seen_unix_ms: now_unix_ms,
+            occurrence_count: 0,
+            cooldown_until_unix_ms: None,
+        }
+    }
+
+    fn reset_window(&mut self, now_unix_ms: i64) {
+        self.first_seen_unix_ms = now_unix_ms;
+        self.last_seen_unix_ms = now_unix_ms;
+        self.occurrence_count = 0;
+        self.cooldown_until_unix_ms = None;
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChannelBotLoopGuardState {
+    buckets: HashMap<BotPairKey, BotLoopBucket>,
+}
+
+/// Bounded in-memory detector for repeated channel bot pair traffic.
+///
+/// The guard is intentionally narrow: it only decides whether the current
+/// channel turn should be admitted. Durable audit comes from
+/// `channel.bot_loop.*` journal events emitted by the caller.
+#[derive(Debug)]
+pub(crate) struct ChannelBotLoopGuard {
+    config: ChannelBotLoopGuardConfig,
+    state: Mutex<ChannelBotLoopGuardState>,
+}
+
+impl Default for ChannelBotLoopGuard {
+    fn default() -> Self {
+        Self::new(ChannelBotLoopGuardConfig::default())
+    }
+}
+
+impl ChannelBotLoopGuard {
+    /// Creates an empty guard using normalized policy limits.
+    #[must_use]
+    pub(crate) fn new(config: ChannelBotLoopGuardConfig) -> Self {
+        Self { config: config.normalized(), state: Mutex::new(ChannelBotLoopGuardState::default()) }
+    }
+
+    /// Observes one provider-agnostic bot pair and returns an audit-safe decision.
+    pub(crate) fn observe(&self, key: BotPairKey, now_unix_ms: i64) -> BotLoopDecision {
+        let now_unix_ms = now_unix_ms.max(0);
+        let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bucket =
+            guard.buckets.entry(key.clone()).or_insert_with(|| BotLoopBucket::new(now_unix_ms));
+
+        if let Some(cooldown_until_unix_ms) = bucket.cooldown_until_unix_ms {
+            if now_unix_ms < cooldown_until_unix_ms {
+                bucket.last_seen_unix_ms = now_unix_ms;
+                return BotLoopDecision::dropped(&key, bucket, self.config);
+            }
+            bucket.reset_window(now_unix_ms);
+        }
+
+        if elapsed_ms(bucket.first_seen_unix_ms, now_unix_ms) > self.config.window_ms {
+            bucket.reset_window(now_unix_ms);
+        }
+        bucket.occurrence_count = bucket.occurrence_count.saturating_add(1);
+        bucket.last_seen_unix_ms = now_unix_ms;
+        if bucket.occurrence_count > self.config.threshold {
+            bucket.cooldown_until_unix_ms =
+                Some(unix_ms_saturating_add(now_unix_ms, self.config.cooldown_ms));
+            let decision = BotLoopDecision::dropped(&key, bucket, self.config);
+            enforce_bot_loop_pair_limit(&mut guard, self.config.max_tracked_pairs);
+            return decision;
+        }
+        let decision = BotLoopDecision::observed(&key, bucket, self.config);
+        enforce_bot_loop_pair_limit(&mut guard, self.config.max_tracked_pairs);
+        decision
+    }
+}
+
 /// Effective route policy facts supplied by the existing channel router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelTurnPolicyFacts {
@@ -222,6 +490,7 @@ impl ChannelTurnRouterOutcomeKind {
 pub(crate) struct ChannelTurnAdmissionInput {
     pub(crate) mention: ChannelTurnMentionState,
     pub(crate) bot: ChannelTurnBotFacts,
+    pub(crate) bot_loop: BotLoopDecision,
     pub(crate) policy: ChannelTurnPolicyFacts,
     pub(crate) binding: ChannelTurnBindingFacts,
     pub(crate) media: ChannelTurnMediaFacts,
@@ -267,6 +536,7 @@ pub(crate) enum ChannelAdmissionReason {
     HandledCommand,
     HandledQueued,
     DropBotLoop,
+    DropBotLoopProtection,
     DropPolicyDenied,
     DropRouterRejected,
     DropNoRoute,
@@ -284,6 +554,7 @@ impl ChannelAdmissionReason {
             Self::HandledCommand => "channel.admission.handled.command",
             Self::HandledQueued => "channel.admission.handled.queued",
             Self::DropBotLoop => "channel.admission.drop.bot_loop",
+            Self::DropBotLoopProtection => "channel.admission.drop.bot_loop_protection",
             Self::DropPolicyDenied => "channel.admission.drop.policy_denied",
             Self::DropRouterRejected => "channel.admission.drop.router_rejected",
             Self::DropNoRoute => "channel.admission.drop.no_route",
@@ -299,6 +570,7 @@ impl ChannelAdmissionReason {
             Self::ObserveAmbient => ChannelTurnAdmissionKind::ObserveOnly,
             Self::HandledCommand | Self::HandledQueued => ChannelTurnAdmissionKind::HandledNoRun,
             Self::DropBotLoop
+            | Self::DropBotLoopProtection
             | Self::DropPolicyDenied
             | Self::DropRouterRejected
             | Self::DropNoRoute => ChannelTurnAdmissionKind::Drop,
@@ -344,6 +616,9 @@ impl ChannelTurnAdmission {
 pub(crate) fn decide_channel_turn_admission(
     input: &ChannelTurnAdmissionInput,
 ) -> ChannelTurnAdmission {
+    if input.bot_loop.kind == BotLoopDecisionKind::Dropped {
+        return ChannelTurnAdmission::new(ChannelAdmissionReason::DropBotLoopProtection);
+    }
     if input.bot.sender_is_self {
         return ChannelTurnAdmission::new(ChannelAdmissionReason::DropBotLoop);
     }
@@ -932,6 +1207,32 @@ pub(crate) fn channel_turn_history_record(
     )
 }
 
+/// Builds the `channel.bot_loop.*` projection payload when the guard observed a pair.
+#[must_use]
+pub(crate) fn channel_bot_loop_record(
+    envelope: &ChannelTurnEnvelope,
+    decision: &BotLoopDecision,
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+) -> Option<ChannelTurnJournalRecord> {
+    let event_type = match decision.kind {
+        BotLoopDecisionKind::Bypassed => return None,
+        BotLoopDecisionKind::Observed => CHANNEL_BOT_LOOP_OBSERVED_EVENT,
+        BotLoopDecisionKind::Dropped => CHANNEL_BOT_LOOP_DROPPED_EVENT,
+    };
+    Some(ChannelTurnJournalRecord::new(
+        event_type,
+        envelope,
+        session_id,
+        run_id,
+        decision.reason_code.as_str(),
+        json!({
+            "bot_loop": decision,
+            "bot_loop_kind": decision.kind.as_str(),
+        }),
+    ))
+}
+
 /// Builds the `channel.turn.received` projection payload.
 #[must_use]
 pub(crate) fn channel_turn_received_record(
@@ -970,6 +1271,8 @@ pub(crate) fn channel_turn_admission_record(
             "input": {
                 "mention": input.mention.as_str(),
                 "bot": input.bot,
+                "bot_loop": input.bot_loop,
+                "bot_loop_kind": input.bot_loop.kind.as_str(),
                 "policy": input.policy,
                 "binding": input.binding,
                 "media": input.media,
@@ -1078,6 +1381,48 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
+fn normalize_required_identity(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn append_key_field(output: &mut String, value: &str) {
+    output.push_str(value.len().to_string().as_str());
+    output.push(':');
+    output.push_str(value);
+    output.push('|');
+}
+
+fn append_key_option(output: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => append_key_field(output, value),
+        None => append_key_field(output, "<none>"),
+    }
+}
+
+fn elapsed_ms(first_seen_unix_ms: i64, now_unix_ms: i64) -> u64 {
+    let elapsed = now_unix_ms.saturating_sub(first_seen_unix_ms);
+    u64::try_from(elapsed).unwrap_or(0)
+}
+
+fn unix_ms_saturating_add(now_unix_ms: i64, delta_ms: u64) -> i64 {
+    now_unix_ms.saturating_add(i64::try_from(delta_ms).unwrap_or(i64::MAX))
+}
+
+fn enforce_bot_loop_pair_limit(guard: &mut ChannelBotLoopGuardState, max_tracked_pairs: usize) {
+    while guard.buckets.len() > max_tracked_pairs {
+        let Some(victim_key) = guard
+            .buckets
+            .iter()
+            .min_by_key(|(_key, bucket)| bucket.last_seen_unix_ms)
+            .map(|(key, _bucket)| key.clone())
+        else {
+            break;
+        };
+        guard.buckets.remove(&victim_key);
+    }
+}
+
 fn normalize_reason_fragment(value: &str) -> String {
     let normalized =
         value
@@ -1143,6 +1488,7 @@ mod tests {
         ChannelTurnAdmissionInput {
             mention: ChannelTurnMentionState::Matched,
             bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+            bot_loop: BotLoopDecision::bypassed("channel.bot_loop.bypassed.test"),
             policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
             binding: ChannelTurnBindingFacts {
                 binding_id: Some("binding-1".to_owned()),
@@ -1208,6 +1554,92 @@ mod tests {
     }
 
     #[test]
+    fn bot_loop_guard_serializes_audit_safe_decisions() {
+        let key = BotPairKey::new(
+            "discord",
+            "discord:ops",
+            Some("C01".to_owned()),
+            Some("T01".to_owned()),
+            "bot-a",
+            "bot-b",
+        )
+        .expect("valid pair key");
+        let guard = ChannelBotLoopGuard::new(ChannelBotLoopGuardConfig {
+            threshold: 1,
+            window_ms: 1_000,
+            cooldown_ms: 5_000,
+            max_tracked_pairs: 4,
+        });
+
+        let observed = guard.observe(key.clone(), 10);
+        let dropped = guard.observe(key, 20);
+
+        assert_eq!(observed.kind, BotLoopDecisionKind::Observed);
+        assert_eq!(observed.reason_code, "channel.bot_loop.observed");
+        assert_eq!(dropped.kind, BotLoopDecisionKind::Dropped);
+        assert_eq!(dropped.reason_code, "channel.bot_loop.dropped.bot_loop_protection");
+        assert_eq!(dropped.cooldown_until_unix_ms, Some(5_020));
+        let serialized = serde_json::to_string(&dropped).expect("decision should serialize");
+        assert!(serialized.contains("key_hash_sha256"));
+        assert!(!serialized.contains("bot-a"));
+        let roundtrip: BotLoopDecision =
+            serde_json::from_str(serialized.as_str()).expect("decision should deserialize");
+        assert_eq!(roundtrip, dropped);
+
+        let payload =
+            channel_bot_loop_record(&envelope(), &dropped, Some("session-1"), Some("run-1"))
+                .expect("dropped decision should produce a journal record")
+                .payload_json();
+        assert_eq!(payload["event"], CHANNEL_BOT_LOOP_DROPPED_EVENT);
+        assert_eq!(payload["payload"]["bot_loop_kind"], "dropped");
+    }
+
+    #[test]
+    fn bot_loop_guard_drops_repeated_bot_pair_without_blocking_other_sender() {
+        let guard = ChannelBotLoopGuard::new(ChannelBotLoopGuardConfig {
+            threshold: 2,
+            window_ms: 1_000,
+            cooldown_ms: 5_000,
+            max_tracked_pairs: 8,
+        });
+        let bot_a_to_b = BotPairKey::new(
+            "discord",
+            "discord:ops",
+            Some("C01".to_owned()),
+            Some("T01".to_owned()),
+            "bot-a",
+            "bot-b",
+        )
+        .expect("bot-a key");
+        let bot_b_to_a = BotPairKey::new(
+            "discord",
+            "discord:ops",
+            Some("C01".to_owned()),
+            Some("T01".to_owned()),
+            "bot-b",
+            "bot-a",
+        )
+        .expect("bot-b key");
+        let human_to_b = BotPairKey::new(
+            "discord",
+            "discord:ops",
+            Some("C01".to_owned()),
+            Some("T01".to_owned()),
+            "human-user",
+            "bot-b",
+        )
+        .expect("human key");
+
+        assert_eq!(guard.observe(bot_a_to_b.clone(), 100).kind, BotLoopDecisionKind::Observed);
+        assert_eq!(guard.observe(bot_b_to_a.clone(), 150).kind, BotLoopDecisionKind::Observed);
+        assert_eq!(guard.observe(bot_a_to_b.clone(), 200).kind, BotLoopDecisionKind::Observed);
+        assert_eq!(guard.observe(bot_b_to_a, 250).kind, BotLoopDecisionKind::Observed);
+        assert_eq!(guard.observe(bot_a_to_b.clone(), 300).kind, BotLoopDecisionKind::Dropped);
+        assert_eq!(guard.observe(bot_a_to_b, 400).kind, BotLoopDecisionKind::Dropped);
+        assert_eq!(guard.observe(human_to_b, 450).kind, BotLoopDecisionKind::Observed);
+    }
+
+    #[test]
     fn bot_loop_guard_drops_before_dispatch() {
         let mut input = admission_input();
         input.bot.sender_is_self = true;
@@ -1216,6 +1648,28 @@ mod tests {
 
         assert_eq!(admission.kind, ChannelTurnAdmissionKind::Drop);
         assert_eq!(admission.reason_code, "channel.admission.drop.bot_loop");
+        assert!(!admission.durable_history_permitted);
+    }
+
+    #[test]
+    fn admission_drops_when_bot_loop_guard_enforces_protection() {
+        let mut input = admission_input();
+        let key = BotPairKey::new("discord", "discord:ops", None, None, "bot-a", "palyra")
+            .expect("valid bot loop key");
+        let guard = ChannelBotLoopGuard::new(ChannelBotLoopGuardConfig {
+            threshold: 1,
+            window_ms: 1_000,
+            cooldown_ms: 5_000,
+            max_tracked_pairs: 4,
+        });
+        guard.observe(key.clone(), 10);
+        input.bot_loop = guard.observe(key, 20);
+
+        let admission = decide_channel_turn_admission(&input);
+
+        assert_eq!(admission.kind, ChannelTurnAdmissionKind::Drop);
+        assert_eq!(admission.reason_code, "channel.admission.drop.bot_loop_protection");
+        assert!(!admission.model_request_permitted);
         assert!(!admission.durable_history_permitted);
     }
 

@@ -67,7 +67,7 @@ use crate::{
         AgentResolutionSource, AgentResolveRequest,
     },
     application::{
-        channel_turn::ChannelHistoryStore,
+        channel_turn::{ChannelBotLoopGuard, ChannelHistoryStore},
         conversation_bindings::ConversationBindingStore,
         inbound_coalescer::InboundCoalescer,
         tool_runtime::workspace_scope::{

@@ -394,6 +394,52 @@ async fn route_message_with_ids(
         .into_inner())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn route_message_with_sender(
+    client: &mut gateway_v1::gateway_service_client::GatewayServiceClient<
+        tonic::transport::Channel,
+    >,
+    text: &str,
+    envelope_id: &str,
+    adapter_message_id: &str,
+    sender_handle: &str,
+    sender_display: &str,
+) -> Result<gateway_v1::RouteMessageResponse> {
+    let mut request = tonic::Request::new(gateway_v1::RouteMessageRequest {
+        v: 1,
+        envelope: Some(common_v1::MessageEnvelope {
+            v: 1,
+            envelope_id: Some(common_v1::CanonicalId { ulid: envelope_id.to_owned() }),
+            origin: Some(common_v1::EnvelopeOrigin {
+                r#type: common_v1::envelope_origin::OriginType::Channel as i32,
+                channel: "cli".to_owned(),
+                conversation_id: "adapter-conv-1".to_owned(),
+                sender_display: sender_display.to_owned(),
+                sender_handle: sender_handle.to_owned(),
+                sender_verified: true,
+            }),
+            content: Some(common_v1::MessageContent {
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            }),
+            max_payload_bytes: 4096,
+            ..Default::default()
+        }),
+        is_direct_message: false,
+        request_broadcast: false,
+        adapter_message_id: adapter_message_id.to_owned(),
+        adapter_thread_id: "thread-1".to_owned(),
+        retry_attempt: 0,
+        session_label: "Adapter".to_owned(),
+    });
+    authorize_metadata(request.metadata_mut())?;
+    Ok(client
+        .route_message(request)
+        .await
+        .context("failed to call RouteMessage with explicit sender")?
+        .into_inner())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_route_message_with_fake_adapter_emits_reply_and_journal_events() -> Result<()> {
     let (openai_base_url, request_count, server_handle) =
@@ -1790,6 +1836,165 @@ async fn grpc_route_message_injects_observe_only_channel_context() -> Result<()>
                 && payload.pointer("/payload/history/sequence").and_then(Value::as_u64) == Some(0)
         }),
         "observe-only history should be retained for the next dispatch"
+    );
+
+    server_handle.join().expect("scripted openai server thread should exit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Result<()> {
+    let (openai_base_url, request_count, server_handle) = spawn_scripted_openai_server(vec![
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"bot loop first reply"}}]}"#.to_owned(),
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"bot loop second reply"}}]}"#.to_owned(),
+        ),
+        ScriptedOpenAiResponse::immediate(
+            200,
+            r#"{"choices":[{"message":{"content":"human still routes"}}]}"#.to_owned(),
+        ),
+    ])?;
+    let (child, admin_port, grpc_port, journal_db_path, config_path) =
+        spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
+            openai_base_url.as_str(),
+            OPENAI_API_KEY,
+            &[("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true")],
+        )?;
+    let _config_guard = TempFileGuard::new(config_path);
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let endpoint = format!("http://127.0.0.1:{grpc_port}");
+    let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::connect(endpoint)
+        .await
+        .context("failed to connect gRPC client")?;
+    let mut create_route_agent = tonic::Request::new(gateway_v1::CreateAgentRequest {
+        v: 1,
+        agent_id: "route".to_owned(),
+        display_name: "Route".to_owned(),
+        agent_dir: String::new(),
+        workspace_roots: vec!["workspace".to_owned()],
+        default_model_profile: "gpt-4o-mini".to_owned(),
+        execution_backend_preference: String::new(),
+        default_tool_allowlist: vec!["palyra.echo".to_owned()],
+        default_skill_allowlist: vec!["acme.route".to_owned()],
+        set_default: true,
+        allow_absolute_paths: false,
+    });
+    authorize_metadata_with_principal(create_route_agent.metadata_mut(), "admin:ops")?;
+    client
+        .create_agent(create_route_agent)
+        .await
+        .context("failed to create route agent before bot loop guard test")?;
+
+    let first = route_message_with_sender(
+        &mut client,
+        "@palyra loop candidate one",
+        "01ARZ3NDEKTSV4RRFFQ69G5FC5",
+        "msg-loop-1",
+        "bot:alpha",
+        "Alpha Bot",
+    )
+    .await?;
+    assert!(first.accepted, "first loop candidate should route");
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+
+    let second = route_message_with_sender(
+        &mut client,
+        "@palyra loop candidate two",
+        "01ARZ3NDEKTSV4RRFFQ69G5FC6",
+        "msg-loop-2",
+        "bot:alpha",
+        "Alpha Bot",
+    )
+    .await?;
+    assert!(second.accepted, "second loop candidate should still route at threshold");
+    assert_eq!(request_count.load(Ordering::Relaxed), 2);
+
+    let dropped = route_message_with_sender(
+        &mut client,
+        "@palyra loop candidate three",
+        "01ARZ3NDEKTSV4RRFFQ69G5FC7",
+        "msg-loop-3",
+        "bot:alpha",
+        "Alpha Bot",
+    )
+    .await?;
+    assert!(!dropped.accepted, "third loop candidate should be dropped");
+    assert!(!dropped.queued_for_retry);
+    assert_eq!(dropped.decision_reason, "bot_loop_protection");
+    assert!(dropped.run_id.is_none(), "dropped loop turn must not allocate a run");
+    assert!(dropped.outputs.is_empty(), "dropped loop turn must not emit output");
+    assert_eq!(
+        request_count.load(Ordering::Relaxed),
+        2,
+        "bot-loop drop must not call the model provider"
+    );
+
+    let human = route_message_with_sender(
+        &mut client,
+        "@palyra human follow-up in same thread",
+        "01ARZ3NDEKTSV4RRFFQ69G5FC8",
+        "msg-human-1",
+        "user:human",
+        "Human User",
+    )
+    .await?;
+    assert!(human.accepted, "different sender in same channel should not inherit bot cooldown");
+    assert_eq!(request_count.load(Ordering::Relaxed), 3);
+
+    let message_events = load_message_router_journal_events(&journal_db_path)?;
+    let dropped_bot_loop = message_events
+        .iter()
+        .find(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.bot_loop.dropped")
+        })
+        .context("bot-loop drop event should be persisted")?;
+    assert_eq!(
+        dropped_bot_loop.pointer("/payload/bot_loop_kind").and_then(Value::as_str),
+        Some("dropped")
+    );
+    assert!(
+        dropped_bot_loop
+            .pointer("/payload/bot_loop/key_hash_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.starts_with("sha256:")),
+        "bot-loop event should include a hashed pair key: {dropped_bot_loop}"
+    );
+    assert!(
+        !dropped_bot_loop.to_string().contains("bot:alpha"),
+        "bot-loop audit event should not expose raw sender identity: {dropped_bot_loop}"
+    );
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dropped")
+                && payload.pointer("/payload/admission/reason_code").and_then(Value::as_str)
+                    == Some("channel.admission.drop.bot_loop_protection")
+        }),
+        "admission drop should carry the bot-loop protection reason"
+    );
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("channel.turn.dispatched")
+                && payload.pointer("/payload/dispatch/kind").and_then(Value::as_str)
+                    == Some("not_dispatched")
+                && payload
+                    .pointer("/payload/dispatch/model_request_started")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+        }),
+        "dropped bot-loop turn should record a no-provider dispatch outcome"
+    );
+    assert!(
+        message_events.iter().any(|payload| {
+            payload.get("event").and_then(Value::as_str) == Some("message.rejected")
+                && payload.get("reason").and_then(Value::as_str) == Some("bot_loop_protection")
+        }),
+        "router journal should expose the short bot-loop rejection reason"
     );
 
     server_handle.join().expect("scripted openai server thread should exit");
@@ -11269,6 +11474,7 @@ fn load_message_router_journal_events(journal_db_path: &PathBuf) -> Result<Vec<V
             event.starts_with("message.")
                 || event.starts_with("channel.turn.")
                 || event.starts_with("channel.history.")
+                || event.starts_with("channel.bot_loop.")
                 || event.starts_with("channel.command.")
                 || event.starts_with("conversation.binding.")
                 || event.starts_with("inbound.coalescing.")

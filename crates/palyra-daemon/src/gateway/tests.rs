@@ -83,9 +83,10 @@ use crate::application::{
     approvals::{apply_tool_approval_outcome, approval_risk_for_tool},
     auth::record_auth_refresh_journal_event,
     channel_turn::{
-        decide_channel_turn_admission, ChannelTurnAdmissionInput, ChannelTurnBindingFacts,
-        ChannelTurnBotFacts, ChannelTurnEnvelope, ChannelTurnEnvelopeInput, ChannelTurnMediaFacts,
-        ChannelTurnMentionState, ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
+        decide_channel_turn_admission, BotLoopDecision, ChannelTurnAdmissionInput,
+        ChannelTurnBindingFacts, ChannelTurnBotFacts, ChannelTurnEnvelope,
+        ChannelTurnEnvelopeInput, ChannelTurnMediaFacts, ChannelTurnMentionState,
+        ChannelTurnPolicyFacts, ChannelTurnRouterOutcomeKind,
     },
     memory::{
         enforce_memory_item_scope, memory_item_message, memory_search_hit_message,
@@ -2801,6 +2802,7 @@ async fn context_engine_injects_observe_only_channel_history() {
     let observe_input = ChannelTurnAdmissionInput {
         mention: ChannelTurnMentionState::NotMatched,
         bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+        bot_loop: BotLoopDecision::bypassed("channel.bot_loop.bypassed.test"),
         policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
         binding: ChannelTurnBindingFacts {
             binding_id: None,

@@ -29,10 +29,11 @@ use crate::{
             ChannelCommandRegistry, ChannelCommandRuntimeView, ChannelCommandScope,
         },
         channel_turn::{
-            channel_turn_admission_record, channel_turn_admission_terminal_record,
-            channel_turn_delivered_record, channel_turn_dispatched_record,
-            channel_turn_history_record, channel_turn_received_record,
-            decide_channel_turn_admission, ChannelTurnAdmissionInput, ChannelTurnBindingFacts,
+            channel_bot_loop_record, channel_turn_admission_record,
+            channel_turn_admission_terminal_record, channel_turn_delivered_record,
+            channel_turn_dispatched_record, channel_turn_history_record,
+            channel_turn_received_record, decide_channel_turn_admission, BotLoopDecision,
+            BotPairKey, ChannelAdmissionReason, ChannelTurnAdmissionInput, ChannelTurnBindingFacts,
             ChannelTurnBotFacts, ChannelTurnDeliveryOutcome, ChannelTurnDispatchOutcome,
             ChannelTurnEnvelope, ChannelTurnEnvelopeInput, ChannelTurnHistory,
             ChannelTurnJournalRecord, ChannelTurnMediaFacts, ChannelTurnMentionState,
@@ -194,6 +195,50 @@ fn channel_turn_ambient_context_enabled(
         && !input.requested_broadcast
 }
 
+fn channel_bot_loop_decision(
+    state: &GatewayRuntimeState,
+    input: &ChannelInboundMessage,
+    envelope: &ChannelTurnEnvelope,
+    command_parse_outcome: &ChannelCommandParseOutcome,
+    actor_connector: &str,
+    actor_gateway_principal: &str,
+    actor_gateway_device_id: &str,
+) -> BotLoopDecision {
+    if !state.config.feature_rollouts.channel_turn_kernel.enabled {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.rollout_disabled");
+    }
+    if !matches!(command_parse_outcome, ChannelCommandParseOutcome::NotCommand) {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.channel_command");
+    }
+    if input.retry_attempt > 0 {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.retry_attempt");
+    }
+    let Some(sender_id) = input.sender_handle.clone().or_else(|| input.sender_display.clone())
+    else {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.missing_sender_identity");
+    };
+    let receiver_id = format!("gateway:{actor_gateway_principal}:{actor_gateway_device_id}");
+    let Some(key) = BotPairKey::new(
+        actor_connector,
+        input.channel.as_str(),
+        input.conversation_id.clone(),
+        input.adapter_thread_id.clone(),
+        sender_id,
+        receiver_id,
+    ) else {
+        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.invalid_pair_key");
+    };
+    state.channel_bot_loop_guard.observe(key, envelope.received_at_unix_ms)
+}
+
+fn bot_loop_route_decision_reason(admission_reason: ChannelAdmissionReason) -> String {
+    if admission_reason == ChannelAdmissionReason::DropBotLoopProtection {
+        "bot_loop_protection".to_owned()
+    } else {
+        admission_reason.as_str().to_owned()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_channel_turn_admission_input(
     input: &ChannelInboundMessage,
@@ -205,11 +250,13 @@ fn build_channel_turn_admission_input(
     router_reason: Option<&str>,
     queued_for_retry: bool,
     ambient_context_enabled: bool,
+    bot_loop: BotLoopDecision,
 ) -> ChannelTurnAdmissionInput {
     let (is_channel_command, urgent_command) = channel_turn_command_facts(command_parse_outcome);
     ChannelTurnAdmissionInput {
         mention: channel_turn_mention_state(input, router_outcome, router_reason),
         bot: ChannelTurnBotFacts { sender_is_self: false, sender_is_bot: false },
+        bot_loop,
         policy: ChannelTurnPolicyFacts { channel_enabled: true, route_allowed: true },
         binding: ChannelTurnBindingFacts {
             binding_present: binding_id.is_some(),
@@ -261,8 +308,13 @@ async fn record_channel_turn_intake_events(
     let admission = decide_channel_turn_admission(admission_input);
     let history_decision =
         state.channel_turn_history.record(envelope, &admission, envelope.received_at_unix_ms);
-    let mut history = ChannelTurnHistory::new(4);
+    let mut history = ChannelTurnHistory::new(5);
     history.push(channel_turn_received_record(envelope, Some(session_id), Some(run_id)));
+    if let Some(record) =
+        channel_bot_loop_record(envelope, &admission_input.bot_loop, Some(session_id), Some(run_id))
+    {
+        history.push(record);
+    }
     history.push(channel_turn_admission_record(
         envelope,
         &admission,
@@ -1019,6 +1071,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Some(rejection_reason.as_str()),
                     false,
                     ambient_context_enabled,
+                    BotLoopDecision::bypassed("channel.bot_loop.bypassed.router_rejected"),
                 );
                 record_channel_turn_intake_events(
                     &self.state,
@@ -1106,6 +1159,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     Some(queue_reason.as_str()),
                     true,
                     false,
+                    BotLoopDecision::bypassed("channel.bot_loop.bypassed.router_queued"),
                 );
                 record_channel_turn_intake_events(
                     &self.state,
@@ -1188,6 +1242,15 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
             }
             RouteOutcome::Routed(routed) => {
                 let ChannelRoutedMessage { plan, lease: route_lease } = *routed;
+                let bot_loop_decision = channel_bot_loop_decision(
+                    self.state.as_ref(),
+                    &input,
+                    &channel_turn_envelope,
+                    &command_parse_outcome,
+                    actor_connector.as_str(),
+                    actor_gateway_principal.as_str(),
+                    actor_gateway_device_id.as_str(),
+                );
                 let channel_turn_admission_input = build_channel_turn_admission_input(
                     &input,
                     &content,
@@ -1198,6 +1261,7 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                     None,
                     false,
                     false,
+                    bot_loop_decision,
                 );
                 match command_parse_outcome {
                     ChannelCommandParseOutcome::NotCommand => {}
@@ -1395,6 +1459,121 @@ impl gateway_v1::gateway_service_server::GatewayService for GatewayServiceImpl {
                         .await;
                         return Ok(Response::new(route_response));
                     }
+                }
+                let channel_turn_admission =
+                    decide_channel_turn_admission(&channel_turn_admission_input);
+                if !channel_turn_admission.model_request_permitted {
+                    drop(route_lease);
+                    self.state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+                    self.state
+                        .counters
+                        .channel_router_queue_depth
+                        .store(self.state.channel_router.queue_depth() as u64, Ordering::Relaxed);
+                    let session_id = Ulid::new().to_string();
+                    let run_id = Ulid::new().to_string();
+                    record_channel_turn_intake_events(
+                        &self.state,
+                        &context,
+                        &channel_turn_envelope,
+                        &channel_turn_admission_input,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                    )
+                    .await;
+                    let channel_turn_dispatch = ChannelTurnDispatchOutcome::not_dispatched(
+                        channel_turn_admission.reason_code.clone(),
+                    );
+                    record_channel_turn_record(
+                        &self.state,
+                        &context,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        common_v1::journal_event::EventActor::System as i32,
+                        channel_turn_dispatched_record(
+                            &channel_turn_envelope,
+                            &channel_turn_dispatch,
+                        ),
+                    )
+                    .await;
+                    let decision_reason =
+                        bot_loop_route_decision_reason(channel_turn_admission.reason);
+                    let _ = record_message_router_journal_event(
+                        &self.state,
+                        &context,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        "message.received",
+                        common_v1::journal_event::EventActor::User as i32,
+                        json!({
+                            "event": "message.received",
+                            "envelope_id": input.envelope_id.clone(),
+                            "channel": input.channel.clone(),
+                            "requested_broadcast": input.requested_broadcast,
+                            "is_direct_message": input.is_direct_message,
+                            "config_hash": route_config_hash.clone(),
+                            "actor": {
+                                "connector_channel": actor_connector.clone(),
+                                "gateway_principal": actor_gateway_principal.clone(),
+                                "gateway_device_id": actor_gateway_device_id.clone(),
+                            }
+                        }),
+                    )
+                    .await;
+                    let _ = record_message_router_journal_event(
+                        &self.state,
+                        &context,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        "message.rejected",
+                        common_v1::journal_event::EventActor::System as i32,
+                        json!({
+                            "event": "message.rejected",
+                            "envelope_id": input.envelope_id.clone(),
+                            "channel": input.channel.clone(),
+                            "reason": decision_reason.clone(),
+                            "queued_for_retry": false,
+                            "quarantined": false,
+                            "config_hash": route_config_hash.clone(),
+                            "actor": {
+                                "connector_channel": actor_connector.clone(),
+                                "gateway_principal": actor_gateway_principal.clone(),
+                                "gateway_device_id": actor_gateway_device_id.clone(),
+                            }
+                        }),
+                    )
+                    .await;
+                    let delivery = ChannelTurnDeliveryOutcome::from_route_response(
+                        false,
+                        false,
+                        0,
+                        decision_reason.as_str(),
+                    );
+                    record_channel_turn_record(
+                        &self.state,
+                        &context,
+                        session_id.as_str(),
+                        run_id.as_str(),
+                        common_v1::journal_event::EventActor::System as i32,
+                        channel_turn_delivered_record(
+                            &channel_turn_envelope,
+                            &delivery,
+                            Some(session_id.as_str()),
+                            Some(run_id.as_str()),
+                        ),
+                    )
+                    .await;
+                    return Ok(Response::new(gateway_v1::RouteMessageResponse {
+                        v: CANONICAL_PROTOCOL_MAJOR,
+                        accepted: false,
+                        queued_for_retry: false,
+                        decision_reason,
+                        session_id: None,
+                        run_id: None,
+                        outputs: Vec::new(),
+                        route_key: String::new(),
+                        retry_attempt,
+                        queue_depth: self.state.channel_router.queue_depth() as u32,
+                    }));
                 }
                 let response = handle_routed_route_message(
                     &self.state,
