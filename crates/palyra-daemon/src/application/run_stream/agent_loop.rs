@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
+    application::verification::{VerificationCommandClassifier, VerificationKind},
     gateway::current_unix_ms,
     model_provider::{ProviderMessage, ProviderMessageRole, ProviderResponse, ProviderTurnOutput},
 };
+use palyra_common::process_runner_input::parse_process_runner_tool_input;
 
 /// Default wall-clock budget per run (15 minutes) covering long browser workflows.
 pub(crate) const DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS: u64 = 900_000;
@@ -58,6 +60,11 @@ pub(crate) const FINAL_ANSWER_CONTRACT_COMPLETED_EVENT: &str =
 /// Audit event projected when the terminal answer is failed or requires continuation.
 pub(crate) const FINAL_ANSWER_CONTRACT_FAILED_EVENT: &str =
     "final_answer_contract_a_evidence_summary.failed";
+/// Soft guard event emitted when a code-changing run tries to finish without fresh verification.
+pub(crate) const VERIFICATION_FINALIZER_NUDGE_EVENT: &str = "verification.finalizer.nudge";
+/// Soft guard event emitted when the final answer explicitly carries an unverified reason.
+pub(crate) const VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT: &str =
+    "verification.finalizer.unverified_allowed";
 
 /// Observable class of one tool attempt for repeated-no-progress detection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -424,6 +431,7 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) artifact_refs: Vec<String>,
     pub(crate) final_answer_contract: FinalAnswerContract,
     pub(crate) evidence_summary: FinalAnswerEvidenceSummary,
+    pub(crate) verification_finalizer: FinalizationVerificationReport,
     pub(crate) progress_checkpoint: Option<RunProgressCheckpoint>,
     pub(crate) provider_trace_ref: Option<String>,
 }
@@ -449,6 +457,55 @@ pub(crate) enum FinalAnswerEvidenceCoverage {
     Satisfied,
     GapsDetected,
     NoToolEvidence,
+}
+
+/// Soft verification status applied before accepting a final answer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalizationVerificationStatus {
+    NotRequired,
+    Verified,
+    NudgeRequired,
+    UnverifiedAllowed,
+}
+
+/// Bounded summary of one stale requirement still relevant at finalization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalizationVerificationRequirementSummary {
+    pub(crate) requirement_id: String,
+    pub(crate) required_kind: String,
+    pub(crate) changed_paths: Vec<String>,
+}
+
+/// Verify-before-finish report embedded in the terminal finalization envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalizationVerificationReport {
+    pub(crate) schema_version: u32,
+    pub(crate) status: FinalizationVerificationStatus,
+    pub(crate) reason_code: String,
+    pub(crate) enforcement_mode: String,
+    pub(crate) surface_policy: String,
+    pub(crate) code_mutation_seen: bool,
+    pub(crate) pending_requirement_count: usize,
+    pub(crate) satisfied_requirement_count: usize,
+    pub(crate) pending_requirements: Vec<FinalizationVerificationRequirementSummary>,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) event_type: Option<String>,
+    pub(crate) nudge: Option<String>,
+    pub(crate) unverified_reason: Option<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Pure soft guard for final answers after code mutation.
+pub(crate) struct VerifyBeforeFinishGuard;
+
+struct VerifyBeforeFinishRequest<'a> {
+    run_id: &'a str,
+    reason: AgentLoopTerminationReason,
+    final_answer: &'a str,
+    messages: &'a [ProviderMessage],
 }
 
 /// Tape projection for the terminal final answer contract event.
@@ -705,6 +762,7 @@ impl AgentRunLoopState {
         user_visible_message: impl Into<String>,
         provider_trace_ref: Option<String>,
     ) -> AgentLoopFinalizationEnvelope {
+        let user_visible_message = user_visible_message.into();
         let outcome = self.finalization_outcome(reason);
         let evidence_checkpoint = self.progress_checkpoint(run_id, reason);
         let final_answer_contract = final_answer_contract(run_id, outcome, reason);
@@ -715,6 +773,8 @@ impl AgentRunLoopState {
             self.completed_tool_calls,
             &evidence_checkpoint,
         );
+        let verification_finalizer =
+            self.verify_before_finish_guard(run_id, reason, user_visible_message.as_str());
         let progress_checkpoint = outcome.continuation_required.then_some(evidence_checkpoint);
         AgentLoopFinalizationEnvelope {
             schema_version: 1,
@@ -724,15 +784,31 @@ impl AgentRunLoopState {
             reason_code: outcome.reason_code.to_owned(),
             partial: outcome.partial,
             continuation_required: outcome.continuation_required,
-            user_visible_message: user_visible_message.into(),
+            user_visible_message,
             usage: self.usage.clone(),
             tool_count: self.completed_tool_calls,
             artifact_refs: Vec::new(),
             final_answer_contract,
             evidence_summary,
+            verification_finalizer,
             progress_checkpoint,
             provider_trace_ref,
         }
+    }
+
+    /// Evaluates whether finalization should nudge the model toward verification.
+    pub(crate) fn verify_before_finish_guard(
+        &self,
+        run_id: &str,
+        reason: AgentLoopTerminationReason,
+        final_answer: &str,
+    ) -> FinalizationVerificationReport {
+        VerifyBeforeFinishGuard::evaluate(VerifyBeforeFinishRequest {
+            run_id,
+            reason,
+            final_answer,
+            messages: self.messages.as_slice(),
+        })
     }
 
     /// Infers bounded continuation state from the provider message history.
@@ -975,6 +1051,315 @@ fn final_answer_evidence_refs(
     refs.into_iter().take(32).collect()
 }
 
+impl VerifyBeforeFinishGuard {
+    fn evaluate(request: VerifyBeforeFinishRequest<'_>) -> FinalizationVerificationReport {
+        let activity = verification_activity_from_messages(request.run_id, request.messages);
+        if request.reason != AgentLoopTerminationReason::FinalAnswer {
+            return verification_finalizer_report(
+                FinalizationVerificationStatus::NotRequired,
+                "verification.finalizer.not_final_answer",
+                activity,
+                None,
+            );
+        }
+        if !activity.code_mutation_seen {
+            return verification_finalizer_report(
+                FinalizationVerificationStatus::NotRequired,
+                "verification.finalizer.no_code_mutation",
+                activity,
+                None,
+            );
+        }
+        if activity.pending_requirements.is_empty() {
+            return verification_finalizer_report(
+                FinalizationVerificationStatus::Verified,
+                "verification.finalizer.fresh_verification_found",
+                activity,
+                None,
+            );
+        }
+        if let Some(reason) = final_answer_unverified_reason(request.final_answer) {
+            return verification_finalizer_report(
+                FinalizationVerificationStatus::UnverifiedAllowed,
+                "verification.finalizer.unverified_allowed",
+                activity,
+                Some(reason),
+            );
+        }
+        verification_finalizer_report(
+            FinalizationVerificationStatus::NudgeRequired,
+            "verification.finalizer.stale_after_code_mutation",
+            activity,
+            None,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFinalizationVerificationRequirement {
+    requirement_id: String,
+    required_kind: VerificationKind,
+    changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct FinalizationVerificationActivity {
+    code_mutation_seen: bool,
+    pending_requirements: BTreeMap<String, PendingFinalizationVerificationRequirement>,
+    satisfied_requirements: BTreeMap<String, PendingFinalizationVerificationRequirement>,
+    evidence_refs: BTreeSet<String>,
+}
+
+fn verification_finalizer_report(
+    status: FinalizationVerificationStatus,
+    reason_code: &str,
+    activity: FinalizationVerificationActivity,
+    unverified_reason: Option<String>,
+) -> FinalizationVerificationReport {
+    let pending_requirements = requirement_summaries(activity.pending_requirements.values());
+    let satisfied_requirement_count = activity.satisfied_requirements.len();
+    let event_type = match status {
+        FinalizationVerificationStatus::NudgeRequired => {
+            Some(VERIFICATION_FINALIZER_NUDGE_EVENT.to_owned())
+        }
+        FinalizationVerificationStatus::UnverifiedAllowed => {
+            Some(VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT.to_owned())
+        }
+        FinalizationVerificationStatus::NotRequired | FinalizationVerificationStatus::Verified => {
+            None
+        }
+    };
+    let nudge = (status == FinalizationVerificationStatus::NudgeRequired)
+        .then(|| verification_finalizer_nudge_text(pending_requirements.as_slice()));
+    FinalizationVerificationReport {
+        schema_version: FINAL_ANSWER_CONTRACT_SCHEMA_VERSION,
+        status,
+        reason_code: reason_code.to_owned(),
+        enforcement_mode: "soft_nudge".to_owned(),
+        surface_policy: "default_coding_session_soft_guard".to_owned(),
+        code_mutation_seen: activity.code_mutation_seen,
+        pending_requirement_count: pending_requirements.len(),
+        satisfied_requirement_count,
+        pending_requirements,
+        evidence_refs: activity.evidence_refs.into_iter().take(32).collect(),
+        event_type,
+        nudge,
+        unverified_reason,
+        redaction_level: FINAL_ANSWER_CONTRACT_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn verification_activity_from_messages(
+    run_id: &str,
+    messages: &[ProviderMessage],
+) -> FinalizationVerificationActivity {
+    let mut activity = FinalizationVerificationActivity::default();
+    let mut tool_calls_by_id = BTreeMap::<String, ProviderMessageToolCallRef>::new();
+
+    for message in messages {
+        for tool_call in &message.tool_calls {
+            tool_calls_by_id.insert(
+                tool_call.proposal_id.clone(),
+                ProviderMessageToolCallRef {
+                    tool_name: tool_call.tool_name.clone(),
+                    input_json: tool_call.input_json.clone(),
+                },
+            );
+        }
+
+        if message.role != ProviderMessageRole::Tool {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(tool_call) = tool_calls_by_id.get(tool_call_id) else {
+            continue;
+        };
+        let Ok(raw_output) = serde_json::from_str::<Value>(message.text_content().as_str()) else {
+            continue;
+        };
+        let output = model_visible_tool_result_payload(&raw_output);
+        if tool_call.tool_name == WORKSPACE_PATCH_TOOL_NAME
+            && model_visible_tool_result_succeeded(&raw_output)
+        {
+            observe_workspace_patch_verification_requirements(
+                run_id,
+                tool_call_id,
+                output,
+                &mut activity,
+            );
+            continue;
+        }
+        if tool_call.tool_name == PROCESS_RUN_TOOL_NAME
+            && process_run_verification_result_passed(&raw_output, output)
+        {
+            observe_process_run_verification(tool_call, tool_call_id, &mut activity);
+        }
+    }
+
+    activity
+}
+
+fn observe_workspace_patch_verification_requirements(
+    run_id: &str,
+    tool_call_id: &str,
+    output: &Value,
+    activity: &mut FinalizationVerificationActivity,
+) {
+    if output.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    if output.get("files_touched").and_then(Value::as_array).is_some_and(|files| {
+        files.iter().any(|file| {
+            !matches!(file.get("operation").and_then(Value::as_str).unwrap_or_default(), "no_op")
+        })
+    }) {
+        activity.code_mutation_seen = true;
+    }
+    for requirement in stale_requirements_from_patch_output(output) {
+        activity.code_mutation_seen = true;
+        activity.evidence_refs.insert(format!("tape:{run_id}:tool_result:{tool_call_id}"));
+        activity.pending_requirements.insert(requirement_key(&requirement), requirement);
+    }
+}
+
+fn observe_process_run_verification(
+    tool_call: &ProviderMessageToolCallRef,
+    tool_call_id: &str,
+    activity: &mut FinalizationVerificationActivity,
+) {
+    let Ok(input_json) = serde_json::to_vec(&tool_call.input_json) else {
+        return;
+    };
+    let Ok(input) = parse_process_runner_tool_input(input_json.as_slice()) else {
+        return;
+    };
+    let classification = VerificationCommandClassifier::classify_process_run(&input);
+    if !classification.is_verification {
+        return;
+    }
+    let matching = activity
+        .pending_requirements
+        .iter()
+        .filter(|(_, requirement)| requirement.required_kind == classification.kind)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in matching {
+        if let Some(requirement) = activity.pending_requirements.remove(key.as_str()) {
+            activity.evidence_refs.insert(format!("tool_call:{tool_call_id}"));
+            activity.satisfied_requirements.insert(key, requirement);
+        }
+    }
+}
+
+fn stale_requirements_from_patch_output(
+    output: &Value,
+) -> Vec<PendingFinalizationVerificationRequirement> {
+    let Some(requirements) =
+        output.pointer("/coding_posture/verification/requirements").and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    requirements
+        .iter()
+        .filter_map(|state| {
+            let requirement = state.get("requirement")?;
+            let required_kind = requirement
+                .get("required_kind")
+                .and_then(Value::as_str)
+                .and_then(verification_kind_from_str)?;
+            Some(PendingFinalizationVerificationRequirement {
+                requirement_id: requirement
+                    .get("requirement_id")
+                    .and_then(Value::as_str)
+                    .map(checkpoint_text_id)
+                    .unwrap_or_else(|| {
+                        format!("verification.required_after_patch.{}", required_kind.as_str())
+                    }),
+                required_kind,
+                changed_paths: requirement
+                    .get("changed_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(checkpoint_path)
+                            .take(12)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn process_run_verification_result_passed(raw_output: &Value, output: &Value) -> bool {
+    model_visible_tool_result_succeeded(raw_output)
+        && output.get("exit_code").and_then(Value::as_i64).is_none_or(|code| code == 0)
+}
+
+fn verification_kind_from_str(value: &str) -> Option<VerificationKind> {
+    match value {
+        "build" => Some(VerificationKind::Build),
+        "check" => Some(VerificationKind::Check),
+        "format" => Some(VerificationKind::Format),
+        "lint" => Some(VerificationKind::Lint),
+        "test" => Some(VerificationKind::Test),
+        "typecheck" => Some(VerificationKind::Typecheck),
+        _ => None,
+    }
+}
+
+fn requirement_key(requirement: &PendingFinalizationVerificationRequirement) -> String {
+    format!("{}:{}", requirement.required_kind.as_str(), requirement.requirement_id)
+}
+
+fn requirement_summaries<'a>(
+    requirements: impl Iterator<Item = &'a PendingFinalizationVerificationRequirement>,
+) -> Vec<FinalizationVerificationRequirementSummary> {
+    requirements
+        .take(16)
+        .map(|requirement| FinalizationVerificationRequirementSummary {
+            requirement_id: requirement.requirement_id.clone(),
+            required_kind: requirement.required_kind.as_str().to_owned(),
+            changed_paths: requirement.changed_paths.iter().take(12).cloned().collect(),
+        })
+        .collect()
+}
+
+fn verification_finalizer_nudge_text(
+    pending_requirements: &[FinalizationVerificationRequirementSummary],
+) -> String {
+    let kinds = pending_requirements
+        .iter()
+        .map(|requirement| requirement.required_kind.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Verification is stale after code changes. Run a matching verification command for: {kinds}. If verification cannot be run, final answer must explicitly include verification_status=unverified and the reason."
+    )
+}
+
+fn final_answer_unverified_reason(text: &str) -> Option<String> {
+    let normalized = normalize_finalizer_text(text);
+    let explicit = normalized.contains("verification_status=unverified")
+        || normalized.contains("verification status: unverified")
+        || normalized.contains("verification: unverified")
+        || normalized.contains("unverified because")
+        || normalized.contains("could not verify")
+        || normalized.contains("unable to verify")
+        || normalized.contains("tests not run");
+    explicit.then(|| checkpoint_text(text, 320))
+}
+
+fn normalize_finalizer_text(text: &str) -> String {
+    text.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl RunProgressCheckpoint {
     fn truncate_for_model(&mut self) {
         truncate_vec(&mut self.produced_files, RUN_PROGRESS_MAX_PRODUCED_FILES);
@@ -1031,7 +1416,10 @@ fn build_run_progress_checkpoint(
         for tool_call in &message.tool_calls {
             tool_calls_by_id.insert(
                 tool_call.proposal_id.clone(),
-                ProviderMessageToolCallRef { tool_name: tool_call.tool_name.clone() },
+                ProviderMessageToolCallRef {
+                    tool_name: tool_call.tool_name.clone(),
+                    input_json: tool_call.input_json.clone(),
+                },
             );
         }
 
@@ -1093,6 +1481,7 @@ fn build_run_progress_checkpoint(
 #[derive(Debug, Clone)]
 struct ProviderMessageToolCallRef {
     tool_name: String,
+    input_json: Value,
 }
 
 fn model_visible_tool_result_payload(output: &Value) -> &Value {
@@ -1901,6 +2290,119 @@ mod tests {
         )]);
     }
 
+    fn append_workspace_patch_with_stale_verification(
+        state: &mut AgentRunLoopState,
+        proposal_id: &str,
+    ) {
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: proposal_id.to_owned(),
+                tool_name: WORKSPACE_PATCH_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/lib.rs\n+pub fn value() -> u8 { 1 }\n*** End Patch"
+                }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            proposal_id,
+            serde_json::json!({
+                "patch_sha256": "abc",
+                "dry_run": false,
+                "files_touched": [{
+                    "path": "src/lib.rs",
+                    "workspace_root_index": 0,
+                    "operation": "create",
+                    "after_sha256": "sha",
+                    "after_size_bytes": 42
+                }],
+                "coding_posture": {
+                    "schema_version": 1,
+                    "instruction_authority": "none",
+                    "verification": {
+                        "schema_version": 1,
+                        "instruction_authority": "none",
+                        "freshness_status": "stale",
+                        "requirements": [{
+                            "schema_version": 1,
+                            "workspace_root": {
+                                "index": 0,
+                                "root_id_sha256": "root-a",
+                                "display_name": "workspace",
+                                "exists": true
+                            },
+                            "requirement": {
+                                "requirement_id": "verification.required_after_patch.test",
+                                "workspace_root": {
+                                    "index": 0,
+                                    "root_id_sha256": "root-a",
+                                    "display_name": "workspace",
+                                    "exists": true
+                                },
+                                "required_kind": "test",
+                                "changed_paths": ["src/lib.rs"],
+                                "min_created_at_unix_ms": 500,
+                                "reason_code": "verification.required_after_patch"
+                            },
+                            "latest_event_id": null,
+                            "latest_passing_event_id": null,
+                            "freshness": {
+                                "schema_version": 1,
+                                "status": "stale",
+                                "requirement_id": "verification.required_after_patch.test",
+                                "matched_event_id": null,
+                                "checked_at_unix_ms": 500,
+                                "reason_codes": [
+                                    "verification.freshness_checked",
+                                    "verification.no_passing_evidence",
+                                    "verification.state_stale"
+                                ],
+                                "redaction_level": "metadata_and_redacted_summary"
+                            },
+                            "redaction_level": "metadata_and_redacted_summary"
+                        }],
+                        "redaction_level": "metadata_and_redacted_summary"
+                    }
+                },
+                "rollback_performed": false,
+                "redacted_preview": ""
+            })
+            .to_string(),
+        )]);
+    }
+
+    fn append_successful_process_verification(state: &mut AgentRunLoopState, proposal_id: &str) {
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: proposal_id.to_owned(),
+                tool_name: PROCESS_RUN_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({
+                    "command": "cargo",
+                    "args": ["test"]
+                }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            proposal_id,
+            serde_json::json!({
+                "exit_code": 0,
+                "stdout": "test result: ok",
+                "stderr": "",
+                "background": false
+            })
+            .to_string(),
+        )]);
+    }
+
     #[test]
     fn run_progress_controller_intervenes_after_repeated_failure() {
         let mut controller = RunProgressController::new(3);
@@ -2115,6 +2617,105 @@ mod tests {
             .any(|value| value == "file:extract.js"));
         assert_eq!(envelope.final_answer_contract.decision, FinalAnswerDecision::Accepted);
         assert_eq!(envelope.evidence_summary.coverage, FinalAnswerEvidenceCoverage::Satisfied);
+    }
+
+    #[test]
+    fn verify_before_finish_guard_nudges_after_unverified_code_mutation() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create src/lib.rs.".to_owned())],
+            2,
+            4,
+            10_000,
+        );
+        append_workspace_patch_with_stale_verification(&mut state, "call-patch");
+
+        let report = state.verify_before_finish_guard(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Created src/lib.rs.",
+        );
+
+        assert_eq!(report.status, FinalizationVerificationStatus::NudgeRequired);
+        assert_eq!(report.event_type.as_deref(), Some(VERIFICATION_FINALIZER_NUDGE_EVENT));
+        assert_eq!(report.pending_requirement_count, 1);
+        assert!(report
+            .nudge
+            .as_deref()
+            .is_some_and(|text| text.contains("verification_status=unverified")));
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Created src/lib.rs.",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should parse");
+        assert_eq!(parsed["finalization"]["verification_finalizer"]["status"], "nudge_required");
+    }
+
+    #[test]
+    fn verify_before_finish_guard_accepts_matching_process_verification() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create src/lib.rs.".to_owned())],
+            2,
+            4,
+            10_000,
+        );
+        append_workspace_patch_with_stale_verification(&mut state, "call-patch");
+        append_successful_process_verification(&mut state, "call-test");
+
+        let report = state.verify_before_finish_guard(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Created src/lib.rs and cargo test passed.",
+        );
+
+        assert_eq!(report.status, FinalizationVerificationStatus::Verified);
+        assert_eq!(report.pending_requirement_count, 0);
+        assert_eq!(report.satisfied_requirement_count, 1);
+        assert!(report.evidence_refs.iter().any(|reference| reference == "tool_call:call-test"));
+    }
+
+    #[test]
+    fn verify_before_finish_guard_allows_explicit_unverified_reason() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create src/lib.rs.".to_owned())],
+            2,
+            4,
+            10_000,
+        );
+        append_workspace_patch_with_stale_verification(&mut state, "call-patch");
+
+        let report = state.verify_before_finish_guard(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Created src/lib.rs. verification_status=unverified because cargo is unavailable.",
+        );
+
+        assert_eq!(report.status, FinalizationVerificationStatus::UnverifiedAllowed);
+        assert_eq!(
+            report.event_type.as_deref(),
+            Some(VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT)
+        );
+        assert!(report
+            .unverified_reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("verification_status=unverified") }));
+    }
+
+    #[test]
+    fn verify_before_finish_guard_skips_runs_without_code_mutation() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 4, 10_000);
+
+        let report = state.verify_before_finish_guard(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Plain answer.",
+        );
+
+        assert_eq!(report.status, FinalizationVerificationStatus::NotRequired);
+        assert_eq!(report.reason_code, "verification.finalizer.no_code_mutation");
     }
 
     #[test]

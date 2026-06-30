@@ -71,9 +71,11 @@ use crate::{
 
 use super::{
     agent_loop::{
-        AgentLoopTerminationReason, AgentRunLoopState, RunProgressAttempt, RunProgressController,
+        AgentLoopTerminationReason, AgentRunLoopState, FinalizationVerificationReport,
+        FinalizationVerificationStatus, RunProgressAttempt, RunProgressController,
         RunProgressIntervention, RunProgressOutcomeClass, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
         TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
+        VERIFICATION_FINALIZER_NUDGE_EVENT, VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
     },
     cancellation::transition_run_stream_to_cancelled,
     tape::{
@@ -1746,6 +1748,7 @@ pub(crate) async fn process_run_stream_message(
     .await?;
     let mut length_recovery_attempts = 0u8;
     let mut final_answer_recovery_attempted = false;
+    let mut verification_finalizer_nudge_attempted = false;
     let mut browser_followup_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
     let mut run_progress_controller = RunProgressController::new(3);
@@ -2427,6 +2430,57 @@ pub(crate) async fn process_run_stream_message(
                         return Ok(RunStreamMessageProcessingOutcome::Terminate);
                     }
                     if let Some(reply_text) = final_reply_text.as_deref() {
+                        let verification_guard = loop_state.verify_before_finish_guard(
+                            run_id.as_str(),
+                            AgentLoopTerminationReason::FinalAnswer,
+                            reply_text,
+                        );
+                        if verification_guard.status
+                            == FinalizationVerificationStatus::NudgeRequired
+                            && !verification_finalizer_nudge_attempted
+                        {
+                            verification_finalizer_nudge_attempted = true;
+                            loop_state.append_user_guidance(
+                                verification_guard.nudge.clone().unwrap_or_else(|| {
+                                    "Verification is stale after code changes. Run matching verification or explicitly report verification_status=unverified with a reason.".to_owned()
+                                }),
+                            );
+                            append_agent_loop_tape_event(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                verification_finalizer_payload(
+                                    VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                    &verification_guard,
+                                ),
+                            )
+                            .await?;
+                            send_agent_loop_progress_status(
+                                sender,
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                VERIFICATION_FINALIZER_NUDGE_EVENT,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if verification_guard.status
+                            == FinalizationVerificationStatus::UnverifiedAllowed
+                        {
+                            append_agent_loop_tape_event(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
+                                verification_finalizer_payload(
+                                    VERIFICATION_FINALIZER_UNVERIFIED_ALLOWED_EVENT,
+                                    &verification_guard,
+                                ),
+                            )
+                            .await?;
+                        }
                         if final_reply_tokens_deferred {
                             send_deferred_final_reply_tokens(
                                 sender,
@@ -3103,6 +3157,18 @@ fn tool_loop_intervention_payload(intervention: &RunProgressIntervention) -> Str
         "fingerprint": intervention.fingerprint,
         "guidance": intervention.guidance,
         "learning_observation": intervention.learning_observation,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn verification_finalizer_payload(
+    event_type: &str,
+    report: &FinalizationVerificationReport,
+) -> String {
+    serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event_type": event_type,
+        "verification_finalizer": report,
     }))
     .unwrap_or_else(|_| "{}".to_owned())
 }
