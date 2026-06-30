@@ -12,6 +12,10 @@ run_self_test() {
     *palyra_daemon*) echo "architecture boundary self-test failed" >&2; exit 1 ;;
     *) ;;
   esac
+  case "use palyra_cli::commands;" in
+    *palyra_cli*) ;;
+    *) echo "architecture boundary self-test failed" >&2; exit 1 ;;
+  esac
   echo "architecture boundary self-test passed"
 }
 
@@ -78,6 +82,18 @@ check_rule \
   "desktop-ui-does-not-import-rust-crates" \
   "apps/desktop/ui/src" \
   '\.\./\.\./crates/|crates[/\\]palyra' \
+  || failed=true
+
+check_rule \
+  "plugin-sdk-stays-host-independent" \
+  "crates/palyra-plugins/sdk" \
+  'palyra[_-](daemon|cli|vault|connectors|policy)|(^|[^[:alnum:]_])(axum|tauri|rusqlite|reqwest)([^[:alnum:]_]|$)' \
+  || failed=true
+
+check_rule \
+  "plugin-runtime-stays-host-independent" \
+  "crates/palyra-plugins/runtime" \
+  'palyra[_-](daemon|cli|vault|connectors|policy)|(^|[^[:alnum:]_])(axum|tauri|rusqlite|reqwest)([^[:alnum:]_]|$)' \
   || failed=true
 
 if [[ "$failed" == true ]]; then
