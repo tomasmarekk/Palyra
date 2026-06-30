@@ -26771,6 +26771,81 @@ mod tests {
     }
 
     #[test]
+    fn queue_steering_audit_events_share_turn_control_ledger() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5QS1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5QS2";
+        let queued_input_id = "01ARZ3NDEKTSV4RRFFQ69G5QS3";
+        upsert_orchestrator_session(&store, session_id);
+        start_orchestrator_run(&store, session_id, run_id);
+
+        let event = store
+            .append_turn_control_event(&TurnControlAuditEventAppendRequest {
+                event_id: "01ARZ3NDEKTSV4RRFFQ69G5QS4".to_owned(),
+                event_type: crate::application::session_queue::QUEUE_STEERING_EVENT_COMPLETED
+                    .to_owned(),
+                operation: "queue_steering".to_owned(),
+                actor_principal: "user:ops".to_owned(),
+                target_kind: "queued_input".to_owned(),
+                target_id: Some(queued_input_id.to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: Some(run_id.to_owned()),
+                outcome: "completed".to_owned(),
+                reason_code:
+                    crate::application::session_queue::QueueSteeringReasonCode::PriorityLaneSelected
+                        .as_str()
+                        .to_owned(),
+                payload_json: json!({
+                    "schema_version": crate::application::session_queue::QUEUE_STEERING_SCHEMA_VERSION,
+                    "action": "set_priority_lane",
+                    "queued_input_id": queued_input_id,
+                    "to_priority_lane": "operator_priority",
+                })
+                .to_string(),
+                evidence_refs_json: json!([{
+                    "kind": "queued_input",
+                    "queued_input_id": queued_input_id,
+                }])
+                .to_string(),
+                redaction_level: crate::application::session_queue::QUEUE_STEERING_REDACTION_NONE
+                    .to_owned(),
+            })
+            .expect("queue steering event should append");
+
+        assert_eq!(event.operation, "queue_steering");
+        assert_eq!(
+            event.event_type,
+            crate::application::session_queue::QUEUE_STEERING_EVENT_COMPLETED
+        );
+        assert_eq!(event.target_kind, "queued_input");
+        assert_eq!(event.target_id.as_deref(), Some(queued_input_id));
+        assert_eq!(
+            event.reason_code,
+            crate::application::session_queue::QueueSteeringReasonCode::PriorityLaneSelected
+                .as_str()
+        );
+        assert_eq!(
+            event.redaction_level,
+            crate::application::session_queue::QUEUE_STEERING_REDACTION_NONE
+        );
+
+        let events = store
+            .list_turn_control_events(&TurnControlAuditEventListFilter {
+                actor_principal: Some("user:ops".to_owned()),
+                session_id: Some(session_id.to_owned()),
+                run_id: Some(run_id.to_owned()),
+                target_kind: Some("queued_input".to_owned()),
+                target_id: Some(queued_input_id.to_owned()),
+                limit: 10,
+            })
+            .expect("queue steering events should list from audit ledger");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event.event_id);
+    }
+
+    #[test]
     fn reset_orchestrator_session_clears_project_context_state() {
         let db_path = temp_db_path();
         let store = JournalStore::open(test_journal_config(db_path, false))

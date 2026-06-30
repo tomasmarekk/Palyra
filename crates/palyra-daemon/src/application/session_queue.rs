@@ -8,12 +8,14 @@
 //! and hitting the per-group cap forces a deterministic overflow summary
 //! instead of unbounded queue growth. [`build_queue_collect_summary`] renders
 //! that summary with full provenance; [`analyze_session_queue`] derives the
-//! operator-facing busy state and depth/age/fairness metrics. This module is
-//! pure decision logic over journal `OrchestratorQueuedInputRecord`s --
-//! persistence and forwarding live in the console chat handlers.
+//! operator-facing busy state and depth/age/fairness metrics; and
+//! [`decide_queue_steering`] projects explicit queued-input lane changes into
+//! journal-ready decisions. This module stays pure over journal
+//! `OrchestratorQueuedInputRecord`s; runtime code owns persistence, audit, and
+//! forwarding side effects.
 
 use palyra_common::runtime_contracts::{QueueDecision, QueueMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::SessionQueuePolicyConfig;
@@ -21,6 +23,12 @@ use crate::journal::OrchestratorQueuedInputRecord;
 
 /// Policy identifier recorded in queue decisions and explain payloads.
 pub(crate) const SESSION_QUEUE_POLICY_ID: &str = "session_queue.v1";
+pub(crate) const QUEUE_STEERING_SCHEMA_VERSION: i64 = 1;
+pub(crate) const QUEUE_STEERING_EVENT_STARTED: &str = "queue_steering_pro_queued_inputs.started";
+pub(crate) const QUEUE_STEERING_EVENT_COMPLETED: &str =
+    "queue_steering_pro_queued_inputs.completed";
+pub(crate) const QUEUE_STEERING_EVENT_FAILED: &str = "queue_steering_pro_queued_inputs.failed";
+pub(crate) const QUEUE_STEERING_REDACTION_NONE: &str = "none";
 const DEFAULT_PRIORITY_LANE: &str = "normal";
 const DEFAULT_DROP_POLICY: &str = "summarize_oldest";
 const DEFAULT_OVERFLOW_BEHAVIOR: &str = "deterministic_backlog_summary";
@@ -198,6 +206,79 @@ impl SessionQueueAnalysis {
             "metrics": self.metrics.snapshot_json(),
         })
     }
+}
+
+/// Runtime action selected for a queued-input steering request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueSteeringAction {
+    Noop,
+    SetPriorityLane,
+    Reject,
+}
+
+impl QueueSteeringAction {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::SetPriorityLane => "set_priority_lane",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+/// Stable reason codes for queued-input steering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueSteeringReasonCode {
+    PriorityLaneSelected,
+    AlreadyInRequestedLane,
+    MissingActor,
+    MissingPriorityLane,
+    InvalidPriorityLane,
+    NonPendingInput,
+}
+
+impl QueueSteeringReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PriorityLaneSelected => "queue_steering.priority_lane_selected",
+            Self::AlreadyInRequestedLane => "queue_steering.already_in_requested_lane",
+            Self::MissingActor => "queue_steering.missing_actor",
+            Self::MissingPriorityLane => "queue_steering.missing_priority_lane",
+            Self::InvalidPriorityLane => "queue_steering.invalid_priority_lane",
+            Self::NonPendingInput => "queue_steering.non_pending_input",
+        }
+    }
+}
+
+/// Operator request to steer one queued input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct QueueSteeringRequest {
+    pub(crate) actor_principal: String,
+    pub(crate) requested_priority_lane: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+/// Pure decision and journal projection for queued-input steering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct QueueSteeringDecision {
+    pub(crate) schema_version: i64,
+    pub(crate) action: QueueSteeringAction,
+    pub(crate) accepted: bool,
+    pub(crate) reason_code: String,
+    pub(crate) queued_input_id: String,
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) from_priority_lane: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_priority_lane: Option<String>,
+    pub(crate) terminal_event_type: String,
+    pub(crate) payload_json: String,
+    pub(crate) evidence_refs_json: String,
+    pub(crate) redaction_level: String,
 }
 
 impl SessionQueuePolicy {
@@ -446,6 +527,67 @@ pub(crate) fn analyze_session_queue(
     SessionQueueAnalysis { busy_state, recommendation, metrics }
 }
 
+/// Decides whether and how one pending queued input should move lanes.
+#[must_use]
+pub(crate) fn decide_queue_steering(
+    queued: &OrchestratorQueuedInputRecord,
+    request: &QueueSteeringRequest,
+) -> QueueSteeringDecision {
+    if request.actor_principal.trim().is_empty() {
+        return queue_steering_decision(
+            queued,
+            QueueSteeringAction::Reject,
+            false,
+            QueueSteeringReasonCode::MissingActor,
+            None,
+        );
+    }
+    let requested_lane = request.requested_priority_lane.trim();
+    if requested_lane.is_empty() {
+        return queue_steering_decision(
+            queued,
+            QueueSteeringAction::Reject,
+            false,
+            QueueSteeringReasonCode::MissingPriorityLane,
+            None,
+        );
+    }
+    let Some(normalized_lane) = normalize_priority_lane(requested_lane) else {
+        return queue_steering_decision(
+            queued,
+            QueueSteeringAction::Reject,
+            false,
+            QueueSteeringReasonCode::InvalidPriorityLane,
+            None,
+        );
+    };
+    if queued.state != "pending" {
+        return queue_steering_decision(
+            queued,
+            QueueSteeringAction::Reject,
+            false,
+            QueueSteeringReasonCode::NonPendingInput,
+            Some(normalized_lane),
+        );
+    }
+    if queued.priority_lane == normalized_lane {
+        return queue_steering_decision(
+            queued,
+            QueueSteeringAction::Noop,
+            true,
+            QueueSteeringReasonCode::AlreadyInRequestedLane,
+            Some(normalized_lane),
+        );
+    }
+    queue_steering_decision(
+        queued,
+        QueueSteeringAction::SetPriorityLane,
+        true,
+        QueueSteeringReasonCode::PriorityLaneSelected,
+        Some(normalized_lane),
+    )
+}
+
 /// Computes depth, age, and fairness metrics over the queued inputs.
 ///
 /// When `coalescing_group` is given, only records in that group are counted;
@@ -592,6 +734,67 @@ fn queue_age_ms(observed_at_unix_ms: i64, created_at_unix_ms: i64) -> u64 {
     observed_at_unix_ms.saturating_sub(created_at_unix_ms).max(0) as u64
 }
 
+fn queue_steering_decision(
+    queued: &OrchestratorQueuedInputRecord,
+    action: QueueSteeringAction,
+    accepted: bool,
+    reason_code: QueueSteeringReasonCode,
+    to_priority_lane: Option<String>,
+) -> QueueSteeringDecision {
+    let terminal_event_type =
+        if accepted { QUEUE_STEERING_EVENT_COMPLETED } else { QUEUE_STEERING_EVENT_FAILED };
+    let reason_code = reason_code.as_str().to_owned();
+    let payload_json = json!({
+        "schema_version": QUEUE_STEERING_SCHEMA_VERSION,
+        "queued_input_id": queued.queued_input_id.as_str(),
+        "session_id": queued.session_id.as_str(),
+        "run_id": queued.run_id.as_str(),
+        "state": queued.state.as_str(),
+        "action": action.as_str(),
+        "accepted": accepted,
+        "reason_code": reason_code,
+        "from_priority_lane": queued.priority_lane.as_str(),
+        "to_priority_lane": to_priority_lane.as_deref(),
+        "queue_mode": queued.queue_mode.as_str(),
+        "coalescing_group": queued.coalescing_group.as_deref(),
+    })
+    .to_string();
+    let evidence_refs_json = json!([{
+        "kind": "queued_input",
+        "queued_input_id": queued.queued_input_id.as_str(),
+        "session_id": queued.session_id.as_str(),
+        "run_id": queued.run_id.as_str(),
+        "created_at_unix_ms": queued.created_at_unix_ms,
+    }])
+    .to_string();
+    QueueSteeringDecision {
+        schema_version: QUEUE_STEERING_SCHEMA_VERSION,
+        action,
+        accepted,
+        reason_code,
+        queued_input_id: queued.queued_input_id.clone(),
+        session_id: queued.session_id.clone(),
+        run_id: queued.run_id.clone(),
+        from_priority_lane: queued.priority_lane.clone(),
+        to_priority_lane,
+        terminal_event_type: terminal_event_type.to_owned(),
+        payload_json,
+        evidence_refs_json,
+        redaction_level: QUEUE_STEERING_REDACTION_NONE.to_owned(),
+    }
+}
+
+fn normalize_priority_lane(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
+        .then(|| trimmed.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use palyra_common::runtime_contracts::{QueueDecision, QueueMode};
@@ -601,9 +804,12 @@ mod tests {
     use crate::journal::OrchestratorQueuedInputRecord;
 
     use super::{
-        analyze_session_queue, build_queue_collect_summary, decide_session_queue_mode,
-        pending_queue_depth, queue_profile_for_input, SessionBusyState, SessionQueuePolicy,
-        SessionQueueProfile, SessionQueueSafeBoundary,
+        analyze_session_queue, build_queue_collect_summary, decide_queue_steering,
+        decide_session_queue_mode, pending_queue_depth, queue_profile_for_input,
+        QueueSteeringAction, QueueSteeringReasonCode, QueueSteeringRequest, SessionBusyState,
+        SessionQueuePolicy, SessionQueueProfile, SessionQueueSafeBoundary,
+        QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED, QUEUE_STEERING_REDACTION_NONE,
+        QUEUE_STEERING_SCHEMA_VERSION,
     };
 
     #[test]
@@ -775,5 +981,127 @@ mod tests {
         assert_eq!(analysis.metrics.newest_pending_age_ms, Some(150));
         assert_eq!(analysis.metrics.operator_priority_pending, 1);
         assert_eq!(queue_profile_for_input(&records[1]), SessionQueueProfile::OperatorPriority);
+    }
+
+    #[test]
+    fn queue_steering_moves_pending_input_to_normalized_lane() {
+        let queued = queued_input_fixture("pending", "normal");
+        let decision = decide_queue_steering(
+            &queued,
+            &QueueSteeringRequest {
+                actor_principal: "user:ops".to_owned(),
+                requested_priority_lane: "Operator_Priority".to_owned(),
+                reason: Some("operator escalation".to_owned()),
+            },
+        );
+
+        assert_eq!(decision.schema_version, QUEUE_STEERING_SCHEMA_VERSION);
+        assert_eq!(decision.action, QueueSteeringAction::SetPriorityLane);
+        assert!(decision.accepted);
+        assert_eq!(decision.reason_code, QueueSteeringReasonCode::PriorityLaneSelected.as_str());
+        assert_eq!(decision.from_priority_lane, "normal");
+        assert_eq!(decision.to_priority_lane.as_deref(), Some("operator_priority"));
+        assert_eq!(decision.terminal_event_type, QUEUE_STEERING_EVENT_COMPLETED);
+        assert_eq!(decision.redaction_level, QUEUE_STEERING_REDACTION_NONE);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(decision.payload_json.as_str()).expect("payload should be JSON");
+        assert_eq!(payload["action"], QueueSteeringAction::SetPriorityLane.as_str());
+        assert_eq!(payload["to_priority_lane"], "operator_priority");
+
+        let roundtrip: super::QueueSteeringDecision =
+            serde_json::from_str(&serde_json::to_string(&decision).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(roundtrip, decision);
+    }
+
+    #[test]
+    fn queue_steering_rejects_non_pending_input_without_lane_change() {
+        let queued = queued_input_fixture("forwarded", "normal");
+        let decision = decide_queue_steering(
+            &queued,
+            &QueueSteeringRequest {
+                actor_principal: "user:ops".to_owned(),
+                requested_priority_lane: "operator_priority".to_owned(),
+                reason: None,
+            },
+        );
+
+        assert_eq!(decision.action, QueueSteeringAction::Reject);
+        assert!(!decision.accepted);
+        assert_eq!(decision.reason_code, QueueSteeringReasonCode::NonPendingInput.as_str());
+        assert_eq!(decision.to_priority_lane.as_deref(), Some("operator_priority"));
+        assert_eq!(decision.terminal_event_type, QUEUE_STEERING_EVENT_FAILED);
+    }
+
+    #[test]
+    fn queue_steering_noops_when_input_is_already_in_requested_lane() {
+        let queued = queued_input_fixture("pending", "operator_priority");
+        let decision = decide_queue_steering(
+            &queued,
+            &QueueSteeringRequest {
+                actor_principal: "user:ops".to_owned(),
+                requested_priority_lane: "operator_priority".to_owned(),
+                reason: None,
+            },
+        );
+
+        assert_eq!(decision.action, QueueSteeringAction::Noop);
+        assert!(decision.accepted);
+        assert_eq!(decision.reason_code, QueueSteeringReasonCode::AlreadyInRequestedLane.as_str());
+        assert_eq!(decision.to_priority_lane.as_deref(), Some("operator_priority"));
+        assert_eq!(decision.terminal_event_type, QUEUE_STEERING_EVENT_COMPLETED);
+    }
+
+    #[test]
+    fn queue_steering_rejects_missing_actor_and_invalid_lane() {
+        let queued = queued_input_fixture("pending", "normal");
+        let missing_actor = decide_queue_steering(
+            &queued,
+            &QueueSteeringRequest {
+                actor_principal: " ".to_owned(),
+                requested_priority_lane: "operator_priority".to_owned(),
+                reason: None,
+            },
+        );
+        assert_eq!(missing_actor.action, QueueSteeringAction::Reject);
+        assert_eq!(missing_actor.reason_code, QueueSteeringReasonCode::MissingActor.as_str());
+
+        let invalid_lane = decide_queue_steering(
+            &queued,
+            &QueueSteeringRequest {
+                actor_principal: "user:ops".to_owned(),
+                requested_priority_lane: "bad lane".to_owned(),
+                reason: None,
+            },
+        );
+        assert_eq!(invalid_lane.action, QueueSteeringAction::Reject);
+        assert_eq!(invalid_lane.reason_code, QueueSteeringReasonCode::InvalidPriorityLane.as_str());
+        assert_eq!(invalid_lane.terminal_event_type, QUEUE_STEERING_EVENT_FAILED);
+    }
+
+    fn queued_input_fixture(state: &str, priority_lane: &str) -> OrchestratorQueuedInputRecord {
+        OrchestratorQueuedInputRecord {
+            queued_input_id: "queued-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            state: state.to_owned(),
+            queue_mode: "followup".to_owned(),
+            priority_lane: priority_lane.to_owned(),
+            coalescing_group: Some("session:session-1".to_owned()),
+            overflow_summary_ref: None,
+            safe_boundary_flags_json: "{}".to_owned(),
+            decision_reason: "followup_requested".to_owned(),
+            text: "queued input".to_owned(),
+            accepted_at_unix_ms: Some(100),
+            coalesced_at_unix_ms: None,
+            forwarded_at_unix_ms: None,
+            terminal_at_unix_ms: None,
+            policy_snapshot_json: "{}".to_owned(),
+            explain_json: "{}".to_owned(),
+            created_at_unix_ms: 100,
+            updated_at_unix_ms: 100,
+            origin_run_id: None,
+        }
     }
 }

@@ -23,7 +23,7 @@ use crate::{
     },
     application::session_queue::{
         analyze_session_queue, build_queue_collect_summary, decide_session_queue_mode,
-        pending_queue_depth, SessionQueuePolicy, SessionQueueSafeBoundary,
+        pending_queue_depth, QueueSteeringRequest, SessionQueuePolicy, SessionQueueSafeBoundary,
     },
     *,
 };
@@ -3796,28 +3796,27 @@ pub(crate) async fn console_chat_queue_prioritize_handler(
                 "queued input not found: {queued_input_id}"
             )))
         })?;
-    if queued.state != QueuedInputState::Pending.as_str() {
-        return Err(runtime_status_response(tonic::Status::failed_precondition(
-            "only pending queued inputs can be prioritized",
-        )));
-    }
-    let explain_json = json!({
-        "decision": "prioritize",
-        "reason": reason.as_str(),
-        "previous_priority_lane": queued.priority_lane.as_str(),
-        "priority_lane": priority_lane.as_str(),
-        "queue_mode": queued.queue_mode.as_str(),
-    });
-    state
+    let previous_priority_lane = queued.priority_lane.clone();
+    let queued_queue_mode = queued.queue_mode.clone();
+    let steering_decision = state
         .runtime
-        .prioritize_orchestrator_queued_input(
+        .steer_orchestrator_queued_input(
+            session_id.clone(),
             queued_input_id.clone(),
-            priority_lane.clone(),
-            reason.clone(),
-            explain_json.to_string(),
+            QueueSteeringRequest {
+                actor_principal: session.context.principal.clone(),
+                requested_priority_lane: priority_lane.clone(),
+                reason: Some(reason.clone()),
+            },
         )
         .await
         .map_err(runtime_status_response)?;
+    if !steering_decision.accepted {
+        return Err(runtime_status_response(tonic::Status::failed_precondition(format!(
+            "queued input priority rejected: {}",
+            steering_decision.reason_code
+        ))));
+    }
     record_session_queue_operator_event(
         &state,
         &session.context,
@@ -3829,6 +3828,12 @@ pub(crate) async fn console_chat_queue_prioritize_handler(
         snapshot.pending_inputs().len(),
         json!({
             "priority_lane": priority_lane.as_str(),
+            "previous_priority_lane": previous_priority_lane.as_str(),
+            "queue_mode": queued_queue_mode.as_str(),
+            "queue_steering": {
+                "action": steering_decision.action.as_str(),
+                "reason_code": steering_decision.reason_code.as_str(),
+            },
         }),
     )
     .await?;
@@ -3839,6 +3844,7 @@ pub(crate) async fn console_chat_queue_prioritize_handler(
         "action": "prioritize",
         "queued_input_id": queued_input_id,
         "priority_lane": priority_lane,
+        "queue_steering": steering_decision,
         "queue": session_queue_snapshot_json(refreshed),
         "contract": contract_descriptor(),
     })))

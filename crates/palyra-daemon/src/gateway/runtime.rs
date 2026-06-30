@@ -37,6 +37,10 @@ use crate::application::{
         CodeIntelRuntimeSnapshotRequest,
     },
     progress_draft::project_progress_draft_tape_event,
+    session_queue::{
+        decide_queue_steering, QueueSteeringAction, QueueSteeringDecision, QueueSteeringRequest,
+        QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED, QUEUE_STEERING_EVENT_STARTED,
+    },
     turn_control::{
         decide_turn_control_request, TurnControlAction, TurnControlApplyOutcome,
         TurnControlDecision, TurnControlOperation, TurnControlRequest,
@@ -5763,6 +5767,26 @@ impl GatewayRuntimeState {
                     .ok_or_else(|| {
                         Status::invalid_argument("turn control priority missing priority lane")
                     })?;
+                if let Some(session_id) =
+                    request.session_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+                {
+                    let steering_decision = self
+                        .steer_orchestrator_queued_input(
+                            session_id.to_owned(),
+                            queued_input_id.to_owned(),
+                            QueueSteeringRequest {
+                                actor_principal: decision.actor_principal.clone(),
+                                requested_priority_lane: priority_lane.to_owned(),
+                                reason: request.reason.clone(),
+                            },
+                        )
+                        .await?;
+                    return serde_json::to_value(steering_decision).map_err(|error| {
+                        Status::internal(format!(
+                            "failed to serialize queue steering effect: {error}"
+                        ))
+                    });
+                }
                 self.prioritize_orchestrator_queued_input(
                     queued_input_id.to_owned(),
                     priority_lane.to_owned(),
@@ -5834,6 +5858,112 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("turn control audit append worker panicked"))?
+    }
+
+    /// Applies a queued-input steering request through the journal-backed audit path.
+    ///
+    /// # Errors
+    /// Returns `not_found` if the queued input does not belong to the session,
+    /// or the mapped journal/runtime error when audit or priority updates fail.
+    #[allow(clippy::result_large_err)]
+    pub async fn steer_orchestrator_queued_input(
+        self: &Arc<Self>,
+        session_id: String,
+        queued_input_id: String,
+        request: QueueSteeringRequest,
+    ) -> Result<QueueSteeringDecision, Status> {
+        let queued_inputs = self.list_orchestrator_queued_inputs(session_id.clone()).await?;
+        let queued = queued_inputs
+            .into_iter()
+            .find(|queued| queued.queued_input_id.as_str() == queued_input_id.as_str())
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "queued input not found in session {session_id}: {queued_input_id}"
+                ))
+            })?;
+        let decision = decide_queue_steering(&queued, &request);
+        self.record_queue_steering_event(
+            &request,
+            &decision,
+            QUEUE_STEERING_EVENT_STARTED,
+            "started",
+        )
+        .await?;
+        if !decision.accepted {
+            self.record_queue_steering_event(
+                &request,
+                &decision,
+                QUEUE_STEERING_EVENT_FAILED,
+                "failed",
+            )
+            .await?;
+            return Ok(decision);
+        }
+        match decision.action {
+            QueueSteeringAction::SetPriorityLane => {
+                let priority_lane = decision.to_priority_lane.as_ref().ok_or_else(|| {
+                    Status::internal("accepted queue steering decision missing priority lane")
+                })?;
+                self.prioritize_orchestrator_queued_input(
+                    decision.queued_input_id.clone(),
+                    priority_lane.clone(),
+                    decision.reason_code.clone(),
+                    decision.payload_json.clone(),
+                )
+                .await?;
+            }
+            QueueSteeringAction::Noop => {}
+            QueueSteeringAction::Reject => {
+                return Err(Status::internal(
+                    "accepted queue steering decision cannot select reject action",
+                ));
+            }
+        }
+        self.record_queue_steering_event(
+            &request,
+            &decision,
+            QUEUE_STEERING_EVENT_COMPLETED,
+            "completed",
+        )
+        .await?;
+        Ok(decision)
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn record_queue_steering_event(
+        self: &Arc<Self>,
+        request: &QueueSteeringRequest,
+        decision: &QueueSteeringDecision,
+        event_type: &str,
+        outcome: &str,
+    ) -> Result<TurnControlAuditEventRecord, Status> {
+        let actor_principal = request.actor_principal.trim();
+        let actor_principal = if actor_principal.is_empty() {
+            "unknown".to_owned()
+        } else {
+            actor_principal.to_owned()
+        };
+        let append_request = TurnControlAuditEventAppendRequest {
+            event_id: ulid::Ulid::new().to_string(),
+            event_type: event_type.to_owned(),
+            operation: "queue_steering".to_owned(),
+            actor_principal,
+            target_kind: "queued_input".to_owned(),
+            target_id: Some(decision.queued_input_id.clone()),
+            session_id: Some(decision.session_id.clone()),
+            run_id: Some(decision.run_id.clone()),
+            outcome: outcome.to_owned(),
+            reason_code: decision.reason_code.clone(),
+            payload_json: decision.payload_json.clone(),
+            evidence_refs_json: decision.evidence_refs_json.clone(),
+            redaction_level: decision.redaction_level.clone(),
+        };
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.append_turn_control_event_blocking(&append_request)
+        })
+        .await
+        .map_err(|_| Status::internal("queue steering audit append worker panicked"))?
     }
 
     /// Appends one tape event for a run and bumps the tape counter.

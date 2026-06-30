@@ -1713,6 +1713,17 @@ async fn collect_console_turn_control_diagnostics(
             "completed": crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
             "failed": crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
         },
+        "queue_steering": {
+            "schema_version": crate::application::session_queue::QUEUE_STEERING_SCHEMA_VERSION,
+            "operation": "queue_steering",
+            "target_kind": "queued_input",
+            "audit_ledger": "turn_control_events",
+            "event_types": {
+                "started": crate::application::session_queue::QUEUE_STEERING_EVENT_STARTED,
+                "completed": crate::application::session_queue::QUEUE_STEERING_EVENT_COMPLETED,
+                "failed": crate::application::session_queue::QUEUE_STEERING_EVENT_FAILED,
+            },
+        },
         "recent": recent,
     }))
 }
