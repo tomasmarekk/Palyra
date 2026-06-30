@@ -1479,6 +1479,7 @@ async fn maybe_apply_automatic_session_compaction(
                 "pre_checkpoint_id": execution.pre_checkpoint.checkpoint_id,
                 "post_checkpoint_id": execution.post_checkpoint.checkpoint_id,
                 "checkpoint_pair": execution.checkpoint_pair.journal_projection,
+                "compaction_safeguard": execution.safeguard,
                 "estimated_input_tokens": artifact.estimated_input_tokens,
                 "estimated_output_tokens": artifact.estimated_output_tokens,
             })

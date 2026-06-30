@@ -62,6 +62,13 @@ pub(crate) const PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED: &str =
 const PRE_POST_COMPACTION_CHECKPOINTS_TAG: &str = "pre_post_compaction_checkpoints";
 const PRE_POST_COMPACTION_CHECKPOINTS_ROLLOUT_MODE: &str = "enabled_existing_checkpoint_journal";
 const PRE_POST_COMPACTION_CHECKPOINTS_REDACTION_LEVEL: &str = "metadata_only";
+pub(crate) const COMPACTION_SAFEGUARD_SCHEMA_VERSION: u64 = 1;
+pub(crate) const COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED: &str =
+    "compaction.checkpoint.created";
+pub(crate) const COMPACTION_SAFEGUARD_EVENT_PASSED: &str = "compaction.safeguard.passed";
+pub(crate) const COMPACTION_SAFEGUARD_EVENT_FAILED: &str = "compaction.safeguard.failed";
+pub(crate) const COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK: &str = "compaction.rolled_back";
+const COMPACTION_SAFEGUARD_REDACTION_LEVEL: &str = "metadata_only";
 // The newest text events always stay verbatim so the model keeps the live
 // conversational tail; compaction is skipped entirely unless at least
 // MIN_CONDENSED_EVENTS older events would actually be condensed.
@@ -117,6 +124,8 @@ const CONTRADICTION_PAIRS: &[(&str, &str)] = &[
 
 #[cfg(test)]
 static TEST_WRITE_FAILURE_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_SAFEGUARD_FAILURE_REASON: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Complete compaction proposal for one session: summary, counts, candidates.
 ///
@@ -149,6 +158,7 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) candidates: Vec<SessionCompactionCandidate>,
     pub(crate) checkpoint_preview: SessionCompactionCheckpointPreview,
     pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
+    pub(crate) safeguard: CompactionSafeguardProjection,
 }
 
 impl SessionCompactionPlan {
@@ -187,6 +197,7 @@ impl SessionCompactionPlan {
             "summary": serde_json::from_str::<Value>(self.summary_json.as_str())
                 .unwrap_or_else(|_| json!({ "summary_text": self.summary_text })),
             "checkpoint_pair": self.checkpoint_pair,
+            "compaction_safeguard": self.safeguard,
         })
     }
 }
@@ -217,6 +228,7 @@ pub(crate) struct SessionCompactionExecution {
     pub(crate) pre_checkpoint: OrchestratorCheckpointRecord,
     pub(crate) post_checkpoint: OrchestratorCheckpointRecord,
     pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
+    pub(crate) safeguard: CompactionSafeguardProjection,
     /// Backward-compatible alias for the post-compaction checkpoint.
     pub(crate) checkpoint: OrchestratorCheckpointRecord,
     /// Workspace writes that were applied (or were no-ops), in path order.
@@ -340,6 +352,102 @@ pub(crate) struct PreAPostCompactionJournalProjection {
     pub workspace_paths: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub redaction_level: String,
+}
+
+/// Deterministic safeguard verdict for one session compaction attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct CompactionSafeguardProjection {
+    pub schema_version: u64,
+    pub rollout_enabled: bool,
+    pub decision: CompactionSafeguardDecision,
+    pub reason_codes: Vec<CompactionSafeguardReasonCode>,
+    pub checkpoint_event_type: String,
+    pub verdict_event_type: String,
+    pub rollback_event_type: String,
+    pub rollback_action: String,
+    pub redaction_level: String,
+    pub pre_checkpoint: PreCompactionCheckpoint,
+    pub post_artifact: PostCompactionArtifact,
+    pub violations: Vec<CompactionSafeguardViolation>,
+}
+
+/// Runtime decision made by the compaction safeguard verifier.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum CompactionSafeguardDecision {
+    #[serde(rename = "passed")]
+    Passed,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "observe_failed")]
+    ObserveFailed,
+}
+
+/// Stable reason code emitted by deterministic safeguard rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CompactionSafeguardReasonCode {
+    #[serde(rename = "compaction_safeguard.all_checks_passed")]
+    AllChecksPassed,
+    #[serde(rename = "compaction_safeguard.missing_evidence_refs")]
+    MissingEvidenceRefs,
+    #[serde(rename = "compaction_safeguard.pending_approval_open")]
+    PendingApprovalOpen,
+    #[serde(rename = "compaction_safeguard.summary_missing")]
+    SummaryMissing,
+    #[serde(rename = "compaction_safeguard.constraints_dropped")]
+    ConstraintsDropped,
+    #[serde(rename = "compaction_safeguard.pending_actions_dropped")]
+    PendingActionsDropped,
+    #[serde(rename = "compaction_safeguard.redaction_boundary_unverified")]
+    RedactionBoundaryUnverified,
+}
+
+/// Severity used to decide whether enabled safeguard rollout must block.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompactionSafeguardSeverity {
+    Warning,
+    Critical,
+}
+
+/// One deterministic safeguard violation, safe for audit logs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CompactionSafeguardViolation {
+    pub reason_code: CompactionSafeguardReasonCode,
+    pub severity: CompactionSafeguardSeverity,
+    pub detail: String,
+}
+
+/// Metadata captured before compaction mutates durable session state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PreCompactionCheckpoint {
+    pub active_user_intent: String,
+    pub explicit_constraints: Vec<String>,
+    pub pending_actions: Vec<String>,
+    pub pending_approval_open: bool,
+    pub pending_tool_call_count: u64,
+    pub pending_memory_write_count: u64,
+    pub active_objective: Option<String>,
+    pub active_routine: Option<String>,
+    pub workspace_branch: String,
+    pub principal_boundary: String,
+    pub channel_boundary: Option<String>,
+    pub instruction_context_hash: String,
+    pub high_importance_facts: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Post-compaction artifact summary used by deterministic verifier rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct PostCompactionArtifact {
+    pub lifecycle_state: String,
+    pub summary_present: bool,
+    pub preserved_constraints: Vec<String>,
+    pub preserved_pending_actions: Vec<String>,
+    pub priority_changes: Vec<String>,
+    pub redaction_boundary_check: String,
+    pub conflicts: Vec<String>,
+    pub confidence: f64,
+    pub summary_hash: String,
 }
 
 /// Structured "what was I doing" digest carried across the compaction cut.
@@ -469,6 +577,7 @@ struct CompactionSummaryJsonInput<'a> {
     writes: &'a [SessionCompactionWritePreview],
     checkpoint_preview: &'a SessionCompactionCheckpointPreview,
     checkpoint_pair: &'a PreAPostCompactionCheckpoints,
+    safeguard: &'a CompactionSafeguardProjection,
     lifecycle_state: &'a str,
     review_candidate_count: usize,
     compressor_mode: Option<&'a str>,
@@ -491,6 +600,19 @@ struct PrePostCompactionCheckpointBuildInput<'a> {
     artifact_id: Option<String>,
     pre_checkpoint_id: Option<String>,
     post_checkpoint_id: Option<String>,
+}
+
+struct CompactionSafeguardBuildInput<'a> {
+    session: &'a OrchestratorSessionRecord,
+    plan_eligible: bool,
+    blocked_reason: Option<&'a str>,
+    active_task_summary: &'a SessionActiveTaskSummary,
+    candidates: &'a [SessionCompactionCandidate],
+    evidence_refs: &'a [String],
+    source_event_count: u64,
+    summary_text: &'a str,
+    lifecycle_state: &'a str,
+    rollout_enabled: bool,
 }
 
 /// Inputs a [`ContextCompressor`] needs to build a compaction plan.
@@ -571,16 +693,22 @@ pub(crate) async fn preview_session_compaction(
         .list_orchestrator_compaction_artifacts(session.session_id.clone())
         .await?
         .len();
-    Ok(HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
-        session,
-        transcript: transcript.as_slice(),
-        pins: pins.as_slice(),
-        workspace_documents: workspace_documents.as_slice(),
-        trigger_reason,
-        trigger_policy,
-        mode: "preview",
-        previous_compaction_count,
-    }))
+    let mut plan =
+        HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
+            session,
+            transcript: transcript.as_slice(),
+            pins: pins.as_slice(),
+            workspace_documents: workspace_documents.as_slice(),
+            trigger_reason,
+            trigger_policy,
+            mode: "preview",
+            previous_compaction_count,
+        });
+    refresh_compaction_safeguard_rollout(
+        &mut plan,
+        runtime_state.config.feature_rollouts.compaction_safeguard.enabled,
+    );
+    Ok(plan)
 }
 
 /// Executes a compaction: workspace writes, artifact, and checkpoint.
@@ -607,16 +735,20 @@ pub(crate) async fn apply_session_compaction(
         .list_orchestrator_compaction_artifacts(request.session.session_id.clone())
         .await?
         .len();
-    let plan = HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
-        session: request.session,
-        transcript: transcript.as_slice(),
-        pins: pins.as_slice(),
-        workspace_documents: workspace_documents.as_slice(),
-        trigger_reason: request.trigger_reason,
-        trigger_policy: request.trigger_policy,
-        mode: request.mode,
-        previous_compaction_count,
-    });
+    let mut plan =
+        HybridSessionContextCompressor::default().compress(SessionContextCompressionInput {
+            session: request.session,
+            transcript: transcript.as_slice(),
+            pins: pins.as_slice(),
+            workspace_documents: workspace_documents.as_slice(),
+            trigger_reason: request.trigger_reason,
+            trigger_policy: request.trigger_policy,
+            mode: request.mode,
+            previous_compaction_count,
+        });
+    let safeguard_rollout_enabled =
+        request.runtime_state.config.feature_rollouts.compaction_safeguard.enabled;
+    refresh_compaction_safeguard_rollout(&mut plan, safeguard_rollout_enabled);
     if !plan.eligible {
         let message = plan.blocked_reason.clone().unwrap_or_else(|| {
             "session does not currently have enough older transcript material to compact".to_owned()
@@ -782,6 +914,34 @@ pub(crate) async fn apply_session_compaction(
             pre_checkpoint_id: Some(pre_checkpoint.checkpoint_id.clone()),
             post_checkpoint_id: Some(post_checkpoint_id.clone()),
         });
+    let applied_safeguard = maybe_inject_compaction_safeguard_failure_for_test(
+        build_compaction_safeguard_projection(CompactionSafeguardBuildInput {
+            session: request.session,
+            plan_eligible: plan.eligible,
+            blocked_reason: plan.blocked_reason.as_deref(),
+            active_task_summary: &plan.active_task_summary,
+            candidates: plan.candidates.as_slice(),
+            evidence_refs: plan.evidence_refs.as_slice(),
+            source_event_count: plan.source_event_count,
+            summary_text: plan.summary_text.as_str(),
+            lifecycle_state,
+            rollout_enabled: safeguard_rollout_enabled,
+        }),
+    );
+    if compaction_safeguard_blocks_apply(&applied_safeguard) {
+        rollback_applied_workspace_writes(
+            request.runtime_state,
+            request.session,
+            applied_rollbacks.as_slice(),
+        )
+        .await?;
+        let reason = applied_safeguard
+            .reason_codes
+            .first()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Err(Status::failed_precondition(format!("compaction safeguard failed: {reason}")));
+    }
     let artifact = request
         .runtime_state
         .create_orchestrator_compaction_artifact(OrchestratorCompactionArtifactCreateRequest {
@@ -813,6 +973,7 @@ pub(crate) async fn apply_session_compaction(
                 writes: applied_writes.as_slice(),
                 checkpoint_preview: &plan.checkpoint_preview,
                 checkpoint_pair: &applied_checkpoint_pair,
+                safeguard: &applied_safeguard,
                 lifecycle_state,
                 review_candidate_count: pending_review_count,
                 compressor_mode: Some(plan.compressor_mode.as_str()),
@@ -851,6 +1012,7 @@ pub(crate) async fn apply_session_compaction(
         checkpoint: post_checkpoint.clone(),
         post_checkpoint,
         checkpoint_pair: applied_checkpoint_pair,
+        safeguard: applied_safeguard,
         writes: applied_writes,
     })
 }
@@ -1069,6 +1231,18 @@ fn build_session_compaction_plan_with_metadata(
             pre_checkpoint_id: None,
             post_checkpoint_id: None,
         });
+    let safeguard = build_compaction_safeguard_projection(CompactionSafeguardBuildInput {
+        session,
+        plan_eligible: eligible,
+        blocked_reason: blocked_reason.as_deref(),
+        active_task_summary: &active_task_summary,
+        candidates: candidates.as_slice(),
+        evidence_refs: evidence_refs.as_slice(),
+        source_event_count,
+        summary_text: summary_text.as_str(),
+        lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
+        rollout_enabled: false,
+    });
     let summary_json = build_compaction_summary_json(CompactionSummaryJsonInput {
         session,
         eligible,
@@ -1079,6 +1253,7 @@ fn build_session_compaction_plan_with_metadata(
         writes: write_previews.as_slice(),
         checkpoint_preview: &checkpoint_preview,
         checkpoint_pair: &checkpoint_pair,
+        safeguard: &safeguard,
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         review_candidate_count,
         compressor_mode: Some("deterministic"),
@@ -1102,6 +1277,7 @@ fn build_session_compaction_plan_with_metadata(
         "blocked_reason": blocked_reason,
         "checkpoint_metadata": checkpoint_metadata,
         "checkpoint_pair": checkpoint_pair,
+        "compaction_safeguard": safeguard,
     })
     .to_string();
 
@@ -1130,6 +1306,7 @@ fn build_session_compaction_plan_with_metadata(
         candidates,
         checkpoint_preview,
         checkpoint_pair,
+        safeguard,
     }
 }
 
@@ -1174,6 +1351,7 @@ fn collect_plan_evidence_refs(plan: &SessionCompactionPlan) -> Vec<String> {
 
 fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     plan.checkpoint_pair.journal_projection.evidence_refs = plan.evidence_refs.clone();
+    plan.safeguard.pre_checkpoint.evidence_refs = plan.evidence_refs.clone();
     let compression = json!({
         "compressor_mode": plan.compressor_mode,
         "fallback_used": plan.fallback_used,
@@ -1184,6 +1362,7 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
         if let Some(object) = summary.as_object_mut() {
             object.insert("compression".to_owned(), compression.clone());
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
+            object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
         }
         plan.summary_json = summary.to_string();
     }
@@ -1192,9 +1371,21 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
         if let Some(object) = trigger_inputs.as_object_mut() {
             object.insert("compression".to_owned(), compression);
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
+            object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
         }
         plan.trigger_inputs_json = trigger_inputs.to_string();
     }
+}
+
+fn refresh_compaction_safeguard_rollout(plan: &mut SessionCompactionPlan, rollout_enabled: bool) {
+    plan.safeguard.rollout_enabled = rollout_enabled;
+    let has_violations = !plan.safeguard.violations.is_empty();
+    plan.safeguard.decision = compaction_safeguard_decision(has_violations, rollout_enabled);
+    plan.safeguard.verdict_event_type =
+        compaction_safeguard_verdict_event_type(plan.safeguard.decision).to_owned();
+    plan.safeguard.rollback_action =
+        compaction_safeguard_rollback_action(plan.safeguard.decision).to_owned();
+    annotate_compaction_json(plan);
 }
 
 fn build_pre_post_compaction_checkpoints(
@@ -1272,6 +1463,279 @@ fn pre_post_compaction_reason_for_plan(
 
 fn compaction_checkpoint_tags(mode: &str, stage: &str, pair_id: &str) -> String {
     json!(["compaction", mode, PRE_POST_COMPACTION_CHECKPOINTS_TAG, stage, pair_id,]).to_string()
+}
+
+fn build_compaction_safeguard_projection(
+    input: CompactionSafeguardBuildInput<'_>,
+) -> CompactionSafeguardProjection {
+    let rollout_enabled = input.rollout_enabled;
+    let pending_memory_write_count = input
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.disposition == "review_required")
+        .count() as u64;
+    let pre_checkpoint = PreCompactionCheckpoint {
+        active_user_intent: input.active_task_summary.active_goal.clone(),
+        explicit_constraints: input.active_task_summary.constraints.clone(),
+        pending_actions: input.active_task_summary.open_action_items.clone(),
+        pending_approval_open: input
+            .blocked_reason
+            .is_some_and(|reason| reason.to_ascii_lowercase().contains("approval")),
+        pending_tool_call_count: 0,
+        pending_memory_write_count,
+        active_objective: None,
+        active_routine: None,
+        workspace_branch: input.session.branch_state.clone(),
+        principal_boundary: input.session.principal.clone(),
+        channel_boundary: input.session.channel.clone(),
+        instruction_context_hash: compaction_instruction_context_hash(
+            input.session,
+            input.active_task_summary,
+        ),
+        high_importance_facts: input
+            .active_task_summary
+            .historical_notes
+            .iter()
+            .chain(input.active_task_summary.constraints.iter())
+            .take(8)
+            .cloned()
+            .collect(),
+        evidence_refs: input.evidence_refs.to_vec(),
+    };
+    let redaction_boundary_check =
+        compaction_safeguard_redaction_boundary(input.candidates, input.summary_text);
+    let post_artifact = PostCompactionArtifact {
+        lifecycle_state: input.lifecycle_state.to_owned(),
+        summary_present: !input.summary_text.trim().is_empty(),
+        preserved_constraints: input.active_task_summary.constraints.clone(),
+        preserved_pending_actions: input.active_task_summary.open_action_items.clone(),
+        priority_changes: Vec::new(),
+        redaction_boundary_check: redaction_boundary_check.to_owned(),
+        conflicts: compaction_safeguard_conflicts(input.candidates),
+        confidence: compaction_safeguard_confidence(
+            input.source_event_count,
+            input.evidence_refs,
+            redaction_boundary_check,
+        ),
+        summary_hash: session_compaction_summary_hash(
+            input.session.session_id.as_str(),
+            input.summary_text,
+        ),
+    };
+    let violations =
+        compaction_safeguard_violations(input, &pre_checkpoint, &post_artifact).collect::<Vec<_>>();
+    let reason_codes = compaction_safeguard_reason_codes(violations.as_slice());
+    let decision = compaction_safeguard_decision(!violations.is_empty(), rollout_enabled);
+    CompactionSafeguardProjection {
+        schema_version: COMPACTION_SAFEGUARD_SCHEMA_VERSION,
+        rollout_enabled,
+        decision,
+        reason_codes,
+        checkpoint_event_type: COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED.to_owned(),
+        verdict_event_type: compaction_safeguard_verdict_event_type(decision).to_owned(),
+        rollback_event_type: COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK.to_owned(),
+        rollback_action: compaction_safeguard_rollback_action(decision).to_owned(),
+        redaction_level: COMPACTION_SAFEGUARD_REDACTION_LEVEL.to_owned(),
+        pre_checkpoint,
+        post_artifact,
+        violations,
+    }
+}
+
+fn compaction_instruction_context_hash(
+    session: &OrchestratorSessionRecord,
+    active_task_summary: &SessionActiveTaskSummary,
+) -> String {
+    let material = format!(
+        "principal={}|channel={}|branch={}|goal={}|constraints={}",
+        session.principal,
+        session.channel.as_deref().unwrap_or(""),
+        session.branch_state,
+        active_task_summary.active_goal,
+        active_task_summary.constraints.join("|")
+    );
+    session_compaction_summary_hash(session.session_id.as_str(), material.as_str())
+}
+
+fn compaction_safeguard_redaction_boundary(
+    candidates: &[SessionCompactionCandidate],
+    summary_text: &str,
+) -> &'static str {
+    if candidates.iter().any(|candidate| {
+        matches!(candidate.disposition.as_str(), "blocked_sensitive" | "blocked_poisoned")
+            && summary_text.contains(candidate.content.as_str())
+    }) {
+        "failed"
+    } else {
+        "passed"
+    }
+}
+
+fn compaction_safeguard_conflicts(candidates: &[SessionCompactionCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.disposition == "review_required"
+                && candidate.rationale.to_ascii_lowercase().contains("conflict")
+        })
+        .map(|candidate| candidate.candidate_id.clone())
+        .collect()
+}
+
+fn compaction_safeguard_confidence(
+    source_event_count: u64,
+    evidence_refs: &[String],
+    redaction_boundary_check: &str,
+) -> f64 {
+    if redaction_boundary_check != "passed" {
+        return 0.25;
+    }
+    if source_event_count > 0 && evidence_refs.is_empty() {
+        return 0.35;
+    }
+    0.96
+}
+
+fn compaction_safeguard_violations(
+    input: CompactionSafeguardBuildInput<'_>,
+    pre_checkpoint: &PreCompactionCheckpoint,
+    post_artifact: &PostCompactionArtifact,
+) -> impl Iterator<Item = CompactionSafeguardViolation> {
+    let mut violations = Vec::new();
+    if input.source_event_count > 0 && input.evidence_refs.is_empty() {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::MissingEvidenceRefs,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "source transcript exists but safeguard evidence refs are empty".to_owned(),
+        });
+    }
+    if input.plan_eligible && pre_checkpoint.pending_approval_open {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::PendingApprovalOpen,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "eligible compaction attempted while an approval interaction is open"
+                .to_owned(),
+        });
+    }
+    if !post_artifact.summary_present {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::SummaryMissing,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "post-compaction summary is empty".to_owned(),
+        });
+    }
+    if !pre_checkpoint
+        .explicit_constraints
+        .iter()
+        .all(|constraint| post_artifact.preserved_constraints.contains(constraint))
+    {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::ConstraintsDropped,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "one or more explicit constraints were dropped from post artifact".to_owned(),
+        });
+    }
+    if !pre_checkpoint
+        .pending_actions
+        .iter()
+        .all(|action| post_artifact.preserved_pending_actions.contains(action))
+    {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::PendingActionsDropped,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "one or more pending actions were dropped from post artifact".to_owned(),
+        });
+    }
+    if post_artifact.redaction_boundary_check != "passed" {
+        violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::RedactionBoundaryUnverified,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: "blocked sensitive or poisoned candidate text appeared in summary".to_owned(),
+        });
+    }
+    violations.into_iter()
+}
+
+fn compaction_safeguard_reason_codes(
+    violations: &[CompactionSafeguardViolation],
+) -> Vec<CompactionSafeguardReasonCode> {
+    if violations.is_empty() {
+        return vec![CompactionSafeguardReasonCode::AllChecksPassed];
+    }
+    violations
+        .iter()
+        .map(|violation| violation.reason_code)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn compaction_safeguard_decision(
+    has_violations: bool,
+    rollout_enabled: bool,
+) -> CompactionSafeguardDecision {
+    match (has_violations, rollout_enabled) {
+        (false, _) => CompactionSafeguardDecision::Passed,
+        (true, true) => CompactionSafeguardDecision::Failed,
+        (true, false) => CompactionSafeguardDecision::ObserveFailed,
+    }
+}
+
+fn compaction_safeguard_verdict_event_type(decision: CompactionSafeguardDecision) -> &'static str {
+    match decision {
+        CompactionSafeguardDecision::Passed => COMPACTION_SAFEGUARD_EVENT_PASSED,
+        CompactionSafeguardDecision::Failed | CompactionSafeguardDecision::ObserveFailed => {
+            COMPACTION_SAFEGUARD_EVENT_FAILED
+        }
+    }
+}
+
+fn compaction_safeguard_rollback_action(decision: CompactionSafeguardDecision) -> &'static str {
+    match decision {
+        CompactionSafeguardDecision::Passed => "none",
+        CompactionSafeguardDecision::ObserveFailed => "observe_only_no_runtime_block",
+        CompactionSafeguardDecision::Failed => "rollback_workspace_writes_and_block_artifact",
+    }
+}
+
+fn compaction_safeguard_blocks_apply(safeguard: &CompactionSafeguardProjection) -> bool {
+    safeguard.decision == CompactionSafeguardDecision::Failed
+}
+
+#[cfg(test)]
+pub(crate) fn configure_test_safeguard_failure(reason: Option<&str>) {
+    let cell = TEST_SAFEGUARD_FAILURE_REASON.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().expect("test safeguard failure lock should not be poisoned");
+    *guard = reason.map(ToOwned::to_owned);
+}
+
+#[cfg(test)]
+fn maybe_inject_compaction_safeguard_failure_for_test(
+    mut safeguard: CompactionSafeguardProjection,
+) -> CompactionSafeguardProjection {
+    let cell = TEST_SAFEGUARD_FAILURE_REASON.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().expect("test safeguard failure lock should not be poisoned");
+    if let Some(reason) = guard.take() {
+        safeguard.violations.push(CompactionSafeguardViolation {
+            reason_code: CompactionSafeguardReasonCode::MissingEvidenceRefs,
+            severity: CompactionSafeguardSeverity::Critical,
+            detail: reason,
+        });
+        safeguard.reason_codes = compaction_safeguard_reason_codes(safeguard.violations.as_slice());
+        safeguard.decision = compaction_safeguard_decision(true, safeguard.rollout_enabled);
+        safeguard.verdict_event_type =
+            compaction_safeguard_verdict_event_type(safeguard.decision).to_owned();
+        safeguard.rollback_action =
+            compaction_safeguard_rollback_action(safeguard.decision).to_owned();
+    }
+    safeguard
+}
+
+#[cfg(not(test))]
+fn maybe_inject_compaction_safeguard_failure_for_test(
+    safeguard: CompactionSafeguardProjection,
+) -> CompactionSafeguardProjection {
+    safeguard
 }
 
 /// Wraps a compaction summary in the `<session_compaction_summary>` tags
@@ -2150,6 +2614,7 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         "writes": input.writes,
         "checkpoint_preview": input.checkpoint_preview,
         "checkpoint_pair": input.checkpoint_pair,
+        "compaction_safeguard": input.safeguard,
         "quality_gates": quality_gates,
         "compression": {
             "compressor_mode": input.compressor_mode.unwrap_or("deterministic"),
@@ -2941,9 +3406,12 @@ pub(crate) fn truncate_console_text(raw: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         build_session_compaction_plan, render_compaction_prompt_block,
-        session_compaction_summary_hash, ContextCompressor, HybridSessionContextCompressor,
-        PreAPostCompactionCheckpoints, PreAPostCompactionDecision, PreAPostCompactionReasonCode,
-        SessionContextCompressionInput, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
+        session_compaction_summary_hash, CompactionSafeguardDecision,
+        CompactionSafeguardProjection, CompactionSafeguardReasonCode, ContextCompressor,
+        HybridSessionContextCompressor, PreAPostCompactionCheckpoints, PreAPostCompactionDecision,
+        PreAPostCompactionReasonCode, SessionContextCompressionInput,
+        COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED, COMPACTION_SAFEGUARD_EVENT_PASSED,
+        COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK, PRE_POST_COMPACTION_CHECKPOINTS_EVENT_COMPLETED,
         PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED,
         PRE_POST_COMPACTION_CHECKPOINTS_EVENT_STARTED,
     };
@@ -3249,6 +3717,85 @@ mod tests {
                 .pointer("/checkpoint_pair/journal_projection/event_types/failed")
                 .and_then(serde_json::Value::as_str),
             Some(PRE_POST_COMPACTION_CHECKPOINTS_EVENT_FAILED)
+        );
+    }
+
+    #[test]
+    fn compaction_safeguard_projection_serializes_audit_contract() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload = format!(
+                    r#"{{"text":"Next action: preserve safeguard audit checkpoint {seq}."}}"#
+                );
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("unit_safeguard"),
+            Some("unit_policy"),
+        );
+
+        assert_eq!(plan.safeguard.decision, CompactionSafeguardDecision::Passed);
+        assert_eq!(
+            plan.safeguard.reason_codes,
+            vec![CompactionSafeguardReasonCode::AllChecksPassed]
+        );
+        assert_eq!(
+            plan.safeguard.checkpoint_event_type,
+            COMPACTION_SAFEGUARD_EVENT_CHECKPOINT_CREATED
+        );
+        assert_eq!(plan.safeguard.verdict_event_type, COMPACTION_SAFEGUARD_EVENT_PASSED);
+        assert_eq!(plan.safeguard.rollback_event_type, COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK);
+        assert_eq!(plan.safeguard.rollback_action, "none");
+        assert_eq!(plan.safeguard.redaction_level, "metadata_only");
+        assert_eq!(plan.safeguard.pre_checkpoint.principal_boundary, "user:ops");
+        assert_eq!(plan.safeguard.post_artifact.redaction_boundary_check, "passed");
+        assert!(plan.safeguard.post_artifact.confidence > 0.9);
+
+        let value =
+            serde_json::to_value(&plan.safeguard).expect("safeguard should serialize to JSON");
+        assert_eq!(
+            value.pointer("/reason_codes/0").and_then(serde_json::Value::as_str),
+            Some("compaction_safeguard.all_checks_passed")
+        );
+        assert_eq!(
+            value
+                .pointer("/pre_checkpoint/instruction_context_hash")
+                .and_then(serde_json::Value::as_str)
+                .map(str::len),
+            Some(16)
+        );
+        let roundtrip = serde_json::from_value::<CompactionSafeguardProjection>(value)
+            .expect("safeguard should deserialize from JSON");
+        assert_eq!(roundtrip, plan.safeguard);
+
+        let response = plan.to_response_json();
+        assert_eq!(
+            response
+                .pointer("/compaction_safeguard/verdict_event_type")
+                .and_then(serde_json::Value::as_str),
+            Some(COMPACTION_SAFEGUARD_EVENT_PASSED)
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should parse");
+        assert_eq!(
+            summary
+                .pointer("/compaction_safeguard/rollback_event_type")
+                .and_then(serde_json::Value::as_str),
+            Some(COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK)
+        );
+        let trigger_inputs =
+            serde_json::from_str::<serde_json::Value>(plan.trigger_inputs_json.as_str())
+                .expect("trigger input JSON should parse");
+        assert_eq!(
+            trigger_inputs
+                .pointer("/compaction_safeguard/redaction_level")
+                .and_then(serde_json::Value::as_str),
+            Some("metadata_only")
         );
     }
 

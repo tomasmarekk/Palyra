@@ -1746,6 +1746,7 @@ pub(crate) async fn console_chat_compaction_apply_handler(
                 "post_checkpoint_id": execution.post_checkpoint.checkpoint_id,
                 "artifact_id": execution.artifact.artifact_id,
                 "checkpoint_pair": execution.checkpoint_pair.journal_projection,
+                "compaction_safeguard": execution.safeguard,
                 "candidate_count": execution.plan.candidates.len(),
                 "write_count": execution.writes.len(),
                 "mode": "manual",
@@ -1760,6 +1761,7 @@ pub(crate) async fn console_chat_compaction_apply_handler(
         "pre_checkpoint": execution.pre_checkpoint,
         "post_checkpoint": execution.post_checkpoint,
         "checkpoint_pair": execution.checkpoint_pair,
+        "compaction_safeguard": execution.safeguard,
         "preview": execution.plan.to_response_json(),
         "contract": contract_descriptor(),
     })))

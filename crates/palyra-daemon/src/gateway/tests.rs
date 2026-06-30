@@ -106,7 +106,8 @@ use crate::application::{
         principal_has_sensitive_service_role, SensitiveServiceRole,
     },
     session_compaction::{
-        apply_session_compaction, configure_test_write_failure_path, SessionCompactionApplyRequest,
+        apply_session_compaction, configure_test_safeguard_failure,
+        configure_test_write_failure_path, SessionCompactionApplyRequest,
     },
     tool_runtime::{
         http_fetch::{
@@ -1596,6 +1597,21 @@ impl TestWriteFailurePathGuard {
 impl Drop for TestWriteFailurePathGuard {
     fn drop(&mut self) {
         configure_test_write_failure_path(None);
+    }
+}
+
+struct TestSafeguardFailureGuard;
+
+impl TestSafeguardFailureGuard {
+    fn set(reason: &str) -> Self {
+        configure_test_safeguard_failure(Some(reason));
+        Self
+    }
+}
+
+impl Drop for TestSafeguardFailureGuard {
+    fn drop(&mut self) {
+        configure_test_safeguard_failure(None);
     }
 }
 
@@ -9734,6 +9750,97 @@ async fn session_compaction_manual_apply_rolls_back_workspace_writes_on_partial_
     assert_eq!(
         checkpoint.referenced_compaction_ids_json, "[]",
         "failed pre checkpoint must not reference a missing artifact"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure() {
+    let _test_guard = lock_session_compaction_test_guard().await;
+    configure_test_write_failure_path(None);
+    configure_test_safeguard_failure(None);
+    let state = build_test_runtime_state_with_runtime_overrides(
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig {
+            compaction_safeguard:
+                palyra_common::feature_rollouts::FeatureRolloutSetting::from_config(true),
+            ..crate::config::FeatureRolloutsConfig::default()
+        },
+    );
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB5";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FB6";
+    seed_session_compaction_fixture(&state, session_id, run_id);
+    let session = state
+        .journal_store
+        .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            require_existing: true,
+            reset_session: false,
+        })
+        .expect("session should resolve")
+        .session;
+
+    let _safeguard_guard =
+        TestSafeguardFailureGuard::set("injected safeguard failure after workspace writes");
+    let error = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state,
+        session: &session,
+        actor_principal: "user:ops",
+        run_id: Some(run_id),
+        mode: "manual",
+        trigger_reason: Some("test_safeguard_rollback"),
+        trigger_policy: Some("test_policy"),
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await
+    .expect_err("enabled safeguard rollout should block the compaction");
+
+    assert!(
+        error.message().contains("compaction safeguard failed"),
+        "error should identify safeguard failure: {}",
+        error.message()
+    );
+
+    let memory_doc = state
+        .workspace_document_by_path(
+            "user:ops".to_owned(),
+            Some("cli".to_owned()),
+            None,
+            "MEMORY.md".to_owned(),
+            false,
+        )
+        .await
+        .expect("memory doc lookup should succeed");
+    assert!(memory_doc.is_none(), "safeguard failure should roll back earlier durable writes");
+
+    let artifacts = state
+        .list_orchestrator_compaction_artifacts(session_id.to_owned())
+        .await
+        .expect("artifact list should succeed");
+    assert!(artifacts.is_empty(), "safeguard failure should block artifact creation");
+    let checkpoints = state
+        .list_orchestrator_checkpoints(session_id.to_owned())
+        .await
+        .expect("checkpoint list should succeed");
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "safeguard failure should leave only the pre-compaction audit checkpoint"
+    );
+    let checkpoint = checkpoint_with_tag(checkpoints.as_slice(), "pre_compaction");
+    assert!(
+        checkpoint_tags(checkpoint).iter().any(|tag| tag == "pre_post_compaction_checkpoints"),
+        "pre checkpoint should retain compaction checkpoint-pair tags"
+    );
+    assert_eq!(
+        checkpoint.referenced_compaction_ids_json, "[]",
+        "pre checkpoint must not reference a blocked artifact"
     );
 }
 

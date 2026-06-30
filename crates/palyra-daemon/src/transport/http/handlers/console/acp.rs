@@ -520,6 +520,7 @@ async fn session_compact_apply(
         "pre_checkpoint": execution.pre_checkpoint,
         "post_checkpoint": execution.post_checkpoint,
         "checkpoint_pair": execution.checkpoint_pair,
+        "compaction_safeguard": execution.safeguard,
         "writes": execution.writes,
     }))
 }
