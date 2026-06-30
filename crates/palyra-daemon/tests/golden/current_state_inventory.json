@@ -888,6 +888,12 @@
       "config_path": "feature_rollouts.compaction_safeguard",
       "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD"
     },
+    "provider_backed_evidence_compaction": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.provider_backed_evidence_compaction",
+      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION"
+    },
     "attack_surface_audit": {
       "enabled": false,
       "source": "default",
