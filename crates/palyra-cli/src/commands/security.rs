@@ -4,7 +4,15 @@
 //! local doctor snapshot whenever it is reachable.
 
 use crate::*;
-use palyra_common::secret_refs::SecretRef;
+use palyra_common::{
+    secret_refs::SecretRef,
+    security_posture::{
+        audit_attack_surface_graph, ApprovalRequirement, AttackSurfaceAudit, AttackSurfaceGraph,
+        ChannelExposure, EgressAccess, FilesystemAccess, IngressExposure, IngressSurfaceKind,
+        PluginExposure, ProcessAccess, SandboxTier, SecretAccess, SecretExposure, SideEffectLevel,
+        ToolExposure, WorkspaceExposure, SECURITY_POSTURE_SCHEMA_VERSION,
+    },
+};
 use palyra_control_plane as control_plane;
 
 use super::{
@@ -17,6 +25,8 @@ struct SecurityAuditPayload {
     generated_at_unix_ms: i64,
     strict: bool,
     used_runtime_posture: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attack_surface: Option<AttackSurfaceAudit>,
     findings: Vec<SecurityFinding>,
     summary: SecurityAuditSummary,
 }
@@ -104,7 +114,7 @@ impl LocalProcessRunnerConfigSnapshot {
 /// in `--strict` mode when the audit reports blocking findings.
 pub(crate) fn run_security(command: SecurityCommand) -> Result<()> {
     match command {
-        SecurityCommand::Audit { path, offline, strict, json } => {
+        SecurityCommand::Audit { path, offline, strict, json, attack_surface } => {
             let checks = build_doctor_checks();
             let doctor = if offline {
                 build_doctor_report_offline(checks.as_slice())?
@@ -115,10 +125,15 @@ pub(crate) fn run_security(command: SecurityCommand) -> Result<()> {
             let local_config = load_local_security_config_snapshot(path)?;
             let runtime = load_runtime_security_snapshot(offline)?;
             let findings = build_security_findings(&doctor, &local_config, &runtime, &secrets);
+            let attack_surface = attack_surface.then(|| {
+                let graph = build_attack_surface_graph(&doctor, &local_config, &runtime, &secrets);
+                audit_attack_surface_graph(&graph)
+            });
             let payload = SecurityAuditPayload {
                 generated_at_unix_ms: unix_now_ms(),
                 strict,
                 used_runtime_posture: runtime.used_runtime_posture,
+                attack_surface,
                 summary: SecurityAuditSummary {
                     blocking_findings: findings
                         .iter()
@@ -168,8 +183,247 @@ fn emit_security_audit(payload: &SecurityAuditPayload, json_output: bool) -> Res
                 finding.remediation.replace('"', "'")
             );
         }
+        if let Some(attack_surface) = payload.attack_surface.as_ref() {
+            println!(
+                "security.attack_surface critical={} warnings={} info={} highest_without_approval={} highest_with_one_approval={}",
+                attack_surface.summary.critical_findings,
+                attack_surface.summary.warning_findings,
+                attack_surface.summary.info_findings,
+                attack_surface
+                    .summary
+                    .highest_side_effect_without_human_approval
+                    .as_str(),
+                attack_surface
+                    .summary
+                    .highest_side_effect_with_one_approval
+                    .as_str()
+            );
+            for finding in &attack_surface.findings {
+                println!(
+                    "security.attack_surface.finding severity={} code={} path={} remediation=\"{}\"",
+                    finding.severity.as_str(),
+                    finding.reason_code.as_str(),
+                    finding.affected_path,
+                    finding.remediation_hint.replace('"', "'")
+                );
+            }
+        }
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn build_attack_surface_graph(
+    doctor: &DoctorReport,
+    local_config: &LocalSecurityConfigSnapshot,
+    runtime: &RuntimeSecuritySnapshot,
+    secrets: &SecretAuditPayload,
+) -> AttackSurfaceGraph {
+    let deployment = runtime.deployment.as_ref();
+    let remote_bind_detected = deployment
+        .map(|value| value.remote_bind_detected)
+        .unwrap_or(doctor.deployment.remote_bind_detected);
+    let admin_auth_required = deployment
+        .map(|value| value.admin_auth_required)
+        .unwrap_or(doctor.deployment.admin_auth_required);
+    let mut graph = AttackSurfaceGraph {
+        schema_version: SECURITY_POSTURE_SCHEMA_VERSION,
+        ingress: vec![
+            IngressExposure {
+                source_id: "cli.operator".to_owned(),
+                source: IngressSurfaceKind::Cli,
+                principal: "local_operator".to_owned(),
+                channel_scope: None,
+                channel_exposure: ChannelExposure::Private,
+                admin_auth_required: true,
+                webhook_signature_required: false,
+                approval_requirement: ApprovalRequirement::PolicyOnly,
+            },
+            IngressExposure {
+                source_id: "console.admin".to_owned(),
+                source: IngressSurfaceKind::ConsoleApi,
+                principal: "admin".to_owned(),
+                channel_scope: Some(doctor.deployment.binds.admin.clone()),
+                channel_exposure: if remote_bind_detected {
+                    ChannelExposure::Public
+                } else {
+                    ChannelExposure::Private
+                },
+                admin_auth_required,
+                webhook_signature_required: false,
+                approval_requirement: if admin_auth_required {
+                    ApprovalRequirement::PolicyOnly
+                } else {
+                    ApprovalRequirement::None
+                },
+            },
+        ],
+        tools: build_attack_surface_tool_exposures(local_config),
+        secrets: build_attack_surface_secret_exposures(local_config, secrets),
+        workspace: build_attack_surface_workspace(local_config),
+        plugins: build_attack_surface_plugin_exposures(doctor),
+    };
+    graph.ingress.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    graph.tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    graph.secrets.sort_by(|left, right| left.ref_id.cmp(&right.ref_id));
+    graph.plugins.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    graph
+}
+
+fn build_attack_surface_tool_exposures(
+    local_config: &LocalSecurityConfigSnapshot,
+) -> Vec<ToolExposure> {
+    let process_access = if !local_config.process_runner.enabled {
+        ProcessAccess::None
+    } else if local_config.process_runner.allowed_executables_wildcard {
+        ProcessAccess::HostWildcard
+    } else {
+        ProcessAccess::HostAllowlist
+    };
+    let side_effect = if local_config.process_runner.enabled {
+        SideEffectLevel::ProcessExecution
+    } else {
+        SideEffectLevel::None
+    };
+    let egress_access =
+        process_runner_egress_access(local_config.process_runner.egress_enforcement_mode.as_str());
+    let sandbox_tier = match local_config.process_runner.tier.as_str() {
+        "tier_c" | "c" => SandboxTier::TierC,
+        "tier_a" | "a" => SandboxTier::TierA,
+        "tier_b" | "b" => SandboxTier::TierB,
+        _ => SandboxTier::None,
+    };
+    let mut tools = vec![ToolExposure {
+        tool_name: "palyra.process_runner".to_owned(),
+        target_surfaces: vec![IngressSurfaceKind::Cli, IngressSurfaceKind::ConsoleApi],
+        side_effect,
+        approval_requirement: if local_config.process_runner.enabled {
+            ApprovalRequirement::PolicyOnly
+        } else {
+            ApprovalRequirement::None
+        },
+        sandbox_tier,
+        process_access,
+        egress_access,
+    }];
+    if local_config.browser_service_enabled {
+        tools.push(ToolExposure {
+            tool_name: "palyra.browser_service".to_owned(),
+            target_surfaces: vec![IngressSurfaceKind::Cli, IngressSurfaceKind::ConsoleApi],
+            side_effect: SideEffectLevel::NetworkEgress,
+            approval_requirement: ApprovalRequirement::PolicyOnly,
+            sandbox_tier: SandboxTier::None,
+            process_access: ProcessAccess::None,
+            egress_access: EgressAccess::Allowlisted,
+        });
+    }
+    tools
+}
+
+fn process_runner_egress_access(mode: &str) -> EgressAccess {
+    match mode {
+        "none" => EgressAccess::Unrestricted,
+        "preflight" | "strict" => EgressAccess::Allowlisted,
+        _ => EgressAccess::None,
+    }
+}
+
+fn build_attack_surface_secret_exposures(
+    local_config: &LocalSecurityConfigSnapshot,
+    secrets: &SecretAuditPayload,
+) -> Vec<SecretExposure> {
+    let mut exposures = Vec::new();
+    if local_config.openai_inline_api_key {
+        exposures.push(raw_secret_exposure("model_provider.openai_api_key"));
+    }
+    if local_config.anthropic_inline_api_key {
+        exposures.push(raw_secret_exposure("model_provider.anthropic_api_key"));
+    }
+    if local_config.openai_api_key_vault_ref.is_some()
+        || local_config.openai_api_key_secret_ref_configured
+    {
+        exposures.push(vault_ref_exposure("model_provider.openai_api_key"));
+    }
+    if local_config.anthropic_api_key_vault_ref.is_some()
+        || local_config.anthropic_api_key_secret_ref_configured
+    {
+        exposures.push(vault_ref_exposure("model_provider.anthropic_api_key"));
+    }
+    if local_config.browser_service_auth_token_configured {
+        exposures.push(raw_secret_exposure("tool_call.browser_service.auth_token"));
+    }
+    for finding in &secrets.findings {
+        if finding.severity == "blocking" && finding.component == "vault" {
+            exposures.push(SecretExposure {
+                ref_id: format!("secrets_audit.{}", finding.code),
+                access: SecretAccess::VaultReferenceOnly,
+                approval_requirement: ApprovalRequirement::PolicyOnly,
+                vault_ref_present: false,
+            });
+        }
+    }
+    exposures
+}
+
+fn raw_secret_exposure(ref_id: &str) -> SecretExposure {
+    SecretExposure {
+        ref_id: ref_id.to_owned(),
+        access: SecretAccess::RawSecret,
+        approval_requirement: ApprovalRequirement::None,
+        vault_ref_present: false,
+    }
+}
+
+fn vault_ref_exposure(ref_id: &str) -> SecretExposure {
+    SecretExposure {
+        ref_id: ref_id.to_owned(),
+        access: SecretAccess::VaultReferenceOnly,
+        approval_requirement: ApprovalRequirement::PolicyOnly,
+        vault_ref_present: true,
+    }
+}
+
+fn build_attack_surface_workspace(local_config: &LocalSecurityConfigSnapshot) -> WorkspaceExposure {
+    WorkspaceExposure {
+        workspace_roots: Vec::new(),
+        filesystem_access: if local_config.process_runner.enabled {
+            FilesystemAccess::WorkspaceWrite
+        } else {
+            FilesystemAccess::None
+        },
+        process_access: if !local_config.process_runner.enabled {
+            ProcessAccess::None
+        } else if local_config.process_runner.allowed_executables_wildcard {
+            ProcessAccess::HostWildcard
+        } else {
+            ProcessAccess::HostAllowlist
+        },
+        egress_access: process_runner_egress_access(
+            local_config.process_runner.egress_enforcement_mode.as_str(),
+        ),
+        browser_access_enabled: local_config.browser_service_enabled,
+        webhook_access_enabled: false,
+    }
+}
+
+fn build_attack_surface_plugin_exposures(doctor: &DoctorReport) -> Vec<PluginExposure> {
+    let mut plugins = Vec::new();
+    if doctor.skills.current_total > 0 {
+        plugins.push(PluginExposure {
+            plugin_id: "skills.current".to_owned(),
+            grants: Vec::new(),
+            diagnostics_provider: false,
+            approval_requirement: ApprovalRequirement::PolicyOnly,
+        });
+    }
+    if doctor.skills.runtime_unknown_total > 0 || doctor.skills.missing_secrets_total > 0 {
+        plugins.push(PluginExposure {
+            plugin_id: "skills.diagnostics".to_owned(),
+            grants: vec!["diagnostics.redacted".to_owned()],
+            diagnostics_provider: true,
+            approval_requirement: ApprovalRequirement::PolicyOnly,
+        });
+    }
+    plugins
 }
 
 fn build_security_findings(
@@ -396,6 +650,22 @@ fn build_security_findings(
             component: "runtime".to_owned(),
             message: format!("Runtime posture checks were degraded: {error}"),
             remediation: "Ensure the daemon admin surface is reachable so `palyra security audit` can verify live deployment posture instead of local-only config snapshots.".to_owned(),
+        });
+    }
+
+    if doctor.skills.runtime_unknown_total > 0 || doctor.skills.missing_secrets_total > 0 {
+        findings.push(SecurityFinding {
+            severity: "warning".to_owned(),
+            code: "extension_diagnostics_provider_degraded".to_owned(),
+            component: "extensions".to_owned(),
+            message: format!(
+                "Extension diagnostics report {} runtime-unknown skill(s) and {} missing secret reference(s).",
+                doctor.skills.runtime_unknown_total,
+                doctor.skills.missing_secrets_total
+            ),
+            remediation:
+                "Run `palyra plugins doctor --json` and keep diagnostics provider output redacted before exposing it outside internal operator surfaces."
+                    .to_owned(),
         });
     }
 
@@ -1066,6 +1336,87 @@ mod tests {
             }),
             "security audit should flag permissive local process-runner posture"
         );
+    }
+
+    #[test]
+    fn security_audit_flags_extension_diagnostics_provider_gaps() {
+        let mut doctor = minimal_doctor();
+        doctor.skills.runtime_unknown_total = 1;
+        doctor.skills.missing_secrets_total = 2;
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "deterministic".to_owned(),
+            auth_profile_id: None,
+            openai_api_key_vault_ref: None,
+            openai_api_key_secret_ref_configured: false,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_api_key_secret_ref_configured: false,
+            anthropic_inline_api_key: false,
+            browser_service_enabled: false,
+            browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("deterministic".to_owned()),
+            process_runner: LocalProcessRunnerConfigSnapshot::default(),
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: false,
+            deployment: None,
+            auth_summary: None,
+            browser: None,
+            error: None,
+        };
+
+        let findings = build_security_findings(&doctor, &local, &runtime, &minimal_secrets());
+
+        assert!(findings.iter().any(|finding| {
+            finding.code == "extension_diagnostics_provider_degraded"
+                && finding.component == "extensions"
+                && finding.remediation.contains("plugins doctor")
+        }));
+    }
+
+    #[test]
+    fn attack_surface_projection_captures_process_runner_side_effects() {
+        let doctor = minimal_doctor();
+        let local = LocalSecurityConfigSnapshot {
+            path_exists: true,
+            provider_kind: "deterministic".to_owned(),
+            auth_profile_id: None,
+            openai_api_key_vault_ref: None,
+            openai_api_key_secret_ref_configured: false,
+            openai_inline_api_key: false,
+            anthropic_api_key_vault_ref: None,
+            anthropic_api_key_secret_ref_configured: false,
+            anthropic_inline_api_key: false,
+            browser_service_enabled: false,
+            browser_service_auth_token_configured: false,
+            effective_provider_kind: Some("deterministic".to_owned()),
+            process_runner: LocalProcessRunnerConfigSnapshot {
+                enabled: true,
+                tier: "tier_b".to_owned(),
+                allowed_executables_wildcard: true,
+                egress_enforcement_mode: "none".to_owned(),
+            },
+        };
+        let runtime = RuntimeSecuritySnapshot {
+            used_runtime_posture: false,
+            deployment: None,
+            auth_summary: None,
+            browser: None,
+            error: None,
+        };
+
+        let graph = build_attack_surface_graph(&doctor, &local, &runtime, &minimal_secrets());
+        let audit = audit_attack_surface_graph(&graph);
+
+        assert!(graph.tools.iter().any(|tool| tool.tool_name == "palyra.process_runner"));
+        assert_eq!(
+            audit.summary.highest_side_effect_without_human_approval,
+            SideEffectLevel::ProcessExecution
+        );
+        assert!(audit.findings.iter().any(|finding| {
+            finding.reason_code.as_str() == "unrestricted_egress_without_approval"
+        }));
     }
 
     #[test]

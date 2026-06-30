@@ -15,5 +15,7 @@ pub enum SecurityCommand {
         strict: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = false)]
+        attack_surface: bool,
     },
 }

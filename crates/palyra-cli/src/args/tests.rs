@@ -6854,6 +6854,7 @@ fn parse_secrets_apply_offline_strict_json() {
         "--offline",
         "--strict",
         "--json",
+        "--attack-surface",
     ]);
     assert_eq!(
         parsed.command,
@@ -7052,6 +7053,7 @@ fn parse_security_audit_offline_strict_json() {
         "--offline",
         "--strict",
         "--json",
+        "--attack-surface",
     ]);
     assert_eq!(
         parsed.command,
@@ -7061,6 +7063,7 @@ fn parse_security_audit_offline_strict_json() {
                 offline: true,
                 strict: true,
                 json: true,
+                attack_surface: true,
             }
         }
     );
