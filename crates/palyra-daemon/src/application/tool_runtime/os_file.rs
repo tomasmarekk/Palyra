@@ -1483,6 +1483,18 @@ mod tests {
             .expect("os-file tempdir should be created")
     }
 
+    #[cfg(windows)]
+    fn stable_os_file_env_root(name: &str) -> PathBuf {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("os-file-env-roots")
+            .join(name);
+        fs::create_dir_all(root.as_path()).expect("stable os-file env root should exist");
+        fs::canonicalize(root.as_path()).expect("stable os-file env root should canonicalize")
+    }
+
     struct ScopedEnvVar {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -2318,9 +2330,8 @@ mod tests {
         let _guard = crate::test_env::lock();
         let tempdir = os_file_tempdir();
         let profile_root = tempdir.path().join("profile");
-        let temp_root = tempdir.path().join("temp");
+        let temp_root = stable_os_file_env_root("windows-user-temp");
         fs::create_dir_all(profile_root.as_path()).expect("profile root should exist");
-        fs::create_dir_all(temp_root.as_path()).expect("temp root should exist");
         let _configured = ScopedEnvVar::remove(PALYRA_OS_FILE_ROOTS_ENV);
         let _userprofile = ScopedEnvVar::set("USERPROFILE", profile_root.as_path());
         let _home = ScopedEnvVar::set("HOME", profile_root.as_path());
