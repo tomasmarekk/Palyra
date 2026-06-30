@@ -116,6 +116,64 @@ impl TypedPluginCapabilityClass {
     }
 }
 
+/// Capability-scoped host services that a Wasm plugin may request through the
+/// daemon host boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapabilityServiceKind {
+    Logging,
+    Events,
+    ConfigLookup,
+    TasksCreate,
+    TasksUpdate,
+    FlowSignal,
+    ChannelSendIntent,
+    MemoryProposeCandidate,
+    BoundedLlmComplete,
+    VaultSecretLeaseRequest,
+}
+
+impl HostCapabilityServiceKind {
+    /// Returns the stable snake_case wire identifier for this host service.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Logging => "logging",
+            Self::Events => "events",
+            Self::ConfigLookup => "config_lookup",
+            Self::TasksCreate => "tasks_create",
+            Self::TasksUpdate => "tasks_update",
+            Self::FlowSignal => "flow_signal",
+            Self::ChannelSendIntent => "channel_send_intent",
+            Self::MemoryProposeCandidate => "memory_propose_candidate",
+            Self::BoundedLlmComplete => "bounded_llm_complete",
+            Self::VaultSecretLeaseRequest => "vault_secret_lease_request",
+        }
+    }
+}
+
+/// Host-published descriptor for one capability-scoped service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostCapabilityServiceDescriptor {
+    /// Host service kind.
+    pub service: HostCapabilityServiceKind,
+    /// Optional Tier A capability class that must also be granted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_capability_class: Option<TypedPluginCapabilityClass>,
+    /// Default host-side timeout in milliseconds.
+    pub default_timeout_ms: u64,
+    /// Maximum accepted request payload size.
+    pub max_payload_bytes: u64,
+    /// Stable audit event emitted around invocation or denial.
+    pub audit_event: String,
+    /// Payload field paths redacted from logs and audit output.
+    #[serde(default)]
+    pub redacted_fields: Vec<String>,
+    /// Whether the service can return raw secret material.
+    pub returns_secret_material: bool,
+}
+
 /// Sensitivity classification applied to a contract's payload data.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
@@ -775,6 +833,84 @@ pub fn supported_typed_plugin_contracts() -> Vec<TypedPluginContractDescriptor> 
         .collect()
 }
 
+/// Returns every capability-scoped host service descriptor published by the SDK.
+#[must_use]
+pub fn supported_host_capability_services() -> Vec<HostCapabilityServiceDescriptor> {
+    [
+        HostCapabilityServiceKind::Logging,
+        HostCapabilityServiceKind::Events,
+        HostCapabilityServiceKind::ConfigLookup,
+        HostCapabilityServiceKind::TasksCreate,
+        HostCapabilityServiceKind::TasksUpdate,
+        HostCapabilityServiceKind::FlowSignal,
+        HostCapabilityServiceKind::ChannelSendIntent,
+        HostCapabilityServiceKind::MemoryProposeCandidate,
+        HostCapabilityServiceKind::BoundedLlmComplete,
+        HostCapabilityServiceKind::VaultSecretLeaseRequest,
+    ]
+    .into_iter()
+    .map(host_capability_service_descriptor)
+    .collect()
+}
+
+/// Returns the descriptor for one capability-scoped host service.
+#[must_use]
+pub fn host_capability_service_descriptor(
+    service: HostCapabilityServiceKind,
+) -> HostCapabilityServiceDescriptor {
+    let (required_capability_class, default_timeout_ms, max_payload_bytes, redacted_fields) =
+        match service {
+            HostCapabilityServiceKind::Logging | HostCapabilityServiceKind::Events => {
+                (None, 250, 8 * 1024, Vec::new())
+            }
+            HostCapabilityServiceKind::ConfigLookup => {
+                (None, 500, 16 * 1024, vec!["config.default_value".to_owned()])
+            }
+            HostCapabilityServiceKind::TasksCreate | HostCapabilityServiceKind::TasksUpdate => (
+                Some(TypedPluginCapabilityClass::StoragePrefixes),
+                1_000,
+                32 * 1024,
+                vec!["task.payload".to_owned()],
+            ),
+            HostCapabilityServiceKind::FlowSignal => {
+                (None, 500, 16 * 1024, vec!["flow.context".to_owned()])
+            }
+            HostCapabilityServiceKind::ChannelSendIntent => (
+                Some(TypedPluginCapabilityClass::Channels),
+                1_000,
+                32 * 1024,
+                vec!["message.body".to_owned()],
+            ),
+            HostCapabilityServiceKind::MemoryProposeCandidate => (
+                Some(TypedPluginCapabilityClass::StoragePrefixes),
+                1_000,
+                32 * 1024,
+                vec!["candidate.content".to_owned()],
+            ),
+            HostCapabilityServiceKind::BoundedLlmComplete => (
+                Some(TypedPluginCapabilityClass::HttpHosts),
+                2_000,
+                64 * 1024,
+                vec!["prompt".to_owned(), "completion.preview".to_owned()],
+            ),
+            HostCapabilityServiceKind::VaultSecretLeaseRequest => (
+                Some(TypedPluginCapabilityClass::Secrets),
+                1_000,
+                8 * 1024,
+                vec!["secret.ref".to_owned(), "lease.metadata".to_owned()],
+            ),
+        };
+    HostCapabilityServiceDescriptor {
+        service,
+        required_capability_class,
+        default_timeout_ms,
+        max_payload_bytes,
+        audit_event: "plugin.host_call.invoked".to_owned(),
+        redacted_fields,
+        returns_secret_material: false,
+    }
+}
+
 fn default_lifecycle() -> Vec<TypedPluginContractLifecyclePhase> {
     vec![
         TypedPluginContractLifecyclePhase::Discover,
@@ -835,15 +971,17 @@ fn build_descriptor(
 mod tests {
     use super::{
         all_typed_plugin_contract_kinds, built_in_sdk_contract_fixtures,
-        default_typed_plugin_contract_version, sdk_abi_compatibility, sdk_abi_version,
-        simulate_sdk_contract_fixture, supported_typed_plugin_contracts,
-        typed_plugin_contract_descriptor, wit_package_id, wit_source, TypedPluginCapabilityClass,
-        TypedPluginContractDescriptor, TypedPluginContractKind, TypedPluginContractOperation,
-        HOST_CAPABILITIES_IMPORT_MODULE, HOST_CAPABILITY_CHANNEL_COUNT_FN,
-        HOST_CAPABILITY_CHANNEL_HANDLE_FN, HOST_CAPABILITY_HTTP_COUNT_FN,
-        HOST_CAPABILITY_HTTP_HANDLE_FN, HOST_CAPABILITY_SECRET_COUNT_FN,
-        HOST_CAPABILITY_SECRET_HANDLE_FN, HOST_CAPABILITY_STORAGE_COUNT_FN,
-        HOST_CAPABILITY_STORAGE_HANDLE_FN, SDK_ABI_MAJOR, WIT_WORLD_NAME,
+        default_typed_plugin_contract_version, host_capability_service_descriptor,
+        sdk_abi_compatibility, sdk_abi_version, simulate_sdk_contract_fixture,
+        supported_host_capability_services, supported_typed_plugin_contracts,
+        typed_plugin_contract_descriptor, wit_package_id, wit_source, HostCapabilityServiceKind,
+        TypedPluginCapabilityClass, TypedPluginContractDescriptor, TypedPluginContractKind,
+        TypedPluginContractOperation, HOST_CAPABILITIES_IMPORT_MODULE,
+        HOST_CAPABILITY_CHANNEL_COUNT_FN, HOST_CAPABILITY_CHANNEL_HANDLE_FN,
+        HOST_CAPABILITY_HTTP_COUNT_FN, HOST_CAPABILITY_HTTP_HANDLE_FN,
+        HOST_CAPABILITY_SECRET_COUNT_FN, HOST_CAPABILITY_SECRET_HANDLE_FN,
+        HOST_CAPABILITY_STORAGE_COUNT_FN, HOST_CAPABILITY_STORAGE_HANDLE_FN, SDK_ABI_MAJOR,
+        WIT_WORLD_NAME,
     };
 
     #[test]
@@ -926,6 +1064,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn host_capability_services_are_capability_scoped_and_redacted() {
+        let services = supported_host_capability_services();
+        assert!(services
+            .iter()
+            .any(|service| service.service == HostCapabilityServiceKind::TasksCreate));
+        let tasks_create =
+            host_capability_service_descriptor(HostCapabilityServiceKind::TasksCreate);
+        assert_eq!(
+            tasks_create.required_capability_class,
+            Some(TypedPluginCapabilityClass::StoragePrefixes)
+        );
+        assert!(tasks_create.redacted_fields.contains(&"task.payload".to_owned()));
+
+        let vault =
+            host_capability_service_descriptor(HostCapabilityServiceKind::VaultSecretLeaseRequest);
+        assert_eq!(vault.required_capability_class, Some(TypedPluginCapabilityClass::Secrets));
+        assert!(
+            !vault.returns_secret_material,
+            "vault host service may return lease metadata, never raw secret material"
+        );
+        assert_eq!(vault.audit_event, "plugin.host_call.invoked");
     }
 
     #[test]

@@ -8,10 +8,12 @@
 use std::{collections::BTreeSet, sync::mpsc, time::Duration};
 
 use palyra_plugins_sdk::{
-    typed_plugin_contract_descriptor, TypedPluginCapabilityClass, TypedPluginContractDeclaration,
-    TypedPluginContractDescriptor, TypedPluginContractKind, HOST_CAPABILITIES_IMPORT_MODULE,
-    HOST_CAPABILITY_CHANNEL_COUNT_FN, HOST_CAPABILITY_CHANNEL_HANDLE_FN,
-    HOST_CAPABILITY_HTTP_COUNT_FN, HOST_CAPABILITY_HTTP_HANDLE_FN, HOST_CAPABILITY_SECRET_COUNT_FN,
+    host_capability_service_descriptor, typed_plugin_contract_descriptor,
+    HostCapabilityServiceDescriptor, HostCapabilityServiceKind, TypedPluginCapabilityClass,
+    TypedPluginContractDeclaration, TypedPluginContractDescriptor, TypedPluginContractKind,
+    HOST_CAPABILITIES_IMPORT_MODULE, HOST_CAPABILITY_CHANNEL_COUNT_FN,
+    HOST_CAPABILITY_CHANNEL_HANDLE_FN, HOST_CAPABILITY_HTTP_COUNT_FN,
+    HOST_CAPABILITY_HTTP_HANDLE_FN, HOST_CAPABILITY_SECRET_COUNT_FN,
     HOST_CAPABILITY_SECRET_HANDLE_FN, HOST_CAPABILITY_STORAGE_COUNT_FN,
     HOST_CAPABILITY_STORAGE_HANDLE_FN,
 };
@@ -206,6 +208,155 @@ pub struct TypedPluginContractNegotiationInput<'a> {
     pub capability_classes: &'a [TypedPluginCapabilityClass],
     /// Typed adapters the daemon currently exposes.
     pub adapters: &'a [TypedPluginContractAdapterSupport],
+}
+
+/// Service grants for capability-scoped Wasm host calls.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostCapabilityServiceGrantSet {
+    /// Host services the plugin may call.
+    pub allowed_services: Vec<HostCapabilityServiceKind>,
+    /// Tier A data-plane grants that service descriptors may require.
+    pub capability_grants: CapabilityGrantSet,
+}
+
+impl HostCapabilityServiceGrantSet {
+    /// Returns a canonical copy with stable service order and canonical data grants.
+    #[must_use]
+    pub fn canonicalized(&self) -> Self {
+        Self {
+            allowed_services: self
+                .allowed_services
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            capability_grants: self.capability_grants.canonicalized(),
+        }
+    }
+}
+
+/// Request metadata for one Wasm host service call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmHostCallRequest {
+    /// Service being requested.
+    pub service: HostCapabilityServiceKind,
+    /// Serialized payload size before host parsing.
+    pub payload_bytes: u64,
+    /// Requested timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// Authorization status for one Wasm host service call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WasmHostCallStatus {
+    /// Host call may be dispatched after policy enforcement.
+    Allowed,
+    /// Host call is denied before dispatch.
+    Denied,
+}
+
+/// Authorization decision for one Wasm host service call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmHostCallDecision {
+    /// Requested service.
+    pub service: HostCapabilityServiceKind,
+    /// Decision status.
+    pub status: WasmHostCallStatus,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Host service descriptor used for the decision.
+    pub descriptor: HostCapabilityServiceDescriptor,
+    /// Audit event the daemon should record.
+    pub audit_event: String,
+    /// Redacted fields that must not be logged raw.
+    #[serde(default)]
+    pub redacted_fields: Vec<String>,
+}
+
+/// Authorizes a Wasm host service call against service grants, data grants,
+/// timeout, and payload budgets without dispatching the call.
+#[must_use]
+pub fn authorize_wasm_host_call(
+    grants: &HostCapabilityServiceGrantSet,
+    request: &WasmHostCallRequest,
+) -> WasmHostCallDecision {
+    let grants = grants.canonicalized();
+    let descriptor = host_capability_service_descriptor(request.service);
+    if !grants.allowed_services.contains(&request.service) {
+        return wasm_host_call_decision(
+            request.service,
+            WasmHostCallStatus::Denied,
+            "plugin.host_call.denied.service_grant_missing",
+            descriptor,
+        );
+    }
+    if request.payload_bytes > descriptor.max_payload_bytes {
+        return wasm_host_call_decision(
+            request.service,
+            WasmHostCallStatus::Denied,
+            "plugin.host_call.denied.payload_budget_exceeded",
+            descriptor,
+        );
+    }
+    if request.timeout_ms > descriptor.default_timeout_ms {
+        return wasm_host_call_decision(
+            request.service,
+            WasmHostCallStatus::Denied,
+            "plugin.host_call.denied.timeout_budget_exceeded",
+            descriptor,
+        );
+    }
+    if let Some(required) = descriptor.required_capability_class {
+        if !capability_class_granted(&grants.capability_grants, required) {
+            return wasm_host_call_decision(
+                request.service,
+                WasmHostCallStatus::Denied,
+                "plugin.host_call.denied.capability_class_missing",
+                descriptor,
+            );
+        }
+    }
+    wasm_host_call_decision(
+        request.service,
+        WasmHostCallStatus::Allowed,
+        "plugin.host_call.allowed",
+        descriptor,
+    )
+}
+
+fn capability_class_granted(
+    grants: &CapabilityGrantSet,
+    required: TypedPluginCapabilityClass,
+) -> bool {
+    match required {
+        TypedPluginCapabilityClass::HttpHosts => !grants.http_hosts.is_empty(),
+        TypedPluginCapabilityClass::Secrets => !grants.secret_keys.is_empty(),
+        TypedPluginCapabilityClass::StoragePrefixes => !grants.storage_prefixes.is_empty(),
+        TypedPluginCapabilityClass::Channels => !grants.channels.is_empty(),
+    }
+}
+
+fn wasm_host_call_decision(
+    service: HostCapabilityServiceKind,
+    status: WasmHostCallStatus,
+    reason_code: &str,
+    descriptor: HostCapabilityServiceDescriptor,
+) -> WasmHostCallDecision {
+    let audit_event = if status == WasmHostCallStatus::Allowed {
+        descriptor.audit_event.clone()
+    } else {
+        "plugin.host_call.denied".to_owned()
+    };
+    WasmHostCallDecision {
+        service,
+        status,
+        reason_code: reason_code.to_owned(),
+        redacted_fields: descriptor.redacted_fields.clone(),
+        descriptor,
+        audit_event,
+    }
 }
 
 /// Negotiates a plugin's declared typed contracts against host descriptors and
@@ -731,13 +882,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        negotiate_typed_plugin_contracts, CapabilityGrantSet, RuntimeError, RuntimeLimits,
+        authorize_wasm_host_call, negotiate_typed_plugin_contracts, CapabilityGrantSet,
+        HostCapabilityServiceGrantSet, RuntimeError, RuntimeLimits,
         TypedPluginContractAdapterSupport, TypedPluginContractMode,
-        TypedPluginContractNegotiationInput, TypedPluginContractStatus, WasmRuntime,
+        TypedPluginContractNegotiationInput, TypedPluginContractStatus, WasmHostCallRequest,
+        WasmHostCallStatus, WasmRuntime,
     };
     use palyra_plugins_sdk::{
-        TypedPluginCapabilityClass, TypedPluginContractDeclaration, TypedPluginContractKind,
-        DEFAULT_RUNTIME_ENTRYPOINT, HOST_CAPABILITIES_IMPORT_MODULE,
+        HostCapabilityServiceKind, TypedPluginCapabilityClass, TypedPluginContractDeclaration,
+        TypedPluginContractKind, DEFAULT_RUNTIME_ENTRYPOINT, HOST_CAPABILITIES_IMPORT_MODULE,
         HOST_CAPABILITY_CHANNEL_COUNT_FN, HOST_CAPABILITY_HTTP_COUNT_FN,
         HOST_CAPABILITY_HTTP_HANDLE_FN, HOST_CAPABILITY_SECRET_COUNT_FN,
         HOST_CAPABILITY_STORAGE_COUNT_FN,
@@ -852,6 +1005,71 @@ mod tests {
         assert_eq!(report.mode, TypedPluginContractMode::UntypedLegacy);
         assert!(report.ready);
         assert!(report.entries.is_empty());
+    }
+
+    #[test]
+    fn host_call_authorization_denies_service_without_explicit_grant() {
+        let decision = authorize_wasm_host_call(
+            &HostCapabilityServiceGrantSet::default(),
+            &WasmHostCallRequest {
+                service: HostCapabilityServiceKind::TasksCreate,
+                payload_bytes: 128,
+                timeout_ms: 100,
+            },
+        );
+
+        assert_eq!(decision.status, WasmHostCallStatus::Denied);
+        assert_eq!(decision.reason_code, "plugin.host_call.denied.service_grant_missing");
+        assert_eq!(decision.audit_event, "plugin.host_call.denied");
+    }
+
+    #[test]
+    fn host_call_authorization_denies_missing_capability_class() {
+        let grants = HostCapabilityServiceGrantSet {
+            allowed_services: vec![HostCapabilityServiceKind::TasksCreate],
+            capability_grants: CapabilityGrantSet::default(),
+        };
+
+        let decision = authorize_wasm_host_call(
+            &grants,
+            &WasmHostCallRequest {
+                service: HostCapabilityServiceKind::TasksCreate,
+                payload_bytes: 128,
+                timeout_ms: 100,
+            },
+        );
+
+        assert_eq!(decision.status, WasmHostCallStatus::Denied);
+        assert_eq!(decision.reason_code, "plugin.host_call.denied.capability_class_missing");
+    }
+
+    #[test]
+    fn host_call_authorization_allows_vault_lease_metadata_with_secret_grant() {
+        let grants = HostCapabilityServiceGrantSet {
+            allowed_services: vec![HostCapabilityServiceKind::VaultSecretLeaseRequest],
+            capability_grants: CapabilityGrantSet {
+                secret_keys: vec!["global/openai_api_key".to_owned()],
+                ..CapabilityGrantSet::default()
+            },
+        };
+
+        let decision = authorize_wasm_host_call(
+            &grants,
+            &WasmHostCallRequest {
+                service: HostCapabilityServiceKind::VaultSecretLeaseRequest,
+                payload_bytes: 256,
+                timeout_ms: 250,
+            },
+        );
+
+        assert_eq!(decision.status, WasmHostCallStatus::Allowed);
+        assert_eq!(decision.reason_code, "plugin.host_call.allowed");
+        assert_eq!(decision.audit_event, "plugin.host_call.invoked");
+        assert!(
+            !decision.descriptor.returns_secret_material,
+            "vault host service must only expose lease metadata"
+        );
+        assert!(decision.redacted_fields.contains(&"secret.ref".to_owned()));
     }
 
     #[test]
