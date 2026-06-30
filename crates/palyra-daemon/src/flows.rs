@@ -17,6 +17,10 @@ use tonic::Status;
 use ulid::Ulid;
 
 use crate::{
+    acceptance::{
+        attach_acceptance_criteria, flow_acceptance_metadata, flow_step_acceptance_criteria,
+        flow_step_acceptance_projection,
+    },
     application::delivery_arbitration::{
         merge_delivery_progress_updates, DeliveryProgressUpdate, DeliverySurface,
         MergedDeliveryProgress,
@@ -852,43 +856,43 @@ pub(crate) fn flow_adapter_contracts() -> Vec<FlowAdapterContract> {
         FlowAdapterContract {
             adapter: "routine",
             input_contract: "routine_id plus optional run lineage",
-            output_contract: "routine run status mapped to flow step state",
+            output_contract: "routine run status mapped to flow step state plus acceptance projection",
             ownership: "mirrored",
         },
         FlowAdapterContract {
             adapter: "objective",
             input_contract: "objective_id plus attempt lineage",
-            output_contract: "objective attempt status mapped to flow step state",
+            output_contract: "objective attempt status mapped to flow step state plus acceptance projection",
             ownership: "mirrored",
         },
         FlowAdapterContract {
             adapter: "delegation",
             input_contract: "delegation prompt or child run lineage",
-            output_contract: "background task or child run terminal state",
+            output_contract: "background task or child run terminal state plus acceptance projection",
             ownership: "managed_or_mirrored",
         },
         FlowAdapterContract {
             adapter: "webhook",
             input_contract: "webhook integration id plus dispatch lineage",
-            output_contract: "dispatch outcome mapped to flow step state",
+            output_contract: "dispatch outcome mapped to flow step state plus acceptance projection",
             ownership: "mirrored",
         },
         FlowAdapterContract {
             adapter: "auxiliary_task",
             input_contract: "task_kind, input_text, optional budget_tokens",
-            output_contract: "auxiliary executor result JSON",
+            output_contract: "auxiliary executor result JSON plus acceptance projection",
             ownership: "managed",
         },
         FlowAdapterContract {
             adapter: "approval_wait",
             input_contract: "approval_id lineage",
-            output_contract: "approval decision mapped to flow step state",
+            output_contract: "approval decision mapped to flow step state plus acceptance projection",
             ownership: "mirrored",
         },
         FlowAdapterContract {
             adapter: "manual_gate",
             input_contract: "operator note",
-            output_contract: "operator retry, skip, resume, cancel, or compensation action",
+            output_contract: "operator retry, skip, resume, cancel, or compensation action plus acceptance projection",
             ownership: "operator",
         },
     ]
@@ -910,11 +914,11 @@ pub(crate) fn merge_flow_step_progress_for_delivery(
 
 fn flow_step_progress_update(step: &FlowStepRecord) -> DeliveryProgressUpdate {
     let state = FlowStepState::from_str(step.state.as_str());
-    let detail = step
-        .last_error
-        .clone()
-        .or_else(|| step.waiting_reason.clone())
-        .or_else(|| (!step.adapter.trim().is_empty()).then(|| step.adapter.clone()));
+    let acceptance = flow_step_acceptance_projection(step);
+    let detail = step.last_error.clone().or_else(|| step.waiting_reason.clone()).or_else(|| {
+        (!step.adapter.trim().is_empty())
+            .then(|| format!("{} acceptance={}", step.adapter, acceptance.decision.as_str()))
+    });
     DeliveryProgressUpdate::flow_step(
         format!("{}/{}", step.flow_id, step.step_id),
         step.title.clone(),
@@ -953,6 +957,7 @@ pub(crate) struct FlowCreateDescriptor {
 /// policy; the descriptor owner is recorded as both flow owner and acting principal.
 pub(crate) fn build_flow_create_request(descriptor: FlowCreateDescriptor) -> FlowCreateRequest {
     let owner_principal = descriptor.owner_principal;
+    let acceptance = flow_acceptance_metadata(descriptor.steps.as_slice());
     FlowCreateRequest {
         flow_id: Ulid::new().to_string(),
         mode: descriptor.mode.as_str().to_owned(),
@@ -973,6 +978,7 @@ pub(crate) fn build_flow_create_request(descriptor: FlowCreateDescriptor) -> Flo
         metadata_json: json!({
             "schema": "palyra.flow.metadata.v1",
             "created_by": owner_principal,
+            "acceptance": acceptance,
         })
         .to_string(),
         actor_principal: owner_principal,
@@ -994,6 +1000,8 @@ pub(crate) fn build_flow_step(
     input_json: Value,
     lineage: FlowLineage,
 ) -> FlowStepCreateRequest {
+    let acceptance = flow_step_acceptance_criteria(adapter, step_kind, title.as_str());
+    let input_json = attach_acceptance_criteria(input_json, acceptance);
     FlowStepCreateRequest {
         step_id: Ulid::new().to_string(),
         step_index,
@@ -1439,6 +1447,27 @@ mod tests {
             &[step("one", FlowStepState::Failed), dependent.clone()],
             &dependent
         ));
+    }
+
+    #[test]
+    fn build_flow_step_embeds_acceptance_criteria() {
+        let step = build_flow_step(
+            0,
+            "auxiliary_task",
+            "summary",
+            "Summarize status".to_owned(),
+            json!({ "input_text": "summarize" }),
+            FlowLineage::default(),
+        );
+        let input = serde_json::from_str::<Value>(step.input_json.as_str())
+            .expect("step input should be json");
+
+        assert_eq!(input["input_text"], "summarize");
+        assert_eq!(input["acceptance_criteria"]["reason_code"], "flow_step_acceptance_required");
+        assert_eq!(
+            input["acceptance_criteria"]["criteria"][0]["evidence_refs"][0],
+            "flow_step:summary:auxiliary_task"
+        );
     }
 
     #[test]

@@ -7,10 +7,11 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tonic::Status;
 
 use crate::{
+    acceptance::commitment_acceptance_projection,
     application::plan_state::{
         AgentPlanEvent, AgentPlanItem, AgentPlanQuery, AgentPlanStatus, AgentPlanStore,
         AGENT_PLAN_SCHEMA_VERSION,
@@ -619,7 +620,7 @@ fn flow_task_run(flow: FlowRecord) -> Result<TaskRun, Status> {
             retry_allowed: !is_terminal_task_state(state.as_str()),
             policy_json: retry_policy_json.clone(),
         },
-        artifact_refs_json: "{}".to_owned(),
+        artifact_refs_json: redact_json(flow.metadata_json.as_str())?,
         retry_policy_json,
         access_policy_json: json!({
             "owner_only": true,
@@ -748,6 +749,16 @@ fn commitment_task_run(commitment: CommitmentRecord) -> Result<TaskRun, Status> 
     let state = commitment.status.clone();
     let title = commitment.normalized_action.clone();
     let recurrence_json = redact_json(commitment.recurrence_json.as_str())?;
+    let acceptance = commitment_acceptance_projection(&commitment);
+    let artifact_refs_json = redact_json(
+        json!({
+            "channel_binding": serde_json::from_str::<Value>(commitment.channel_binding_json.as_str())
+                .unwrap_or_else(|_| json!({ "raw": commitment.channel_binding_json })),
+            "acceptance": acceptance.clone(),
+        })
+        .to_string()
+        .as_str(),
+    )?;
     Ok(TaskRun {
         task_id: normalized_task_id(TaskSourceKind::Commitment, source_id.as_str()),
         source_id: commitment.commitment_id,
@@ -783,14 +794,15 @@ fn commitment_task_run(commitment: CommitmentRecord) -> Result<TaskRun, Status> 
             retry_allowed: !is_terminal_task_state(state.as_str()),
             policy_json: recurrence_json.clone(),
         },
-        artifact_refs_json: redact_json(commitment.channel_binding_json.as_str())?,
+        artifact_refs_json,
         retry_policy_json: recurrence_json,
         access_policy_json: json!({
             "owner_only": true,
             "approval_requirement": commitment.approval_requirement,
             "privacy_label": commitment.privacy_label,
             "due_at_unix_ms": commitment.due_at_unix_ms,
-            "scheduled_at_unix_ms": commitment.scheduled_at_unix_ms
+            "scheduled_at_unix_ms": commitment.scheduled_at_unix_ms,
+            "acceptance": acceptance
         })
         .to_string(),
         created_at_unix_ms: commitment.created_at_unix_ms,
@@ -1106,6 +1118,48 @@ mod tests {
         }
     }
 
+    fn commitment(status: &str) -> CommitmentRecord {
+        CommitmentRecord {
+            commitment_id: "commitment-1".to_owned(),
+            owner_principal: "user:one".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: Some("session".to_owned()),
+            run_id: Some("run".to_owned()),
+            user_wording: "I will send the report.".to_owned(),
+            normalized_action: "send the report".to_owned(),
+            due_condition_json: json!({"type":"unspecified"}).to_string(),
+            recurrence_json: json!({"type":"none"}).to_string(),
+            channel_binding_json: json!({"type":"console_review"}).to_string(),
+            approval_requirement: "manual_review".to_owned(),
+            privacy_label: "user_visible".to_owned(),
+            status: status.to_owned(),
+            confidence_bps: 7_500,
+            extraction_model: "test".to_owned(),
+            review_reason: "explicit commitment language detected".to_owned(),
+            scheduler_binding_json: json!({
+                "type": "none",
+                "acceptance_criteria": {
+                    "schema_version": 1,
+                    "criteria": [{
+                        "description": "Commitment reaches delivery outcome",
+                        "required": true,
+                        "evidence_refs": ["commitment.delivery"]
+                    }],
+                    "decision": "pending",
+                    "reason_code": "commitment_acceptance_required",
+                    "redaction_level": "metadata_only"
+                }
+            })
+            .to_string(),
+            due_at_unix_ms: None,
+            scheduled_at_unix_ms: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            completed_at_unix_ms: (status == "delivered").then_some(3),
+        }
+    }
+
     #[test]
     fn access_policy_rejects_foreign_principal_device_or_channel() {
         let policy = access("user:one");
@@ -1143,6 +1197,17 @@ mod tests {
         assert!(task.retry_policy.retry_allowed);
         assert_eq!(task.steps[0].source_kind, "agent_plan_item");
         assert!(task.artifact_refs_json.contains("journal:event"));
+    }
+
+    #[test]
+    fn commitment_task_run_surfaces_acceptance_projection() {
+        let task = commitment_task_run(commitment("delivered")).expect("commitment should map");
+        let access_policy = serde_json::from_str::<Value>(task.access_policy_json.as_str())
+            .expect("access policy should be json");
+
+        assert_eq!(access_policy["acceptance"]["decision"], "satisfied");
+        assert_eq!(access_policy["acceptance"]["reason_code"], "commitment_acceptance_required");
+        assert!(task.artifact_refs_json.contains("commitment.delivery"));
     }
 
     #[test]

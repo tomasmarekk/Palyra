@@ -47,6 +47,7 @@ pub(crate) mod test_env {
     }
 }
 
+mod acceptance;
 mod access_control;
 mod acp;
 mod agents;
