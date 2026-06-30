@@ -56,6 +56,10 @@ struct StatusRuntimeSnapshot {
     self_healing_active_incidents: Option<u64>,
     self_healing_resolved_incidents: Option<u64>,
     self_healing_heartbeat_count: Option<u64>,
+    verification_status: Option<String>,
+    verification_recent_events: Option<u64>,
+    verification_stale_requirements: Option<u64>,
+    verification_failed_events: Option<u64>,
     diagnostics_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics_error: Option<String>,
@@ -148,6 +152,10 @@ pub(crate) fn run_status(args: StatusCommandArgs) -> Result<()> {
                     "memory_entries": runtime.memory_entries,
                     "memory_bytes": runtime.memory_bytes,
                     "support_bundle_failures": runtime.support_bundle_failures,
+                    "verification_status": runtime.verification_status,
+                    "verification_recent_events": runtime.verification_recent_events,
+                    "verification_stale_requirements": runtime.verification_stale_requirements,
+                    "verification_failed_events": runtime.verification_failed_events,
                     "diagnostics_available": runtime.diagnostics_available,
                     "diagnostics_error": runtime.diagnostics_error,
                 }),
@@ -222,7 +230,7 @@ pub(crate) fn run_status(args: StatusCommandArgs) -> Result<()> {
     }
     if let Some(runtime) = report.runtime.as_ref() {
         println!(
-            "status.runtime deployment_mode={} bind_profile={} remote_bind_detected={} auth_state={} browser_state={} browser_sessions={} connector_degraded={} connector_queue_depth={} memory_entries={} memory_bytes={} support_bundle_failures={} self_healing_active_incidents={} self_healing_resolved_incidents={} self_healing_heartbeats={} diagnostics_available={}",
+            "status.runtime deployment_mode={} bind_profile={} remote_bind_detected={} auth_state={} browser_state={} browser_sessions={} connector_degraded={} connector_queue_depth={} memory_entries={} memory_bytes={} support_bundle_failures={} self_healing_active_incidents={} self_healing_resolved_incidents={} self_healing_heartbeats={} verification_status={} verification_recent_events={} verification_stale_requirements={} verification_failed_events={} diagnostics_available={}",
             runtime.deployment_mode.as_deref().unwrap_or("unknown"),
             runtime.bind_profile.as_deref().unwrap_or("unknown"),
             runtime.remote_bind_detected.unwrap_or(false),
@@ -237,6 +245,10 @@ pub(crate) fn run_status(args: StatusCommandArgs) -> Result<()> {
             runtime.self_healing_active_incidents.unwrap_or(0),
             runtime.self_healing_resolved_incidents.unwrap_or(0),
             runtime.self_healing_heartbeat_count.unwrap_or(0),
+            runtime.verification_status.as_deref().unwrap_or("unknown"),
+            runtime.verification_recent_events.unwrap_or(0),
+            runtime.verification_stale_requirements.unwrap_or(0),
+            runtime.verification_failed_events.unwrap_or(0),
             runtime.diagnostics_available,
         );
         if let Some(error) = runtime.diagnostics_error.as_deref() {
@@ -361,6 +373,10 @@ fn build_status_report(
             self_healing_active_incidents: None,
             self_healing_resolved_incidents: None,
             self_healing_heartbeat_count: None,
+            verification_status: None,
+            verification_recent_events: None,
+            verification_stale_requirements: None,
+            verification_failed_events: None,
             diagnostics_available: false,
             diagnostics_error: Some(
                 "admin token is unavailable; runtime diagnostics were skipped".to_owned(),
@@ -496,6 +512,10 @@ async fn load_runtime_status_snapshot(
                 self_healing_active_incidents: None,
                 self_healing_resolved_incidents: None,
                 self_healing_heartbeat_count: None,
+                verification_status: None,
+                verification_recent_events: None,
+                verification_stale_requirements: None,
+                verification_failed_events: None,
                 diagnostics_available: false,
                 diagnostics_error: Some(redact_auth_error(error.to_string().as_str())),
             };
@@ -521,6 +541,10 @@ async fn load_runtime_status_snapshot(
                 self_healing_active_incidents: None,
                 self_healing_resolved_incidents: None,
                 self_healing_heartbeat_count: None,
+                verification_status: None,
+                verification_recent_events: None,
+                verification_stale_requirements: None,
+                verification_failed_events: None,
                 diagnostics_available: false,
                 diagnostics_error: Some(redact_auth_error(error.to_string().as_str())),
             };
@@ -570,6 +594,19 @@ async fn load_runtime_status_snapshot(
             .pointer("/observability/self_healing/heartbeats")
             .and_then(Value::as_array)
             .and_then(|entries| u64::try_from(entries.len()).ok()),
+        verification_status: diagnostics
+            .pointer("/verification/decision")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        verification_recent_events: diagnostics
+            .pointer("/verification/verification_projection_events")
+            .and_then(Value::as_u64),
+        verification_stale_requirements: diagnostics
+            .pointer("/verification/stale_requirements")
+            .and_then(Value::as_u64),
+        verification_failed_events: diagnostics
+            .pointer("/verification/failed_events")
+            .and_then(Value::as_u64),
         diagnostics_available: true,
         diagnostics_error: None,
     }
@@ -599,6 +636,10 @@ mod tests {
             self_healing_active_incidents: None,
             self_healing_resolved_incidents: None,
             self_healing_heartbeat_count: None,
+            verification_status: None,
+            verification_recent_events: None,
+            verification_stale_requirements: None,
+            verification_failed_events: None,
             diagnostics_available,
             diagnostics_error: None,
         }

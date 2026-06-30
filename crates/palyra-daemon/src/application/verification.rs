@@ -28,6 +28,21 @@ pub(crate) const VERIFICATION_FRESHNESS_CHECKED: &str = "verification.freshness.
 pub(crate) const VERIFICATION_REDACTION_LEVEL: &str = "metadata_and_redacted_summary";
 const MAX_OUTPUT_SUMMARY_CHARS: usize = 640;
 
+pub(crate) const VERIFICATION_STATUS_ROLLOUT_DISABLED: &str =
+    "verification.status.rollout_disabled";
+pub(crate) const VERIFICATION_STATUS_NO_RECENT_EVENTS: &str =
+    "verification.status.no_recent_events";
+pub(crate) const VERIFICATION_STATUS_RECENT_STALE_REQUIREMENT: &str =
+    "verification.status.recent_stale_requirement";
+pub(crate) const VERIFICATION_STATUS_RECENT_FAILED_EVENT: &str =
+    "verification.status.recent_failed_event";
+pub(crate) const VERIFICATION_STATUS_RECENT_UNKNOWN_REQUIREMENT: &str =
+    "verification.status.recent_unknown_requirement";
+pub(crate) const VERIFICATION_STATUS_RECENT_FRESH_EVIDENCE: &str =
+    "verification.status.recent_fresh_evidence";
+pub(crate) const VERIFICATION_STATUS_JOURNAL_UNAVAILABLE: &str =
+    "verification.status.journal_unavailable";
+
 /// Verification work family. Classifiers may map several commands into one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +127,66 @@ pub(crate) enum VerificationFreshnessStatus {
     Fresh,
     Stale,
     Unknown,
+}
+
+impl VerificationFreshnessStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Operator-facing verification status derived from recent journal projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VerificationDiagnosticsDecision {
+    Disabled,
+    Fresh,
+    Stale,
+    Failed,
+    Unknown,
+    NoEvidence,
+}
+
+impl VerificationDiagnosticsDecision {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::NoEvidence => "no_evidence",
+        }
+    }
+}
+
+/// Stable status summary consumed by CLI status and console diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationStatusForCliAndConsoleDiagnostics {
+    pub(crate) schema_version: u32,
+    pub(crate) decision: VerificationDiagnosticsDecision,
+    pub(crate) rollout_enabled: bool,
+    pub(crate) journal_total_events: u64,
+    pub(crate) journal_window_events: u64,
+    pub(crate) verification_projection_events: u64,
+    pub(crate) classified_commands: u64,
+    pub(crate) recorded_events: u64,
+    pub(crate) passing_events: u64,
+    pub(crate) failed_events: u64,
+    pub(crate) stale_requirements: u64,
+    pub(crate) fresh_requirements: u64,
+    pub(crate) unknown_requirements: u64,
+    pub(crate) latest_event_type: Option<String>,
+    pub(crate) latest_status: Option<String>,
+    pub(crate) latest_created_at_unix_ms: Option<i64>,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) journal_events: Vec<String>,
+    pub(crate) redaction_level: String,
 }
 
 /// Stable reason codes used by verification journal payloads.
@@ -452,6 +527,184 @@ pub(crate) struct VerificationJournalProjection {
     pub(crate) state: Option<VerificationState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) freshness: Option<VerificationFreshnessDecision>,
+}
+
+/// Builds the CLI/console verification status from recent journal projections.
+#[must_use]
+pub(crate) fn verification_status_for_cli_and_console(
+    rollout_enabled: bool,
+    journal_total_events: u64,
+    journal_window_events: u64,
+    projections: &[VerificationJournalProjection],
+) -> VerificationStatusForCliAndConsoleDiagnostics {
+    let mut classified_commands = 0_u64;
+    let mut recorded_events = 0_u64;
+    let mut passing_events = 0_u64;
+    let mut failed_events = 0_u64;
+    let mut stale_requirements = 0_u64;
+    let mut fresh_requirements = 0_u64;
+    let mut unknown_requirements = 0_u64;
+    let mut latest_event_type = None;
+    let mut latest_status = None;
+    let mut latest_created_at_unix_ms = None;
+
+    for projection in projections {
+        if latest_created_at_unix_ms.is_none_or(|latest| projection.created_at_unix_ms >= latest) {
+            latest_created_at_unix_ms = Some(projection.created_at_unix_ms);
+            latest_event_type = Some(projection.event_type.clone());
+            latest_status = projection_status(projection);
+        }
+        match projection.event_type.as_str() {
+            VERIFICATION_COMMAND_CLASSIFIED => {
+                classified_commands = classified_commands.saturating_add(1);
+            }
+            VERIFICATION_EVENT_RECORDED => {
+                recorded_events = recorded_events.saturating_add(1);
+                if projection.event.as_ref().is_some_and(|event| event.status.is_passing()) {
+                    passing_events = passing_events.saturating_add(1);
+                } else if projection.event.as_ref().is_some_and(|event| {
+                    matches!(
+                        event.status,
+                        VerificationStatus::Failed
+                            | VerificationStatus::TimedOut
+                            | VerificationStatus::Cancelled
+                    )
+                }) {
+                    failed_events = failed_events.saturating_add(1);
+                }
+            }
+            VERIFICATION_STATE_STALE | VERIFICATION_FRESHNESS_CHECKED => {
+                if let Some(status) = projection_freshness_status(projection) {
+                    match status {
+                        VerificationFreshnessStatus::Fresh => {
+                            fresh_requirements = fresh_requirements.saturating_add(1);
+                        }
+                        VerificationFreshnessStatus::Stale => {
+                            stale_requirements = stale_requirements.saturating_add(1);
+                        }
+                        VerificationFreshnessStatus::Unknown => {
+                            unknown_requirements = unknown_requirements.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let decision = verification_diagnostics_decision(
+        rollout_enabled,
+        projections.is_empty(),
+        stale_requirements,
+        failed_events,
+        unknown_requirements,
+        fresh_requirements,
+        passing_events,
+    );
+    let reason_codes = verification_diagnostics_reason_codes(decision);
+
+    VerificationStatusForCliAndConsoleDiagnostics {
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        decision,
+        rollout_enabled,
+        journal_total_events,
+        journal_window_events,
+        verification_projection_events: u64::try_from(projections.len()).unwrap_or(u64::MAX),
+        classified_commands,
+        recorded_events,
+        passing_events,
+        failed_events,
+        stale_requirements,
+        fresh_requirements,
+        unknown_requirements,
+        latest_event_type,
+        latest_status,
+        latest_created_at_unix_ms,
+        reason_codes,
+        journal_events: vec![
+            VERIFICATION_COMMAND_CLASSIFIED.to_owned(),
+            VERIFICATION_EVENT_RECORDED.to_owned(),
+            VERIFICATION_STATE_STALE.to_owned(),
+            VERIFICATION_FRESHNESS_CHECKED.to_owned(),
+        ],
+        redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn projection_status(projection: &VerificationJournalProjection) -> Option<String> {
+    projection
+        .event
+        .as_ref()
+        .map(|event| event.status.as_str().to_owned())
+        .or_else(|| {
+            projection.state.as_ref().map(|state| state.freshness.status.as_str().to_owned())
+        })
+        .or_else(|| {
+            projection.freshness.as_ref().map(|freshness| freshness.status.as_str().to_owned())
+        })
+}
+
+fn projection_freshness_status(
+    projection: &VerificationJournalProjection,
+) -> Option<VerificationFreshnessStatus> {
+    projection
+        .state
+        .as_ref()
+        .map(|state| state.freshness.status)
+        .or_else(|| projection.freshness.as_ref().map(|freshness| freshness.status))
+}
+
+fn verification_diagnostics_decision(
+    rollout_enabled: bool,
+    no_recent_events: bool,
+    stale_requirements: u64,
+    failed_events: u64,
+    unknown_requirements: u64,
+    fresh_requirements: u64,
+    passing_events: u64,
+) -> VerificationDiagnosticsDecision {
+    if !rollout_enabled {
+        return VerificationDiagnosticsDecision::Disabled;
+    }
+    if no_recent_events {
+        return VerificationDiagnosticsDecision::NoEvidence;
+    }
+    if stale_requirements > 0 {
+        return VerificationDiagnosticsDecision::Stale;
+    }
+    if failed_events > 0 {
+        return VerificationDiagnosticsDecision::Failed;
+    }
+    if unknown_requirements > 0 {
+        return VerificationDiagnosticsDecision::Unknown;
+    }
+    if fresh_requirements > 0 || passing_events > 0 {
+        return VerificationDiagnosticsDecision::Fresh;
+    }
+    VerificationDiagnosticsDecision::Unknown
+}
+
+fn verification_diagnostics_reason_codes(decision: VerificationDiagnosticsDecision) -> Vec<String> {
+    match decision {
+        VerificationDiagnosticsDecision::Disabled => {
+            vec![VERIFICATION_STATUS_ROLLOUT_DISABLED.to_owned()]
+        }
+        VerificationDiagnosticsDecision::NoEvidence => {
+            vec![VERIFICATION_STATUS_NO_RECENT_EVENTS.to_owned()]
+        }
+        VerificationDiagnosticsDecision::Stale => {
+            vec![VERIFICATION_STATUS_RECENT_STALE_REQUIREMENT.to_owned()]
+        }
+        VerificationDiagnosticsDecision::Failed => {
+            vec![VERIFICATION_STATUS_RECENT_FAILED_EVENT.to_owned()]
+        }
+        VerificationDiagnosticsDecision::Unknown => {
+            vec![VERIFICATION_STATUS_RECENT_UNKNOWN_REQUIREMENT.to_owned()]
+        }
+        VerificationDiagnosticsDecision::Fresh => {
+            vec![VERIFICATION_STATUS_RECENT_FRESH_EVIDENCE.to_owned()]
+        }
+    }
 }
 
 #[must_use]
@@ -1029,7 +1282,8 @@ mod tests {
         append_verification_stale_output, build_patch_stale_verification_states,
         build_verification_state, canonicalize_verification_command,
         verification_command_classified_projection, verification_event_recorded_projection,
-        verification_state_stale_projection, VerificationCommandClassifier, VerificationEvent,
+        verification_state_stale_projection, verification_status_for_cli_and_console,
+        VerificationCommandClassifier, VerificationDiagnosticsDecision, VerificationEvent,
         VerificationEventCreateRequest, VerificationFreshnessStatus, VerificationKind,
         VerificationOutputSummary, VerificationPatchStaleRequest, VerificationRequirement,
         VerificationScope, VerificationStatus, VERIFICATION_COMMAND_CLASSIFIED,
@@ -1298,6 +1552,90 @@ mod tests {
         assert_eq!(value["event_type"], VERIFICATION_STATE_STALE);
         assert_eq!(value["redaction_level"], VERIFICATION_REDACTION_LEVEL);
         assert_eq!(value["state"]["freshness"]["status"], "stale");
+    }
+
+    #[test]
+    fn verification_status_for_cli_reports_recent_fresh_evidence() {
+        let projection = verification_event_recorded_projection(event(
+            "event-1",
+            VerificationStatus::Passed,
+            VerificationScope::Workspace,
+            vec![],
+            1_000,
+        ));
+
+        let status = verification_status_for_cli_and_console(true, 12, 5, &[projection]);
+
+        assert_eq!(status.decision, VerificationDiagnosticsDecision::Fresh);
+        assert_eq!(status.recorded_events, 1);
+        assert_eq!(status.passing_events, 1);
+        assert_eq!(status.latest_status.as_deref(), Some("passed"));
+        assert!(status
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.status.recent_fresh_evidence"));
+    }
+
+    #[test]
+    fn verification_status_for_cli_prioritizes_stale_requirements() {
+        let requirement = VerificationRequirement::new(
+            "req-stale",
+            root_ref("root-a"),
+            VerificationKind::Test,
+            vec!["src/lib.rs".to_owned()],
+            2_000,
+            "verification.required_after_patch",
+        );
+        let state = build_verification_state(
+            requirement,
+            &[event(
+                "event-old",
+                VerificationStatus::Passed,
+                VerificationScope::Workspace,
+                vec![],
+                1_000,
+            )],
+            2_100,
+        );
+        let projection = verification_state_stale_projection("session-1", "run-1", state);
+
+        let status = verification_status_for_cli_and_console(true, 12, 5, &[projection]);
+
+        assert_eq!(status.decision, VerificationDiagnosticsDecision::Stale);
+        assert_eq!(status.stale_requirements, 1);
+        assert_eq!(status.latest_status.as_deref(), Some("stale"));
+        assert!(status
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.status.recent_stale_requirement"));
+    }
+
+    #[test]
+    fn verification_status_for_cli_marks_failed_latest_verification_event() {
+        let projection = verification_event_recorded_projection(event(
+            "event-2",
+            VerificationStatus::Failed,
+            VerificationScope::Workspace,
+            vec![],
+            1_000,
+        ));
+
+        let status = verification_status_for_cli_and_console(true, 12, 5, &[projection]);
+
+        assert_eq!(status.decision, VerificationDiagnosticsDecision::Failed);
+        assert_eq!(status.failed_events, 1);
+        assert_eq!(status.latest_status.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn verification_status_for_cli_distinguishes_disabled_and_no_evidence() {
+        let disabled = verification_status_for_cli_and_console(false, 12, 5, &[]);
+        let no_evidence = verification_status_for_cli_and_console(true, 12, 5, &[]);
+
+        assert_eq!(disabled.decision, VerificationDiagnosticsDecision::Disabled);
+        assert_eq!(no_evidence.decision, VerificationDiagnosticsDecision::NoEvidence);
+        assert_eq!(no_evidence.verification_projection_events, 0);
+        assert_eq!(no_evidence.redaction_level, VERIFICATION_REDACTION_LEVEL);
     }
 
     #[test]

@@ -180,6 +180,7 @@ pub(crate) async fn console_diagnostics_handler(
     )
     .await?;
     let context_engine_payload = collect_console_context_engine_diagnostics(&state);
+    let verification_payload = collect_console_verification_status(&state).await;
     let tool_jobs = state
         .runtime
         .list_tool_jobs(crate::journal::ToolJobsListFilter {
@@ -302,6 +303,7 @@ pub(crate) async fn console_diagnostics_handler(
         "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state),
         "runtime_roadmap": collect_console_runtime_roadmap_diagnostics(),
         "context_engine": context_engine_payload,
+        "verification": verification_payload,
         "runtime_controls": runtime_controls_payload,
         "deployment": deployment_payload,
         "execution_backends": execution_backends_payload,
@@ -708,6 +710,78 @@ fn collect_console_execution_backend_diagnostics(state: &AppState) -> Result<Val
     )
     .map_err(|error| {
         tonic::Status::internal(format!("failed to serialize execution backends: {error}"))
+    })
+}
+
+async fn collect_console_verification_status(state: &AppState) -> Value {
+    let snapshot = match state.runtime.recent_journal_snapshot(256).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return json!({
+                "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+                "decision": "unknown",
+                "rollout_enabled": state.runtime.config.feature_rollouts.verification_runtime.enabled,
+                "journal_total_events": Value::Null,
+                "journal_window_events": 0,
+                "verification_projection_events": 0,
+                "reason_codes": [
+                    crate::application::verification::VERIFICATION_STATUS_JOURNAL_UNAVAILABLE
+                ],
+                "error": sanitize_http_error_message(
+                    format!("failed to query verification journal diagnostics: {error}").as_str()
+                ),
+                "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
+            });
+        }
+    };
+
+    let mut projections = Vec::new();
+    for event in snapshot.events.iter() {
+        let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+            continue;
+        };
+        let Some(event_type) = payload.get("event_type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(
+            event_type,
+            crate::application::verification::VERIFICATION_COMMAND_CLASSIFIED
+                | crate::application::verification::VERIFICATION_EVENT_RECORDED
+                | crate::application::verification::VERIFICATION_STATE_STALE
+                | crate::application::verification::VERIFICATION_FRESHNESS_CHECKED
+        ) {
+            continue;
+        }
+        if let Ok(projection) = serde_json::from_value::<
+            crate::application::verification::VerificationJournalProjection,
+        >(payload)
+        {
+            projections.push(projection);
+        }
+    }
+
+    serde_json::to_value(crate::application::verification::verification_status_for_cli_and_console(
+        state.runtime.config.feature_rollouts.verification_runtime.enabled,
+        snapshot.total_events,
+        u64::try_from(snapshot.events.len()).unwrap_or(u64::MAX),
+        projections.as_slice(),
+    ))
+    .unwrap_or_else(|error| {
+        json!({
+            "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+            "decision": "unknown",
+            "rollout_enabled": state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            "journal_total_events": snapshot.total_events,
+            "journal_window_events": snapshot.events.len(),
+            "verification_projection_events": projections.len(),
+            "reason_codes": [
+                crate::application::verification::VERIFICATION_STATUS_JOURNAL_UNAVAILABLE
+            ],
+            "error": sanitize_http_error_message(
+                format!("failed to serialize verification diagnostics: {error}").as_str()
+            ),
+            "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
+        })
     })
 }
 

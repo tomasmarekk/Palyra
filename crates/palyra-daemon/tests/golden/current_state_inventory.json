@@ -36,6 +36,7 @@
     "runtime_roadmap",
     "runtime_watchdog",
     "skills",
+    "verification",
     "webhooks"
   ],
   "capabilities": [
