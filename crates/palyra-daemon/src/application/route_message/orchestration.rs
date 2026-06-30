@@ -330,9 +330,7 @@ pub(crate) async fn handle_routed_route_message(
         is_command: input_is_command,
         urgent_stop: input_urgent_stop,
     };
-    let deferred_coalescing_enabled =
-        runtime_state.config.feature_rollouts.channel_turn_kernel.enabled
-            && runtime_state.inbound_coalescer.policy().active();
+    let deferred_coalescing_enabled = runtime_state.inbound_coalescer.policy().active();
     let coalescing_decision = if deferred_coalescing_enabled {
         runtime_state.inbound_coalescer.submit_deferred(coalescing_request)
     } else {

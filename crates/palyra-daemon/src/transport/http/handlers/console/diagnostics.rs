@@ -1071,6 +1071,9 @@ fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
             "source": feature_rollouts.channel_turn_kernel.source,
             "config_path": CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH,
             "env_var": CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
+            "production_path_enabled": true,
+            "rollout_gate_effective": false,
+            "ambient_context_rollout": "context_engine",
         },
         "agent_plan_state": {
             "enabled": feature_rollouts.agent_plan_state.enabled,

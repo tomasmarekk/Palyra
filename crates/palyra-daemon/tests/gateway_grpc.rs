@@ -1970,10 +1970,9 @@ async fn grpc_route_message_bot_loop_guard_drops_without_provider_call() -> Resu
         ),
     ])?;
     let (child, admin_port, grpc_port, journal_db_path, config_path) =
-        spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
+        spawn_palyrad_with_openai_provider_and_channel_router(
             openai_base_url.as_str(),
             OPENAI_API_KEY,
-            &[("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true")],
         )?;
     let _config_guard = TempFileGuard::new(config_path);
     let mut daemon = ChildGuard::new(child);
@@ -12425,10 +12424,7 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_context_rollouts(
     spawn_palyrad_with_openai_provider_and_channel_router_with_extra_env(
         openai_base_url,
         openai_api_key,
-        &[
-            ("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true"),
-            ("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true"),
-        ],
+        &[("PALYRA_EXPERIMENTAL_CONTEXT_ENGINE", "true")],
     )
 }
 
@@ -12542,7 +12538,6 @@ fn spawn_palyrad_with_openai_provider_and_channel_router_with_inbound_coalescing
         .env("PALYRA_GATEWAY_IDENTITY_STORE_DIR", identity_store_dir.to_string_lossy().to_string())
         .env("PALYRA_VAULT_DIR", vault_dir.to_string_lossy().to_string())
         .env("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED", "true")
-        .env("PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL", "true")
         .env("PALYRA_MODEL_PROVIDER_KIND", "openai_compatible")
         .env("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL", openai_base_url)
         .env("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL", "true")

@@ -228,7 +228,7 @@ impl BotPairKey {
     }
 }
 
-/// Conservative bot-loop guard policy for the first channel-turn rollout.
+/// Conservative bot-loop guard policy for the production channel-turn path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChannelBotLoopGuardConfig {
     pub(crate) threshold: u32,

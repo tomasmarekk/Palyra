@@ -188,7 +188,7 @@ fn channel_turn_ambient_context_enabled(
     router_outcome: ChannelTurnRouterOutcomeKind,
     router_reason: Option<&str>,
 ) -> bool {
-    state.config.feature_rollouts.channel_turn_kernel.enabled
+    state.config.feature_rollouts.context_engine.enabled
         && router_outcome == ChannelTurnRouterOutcomeKind::Rejected
         && router_reason == Some("no_matching_mention_or_dm_policy")
         && !input.is_direct_message
@@ -204,9 +204,6 @@ fn channel_bot_loop_decision(
     actor_gateway_principal: &str,
     actor_gateway_device_id: &str,
 ) -> BotLoopDecision {
-    if !state.config.feature_rollouts.channel_turn_kernel.enabled {
-        return BotLoopDecision::bypassed("channel.bot_loop.bypassed.rollout_disabled");
-    }
     if !matches!(command_parse_outcome, ChannelCommandParseOutcome::NotCommand) {
         return BotLoopDecision::bypassed("channel.bot_loop.bypassed.channel_command");
     }

@@ -1862,9 +1862,6 @@ fn build_ambient_observe_only_channel_segment(
     runtime_state: &GatewayRuntimeState,
     channel_turn_envelope: Option<&ChannelTurnEnvelope>,
 ) -> Option<ContextSegment> {
-    if !runtime_state.config.feature_rollouts.channel_turn_kernel.enabled {
-        return None;
-    }
     let envelope = channel_turn_envelope?;
     let ambient_context = runtime_state
         .channel_turn_history
