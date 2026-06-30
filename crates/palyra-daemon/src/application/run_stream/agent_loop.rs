@@ -40,6 +40,8 @@ const RUN_PROGRESS_MAX_PRODUCED_FILES: usize = 16;
 const RUN_PROGRESS_MAX_MISSING_ARTIFACTS: usize = 12;
 const RUN_PROGRESS_MAX_ACTIVE_PROCESSES: usize = 8;
 const RUN_PROGRESS_MAX_FAILED_ATTEMPTS: usize = 8;
+const FINAL_ANSWER_CONTRACT_SCHEMA_VERSION: u32 = 1;
+const FINAL_ANSWER_CONTRACT_REDACTION_LEVEL: &str = "metadata_only";
 
 /// Tape event emitted when a repeated tool signature first crosses the soft guardrail.
 pub(crate) const TOOL_LOOP_WARNING_EVENT: &str = "tool.loop.warning";
@@ -47,6 +49,15 @@ pub(crate) const TOOL_LOOP_WARNING_EVENT: &str = "tool.loop.warning";
 pub(crate) const TOOL_LOOP_GUIDANCE_INJECTED_EVENT: &str = "tool.loop.guidance_injected";
 /// Tape event emitted when a repeated denied tool loop is stopped.
 pub(crate) const TOOL_LOOP_BLOCKED_EVENT: &str = "tool.loop.blocked";
+/// Audit event projected when a final answer contract begins evaluation.
+pub(crate) const FINAL_ANSWER_CONTRACT_STARTED_EVENT: &str =
+    "final_answer_contract_a_evidence_summary.started";
+/// Audit event projected when the terminal answer satisfies the final answer contract.
+pub(crate) const FINAL_ANSWER_CONTRACT_COMPLETED_EVENT: &str =
+    "final_answer_contract_a_evidence_summary.completed";
+/// Audit event projected when the terminal answer is failed or requires continuation.
+pub(crate) const FINAL_ANSWER_CONTRACT_FAILED_EVENT: &str =
+    "final_answer_contract_a_evidence_summary.failed";
 
 /// Observable class of one tool attempt for repeated-no-progress detection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -411,8 +422,78 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) usage: AgentLoopUsageSnapshot,
     pub(crate) tool_count: u32,
     pub(crate) artifact_refs: Vec<String>,
+    pub(crate) final_answer_contract: FinalAnswerContract,
+    pub(crate) evidence_summary: FinalAnswerEvidenceSummary,
     pub(crate) progress_checkpoint: Option<RunProgressCheckpoint>,
     pub(crate) provider_trace_ref: Option<String>,
+}
+
+/// Terminal decision for the final answer contract.
+///
+/// The contract is observe-only in this milestone: it gives objective
+/// finalization and replay consumers a stable judgment without changing the
+/// run state machine or bypassing existing policy/tool gates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalAnswerDecision {
+    Accepted,
+    NeedsContinuation,
+    Rejected,
+}
+
+/// Evidence coverage derived from recorded tool/message state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FinalAnswerEvidenceCoverage {
+    NotRequired,
+    Satisfied,
+    GapsDetected,
+    NoToolEvidence,
+}
+
+/// Tape projection for the terminal final answer contract event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalAnswerJournalProjection {
+    pub(crate) schema_version: u32,
+    pub(crate) event_type: String,
+    pub(crate) source_event_refs: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Final answer contract embedded in `agent_loop.terminated`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalAnswerContract {
+    pub(crate) schema_version: u32,
+    pub(crate) decision: FinalAnswerDecision,
+    pub(crate) reason_code: String,
+    pub(crate) final_answer_required: bool,
+    pub(crate) evidence_summary_required: bool,
+    pub(crate) tool_evidence_required_for_tool_claims: bool,
+    pub(crate) enforcement_mode: String,
+    pub(crate) journal_projection: FinalAnswerJournalProjection,
+    pub(crate) event_types: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Bounded evidence summary attached to the final answer contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalAnswerEvidenceSummary {
+    pub(crate) schema_version: u32,
+    pub(crate) run_id: String,
+    pub(crate) decision: FinalAnswerDecision,
+    pub(crate) coverage: FinalAnswerEvidenceCoverage,
+    pub(crate) reason_code: String,
+    pub(crate) tool_count: u32,
+    pub(crate) produced_files_count: usize,
+    pub(crate) missing_artifacts_count: usize,
+    pub(crate) active_process_count: usize,
+    pub(crate) known_failed_attempt_count: usize,
+    pub(crate) last_successful_tool: Option<String>,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) redaction_level: String,
 }
 
 /// Structured continuation state inferred from already-recorded tool evidence.
@@ -625,8 +706,16 @@ impl AgentRunLoopState {
         provider_trace_ref: Option<String>,
     ) -> AgentLoopFinalizationEnvelope {
         let outcome = self.finalization_outcome(reason);
-        let progress_checkpoint =
-            outcome.continuation_required.then(|| self.progress_checkpoint(run_id, reason));
+        let evidence_checkpoint = self.progress_checkpoint(run_id, reason);
+        let final_answer_contract = final_answer_contract(run_id, outcome, reason);
+        let evidence_summary = final_answer_evidence_summary(
+            run_id,
+            outcome,
+            reason,
+            self.completed_tool_calls,
+            &evidence_checkpoint,
+        );
+        let progress_checkpoint = outcome.continuation_required.then_some(evidence_checkpoint);
         AgentLoopFinalizationEnvelope {
             schema_version: 1,
             termination_reason: reason,
@@ -639,6 +728,8 @@ impl AgentRunLoopState {
             usage: self.usage.clone(),
             tool_count: self.completed_tool_calls,
             artifact_refs: Vec::new(),
+            final_answer_contract,
+            evidence_summary,
             progress_checkpoint,
             provider_trace_ref,
         }
@@ -749,6 +840,139 @@ impl AgentRunLoopState {
     fn elapsed(&self) -> Duration {
         Instant::now().saturating_duration_since(self.started_at)
     }
+}
+
+fn final_answer_contract(
+    run_id: &str,
+    outcome: AgentLoopFinalizationOutcome,
+    reason: AgentLoopTerminationReason,
+) -> FinalAnswerContract {
+    let decision = final_answer_decision(outcome);
+    FinalAnswerContract {
+        schema_version: FINAL_ANSWER_CONTRACT_SCHEMA_VERSION,
+        decision,
+        reason_code: reason.as_str().to_owned(),
+        final_answer_required: true,
+        evidence_summary_required: true,
+        tool_evidence_required_for_tool_claims: true,
+        enforcement_mode: "observe_only".to_owned(),
+        journal_projection: FinalAnswerJournalProjection {
+            schema_version: FINAL_ANSWER_CONTRACT_SCHEMA_VERSION,
+            event_type: final_answer_event_type(decision).to_owned(),
+            source_event_refs: vec![format!("tape:{run_id}:agent_loop.terminated")],
+            redaction_level: FINAL_ANSWER_CONTRACT_REDACTION_LEVEL.to_owned(),
+        },
+        event_types: final_answer_event_types(),
+        redaction_level: FINAL_ANSWER_CONTRACT_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn final_answer_evidence_summary(
+    run_id: &str,
+    outcome: AgentLoopFinalizationOutcome,
+    reason: AgentLoopTerminationReason,
+    tool_count: u32,
+    checkpoint: &RunProgressCheckpoint,
+) -> FinalAnswerEvidenceSummary {
+    let decision = final_answer_decision(outcome);
+    FinalAnswerEvidenceSummary {
+        schema_version: FINAL_ANSWER_CONTRACT_SCHEMA_VERSION,
+        run_id: run_id.to_owned(),
+        decision,
+        coverage: final_answer_evidence_coverage(decision, tool_count, checkpoint),
+        reason_code: reason.as_str().to_owned(),
+        tool_count,
+        produced_files_count: checkpoint.produced_files.len(),
+        missing_artifacts_count: checkpoint.missing_artifacts.len(),
+        active_process_count: checkpoint.active_processes.len(),
+        known_failed_attempt_count: checkpoint.known_failed_attempts.len(),
+        last_successful_tool: checkpoint
+            .last_successful_tool
+            .as_ref()
+            .map(|tool| checkpoint_text_id(tool.tool_name.as_str())),
+        evidence_refs: final_answer_evidence_refs(run_id, tool_count, checkpoint),
+        redaction_level: FINAL_ANSWER_CONTRACT_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn final_answer_decision(outcome: AgentLoopFinalizationOutcome) -> FinalAnswerDecision {
+    if outcome.status == "completed" {
+        FinalAnswerDecision::Accepted
+    } else if outcome.continuation_required {
+        FinalAnswerDecision::NeedsContinuation
+    } else {
+        FinalAnswerDecision::Rejected
+    }
+}
+
+fn final_answer_evidence_coverage(
+    decision: FinalAnswerDecision,
+    tool_count: u32,
+    checkpoint: &RunProgressCheckpoint,
+) -> FinalAnswerEvidenceCoverage {
+    if tool_count == 0 {
+        return if decision == FinalAnswerDecision::Accepted {
+            FinalAnswerEvidenceCoverage::NotRequired
+        } else {
+            FinalAnswerEvidenceCoverage::NoToolEvidence
+        };
+    }
+    if !checkpoint.missing_artifacts.is_empty() || !checkpoint.active_processes.is_empty() {
+        FinalAnswerEvidenceCoverage::GapsDetected
+    } else {
+        FinalAnswerEvidenceCoverage::Satisfied
+    }
+}
+
+fn final_answer_event_type(decision: FinalAnswerDecision) -> &'static str {
+    match decision {
+        FinalAnswerDecision::Accepted => FINAL_ANSWER_CONTRACT_COMPLETED_EVENT,
+        FinalAnswerDecision::NeedsContinuation | FinalAnswerDecision::Rejected => {
+            FINAL_ANSWER_CONTRACT_FAILED_EVENT
+        }
+    }
+}
+
+fn final_answer_event_types() -> Vec<String> {
+    [
+        FINAL_ANSWER_CONTRACT_STARTED_EVENT,
+        FINAL_ANSWER_CONTRACT_COMPLETED_EVENT,
+        FINAL_ANSWER_CONTRACT_FAILED_EVENT,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn final_answer_evidence_refs(
+    run_id: &str,
+    tool_count: u32,
+    checkpoint: &RunProgressCheckpoint,
+) -> Vec<String> {
+    let mut refs = BTreeSet::<String>::new();
+    refs.insert(format!("tape:{run_id}:agent_loop.terminated"));
+    if tool_count > 0 {
+        refs.insert(format!("tape:{run_id}:tool_results"));
+    }
+    if let Some(tool) = checkpoint.last_successful_tool.as_ref() {
+        refs.insert(format!("tool:{}", checkpoint_text_id(tool.tool_name.as_str())));
+        for artifact_ref in &tool.artifact_refs {
+            refs.insert(format!("artifact:{}", checkpoint_text_id(artifact_ref.as_str())));
+        }
+    }
+    for file in &checkpoint.produced_files {
+        refs.insert(format!("file:{}", checkpoint_path(file.path.as_str())));
+    }
+    for artifact in &checkpoint.missing_artifacts {
+        refs.insert(format!("missing_artifact:{}", checkpoint_path(artifact.path.as_str())));
+    }
+    for process in &checkpoint.active_processes {
+        refs.insert(format!("process:{}", process.pid));
+    }
+    for index in 0..checkpoint.known_failed_attempts.len() {
+        refs.insert(format!("tool_failure:{}", index + 1));
+    }
+    refs.into_iter().take(32).collect()
 }
 
 impl RunProgressCheckpoint {
@@ -1643,6 +1867,40 @@ mod tests {
         }
     }
 
+    fn append_successful_workspace_patch(state: &mut AgentRunLoopState, proposal_id: &str) {
+        state.append_assistant_turn(&ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![crate::model_provider::ProviderOutputContentPart::ToolCall {
+                proposal_id: proposal_id.to_owned(),
+                tool_name: WORKSPACE_PATCH_TOOL_NAME.to_owned(),
+                input_json: serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Add File: extract.js\n+console.log(1)\n*** End Patch"
+                }),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        });
+        state.append_tool_result_messages(vec![ProviderMessage::tool_result(
+            proposal_id,
+            serde_json::json!({
+                "patch_sha256": "abc",
+                "dry_run": false,
+                "files_touched": [{
+                    "path": "extract.js",
+                    "workspace_root_index": 0,
+                    "operation": "create",
+                    "after_sha256": "sha",
+                    "after_size_bytes": 42
+                }],
+                "rollback_performed": false,
+                "redacted_preview": ""
+            })
+            .to_string(),
+        )]);
+    }
+
     #[test]
     fn run_progress_controller_intervenes_after_repeated_failure() {
         let mut controller = RunProgressController::new(3);
@@ -1818,6 +2076,68 @@ mod tests {
         assert_eq!(parsed["finalization"]["partial"], true);
         assert_eq!(parsed["finalization"]["continuation_required"], true);
         assert_eq!(parsed["finalization"]["tool_count"], 1);
+    }
+
+    #[test]
+    fn final_answer_contract_serializes_completed_evidence_summary() {
+        let mut state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Create extract.js.".to_owned())],
+            2,
+            4,
+            10_000,
+        );
+        append_successful_workspace_patch(&mut state, "call-patch");
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::FinalAnswer,
+            "Created extract.js.",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+        let finalization = parsed["finalization"].clone();
+        let envelope: AgentLoopFinalizationEnvelope =
+            serde_json::from_value(finalization.clone()).expect("finalization should round-trip");
+
+        assert_eq!(finalization["final_answer_contract"]["decision"], "accepted");
+        assert_eq!(
+            finalization["final_answer_contract"]["journal_projection"]["event_type"],
+            FINAL_ANSWER_CONTRACT_COMPLETED_EVENT
+        );
+        assert_eq!(finalization["final_answer_contract"]["enforcement_mode"], "observe_only");
+        assert_eq!(finalization["evidence_summary"]["coverage"], "satisfied");
+        assert_eq!(finalization["evidence_summary"]["produced_files_count"], 1);
+        assert!(finalization["evidence_summary"]["evidence_refs"]
+            .as_array()
+            .expect("evidence refs should be an array")
+            .iter()
+            .any(|value| value == "file:extract.js"));
+        assert_eq!(envelope.final_answer_contract.decision, FinalAnswerDecision::Accepted);
+        assert_eq!(envelope.evidence_summary.coverage, FinalAnswerEvidenceCoverage::Satisfied);
+    }
+
+    #[test]
+    fn final_answer_contract_rejects_incomplete_answer_without_tool_evidence() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "model returned no usable answer before any tool evidence",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["finalization"]["status"], "failed");
+        assert_eq!(parsed["finalization"]["final_answer_contract"]["decision"], "rejected");
+        assert_eq!(
+            parsed["finalization"]["final_answer_contract"]["journal_projection"]["event_type"],
+            FINAL_ANSWER_CONTRACT_FAILED_EVENT
+        );
+        assert_eq!(parsed["finalization"]["evidence_summary"]["coverage"], "no_tool_evidence");
+        assert_eq!(parsed["finalization"]["evidence_summary"]["tool_count"], 0);
     }
 
     #[test]
