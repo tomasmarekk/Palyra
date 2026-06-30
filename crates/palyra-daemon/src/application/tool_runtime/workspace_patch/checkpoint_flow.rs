@@ -10,7 +10,11 @@
 //! Journal event names and output JSON keys are pinned by tests and
 //! fixtures; keep them byte-identical.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use palyra_common::workspace_patch::{
     apply_workspace_patch, apply_workspace_patch_with_canonical_root_constraints,
@@ -19,19 +23,28 @@ use palyra_common::workspace_patch::{
     WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
 };
 use serde_json::{json, Value};
-use tracing::error;
+use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::{
+    application::project_facts::{
+        append_project_facts_output, project_facts_journal_projection, workspace_root_ref,
+        ProjectFactsCaptureRequest, ProjectFactsDecision, ProjectFactsJournalProjection,
+        ProjectFactsService, ProjectFactsSnapshot, PROJECT_FACTS_COMPLETED_EVENT,
+        PROJECT_FACTS_FAILED_EVENT, PROJECT_FACTS_STARTED_EVENT,
+    },
     application::tool_runtime::code_intel,
     application::workspace_observability::{
         capture_workspace_patch_checkpoint, compare_workspace_anchors, WorkspaceCompareAnchor,
         WorkspacePatchCheckpointCapture, WorkspacePatchCheckpointStage,
     },
-    gateway::{record_agent_journal_event, GatewayRuntimeState},
-    journal::{WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord},
+    gateway::{current_unix_ms, record_agent_journal_event, GatewayRuntimeState},
+    journal::{
+        JournalAppendRequest, WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
+    },
     tool_protocol::ToolExecutionOutcome,
     transport::grpc::auth::RequestContext,
+    transport::grpc::proto::palyra::common::v1 as common_v1,
 };
 
 use super::{workspace_patch_error_outcome, workspace_patch_tool_execution_outcome};
@@ -309,7 +322,153 @@ pub(super) async fn execute_workspace_patch_mutation(
         &diagnostic_after,
     );
     code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta);
+    if let Some(project_facts) = capture_project_facts_for_coding_posture(
+        runtime_state,
+        ProjectFactsPatchCapture {
+            principal,
+            device_id,
+            channel,
+            session_id,
+            run_id,
+            workspace_roots,
+            files_touched: outcome.files_touched.as_slice(),
+        },
+    )
+    .await
+    {
+        append_project_facts_output(&mut output_value, project_facts);
+    }
     serialize_workspace_patch_success_value(proposal_id, input_json, output_value)
+}
+
+struct ProjectFactsPatchCapture<'a> {
+    principal: &'a str,
+    device_id: &'a str,
+    channel: Option<&'a str>,
+    session_id: &'a str,
+    run_id: &'a str,
+    workspace_roots: &'a [PathBuf],
+    files_touched: &'a [WorkspacePatchFileAttestation],
+}
+
+async fn capture_project_facts_for_coding_posture(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request: ProjectFactsPatchCapture<'_>,
+) -> Option<ProjectFactsSnapshot> {
+    if !runtime_state.config.feature_rollouts.verification_runtime.enabled {
+        return None;
+    }
+    let (workspace_root_index, workspace_root) =
+        select_project_facts_workspace_root(request.workspace_roots, request.files_touched)?;
+    let started_at_unix_ms = current_unix_ms();
+    let root_ref =
+        workspace_root_ref(workspace_root_index, workspace_root, workspace_root.exists());
+    let started_projection = project_facts_journal_projection(
+        PROJECT_FACTS_STARTED_EVENT,
+        request.session_id,
+        request.run_id,
+        None,
+        root_ref.clone(),
+        started_at_unix_ms,
+        None,
+    );
+    record_project_facts_journal_projection(
+        runtime_state,
+        request.principal,
+        request.device_id,
+        request.channel,
+        started_projection,
+    )
+    .await;
+
+    let snapshot = ProjectFactsService::capture(ProjectFactsCaptureRequest {
+        workspace_root_index,
+        workspace_root,
+        files_touched: request.files_touched,
+        generated_at_unix_ms: current_unix_ms(),
+        rollout_enabled: true,
+    });
+    let event_type = if snapshot.decision == ProjectFactsDecision::Failed {
+        PROJECT_FACTS_FAILED_EVENT
+    } else {
+        PROJECT_FACTS_COMPLETED_EVENT
+    };
+    let projection = project_facts_journal_projection(
+        event_type,
+        request.session_id,
+        request.run_id,
+        Some(snapshot.clone()),
+        snapshot.workspace_root.clone(),
+        current_unix_ms(),
+        None,
+    );
+    record_project_facts_journal_projection(
+        runtime_state,
+        request.principal,
+        request.device_id,
+        request.channel,
+        projection,
+    )
+    .await;
+    Some(snapshot)
+}
+
+async fn record_project_facts_journal_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    projection: ProjectFactsJournalProjection,
+) {
+    let payload_json = match serde_json::to_string(&projection) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(
+                event_type = %projection.event_type,
+                error = %error,
+                "failed to serialize project facts journal projection"
+            );
+            return;
+        }
+    };
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: projection.session_id,
+            run_id: projection.run_id,
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: projection.created_at_unix_ms,
+            payload_json: payload_json.into_bytes(),
+            principal: principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            event_type = %projection.event_type,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "project facts journal write failed"
+        );
+    }
+}
+
+fn select_project_facts_workspace_root<'a>(
+    workspace_roots: &'a [PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+) -> Option<(usize, &'a Path)> {
+    if workspace_roots.is_empty() {
+        return None;
+    }
+    let root_index = files_touched
+        .iter()
+        .find_map(|file| {
+            (file.workspace_root_index < workspace_roots.len()).then_some(file.workspace_root_index)
+        })
+        .unwrap_or(0);
+    workspace_roots.get(root_index).map(|root| (root_index, root.as_path()))
 }
 
 /// Dispatches to the constrained engine entry point when canonical
@@ -747,13 +906,26 @@ fn workspace_patch_preflight_failure_outcome(
 
 #[cfg(test)]
 mod tests {
-    use super::{assess_workspace_mutation_risk, WorkspaceMutationRiskLevel};
+    use std::path::PathBuf;
+
+    use super::{
+        assess_workspace_mutation_risk, select_project_facts_workspace_root,
+        WorkspaceMutationRiskLevel,
+    };
     use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
 
     fn attestation(path: &str, operation: &str) -> WorkspacePatchFileAttestation {
+        attestation_for_root(path, operation, 0)
+    }
+
+    fn attestation_for_root(
+        path: &str,
+        operation: &str,
+        workspace_root_index: usize,
+    ) -> WorkspacePatchFileAttestation {
         WorkspacePatchFileAttestation {
             path: path.to_owned(),
-            workspace_root_index: 0,
+            workspace_root_index,
             operation: operation.to_owned(),
             moved_from: None,
             before_sha256: None,
@@ -788,5 +960,17 @@ mod tests {
 
         assert_eq!(risk.level, WorkspaceMutationRiskLevel::High);
         assert!(risk.fail_closed_without_preflight);
+    }
+
+    #[test]
+    fn project_facts_capture_uses_touched_workspace_root_index() {
+        let roots = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let files = vec![attestation_for_root("src/lib.rs", "update", 1)];
+
+        let selected = select_project_facts_workspace_root(roots.as_slice(), files.as_slice())
+            .expect("workspace root should be selected");
+
+        assert_eq!(selected.0, 1);
+        assert_eq!(selected.1, roots[1].as_path());
     }
 }

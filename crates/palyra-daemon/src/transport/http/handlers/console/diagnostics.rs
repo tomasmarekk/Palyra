@@ -2534,6 +2534,17 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
             "mode": state.runtime.config.flow_orchestration.mode.as_str(),
             "rollout_enabled": state.runtime.config.feature_rollouts.flow_orchestration.enabled,
         },
+        "project_facts": {
+            "rollout_enabled": state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            "rollout_source": state.runtime.config.feature_rollouts.verification_runtime.source,
+            "journal_events": [
+                crate::application::project_facts::PROJECT_FACTS_STARTED_EVENT,
+                crate::application::project_facts::PROJECT_FACTS_COMPLETED_EVENT,
+                crate::application::project_facts::PROJECT_FACTS_FAILED_EVENT,
+            ],
+            "tool_output_source": "palyra.fs.apply_patch.coding_posture.project_facts",
+            "redaction_level": crate::application::project_facts::PROJECT_FACTS_REDACTION_LEVEL,
+        },
         "replay_bundle_metadata": build_replay_support_observability(),
         "worker_diagnostics": networked_workers,
     })

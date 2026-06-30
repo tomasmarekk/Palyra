@@ -24,6 +24,7 @@ pub mod outbound_lifecycle;
 pub mod plan_state;
 pub mod project_context;
 pub mod project_context_summary;
+pub mod project_facts;
 pub mod provider_events;
 pub mod provider_input;
 pub mod recall;
