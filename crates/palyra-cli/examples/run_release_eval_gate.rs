@@ -6,14 +6,18 @@ use std::{
 use anyhow::{Context, Result};
 use palyra_common::{
     release_evals::{
-        ensure_release_eval_report_passed, evaluate_release_eval_manifest,
-        parse_release_eval_manifest, release_eval_replay_bundle_filename,
+        build_palyra_trajectory_export, build_regression_eval_pack_index,
+        build_release_eval_maturity_scorecard, ensure_release_eval_report_passed,
+        evaluate_release_eval_manifest, parse_release_eval_manifest,
+        release_eval_replay_bundle_filename,
     },
     replay_bundle::canonical_replay_bundle_bytes,
 };
+use serde::Serialize;
 
 const DEFAULT_MANIFEST_PATH: &str = "fixtures/golden/release_eval_inventory.json";
 const DEFAULT_REPORT_DIR: &str = "target/release-artifacts/release-evals";
+const GENERATED_ARTIFACT_TIMESTAMP_MS: i64 = 0;
 
 fn main() -> Result<()> {
     let options = RunnerOptions::parse()?;
@@ -33,11 +37,22 @@ fn main() -> Result<()> {
     let output = evaluate_release_eval_manifest(&manifest);
 
     let report_path = report_dir.join("report.json");
-    fs::write(
-        report_path.as_path(),
-        serde_json::to_vec_pretty(&output.report).context("failed to encode eval report")?,
-    )
-    .with_context(|| format!("failed to write {}", report_path.display()))?;
+    write_json_artifact(report_path.as_path(), &output.report)?;
+
+    let maturity_scorecard =
+        build_release_eval_maturity_scorecard(&output.report, GENERATED_ARTIFACT_TIMESTAMP_MS);
+    let maturity_scorecard_path = report_dir.join("maturity-scorecard.json");
+    write_json_artifact(maturity_scorecard_path.as_path(), &maturity_scorecard)?;
+
+    let trajectory_export =
+        build_palyra_trajectory_export(&output, GENERATED_ARTIFACT_TIMESTAMP_MS);
+    let trajectory_export_path = report_dir.join("trajectory-export.json");
+    write_json_artifact(trajectory_export_path.as_path(), &trajectory_export)?;
+
+    let regression_packs =
+        build_regression_eval_pack_index(&output, GENERATED_ARTIFACT_TIMESTAMP_MS);
+    let regression_packs_path = report_dir.join("regression-packs.json");
+    write_json_artifact(regression_packs_path.as_path(), &regression_packs)?;
 
     for generated in &output.replay_bundles {
         let bundle_filename = release_eval_replay_bundle_filename(generated.case_id.as_str())
@@ -55,6 +70,9 @@ fn main() -> Result<()> {
 
     println!("release_eval_manifest={}", relative_display_path(&repo_root, &manifest_path));
     println!("release_eval_report={}", report_path.display());
+    println!("release_eval_maturity_scorecard={}", maturity_scorecard_path.display());
+    println!("release_eval_trajectory_export={}", trajectory_export_path.display());
+    println!("release_eval_regression_packs={}", regression_packs_path.display());
     println!("release_eval_replay_bundles={}", output.replay_bundles.len());
     println!("release_eval_status={:?}", output.report.status);
 
@@ -126,6 +144,14 @@ fn recreate_directory(path: &Path) -> Result<()> {
     }
     fs::create_dir_all(path)
         .with_context(|| format!("failed to create report directory {}", path.display()))
+}
+
+fn write_json_artifact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).context("failed to encode release eval artifact")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn ensure_report_dir_under_release_artifacts(repo_root: &Path, report_dir: &Path) -> Result<()> {
