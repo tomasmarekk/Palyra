@@ -21,6 +21,7 @@
     "feature_rollouts",
     "flows",
     "generated_at_unix_ms",
+    "heartbeat_delivery",
     "hooks",
     "learning",
     "media",

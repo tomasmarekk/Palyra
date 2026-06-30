@@ -57,6 +57,15 @@ pub const ROUTINE_TEMPLATE_PACK_VERSION: u32 = 1;
 /// An active run whose record has not been updated for this long is treated as lease-expired
 /// and becomes eligible for repair (see [`routine_run_lifecycle_snapshot`]).
 pub const ROUTINE_RUN_LEASE_TTL_MS: i64 = 15 * 60 * 1_000;
+pub const HEARTBEAT_DELIVERY_SCHEMA_VERSION: u64 = 1;
+pub const HEARTBEAT_DELIVERY_EVENT_STARTED: &str =
+    "heartbeat_delivery_pres_routines_cron_a_objectives.started";
+pub const HEARTBEAT_DELIVERY_EVENT_COMPLETED: &str =
+    "heartbeat_delivery_pres_routines_cron_a_objectives.completed";
+pub const HEARTBEAT_DELIVERY_EVENT_FAILED: &str =
+    "heartbeat_delivery_pres_routines_cron_a_objectives.failed";
+pub const HEARTBEAT_DELIVERY_ROLLOUT_OBSERVE_ONLY: &str = "observe_only_read_model";
+pub const HEARTBEAT_DELIVERY_REDACTION_LEVEL: &str = "metadata_only";
 /// Poll interval applied when a file-watch trigger payload omits `poll_interval_ms`.
 pub const DEFAULT_FILE_WATCH_POLL_INTERVAL_MS: u64 = 30 * 1_000;
 /// Lower bound for file-watch polling; faster polling is rejected at validation time.
@@ -319,6 +328,69 @@ pub struct RoutineRunLifecycleSnapshot {
     pub terminal: bool,
     pub delivery_ready: bool,
     pub recovery_hint: String,
+}
+
+/// Decision projected from routine heartbeats, cron leases, and objective posture.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatDeliveryDecision {
+    Deliverable,
+    AwaitHeartbeat,
+    RepairLease,
+    Blocked,
+    Suppressed,
+}
+
+/// Stable reason code for heartbeat delivery projections.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HeartbeatDeliveryReasonCode {
+    #[serde(rename = "heartbeat_delivery.delivery_ready")]
+    DeliveryReady,
+    #[serde(rename = "heartbeat_delivery.active_lease")]
+    ActiveLease,
+    #[serde(rename = "heartbeat_delivery.expired_lease")]
+    ExpiredLease,
+    #[serde(rename = "heartbeat_delivery.approval_pending")]
+    ApprovalPending,
+    #[serde(rename = "heartbeat_delivery.approval_denied")]
+    ApprovalDenied,
+    #[serde(rename = "heartbeat_delivery.objective_blocked")]
+    ObjectiveBlocked,
+    #[serde(rename = "heartbeat_delivery.delivery_suppressed")]
+    DeliverySuppressed,
+}
+
+/// Event names attached to heartbeat delivery audit/read-model projections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatDeliveryEventTypes {
+    pub started: String,
+    pub completed: String,
+    pub failed: String,
+}
+
+/// Metadata-only projection used by routine run history and diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatDeliveryJournalProjection {
+    pub schema_version: u64,
+    pub rollout_mode: String,
+    pub decision: HeartbeatDeliveryDecision,
+    pub reason_code: HeartbeatDeliveryReasonCode,
+    pub routine_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub lease_state: RoutineRunLeaseState,
+    pub approval_gate: RoutineApprovalGateState,
+    pub delivery_ready: bool,
+    pub last_heartbeat_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objective_state: Option<String>,
+    pub event_types: HeartbeatDeliveryEventTypes,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
 }
 
 /// Contracts for routine preflight steps and the wake gate that decides whether a triggered
@@ -1926,6 +1998,115 @@ pub fn routine_run_lifecycle_snapshot(
     }
 }
 
+/// Builds a metadata-only heartbeat delivery projection for a routine run.
+///
+/// This is observe-only: it explains whether delivery can proceed, should wait
+/// for a live heartbeat, or needs repair/review without changing scheduler or
+/// delivery behavior.
+#[must_use]
+pub fn heartbeat_delivery_journal_projection(
+    routine_id: &str,
+    run: &CronRunRecord,
+    lifecycle: &RoutineRunLifecycleSnapshot,
+    now_unix_ms: i64,
+    objective_state: Option<&str>,
+) -> HeartbeatDeliveryJournalProjection {
+    let objective_state = objective_state
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let (decision, reason_code) =
+        heartbeat_delivery_decision(lifecycle, objective_state.as_deref());
+    let heartbeat_age_ms =
+        run.status.is_active().then_some(now_unix_ms.saturating_sub(run.updated_at_unix_ms));
+    HeartbeatDeliveryJournalProjection {
+        schema_version: HEARTBEAT_DELIVERY_SCHEMA_VERSION,
+        rollout_mode: HEARTBEAT_DELIVERY_ROLLOUT_OBSERVE_ONLY.to_owned(),
+        decision,
+        reason_code,
+        routine_id: routine_id.to_owned(),
+        run_id: run.run_id.clone(),
+        status: run.status.as_str().to_owned(),
+        lease_state: lifecycle.lease_state,
+        approval_gate: lifecycle.approval_gate,
+        delivery_ready: lifecycle.delivery_ready,
+        last_heartbeat_unix_ms: run.updated_at_unix_ms,
+        heartbeat_age_ms,
+        objective_state: objective_state.clone(),
+        event_types: heartbeat_delivery_event_types(),
+        evidence_refs: heartbeat_delivery_evidence_refs(
+            routine_id,
+            run,
+            objective_state.as_deref(),
+        ),
+        redaction_level: HEARTBEAT_DELIVERY_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn heartbeat_delivery_decision(
+    lifecycle: &RoutineRunLifecycleSnapshot,
+    objective_state: Option<&str>,
+) -> (HeartbeatDeliveryDecision, HeartbeatDeliveryReasonCode) {
+    if objective_state.is_some_and(objective_state_blocks_heartbeat_delivery) {
+        return (HeartbeatDeliveryDecision::Blocked, HeartbeatDeliveryReasonCode::ObjectiveBlocked);
+    }
+    if lifecycle.lease_state == RoutineRunLeaseState::Expired {
+        return (HeartbeatDeliveryDecision::RepairLease, HeartbeatDeliveryReasonCode::ExpiredLease);
+    }
+    if !lifecycle.terminal {
+        return (
+            HeartbeatDeliveryDecision::AwaitHeartbeat,
+            HeartbeatDeliveryReasonCode::ActiveLease,
+        );
+    }
+    match lifecycle.approval_gate {
+        RoutineApprovalGateState::Pending => {
+            (HeartbeatDeliveryDecision::Blocked, HeartbeatDeliveryReasonCode::ApprovalPending)
+        }
+        RoutineApprovalGateState::Denied => {
+            (HeartbeatDeliveryDecision::Suppressed, HeartbeatDeliveryReasonCode::ApprovalDenied)
+        }
+        RoutineApprovalGateState::NotRequired | RoutineApprovalGateState::Approved => {
+            if lifecycle.delivery_ready {
+                (HeartbeatDeliveryDecision::Deliverable, HeartbeatDeliveryReasonCode::DeliveryReady)
+            } else {
+                (
+                    HeartbeatDeliveryDecision::Suppressed,
+                    HeartbeatDeliveryReasonCode::DeliverySuppressed,
+                )
+            }
+        }
+    }
+}
+
+fn objective_state_blocks_heartbeat_delivery(state: &str) -> bool {
+    matches!(state, "paused" | "cancelled" | "archived")
+}
+
+fn heartbeat_delivery_event_types() -> HeartbeatDeliveryEventTypes {
+    HeartbeatDeliveryEventTypes {
+        started: HEARTBEAT_DELIVERY_EVENT_STARTED.to_owned(),
+        completed: HEARTBEAT_DELIVERY_EVENT_COMPLETED.to_owned(),
+        failed: HEARTBEAT_DELIVERY_EVENT_FAILED.to_owned(),
+    }
+}
+
+fn heartbeat_delivery_evidence_refs(
+    routine_id: &str,
+    run: &CronRunRecord,
+    objective_state: Option<&str>,
+) -> Vec<String> {
+    let mut refs = vec![
+        format!("routine:{routine_id}"),
+        format!("cron_run:{}", run.run_id),
+        "cron_run.updated_at_unix_ms".to_owned(),
+    ];
+    if objective_state.is_some() {
+        refs.push("objective.state".to_owned());
+    }
+    refs
+}
+
 /// Joins a cron run record with its optional routine metadata into the JSON shape served to
 /// console and CLI surfaces; missing metadata falls back to sensible defaults.
 pub fn join_run_metadata(
@@ -1969,6 +2150,13 @@ pub fn join_run_metadata(
         approval_policy.unwrap_or(&default_approval_policy),
         now_unix_ms.unwrap_or(run.updated_at_unix_ms),
     );
+    let heartbeat_delivery = heartbeat_delivery_journal_projection(
+        routine_id,
+        run,
+        &lifecycle,
+        now_unix_ms.unwrap_or(run.updated_at_unix_ms),
+        None,
+    );
     json!({
         "routine_id": routine_id,
         "run_id": run.run_id,
@@ -1994,6 +2182,7 @@ pub fn join_run_metadata(
         "delivery_preview": routine_delivery_preview(&delivery),
         "delivery_contract": delivery_contract,
         "lifecycle": lifecycle,
+        "heartbeat_delivery": heartbeat_delivery,
         "effective_delivery_mode": effective_delivery.mode.as_str(),
         "effective_delivery_channel": effective_delivery.channel,
         "delivery_reason": delivery_reason,
@@ -3174,20 +3363,24 @@ fn humanize_duration(duration_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_routine_export_bundle, default_outcome_from_cron_status, join_run_metadata,
+        build_routine_export_bundle, default_outcome_from_cron_status,
+        heartbeat_delivery_journal_projection, join_run_metadata,
         natural_language_schedule_preview, normalize_file_watch_trigger_payload,
         resolve_routines_root, routine_allows_sensitive_tools,
         routine_approval_policy_with_auto_enable_guard, routine_delivery_contract,
         routine_delivery_preview, routine_retention_dry_run, routine_run_lifecycle_snapshot,
         routine_runtime_backfill_plan, schedule_requires_auto_enable_guard,
         shadow_manual_schedule_payload_json, validate_routine_export_bundle,
-        validate_routine_prompt_self_contained, RoutineApprovalGateState, RoutineApprovalMode,
-        RoutineApprovalPolicy, RoutineDeliveryConfig, RoutineDeliveryContractKind,
-        RoutineDeliveryMode, RoutineExecutionConfig, RoutineExecutionPosture,
-        RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy, RoutineRunLeaseState,
-        RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode, RoutineRunOutcomeKind,
-        RoutineSilentPolicy, RoutineTriggerKind, MIN_AUTO_ENABLE_EVERY_INTERVAL_MS,
-        ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
+        validate_routine_prompt_self_contained, HeartbeatDeliveryDecision,
+        HeartbeatDeliveryJournalProjection, HeartbeatDeliveryReasonCode, RoutineApprovalGateState,
+        RoutineApprovalMode, RoutineApprovalPolicy, RoutineDeliveryConfig,
+        RoutineDeliveryContractKind, RoutineDeliveryMode, RoutineExecutionConfig,
+        RoutineExecutionPosture, RoutineMetadataRecord, RoutineRegistry, RoutineRetentionPolicy,
+        RoutineRunLeaseState, RoutineRunMetadataRecord, RoutineRunMetadataUpsert, RoutineRunMode,
+        RoutineRunOutcomeKind, RoutineSilentPolicy, RoutineTriggerKind,
+        HEARTBEAT_DELIVERY_EVENT_COMPLETED, HEARTBEAT_DELIVERY_EVENT_STARTED,
+        HEARTBEAT_DELIVERY_REDACTION_LEVEL, HEARTBEAT_DELIVERY_SCHEMA_VERSION,
+        MIN_AUTO_ENABLE_EVERY_INTERVAL_MS, ROUTINE_EXPORT_SCHEMA_ID, ROUTINE_RUN_LEASE_TTL_MS,
     };
     use crate::{
         cron::CronTimezoneMode,
@@ -3878,6 +4071,81 @@ mod tests {
         assert_eq!(expired.approval_gate, RoutineApprovalGateState::NotRequired);
         assert!(!expired.delivery_ready);
         assert_eq!(expired.recovery_hint, "repair_or_cancel_expired_routine_run_lease");
+    }
+
+    #[test]
+    fn heartbeat_delivery_projection_round_trips_metadata_contract() {
+        let terminal = sample_cron_run(CronRunStatus::Succeeded, 2_000);
+        let lifecycle = routine_run_lifecycle_snapshot(
+            "routine-1",
+            &terminal,
+            None,
+            &RoutineApprovalPolicy::default(),
+            2_100,
+        );
+
+        let projection =
+            heartbeat_delivery_journal_projection("routine-1", &terminal, &lifecycle, 2_100, None);
+
+        assert_eq!(projection.schema_version, HEARTBEAT_DELIVERY_SCHEMA_VERSION);
+        assert_eq!(projection.decision, HeartbeatDeliveryDecision::Deliverable);
+        assert_eq!(projection.reason_code, HeartbeatDeliveryReasonCode::DeliveryReady);
+        assert_eq!(projection.event_types.started, HEARTBEAT_DELIVERY_EVENT_STARTED);
+        assert_eq!(projection.redaction_level, HEARTBEAT_DELIVERY_REDACTION_LEVEL);
+        let encoded = serde_json::to_value(&projection).expect("projection should serialize");
+        assert_eq!(encoded["event_types"]["completed"], HEARTBEAT_DELIVERY_EVENT_COMPLETED);
+        let decoded: HeartbeatDeliveryJournalProjection =
+            serde_json::from_value(encoded).expect("projection should deserialize");
+        assert_eq!(decoded, projection);
+    }
+
+    #[test]
+    fn heartbeat_delivery_projection_marks_expired_lease_for_repair() {
+        let active = sample_cron_run(CronRunStatus::Running, 1_000);
+        let now = 1_000 + ROUTINE_RUN_LEASE_TTL_MS + 1;
+        let lifecycle = routine_run_lifecycle_snapshot(
+            "routine-1",
+            &active,
+            None,
+            &RoutineApprovalPolicy::default(),
+            now,
+        );
+
+        let projection =
+            heartbeat_delivery_journal_projection("routine-1", &active, &lifecycle, now, None);
+
+        assert_eq!(projection.decision, HeartbeatDeliveryDecision::RepairLease);
+        assert_eq!(projection.reason_code, HeartbeatDeliveryReasonCode::ExpiredLease);
+        assert_eq!(projection.heartbeat_age_ms, Some(ROUTINE_RUN_LEASE_TTL_MS + 1));
+        assert!(projection
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "cron_run.updated_at_unix_ms"));
+    }
+
+    #[test]
+    fn heartbeat_delivery_projection_blocks_paused_objectives() {
+        let terminal = sample_cron_run(CronRunStatus::Succeeded, 2_000);
+        let lifecycle = routine_run_lifecycle_snapshot(
+            "routine-1",
+            &terminal,
+            None,
+            &RoutineApprovalPolicy::default(),
+            2_100,
+        );
+
+        let projection = heartbeat_delivery_journal_projection(
+            "routine-1",
+            &terminal,
+            &lifecycle,
+            2_100,
+            Some("paused"),
+        );
+
+        assert_eq!(projection.decision, HeartbeatDeliveryDecision::Blocked);
+        assert_eq!(projection.reason_code, HeartbeatDeliveryReasonCode::ObjectiveBlocked);
+        assert_eq!(projection.objective_state.as_deref(), Some("paused"));
+        assert!(projection.evidence_refs.iter().any(|reference| reference == "objective.state"));
     }
 
     #[test]

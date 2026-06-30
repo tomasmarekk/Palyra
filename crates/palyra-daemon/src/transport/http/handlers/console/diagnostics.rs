@@ -151,6 +151,7 @@ pub(crate) async fn console_diagnostics_handler(
     let task_reconciler_payload = collect_console_task_reconciler_diagnostics();
     let replay_continuity_payload = collect_console_replay_continuity_diagnostics();
     let commitment_inference_payload = collect_console_commitment_inference_diagnostics();
+    let heartbeat_delivery_payload = collect_console_heartbeat_delivery_diagnostics();
     let mut turn_control_payload =
         collect_console_turn_control_diagnostics(&state, &session.context).await?;
     redact_console_diagnostics_value(&mut turn_control_payload, None);
@@ -308,6 +309,7 @@ pub(crate) async fn console_diagnostics_handler(
         "task_reconciler": task_reconciler_payload,
         "replay_continuity": replay_continuity_payload,
         "commitment_inference": commitment_inference_payload,
+        "heartbeat_delivery": heartbeat_delivery_payload,
         "turn_control": turn_control_payload,
         "delegation": delegation_payload,
         "access": {
@@ -1749,6 +1751,29 @@ fn collect_console_commitment_inference_diagnostics() -> Value {
         },
         "redaction_level": crate::commitments::HYBRID_INFERRED_COMMITMENTS_REDACTION_LEVEL,
         "runtime_behavior": "operator_opt_in_review_candidates_only",
+    })
+}
+
+/// Summarizes the observe-only heartbeat delivery projection contract.
+fn collect_console_heartbeat_delivery_diagnostics() -> Value {
+    json!({
+        "schema_version": crate::routines::HEARTBEAT_DELIVERY_SCHEMA_VERSION,
+        "rollout_mode": crate::routines::HEARTBEAT_DELIVERY_ROLLOUT_OBSERVE_ONLY,
+        "audit_ledger": "routine_run_read_model",
+        "read_model_endpoint": "/console/v1/routines/{routine_id}/runs",
+        "event_types": {
+            "started": crate::routines::HEARTBEAT_DELIVERY_EVENT_STARTED,
+            "completed": crate::routines::HEARTBEAT_DELIVERY_EVENT_COMPLETED,
+            "failed": crate::routines::HEARTBEAT_DELIVERY_EVENT_FAILED,
+        },
+        "inputs": [
+            "routine_run.lifecycle",
+            "cron_run.updated_at_unix_ms",
+            "cron.scheduler.health.expired_active_run_leases",
+            "objective.state",
+        ],
+        "redaction_level": crate::routines::HEARTBEAT_DELIVERY_REDACTION_LEVEL,
+        "runtime_behavior": "observe_only_no_dispatch_or_delivery_side_effects",
     })
 }
 
