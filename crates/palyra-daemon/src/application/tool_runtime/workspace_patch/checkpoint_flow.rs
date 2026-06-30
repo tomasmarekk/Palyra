@@ -179,11 +179,12 @@ pub(super) async fn execute_workspace_patch_mutation(
         }
     }
 
-    let diagnostic_baseline = code_intel::capture_diagnostic_snapshot(
+    let diagnostic_baseline = code_intel::capture_diagnostic_snapshot_with_providers(
         &runtime_state.config.code_intel,
         workspace_roots,
         planned_outcome.files_touched.as_slice(),
-    );
+    )
+    .await;
 
     let request = WorkspacePatchRequest {
         patch: patch.to_owned(),
@@ -321,11 +322,12 @@ pub(super) async fn execute_workspace_patch_mutation(
         pair_error: pair_error.as_deref(),
     };
     append_workspace_checkpoint_output(&mut output_value, checkpoint_output_context);
-    let diagnostic_after = code_intel::capture_diagnostic_snapshot(
+    let diagnostic_after = code_intel::capture_diagnostic_snapshot_with_providers(
         &runtime_state.config.code_intel,
         workspace_roots,
         outcome.files_touched.as_slice(),
-    );
+    )
+    .await;
     let diagnostic_delta = code_intel::diagnostic_delta(
         &runtime_state.config.code_intel,
         &diagnostic_baseline,
@@ -346,6 +348,17 @@ pub(super) async fn execute_workspace_patch_mutation(
         session_id,
         run_id,
         code_intel_runtime.audit_events.as_slice(),
+    )
+    .await;
+    record_code_intel_rust_snapshot_journal_event(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        &diagnostic_after,
+        code_intel_evidence_refs.as_slice(),
     )
     .await;
     record_code_intel_diagnostics_delta_journal_event(
@@ -683,6 +696,70 @@ async fn record_code_intel_runtime_journal_events(
         )
         .await;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_code_intel_rust_snapshot_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    session_id: &str,
+    run_id: &str,
+    snapshot: &code_intel::DiagnosticSnapshot,
+    evidence_refs: &[String],
+) {
+    if !snapshot
+        .reason_codes
+        .iter()
+        .any(|code| code == code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT)
+    {
+        return;
+    }
+    let rust_provider_status = snapshot
+        .provider_status
+        .iter()
+        .find(|status| {
+            status.language == crate::application::code_intel_runtime::CodeIntelLanguage::Rust
+        })
+        .map(|status| {
+            json!({
+                "provider": status.provider.as_str(),
+                "status": status.status.as_str(),
+                "reason_code": status.reason_code.as_str(),
+            })
+        });
+    let rust_items_count = snapshot
+        .items
+        .iter()
+        .filter(|item| {
+            item.language == crate::application::code_intel_runtime::CodeIntelLanguage::Rust
+        })
+        .count();
+    record_code_intel_journal_payload(
+        runtime_state,
+        principal,
+        device_id,
+        channel,
+        session_id,
+        run_id,
+        current_unix_ms(),
+        json!({
+            "event": code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+            "schema_version": snapshot.schema_version,
+            "session_id": session_id,
+            "run_id": run_id,
+            "workspace_root": snapshot.workspace_root.as_deref(),
+            "items_count": rust_items_count,
+            "truncated": snapshot.truncated,
+            "degraded": snapshot.degraded,
+            "reason_codes": snapshot.reason_codes.as_slice(),
+            "provider_status": rust_provider_status,
+            "evidence_refs": evidence_refs,
+            "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+        }),
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_arguments)]

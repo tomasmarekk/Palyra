@@ -2566,6 +2566,7 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
                 crate::application::code_intel_runtime::CODE_INTEL_PROVIDER_STARTED_EVENT,
                 crate::application::code_intel_runtime::CODE_INTEL_PROVIDER_DEGRADED_EVENT,
                 crate::application::code_intel_runtime::CODE_INTEL_DIAGNOSTICS_DELTA_EVENT,
+                crate::application::tool_runtime::code_intel::CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
             ],
             "tool_output_source": "palyra.fs.apply_patch.diagnostics.runtime",
             "redaction_level": crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL,

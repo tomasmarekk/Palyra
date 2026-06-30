@@ -10,11 +10,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     path::{Component, Path, PathBuf},
+    process::Stdio,
 };
 
-use palyra_common::workspace_patch::WorkspacePatchFileAttestation;
+use palyra_common::{
+    redaction::redact_diagnostic_text, workspace_patch::WorkspacePatchFileAttestation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command as TokioCommand,
+    time::{timeout, Duration},
+};
 
 use crate::{
     application::code_intel_runtime::{
@@ -24,8 +32,14 @@ use crate::{
 };
 
 const CODE_INTEL_SCHEMA_VERSION: u32 = 1;
-#[cfg(test)]
 const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 320;
+const RUST_ANALYZER_CARGO_CHECK_SOURCE: &str = "rust-analyzer/cargo-check";
+const RUST_ANALYZER_CARGO_CHECK_COMMAND: &str = "cargo";
+const RUST_ANALYZER_CARGO_CHECK_ARGS: &[&str] =
+    &["check", "--quiet", "--workspace", "--message-format=json", "--all-targets", "--keep-going"];
+const RUST_ANALYZER_ERROR_HINT_CHARS: usize = 512;
+pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
+    "code_intel.rust.snapshot_captured";
 
 /// Normalized diagnostic severity. Higher ranks are worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -38,7 +52,6 @@ pub(crate) enum DiagnosticSeverity {
 }
 
 impl DiagnosticSeverity {
-    #[cfg(test)]
     fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "error" | "err" => Self::Error,
@@ -155,6 +168,72 @@ pub(crate) fn capture_diagnostic_snapshot(
         degraded: !reason_codes.is_empty(),
         reason_codes,
     }
+}
+
+/// Captures diagnostics and invokes enabled language providers behind the
+/// conservative code-intelligence rollout flag.
+pub(crate) async fn capture_diagnostic_snapshot_with_providers(
+    config: &CodeIntelConfig,
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+) -> DiagnosticSnapshot {
+    let mut snapshot = capture_diagnostic_snapshot(config, workspace_roots, files_touched);
+    if !snapshot.enabled {
+        return snapshot;
+    }
+    let rust_files = snapshot
+        .files
+        .iter()
+        .filter(|path| CodeIntelLanguage::from_path(path) == Some(CodeIntelLanguage::Rust))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if rust_files.is_empty() || !provider_ready(&snapshot, CodeIntelLanguage::Rust) {
+        return snapshot;
+    }
+    let Some(workspace_root) = configured_workspace_root(config, workspace_roots) else {
+        mark_provider_degraded(
+            &mut snapshot,
+            CodeIntelLanguage::Rust,
+            "code_intel.workspace_root_missing",
+            "No workspace root was available for Rust diagnostics.",
+        );
+        return snapshot;
+    };
+    let provider = RustAnalyzerProvider::from_config(config);
+    match provider.capture(workspace_root.as_path(), &rust_files).await {
+        RustAnalyzerCaptureOutcome::Captured { items, truncated, reason_codes } => {
+            snapshot.items.extend(items);
+            snapshot.truncated |= truncated;
+            snapshot.degraded |= truncated;
+            snapshot.reason_codes.extend(reason_codes);
+            set_provider_status(
+                &mut snapshot,
+                CodeIntelLanguage::Rust,
+                "ready",
+                CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT,
+                "Rust diagnostics snapshot captured through the rust-analyzer check pipeline.",
+            );
+        }
+        RustAnalyzerCaptureOutcome::Degraded { reason_code, repair_hint } => {
+            mark_provider_degraded(
+                &mut snapshot,
+                CodeIntelLanguage::Rust,
+                reason_code.as_str(),
+                repair_hint.as_str(),
+            );
+        }
+    }
+    snapshot.reason_codes.sort();
+    snapshot.reason_codes.dedup();
+    snapshot.items.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line.cmp(&right.line))
+            .then(left.column.cmp(&right.column))
+            .then(left.source.cmp(&right.source))
+            .then(left.message.cmp(&right.message))
+    });
+    snapshot
 }
 
 /// Computes diagnostics that are new or worse in `after` for touched files.
@@ -300,6 +379,361 @@ pub(crate) fn append_runtime_output(
     }
 }
 
+/// Rust diagnostics provider backed by the rust-analyzer check pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RustAnalyzerProvider {
+    pub provider: String,
+    pub binary: String,
+    pub check_command: String,
+    pub check_args: Vec<String>,
+    pub timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub max_items: usize,
+    pub redaction_level: String,
+}
+
+impl RustAnalyzerProvider {
+    fn from_config(config: &CodeIntelConfig) -> Self {
+        Self {
+            provider: CodeIntelLanguage::Rust.provider_name().to_owned(),
+            binary: config.rust_analyzer_binary.clone(),
+            check_command: RUST_ANALYZER_CARGO_CHECK_COMMAND.to_owned(),
+            check_args: RUST_ANALYZER_CARGO_CHECK_ARGS
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            timeout_ms: config.timeout_ms,
+            max_output_bytes: config.max_output_bytes,
+            max_items: config.max_items,
+            redaction_level: crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                .to_owned(),
+        }
+    }
+
+    async fn capture(
+        &self,
+        workspace_root: &Path,
+        touched_files: &BTreeSet<String>,
+    ) -> RustAnalyzerCaptureOutcome {
+        if !executable_is_available(self.binary.as_str()) {
+            return RustAnalyzerCaptureOutcome::degraded(
+                "code_intel.provider_missing.rust",
+                "Install rust-analyzer or set tool_call.code_intel.rust_analyzer_binary to an executable path.",
+            );
+        }
+        if !workspace_root.is_dir() {
+            return RustAnalyzerCaptureOutcome::degraded(
+                "code_intel.rust.workspace_root_missing",
+                "Rust diagnostics require an existing workspace root.",
+            );
+        }
+        let output = match self.run_cargo_check_json(workspace_root).await {
+            Ok(output) => output,
+            Err(error) => {
+                let repair_hint = error.repair_hint();
+                return RustAnalyzerCaptureOutcome::degraded(
+                    error.reason_code(),
+                    repair_hint.as_str(),
+                );
+            }
+        };
+        let normalizer = RustDiagnosticNormalizer {
+            workspace_root: workspace_root.to_path_buf(),
+            touched_files: touched_files.clone(),
+            max_items: self.max_items,
+        };
+        let (items, parse_truncated) = normalizer.normalize_cargo_json(output.stdout.as_slice());
+        let truncated = parse_truncated || output.stdout_truncated || output.stderr_truncated;
+        if items.is_empty() && !output.status_success {
+            let hint = bounded_error_hint(output.stderr.as_slice());
+            return RustAnalyzerCaptureOutcome::degraded(
+                "code_intel.rust.cargo_check_failed",
+                hint.as_str(),
+            );
+        }
+        let mut reason_codes = vec![CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT.to_owned()];
+        if truncated {
+            reason_codes.push("code_intel.rust.output_truncated".to_owned());
+        }
+        RustAnalyzerCaptureOutcome::Captured { items, truncated, reason_codes }
+    }
+
+    async fn run_cargo_check_json(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<RustAnalyzerProcessOutput, RustAnalyzerRunError> {
+        let mut command = TokioCommand::new(RUST_ANALYZER_CARGO_CHECK_COMMAND);
+        command
+            .args(RUST_ANALYZER_CARGO_CHECK_ARGS)
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            RustAnalyzerRunError::Spawn(redact_diagnostic_text(&error.to_string()))
+        })?;
+        let stdout = child.stdout.take().ok_or(RustAnalyzerRunError::MissingPipe("stdout"))?;
+        let stderr = child.stderr.take().ok_or(RustAnalyzerRunError::MissingPipe("stderr"))?;
+        let max_output_bytes = max_output_bytes(self.max_output_bytes);
+        let stdout_task = tokio::spawn(read_bounded_stream(stdout, max_output_bytes));
+        let stderr_task = tokio::spawn(read_bounded_stream(stderr, max_output_bytes));
+        let status = match timeout(Duration::from_millis(self.timeout_ms), child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                return Err(RustAnalyzerRunError::Wait(redact_diagnostic_text(&error.to_string())));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(RustAnalyzerRunError::Timeout);
+            }
+        };
+        let stdout = stdout_task
+            .await
+            .map_err(|error| {
+                RustAnalyzerRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?
+            .map_err(|error| {
+                RustAnalyzerRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| {
+                RustAnalyzerRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?
+            .map_err(|error| {
+                RustAnalyzerRunError::Output(redact_diagnostic_text(&error.to_string()))
+            })?;
+        Ok(RustAnalyzerProcessOutput {
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            status_success: status.success(),
+        })
+    }
+}
+
+/// Normalizes rust-analyzer/cargo JSON messages into compact diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RustDiagnosticNormalizer {
+    pub workspace_root: PathBuf,
+    pub touched_files: BTreeSet<String>,
+    pub max_items: usize,
+}
+
+impl RustDiagnosticNormalizer {
+    fn normalize_cargo_json(&self, raw: &[u8]) -> (Vec<CodeDiagnostic>, bool) {
+        let mut items = Vec::new();
+        let mut truncated = false;
+        for line in String::from_utf8_lossy(raw).lines() {
+            if items.len() >= self.max_items {
+                truncated = true;
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(item) = self.normalize_cargo_message(&value) else {
+                continue;
+            };
+            items.push(item);
+        }
+        items.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.source.cmp(&right.source))
+                .then(left.message.cmp(&right.message))
+        });
+        items.dedup_by(|left, right| {
+            diagnostic_key_without_severity(left) == diagnostic_key_without_severity(right)
+        });
+        (items, truncated)
+    }
+
+    fn normalize_cargo_message(&self, value: &Value) -> Option<CodeDiagnostic> {
+        if value.get("reason").and_then(Value::as_str) != Some("compiler-message") {
+            return None;
+        }
+        let message = value.get("message")?;
+        let span = primary_cargo_span(message)?;
+        let file_name = span.get("file_name").and_then(Value::as_str)?;
+        let path = normalize_diagnostic_path(file_name, self.workspace_root.as_path())?;
+        if !self.touched_files.contains(path.as_str()) {
+            return None;
+        }
+        let message_text = message
+            .get("message")
+            .and_then(Value::as_str)
+            .map(redact_diagnostic_text)
+            .map(|text| bound_message(text.as_str()))
+            .filter(|text| !text.trim().is_empty())?;
+        let code = message
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(Value::as_str)
+            .map(redact_diagnostic_text)
+            .filter(|value| !value.trim().is_empty());
+        Some(CodeDiagnostic {
+            language: CodeIntelLanguage::Rust,
+            path,
+            line: read_u32(span, &["line_start"]).unwrap_or(1),
+            column: read_u32(span, &["column_start"]).unwrap_or(1),
+            severity: message
+                .get("level")
+                .and_then(Value::as_str)
+                .map(DiagnosticSeverity::parse)
+                .unwrap_or(DiagnosticSeverity::Warning),
+            code,
+            message: message_text,
+            source: RUST_ANALYZER_CARGO_CHECK_SOURCE.to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustAnalyzerCaptureOutcome {
+    Captured { items: Vec<CodeDiagnostic>, truncated: bool, reason_codes: Vec<String> },
+    Degraded { reason_code: String, repair_hint: String },
+}
+
+impl RustAnalyzerCaptureOutcome {
+    fn degraded(reason_code: &str, repair_hint: &str) -> Self {
+        Self::Degraded { reason_code: reason_code.to_owned(), repair_hint: repair_hint.to_owned() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustAnalyzerProcessOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    status_success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustAnalyzerRunError {
+    Spawn(String),
+    MissingPipe(&'static str),
+    Timeout,
+    Wait(String),
+    Output(String),
+}
+
+impl RustAnalyzerRunError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Spawn(_) => "code_intel.rust.cargo_check_spawn_failed",
+            Self::MissingPipe(_) => "code_intel.rust.cargo_check_pipe_failed",
+            Self::Timeout => "code_intel.rust.cargo_check_timeout",
+            Self::Wait(_) | Self::Output(_) => "code_intel.rust.cargo_check_failed",
+        }
+    }
+
+    fn repair_hint(&self) -> String {
+        match self {
+            Self::Spawn(error) => format!("Failed to start cargo check for Rust diagnostics: {error}"),
+            Self::MissingPipe(pipe) => format!("Failed to capture cargo check {pipe} for Rust diagnostics."),
+            Self::Timeout => "Rust diagnostics timed out; increase tool_call.code_intel.timeout_ms or inspect rust-analyzer health.".to_owned(),
+            Self::Wait(error) | Self::Output(error) => {
+                format!("Rust diagnostics failed while reading cargo check output: {error}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedStreamOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn provider_ready(snapshot: &DiagnosticSnapshot, language: CodeIntelLanguage) -> bool {
+    snapshot
+        .provider_status
+        .iter()
+        .any(|status| status.language == language && status.status == "ready")
+}
+
+fn set_provider_status(
+    snapshot: &mut DiagnosticSnapshot,
+    language: CodeIntelLanguage,
+    status_value: &str,
+    reason_code: &str,
+    repair_hint: &str,
+) {
+    if let Some(status) =
+        snapshot.provider_status.iter_mut().find(|status| status.language == language)
+    {
+        status.status = status_value.to_owned();
+        status.reason_code = reason_code.to_owned();
+        status.repair_hint = repair_hint.to_owned();
+    }
+}
+
+fn mark_provider_degraded(
+    snapshot: &mut DiagnosticSnapshot,
+    language: CodeIntelLanguage,
+    reason_code: &str,
+    repair_hint: &str,
+) {
+    snapshot.degraded = true;
+    snapshot.reason_codes.push(reason_code.to_owned());
+    set_provider_status(snapshot, language, "degraded", reason_code, repair_hint);
+}
+
+fn primary_cargo_span(message: &Value) -> Option<&Value> {
+    let spans = message.get("spans").and_then(Value::as_array)?;
+    spans
+        .iter()
+        .find(|span| span.get("is_primary").and_then(Value::as_bool).unwrap_or(false))
+        .or_else(|| spans.first())
+}
+
+async fn read_bounded_stream<R>(
+    mut reader: R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedStreamOutput>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(BoundedStreamOutput { bytes, truncated: false });
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if read > remaining {
+            bytes.extend_from_slice(&buffer[..remaining]);
+            return Ok(BoundedStreamOutput { bytes, truncated: true });
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn max_output_bytes(configured: u64) -> usize {
+    usize::try_from(configured).unwrap_or(usize::MAX)
+}
+
+fn bounded_error_hint(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let redacted = redact_diagnostic_text(stderr.as_ref());
+    let hint = bound_message_with_limit(redacted.as_str(), RUST_ANALYZER_ERROR_HINT_CHARS);
+    if hint.trim().is_empty() {
+        "Rust diagnostics command failed without emitting a useful stderr summary.".to_owned()
+    } else {
+        hint
+    }
+}
+
 /// Parses an LSP-like JSON diagnostic payload used by provider adapters and
 /// tests. Paths are normalized relative to `workspace_root`; outside paths
 /// are dropped rather than leaked.
@@ -380,7 +814,6 @@ fn parse_json_severity(value: &Value) -> DiagnosticSeverity {
         .unwrap_or(DiagnosticSeverity::Warning)
 }
 
-#[cfg(test)]
 fn read_u32(entry: &Value, keys: &[&str]) -> Option<u32> {
     keys.iter().find_map(|key| {
         let value = entry.get(*key)?;
@@ -526,7 +959,6 @@ fn diagnostic_key_without_severity(item: &CodeDiagnostic) -> String {
     )
 }
 
-#[cfg(test)]
 fn normalize_diagnostic_path(path: &str, workspace_root: &Path) -> Option<String> {
     let trimmed = path.trim().strip_prefix("file://").unwrap_or(path.trim());
     let candidate = PathBuf::from(trimmed);
@@ -567,11 +999,14 @@ fn normalize_path_for_output(path: &Path) -> String {
         .join("/")
 }
 
-#[cfg(test)]
 fn bound_message(message: &str) -> String {
+    bound_message_with_limit(message, MAX_DIAGNOSTIC_MESSAGE_CHARS)
+}
+
+fn bound_message_with_limit(message: &str, max_chars: usize) -> String {
     let trimmed = message.trim();
-    let mut bounded = trimmed.chars().take(MAX_DIAGNOSTIC_MESSAGE_CHARS).collect::<String>();
-    if trimmed.chars().count() > MAX_DIAGNOSTIC_MESSAGE_CHARS {
+    let mut bounded = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
         bounded.push_str("...");
     }
     bounded
@@ -632,6 +1067,86 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "src/lib.rs");
         assert_eq!(items[0].severity, DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn rust_diagnostic_normalizer_filters_touched_files() {
+        let raw = br#"{"reason":"compiler-message","message":{"message":"expected expression","code":{"code":"E0425"},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":3,"column_start":9,"is_primary":true}]}}
+{"reason":"compiler-message","message":{"message":"unrelated warning","code":{"code":"unused"},"level":"warning","spans":[{"file_name":"src/other.rs","line_start":1,"column_start":1,"is_primary":true}]}}"#;
+        let normalizer = RustDiagnosticNormalizer {
+            workspace_root: PathBuf::from("workspace"),
+            touched_files: BTreeSet::from(["src/lib.rs".to_owned()]),
+            max_items: 8,
+        };
+
+        let (items, truncated) = normalizer.normalize_cargo_json(raw);
+
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, "src/lib.rs");
+        assert_eq!(items[0].line, 3);
+        assert_eq!(items[0].column, 9);
+        assert_eq!(items[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(items[0].source, RUST_ANALYZER_CARGO_CHECK_SOURCE);
+    }
+
+    #[test]
+    fn rust_diagnostic_delta_reports_new_syntax_error() {
+        let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
+        let before = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/lib.rs".to_owned()],
+            provider_status: Vec::new(),
+            items: Vec::new(),
+            truncated: false,
+            degraded: false,
+            reason_codes: vec![CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT.to_owned()],
+        };
+        let after = DiagnosticSnapshot {
+            items: vec![CodeDiagnostic {
+                language: CodeIntelLanguage::Rust,
+                path: "src/lib.rs".to_owned(),
+                line: 3,
+                column: 9,
+                severity: DiagnosticSeverity::Error,
+                code: Some("E0425".to_owned()),
+                message: "expected expression".to_owned(),
+                source: RUST_ANALYZER_CARGO_CHECK_SOURCE.to_owned(),
+            }],
+            ..before.clone()
+        };
+
+        let delta = diagnostic_delta(&config, &before, &after);
+
+        assert_eq!(delta.new_errors, 1);
+        assert_eq!(delta.items.len(), 1);
+        assert_eq!(delta.items[0].code.as_deref(), Some("E0425"));
+    }
+
+    #[tokio::test]
+    async fn missing_rust_analyzer_degrades_without_failing_snapshot() {
+        let config = CodeIntelConfig {
+            enabled: true,
+            rust_analyzer_binary: "palyra-rust-analyzer-missing-for-test".to_owned(),
+            ..CodeIntelConfig::default()
+        };
+
+        let snapshot = capture_diagnostic_snapshot_with_providers(
+            &config,
+            &[PathBuf::from("workspace")],
+            &[touched("src/lib.rs")],
+        )
+        .await;
+
+        let rust_status = snapshot
+            .provider_status
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::Rust)
+            .expect("rust provider status should be present");
+        assert_eq!(rust_status.status, "missing_binary");
+        assert!(snapshot.items.is_empty());
     }
 
     #[test]
