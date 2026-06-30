@@ -426,6 +426,7 @@ pub(crate) enum RunStreamToolExecutionOutcome {
     Completed {
         proposal_id: String,
         tool_name: String,
+        input_json: Vec<u8>,
         outcome: crate::tool_protocol::ToolExecutionOutcome,
     },
     Cancelled,

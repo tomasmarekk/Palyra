@@ -21,7 +21,9 @@ use std::{
 use palyra_common::{
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
-        ArtifactRetentionPolicy, ToolResultSensitivity, ToolResultVisibility, ToolTurnBudget,
+        ArtifactRetentionPolicy, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
+        ToolTurnBudget,
     },
 };
 use serde_json::{json, Map, Value};
@@ -90,6 +92,7 @@ use super::{
 
 const MAX_PARALLEL_TOOL_CALLS_PER_GROUP: usize = 4;
 const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
+const TOOL_RESULT_PROJECTION_POLICY_EVENT: &str = "tool.result.projection_policy";
 
 /// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
@@ -143,6 +146,12 @@ pub(crate) enum ToolParallelism {
     PathScoped,
     /// Idempotent network fetches (GET/HEAD).
     IdempotentNetwork,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedToolExecutionOutcome {
+    outcome: ToolExecutionOutcome,
+    audit: Option<ToolResultProjectionAuditRecord>,
 }
 
 impl ToolParallelism {
@@ -584,6 +593,7 @@ async fn complete_catalog_bridge_tool_call(
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: proposal_id.to_owned(),
         tool_name: tool_name.to_owned(),
+        input_json: input_json.to_vec(),
         outcome: execution_outcome,
     })
 }
@@ -753,6 +763,7 @@ async fn reject_run_stream_tool_call(
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: proposal_id.to_owned(),
         tool_name: tool_name.to_owned(),
+        input_json: input_json.to_vec(),
         outcome: execution_outcome,
     })
 }
@@ -824,11 +835,13 @@ pub(crate) async fn execute_prepared_run_stream_tool_proposals_ordered(
                     RunStreamToolExecutionOutcome::Completed {
                         proposal_id,
                         tool_name,
+                        input_json,
                         outcome,
                     } => {
                         completed.push(RunStreamToolExecutionOutcome::Completed {
                             proposal_id,
                             tool_name,
+                            input_json,
                             outcome,
                         });
                     }
@@ -1868,7 +1881,7 @@ async fn finalize_prepared_tool_execution_outcome(
     execution_outcome: ToolExecutionOutcome,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
-    let execution_outcome = project_tool_result_for_model(
+    let projected = project_tool_result_for_model(
         runtime_state,
         ToolRuntimeExecutionContext {
             principal: request_context.principal.as_str(),
@@ -1884,6 +1897,11 @@ async fn finalize_prepared_tool_execution_outcome(
         execution_outcome,
     )
     .await?;
+    if let Some(audit) = projected.audit.as_ref() {
+        append_tool_result_projection_audit_tape_event(runtime_state, run_id, tape_seq, audit)
+            .await?;
+    }
+    let execution_outcome = projected.outcome;
 
     send_tool_result_with_tape(
         sender,
@@ -1933,6 +1951,7 @@ async fn finalize_prepared_tool_execution_outcome(
     Ok(RunStreamToolExecutionOutcome::Completed {
         proposal_id: prepared.proposal_id.clone(),
         tool_name: prepared.tool_name.clone(),
+        input_json: prepared.input_json.clone(),
         outcome: execution_outcome,
     })
 }
@@ -1943,11 +1962,11 @@ async fn project_tool_result_for_model(
     proposal_id: &str,
     tool_name: &str,
     outcome: ToolExecutionOutcome,
-) -> Result<ToolExecutionOutcome, Status> {
+) -> Result<ProjectedToolExecutionOutcome, Status> {
     let budget = ToolTurnBudget::default();
     let should_spill = should_project_tool_result_for_model(tool_name, &outcome, &budget);
     if !should_spill {
-        return Ok(outcome);
+        return Ok(ProjectedToolExecutionOutcome { outcome, audit: None });
     }
 
     let projection_policy = projection_policy_for_tool(tool_name);
@@ -2019,7 +2038,73 @@ async fn project_tool_result_for_model(
     projected_outcome.output_json = serde_json::to_vec(&projected).map_err(|error| {
         Status::internal(format!("failed to serialize projected tool result: {error}"))
     })?;
-    Ok(projected_outcome)
+    let audit = ToolResultProjectionAuditRecord {
+        schema_version: 1,
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        policy: projection_policy_contract(projection_policy),
+        decision: ToolResultProjectionDecisionKind::SpilledToArtifact,
+        visibility,
+        sensitivity,
+        reason_code: "tool_result_projection.high_volume_artifact".to_owned(),
+        redaction_level: if default_sensitive {
+            "redacted_preview_only".to_owned()
+        } else {
+            "model_summary_only".to_owned()
+        },
+        artifact_id: Some(artifact.artifact_id.clone()),
+        artifact_digest_sha256: Some(artifact.digest_sha256.clone()),
+        original_output_bytes: artifact_content
+            .original_output_bytes
+            .try_into()
+            .unwrap_or(u64::MAX),
+        model_visible_output_bytes: projected_outcome
+            .output_json
+            .len()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        saved_model_visible_bytes,
+        budget,
+    };
+    Ok(ProjectedToolExecutionOutcome { outcome: projected_outcome, audit: Some(audit) })
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_tool_result_projection_audit_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    audit: &ToolResultProjectionAuditRecord,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(audit).map_err(|error| {
+        Status::internal(format!("failed to serialize tool result projection audit: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: TOOL_RESULT_PROJECTION_POLICY_EVENT.to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+fn projection_policy_contract(
+    projection_policy: ToolResultProjectionPolicy,
+) -> ToolResultProjectionPolicyKind {
+    match projection_policy {
+        ToolResultProjectionPolicy::InlineUnlessLarge => {
+            ToolResultProjectionPolicyKind::InlineUnlessLarge
+        }
+        ToolResultProjectionPolicy::SummarizeAndArtifact => {
+            ToolResultProjectionPolicyKind::SummarizeAndArtifact
+        }
+        ToolResultProjectionPolicy::RedactedPreviewAndArtifact => {
+            ToolResultProjectionPolicyKind::RedactedPreviewAndArtifact
+        }
+    }
 }
 
 fn should_project_tool_result_for_model(
@@ -2338,12 +2423,16 @@ mod tests {
     use super::{
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
         drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
-        process_progress_status_message, ParallelToolExecutionTaskOutcome, ToolParallelism,
+        process_progress_status_message, projection_policy_contract,
+        ParallelToolExecutionTaskOutcome, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
     };
+    use crate::application::tool_registry::ToolResultProjectionPolicy;
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
     use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
-    use palyra_common::runtime_contracts::{ToolResultSensitivity, ToolTurnBudget};
+    use palyra_common::runtime_contracts::{
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
+    };
     use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
     use std::sync::{
@@ -2410,6 +2499,23 @@ mod tests {
         );
         validate_canonical_id(outcome.approval_id.as_str())
             .expect("auto approval id should be canonical");
+    }
+
+    #[test]
+    fn projection_policy_audit_event_uses_shared_contract_labels() {
+        assert_eq!(TOOL_RESULT_PROJECTION_POLICY_EVENT, "tool.result.projection_policy");
+        assert_eq!(
+            projection_policy_contract(ToolResultProjectionPolicy::InlineUnlessLarge),
+            ToolResultProjectionPolicyKind::InlineUnlessLarge
+        );
+        assert_eq!(
+            projection_policy_contract(ToolResultProjectionPolicy::SummarizeAndArtifact),
+            ToolResultProjectionPolicyKind::SummarizeAndArtifact
+        );
+        assert_eq!(
+            projection_policy_contract(ToolResultProjectionPolicy::RedactedPreviewAndArtifact),
+            ToolResultProjectionPolicyKind::RedactedPreviewAndArtifact
+        );
     }
 
     #[test]

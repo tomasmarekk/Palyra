@@ -25,7 +25,7 @@ pub(crate) use catalog::{
     provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
     snapshot_to_provider_request_value, tool_catalog_tape_payload,
 };
-pub(crate) use hashing::{stable_hash_bytes, stable_hash_value};
+pub(crate) use hashing::{canonical_json_bytes, stable_hash_bytes, stable_hash_value};
 pub(crate) use normalization::{
     normalization_audit_tape_payload, rejection_tape_payload, tool_call_rejection_outcome,
     validate_tool_call_against_catalog_snapshot, validate_tool_call_against_model_visible_tool,

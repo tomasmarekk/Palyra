@@ -55,7 +55,8 @@ pub use discovery::{
     OPENAI_CHATGPT_OAUTH_CLIENT_ID, OPENAI_CODEX_BACKEND_BASE_URL, OPENAI_CODEX_MODELS_ENDPOINT,
 };
 pub use error_envelope::{
-    ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity, ProviderRetryability,
+    ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity, ProviderRecoveryDecision,
+    ProviderRecoveryDecisionKind, ProviderRetryability, PROVIDER_RECOVERY_DECISION_EVENT,
 };
 pub use errors::{
     classify_http_provider_failure, classify_network_provider_failure,

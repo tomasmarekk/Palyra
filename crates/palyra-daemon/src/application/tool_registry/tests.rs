@@ -320,6 +320,11 @@ fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
         .expect("search should return indexed echo");
     assert_eq!(search["index_digest"], snapshot.index.index_digest);
     assert_eq!(search["results"][0]["id"], "palyra.echo");
+    assert_eq!(search["results"][0]["exposure_reason"], "allowlisted_policy_visible");
+    assert_eq!(search["results"][0]["projection_policy"], "inline_unless_large");
+    assert!(search["results"][0]["repair_hint"]
+        .as_str()
+        .is_some_and(|hint| hint.contains("provider_schema")));
     let schema_digest = search["results"][0]["schema_digest"].as_str().expect("schema digest");
 
     let describe = describe_catalog_tool(
@@ -329,6 +334,8 @@ fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
     .expect("describe should return provider schema");
     assert_eq!(describe["tool_id"], "palyra.echo");
     assert_eq!(describe["provider_schema"]["type"], "object");
+    assert_eq!(describe["exposure_reason"], "allowlisted_policy_visible");
+    assert!(describe["repair_hint"].as_str().is_some_and(|hint| hint.contains("provider_schema")));
 
     let invoke = resolve_catalog_invoke_target(
         &snapshot,

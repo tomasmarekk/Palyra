@@ -23,6 +23,7 @@ const DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES: usize = 256 * 1024;
 /// `Completed`, `Failed`, and `Cancelled` are terminal: the accumulator
 /// ignores every event that arrives after one of them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
     Started { provider_id: String, model_id: String },

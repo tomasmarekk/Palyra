@@ -41,16 +41,48 @@ const RUN_PROGRESS_MAX_MISSING_ARTIFACTS: usize = 12;
 const RUN_PROGRESS_MAX_ACTIVE_PROCESSES: usize = 8;
 const RUN_PROGRESS_MAX_FAILED_ATTEMPTS: usize = 8;
 
+/// Tape event emitted when a repeated tool signature first crosses the soft guardrail.
+pub(crate) const TOOL_LOOP_WARNING_EVENT: &str = "tool.loop.warning";
+/// Tape event emitted when guardrail guidance is injected into the next model turn.
+pub(crate) const TOOL_LOOP_GUIDANCE_INJECTED_EVENT: &str = "tool.loop.guidance_injected";
+/// Tape event emitted when a repeated denied tool loop is stopped.
+pub(crate) const TOOL_LOOP_BLOCKED_EVENT: &str = "tool.loop.blocked";
+
 /// Observable class of one tool attempt for repeated-no-progress detection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RunProgressOutcomeClass {
+pub(crate) enum ToolResultClass {
     Success,
     Failure,
+    ValidationFailure,
     PolicyDenied,
     ApprovalDenied,
+    NotFound,
+    Timeout,
     ReadNoProgress,
 }
+
+impl ToolResultClass {
+    /// Stable snake_case label used in guardrail reason codes.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::ValidationFailure => "validation_failure",
+            Self::PolicyDenied => "policy_denied",
+            Self::ApprovalDenied => "approval_denied",
+            Self::NotFound => "not_found",
+            Self::Timeout => "timeout",
+            Self::ReadNoProgress => "read_no_progress",
+        }
+    }
+
+    const fn is_denial(&self) -> bool {
+        matches!(self, Self::PolicyDenied | Self::ApprovalDenied)
+    }
+}
+
+pub(crate) type RunProgressOutcomeClass = ToolResultClass;
 
 /// Normalized attempt data fed into [`RunProgressController`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +93,16 @@ pub(crate) struct RunProgressAttempt {
     pub(crate) query_hash: Option<String>,
     pub(crate) sensitivity: String,
     pub(crate) outcome_class: RunProgressOutcomeClass,
+}
+
+/// Stable per-run signature for repeated tool-call guardrails.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ToolCallSignature {
+    pub(crate) tool_name: String,
+    pub(crate) canonical_arguments_hash: String,
+    pub(crate) normalized_path_scope: Option<String>,
+    pub(crate) query_hash: Option<String>,
+    pub(crate) last_result_class: ToolResultClass,
 }
 
 /// Stable attempt fingerprint used for loop detection.
@@ -77,6 +119,9 @@ pub(crate) struct RunProgressAttemptFingerprint {
 /// Controller decision emitted when repeated attempts stop making progress.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RunProgressIntervention {
+    pub(crate) event_type: String,
+    pub(crate) reason_code: String,
+    pub(crate) signature: ToolCallSignature,
     pub(crate) fingerprint: RunProgressAttemptFingerprint,
     pub(crate) attempts: u32,
     pub(crate) guidance: String,
@@ -87,18 +132,36 @@ pub(crate) struct RunProgressIntervention {
 /// Pure no-progress detector for repeated tool failure, denial, or read loops.
 #[derive(Debug, Clone)]
 pub(crate) struct RunProgressController {
-    max_repeated_attempts: u32,
-    attempt_counts: BTreeMap<RunProgressAttemptFingerprint, u32>,
+    guardrail_state: ToolLoopGuardrailState,
+}
+
+/// Per-run repeated tool-call counters, keyed by sanitized call signature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolLoopGuardrailState {
+    guidance_threshold: u32,
+    attempt_counts: BTreeMap<String, ToolLoopGuardrailCounter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolLoopGuardrailCounter {
+    pub(crate) signature: ToolCallSignature,
+    pub(crate) attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolLoopGuardrailDecision {
+    signature: ToolCallSignature,
+    attempts: u32,
+    event_type: &'static str,
+    reason_code: String,
+    block_run: bool,
 }
 
 impl RunProgressController {
     /// Creates a controller that intervenes after `max_repeated_attempts`.
     #[must_use]
     pub(crate) fn new(max_repeated_attempts: u32) -> Self {
-        Self {
-            max_repeated_attempts: max_repeated_attempts.max(1),
-            attempt_counts: BTreeMap::new(),
-        }
+        Self { guardrail_state: ToolLoopGuardrailState::new(max_repeated_attempts) }
     }
 
     /// Records an attempt and returns guidance once the same failure repeats.
@@ -107,32 +170,71 @@ impl RunProgressController {
         attempt: RunProgressAttempt,
     ) -> Option<RunProgressIntervention> {
         if attempt.outcome_class == RunProgressOutcomeClass::Success {
-            self.attempt_counts.clear();
+            self.guardrail_state.clear();
             return None;
         }
+        let decision = self.guardrail_state.observe(&attempt)?;
         let fingerprint = attempt.fingerprint();
-        let count = self.attempt_counts.entry(fingerprint.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        if *count < self.max_repeated_attempts {
-            return None;
-        }
         Some(RunProgressIntervention {
-            guidance: guidance_for_repeated_attempt(&fingerprint, *count),
-            terminate_run: matches!(
-                fingerprint.outcome_class,
-                RunProgressOutcomeClass::PolicyDenied | RunProgressOutcomeClass::ApprovalDenied
-            ),
+            event_type: decision.event_type.to_owned(),
+            reason_code: decision.reason_code,
+            signature: decision.signature,
+            guidance: guidance_for_repeated_attempt(&fingerprint, decision.attempts),
+            terminate_run: decision.block_run,
             learning_observation: format!(
                 "repeated_no_progress tool={} outcome={:?} attempts={}",
-                fingerprint.tool_name, fingerprint.outcome_class, count
+                fingerprint.tool_name, fingerprint.outcome_class, decision.attempts
             ),
             fingerprint,
-            attempts: *count,
+            attempts: decision.attempts,
         })
     }
 }
 
+impl ToolLoopGuardrailState {
+    /// Creates per-run guardrail state with a conservative soft guidance threshold.
+    #[must_use]
+    pub(crate) fn new(guidance_threshold: u32) -> Self {
+        Self { guidance_threshold: guidance_threshold.max(1), attempt_counts: BTreeMap::new() }
+    }
+
+    /// Records a sanitized signature and returns the guardrail decision, if any.
+    fn observe(&mut self, attempt: &RunProgressAttempt) -> Option<ToolLoopGuardrailDecision> {
+        let signature = attempt.signature();
+        let counter = self.attempt_counts.entry(signature.stable_key()).or_insert_with(|| {
+            ToolLoopGuardrailCounter { signature: signature.clone(), attempts: 0 }
+        });
+        counter.attempts = counter.attempts.saturating_add(1);
+        if counter.attempts < self.guidance_threshold {
+            return None;
+        }
+        let block_run = counter.signature.last_result_class.is_denial();
+        let event_type = if block_run { TOOL_LOOP_BLOCKED_EVENT } else { TOOL_LOOP_WARNING_EVENT };
+        Some(ToolLoopGuardrailDecision {
+            reason_code: format!("tool.loop.{}", counter.signature.last_result_class.as_str()),
+            signature: counter.signature.clone(),
+            attempts: counter.attempts,
+            event_type,
+            block_run,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.attempt_counts.clear();
+    }
+}
+
 impl RunProgressAttempt {
+    fn signature(&self) -> ToolCallSignature {
+        ToolCallSignature {
+            tool_name: self.tool_name.clone(),
+            canonical_arguments_hash: crate::sha256_hex(self.normalized_input_json.as_slice()),
+            normalized_path_scope: self.workspace_key.clone(),
+            query_hash: self.query_hash.clone(),
+            last_result_class: self.outcome_class.clone(),
+        }
+    }
+
     fn fingerprint(&self) -> RunProgressAttemptFingerprint {
         RunProgressAttemptFingerprint {
             tool_name: self.tool_name.clone(),
@@ -145,6 +247,19 @@ impl RunProgressAttempt {
     }
 }
 
+impl ToolCallSignature {
+    fn stable_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.tool_name,
+            self.canonical_arguments_hash,
+            self.normalized_path_scope.as_deref().unwrap_or(""),
+            self.query_hash.as_deref().unwrap_or(""),
+            self.last_result_class.as_str()
+        )
+    }
+}
+
 fn guidance_for_repeated_attempt(
     fingerprint: &RunProgressAttemptFingerprint,
     attempts: u32,
@@ -152,6 +267,18 @@ fn guidance_for_repeated_attempt(
     match fingerprint.outcome_class {
         RunProgressOutcomeClass::PolicyDenied | RunProgressOutcomeClass::ApprovalDenied => format!(
             "Tool '{}' was denied {attempts} times with the same arguments; stop retrying and ask for a changed policy, approval, or alternate plan.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::ValidationFailure => format!(
+            "Tool '{}' failed validation {attempts} times with the same arguments; inspect the schema, change the arguments, or use catalog describe before retrying.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::NotFound => format!(
+            "Tool '{}' returned not-found {attempts} times for the same scope; change the path/query or verify the target exists before retrying.",
+            fingerprint.tool_name
+        ),
+        RunProgressOutcomeClass::Timeout => format!(
+            "Tool '{}' timed out {attempts} times with the same arguments; narrow the request or choose a cheaper verification path before retrying.",
             fingerprint.tool_name
         ),
         RunProgressOutcomeClass::ReadNoProgress => format!(
@@ -1529,6 +1656,8 @@ mod tests {
         assert!(!intervention.terminate_run);
         assert!(intervention.guidance.contains("palyra.fs.apply_patch"));
         assert_eq!(intervention.fingerprint.input_hash.len(), 64);
+        assert_eq!(intervention.event_type, TOOL_LOOP_WARNING_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.failure");
     }
 
     #[test]
@@ -1542,6 +1671,59 @@ mod tests {
 
         assert!(intervention.terminate_run);
         assert!(intervention.learning_observation.contains("repeated_no_progress"));
+        assert_eq!(intervention.event_type, TOOL_LOOP_BLOCKED_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.policy_denied");
+    }
+
+    #[test]
+    fn tool_loop_guardrail_guides_after_three_repeated_read_only_no_progress_calls() {
+        let mut controller = RunProgressController::new(3);
+        let mut attempt =
+            failed_attempt("palyra.fs.read_file", br#"{"path":"src/main.rs","max_bytes":4096}"#);
+        attempt.workspace_key = Some("src/main.rs".to_owned());
+        attempt.outcome_class = RunProgressOutcomeClass::ReadNoProgress;
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        assert!(controller.observe(attempt.clone()).is_none());
+        let intervention = controller.observe(attempt).expect("third read loop warns");
+
+        assert!(!intervention.terminate_run);
+        assert_eq!(intervention.event_type, TOOL_LOOP_WARNING_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.read_no_progress");
+        assert_eq!(intervention.signature.normalized_path_scope.as_deref(), Some("src/main.rs"));
+        assert_eq!(intervention.signature.canonical_arguments_hash.len(), 64);
+        assert!(intervention.guidance.contains("repeated the same read"));
+    }
+
+    #[test]
+    fn tool_loop_guardrail_blocks_repeated_policy_denied_mutating_call() {
+        let mut controller = RunProgressController::new(3);
+        let mut attempt = failed_attempt(
+            "palyra.fs.apply_patch",
+            br#"{"patch":"*** Begin Patch\n*** Add File: secret.txt\n+token\n*** End Patch"}"#,
+        );
+        attempt.outcome_class = RunProgressOutcomeClass::PolicyDenied;
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        assert!(controller.observe(attempt.clone()).is_none());
+        let intervention = controller.observe(attempt).expect("third denial blocks");
+
+        assert!(intervention.terminate_run);
+        assert_eq!(intervention.event_type, TOOL_LOOP_BLOCKED_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.policy_denied");
+        assert!(intervention.guidance.contains("stop retrying"));
+    }
+
+    #[test]
+    fn tool_loop_guardrail_state_serializes_without_raw_arguments() {
+        let mut state = ToolLoopGuardrailState::new(1);
+        let attempt = failed_attempt("palyra.fs.search", br#"{"query":"needle"}"#);
+        let decision = state.observe(&attempt).expect("first attempt crosses threshold");
+        let serialized = serde_json::to_string(&state).expect("state should serialize");
+
+        assert_eq!(decision.signature.canonical_arguments_hash.len(), 64);
+        assert!(serialized.contains("canonical_arguments_hash"));
+        assert!(!serialized.contains("needle"));
     }
 
     #[test]

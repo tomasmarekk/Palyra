@@ -75,6 +75,7 @@ pub(crate) enum RunStreamProviderEventsOutcome {
 pub(crate) struct RunStreamToolResultForModel {
     pub(crate) proposal_id: String,
     pub(crate) tool_name: String,
+    pub(crate) input_json: Vec<u8>,
     pub(crate) outcome: ToolExecutionOutcome,
 }
 
@@ -245,11 +246,13 @@ pub(crate) async fn process_provider_event_for_surface(
                     RunStreamToolExecutionOutcome::Completed {
                         proposal_id,
                         tool_name,
+                        input_json,
                         outcome,
                     } => {
                         tool_results.push(RunStreamToolResultForModel {
                             proposal_id,
                             tool_name,
+                            input_json,
                             outcome,
                         });
                         Ok(RunStreamProviderEventOutcome::Continue)
@@ -600,8 +603,18 @@ fn push_run_stream_tool_execution_outcome(
     outcome: RunStreamToolExecutionOutcome,
 ) -> RunStreamProviderEventOutcome {
     match outcome {
-        RunStreamToolExecutionOutcome::Completed { proposal_id, tool_name, outcome } => {
-            tool_results.push(RunStreamToolResultForModel { proposal_id, tool_name, outcome });
+        RunStreamToolExecutionOutcome::Completed {
+            proposal_id,
+            tool_name,
+            input_json,
+            outcome,
+        } => {
+            tool_results.push(RunStreamToolResultForModel {
+                proposal_id,
+                tool_name,
+                input_json,
+                outcome,
+            });
             RunStreamProviderEventOutcome::Continue
         }
         RunStreamToolExecutionOutcome::Cancelled => RunStreamProviderEventOutcome::Cancelled,

@@ -99,8 +99,9 @@ pub use palyra_model_providers::{
     ProviderError, ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity,
     ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
     ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
-    ProviderRecoveryPlanSnapshot, ProviderRetryability, ProviderStreamAccumulator,
-    ProviderStreamEvent,
+    ProviderRecoveryDecision, ProviderRecoveryDecisionKind, ProviderRecoveryPlanSnapshot,
+    ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
+    PROVIDER_RECOVERY_DECISION_EVENT,
 };
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";

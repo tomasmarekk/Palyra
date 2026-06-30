@@ -35,9 +35,9 @@ use crate::{
         PrepareModelProviderInputRequest,
     },
     application::tool_registry::{
-        build_model_visible_tool_catalog_snapshot, snapshot_to_provider_request_value,
-        tool_catalog_tape_payload, ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest,
-        ToolExposureSurface,
+        build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
+        snapshot_to_provider_request_value, tool_catalog_tape_payload,
+        ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest, ToolExposureSurface,
     },
     delegation::DelegationSnapshot,
     gateway::{
@@ -57,7 +57,7 @@ use crate::{
         ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
         ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
-        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_RECOVERY_DECISION_EVENT,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -73,6 +73,7 @@ use super::{
     agent_loop::{
         AgentLoopTerminationReason, AgentRunLoopState, RunProgressAttempt, RunProgressController,
         RunProgressIntervention, RunProgressOutcomeClass, DEFAULT_AGENT_LOOP_WALL_CLOCK_BUDGET_MS,
+        TOOL_LOOP_GUIDANCE_INJECTED_EVENT, TOOL_LOOP_WARNING_EVENT,
     },
     cancellation::transition_run_stream_to_cancelled,
     tape::{
@@ -149,6 +150,16 @@ pub(crate) enum ProviderRequestTimeoutReason {
     BrowserFollowup,
     /// The bounded follow-up deadline after non-browser tool results.
     ToolFollowup,
+}
+
+impl ProviderRequestTimeoutReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::BrowserFollowup => "browser_followup",
+            Self::ToolFollowup => "tool_followup",
+        }
+    }
 }
 
 /// Agent-loop phase covered by a local deadline before the provider watchdog starts.
@@ -2063,6 +2074,18 @@ pub(crate) async fn process_run_stream_message(
         {
             Ok(RunStreamProviderRequestOutcome::Completed(response)) => *response,
             Ok(RunStreamProviderRequestOutcome::TimedOut { reason, message }) => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_RECOVERY_DECISION_EVENT,
+                    provider_status_recovery_decision_payload(
+                        Code::DeadlineExceeded,
+                        message.as_str(),
+                        Some(reason),
+                    ),
+                )
+                .await?;
                 // With tool evidence on the tape the run is worth resuming:
                 // try one browser follow-up recovery turn, else emit a
                 // partial summary and terminate as needs_continuation.
@@ -2163,6 +2186,14 @@ pub(crate) async fn process_run_stream_message(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             Err(error) => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_RECOVERY_DECISION_EVENT,
+                    provider_status_recovery_decision_payload(error.code(), error.message(), None),
+                )
+                .await?;
                 if loop_state.completed_tool_calls() > 0 {
                     let fallback_summary = if final_answer_recovery_attempted {
                         final_answer_recovery_fallback_summary(
@@ -2486,17 +2517,27 @@ pub(crate) async fn process_run_stream_message(
                         runtime_state,
                         run_id.as_str(),
                         tape_seq,
-                        "agent_loop.run_progress_intervention",
-                        serde_json::to_string(&intervention).unwrap_or_else(|_| "{}".to_owned()),
+                        intervention.event_type.as_str(),
+                        tool_loop_intervention_payload(&intervention),
                     )
                     .await?;
                     loop_state.append_user_guidance(intervention.guidance.clone());
+                    if intervention.event_type == TOOL_LOOP_WARNING_EVENT {
+                        append_agent_loop_tape_event(
+                            runtime_state,
+                            run_id.as_str(),
+                            tape_seq,
+                            TOOL_LOOP_GUIDANCE_INJECTED_EVENT,
+                            tool_loop_intervention_payload(&intervention),
+                        )
+                        .await?;
+                    }
                     send_agent_loop_progress_status(
                         sender,
                         runtime_state,
                         run_id.as_str(),
                         tape_seq,
-                        "agent_loop.run_progress_intervention",
+                        TOOL_LOOP_GUIDANCE_INJECTED_EVENT,
                     )
                     .await?;
                     if intervention.terminate_run {
@@ -3049,22 +3090,42 @@ fn observe_run_progress_controller(
     attempts.iter().cloned().find_map(|attempt| controller.observe(attempt))
 }
 
+fn tool_loop_intervention_payload(intervention: &RunProgressIntervention) -> String {
+    serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event_type": intervention.event_type,
+        "reason_code": intervention.reason_code,
+        "attempts": intervention.attempts,
+        "terminate_run": intervention.terminate_run,
+        "redaction_level": "hash_only_tool_arguments",
+        "signature": intervention.signature,
+        "fingerprint": intervention.fingerprint,
+        "guidance": intervention.guidance,
+        "learning_observation": intervention.learning_observation,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
 fn run_progress_attempt_from_tool_result(
     result: &RunStreamToolResultForModel,
 ) -> RunProgressAttempt {
-    let output_or_error = if result.outcome.output_json.is_empty() {
-        result.outcome.error.as_bytes().to_vec()
-    } else {
-        result.outcome.output_json.clone()
-    };
     RunProgressAttempt {
         tool_name: result.tool_name.clone(),
-        normalized_input_json: output_or_error,
-        workspace_key: None,
-        query_hash: None,
+        normalized_input_json: canonical_tool_input_json(result.input_json.as_slice()),
+        workspace_key: normalized_tool_path_scope(
+            result.tool_name.as_str(),
+            result.input_json.as_slice(),
+        ),
+        query_hash: tool_query_hash(result.tool_name.as_str(), result.input_json.as_slice()),
         sensitivity: "runtime_result".to_owned(),
         outcome_class: run_progress_outcome_class(result),
     }
+}
+
+fn canonical_tool_input_json(input_json: &[u8]) -> Vec<u8> {
+    serde_json::from_slice::<Value>(input_json)
+        .map(|value| canonical_json_bytes(&value))
+        .unwrap_or_else(|_| input_json.to_vec())
 }
 
 fn run_progress_outcome_class(result: &RunStreamToolResultForModel) -> RunProgressOutcomeClass {
@@ -3076,11 +3137,27 @@ fn run_progress_outcome_class(result: &RunStreamToolResultForModel) -> RunProgre
     }
 
     let error = result.outcome.error.to_ascii_lowercase();
+    if result.outcome.attestation.timed_out
+        || error.contains("timeout")
+        || error.contains("timed out")
+    {
+        return RunProgressOutcomeClass::Timeout;
+    }
     if error.contains("approval") && error.contains("denied") {
         return RunProgressOutcomeClass::ApprovalDenied;
     }
     if error.contains("policy") && (error.contains("denied") || error.contains("blocked")) {
         return RunProgressOutcomeClass::PolicyDenied;
+    }
+    if error.contains("malformed")
+        || error.contains("schema")
+        || error.contains("invalid_json")
+        || error.contains("arguments")
+    {
+        return RunProgressOutcomeClass::ValidationFailure;
+    }
+    if error.contains("not found") || error.contains("not_found") || error.contains("missing") {
+        return RunProgressOutcomeClass::NotFound;
     }
     RunProgressOutcomeClass::Failure
 }
@@ -3092,6 +3169,87 @@ fn run_progress_is_read_only_workspace_tool(tool_name: &str) -> bool {
             | crate::gateway::WORKSPACE_LIST_DIR_TOOL_NAME
             | crate::gateway::WORKSPACE_SEARCH_TOOL_NAME
     )
+}
+
+fn normalized_tool_path_scope(tool_name: &str, input_json: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(input_json).ok()?;
+    match tool_name {
+        crate::gateway::WORKSPACE_READ_FILE_TOOL_NAME
+        | crate::gateway::WORKSPACE_LIST_DIR_TOOL_NAME
+        | crate::gateway::WORKSPACE_SEARCH_TOOL_NAME
+        | crate::gateway::WORKSPACE_PATCH_TOOL_NAME => {
+            normalized_path_from_fields(&value, &["path", "root", "dir", "cwd"])
+        }
+        crate::gateway::PROCESS_RUNNER_TOOL_NAME => normalized_process_path_scope(&value),
+        _ => None,
+    }
+}
+
+fn normalized_path_from_fields(value: &Value, fields: &[&str]) -> Option<String> {
+    let mut paths = Vec::new();
+    for field in fields {
+        collect_path_scope_string(value.get(*field), &mut paths);
+    }
+    collect_path_scope_string(value.get("paths"), &mut paths);
+    paths.sort();
+    paths.dedup();
+    (!paths.is_empty()).then(|| paths.join("|"))
+}
+
+fn normalized_process_path_scope(value: &Value) -> Option<String> {
+    let mut paths = Vec::new();
+    collect_path_scope_string(value.get("cwd"), &mut paths);
+    if let Some(args) = value.get("args").and_then(Value::as_array) {
+        for arg in args {
+            let Some(raw) = arg.as_str() else {
+                continue;
+            };
+            if raw.contains('/') || raw.contains('\\') || raw.starts_with('.') {
+                collect_path_scope_string(Some(arg), &mut paths);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    (!paths.is_empty()).then(|| paths.join("|"))
+}
+
+fn collect_path_scope_string(value: Option<&Value>, paths: &mut Vec<String>) {
+    match value {
+        Some(Value::String(path)) => {
+            let normalized = normalize_path_scope_component(path);
+            if !normalized.is_empty() {
+                paths.push(normalized);
+            }
+        }
+        Some(Value::Array(values)) => {
+            for value in values {
+                collect_path_scope_string(Some(value), paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_path_scope_component(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|component| !matches!(*component, "" | "."))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn tool_query_hash(tool_name: &str, input_json: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(input_json).ok()?;
+    let query = match tool_name {
+        crate::gateway::WORKSPACE_SEARCH_TOOL_NAME => value.get("query").and_then(Value::as_str),
+        "palyra.memory.search" | "palyra.memory.recall" | "palyra.session_search" => {
+            value.get("query").and_then(Value::as_str)
+        }
+        _ => None,
+    }?;
+    Some(crate::sha256_hex(query.trim().to_ascii_lowercase().as_bytes()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3595,6 +3753,55 @@ fn provider_timeout_termination_reason(
     }
 }
 
+fn provider_status_recovery_decision_payload(
+    status_code: Code,
+    message: &str,
+    provider_timeout_reason: Option<ProviderRequestTimeoutReason>,
+) -> String {
+    let (decision, reason_code) =
+        provider_status_recovery_decision(status_code, message, provider_timeout_reason);
+    serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event_type": PROVIDER_RECOVERY_DECISION_EVENT,
+        "decision": decision,
+        "reason_code": reason_code,
+        "status_code": format!("{status_code:?}").to_ascii_lowercase(),
+        "provider_timeout_reason": provider_timeout_reason.map(|reason| reason.as_str()),
+        "redaction_level": "status_message_redacted",
+        "message": crate::model_provider::sanitize_remote_error(message),
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn provider_status_recovery_decision(
+    status_code: Code,
+    message: &str,
+    provider_timeout_reason: Option<ProviderRequestTimeoutReason>,
+) -> (&'static str, &'static str) {
+    if provider_timeout_reason.is_some() {
+        return ("retry_same_provider", "provider.recovery.retry_same_provider");
+    }
+    match status_code {
+        Code::Unavailable | Code::DeadlineExceeded => {
+            ("retry_same_provider", "provider.recovery.retry_same_provider")
+        }
+        Code::Unauthenticated => ("refresh_credential", "provider.recovery.refresh_credential"),
+        Code::ResourceExhausted | Code::PermissionDenied | Code::FailedPrecondition => {
+            ("ask_user", "provider.recovery.ask_user")
+        }
+        Code::InvalidArgument
+            if message.contains("context_window_exceeded")
+                || message.to_ascii_lowercase().contains("context") =>
+        {
+            ("compact_and_retry", "provider.recovery.compact_and_retry")
+        }
+        Code::Internal if message.contains("malformed_response") => {
+            ("failover_provider", "provider.recovery.failover_provider")
+        }
+        _ => ("fail_closed", "provider.recovery.fail_closed"),
+    }
+}
+
 fn is_browser_tool_name(tool_name: &str) -> bool {
     tool_name.starts_with("palyra.browser.")
 }
@@ -4047,10 +4254,11 @@ mod tests {
         provider_error_partial_summary, provider_model_override_for_routing,
         provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
         provider_request_timeout_message, provider_request_timeout_status,
-        provider_timeout_termination_reason, provider_waiting_status_message,
-        repeated_tool_failure_signature, run_loop_phase_timeout_message,
-        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
-        run_loop_phase_waiting_status_message, should_emit_budget_exhausted_partial_summary,
+        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
+        provider_waiting_status_message, repeated_tool_failure_signature,
+        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
+        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
+        run_progress_attempt_from_tool_result, should_emit_budget_exhausted_partial_summary,
         terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
         tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
         tool_result_to_provider_message, truncated_final_answer_without_tools,
@@ -4476,6 +4684,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_approval_01".to_owned(),
             tool_name: "palyra.process.run".to_owned(),
+            input_json: br#"{"command":"cmd","args":["/C","whoami"]}"#.to_vec(),
             outcome: crate::tool_protocol::denied_execution_outcome(
                 "toolu_approval_01",
                 "palyra.process.run",
@@ -4896,6 +5105,26 @@ mod tests {
     }
 
     #[test]
+    fn provider_status_recovery_decision_payload_redacts_and_classifies_status() {
+        let payload = provider_status_recovery_decision_payload(
+            Code::InvalidArgument,
+            "model provider request failed (class=context_window_exceeded): sk-secret-token",
+            None,
+        );
+        let parsed: Value =
+            serde_json::from_str(payload.as_str()).expect("recovery payload should be JSON");
+
+        assert_eq!(parsed["event_type"], "provider.recovery.decision");
+        assert_eq!(parsed["decision"], "compact_and_retry");
+        assert_eq!(parsed["reason_code"], "provider.recovery.compact_and_retry");
+        assert_eq!(parsed["redaction_level"], "status_message_redacted");
+        assert!(!parsed["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("sk-secret-token"));
+    }
+
+    #[test]
     fn budget_partial_summary_requires_terminal_budget_with_tool_evidence() {
         let state = loop_state_after_tool("build a browser app", "palyra.browser.observe");
         let state_without_tools =
@@ -4939,6 +5168,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_denied_01".to_owned(),
             tool_name: "palyra.process.run".to_owned(),
+            input_json: br#"{"command":"cmd","args":["/C","whoami"]}"#.to_vec(),
             outcome: crate::tool_protocol::denied_execution_outcome(
                 "toolu_denied_01",
                 "palyra.process.run",
@@ -4958,6 +5188,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_noninteractive_01".to_owned(),
             tool_name: "palyra.process.run".to_owned(),
+            input_json: br#"{"command":"node","args":["-e","console.log(1)"]}"#.to_vec(),
             outcome: crate::tool_protocol::denied_execution_outcome(
                 "toolu_noninteractive_01",
                 "palyra.process.run",
@@ -4979,6 +5210,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_deny_mode_01".to_owned(),
             tool_name: "palyra.fs.read_file".to_owned(),
+            input_json: br#"{"path":"generated/temp.txt"}"#.to_vec(),
             outcome: crate::tool_protocol::denied_execution_outcome(
                 "toolu_deny_mode_01",
                 "palyra.fs.read_file",
@@ -5001,6 +5233,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_regular_error_01".to_owned(),
             tool_name: "palyra.process.run".to_owned(),
+            input_json: br#"{"command":"cmd","args":["/C","exit","1"]}"#.to_vec(),
             outcome: crate::tool_protocol::build_tool_execution_outcome(
                 "toolu_regular_error_01",
                 "palyra.process.run",
@@ -5021,10 +5254,44 @@ mod tests {
     }
 
     #[test]
+    fn run_progress_attempt_canonicalizes_tool_arguments_before_hashing() {
+        let first_input = br#"{"path":"src/lib.rs","options":{"b":2,"a":1}}"#.to_vec();
+        let second_input = br#"{"options":{"a":1,"b":2},"path":"src/lib.rs"}"#.to_vec();
+        let result = |proposal_id: &str, input_json: Vec<u8>| RunStreamToolResultForModel {
+            proposal_id: proposal_id.to_owned(),
+            tool_name: "palyra.fs.read_file".to_owned(),
+            input_json: input_json.clone(),
+            outcome: crate::tool_protocol::build_tool_execution_outcome(
+                proposal_id,
+                "palyra.fs.read_file",
+                input_json.as_slice(),
+                true,
+                br#"{"content":"same"}"#.to_vec(),
+                String::new(),
+                false,
+                "builtin".to_owned(),
+                "none".to_owned(),
+            ),
+        };
+
+        let first_attempt =
+            run_progress_attempt_from_tool_result(&result("toolu_read_01", first_input));
+        let second_attempt =
+            run_progress_attempt_from_tool_result(&result("toolu_read_02", second_input));
+
+        assert_eq!(first_attempt.normalized_input_json, second_attempt.normalized_input_json);
+        assert_eq!(
+            std::str::from_utf8(first_attempt.normalized_input_json.as_slice()).unwrap(),
+            r#"{"options":{"a":1,"b":2},"path":"src/lib.rs"}"#
+        );
+    }
+
+    #[test]
     fn failed_browser_console_result_marks_console_status_unknown_for_model() {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_console_01".to_owned(),
             tool_name: crate::gateway::BROWSER_CONSOLE_LOG_TOOL_NAME.to_owned(),
+            input_json: br#"{"session_id":"browser-session-1"}"#.to_vec(),
             outcome: crate::tool_protocol::build_tool_execution_outcome(
                 "toolu_console_01",
                 crate::gateway::BROWSER_CONSOLE_LOG_TOOL_NAME,
@@ -5062,6 +5329,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_memory_retain_01".to_owned(),
             tool_name: crate::gateway::MEMORY_RETAIN_TOOL_NAME.to_owned(),
+            input_json: br#"{"content_text":"remember this"}"#.to_vec(),
             outcome: crate::tool_protocol::build_tool_execution_outcome(
                 "toolu_memory_retain_01",
                 crate::gateway::MEMORY_RETAIN_TOOL_NAME,
@@ -5117,6 +5385,7 @@ mod tests {
         let result = RunStreamToolResultForModel {
             proposal_id: "toolu_artifact_read_01".to_owned(),
             tool_name: crate::gateway::ARTIFACT_READ_TOOL_NAME.to_owned(),
+            input_json: br#"{"artifact_id":"01JARTIFACTREADTEST000000000"}"#.to_vec(),
             outcome: crate::tool_protocol::build_tool_execution_outcome(
                 "toolu_artifact_read_01",
                 crate::gateway::ARTIFACT_READ_TOOL_NAME,

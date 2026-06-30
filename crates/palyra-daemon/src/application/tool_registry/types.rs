@@ -214,6 +214,9 @@ pub(crate) struct ToolCatalogIndexEntry {
     pub(crate) capability_class: String,
     pub(crate) risk_tier: String,
     pub(crate) approval_summary: String,
+    pub(crate) exposure_reason: String,
+    pub(crate) repair_hint: String,
+    pub(crate) projection_policy: ToolResultProjectionPolicy,
     pub(crate) provider_schema_hash: String,
     pub(crate) internal_schema_hash: String,
 }

@@ -57,7 +57,7 @@ pub(crate) fn stable_hash_bytes(bytes: &[u8]) -> String {
 
 /// Serializes `value` with recursively key-sorted objects so logically equal
 /// values always produce identical bytes (and therefore identical hashes).
-pub(super) fn canonical_json_bytes(value: &Value) -> Vec<u8> {
+pub(crate) fn canonical_json_bytes(value: &Value) -> Vec<u8> {
     let mut sorted = value.clone();
     sort_json_value(&mut sorted);
     // Serializing a tree-shaped `Value` cannot realistically fail; fall back

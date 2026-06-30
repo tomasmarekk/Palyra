@@ -257,6 +257,23 @@ runtime_contract_enum! {
 }
 
 runtime_contract_enum! {
+    /// Registry policy that determines whether a tool result can stay inline.
+    pub enum ToolResultProjectionPolicyKind {
+        InlineUnlessLarge => "inline_unless_large",
+        SummarizeAndArtifact => "summarize_and_artifact",
+        RedactedPreviewAndArtifact => "redacted_preview_and_artifact"
+    }
+}
+
+runtime_contract_enum! {
+    /// Decision made for one concrete tool result after applying projection policy and budgets.
+    pub enum ToolResultProjectionDecisionKind {
+        ModelInline => "model_inline",
+        SpilledToArtifact => "spilled_to_artifact"
+    }
+}
+
+runtime_contract_enum! {
     /// Sensitivity taxonomy for durable tool result artifacts.
     pub enum ToolResultSensitivity {
         Public => "public",
@@ -616,6 +633,28 @@ impl Default for ToolTurnBudget {
             max_artifact_read_bytes: 16 * 1024,
         }
     }
+}
+
+/// Hash- and budget-only audit record for a high-volume tool-result projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultProjectionAuditRecord {
+    pub schema_version: u32,
+    pub proposal_id: String,
+    pub tool_name: String,
+    pub policy: ToolResultProjectionPolicyKind,
+    pub decision: ToolResultProjectionDecisionKind,
+    pub visibility: ToolResultVisibility,
+    pub sensitivity: ToolResultSensitivity,
+    pub reason_code: String,
+    pub redaction_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_digest_sha256: Option<String>,
+    pub original_output_bytes: u64,
+    pub model_visible_output_bytes: u64,
+    pub saved_model_visible_bytes: u64,
+    pub budget: ToolTurnBudget,
 }
 
 /// Observability counters for model-visible budget projection.
@@ -1456,8 +1495,9 @@ mod tests {
         RealtimeEventSensitivity, RealtimeEventTopic, RealtimeHandshakeRequest,
         RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope, RealtimeSubscription,
         RunLifecycleHookDecision, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
-        RunLifecyclePhase, ToolResultSensitivity, ToolResultVisibility, ToolTurnBudget,
-        WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
+        RunLifecyclePhase, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
+        ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
         REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::json;
@@ -1602,6 +1642,33 @@ mod tests {
         let budget = ToolTurnBudget::default();
         assert!(budget.max_model_inline_bytes > budget.max_model_summary_bytes);
         assert!(budget.max_artifact_read_bytes >= budget.max_model_inline_bytes);
+    }
+
+    #[test]
+    fn tool_result_projection_audit_record_uses_stable_wire_names() {
+        let record = ToolResultProjectionAuditRecord {
+            schema_version: 1,
+            proposal_id: "call-01".to_owned(),
+            tool_name: "palyra.process.run".to_owned(),
+            policy: ToolResultProjectionPolicyKind::RedactedPreviewAndArtifact,
+            decision: ToolResultProjectionDecisionKind::SpilledToArtifact,
+            visibility: ToolResultVisibility::RedactedPreview,
+            sensitivity: ToolResultSensitivity::StdoutStderr,
+            reason_code: "tool_result_projection.high_volume_artifact".to_owned(),
+            redaction_level: "redacted_preview_only".to_owned(),
+            artifact_id: Some("artifact-01".to_owned()),
+            artifact_digest_sha256: Some("digest".to_owned()),
+            original_output_bytes: 65_536,
+            model_visible_output_bytes: 1_024,
+            saved_model_visible_bytes: 64_512,
+            budget: ToolTurnBudget::default(),
+        };
+        let value = serde_json::to_value(record).expect("record should serialize");
+
+        assert_eq!(value["policy"], "redacted_preview_and_artifact");
+        assert_eq!(value["decision"], "spilled_to_artifact");
+        assert_eq!(value["visibility"], "redacted_preview");
+        assert_eq!(value["sensitivity"], "stdout_stderr");
     }
 
     #[test]

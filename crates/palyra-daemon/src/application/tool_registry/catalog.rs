@@ -293,6 +293,9 @@ pub(crate) fn search_tool_catalog_index(
                 "capability_class": entry.capability_class,
                 "risk_tier": entry.risk_tier,
                 "approval_summary": entry.approval_summary,
+                "exposure_reason": entry.exposure_reason,
+                "repair_hint": entry.repair_hint,
+                "projection_policy": entry.projection_policy.as_str(),
                 "schema_digest": entry.provider_schema_hash,
                 "relevance": relevance,
             })
@@ -336,6 +339,8 @@ pub(crate) fn describe_catalog_tool(
             super::types::ToolApprovalPosture::ApprovalRequired
         ),
         "approval_summary": approval_summary(tool),
+        "exposure_reason": tool.exposure_reason,
+        "repair_hint": repair_hint_for_tool(tool),
         "projection_policy": tool.projection_policy.as_str(),
         "parallelism_policy": tool.parallelism_policy.as_str(),
         "safety_notes": safety_notes_for_tool(tool),
@@ -441,6 +446,7 @@ pub(crate) fn tool_catalog_tape_payload(snapshot: &ModelVisibleToolCatalogSnapsh
                 "internal_schema_hash": tool.internal_schema_hash,
                 "provider_schema_hash": tool.provider_schema_hash,
                 "exposure_reason": tool.exposure_reason,
+                "repair_hint": repair_hint_for_tool(tool),
                 "approval_posture": tool.approval_posture.as_str(),
                 "projection_policy": tool.projection_policy.as_str(),
                 "parallelism_policy": tool.parallelism_policy.as_str(),
@@ -615,6 +621,9 @@ fn index_entry_for_tool(tool: &ModelVisibleTool) -> ToolCatalogIndexEntry {
         capability_class: capability_class(tool),
         risk_tier: tool.approval_posture.as_str().to_owned(),
         approval_summary: approval_summary(tool),
+        exposure_reason: tool.exposure_reason.clone(),
+        repair_hint: repair_hint_for_tool(tool),
+        projection_policy: tool.projection_policy,
         provider_schema_hash: tool.provider_schema_hash.clone(),
         internal_schema_hash: tool.internal_schema_hash.clone(),
     }
@@ -643,6 +652,26 @@ fn approval_summary(tool: &ModelVisibleTool) -> String {
             "approval required before execution".to_owned()
         }
     }
+}
+
+fn repair_hint_for_tool(tool: &ModelVisibleTool) -> String {
+    if is_catalog_bridge_tool(tool.name.as_str()) {
+        return "use palyra.tools.search to find a tool, palyra.tools.describe to fetch its schema_digest, then palyra.tools.invoke with that digest"
+            .to_owned();
+    }
+    if matches!(tool.approval_posture, super::types::ToolApprovalPosture::ApprovalRequired) {
+        return "request approval before execution, or choose a read-only lower-risk tool when approval is unavailable"
+            .to_owned();
+    }
+    if matches!(
+        tool.projection_policy,
+        ToolResultProjectionPolicy::SummarizeAndArtifact
+            | ToolResultProjectionPolicy::RedactedPreviewAndArtifact
+    ) {
+        return "large or sensitive results return a summary plus artifact metadata; use palyra.artifact.read for bounded local preview reads"
+            .to_owned();
+    }
+    "call with arguments matching provider_schema; if hidden by compact catalog, use palyra.tools.describe before invoking".to_owned()
 }
 
 fn safety_notes_for_tool(tool: &ModelVisibleTool) -> Vec<String> {
