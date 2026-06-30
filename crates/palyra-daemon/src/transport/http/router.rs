@@ -1193,6 +1193,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::memory::console_learning_candidates_list_handler),
         )
         .route(
+            "/console/v1/memory/learning/curator/report",
+            post(console::memory::console_learning_curator_report_handler),
+        )
+        .route(
             "/console/v1/memory/learning/candidates/{candidate_id}/history",
             get(console::memory::console_learning_candidate_history_handler),
         )

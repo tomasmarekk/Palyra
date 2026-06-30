@@ -3681,6 +3681,8 @@ pub struct SessionSearchRequest {
 pub const RECALL_ARTIFACT_KIND_PREVIEW: &str = "recall_preview";
 /// Artifact kind for persisted session-search results.
 pub const RECALL_ARTIFACT_KIND_SESSION_SEARCH: &str = "session_search";
+/// Artifact kind for observe-only learning curator reports.
+pub const RECALL_ARTIFACT_KIND_LEARNING_CURATOR_REPORT: &str = "learning_curator_report";
 /// Stable schema for session-search source-ref UX projections.
 pub const SESSION_SEARCH_UX_SOURCE_REFS_SCHEMA_VERSION: u64 = 1;
 /// Audit event emitted when session-search source refs are projected.

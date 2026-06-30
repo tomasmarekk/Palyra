@@ -1683,6 +1683,12 @@ export interface LearningPreferenceRecord {
   updated_at_unix_ms: number;
 }
 
+export interface LearningCuratorReportEnvelope {
+  report: JsonValue;
+  artifact: RecallArtifactRecord;
+  contract: ContractDescriptor;
+}
+
 export interface ChatAttachmentRecord {
   artifact_id: string;
   attachment_id: string;
@@ -6389,6 +6395,20 @@ export class ConsoleApiClient {
     contract: ContractDescriptor;
   }> {
     return this.request(buildPathWithQuery("/console/v1/memory/learning/candidates", params));
+  }
+
+  async createLearningCuratorReport(payload?: {
+    limit?: number;
+    stale_after_ms?: number;
+  }): Promise<LearningCuratorReportEnvelope> {
+    return this.request(
+      "/console/v1/memory/learning/curator/report",
+      {
+        method: "POST",
+        body: JSON.stringify(payload ?? {}),
+      },
+      { csrf: true },
+    );
   }
 
   async getLearningCandidateHistory(candidateId: string): Promise<{

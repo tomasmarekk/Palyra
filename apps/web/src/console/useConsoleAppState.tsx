@@ -42,6 +42,7 @@ import {
   emptyToUndefined,
   isJsonObject,
   parseInteger,
+  readNumber,
   readObject,
   readString,
   toErrorMessage,
@@ -451,6 +452,9 @@ export function useConsoleAppState() {
   const [memoryLearningCandidates, setMemoryLearningCandidates] = useState<JsonObject[]>([]);
   const [memoryLearningHistory, setMemoryLearningHistory] = useState<JsonObject[]>([]);
   const [memoryLearningPreferences, setMemoryLearningPreferences] = useState<JsonObject[]>([]);
+  const [memoryLearningCuratorReport, setMemoryLearningCuratorReport] = useState<JsonObject | null>(
+    null,
+  );
   const [memoryLearningCandidateId, setMemoryLearningCandidateId] = useState("");
   const [memoryLearningCandidateKindFilter, setMemoryLearningCandidateKindFilter] = useState("");
   const [memoryLearningStatusFilter, setMemoryLearningStatusFilter] = useState("");
@@ -903,6 +907,7 @@ export function useConsoleAppState() {
     setMemoryLearningCandidates([]);
     setMemoryLearningHistory([]);
     setMemoryLearningPreferences([]);
+    setMemoryLearningCuratorReport(null);
     setMemoryLearningCandidateId("");
     setMemoryLearningCandidateKindFilter("");
     setMemoryLearningStatusFilter("");
@@ -1225,6 +1230,24 @@ export function useConsoleAppState() {
       } else {
         setMemoryLearningHistory([]);
       }
+    } catch (failure) {
+      setError(toErrorMessage(failure));
+    } finally {
+      setMemoryLearningBusy(false);
+    }
+  }
+
+  async function createLearningCuratorReport(): Promise<void> {
+    setMemoryLearningBusy(true);
+    setError(null);
+    try {
+      const response = await api.createLearningCuratorReport({ limit: 256 });
+      setMemoryLearningCuratorReport(response.report as unknown as JsonObject);
+      rememberRecallArtifact(response.artifact as unknown as JsonValue | undefined);
+      setNotice(
+        `Learning curator found ${readNumber(response.report as unknown as JsonObject, "finding_count") ?? 0} issue(s).`,
+      );
+      await refreshLearningQueue();
     } catch (failure) {
       setError(toErrorMessage(failure));
     } finally {
@@ -1866,6 +1889,7 @@ export function useConsoleAppState() {
     memoryLearningCandidates,
     memoryLearningHistory,
     memoryLearningPreferences,
+    memoryLearningCuratorReport,
     memoryLearningCandidateId,
     memoryLearningCandidateKindFilter,
     setMemoryLearningCandidateKindFilter,
@@ -1886,6 +1910,7 @@ export function useConsoleAppState() {
     memoryRecallArtifacts,
     refreshMemoryStatus,
     refreshLearningQueue,
+    createLearningCuratorReport,
     refreshWorkspaceDocuments,
     searchMemory,
     selectLearningCandidate,

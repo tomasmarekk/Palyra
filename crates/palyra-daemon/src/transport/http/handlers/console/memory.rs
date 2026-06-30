@@ -11,25 +11,30 @@
 //! `memory_external_index` module; recall/search handlers persist their
 //! outcomes as recall artifacts in the journal.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::gateway::ListOrchestratorSessionsRequest;
 use crate::gateway::{current_unix_ms, MEMORY_AUTO_INJECT_MIN_SCORE};
 use crate::journal::{
     session_search_source_refs_projection, MemoryRetentionPolicy, RecallArtifactCreateRequest,
     RecallArtifactListFilter, RecallArtifactRecord, SessionSearchOutcome, SessionSearchRequest,
-    RECALL_ARTIFACT_KIND_PREVIEW, RECALL_ARTIFACT_KIND_SESSION_SEARCH,
+    RECALL_ARTIFACT_KIND_LEARNING_CURATOR_REPORT, RECALL_ARTIFACT_KIND_PREVIEW,
+    RECALL_ARTIFACT_KIND_SESSION_SEARCH,
 };
 use crate::*;
 use crate::{
     application::learning::{
         apply_patch_learning_candidate, apply_preference_candidate,
-        shadow_learning_candidate_lifecycle,
+        shadow_learning_candidate_lifecycle, LearningCurator, LearningCuratorInput,
+        LearningCuratorReport, LEARNING_CURATOR_EVENT_REPORT_CREATED,
     },
     application::memory_provider::{
         explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
@@ -813,6 +818,105 @@ pub(crate) async fn console_memory_purge_handler(
         .await
         .map_err(runtime_status_response)?;
     Ok(Json(json!({ "deleted_count": deleted_count })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ConsoleLearningCuratorReportRequest {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    stale_after_ms: Option<i64>,
+}
+
+/// `POST /console/v1/memory/learning/curator/report` — builds an observe-only
+/// learning curator report, stores it as a recall artifact, and records a
+/// console audit event. The report suggests dedupe, merge, conflict, and
+/// archive actions but never mutates candidates, preferences, or procedures.
+///
+/// # Errors
+/// Returns an error response when authorization, journal reads, artifact
+/// creation, or console-event recording fails.
+pub(crate) async fn console_learning_curator_report_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConsoleLearningCuratorReportRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let limit = payload.limit.unwrap_or(256).clamp(1, 512);
+    let stale_after_ms = payload.stale_after_ms.unwrap_or(14 * 24 * 60 * 60 * 1_000).max(0);
+    let candidates = state
+        .runtime
+        .list_learning_candidates(journal::LearningCandidateListFilter {
+            candidate_id: None,
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            session_id: None,
+            scope_kind: None,
+            scope_id: None,
+            candidate_kind: None,
+            status: None,
+            risk_level: None,
+            source_task_id: None,
+            min_confidence: None,
+            max_confidence: None,
+            limit,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let preferences = state
+        .runtime
+        .list_learning_preferences(journal::LearningPreferenceListFilter {
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            scope_kind: None,
+            scope_id: None,
+            status: Some("active".to_owned()),
+            key: None,
+            limit,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let report = LearningCurator.curate(LearningCuratorInput {
+        report_id: Ulid::new().to_string(),
+        generated_at_unix_ms: current_unix_ms(),
+        stale_after_ms,
+        candidates: candidates.as_slice(),
+        preferences: preferences.as_slice(),
+    });
+    let artifact = state
+        .runtime
+        .create_recall_artifact(build_learning_curator_artifact_request(
+            &session.context,
+            session.context.channel.clone(),
+            &report,
+        ))
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_console_event(
+            &session.context,
+            LEARNING_CURATOR_EVENT_REPORT_CREATED,
+            json!({
+                "artifact_id": artifact.artifact_id,
+                "report_id": report.run.report_id,
+                "finding_count": report.finding_count,
+                "candidate_count": report.run.candidate_count,
+                "preference_count": report.run.preference_count,
+                "decision": report.decision,
+                "reason_code": report.reason_code,
+                "mutation_policy": report.run.mutation_policy,
+            }),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "report": report,
+        "artifact": artifact,
+        "contract": contract_descriptor(),
+    })))
 }
 
 /// `GET /console/v1/memory/learning/candidates` — lists the caller's learning
@@ -2049,6 +2153,51 @@ fn build_session_search_artifact_request(
             "source_refs_decision": source_refs_projection.decision,
         }),
         provenance: session_search_provenance(outcome, &source_refs_projection),
+        created_by_principal: context.principal.clone(),
+    }
+}
+
+fn build_learning_curator_artifact_request(
+    context: &RequestContext,
+    channel: Option<String>,
+    report: &LearningCuratorReport,
+) -> RecallArtifactCreateRequest {
+    RecallArtifactCreateRequest {
+        artifact_id: report.run.report_id.clone(),
+        artifact_kind: RECALL_ARTIFACT_KIND_LEARNING_CURATOR_REPORT.to_owned(),
+        principal: context.principal.clone(),
+        device_id: context.device_id.clone(),
+        channel,
+        session_id: None,
+        query: "learning curator report".to_owned(),
+        summary: format!("{} learning curator finding(s)", report.finding_count),
+        payload: json!({
+            "report": report,
+            "durable_memory_write": false,
+        }),
+        diagnostics: json!({
+            "event_type": report.event_type,
+            "decision": report.decision,
+            "reason_code": report.reason_code,
+            "finding_count": report.finding_count,
+            "candidate_count": report.run.candidate_count,
+            "preference_count": report.run.preference_count,
+            "redaction_level": report.redaction_level,
+            "mutation_policy": report.run.mutation_policy,
+        }),
+        provenance: json!({
+            "source": "learning_curator",
+            "event_type": report.event_type,
+            "report_id": report.run.report_id,
+            "evidence_refs": report
+                .findings
+                .iter()
+                .flat_map(|finding| finding.evidence_refs.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "redaction_level": report.redaction_level,
+        }),
         created_by_principal: context.principal.clone(),
     }
 }

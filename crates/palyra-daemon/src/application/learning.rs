@@ -30,6 +30,7 @@ use palyra_common::workspace_patch::{
     apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
     WorkspacePatchRequest,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Status;
 use ulid::Ulid;
@@ -65,6 +66,443 @@ const PATCH_PROCEDURE_CANDIDATE_KIND: &str = "patch_procedure";
 const PATCH_SUPPORT_FILE_CANDIDATE_KIND: &str = "write_support_file";
 const PATCH_LEARNING_REASONING_VERSION: &str = "patch_learning_v1";
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+pub(crate) const LEARNING_CURATOR_EVENT_REPORT_CREATED: &str = "learning.curator.report_created";
+const LEARNING_CURATOR_SCHEMA_VERSION: u64 = 1;
+const LEARNING_CURATOR_REDACTION_LEVEL: &str = "metadata_only";
+
+/// Observe-only curator over learning candidates and active preferences.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LearningCurator;
+
+/// Inputs for one learning-curator report generation pass.
+pub(crate) struct LearningCuratorInput<'a> {
+    pub report_id: String,
+    pub generated_at_unix_ms: i64,
+    pub stale_after_ms: i64,
+    pub candidates: &'a [LearningCandidateRecord],
+    pub preferences: &'a [LearningPreferenceRecord],
+}
+
+/// Curator-level report decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LearningCuratorDecision {
+    ReportCreated,
+    NoFindings,
+}
+
+/// Stable reason code for a curator report.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum LearningCuratorReasonCode {
+    #[serde(rename = "learning_curator.findings_detected")]
+    FindingsDetected,
+    #[serde(rename = "learning_curator.no_findings")]
+    NoFindings,
+}
+
+/// Kind of curation suggestion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LearningCuratorFindingKind {
+    DuplicateCandidate,
+    ProcedureMerge,
+    StaleCandidate,
+    PreferenceConflict,
+}
+
+/// Stable reason code for one curator finding.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum LearningCuratorFindingReasonCode {
+    #[serde(rename = "learning_curator.duplicate_candidate")]
+    DuplicateCandidate,
+    #[serde(rename = "learning_curator.procedure_merge_suggested")]
+    ProcedureMergeSuggested,
+    #[serde(rename = "learning_curator.stale_candidate_archive_suggested")]
+    StaleCandidateArchiveSuggested,
+    #[serde(rename = "learning_curator.preference_conflict")]
+    PreferenceConflict,
+}
+
+/// One non-mutating curator suggestion with enough evidence for operator review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LearningCuratorFinding {
+    pub finding_id: String,
+    pub finding_kind: LearningCuratorFindingKind,
+    pub reason_code: LearningCuratorFindingReasonCode,
+    pub severity: String,
+    pub candidate_ids: Vec<String>,
+    pub preference_ids: Vec<String>,
+    pub scope_kind: Option<String>,
+    pub scope_id_hash: Option<String>,
+    pub key: Option<String>,
+    pub value_hashes: Vec<String>,
+    pub suggested_action: String,
+    pub evidence_refs: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Metadata about one curator run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LearningCuratorRun {
+    pub report_id: String,
+    pub generated_at_unix_ms: i64,
+    pub stale_after_ms: i64,
+    pub candidate_count: u64,
+    pub preference_count: u64,
+    pub mutation_policy: String,
+}
+
+/// Auditable curator report. It is intentionally observe-only; activation
+/// remains behind the existing review, eval, and apply gates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LearningCuratorReport {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: LearningCuratorDecision,
+    pub reason_code: LearningCuratorReasonCode,
+    pub run: LearningCuratorRun,
+    pub finding_count: u64,
+    pub findings_by_kind: BTreeMap<LearningCuratorFindingKind, u64>,
+    pub findings: Vec<LearningCuratorFinding>,
+    pub redaction_level: String,
+}
+
+impl LearningCurator {
+    pub(crate) fn curate(&self, input: LearningCuratorInput<'_>) -> LearningCuratorReport {
+        let mut findings = Vec::new();
+        findings.extend(curate_duplicate_learning_candidates(input.candidates));
+        findings.extend(curate_procedure_merge_candidates(input.candidates));
+        findings.extend(curate_stale_learning_candidates(
+            input.candidates,
+            input.generated_at_unix_ms,
+            input.stale_after_ms,
+        ));
+        findings.extend(curate_preference_conflicts(input.candidates, input.preferences));
+        let mut findings_by_kind = BTreeMap::new();
+        for finding in &findings {
+            *findings_by_kind.entry(finding.finding_kind).or_insert(0) += 1;
+        }
+        let has_findings = !findings.is_empty();
+        LearningCuratorReport {
+            schema_version: LEARNING_CURATOR_SCHEMA_VERSION,
+            event_type: LEARNING_CURATOR_EVENT_REPORT_CREATED.to_owned(),
+            decision: if has_findings {
+                LearningCuratorDecision::ReportCreated
+            } else {
+                LearningCuratorDecision::NoFindings
+            },
+            reason_code: if has_findings {
+                LearningCuratorReasonCode::FindingsDetected
+            } else {
+                LearningCuratorReasonCode::NoFindings
+            },
+            run: LearningCuratorRun {
+                report_id: input.report_id,
+                generated_at_unix_ms: input.generated_at_unix_ms,
+                stale_after_ms: input.stale_after_ms,
+                candidate_count: input.candidates.len() as u64,
+                preference_count: input.preferences.len() as u64,
+                mutation_policy: "observe_only_no_activation".to_owned(),
+            },
+            finding_count: findings.len() as u64,
+            findings_by_kind,
+            findings,
+            redaction_level: LEARNING_CURATOR_REDACTION_LEVEL.to_owned(),
+        }
+    }
+}
+
+fn curate_duplicate_learning_candidates(
+    candidates: &[LearningCandidateRecord],
+) -> Vec<LearningCuratorFinding> {
+    let mut groups = BTreeMap::<String, Vec<&LearningCandidateRecord>>::new();
+    for candidate in candidates.iter().filter(|candidate| learning_candidate_open(candidate)) {
+        let key = format!(
+            "{}:{}:{}:{}",
+            candidate.candidate_kind,
+            candidate.scope_kind,
+            candidate.scope_id,
+            candidate.dedupe_key
+        );
+        groups.entry(key).or_default().push(candidate);
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|group| {
+            learning_curator_finding(LearningCuratorFindingInput {
+                finding_kind: LearningCuratorFindingKind::DuplicateCandidate,
+                reason_code: LearningCuratorFindingReasonCode::DuplicateCandidate,
+                severity: "medium",
+                candidate_ids: group
+                    .iter()
+                    .map(|candidate| candidate.candidate_id.clone())
+                    .collect(),
+                preference_ids: Vec::new(),
+                scope_kind: group.first().map(|candidate| candidate.scope_kind.clone()),
+                scope_id: group.first().map(|candidate| candidate.scope_id.as_str()),
+                key: None,
+                value_hashes: Vec::new(),
+                suggested_action: "merge_or_archive_duplicate_candidates",
+            })
+        })
+        .collect()
+}
+
+fn curate_procedure_merge_candidates(
+    candidates: &[LearningCandidateRecord],
+) -> Vec<LearningCuratorFinding> {
+    let mut groups = BTreeMap::<String, Vec<&LearningCandidateRecord>>::new();
+    for candidate in candidates.iter().filter(|candidate| learning_candidate_open(candidate)) {
+        if !matches!(
+            candidate.candidate_kind.as_str(),
+            "procedure" | PATCH_PROCEDURE_CANDIDATE_KIND
+        ) {
+            continue;
+        }
+        let Some(signature) = learning_candidate_procedure_signature(candidate) else {
+            continue;
+        };
+        groups.entry(signature).or_default().push(candidate);
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .map(|group| {
+            learning_curator_finding(LearningCuratorFindingInput {
+                finding_kind: LearningCuratorFindingKind::ProcedureMerge,
+                reason_code: LearningCuratorFindingReasonCode::ProcedureMergeSuggested,
+                severity: "medium",
+                candidate_ids: group
+                    .iter()
+                    .map(|candidate| candidate.candidate_id.clone())
+                    .collect(),
+                preference_ids: Vec::new(),
+                scope_kind: group.first().map(|candidate| candidate.scope_kind.clone()),
+                scope_id: group.first().map(|candidate| candidate.scope_id.as_str()),
+                key: None,
+                value_hashes: Vec::new(),
+                suggested_action: "review_and_merge_procedure_candidates_without_auto_activation",
+            })
+        })
+        .collect()
+}
+
+fn curate_stale_learning_candidates(
+    candidates: &[LearningCandidateRecord],
+    now_unix_ms: i64,
+    stale_after_ms: i64,
+) -> Vec<LearningCuratorFinding> {
+    let cutoff = now_unix_ms.saturating_sub(stale_after_ms.max(0));
+    candidates
+        .iter()
+        .filter(|candidate| learning_candidate_open(candidate))
+        .filter(|candidate| candidate.updated_at_unix_ms <= cutoff)
+        .map(|candidate| {
+            learning_curator_finding(LearningCuratorFindingInput {
+                finding_kind: LearningCuratorFindingKind::StaleCandidate,
+                reason_code: LearningCuratorFindingReasonCode::StaleCandidateArchiveSuggested,
+                severity: "low",
+                candidate_ids: vec![candidate.candidate_id.clone()],
+                preference_ids: Vec::new(),
+                scope_kind: Some(candidate.scope_kind.clone()),
+                scope_id: Some(candidate.scope_id.as_str()),
+                key: None,
+                value_hashes: Vec::new(),
+                suggested_action: "archive_or_refresh_stale_candidate_after_operator_review",
+            })
+        })
+        .collect()
+}
+
+fn curate_preference_conflicts(
+    candidates: &[LearningCandidateRecord],
+    preferences: &[LearningPreferenceRecord],
+) -> Vec<LearningCuratorFinding> {
+    let mut groups = BTreeMap::<String, Vec<PreferenceConflictEntry>>::new();
+    for candidate in candidates.iter().filter(|candidate| learning_candidate_open(candidate)) {
+        if candidate.candidate_kind != "preference" {
+            continue;
+        }
+        let Some(entry) = preference_conflict_entry_from_candidate(candidate) else {
+            continue;
+        };
+        groups.entry(entry.group_key()).or_default().push(entry);
+    }
+
+    for preference in preferences.iter().filter(|preference| preference.status == "active") {
+        let entry = PreferenceConflictEntry {
+            candidate_id: None,
+            preference_id: Some(preference.preference_id.clone()),
+            scope_kind: preference.scope_kind.clone(),
+            scope_id: preference.scope_id.clone(),
+            key: preference.key.clone(),
+            value_hash: crate::sha256_hex(
+                canonical_learning_text(preference.value.as_str()).as_bytes(),
+            ),
+        };
+        groups.entry(entry.group_key()).or_default().push(entry);
+    }
+    groups.into_values().filter_map(preference_conflict_finding).collect()
+}
+
+struct LearningCuratorFindingInput<'a> {
+    finding_kind: LearningCuratorFindingKind,
+    reason_code: LearningCuratorFindingReasonCode,
+    severity: &'a str,
+    candidate_ids: Vec<String>,
+    preference_ids: Vec<String>,
+    scope_kind: Option<String>,
+    scope_id: Option<&'a str>,
+    key: Option<String>,
+    value_hashes: Vec<String>,
+    suggested_action: &'a str,
+}
+
+fn learning_curator_finding(input: LearningCuratorFindingInput<'_>) -> LearningCuratorFinding {
+    let LearningCuratorFindingInput {
+        finding_kind,
+        reason_code,
+        severity,
+        mut candidate_ids,
+        mut preference_ids,
+        scope_kind,
+        scope_id,
+        key,
+        mut value_hashes,
+        suggested_action,
+    } = input;
+    candidate_ids.sort();
+    candidate_ids.dedup();
+    preference_ids.sort();
+    preference_ids.dedup();
+    value_hashes.sort();
+    value_hashes.dedup();
+    let mut evidence_refs = candidate_ids
+        .iter()
+        .map(|candidate_id| format!("learning_candidate:{candidate_id}"))
+        .collect::<Vec<_>>();
+    evidence_refs.extend(
+        preference_ids.iter().map(|preference_id| format!("learning_preference:{preference_id}")),
+    );
+    LearningCuratorFinding {
+        finding_id: crate::sha256_hex(
+            format!(
+                "{:?}:{:?}:{}:{}",
+                finding_kind,
+                reason_code,
+                candidate_ids.join(","),
+                preference_ids.join(",")
+            )
+            .as_bytes(),
+        )
+        .chars()
+        .take(24)
+        .collect(),
+        finding_kind,
+        reason_code,
+        severity: severity.to_owned(),
+        candidate_ids,
+        preference_ids,
+        scope_kind,
+        scope_id_hash: scope_id.map(|scope_id| crate::sha256_hex(scope_id.as_bytes())),
+        key,
+        value_hashes,
+        suggested_action: suggested_action.to_owned(),
+        evidence_refs,
+        redaction_level: LEARNING_CURATOR_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreferenceConflictEntry {
+    candidate_id: Option<String>,
+    preference_id: Option<String>,
+    scope_kind: String,
+    scope_id: String,
+    key: String,
+    value_hash: String,
+}
+
+impl PreferenceConflictEntry {
+    fn group_key(&self) -> String {
+        format!("{}:{}:{}", self.scope_kind, self.scope_id, self.key)
+    }
+}
+
+fn preference_conflict_entry_from_candidate(
+    candidate: &LearningCandidateRecord,
+) -> Option<PreferenceConflictEntry> {
+    let content = serde_json::from_str::<Value>(candidate.content_json.as_str()).ok()?;
+    let key = content.get("key").and_then(Value::as_str)?.trim();
+    let value = content.get("value").and_then(Value::as_str)?.trim();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some(PreferenceConflictEntry {
+        candidate_id: Some(candidate.candidate_id.clone()),
+        preference_id: None,
+        scope_kind: content
+            .get("scope_kind")
+            .and_then(Value::as_str)
+            .unwrap_or(candidate.scope_kind.as_str())
+            .to_owned(),
+        scope_id: content
+            .get("scope_id")
+            .and_then(Value::as_str)
+            .unwrap_or(candidate.scope_id.as_str())
+            .to_owned(),
+        key: key.to_owned(),
+        value_hash: crate::sha256_hex(canonical_learning_text(value).as_bytes()),
+    })
+}
+
+fn preference_conflict_finding(
+    entries: Vec<PreferenceConflictEntry>,
+) -> Option<LearningCuratorFinding> {
+    let value_hashes =
+        entries.iter().map(|entry| entry.value_hash.clone()).collect::<BTreeSet<_>>();
+    if value_hashes.len() < 2 {
+        return None;
+    }
+    let first = entries.first()?;
+    Some(learning_curator_finding(LearningCuratorFindingInput {
+        finding_kind: LearningCuratorFindingKind::PreferenceConflict,
+        reason_code: LearningCuratorFindingReasonCode::PreferenceConflict,
+        severity: "high",
+        candidate_ids: entries.iter().filter_map(|entry| entry.candidate_id.clone()).collect(),
+        preference_ids: entries.iter().filter_map(|entry| entry.preference_id.clone()).collect(),
+        scope_kind: Some(first.scope_kind.clone()),
+        scope_id: Some(first.scope_id.as_str()),
+        key: Some(first.key.clone()),
+        value_hashes: value_hashes.into_iter().collect(),
+        suggested_action: "resolve_preference_conflict_before_activation",
+    }))
+}
+
+fn learning_candidate_open(candidate: &LearningCandidateRecord) -> bool {
+    matches!(
+        candidate.status.as_str(),
+        "queued" | "suppressed" | "approved" | "accepted" | "eval_passed" | "shadow"
+    )
+}
+
+fn learning_candidate_procedure_signature(candidate: &LearningCandidateRecord) -> Option<String> {
+    let content = serde_json::from_str::<Value>(candidate.content_json.as_str()).ok();
+    let signature = content
+        .as_ref()
+        .and_then(|content| content.get("signature").and_then(Value::as_str))
+        .or_else(|| {
+            content.as_ref().and_then(|content| content.get("title").and_then(Value::as_str))
+        })
+        .unwrap_or(candidate.title.as_str());
+    let signature = canonical_learning_text(signature);
+    (!signature.is_empty()).then_some(signature)
+}
+
+fn canonical_learning_text(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_ascii_lowercase()
+}
 
 /// Per-run summary of one successful tool sequence, grouped across runs by
 /// signature to detect repeatable procedures.
@@ -2356,6 +2794,68 @@ mod tests {
         LearningRuntimeConfig::default()
     }
 
+    fn learning_candidate_record(
+        candidate_id: &str,
+        candidate_kind: &str,
+        status: &str,
+        dedupe_key: &str,
+        content_json: Value,
+        updated_at_unix_ms: i64,
+    ) -> LearningCandidateRecord {
+        LearningCandidateRecord {
+            candidate_id: candidate_id.to_owned(),
+            candidate_kind: candidate_kind.to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FD2".to_owned(),
+            run_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FD1".to_owned()),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "dev-01".to_owned(),
+            channel: Some("cli".to_owned()),
+            scope_kind: "profile".to_owned(),
+            scope_id: "user:ops".to_owned(),
+            status: status.to_owned(),
+            auto_applied: false,
+            confidence: 0.88,
+            risk_level: "review".to_owned(),
+            title: format!("{candidate_kind} fixture"),
+            summary: "Curator fixture".to_owned(),
+            target_path: None,
+            dedupe_key: dedupe_key.to_owned(),
+            content_json: content_json.to_string(),
+            provenance_json: "[]".to_owned(),
+            source_task_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FT1".to_owned()),
+            created_at_unix_ms: updated_at_unix_ms.saturating_sub(100),
+            updated_at_unix_ms,
+            reviewed_at_unix_ms: None,
+            reviewed_by_principal: None,
+            last_action_summary: None,
+            last_action_payload_json: None,
+        }
+    }
+
+    fn learning_preference_record(
+        preference_id: &str,
+        key: &str,
+        value: &str,
+    ) -> LearningPreferenceRecord {
+        LearningPreferenceRecord {
+            preference_id: preference_id.to_owned(),
+            owner_principal: "user:ops".to_owned(),
+            device_id: "dev-01".to_owned(),
+            channel: Some("cli".to_owned()),
+            scope_kind: "profile".to_owned(),
+            scope_id: "user:ops".to_owned(),
+            key: key.to_owned(),
+            value: value.to_owned(),
+            source_kind: "operator".to_owned(),
+            status: "active".to_owned(),
+            confidence: 0.91,
+            candidate_id: None,
+            provenance_json: "[]".to_owned(),
+            created_at_unix_ms: 1_699_999_999_000,
+            updated_at_unix_ms: 1_699_999_999_500,
+        }
+    }
+
     #[test]
     fn memory_eval_fixture_covers_shadow_and_safety_cases() {
         let fixture = include_str!("../../../../fixtures/memory_eval/shadow_write_cases.json");
@@ -2437,6 +2937,152 @@ mod tests {
         assert!(learning_sample_included("7f", 50));
         assert!(!learning_sample_included("80", 50));
         assert!(!learning_sample_included("00", 0));
+    }
+
+    #[test]
+    fn learning_curator_reports_procedure_merge_without_activation() {
+        let candidates = vec![
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LC1",
+                "procedure",
+                "queued",
+                "procedure:one",
+                json!({"signature": "palyra.fs.apply_patch -> palyra.tests.run"}),
+                1_700_000_000_000,
+            ),
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LC2",
+                "procedure",
+                "queued",
+                "procedure:two",
+                json!({"signature": " palyra.fs.apply_patch   ->   palyra.tests.run "}),
+                1_700_000_000_010,
+            ),
+        ];
+
+        let report = LearningCurator.curate(LearningCuratorInput {
+            report_id: "01ARZ3NDEKTSV4RRFFQ69G5LR1".to_owned(),
+            generated_at_unix_ms: 1_700_000_000_100,
+            stale_after_ms: 60_000,
+            candidates: candidates.as_slice(),
+            preferences: &[],
+        });
+
+        assert_eq!(report.event_type, LEARNING_CURATOR_EVENT_REPORT_CREATED);
+        assert_eq!(report.run.mutation_policy, "observe_only_no_activation");
+        assert!(report.findings.iter().any(|finding| {
+            finding.finding_kind == LearningCuratorFindingKind::ProcedureMerge
+                && finding.reason_code == LearningCuratorFindingReasonCode::ProcedureMergeSuggested
+                && finding.candidate_ids.len() == 2
+        }));
+        let serialized = serde_json::to_value(&report).expect("curator report should serialize");
+        let decoded = serde_json::from_value::<LearningCuratorReport>(serialized)
+            .expect("curator report should deserialize");
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn learning_curator_reports_conflicting_preference_candidates() {
+        let candidates = vec![
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LP1",
+                "preference",
+                "queued",
+                "preference:style:concise",
+                json!({
+                    "scope_kind": "profile",
+                    "scope_id": "user:ops",
+                    "key": "interaction.style",
+                    "value": "concise",
+                }),
+                1_700_000_000_000,
+            ),
+            learning_candidate_record(
+                "01ARZ3NDEKTSV4RRFFQ69G5LP2",
+                "preference",
+                "queued",
+                "preference:style:verbose",
+                json!({
+                    "scope_kind": "profile",
+                    "scope_id": "user:ops",
+                    "key": "interaction.style",
+                    "value": "verbose",
+                }),
+                1_700_000_000_010,
+            ),
+        ];
+
+        let report = LearningCurator.curate(LearningCuratorInput {
+            report_id: "01ARZ3NDEKTSV4RRFFQ69G5LR2".to_owned(),
+            generated_at_unix_ms: 1_700_000_000_100,
+            stale_after_ms: 60_000,
+            candidates: candidates.as_slice(),
+            preferences: &[],
+        });
+        let conflict = report
+            .findings
+            .iter()
+            .find(|finding| finding.finding_kind == LearningCuratorFindingKind::PreferenceConflict)
+            .expect("preference conflict should be reported");
+
+        assert_eq!(conflict.reason_code, LearningCuratorFindingReasonCode::PreferenceConflict);
+        assert_eq!(conflict.key.as_deref(), Some("interaction.style"));
+        assert_eq!(conflict.value_hashes.len(), 2);
+        assert!(conflict
+            .evidence_refs
+            .iter()
+            .all(|value| value.starts_with("learning_candidate:")));
+        let serialized = serde_json::to_string(&report).expect("report JSON should serialize");
+        assert!(!serialized.contains("concise"));
+        assert!(!serialized.contains("verbose"));
+    }
+
+    #[test]
+    fn learning_curator_reports_candidate_conflict_with_active_preference() {
+        let candidates = vec![learning_candidate_record(
+            "01ARZ3NDEKTSV4RRFFQ69G5LP3",
+            "preference",
+            "queued",
+            "preference:style:verbose",
+            json!({
+                "scope_kind": "profile",
+                "scope_id": "user:ops",
+                "key": "interaction.style",
+                "value": "verbose",
+            }),
+            1_700_000_000_010,
+        )];
+        let preferences = vec![learning_preference_record(
+            "01ARZ3NDEKTSV4RRFFQ69G5LPR",
+            "interaction.style",
+            "concise",
+        )];
+
+        let report = LearningCurator.curate(LearningCuratorInput {
+            report_id: "01ARZ3NDEKTSV4RRFFQ69G5LR3".to_owned(),
+            generated_at_unix_ms: 1_700_000_000_100,
+            stale_after_ms: 60_000,
+            candidates: candidates.as_slice(),
+            preferences: preferences.as_slice(),
+        });
+        let conflict = report
+            .findings
+            .iter()
+            .find(|finding| finding.finding_kind == LearningCuratorFindingKind::PreferenceConflict)
+            .expect("active preference conflict should be reported");
+
+        assert_eq!(conflict.candidate_ids, vec!["01ARZ3NDEKTSV4RRFFQ69G5LP3"]);
+        assert_eq!(conflict.preference_ids, vec!["01ARZ3NDEKTSV4RRFFQ69G5LPR"]);
+        assert_eq!(conflict.value_hashes.len(), 2);
+        assert!(conflict
+            .evidence_refs
+            .contains(&"learning_candidate:01ARZ3NDEKTSV4RRFFQ69G5LP3".to_owned()));
+        assert!(conflict
+            .evidence_refs
+            .contains(&"learning_preference:01ARZ3NDEKTSV4RRFFQ69G5LPR".to_owned()));
+        let serialized = serde_json::to_string(&report).expect("report JSON should serialize");
+        assert!(!serialized.contains("concise"));
+        assert!(!serialized.contains("verbose"));
     }
 
     #[cfg(unix)]

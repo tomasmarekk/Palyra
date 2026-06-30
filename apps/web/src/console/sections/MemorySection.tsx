@@ -71,6 +71,7 @@ type MemorySectionProps = {
     | "memoryLearningCandidates"
     | "memoryLearningHistory"
     | "memoryLearningPreferences"
+    | "memoryLearningCuratorReport"
     | "memoryLearningCandidateId"
     | "memoryLearningCandidateKindFilter"
     | "setMemoryLearningCandidateKindFilter"
@@ -91,6 +92,7 @@ type MemorySectionProps = {
     | "memoryRecallArtifacts"
     | "refreshMemoryStatus"
     | "refreshLearningQueue"
+    | "createLearningCuratorReport"
     | "refreshWorkspaceDocuments"
     | "selectLearningCandidate"
     | "selectWorkspaceDocument"
@@ -219,6 +221,8 @@ export function MemorySection({ app }: MemorySectionProps) {
   const learningCandidates = app.memoryLearningCandidates;
   const learningPreferences = app.memoryLearningPreferences;
   const learningHistory = app.memoryLearningHistory;
+  const learningCuratorFindingCount =
+    readNumber(app.memoryLearningCuratorReport ?? EMPTY_OBJECT, "finding_count") ?? 0;
   const selectedLearningCandidate =
     learningCandidates.find(
       (candidate) => readString(candidate, "candidate_id") === app.memoryLearningCandidateId,
@@ -444,6 +448,19 @@ export function MemorySection({ app }: MemorySectionProps) {
               >
                 {app.memoryLearningBusy ? "Refreshing..." : "Refresh queue"}
               </ActionButton>
+              <ActionButton
+                isDisabled={app.memoryLearningBusy}
+                type="button"
+                variant="ghost"
+                onPress={() => void app.createLearningCuratorReport()}
+              >
+                Curate
+              </ActionButton>
+              {app.memoryLearningCuratorReport !== null ? (
+                <WorkspaceStatusChip tone={learningCuratorFindingCount > 0 ? "warning" : "success"}>
+                  Curator {learningCuratorFindingCount}
+                </WorkspaceStatusChip>
+              ) : null}
             </div>
             <div className="workspace-stack">
               <SelectField
