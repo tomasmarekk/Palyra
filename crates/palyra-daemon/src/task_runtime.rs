@@ -11,6 +11,10 @@ use serde_json::json;
 use tonic::Status;
 
 use crate::{
+    application::plan_state::{
+        AgentPlanEvent, AgentPlanItem, AgentPlanQuery, AgentPlanStatus, AgentPlanStore,
+        AGENT_PLAN_SCHEMA_VERSION,
+    },
     gateway::GatewayRuntimeState,
     journal::{
         self, CommitmentEventRecord, CommitmentListFilter, CommitmentRecord, FlowEventRecord,
@@ -32,6 +36,7 @@ pub(crate) enum TaskSourceKind {
     ToolJob,
     WorkItem,
     Commitment,
+    AgentPlanItem,
 }
 
 impl TaskSourceKind {
@@ -42,6 +47,7 @@ impl TaskSourceKind {
             Self::ToolJob => "tool_job",
             Self::WorkItem => "work_item",
             Self::Commitment => "commitment",
+            Self::AgentPlanItem => "agent_plan_item",
         }
     }
 
@@ -52,6 +58,7 @@ impl TaskSourceKind {
             Self::ToolJob => "tool_job",
             Self::WorkItem => "work_item",
             Self::Commitment => "commitment",
+            Self::AgentPlanItem => "agent_plan",
         }
     }
 }
@@ -193,6 +200,25 @@ pub(crate) struct TaskRuntimeSummary {
 pub(crate) struct TaskRuntimeSnapshot {
     pub tasks: Vec<TaskRun>,
     pub summary: TaskRuntimeSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_progress: Option<TaskPlanProgressCheckpoint>,
+}
+
+/// Read-model checkpoint summarizing durable agent-plan progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TaskPlanProgressCheckpoint {
+    pub schema_version: u64,
+    pub plan_schema_version: u64,
+    pub rollout_enabled: bool,
+    pub source_kind: String,
+    pub reason_code: String,
+    pub total: usize,
+    pub active: usize,
+    pub blocked: usize,
+    pub completed: usize,
+    pub cancelled: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_update_unix_ms: Option<i64>,
 }
 
 /// Stateless facade over the runtime's source stores.
@@ -289,6 +315,15 @@ impl TaskRuntime {
             push_if_visible(&mut tasks, commitment_task_run(commitment)?, &filter);
         }
 
+        let mut plan_progress = None;
+        if runtime.config.feature_rollouts.agent_plan_state.enabled {
+            let plan_items = list_agent_plan_items(runtime, &filter, limit).await?;
+            plan_progress = Some(plan_progress_checkpoint(plan_items.as_slice(), true));
+            for item in plan_items {
+                push_if_visible(&mut tasks, agent_plan_task_run(item)?, &filter);
+            }
+        }
+
         tasks.sort_by(|left, right| {
             right
                 .updated_at_unix_ms
@@ -298,7 +333,7 @@ impl TaskRuntime {
         });
         tasks.truncate(limit);
         let summary = summarize_tasks(tasks.as_slice());
-        Ok(TaskRuntimeSnapshot { tasks, summary })
+        Ok(TaskRuntimeSnapshot { tasks, summary, plan_progress })
     }
 
     /// Loads one normalized task by id.
@@ -339,6 +374,10 @@ impl TaskRuntime {
                 .get_commitment(parsed.source_id.to_owned())
                 .await?
                 .map(commitment_task_run)
+                .transpose()?,
+            TaskSourceKind::AgentPlanItem => get_agent_plan_item(runtime, parsed.source_id)
+                .await?
+                .map(agent_plan_task_run)
                 .transpose()?,
         };
         Ok(task.filter(|task| {
@@ -385,6 +424,11 @@ impl TaskRuntime {
                 .into_iter()
                 .map(commitment_event)
                 .collect(),
+            "agent_plan_item" => list_agent_plan_events(runtime, source_id, TASK_EVENT_LIMIT)
+                .await?
+                .into_iter()
+                .map(agent_plan_event)
+                .collect(),
             _ => Ok(vec![synthetic_current_state_event(&task)?]),
         }
     }
@@ -408,6 +452,7 @@ impl<'a> ParsedTaskId<'a> {
             "tool_job" => TaskSourceKind::ToolJob,
             "work_item" => TaskSourceKind::WorkItem,
             "commitment" => TaskSourceKind::Commitment,
+            "agent_plan" => TaskSourceKind::AgentPlanItem,
             _ => return None,
         };
         Some(Self { kind, source_id })
@@ -422,6 +467,68 @@ fn push_if_visible(tasks: &mut Vec<TaskRun>, task: TaskRun, filter: &TaskRuntime
         return;
     }
     tasks.push(task);
+}
+
+#[allow(clippy::result_large_err)]
+async fn list_agent_plan_items(
+    runtime: &Arc<GatewayRuntimeState>,
+    filter: &TaskRuntimeFilter,
+    limit: usize,
+) -> Result<Vec<AgentPlanItem>, Status> {
+    let state = Arc::clone(runtime);
+    let query = AgentPlanQuery {
+        owner_principal: Some(filter.access.owner_principal.clone()),
+        device_id: filter.access.device_id.clone(),
+        channel: filter.access.channel.clone(),
+        session_id: None,
+        run_id: None,
+        status: None,
+        include_terminal: true,
+        limit,
+    };
+    tokio::task::spawn_blocking(move || {
+        let store = AgentPlanStore::new(&state.journal_store);
+        store.list_items(&query)
+    })
+    .await
+    .map_err(|_| Status::internal("agent plan task list worker panicked"))?
+    .map_err(|error| Status::internal(format!("failed to list agent plan tasks: {error}")))
+}
+
+#[allow(clippy::result_large_err)]
+async fn get_agent_plan_item(
+    runtime: &Arc<GatewayRuntimeState>,
+    plan_item_id: &str,
+) -> Result<Option<AgentPlanItem>, Status> {
+    if !runtime.config.feature_rollouts.agent_plan_state.enabled {
+        return Ok(None);
+    }
+    let state = Arc::clone(runtime);
+    let plan_item_id = plan_item_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let store = AgentPlanStore::new(&state.journal_store);
+        store.get_item(plan_item_id.as_str())
+    })
+    .await
+    .map_err(|_| Status::internal("agent plan task get worker panicked"))?
+    .map_err(|error| Status::internal(format!("failed to load agent plan task: {error}")))
+}
+
+#[allow(clippy::result_large_err)]
+async fn list_agent_plan_events(
+    runtime: &Arc<GatewayRuntimeState>,
+    plan_item_id: &str,
+    limit: usize,
+) -> Result<Vec<AgentPlanEvent>, Status> {
+    let state = Arc::clone(runtime);
+    let plan_item_id = plan_item_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let store = AgentPlanStore::new(&state.journal_store);
+        store.list_events(plan_item_id.as_str(), limit)
+    })
+    .await
+    .map_err(|_| Status::internal("agent plan task timeline worker panicked"))?
+    .map_err(|error| Status::internal(format!("failed to load agent plan timeline: {error}")))
 }
 
 fn background_task_run(task: OrchestratorBackgroundTaskRecord) -> Result<TaskRun, Status> {
@@ -694,6 +801,79 @@ fn commitment_task_run(commitment: CommitmentRecord) -> Result<TaskRun, Status> 
     })
 }
 
+fn agent_plan_task_run(item: AgentPlanItem) -> Result<TaskRun, Status> {
+    let source_id = item.plan_item_id.clone();
+    let state = item.status.as_str().to_owned();
+    let title = item.title.clone();
+    let reason_code = item.reason_code.clone();
+    let redaction_level = item.redaction_level.clone();
+    let retry_policy_json = json!({
+        "retry_allowed": !item.status.is_terminal(),
+        "reason_code": reason_code,
+        "redaction_level": redaction_level
+    })
+    .to_string();
+    let artifact_refs_json = redact_json(
+        json!({
+            "evidence_refs": item.evidence_refs.clone(),
+            "details": item.details.clone(),
+            "redaction_level": item.redaction_level.as_str()
+        })
+        .to_string()
+        .as_str(),
+    )?;
+    let summary = item
+        .blocked_reason
+        .clone()
+        .unwrap_or_else(|| format!("agent plan item is {}", item.status.as_str()));
+    Ok(TaskRun {
+        task_id: normalized_task_id(TaskSourceKind::AgentPlanItem, source_id.as_str()),
+        source_id: item.plan_item_id,
+        source_kind: TaskSourceKind::AgentPlanItem.as_str().to_owned(),
+        owner_principal: item.owner_principal.clone(),
+        device_id: item.device_id.clone(),
+        channel: item.channel.clone(),
+        owner: task_owner(&item.owner_principal, &item.device_id, item.channel.clone()),
+        session_id: Some(item.session_id),
+        run_id: item.run_id,
+        objective_id: None,
+        routine_id: None,
+        state,
+        title: item.title,
+        summary,
+        priority: item.priority,
+        steps: single_step(
+            TaskSourceKind::AgentPlanItem,
+            source_id.as_str(),
+            item.status.as_str(),
+            title.as_str(),
+            Some(item.created_at_unix_ms),
+            item.completed_at_unix_ms.or(item.cancelled_at_unix_ms),
+        ),
+        artifacts: Vec::new(),
+        retry_policy: TaskRetryPolicy {
+            attempt_count: 0,
+            max_attempts: None,
+            retry_allowed: !item.status.is_terminal(),
+            policy_json: retry_policy_json.clone(),
+        },
+        artifact_refs_json,
+        retry_policy_json,
+        access_policy_json: json!({
+            "owner_only": true,
+            "plan_schema_version": item.schema_version,
+            "reason_code": item.reason_code,
+            "redaction_level": item.redaction_level
+        })
+        .to_string(),
+        created_at_unix_ms: item.created_at_unix_ms,
+        updated_at_unix_ms: item.updated_at_unix_ms,
+        started_at_unix_ms: Some(item.created_at_unix_ms),
+        heartbeat_at_unix_ms: Some(item.updated_at_unix_ms),
+        completed_at_unix_ms: item.completed_at_unix_ms.or(item.cancelled_at_unix_ms),
+    })
+}
+
 fn flow_event(event: FlowEventRecord) -> Result<TaskTimelineEvent, Status> {
     Ok(TaskTimelineEvent {
         event_id: event.event_id,
@@ -739,6 +919,30 @@ fn commitment_event(event: CommitmentEventRecord) -> Result<TaskTimelineEvent, S
     })
 }
 
+fn agent_plan_event(event: AgentPlanEvent) -> Result<TaskTimelineEvent, Status> {
+    Ok(TaskTimelineEvent {
+        event_id: event.event_id,
+        task_id: normalized_task_id(TaskSourceKind::AgentPlanItem, event.plan_item_id.as_str()),
+        source_kind: TaskSourceKind::AgentPlanItem.as_str().to_owned(),
+        event_type: event.event_type,
+        actor_principal: event.actor_principal,
+        from_state: event.from_status.map(|status| status.as_str().to_owned()),
+        to_state: event.to_status.map(|status| status.as_str().to_owned()),
+        summary: event.summary,
+        payload_json: redact_json(
+            json!({
+                "payload": event.payload,
+                "evidence_refs": event.evidence_refs,
+                "redaction_level": event.redaction_level,
+                "reason_code": event.reason_code
+            })
+            .to_string()
+            .as_str(),
+        )?,
+        created_at_unix_ms: event.created_at_unix_ms,
+    })
+}
+
 fn synthetic_current_state_event(task: &TaskRun) -> Result<TaskTimelineEvent, Status> {
     Ok(TaskTimelineEvent {
         event_id: format!("{}:current", task.task_id),
@@ -760,6 +964,37 @@ fn synthetic_current_state_event(task: &TaskRun) -> Result<TaskTimelineEvent, St
         )?,
         created_at_unix_ms: task.updated_at_unix_ms,
     })
+}
+
+fn plan_progress_checkpoint(
+    items: &[AgentPlanItem],
+    rollout_enabled: bool,
+) -> TaskPlanProgressCheckpoint {
+    let mut checkpoint = TaskPlanProgressCheckpoint {
+        schema_version: 1,
+        plan_schema_version: AGENT_PLAN_SCHEMA_VERSION,
+        rollout_enabled,
+        source_kind: TaskSourceKind::AgentPlanItem.as_str().to_owned(),
+        reason_code: "agent_plan_task_runtime_checkpoint".to_owned(),
+        total: items.len(),
+        active: 0,
+        blocked: 0,
+        completed: 0,
+        cancelled: 0,
+        latest_update_unix_ms: items.iter().map(|item| item.updated_at_unix_ms).max(),
+    };
+    for item in items {
+        match item.status {
+            AgentPlanStatus::Blocked => {
+                checkpoint.blocked += 1;
+                checkpoint.active += 1;
+            }
+            AgentPlanStatus::Completed => checkpoint.completed += 1,
+            AgentPlanStatus::Cancelled => checkpoint.cancelled += 1,
+            AgentPlanStatus::Pending | AgentPlanStatus::InProgress => checkpoint.active += 1,
+        }
+    }
+    checkpoint
 }
 
 fn normalized_task_id(kind: TaskSourceKind, source_id: &str) -> String {
@@ -845,6 +1080,32 @@ mod tests {
         }
     }
 
+    fn plan_item(id: &str, status: AgentPlanStatus) -> AgentPlanItem {
+        AgentPlanItem {
+            schema_version: AGENT_PLAN_SCHEMA_VERSION,
+            plan_item_id: id.to_owned(),
+            session_id: "session-1".to_owned(),
+            run_id: Some("run-1".to_owned()),
+            parent_run_id: None,
+            owner_principal: "user:one".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+            title: format!("plan item {id}"),
+            details: json!({"next":"verify"}),
+            status,
+            priority: 7,
+            blocked_reason: (status == AgentPlanStatus::Blocked)
+                .then(|| "waiting on evidence".to_owned()),
+            evidence_refs: json!(["journal:event"]),
+            redaction_level: "none".to_owned(),
+            reason_code: "test".to_owned(),
+            created_at_unix_ms: 10,
+            updated_at_unix_ms: 20,
+            completed_at_unix_ms: (status == AgentPlanStatus::Completed).then_some(30),
+            cancelled_at_unix_ms: (status == AgentPlanStatus::Cancelled).then_some(31),
+        }
+    }
+
     #[test]
     fn access_policy_rejects_foreign_principal_device_or_channel() {
         let policy = access("user:one");
@@ -861,8 +1122,47 @@ mod tests {
 
         assert_eq!(parsed.kind, TaskSourceKind::Flow);
         assert_eq!(parsed.source_id, "01H");
+        let parsed_plan =
+            ParsedTaskId::parse("agent_plan:plan-1").expect("agent plan id should parse");
+        assert_eq!(parsed_plan.kind, TaskSourceKind::AgentPlanItem);
+        assert_eq!(parsed_plan.source_id, "plan-1");
         assert!(ParsedTaskId::parse("unknown:01H").is_none());
         assert!(ParsedTaskId::parse("flow:").is_none());
+    }
+
+    #[test]
+    fn agent_plan_item_maps_to_task_run() {
+        let task = agent_plan_task_run(plan_item("plan-1", AgentPlanStatus::Blocked))
+            .expect("plan item should map to task");
+
+        assert_eq!(task.task_id, "agent_plan:plan-1");
+        assert_eq!(task.source_kind, "agent_plan_item");
+        assert_eq!(task.state, "blocked");
+        assert_eq!(task.summary, "waiting on evidence");
+        assert_eq!(task.priority, 7);
+        assert!(task.retry_policy.retry_allowed);
+        assert_eq!(task.steps[0].source_kind, "agent_plan_item");
+        assert!(task.artifact_refs_json.contains("journal:event"));
+    }
+
+    #[test]
+    fn plan_progress_checkpoint_counts_agent_plan_states() {
+        let items = vec![
+            plan_item("pending", AgentPlanStatus::Pending),
+            plan_item("blocked", AgentPlanStatus::Blocked),
+            plan_item("completed", AgentPlanStatus::Completed),
+            plan_item("cancelled", AgentPlanStatus::Cancelled),
+        ];
+
+        let checkpoint = plan_progress_checkpoint(items.as_slice(), true);
+
+        assert_eq!(checkpoint.total, 4);
+        assert_eq!(checkpoint.active, 2);
+        assert_eq!(checkpoint.blocked, 1);
+        assert_eq!(checkpoint.completed, 1);
+        assert_eq!(checkpoint.cancelled, 1);
+        assert_eq!(checkpoint.latest_update_unix_ms, Some(20));
+        assert_eq!(checkpoint.reason_code, "agent_plan_task_runtime_checkpoint");
     }
 
     #[test]
