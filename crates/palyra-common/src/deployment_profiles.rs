@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 
 /// Schema version stamped on emitted deployment profile manifests.
 pub const DEPLOYMENT_PROFILE_SCHEMA_VERSION: u32 = 1;
+/// Schema version for trusted-proxy feasibility reports.
+pub const TRUSTED_PROXY_FEASIBILITY_SCHEMA_VERSION: u32 = 1;
+/// Audit event emitted before trusted-proxy feasibility is evaluated.
+pub const TRUSTED_PROXY_FEASIBILITY_STARTED_EVENT_TYPE: &str = "trusted_proxy.feasibility.started";
+/// Audit event emitted after trusted-proxy feasibility is evaluated.
+pub const TRUSTED_PROXY_FEASIBILITY_COMPLETED_EVENT_TYPE: &str =
+    "trusted_proxy.feasibility.completed";
+/// Audit event emitted when trusted-proxy feasibility evaluation cannot run.
+pub const TRUSTED_PROXY_FEASIBILITY_FAILED_EVENT_TYPE: &str = "trusted_proxy.feasibility.failed";
 
 /// Canonical deployment profile selector; defaults to [`Local`](Self::Local).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -193,6 +202,203 @@ pub fn derive_deployment_profile(
         }
         _ => DeploymentProfileId::Local,
     }
+}
+
+/// Operator-supplied facts for a trusted reverse-proxy exposure review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedProxyFeasibilityInput {
+    pub deployment_profile: DeploymentProfileId,
+    pub public_gateway_requested: bool,
+    pub tls_termination_configured: bool,
+    pub admin_auth_required: bool,
+    pub config_acknowledged: bool,
+    pub environment_acknowledged: bool,
+    pub strips_untrusted_forwarded_headers: bool,
+    pub forwards_authenticated_identity: bool,
+    pub allowed_proxy_cidrs: Vec<String>,
+}
+
+impl Default for TrustedProxyFeasibilityInput {
+    fn default() -> Self {
+        Self {
+            deployment_profile: DeploymentProfileId::Local,
+            public_gateway_requested: false,
+            tls_termination_configured: false,
+            admin_auth_required: true,
+            config_acknowledged: false,
+            environment_acknowledged: false,
+            strips_untrusted_forwarded_headers: false,
+            forwards_authenticated_identity: false,
+            allowed_proxy_cidrs: Vec::new(),
+        }
+    }
+}
+
+/// Trusted-proxy gate decision; `FeasiblePreview` still does not enable public bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedProxyFeasibilityDecision {
+    NotRequired,
+    FeasiblePreview,
+    Blocked,
+}
+
+/// Stable reason code for trusted-proxy feasibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedProxyFeasibilityReasonCode {
+    LoopbackOnly,
+    ReadyForPreview,
+    PublicExposureRequiresRemoteProfile,
+    PublicExposureRequiresTls,
+    AdminAuthRequired,
+    DualAcknowledgementRequired,
+    ForwardedHeaderSanitizationRequired,
+    AuthenticatedProxyIdentityRequired,
+    ProxyCidrScopeRequired,
+}
+
+/// Pure report for trusted-proxy feasibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedProxyFeasibilityReport {
+    pub schema_version: u32,
+    pub decision: TrustedProxyFeasibilityDecision,
+    pub reason_codes: Vec<TrustedProxyFeasibilityReasonCode>,
+    pub promotion_blockers: Vec<DeploymentProfileBlocker>,
+    pub preview_only: bool,
+    pub redaction_level: String,
+    pub started_event_type: String,
+    pub completed_event_type: String,
+    pub failed_event_type: String,
+}
+
+/// Evaluate whether a public gateway can sit behind a trusted proxy preview.
+///
+/// This gate is deliberately stricter than the deployment profile defaults:
+/// loopback requires no proxy, while public exposure is only "feasible preview"
+/// after TLS, admin auth, dual acknowledgement, forwarded-header hygiene,
+/// authenticated identity forwarding, and proxy CIDR scope are all explicit.
+#[must_use]
+pub fn evaluate_trusted_proxy_feasibility(
+    input: &TrustedProxyFeasibilityInput,
+) -> TrustedProxyFeasibilityReport {
+    if !input.public_gateway_requested {
+        return TrustedProxyFeasibilityReport {
+            schema_version: TRUSTED_PROXY_FEASIBILITY_SCHEMA_VERSION,
+            decision: TrustedProxyFeasibilityDecision::NotRequired,
+            reason_codes: vec![TrustedProxyFeasibilityReasonCode::LoopbackOnly],
+            promotion_blockers: Vec::new(),
+            preview_only: true,
+            redaction_level: "metadata_only".to_owned(),
+            started_event_type: TRUSTED_PROXY_FEASIBILITY_STARTED_EVENT_TYPE.to_owned(),
+            completed_event_type: TRUSTED_PROXY_FEASIBILITY_COMPLETED_EVENT_TYPE.to_owned(),
+            failed_event_type: TRUSTED_PROXY_FEASIBILITY_FAILED_EVENT_TYPE.to_owned(),
+        };
+    }
+
+    let mut blockers = Vec::new();
+    let mut reasons = Vec::new();
+    if input.deployment_profile == DeploymentProfileId::Local {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::PublicExposureRequiresRemoteProfile,
+            "public_exposure_requires_remote_profile",
+            "Public trusted-proxy exposure is not available for the local workstation profile.",
+            "Select single-vm or worker-enabled before reviewing public gateway exposure.",
+        );
+    }
+    if !input.tls_termination_configured {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::PublicExposureRequiresTls,
+            "public_tls_required",
+            "Public trusted-proxy exposure requires TLS termination.",
+            "Configure TLS at the trusted proxy before enabling any public gateway route.",
+        );
+    }
+    if !input.admin_auth_required {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::AdminAuthRequired,
+            "admin_auth_required",
+            "Public trusted-proxy exposure requires authenticated admin surfaces.",
+            "Keep admin.require_auth=true for every remote-capable deployment profile.",
+        );
+    }
+    if !input.config_acknowledged || !input.environment_acknowledged {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::DualAcknowledgementRequired,
+            "dual_ack_required",
+            "Public trusted-proxy exposure requires config and environment acknowledgement.",
+            "Set both deployment config acknowledgement and the matching runtime environment acknowledgement.",
+        );
+    }
+    if !input.strips_untrusted_forwarded_headers {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::ForwardedHeaderSanitizationRequired,
+            "forwarded_header_sanitization_required",
+            "The proxy must strip untrusted forwarded headers before forwarding requests.",
+            "Configure the proxy to overwrite X-Forwarded-* headers from clients.",
+        );
+    }
+    if !input.forwards_authenticated_identity {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::AuthenticatedProxyIdentityRequired,
+            "authenticated_proxy_identity_required",
+            "The proxy must forward an authenticated identity boundary to the gateway.",
+            "Bind gateway access to the trusted proxy identity instead of anonymous public traffic.",
+        );
+    }
+    if input.allowed_proxy_cidrs.is_empty() {
+        push_trusted_proxy_blocker(
+            &mut blockers,
+            &mut reasons,
+            TrustedProxyFeasibilityReasonCode::ProxyCidrScopeRequired,
+            "proxy_cidr_scope_required",
+            "The gateway must know which proxy CIDR ranges are trusted.",
+            "Declare explicit proxy CIDR ranges and keep direct public client IPs untrusted.",
+        );
+    }
+
+    let decision = if blockers.is_empty() {
+        reasons.push(TrustedProxyFeasibilityReasonCode::ReadyForPreview);
+        TrustedProxyFeasibilityDecision::FeasiblePreview
+    } else {
+        TrustedProxyFeasibilityDecision::Blocked
+    };
+
+    TrustedProxyFeasibilityReport {
+        schema_version: TRUSTED_PROXY_FEASIBILITY_SCHEMA_VERSION,
+        decision,
+        reason_codes: reasons,
+        promotion_blockers: blockers,
+        preview_only: true,
+        redaction_level: "metadata_only".to_owned(),
+        started_event_type: TRUSTED_PROXY_FEASIBILITY_STARTED_EVENT_TYPE.to_owned(),
+        completed_event_type: TRUSTED_PROXY_FEASIBILITY_COMPLETED_EVENT_TYPE.to_owned(),
+        failed_event_type: TRUSTED_PROXY_FEASIBILITY_FAILED_EVENT_TYPE.to_owned(),
+    }
+}
+
+fn push_trusted_proxy_blocker(
+    blockers: &mut Vec<DeploymentProfileBlocker>,
+    reasons: &mut Vec<TrustedProxyFeasibilityReasonCode>,
+    reason: TrustedProxyFeasibilityReasonCode,
+    code: &str,
+    summary: &str,
+    remediation: &str,
+) {
+    reasons.push(reason);
+    blockers.push(blocker(code, "blocking", summary, remediation));
 }
 
 fn local_profile_manifest() -> DeploymentProfileManifest {
@@ -527,7 +733,8 @@ fn recipe(kind: &str, path: &str, service: &str) -> DeploymentRecipeTarget {
 mod tests {
     use super::{
         canonical_deployment_profiles, deployment_profile_manifest, derive_deployment_profile,
-        DeploymentProfileId,
+        evaluate_trusted_proxy_feasibility, DeploymentProfileId, TrustedProxyFeasibilityDecision,
+        TrustedProxyFeasibilityInput, TrustedProxyFeasibilityReasonCode,
     };
 
     #[test]
@@ -591,5 +798,57 @@ mod tests {
             derive_deployment_profile(None, Some("local_desktop"), true),
             DeploymentProfileId::WorkerEnabled
         );
+    }
+
+    #[test]
+    fn trusted_proxy_feasibility_defaults_to_loopback_not_required() {
+        let report = evaluate_trusted_proxy_feasibility(&TrustedProxyFeasibilityInput::default());
+
+        assert_eq!(report.decision, TrustedProxyFeasibilityDecision::NotRequired);
+        assert_eq!(report.reason_codes, vec![TrustedProxyFeasibilityReasonCode::LoopbackOnly]);
+        assert!(report.promotion_blockers.is_empty());
+        assert!(report.preview_only);
+    }
+
+    #[test]
+    fn trusted_proxy_feasibility_blocks_incomplete_public_exposure() {
+        let report = evaluate_trusted_proxy_feasibility(&TrustedProxyFeasibilityInput {
+            deployment_profile: DeploymentProfileId::SingleVm,
+            public_gateway_requested: true,
+            admin_auth_required: false,
+            ..TrustedProxyFeasibilityInput::default()
+        });
+
+        assert_eq!(report.decision, TrustedProxyFeasibilityDecision::Blocked);
+        assert!(report
+            .reason_codes
+            .contains(&TrustedProxyFeasibilityReasonCode::PublicExposureRequiresTls));
+        assert!(report
+            .reason_codes
+            .contains(&TrustedProxyFeasibilityReasonCode::AdminAuthRequired));
+        assert!(report
+            .reason_codes
+            .contains(&TrustedProxyFeasibilityReasonCode::DualAcknowledgementRequired));
+        assert!(!report.promotion_blockers.is_empty());
+    }
+
+    #[test]
+    fn trusted_proxy_feasibility_allows_preview_when_every_guardrail_is_explicit() {
+        let report = evaluate_trusted_proxy_feasibility(&TrustedProxyFeasibilityInput {
+            deployment_profile: DeploymentProfileId::SingleVm,
+            public_gateway_requested: true,
+            tls_termination_configured: true,
+            admin_auth_required: true,
+            config_acknowledged: true,
+            environment_acknowledged: true,
+            strips_untrusted_forwarded_headers: true,
+            forwards_authenticated_identity: true,
+            allowed_proxy_cidrs: vec!["203.0.113.0/24".to_owned()],
+        });
+
+        assert_eq!(report.decision, TrustedProxyFeasibilityDecision::FeasiblePreview);
+        assert_eq!(report.reason_codes, vec![TrustedProxyFeasibilityReasonCode::ReadyForPreview]);
+        assert!(report.promotion_blockers.is_empty());
+        assert!(report.preview_only);
     }
 }
