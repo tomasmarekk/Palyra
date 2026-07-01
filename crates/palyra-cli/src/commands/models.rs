@@ -14,7 +14,8 @@ use palyra_model_providers::{
     model_id_supports_reasoning_effort, normalized_provider_filter_alias,
     parse_discovered_model_ids,
     provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
-    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_CODEX_BACKEND_BASE_URL,
+    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID,
+    OPENAI_CODEX_BACKEND_BASE_URL,
 };
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
 use reqwest::blocking::Client;
@@ -1355,7 +1356,8 @@ fn models_overview_from_document(
     let model_provider = root_config.model_provider.unwrap_or_default();
     let provider_kind =
         model_provider.kind.clone().unwrap_or_else(|| DETERMINISTIC_PROVIDER_KIND.to_owned());
-    let (providers, models) = registry_views_from_config(&model_provider);
+    let (providers, mut models) = registry_views_from_config(&model_provider);
+    append_pending_openai_api_default_model(providers.as_slice(), &mut models);
     let validation_issues = validate_registry_views(
         providers.as_slice(),
         models.as_slice(),
@@ -1371,7 +1373,8 @@ fn models_overview_from_document(
     let text_model = model_provider
         .default_chat_model_id
         .clone()
-        .or_else(|| legacy_chat_model_for_kind(provider_kind.as_str(), &model_provider));
+        .or_else(|| legacy_chat_model_for_kind(provider_kind.as_str(), &model_provider))
+        .or_else(|| default_chat_model_id.clone());
     let embeddings_model = model_provider.default_embeddings_model_id.clone().or_else(|| {
         (provider_kind == OPENAI_COMPATIBLE_PROVIDER_KIND)
             .then(|| model_provider.openai_embeddings_model.clone())
@@ -2079,6 +2082,59 @@ fn append_synthetic_default_model_entry(
         return;
     };
     models.push(synthetic_default_registry_model(model_id, provider, role));
+}
+
+fn append_pending_openai_api_default_model(
+    providers: &[RegistryProviderEntry],
+    models: &mut Vec<RegistryModelEntry>,
+) {
+    if !models.is_empty() {
+        return;
+    }
+    let Some(provider) = pending_openai_api_key_provider(providers) else {
+        return;
+    };
+    models.push(synthetic_default_registry_model(
+        OPENAI_API_DEFAULT_CHAT_MODEL_ID,
+        provider,
+        "chat",
+    ));
+}
+
+fn pending_openai_api_key_provider(
+    providers: &[RegistryProviderEntry],
+) -> Option<&RegistryProviderEntry> {
+    let mut selected = None;
+    for provider in providers.iter().filter(|provider| {
+        provider.enabled
+            && provider.kind == OPENAI_COMPATIBLE_PROVIDER_KIND
+            && provider.api_key_configured
+            && auth_provider_kind_allows_openai_api_default(provider.auth_provider_kind.as_deref())
+            && base_url_is_official_openai_api(provider.base_url.as_deref())
+    }) {
+        if selected.is_some() {
+            return None;
+        }
+        selected = Some(provider);
+    }
+    selected
+}
+
+fn auth_provider_kind_allows_openai_api_default(auth_provider_kind: Option<&str>) -> bool {
+    auth_provider_kind.is_none_or(|kind| {
+        kind.eq_ignore_ascii_case("openai")
+            || kind.eq_ignore_ascii_case("openai_compatible")
+            || kind.eq_ignore_ascii_case("openai-compatible")
+    })
+}
+
+fn base_url_is_official_openai_api(base_url: Option<&str>) -> bool {
+    let Some(url) = base_url.and_then(|value| reqwest::Url::parse(value).ok()) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        && url.path().trim_end_matches('/').eq_ignore_ascii_case("/v1")
 }
 
 fn provider_for_synthetic_default_model<'a>(
@@ -3173,6 +3229,49 @@ mod tests {
             configured_model_ids: Vec::new(),
             latency_ms: None,
         }
+    }
+
+    #[test]
+    fn pending_openai_api_key_registry_uses_provider_default_for_status() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        let document = toml::from_str::<toml::Value>(
+            r#"
+version = 1
+
+[model_provider]
+kind = "openai_compatible"
+auth_provider_kind = "openai"
+openai_base_url = "https://api.openai.com/v1"
+openai_api_key_vault_ref = "global/openai_api_key"
+
+[[model_provider.providers]]
+provider_id = "openai-primary"
+display_name = "OpenAI"
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+enabled = true
+"#,
+        )
+        .expect("config should parse");
+
+        let overview = models_overview_from_document(
+            config_path.display().to_string(),
+            config_path.as_path(),
+            &document,
+            false,
+        )
+        .expect("models overview should load");
+
+        assert_eq!(overview.status.text_model.as_deref(), Some(OPENAI_API_DEFAULT_CHAT_MODEL_ID));
+        assert_eq!(
+            overview.status.default_chat_model_id.as_deref(),
+            Some(OPENAI_API_DEFAULT_CHAT_MODEL_ID)
+        );
+        assert!(overview.status.registry_valid, "{:?}", overview.status.validation_issues);
+        assert_eq!(overview.status.registry_model_count, 1);
+        assert_eq!(overview.models[0].model_id, OPENAI_API_DEFAULT_CHAT_MODEL_ID);
+        assert_eq!(overview.models[0].source, "synthetic_default");
     }
 
     #[test]

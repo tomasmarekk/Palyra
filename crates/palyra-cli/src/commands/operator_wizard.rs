@@ -60,10 +60,6 @@ const OPENROUTER_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_OPENROUTER_BASE_URL
 const PROVIDER_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_FETCH_CREDENTIAL_VAULT_REFS_PATH: &str =
     "tool_call.http_fetch.allowed_credential_vault_refs";
-#[cfg(test)]
-const OPENAI_API_CURATED_DEFAULT_ORDER: &[&str] =
-    &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
-
 /// Parameters for the onboarding/setup wizard, assembled from CLI arguments.
 #[derive(Debug, Clone)]
 pub(crate) struct OnboardingWizardRequest {
@@ -3029,7 +3025,7 @@ fn apply_deferred_provider_auth_method(
         );
     } else if auth_method == "xai_oauth" {
         warnings.push(
-            "xAI OAuth was selected; after the gateway is running, run `palyra auth xai oauth-start --set-default --open` and finish the browser callback."
+            "xAI OAuth was selected; after the gateway is running, run `palyra auth xai device-code --set-default --open`, enter the browser code, and wait for Palyra to persist the profile."
                 .to_owned(),
         );
     } else {
@@ -3405,67 +3401,6 @@ fn discover_openai_compatible_model_selection(
             "{provider_label} model discovery returned no selectable models; no model was written because the wizard does not use hardcoded provider defaults"
         )
     })
-}
-
-#[cfg(test)]
-fn select_openai_api_preferred_model(
-    models: &[DiscoveredProviderModel],
-) -> Option<DiscoveredProviderModel> {
-    let candidates = models
-        .iter()
-        .filter(|model| model.can_be_chat_default())
-        .filter(|model| !is_openai_dynamic_chat_alias(model.id.as_str()))
-        .filter(|model| !is_openai_expensive_or_snapshot_default(model.id.as_str()))
-        .collect::<Vec<_>>();
-    OPENAI_API_CURATED_DEFAULT_ORDER.iter().find_map(|preferred| {
-        candidates
-            .iter()
-            .copied()
-            .find(|model| openai_model_id_matches(model.id.as_str(), preferred))
-            .cloned()
-    })
-}
-
-#[cfg(test)]
-fn is_openai_dynamic_chat_alias(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    normalized == "chat-latest" || normalized.ends_with("/chat-latest")
-}
-
-#[cfg(test)]
-fn is_openai_expensive_or_snapshot_default(model_id: &str) -> bool {
-    let normalized = openai_model_terminal_id(model_id).to_ascii_lowercase();
-    is_openai_pro_model(normalized.as_str()) || has_date_snapshot_suffix(normalized.as_str())
-}
-
-#[cfg(test)]
-fn openai_model_id_matches(model_id: &str, expected: &str) -> bool {
-    openai_model_terminal_id(model_id).eq_ignore_ascii_case(expected)
-}
-
-#[cfg(test)]
-fn openai_model_terminal_id(model_id: &str) -> &str {
-    model_id.trim().rsplit('/').next().unwrap_or_default().trim()
-}
-
-#[cfg(test)]
-fn is_openai_pro_model(model_id: &str) -> bool {
-    model_id.split('-').any(|part| part == "pro")
-}
-
-#[cfg(test)]
-fn has_date_snapshot_suffix(model_id: &str) -> bool {
-    let bytes = model_id.as_bytes();
-    if bytes.len() < 11 || bytes[bytes.len() - 11] != b'-' {
-        return false;
-    }
-    let suffix = &bytes[bytes.len() - 10..];
-    suffix[4] == b'-'
-        && suffix[7] == b'-'
-        && suffix
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
 fn discover_openai_compatible_models(
@@ -5093,6 +5028,34 @@ openai_base_url = "https://chatgpt.com/backend-api/codex"
     }
 
     #[test]
+    fn openai_api_key_config_keeps_model_discovery_pending() {
+        let mut document = toml::Value::Table(Default::default());
+
+        configure_openai_provider_with_base_url(
+            &mut document,
+            OPENAI_DEFAULT_BASE_URL,
+            None,
+            Some("global/openai_api_key".to_owned()),
+        )
+        .expect("OpenAI API-key config should apply");
+
+        assert_eq!(
+            get_string_value_at_path(&document, "model_provider.openai_model")
+                .expect("OpenAI model lookup should succeed")
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            get_string_value_at_path(&document, "model_provider.openai_api_key_vault_ref")
+                .expect("OpenAI vault ref lookup should succeed")
+                .as_deref(),
+            Some("global/openai_api_key")
+        );
+        validate_daemon_compatible_document(&document)
+            .expect("OpenAI API-key config should remain daemon-compatible");
+    }
+
+    #[test]
     fn anthropic_api_key_base_url_ignores_config_and_env_overrides() {
         let document: toml::Value = toml::from_str(
             r#"
@@ -5156,7 +5119,7 @@ anthropic_base_url = "https://attacker.example/v1"
         )
         .expect("OpenAI discovery fixture should parse");
 
-        let selected = select_openai_api_preferred_model(models.as_slice())
+        let selected = palyra_model_providers::select_openai_api_preferred_model(models.as_slice())
             .expect("OpenAI curated chat model should be selected");
 
         assert_eq!(selected.id, "gpt-5.5");
@@ -5169,7 +5132,9 @@ anthropic_base_url = "https://attacker.example/v1"
         )
         .expect("OpenAI discovery fixture should parse");
 
-        assert!(select_openai_api_preferred_model(models.as_slice()).is_none());
+        assert!(
+            palyra_model_providers::select_openai_api_preferred_model(models.as_slice()).is_none()
+        );
     }
 
     #[test]
@@ -5179,7 +5144,9 @@ anthropic_base_url = "https://attacker.example/v1"
         )
         .expect("OpenAI discovery fixture should parse");
 
-        assert!(select_openai_api_preferred_model(models.as_slice()).is_none());
+        assert!(
+            palyra_model_providers::select_openai_api_preferred_model(models.as_slice()).is_none()
+        );
     }
 
     #[test]
