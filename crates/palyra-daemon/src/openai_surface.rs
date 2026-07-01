@@ -23,8 +23,10 @@ use crate::openai_model_discovery::{
 };
 use palyra_common::daemon_config_schema::FileModelProviderConfig;
 use palyra_model_providers::{
-    preserved_unresolved_default_chat_model_for_provider, ANTHROPIC_API_VERSION,
-    OPENAI_CHATGPT_OAUTH_CLIENT_ID, OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CHATGPT_CODEX_BASE_URL,
+    normalize_xai_oauth_endpoint, preserved_unresolved_default_chat_model_for_provider,
+    ANTHROPIC_API_VERSION, OPENAI_CHATGPT_OAUTH_CLIENT_ID,
+    OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CHATGPT_CODEX_BASE_URL, XAI_DEFAULT_BASE_URL,
+    XAI_DEFAULT_CHAT_MODEL_ID, XAI_OAUTH_CLIENT_ID,
 };
 
 const OPENAI_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,12 +54,8 @@ const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39
 const MINIMAX_OAUTH_DEFAULT_SCOPES: &[&str] = &["group_id", "profile", "model.completion"];
 const MINIMAX_OAUTH_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:user_code";
 const MINIMAX_RESOURCE_URL_ALLOWED_DOMAINS: &[&str] = &["minimax.io", "minimaxi.com"];
-const XAI_DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const XAI_MODEL_DISCOVERY_BASE_URL_ENV: &str = "PALYRA_MODEL_PROVIDER_XAI_BASE_URL";
 const XAI_PROVIDER_CUSTOM_NAME: &str = "xai";
-const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
-const XAI_OAUTH_ALLOWED_ROOT_HOST: &str = "x.ai";
-const XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX: &str = ".x.ai";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -3239,46 +3237,10 @@ fn normalize_anthropic_oauth_token_endpoint(raw: &str) -> Result<String, Respons
 
 #[allow(clippy::result_large_err)]
 fn normalize_xai_oauth_token_endpoint(raw: &str) -> Result<String, Response> {
-    let trimmed = normalize_required_openai_text(raw, "token_endpoint")?;
-    let parsed = Url::parse(trimmed.as_str()).map_err(|_| {
-        validation_error_response(
-            "token_endpoint",
-            "invalid",
-            "token_endpoint must be a valid absolute URL",
-        )
-    })?;
-    if parsed.scheme() != "https" {
-        return Err(validation_error_response(
-            "token_endpoint",
-            "unsupported",
-            "xAI OAuth token_endpoint must use https",
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(validation_error_response(
-            "token_endpoint",
-            "unsupported",
-            "xAI OAuth token_endpoint must not contain embedded credentials",
-        ));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(validation_error_response(
-            "token_endpoint",
-            "unsupported",
-            "xAI OAuth token_endpoint must not contain query or fragment components",
-        ));
-    }
-    let host = parsed.host_str().unwrap_or_default();
-    if !host.eq_ignore_ascii_case(XAI_OAUTH_ALLOWED_ROOT_HOST)
-        && !host.to_ascii_lowercase().ends_with(XAI_OAUTH_ALLOWED_TOKEN_HOST_SUFFIX)
-    {
-        return Err(validation_error_response(
-            "token_endpoint",
-            "unsupported",
-            "xAI OAuth token_endpoint host is not trusted",
-        ));
-    }
-    Ok(parsed.to_string())
+    normalize_xai_oauth_endpoint(raw, "token_endpoint").map_err(|error| {
+        let message = error.to_string();
+        validation_error_response("token_endpoint", "unsupported", message.as_str())
+    })
 }
 
 fn load_minimax_validation_base_url(document: Option<&toml::Value>) -> String {
@@ -3763,29 +3725,7 @@ async fn persist_model_provider_auth_profile_selection_with_openai_runtime(
             }
         }
         ModelProviderAuthProviderKind::Xai => {
-            set_string_value_at_path(
-                &mut document,
-                "model_provider.openai_base_url",
-                XAI_DEFAULT_BASE_URL,
-            )?;
-            apply_discovered_or_clear_text_model_selection(
-                &mut document,
-                "model_provider.openai_model",
-                discovered_model_id,
-                true,
-            )?;
-            if !discovered_model_present {
-                write_pending_model_registry(
-                    &mut document,
-                    PendingModelRegistryProvider {
-                        provider_id: "xai-primary",
-                        display_name: "xAI (Grok)",
-                        kind: "openai_compatible",
-                        base_url: XAI_DEFAULT_BASE_URL,
-                        auth_provider_kind: XAI_PROVIDER_CUSTOM_NAME,
-                    },
-                )?;
-            }
+            apply_xai_provider_selection_defaults(&mut document, discovered_model_id)?;
         }
         ModelProviderAuthProviderKind::GoogleGemini
         | ModelProviderAuthProviderKind::GoogleGeminiCli => {
@@ -4037,6 +3977,21 @@ fn openai_base_url_matches_stale_provider_default(document: &toml::Value) -> boo
     ]
     .iter()
     .any(|known| base_url.eq_ignore_ascii_case(known))
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_xai_provider_selection_defaults(
+    document: &mut toml::Value,
+    discovered_model_id: Option<&str>,
+) -> Result<(), Response> {
+    set_string_value_at_path(document, "model_provider.openai_base_url", XAI_DEFAULT_BASE_URL)?;
+    let selected_model_id = discovered_model_id.or(Some(XAI_DEFAULT_CHAT_MODEL_ID));
+    apply_discovered_or_clear_text_model_selection(
+        document,
+        "model_provider.openai_model",
+        selected_model_id,
+        true,
+    )
 }
 
 fn model_provider_auth_provider_kind_from_document(
@@ -5209,6 +5164,35 @@ mod tests {
         assert_eq!(
             document_string_value_at_path(&document, "model_provider.default_chat_model_id"),
             None
+        );
+    }
+
+    #[test]
+    fn xai_selection_defaults_use_static_model_when_discovery_is_unavailable() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+            [model_provider]
+            auth_provider_kind = "openai"
+            openai_base_url = "https://api.openai.com/v1"
+            openai_model = "stale-openai-model"
+            "#,
+        )
+        .expect("model provider config should parse");
+
+        apply_xai_provider_selection_defaults(&mut document, None)
+            .expect("xAI selection defaults should apply");
+
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_base_url"),
+            Some(XAI_DEFAULT_BASE_URL)
+        );
+        assert_eq!(
+            document_string_value_at_path(&document, "model_provider.openai_model"),
+            Some(XAI_DEFAULT_CHAT_MODEL_ID)
+        );
+        assert!(
+            get_value_at_path(&document, "model_provider.providers").ok().flatten().is_none(),
+            "static xAI fallback should produce a usable legacy model selection"
         );
     }
 

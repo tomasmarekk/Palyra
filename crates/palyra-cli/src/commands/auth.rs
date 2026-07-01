@@ -9,6 +9,12 @@
 use crate::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use palyra_control_plane as control_plane;
+use palyra_model_providers::{
+    is_trusted_xai_oauth_host, normalize_xai_oauth_endpoint,
+    XAI_OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST, XAI_OAUTH_CALLBACK_HOST, XAI_OAUTH_CALLBACK_PATH,
+    XAI_OAUTH_CALLBACK_PORT, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DISCOVERY_URL, XAI_OAUTH_REDIRECT_URI,
+    XAI_OAUTH_SCOPE,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 
 const AUTH_PROFILES_EMPTY_REGISTRY_NOTE: &str = "This command lists auth-profile registry entries only. Model-provider credentials configured with `palyra configure --section auth-model` can be active vault refs even when this registry is empty; use the model-provider diagnostics commands for MiniMax/model-provider auth state.";
@@ -24,17 +30,9 @@ const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 const ANTHROPIC_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
-const XAI_OAUTH_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
-const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
-const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
-const XAI_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:56121/callback";
-const XAI_OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
-const XAI_OAUTH_CALLBACK_PORT: u16 = 56_121;
-const XAI_OAUTH_CALLBACK_PATH: &str = "/callback";
 const XAI_OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const XAI_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const XAI_OAUTH_USER_AGENT: &str = "palyra-cli/0.1.0";
-const XAI_OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST: &[&str] = &["auth.x.ai", "accounts.x.ai"];
 const XAI_DEVICE_CODE_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const XAI_DEVICE_CODE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const XAI_DEVICE_CODE_SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
@@ -858,9 +856,19 @@ struct XaiOAuthErrorResponse {
 async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
     match command {
         AuthOpenAiCommand::Status { json } => {
-            let context =
-                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-                    .await?;
+            let context = match client::control_plane::connect_admin_console(
+                app::ConnectionOverrides::default(),
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    return emit_openai_status(
+                        provider_console_unavailable_status_payload("openai", error),
+                        output::preferred_json(json),
+                    );
+                }
+            };
             let provider_state = context
                 .client
                 .get_openai_provider_state()
@@ -1093,9 +1101,21 @@ async fn run_auth_openai_async(command: AuthOpenAiCommand) -> Result<()> {
 async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
     match command {
         AuthAnthropicCommand::Status { json } => {
-            let context =
-                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-                    .await?;
+            let context = match client::control_plane::connect_admin_console(
+                app::ConnectionOverrides::default(),
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    return emit_provider_status(
+                        "anthropic",
+                        "Anthropic",
+                        provider_console_unavailable_status_payload("anthropic", error),
+                        output::preferred_json(json),
+                    );
+                }
+            };
             let provider_state = context
                 .client
                 .get_provider_auth_state("anthropic")
@@ -1337,9 +1357,21 @@ async fn run_auth_anthropic_async(command: AuthAnthropicCommand) -> Result<()> {
 async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
     match command {
         AuthXaiCommand::Status { json } => {
-            let context =
-                client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-                    .await?;
+            let context = match client::control_plane::connect_admin_console(
+                app::ConnectionOverrides::default(),
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    return emit_provider_status(
+                        "xai",
+                        "xAI",
+                        provider_console_unavailable_status_payload("xai", error),
+                        output::preferred_json(json),
+                    );
+                }
+            };
             let provider_state = context
                 .client
                 .get_provider_auth_state("xai")
@@ -1371,6 +1403,7 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
             callback_url_stdin,
             json,
         } => {
+            preflight_xai_oauth_profile_store("xAI OAuth loopback").await?;
             let discovery = discover_xai_oauth_endpoints().await?;
             let verifier = generate_oauth_pkce_verifier()?;
             let challenge = oauth_pkce_challenge(verifier.as_str());
@@ -1423,7 +1456,10 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
             .await?;
             let context =
                 client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-                    .await?;
+                    .await
+                    .context(
+                        "failed to reconnect local Palyra console after xAI OAuth authorization; the OAuth code was already exchanged, so run `palyra health --json` and retry with `palyra auth xai device-code --set-default --open`",
+                    )?;
             let response = context
                 .client
                 .connect_provider_oauth_tokens(
@@ -1442,7 +1478,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     },
                 )
                 .await
-                .context("failed to store xAI OAuth profile")?;
+                .context(
+                    "failed to store xAI OAuth profile after provider authorization; run `palyra health --json`, restart the gateway if needed, then retry with `palyra auth xai device-code --set-default --open`",
+                )?;
             emit_provider_action(
                 "xai",
                 "xAI",
@@ -1467,6 +1505,7 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
             open,
             json,
         } => {
+            preflight_xai_oauth_profile_store("xAI device-code OAuth").await?;
             let discovery = discover_xai_device_code_endpoints().await?;
             let device_code =
                 request_xai_device_code(discovery.device_authorization_endpoint.as_str()).await?;
@@ -1492,7 +1531,10 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
             .await?;
             let context =
                 client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
-                    .await?;
+                    .await
+                    .context(
+                        "failed to reconnect local Palyra console after xAI device-code authorization; the OAuth tokens were received but could not be persisted, so run `palyra health --json` and retry",
+                    )?;
             let response = context
                 .client
                 .connect_provider_oauth_tokens(
@@ -1511,7 +1553,9 @@ async fn run_auth_xai_async(command: AuthXaiCommand) -> Result<()> {
                     },
                 )
                 .await
-                .context("failed to store xAI device-code profile")?;
+                .context(
+                    "failed to store xAI device-code profile after browser authorization; run `palyra health --json`, restart the gateway if needed, then retry the device-code flow",
+                )?;
             emit_provider_action(
                 "xai",
                 "xAI",
@@ -1689,6 +1733,24 @@ fn build_provider_status_payload(
         refresh,
         profiles,
     })
+}
+
+fn provider_console_unavailable_status_payload(
+    provider_key: &str,
+    error: impl std::fmt::Display,
+) -> OpenAiAuthStatusPayload {
+    OpenAiAuthStatusPayload {
+        provider: provider_key.to_owned(),
+        provider_state: "console_unavailable".to_owned(),
+        note: Some(format!(
+            "Local Palyra console is unavailable: {}. Run `palyra health --json`; if the console is not healthy, run `palyra gateway restart` and retry this status command.",
+            sanitize_auth_message(error.to_string().as_str())
+        )),
+        default_profile_id: None,
+        summary: OpenAiAuthHealthSummary::default(),
+        refresh: OpenAiRefreshSnapshot { attempts: 0, successes: 0, failures: 0 },
+        profiles: Vec::new(),
+    }
 }
 
 fn provider_health_summary<'a>(
@@ -2068,6 +2130,22 @@ async fn discover_xai_device_code_endpoints() -> Result<XaiDeviceCodeDiscovery> 
     Ok(XaiDeviceCodeDiscovery { device_authorization_endpoint, token_endpoint })
 }
 
+async fn preflight_xai_oauth_profile_store(flow_label: &str) -> Result<()> {
+    let context = client::control_plane::connect_admin_console(app::ConnectionOverrides::default())
+        .await
+        .with_context(|| {
+            format!(
+                "local Palyra console is unavailable before starting {flow_label}; xAI authorization cannot be persisted without /console/v1/auth/providers/xai/oauth-token. Run `palyra health --json` and `palyra gateway restart`, then retry."
+            )
+        })?;
+    context.client.get_provider_auth_state("xai").await.with_context(|| {
+        format!(
+            "local Palyra console could not verify the xAI provider auth store before starting {flow_label}; run `palyra health --json` and `palyra gateway restart`, then retry."
+        )
+    })?;
+    Ok(())
+}
+
 async fn fetch_xai_oauth_discovery_document() -> Result<XaiOAuthDiscoveryResponse> {
     let response = reqwest::Client::builder()
         .timeout(XAI_OAUTH_HTTP_TIMEOUT)
@@ -2092,32 +2170,6 @@ async fn fetch_xai_oauth_discovery_document() -> Result<XaiOAuthDiscoveryRespons
     let parsed: XaiOAuthDiscoveryResponse =
         serde_json::from_str(body.as_str()).context("xAI OAuth discovery response was not JSON")?;
     Ok(parsed)
-}
-
-fn normalize_xai_oauth_endpoint(raw: &str, field: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("xAI OAuth discovery is missing {field}");
-    }
-    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("invalid xAI {field}"))?;
-    if parsed.scheme() != "https" {
-        anyhow::bail!("xAI {field} must use https");
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        anyhow::bail!("xAI {field} must not contain embedded credentials");
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        anyhow::bail!("xAI {field} must not contain query or fragment components");
-    }
-    let host = parsed.host_str().unwrap_or_default();
-    if !is_trusted_xai_oauth_host(host) {
-        anyhow::bail!("xAI {field} host is not trusted");
-    }
-    Ok(parsed.to_string())
-}
-
-fn is_trusted_xai_oauth_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("x.ai") || host.to_ascii_lowercase().ends_with(".x.ai")
 }
 
 fn build_xai_oauth_authorization_url(
@@ -3006,11 +3058,12 @@ mod tests {
         generate_oauth_random_urlsafe, normalize_xai_oauth_browser_url,
         normalize_xai_oauth_endpoint, openai_oauth_launch_text_lines,
         parse_anthropic_authorization_code, parse_xai_callback_url,
-        write_xai_callback_response_best_effort, xai_oauth_instruction_message,
-        AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload, ANTHROPIC_OAUTH_AUTHORIZE_URL,
-        ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI, ANTHROPIC_OAUTH_SCOPES,
-        AUTH_PROFILES_EMPTY_REGISTRY_NOTE, AUTH_PROFILES_MODEL_PROVIDER_SOURCES,
-        OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
+        provider_console_unavailable_status_payload, write_xai_callback_response_best_effort,
+        xai_oauth_instruction_message, AnthropicOAuthTokenResponse, OpenAiOAuthLaunchPayload,
+        ANTHROPIC_OAUTH_AUTHORIZE_URL, ANTHROPIC_OAUTH_CLIENT_ID, ANTHROPIC_OAUTH_REDIRECT_URI,
+        ANTHROPIC_OAUTH_SCOPES, AUTH_PROFILES_EMPTY_REGISTRY_NOTE,
+        AUTH_PROFILES_MODEL_PROVIDER_SOURCES, OPENAI_OAUTH_COMPLETION_NOTE, XAI_OAUTH_CLIENT_ID,
+        XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
     };
     use palyra_control_plane as control_plane;
     use serde_json::json;
@@ -3122,6 +3175,26 @@ mod tests {
         assert_eq!(payload.refresh.successes, 0);
         assert_eq!(payload.refresh.failures, 0);
         assert!(payload.profiles.is_empty());
+    }
+
+    #[test]
+    fn provider_status_payload_degrades_when_console_is_unavailable() {
+        let payload = provider_console_unavailable_status_payload(
+            "openai",
+            anyhow::anyhow!("connection refused"),
+        );
+
+        assert_eq!(payload.provider, "openai");
+        assert_eq!(payload.provider_state, "console_unavailable");
+        assert!(payload.default_profile_id.is_none());
+        assert_eq!(payload.summary.total, 0);
+        assert_eq!(payload.refresh.attempts, 0);
+        assert!(
+            payload.note.as_deref().is_some_and(|note| note.contains("palyra health --json")
+                && note.contains("palyra gateway restart")),
+            "degraded status should include recovery guidance: {:?}",
+            payload.note
+        );
     }
 
     #[test]

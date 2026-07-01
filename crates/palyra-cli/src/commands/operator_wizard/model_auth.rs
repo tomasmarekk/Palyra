@@ -1,4 +1,5 @@
 use crate::commands::wizard::StepChoice;
+use palyra_model_providers::XAI_DEFAULT_BASE_URL;
 
 pub(crate) const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/anthropic";
 pub(crate) const DEFAULT_MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
@@ -7,7 +8,6 @@ pub(crate) const XAI_AUTH_PROVIDER_KIND: &str = "xai";
 pub(crate) const GOOGLE_GEMINI_AUTH_PROVIDER_KIND: &str = "google_gemini";
 pub(crate) const GOOGLE_GEMINI_CLI_AUTH_PROVIDER_KIND: &str = "google_gemini_cli";
 pub(crate) const OPENROUTER_AUTH_PROVIDER_KIND: &str = "openrouter";
-const XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const GOOGLE_GEMINI_OPENAI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -187,7 +187,7 @@ const REGISTRY_PROVIDER_DEFAULTS: &[RegistryProviderDefaults] = &[
         provider_id: "xai-primary",
         display_name: "xAI (Grok)",
         auth_provider_kind: XAI_AUTH_PROVIDER_KIND,
-        base_url: XAI_BASE_URL,
+        base_url: XAI_DEFAULT_BASE_URL,
         secret_key: "xai_api_key",
     },
     RegistryProviderDefaults {
