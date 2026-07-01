@@ -12,10 +12,67 @@ use crate::contract::{
     ProviderMessageContentPart, ProviderMessageRole, ProviderReasoningEffort, ProviderRequest,
     ProviderServiceTier,
 };
+use crate::discovery::DiscoveredProviderModel;
 
 pub(crate) const PROVIDER_ID: &str = "openai-primary";
 pub(crate) const DISPLAY_NAME: &str = "OpenAI-compatible";
+/// Static OpenAI API-key default used when live model discovery is unavailable.
+pub const API_DEFAULT_CHAT_MODEL_ID: &str = "gpt-5.5";
+const API_CURATED_DEFAULT_ORDER: &[&str] =
+    &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4.1", "gpt-4o"];
 const DEFAULT_OPENAI_RESPONSES_INSTRUCTIONS: &str = "You are a helpful assistant.";
+
+/// Selects the safest curated OpenAI API chat default from live discovery rows.
+#[must_use]
+pub fn select_api_preferred_model(
+    models: &[DiscoveredProviderModel],
+) -> Option<&DiscoveredProviderModel> {
+    let candidates = models
+        .iter()
+        .filter(|model| model.can_be_chat_default())
+        .filter(|model| !is_dynamic_chat_alias(model.id.as_str()))
+        .filter(|model| !is_expensive_or_snapshot_default(model.id.as_str()))
+        .collect::<Vec<_>>();
+    API_CURATED_DEFAULT_ORDER.iter().find_map(|preferred| {
+        candidates.iter().copied().find(|model| model_id_matches(model.id.as_str(), preferred))
+    })
+}
+
+fn is_dynamic_chat_alias(model_id: &str) -> bool {
+    let normalized = model_id.trim().to_ascii_lowercase();
+    normalized == "chat-latest" || normalized.ends_with("/chat-latest")
+}
+
+fn is_expensive_or_snapshot_default(model_id: &str) -> bool {
+    let normalized = model_terminal_id(model_id).to_ascii_lowercase();
+    is_pro_model(normalized.as_str()) || has_date_snapshot_suffix(normalized.as_str())
+}
+
+fn model_id_matches(model_id: &str, expected: &str) -> bool {
+    model_terminal_id(model_id).eq_ignore_ascii_case(expected)
+}
+
+fn model_terminal_id(model_id: &str) -> &str {
+    model_id.trim().rsplit('/').next().unwrap_or_default().trim()
+}
+
+fn is_pro_model(model_id: &str) -> bool {
+    model_id.split('-').any(|part| part == "pro")
+}
+
+fn has_date_snapshot_suffix(model_id: &str) -> bool {
+    let bytes = model_id.as_bytes();
+    if bytes.len() < 11 || bytes[bytes.len() - 11] != b'-' {
+        return false;
+    }
+    let suffix = &bytes[bytes.len() - 10..];
+    suffix[4] == b'-'
+        && suffix[7] == b'-'
+        && suffix
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
 
 pub(crate) fn chat_capabilities() -> ProviderCapabilitiesSnapshot {
     ProviderCapabilitiesSnapshot {

@@ -28,7 +28,20 @@ pub use openai::{
     chat_completions_payload as openai_chat_completions_payload,
     responses_payload as openai_responses_payload,
     responses_tool_wire_name_map_from_tools as openai_responses_tool_wire_name_map_from_tools,
+    select_api_preferred_model as select_openai_api_preferred_model,
     ResponsesPayload as OpenAiResponsesPayload,
+    API_DEFAULT_CHAT_MODEL_ID as OPENAI_API_DEFAULT_CHAT_MODEL_ID,
+};
+pub use xai::{
+    is_trusted_oauth_host as is_trusted_xai_oauth_host,
+    normalize_oauth_endpoint as normalize_xai_oauth_endpoint, API_BASE_URL as XAI_DEFAULT_BASE_URL,
+    DEFAULT_CHAT_MODEL_ID as XAI_DEFAULT_CHAT_MODEL_ID,
+    GROK_OAUTH_BASE_URL as XAI_GROK_OAUTH_BASE_URL,
+    OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST as XAI_OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST,
+    OAUTH_CALLBACK_HOST as XAI_OAUTH_CALLBACK_HOST, OAUTH_CALLBACK_PATH as XAI_OAUTH_CALLBACK_PATH,
+    OAUTH_CALLBACK_PORT as XAI_OAUTH_CALLBACK_PORT, OAUTH_CLIENT_ID as XAI_OAUTH_CLIENT_ID,
+    OAUTH_DISCOVERY_URL as XAI_OAUTH_DISCOVERY_URL, OAUTH_ISSUER as XAI_OAUTH_ISSUER,
+    OAUTH_REDIRECT_URI as XAI_OAUTH_REDIRECT_URI, OAUTH_SCOPE as XAI_OAUTH_SCOPE,
 };
 
 const DETERMINISTIC_PROVIDER_ID: &str = "deterministic-primary";
