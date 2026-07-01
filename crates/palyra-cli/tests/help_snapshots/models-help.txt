@@ -7,6 +7,7 @@ Commands:
   list             List configured and available model catalog entries
   test-connection  Verify model-provider credentials and connectivity
   discover         Discover live provider models with registry fallback
+  failover-check   Run a safe in-memory provider failover self-check
   explain          Explain model routing and provider candidate selection
   set              Set the default chat model
   set-embeddings   Set the default embeddings model

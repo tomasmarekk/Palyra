@@ -47,6 +47,11 @@ pub enum ModelsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Run a safe in-memory provider failover self-check")]
+    FailoverCheck {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     #[command(about = "Explain model routing and provider candidate selection")]
     Explain {
         #[arg(long)]

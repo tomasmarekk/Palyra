@@ -1,12 +1,15 @@
 //! Console model-provider connectivity probes.
 //!
-//! Serves `POST /console/v1/models/test-connection` and
-//! `POST /console/v1/models/discover`. Builds probe targets from the on-disk
-//! daemon config overlaid with the live runtime provider snapshot, resolves a
-//! credential (auth profile, then inline config key, then vault ref), and
-//! calls each provider's models endpoint. Per-provider failures are reported
-//! inside the envelope payload, not as HTTP errors, and every outbound error
-//! string is redacted before it reaches the console wire contract.
+//! Serves `POST /console/v1/models/test-connection`,
+//! `POST /console/v1/models/discover`, and
+//! `POST /console/v1/models/failover-check`. Connectivity probes build targets
+//! from the on-disk daemon config overlaid with the live runtime provider
+//! snapshot, resolve a credential (auth profile, then inline config key, then
+//! vault ref), and call each provider's models endpoint. Per-provider failures
+//! are reported inside the envelope payload, not as HTTP errors, and every
+//! outbound error string is redacted before it reaches the console wire
+//! contract. The failover check is a synthetic in-memory runtime check that
+//! never reads real config or credentials.
 
 use std::time::Instant;
 
@@ -26,6 +29,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 
 use crate::app::state::AppState;
+use crate::model_provider::{run_provider_failover_self_check, ProviderFailoverSelfCheckReport};
 use crate::*;
 
 const OPENAI_COMPATIBLE_PROVIDER_KIND: &str = "openai_compatible";
@@ -77,6 +81,14 @@ pub(crate) struct ConsoleProviderProbePayload {
     pub configured_model_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+}
+
+/// Wire envelope for the synthetic provider failover self-check.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConsoleProviderFailoverCheckEnvelope {
+    pub contract: control_plane::ContractDescriptor,
+    #[serde(flatten)]
+    pub report: ProviderFailoverSelfCheckReport,
 }
 
 /// One provider to probe, with config-derived endpoint and credential wiring.
@@ -135,6 +147,25 @@ pub(crate) async fn console_models_discover_handler(
 ) -> Result<Json<ConsoleProviderProbeEnvelope>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     run_console_provider_probe(&state, &session.context, payload, true).await.map(Json)
+}
+
+/// Verifies registry-backed failover with a synthetic primary failure and
+/// deterministic fallback.
+///
+/// # Errors
+/// Returns an error response when console authorization fails or the synthetic
+/// runtime does not observe the expected one-hop failover.
+pub(crate) async fn console_models_failover_check_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConsoleProviderFailoverCheckEnvelope>, Response> {
+    let _session = authorize_console_session(&state, &headers, true)?;
+    let report = run_provider_failover_self_check().await.map_err(|error| {
+        runtime_status_response(tonic::Status::internal(format!(
+            "provider failover self-check failed: {error}"
+        )))
+    })?;
+    Ok(Json(ConsoleProviderFailoverCheckEnvelope { contract: contract_descriptor(), report }))
 }
 
 async fn run_console_provider_probe(

@@ -14,8 +14,9 @@ use palyra_model_providers::{
     model_id_supports_reasoning_effort, normalized_provider_filter_alias,
     parse_discovered_model_ids,
     provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
-    provider_probe_message_indicates_vault_unavailable, ProviderModelsEndpoint,
-    ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID, OPENAI_CODEX_BACKEND_BASE_URL,
+    provider_probe_message_indicates_vault_unavailable, ProviderAttemptSummary,
+    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID,
+    OPENAI_CODEX_BACKEND_BASE_URL,
 };
 use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultError, VaultRef};
 use reqwest::blocking::Client;
@@ -211,6 +212,32 @@ struct ConsoleProviderConnectionPayload {
     latency_ms: Option<u64>,
 }
 
+/// Aggregate payload for `models failover-check`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelsFailoverCheckPayload {
+    pub(crate) status: String,
+    pub(crate) mode: String,
+    pub(crate) safety: ModelsFailoverCheckSafetyPayload,
+    pub(crate) primary_provider_id: String,
+    pub(crate) primary_model_id: String,
+    pub(crate) fallback_provider_id: String,
+    pub(crate) fallback_model_id: String,
+    pub(crate) resolved_provider_id: String,
+    pub(crate) resolved_model_id: String,
+    pub(crate) failover_count: u32,
+    pub(crate) attempt_count: usize,
+    pub(crate) attempts: Vec<ProviderAttemptSummary>,
+}
+
+/// Safety metadata emitted by `models failover-check`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ModelsFailoverCheckSafetyPayload {
+    pub(crate) label: String,
+    pub(crate) uses_real_config: bool,
+    pub(crate) uses_real_credentials: bool,
+    pub(crate) performs_network_io: bool,
+}
+
 /// One routing candidate (primary or fallback) in the `models explain` output.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelsExplainCandidatePayload {
@@ -377,6 +404,10 @@ pub(crate) fn run_models(command: ModelsCommand) -> Result<()> {
         ModelsCommand::Discover { path, provider, timeout_ms, refresh, json } => {
             let payload = run_provider_checks(path, provider, timeout_ms, refresh, true)?;
             emit_models_connection(&payload, output::preferred_json(json))
+        }
+        ModelsCommand::FailoverCheck { json } => {
+            let payload = run_provider_failover_check_via_console()?;
+            emit_models_failover_check(&payload, output::preferred_json(json))
         }
         ModelsCommand::Explain { path, model, json_mode, vision, json } => {
             let payload = explain_models_routing(path, model, json_mode, vision)?;
@@ -548,6 +579,48 @@ fn emit_models_connection(payload: &ModelsConnectionPayload, json_output: bool) 
                     );
                 }
             }
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_models_failover_check(
+    payload: &ModelsFailoverCheckPayload,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        output::print_json_pretty(payload, "failed to encode models failover check as JSON")?;
+    } else {
+        println!(
+            "models.failover_check status={} mode={} primary_provider={} primary_model={} fallback_provider={} fallback_model={} resolved_provider={} resolved_model={} failover_count={} attempts={} safety={}",
+            payload.status,
+            payload.mode,
+            payload.primary_provider_id,
+            payload.primary_model_id,
+            payload.fallback_provider_id,
+            payload.fallback_model_id,
+            payload.resolved_provider_id,
+            payload.resolved_model_id,
+            payload.failover_count,
+            payload.attempt_count,
+            payload.safety.label
+        );
+        println!(
+            "models.failover_check.safety uses_real_config={} uses_real_credentials={} performs_network_io={}",
+            payload.safety.uses_real_config,
+            payload.safety.uses_real_credentials,
+            payload.safety.performs_network_io
+        );
+        for attempt in &payload.attempts {
+            println!(
+                "models.failover_check.attempt provider_id={} model_id={} outcome={} retryable={} served_from_cache={} reason_code={}",
+                attempt.provider_id,
+                attempt.model_id,
+                attempt.outcome,
+                attempt.retryable,
+                attempt.served_from_cache,
+                attempt.reason_code.as_deref().unwrap_or("none")
+            );
         }
     }
     std::io::stdout().flush().context("stdout flush failed")
@@ -961,6 +1034,21 @@ fn run_provider_checks_via_console(
             .context("failed to decode console model-provider probe response")
     })?;
     Ok(console_probe_envelope_to_models_payload(overview.status.path, envelope, discover))
+}
+
+fn run_provider_failover_check_via_console() -> Result<ModelsFailoverCheckPayload> {
+    let runtime = build_runtime()?;
+    runtime.block_on(async {
+        let context = client::control_plane::connect_admin_console_with_request_timeout(
+            app::ConnectionOverrides::default(),
+            Some(Duration::from_millis(10_000)),
+        )
+        .await?;
+        let payload =
+            context.client.check_model_provider_failover(&json!({ "mode": "synthetic" })).await?;
+        serde_json::from_value::<ModelsFailoverCheckPayload>(payload)
+            .context("failed to decode console model-provider failover check response")
+    })
 }
 
 fn console_probe_envelope_to_models_payload(

@@ -1759,6 +1759,18 @@ impl ControlPlaneClient {
         self.request_json(Method::POST, "console/v1/models/discover", Some(request), true).await
     }
 
+    /// Runs the synthetic provider failover self-check via `POST console/v1/models/failover-check`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn check_model_provider_failover<T: Serialize + ?Sized>(
+        &self,
+        request: &T,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/models/failover-check", Some(request), true)
+            .await
+    }
+
     /// Fetches provider auth state via `GET console/v1/auth/providers/{provider}`.
     ///
     /// # Errors

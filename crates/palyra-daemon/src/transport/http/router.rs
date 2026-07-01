@@ -725,6 +725,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/console/v1/models/discover",
             post(console::models::console_models_discover_handler),
         )
+        .route(
+            "/console/v1/models/failover-check",
+            post(console::models::console_models_failover_check_handler),
+        )
         .route("/console/v1/usage/insights", get(console::usage::console_usage_insights_handler))
         .route(
             "/console/v1/usage/pricing",

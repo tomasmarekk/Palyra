@@ -6294,6 +6294,15 @@ fn parse_models_test_connection() {
 }
 
 #[test]
+fn parse_models_failover_check() {
+    let parsed = Cli::parse_from(["palyra", "models", "failover-check", "--json"]);
+    assert_eq!(
+        parsed.command,
+        Command::Models { command: ModelsCommand::FailoverCheck { json: true } }
+    );
+}
+
+#[test]
 fn parse_models_explain() {
     let parsed = Cli::parse_from([
         "palyra",

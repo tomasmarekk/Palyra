@@ -146,7 +146,8 @@
         "/console/v1/auth/providers/xai/revoke",
         "/console/v1/auth/providers/xai/default-profile",
         "/console/v1/models/test-connection",
-        "/console/v1/models/discover"
+        "/console/v1/models/discover",
+        "/console/v1/models/failover-check"
       ],
       "cli_handoff_commands": null
     },

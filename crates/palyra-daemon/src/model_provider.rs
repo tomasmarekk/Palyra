@@ -28,7 +28,7 @@ use std::{
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
 
@@ -118,6 +118,37 @@ const ANTHROPIC_OAUTH_USER_AGENT: &str = "claude-cli/2.1.74 (external, cli)";
 // Shared by all HTTP backends; 529 is the Anthropic/MiniMax overload status
 // and must be retried like the other transient upstream codes.
 const OPENAI_RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504, 529];
+const FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID: &str = "e2e-failing-openai";
+const FAILOVER_SELF_CHECK_PRIMARY_MODEL_ID: &str = "e2e-failing-openai-chat";
+const FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID: &str = "e2e-deterministic-fallback";
+const FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID: &str = "e2e-deterministic-chat";
+const FAILOVER_SELF_CHECK_PROMPT: &str = "palyra provider failover fixture";
+
+/// Safety metadata for the synthetic provider failover self-check.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderFailoverSelfCheckSafety {
+    pub label: String,
+    pub uses_real_config: bool,
+    pub uses_real_credentials: bool,
+    pub performs_network_io: bool,
+}
+
+/// Operator-facing result of the synthetic provider failover self-check.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderFailoverSelfCheckReport {
+    pub status: String,
+    pub mode: String,
+    pub safety: ProviderFailoverSelfCheckSafety,
+    pub primary_provider_id: String,
+    pub primary_model_id: String,
+    pub fallback_provider_id: String,
+    pub fallback_model_id: String,
+    pub resolved_provider_id: String,
+    pub resolved_model_id: String,
+    pub failover_count: u32,
+    pub attempt_count: usize,
+    pub attempts: Vec<ProviderAttemptSummary>,
+}
 const MAX_EMBEDDINGS_BATCH_SIZE: usize = 64;
 const MAX_EMBEDDINGS_INPUT_BYTES: usize = 256 * 1024;
 const MAX_SINGLE_EMBEDDING_INPUT_BYTES: usize = 64 * 1024;
@@ -506,6 +537,168 @@ pub trait EmbeddingsProvider: Send + Sync {
 pub fn build_model_provider(config: &ModelProviderConfig) -> Result<Arc<dyn ModelProvider>> {
     validate_model_provider_config(config)?;
     Ok(Arc::new(RegistryBackedModelProvider::new(config.clone())?))
+}
+
+/// Runs an in-memory provider failover self-check without reading real config
+/// or credentials.
+///
+/// # Errors
+/// Returns an error when the synthetic runtime cannot be built or when the
+/// primary missing-credential failure does not route to the deterministic
+/// fallback exactly once.
+pub(crate) async fn run_provider_failover_self_check() -> Result<ProviderFailoverSelfCheckReport> {
+    let provider = build_model_provider(&provider_failover_self_check_config())
+        .context("failed to build provider failover self-check runtime")?;
+    let response = provider
+        .complete(ProviderRequest::from_input_text(
+            FAILOVER_SELF_CHECK_PROMPT.to_owned(),
+            false,
+            Vec::new(),
+            None,
+        ))
+        .await
+        .map_err(|error| {
+            let envelope = error.envelope();
+            anyhow::anyhow!(
+                "provider failover self-check failed before fallback served request: {}",
+                envelope.redacted_message
+            )
+        })?;
+    ensure_provider_failover_self_check_response(&response)?;
+
+    Ok(ProviderFailoverSelfCheckReport {
+        status: "passed".to_owned(),
+        mode: "in_memory_synthetic".to_owned(),
+        safety: ProviderFailoverSelfCheckSafety {
+            label: "no_real_config_no_real_credentials_no_network".to_owned(),
+            uses_real_config: false,
+            uses_real_credentials: false,
+            performs_network_io: false,
+        },
+        primary_provider_id: FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID.to_owned(),
+        primary_model_id: FAILOVER_SELF_CHECK_PRIMARY_MODEL_ID.to_owned(),
+        fallback_provider_id: FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID.to_owned(),
+        fallback_model_id: FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID.to_owned(),
+        resolved_provider_id: response.provider_id.clone(),
+        resolved_model_id: response.model_id.clone(),
+        failover_count: response.failover_count,
+        attempt_count: response.attempts.len(),
+        attempts: response.attempts.clone(),
+    })
+}
+
+fn provider_failover_self_check_config() -> ModelProviderConfig {
+    ModelProviderConfig {
+        kind: ModelProviderKind::Deterministic,
+        registry: ModelProviderRegistryConfig {
+            providers: vec![
+                ProviderRegistryEntryConfig {
+                    provider_id: FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID.to_owned(),
+                    display_name: Some("E2E failing OpenAI-compatible provider".to_owned()),
+                    kind: ModelProviderKind::OpenAiCompatible,
+                    base_url: None,
+                    allow_private_base_url: false,
+                    enabled: true,
+                    auth_profile_id: None,
+                    auth_profile_provider_kind: Some(ModelProviderAuthProviderKind::Openai),
+                    api_key: None,
+                    api_key_secret_ref: None,
+                    api_key_vault_ref: None,
+                    credential_source: None,
+                    request_timeout_ms: 500,
+                    max_retries: 0,
+                    retry_backoff_ms: 1,
+                    circuit_breaker_failure_threshold: 1,
+                    circuit_breaker_cooldown_ms: 60_000,
+                },
+                ProviderRegistryEntryConfig {
+                    provider_id: FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID.to_owned(),
+                    display_name: Some("E2E deterministic fallback provider".to_owned()),
+                    kind: ModelProviderKind::Deterministic,
+                    base_url: None,
+                    allow_private_base_url: false,
+                    enabled: true,
+                    auth_profile_id: None,
+                    auth_profile_provider_kind: None,
+                    api_key: None,
+                    api_key_secret_ref: None,
+                    api_key_vault_ref: None,
+                    credential_source: None,
+                    request_timeout_ms: 500,
+                    max_retries: 0,
+                    retry_backoff_ms: 1,
+                    circuit_breaker_failure_threshold: 1,
+                    circuit_breaker_cooldown_ms: 60_000,
+                },
+            ],
+            models: vec![
+                ProviderModelEntryConfig {
+                    model_id: FAILOVER_SELF_CHECK_PRIMARY_MODEL_ID.to_owned(),
+                    provider_id: FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID.to_owned(),
+                    role: ProviderModelRole::Chat,
+                    enabled: true,
+                    metadata_source: ProviderMetadataSource::Static,
+                    operator_override: false,
+                    capabilities: capability_defaults_for_kind(
+                        ModelProviderKind::OpenAiCompatible,
+                        ProviderModelRole::Chat,
+                    ),
+                },
+                ProviderModelEntryConfig {
+                    model_id: FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID.to_owned(),
+                    provider_id: FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID.to_owned(),
+                    role: ProviderModelRole::Chat,
+                    enabled: true,
+                    metadata_source: ProviderMetadataSource::Static,
+                    operator_override: false,
+                    capabilities: capability_defaults_for_kind(
+                        ModelProviderKind::Deterministic,
+                        ProviderModelRole::Chat,
+                    ),
+                },
+            ],
+            default_chat_model_id: Some(FAILOVER_SELF_CHECK_PRIMARY_MODEL_ID.to_owned()),
+            failover_enabled: true,
+            response_cache_enabled: false,
+            response_cache_ttl_ms: 1_000,
+            response_cache_max_entries: 1,
+            ..ModelProviderRegistryConfig::default()
+        },
+        request_timeout_ms: 500,
+        max_retries: 0,
+        retry_backoff_ms: 1,
+        circuit_breaker_failure_threshold: 1,
+        circuit_breaker_cooldown_ms: 60_000,
+        ..ModelProviderConfig::default()
+    }
+}
+
+fn ensure_provider_failover_self_check_response(response: &ProviderResponse) -> Result<()> {
+    let first_attempt =
+        response.attempts.first().context("provider failover self-check recorded no attempts")?;
+    let last_attempt =
+        response.attempts.last().context("provider failover self-check recorded no attempts")?;
+    let expected = response.provider_id == FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID
+        && response.model_id == FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID
+        && response.failover_count == 1
+        && response.attempts.len() == 2
+        && first_attempt.provider_id == FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID
+        && first_attempt.model_id == FAILOVER_SELF_CHECK_PRIMARY_MODEL_ID
+        && first_attempt.outcome == "error"
+        && first_attempt.retryable
+        && last_attempt.provider_id == FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID
+        && last_attempt.model_id == FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID
+        && last_attempt.outcome == "failover_success";
+    if !expected {
+        anyhow::bail!(
+            "provider failover self-check observed unexpected routing: resolved_provider={} resolved_model={} failover_count={} attempts={}",
+            response.provider_id,
+            response.model_id,
+            response.failover_count,
+            response.attempts.len()
+        );
+    }
+    Ok(())
 }
 
 /// Builds the embeddings provider matching `config.kind`.
@@ -4653,7 +4846,7 @@ mod tests {
     use super::{
         build_embeddings_provider, build_model_provider, capability_defaults_for_kind,
         classify_http_provider_failure, extract_completion_text, normalize_tool_arguments,
-        provider_seconds_to_millis, sanitize_remote_error,
+        provider_seconds_to_millis, run_provider_failover_self_check, sanitize_remote_error,
         validate_openai_base_url_network_policy_with_resolver, AnthropicCompatibleChatAdapter,
         AnthropicProvider, EmbeddingsRequest, ModelProvider, ModelProviderAuthProviderKind,
         ModelProviderConfig, ModelProviderCredentialSource, ModelProviderKind,
@@ -4665,7 +4858,9 @@ mod tests {
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRegistryEntryConfig,
         ProviderRequest, ProviderRetryability, ProviderServiceTier, ProviderStreamAccumulator,
         ProviderStreamEvent, ProviderTurnOutput, ProviderUsage, RegistryBackedModelProvider,
-        ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT, OPENAI_RETRYABLE_STATUS_CODES,
+        ANTHROPIC_OAUTH_BETA_HEADER, ANTHROPIC_OAUTH_USER_AGENT,
+        FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID,
+        FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID, OPENAI_RETRYABLE_STATUS_CODES,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use palyra_model_providers::classify_transport_provider_failure;
@@ -6029,6 +6224,32 @@ mod tests {
 
         openai_handle.join().expect("openai scripted server thread should exit");
         anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_failover_self_check_uses_synthetic_missing_key_fallback() {
+        let report = run_provider_failover_self_check()
+            .await
+            .expect("synthetic failover self-check should pass");
+
+        assert_eq!(report.status, "passed");
+        assert_eq!(report.mode, "in_memory_synthetic");
+        assert_eq!(report.safety.label, "no_real_config_no_real_credentials_no_network");
+        assert!(!report.safety.uses_real_config);
+        assert!(!report.safety.uses_real_credentials);
+        assert!(!report.safety.performs_network_io);
+        assert_eq!(report.primary_provider_id, FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID);
+        assert_eq!(report.fallback_provider_id, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID);
+        assert_eq!(report.resolved_provider_id, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID);
+        assert_eq!(report.resolved_model_id, FAILOVER_SELF_CHECK_FALLBACK_MODEL_ID);
+        assert_eq!(report.failover_count, 1);
+        assert_eq!(report.attempt_count, 2);
+        assert_eq!(report.attempts[0].provider_id, FAILOVER_SELF_CHECK_PRIMARY_PROVIDER_ID);
+        assert_eq!(report.attempts[0].outcome, "error");
+        assert!(report.attempts[0].retryable);
+        assert_eq!(report.attempts[0].reason_code.as_deref(), Some("missing_api_key"));
+        assert_eq!(report.attempts[1].provider_id, FAILOVER_SELF_CHECK_FALLBACK_PROVIDER_ID);
+        assert_eq!(report.attempts[1].outcome, "failover_success");
     }
 
     #[tokio::test(flavor = "multi_thread")]
