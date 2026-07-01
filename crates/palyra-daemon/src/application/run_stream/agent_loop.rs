@@ -895,7 +895,7 @@ impl AgentRunLoopState {
             return message.to_owned();
         }
         format!(
-            "{message} Automatic cleanup will be attempted. If any resource remains: {}",
+            "{message} Terminal cleanup will be attempted for run-owned resources. If any resource remains or is detached: {}",
             cleanup.join(" ")
         )
     }
@@ -909,6 +909,7 @@ impl AgentRunLoopState {
                 )
             })
             .collect::<Vec<_>>();
+        cleanup.extend(pending_background_process_cleanup_instructions(self.messages.as_slice()));
         cleanup.extend(pending_routine_cleanup_instructions(self.messages.as_slice()));
         cleanup
     }
@@ -1659,13 +1660,24 @@ fn collect_process_progress(
             let Some(pid) = process_pid(output) else {
                 return;
             };
+            let (status, cleanup) = if process_is_detached_handoff(output) {
+                (
+                    "detached_background_started",
+                    "detached_background_process_not_stopped_by_terminal_cleanup_use_cleanup_portable_stop_command",
+                )
+            } else {
+                (
+                    "run_owned_background_started",
+                    "terminal_run_cleanup_will_stop_process_if_still_running",
+                )
+            };
             process_by_pid.insert(
                 pid,
                 RunProgressProcessSummary {
                     pid,
                     kind: "background".to_owned(),
-                    status: "run_owned_background_started".to_owned(),
-                    cleanup: "terminal_run_cleanup_will_stop_process_if_still_running".to_owned(),
+                    status: status.to_owned(),
+                    cleanup: cleanup.to_owned(),
                     log_artifact: output
                         .get("log_artifact")
                         .and_then(Value::as_str)
@@ -1723,6 +1735,12 @@ fn process_pid(output: &Value) -> Option<u32> {
         .and_then(Value::as_u64)
         .or_else(|| output.get("pid").and_then(Value::as_u64))?;
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+fn process_is_detached_handoff(output: &Value) -> bool {
+    output.get("durable_handoff").and_then(Value::as_bool) == Some(true)
+        || output.get("run_owned_lifetime").and_then(Value::as_bool) == Some(false)
+        || output.get("lifetime_mode").and_then(Value::as_str) == Some("detached")
 }
 
 fn tool_success_summary(tool_name: &str, output: &Value) -> RunProgressToolSummary {
@@ -2033,6 +2051,14 @@ struct RoutineToolCallRef {
     input_json: Value,
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundProcessCleanupCandidate {
+    pid: u32,
+    stop_command: Option<String>,
+    status_command: Option<String>,
+    start_context: Option<String>,
+}
+
 // Replays browser session create/close tool pairs from the message history to
 // find sessions the run opened but never confirmably closed. BTree containers
 // keep the cleanup guidance deterministically ordered.
@@ -2087,6 +2113,132 @@ fn pending_browser_session_ids(messages: &[ProviderMessage]) -> BTreeSet<String>
     }
 
     open_session_ids
+}
+
+fn pending_background_process_cleanup_instructions(messages: &[ProviderMessage]) -> Vec<String> {
+    let mut process_tool_calls_by_id = BTreeMap::<String, String>::new();
+    let mut candidates_by_pid = BTreeMap::<u32, BackgroundProcessCleanupCandidate>::new();
+
+    for message in messages {
+        for tool_call in &message.tool_calls {
+            if matches!(
+                tool_call.tool_name.as_str(),
+                PROCESS_RUN_TOOL_NAME | PROCESS_STATUS_TOOL_NAME | PROCESS_STOP_TOOL_NAME
+            ) {
+                process_tool_calls_by_id
+                    .insert(tool_call.proposal_id.clone(), tool_call.tool_name.clone());
+            }
+        }
+
+        if message.role != crate::model_provider::ProviderMessageRole::Tool {
+            continue;
+        }
+        let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(tool_name) = process_tool_calls_by_id.get(tool_call_id) else {
+            continue;
+        };
+        let Ok(raw_output) = serde_json::from_str::<Value>(message.text_content().as_str()) else {
+            continue;
+        };
+        let output = model_visible_tool_result_payload(&raw_output);
+
+        match tool_name.as_str() {
+            PROCESS_RUN_TOOL_NAME => {
+                if output.get("background").and_then(Value::as_bool) != Some(true)
+                    || !process_is_detached_handoff(output)
+                {
+                    continue;
+                }
+                let Some(pid) = process_pid(output) else {
+                    continue;
+                };
+                candidates_by_pid.insert(pid, background_process_cleanup_candidate(pid, output));
+            }
+            PROCESS_STATUS_TOOL_NAME => {
+                if let Some(pid) = process_pid(output) {
+                    if output.get("alive").and_then(Value::as_bool) == Some(false) {
+                        candidates_by_pid.remove(&pid);
+                    }
+                }
+            }
+            PROCESS_STOP_TOOL_NAME => {
+                if let Some(pid) = process_pid(output) {
+                    if process_stop_confirmed(output) {
+                        candidates_by_pid.remove(&pid);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates_by_pid.into_values().map(background_process_cleanup_instruction).collect()
+}
+
+fn background_process_cleanup_candidate(
+    pid: u32,
+    output: &Value,
+) -> BackgroundProcessCleanupCandidate {
+    BackgroundProcessCleanupCandidate {
+        pid,
+        stop_command: process_command_label(
+            output
+                .pointer("/cleanup/portable_stop_command")
+                .or_else(|| output.pointer("/handoff/stop_command")),
+        ),
+        status_command: process_command_label(
+            output
+                .pointer("/cleanup/portable_status_command")
+                .or_else(|| output.pointer("/handoff/status_command")),
+        ),
+        start_context: process_start_context_label(output.pointer("/handoff/start_command")),
+    }
+}
+
+fn background_process_cleanup_instruction(candidate: BackgroundProcessCleanupCandidate) -> String {
+    let stop_command =
+        candidate.stop_command.unwrap_or_else(|| format!("palyra.process.stop {}", candidate.pid));
+    let status_command = candidate
+        .status_command
+        .unwrap_or_else(|| format!("palyra.process.status {}", candidate.pid));
+    let start_context = candidate
+        .start_context
+        .map(|context| format!(" Start context: {context}."))
+        .unwrap_or_default();
+    format!(
+        "detached background process pid {}; terminal cleanup will not stop it. Inspect it with `{status_command}` and stop it with `{stop_command}` if it remains alive.{start_context}",
+        candidate.pid
+    )
+}
+
+fn process_command_label(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let command = value.get("command").and_then(Value::as_str)?;
+    let mut parts = vec![command.to_owned()];
+    if let Some(args) = value.get("args").and_then(Value::as_array) {
+        parts.extend(args.iter().filter_map(Value::as_str).map(ToOwned::to_owned));
+    }
+    Some(checkpoint_text(parts.join(" ").as_str(), 260))
+}
+
+fn process_start_context_label(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let mut parts = Vec::new();
+    if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+        parts.push(format!("cwd={}", checkpoint_text(cwd, 180)));
+    }
+    if let Some(command) = process_command_label(Some(value)) {
+        parts.push(format!("command={command}"));
+    }
+    (!parts.is_empty()).then(|| checkpoint_text(parts.join("; ").as_str(), 420))
+}
+
+fn process_stop_confirmed(output: &Value) -> bool {
+    output.get("stopped").and_then(Value::as_bool) == Some(true)
+        || output.get("alive").and_then(Value::as_bool) == Some(false)
+        || output.get("process_tree_alive").and_then(Value::as_bool) == Some(false)
 }
 
 // Flags only routines this run itself created (an upsert without a
@@ -3216,6 +3368,78 @@ mod tests {
         assert!(message.contains("browser session 01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(message.contains("palyra browser session close 01ARZ3NDEKTSV4RRFFQ69G5FAV --json"));
         assert!(message.contains("palyra browser stop --json"));
+    }
+
+    #[test]
+    fn loop_state_reports_detached_background_process_cleanup_guidance_on_failure() {
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderMessageRole::Assistant,
+                content: Vec::new(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: vec![ProviderMessageToolCall {
+                    proposal_id: "call-process".to_owned(),
+                    tool_name: PROCESS_RUN_TOOL_NAME.to_owned(),
+                    input_json: serde_json::json!({
+                        "command": "node",
+                        "args": ["C:/fixtures/S068/bin/slow-preview.js", "C:/fixtures/S068"],
+                        "background": true,
+                        "lifetime_mode": "detached",
+                    }),
+                }],
+            },
+            ProviderMessage::tool_result(
+                "call-process",
+                serde_json::json!({
+                    "background": true,
+                    "durable_handoff": true,
+                    "run_owned_lifetime": false,
+                    "lifetime_mode": "detached",
+                    "pid": 40660,
+                    "cleanup": {
+                        "portable_stop_command": {
+                            "command": "palyra.process.stop",
+                            "args": ["40660"]
+                        },
+                        "portable_status_command": {
+                            "command": "palyra.process.status",
+                            "args": ["40660"]
+                        }
+                    },
+                    "handoff": {
+                        "start_command": {
+                            "command": "node",
+                            "args": [
+                                "C:/fixtures/S068/bin/slow-preview.js",
+                                "C:/fixtures/S068"
+                            ],
+                            "cwd": "C:/fixtures/S068"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+        ];
+        let state = AgentRunLoopState::new(messages, 2, 4, 10_000);
+
+        let message = state.message_with_cleanup_guidance("cancelled by request");
+        let checkpoint = state.progress_checkpoint(
+            "01KWFMEPWN8K9WQ6QH5VX4GS9B",
+            AgentLoopTerminationReason::Cancellation,
+        );
+
+        assert!(message.contains("cancelled by request"));
+        assert!(message.contains("detached background process pid 40660"));
+        assert!(message.contains("palyra.process.status 40660"));
+        assert!(message.contains("palyra.process.stop 40660"));
+        assert!(message.contains("C:/fixtures/S068"));
+        assert_eq!(checkpoint.active_processes.len(), 1);
+        assert_eq!(checkpoint.active_processes[0].status, "detached_background_started");
+        assert!(
+            checkpoint.active_processes[0].cleanup.contains("detached_background_process"),
+            "{checkpoint:?}"
+        );
     }
 
     #[test]

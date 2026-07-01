@@ -416,15 +416,26 @@ pub(crate) async fn run_sessions_async(
                         ),
                         "cancel_requested": response.cancel_requested,
                         "reason": redacted_text_json_or_null(response.reason.as_str()),
+                        "cleanup_warning": non_empty_json_string(response.cleanup_warning.as_str()),
                     }))?
                 );
             } else {
-                println!(
-                    "sessions.abort run_id={} cancel_requested={} reason={}",
-                    redacted_presence_for_output(response.run_id.is_some()),
-                    response.cancel_requested,
-                    redacted_text_or_none(!response.reason.trim().is_empty())
-                );
+                if response.cleanup_warning.trim().is_empty() {
+                    println!(
+                        "sessions.abort run_id={} cancel_requested={} reason={}",
+                        redacted_presence_for_output(response.run_id.is_some()),
+                        response.cancel_requested,
+                        redacted_text_or_none(!response.reason.trim().is_empty())
+                    );
+                } else {
+                    println!(
+                        "sessions.abort run_id={} cancel_requested={} reason={} cleanup_warning={}",
+                        redacted_presence_for_output(response.run_id.is_some()),
+                        response.cancel_requested,
+                        redacted_text_or_none(!response.reason.trim().is_empty()),
+                        response.cleanup_warning
+                    );
+                }
             }
         }
         SessionsCommand::QueuePolicy { session_id, session_key, json: _ } => {
@@ -1215,6 +1226,15 @@ fn redacted_text_json_or_null(value: &str) -> Value {
         Value::Null
     } else {
         Value::String(REDACTED.to_owned())
+    }
+}
+
+fn non_empty_json_string(value: &str) -> Value {
+    let value = value.trim();
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_owned())
     }
 }
 

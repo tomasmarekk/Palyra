@@ -616,17 +616,18 @@ pub(crate) async fn admin_run_cancel_handler(
             }
         })
         .unwrap_or_else(|| "admin_cancel_requested".to_owned());
-    let response = state
+    let mut response = state
         .runtime
         .request_orchestrator_cancel(OrchestratorCancelRequest { run_id, reason })
         .await
         .map_err(runtime_status_response)?;
-    gateway::cleanup_run_resources(
+    let cleanup_summary = gateway::cleanup_run_resources(
         &state.runtime,
         response.run_id.as_str(),
         response.reason.as_str(),
     )
     .await;
+    response.cleanup_warning = cleanup_summary.cleanup_warning;
     Ok(Json(response))
 }
 

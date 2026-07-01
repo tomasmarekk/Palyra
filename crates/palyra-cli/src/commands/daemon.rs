@@ -960,15 +960,36 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                 )?;
             } else {
                 if let Some(state) = response.state.as_deref() {
-                    println!(
-                        "run.cancel run_id={} state={} cancel_requested={} reason={}",
-                        response.run_id, state, response.cancel_requested, response.reason
-                    );
+                    if response.cleanup_warning.is_empty() {
+                        println!(
+                            "run.cancel run_id={} state={} cancel_requested={} reason={}",
+                            response.run_id, state, response.cancel_requested, response.reason
+                        );
+                    } else {
+                        println!(
+                            "run.cancel run_id={} state={} cancel_requested={} reason={} cleanup_warning={}",
+                            response.run_id,
+                            state,
+                            response.cancel_requested,
+                            response.reason,
+                            response.cleanup_warning
+                        );
+                    }
                 } else {
-                    println!(
-                        "run.cancel run_id={} cancel_requested={} reason={}",
-                        response.run_id, response.cancel_requested, response.reason
-                    );
+                    if response.cleanup_warning.is_empty() {
+                        println!(
+                            "run.cancel run_id={} cancel_requested={} reason={}",
+                            response.run_id, response.cancel_requested, response.reason
+                        );
+                    } else {
+                        println!(
+                            "run.cancel run_id={} cancel_requested={} reason={} cleanup_warning={}",
+                            response.run_id,
+                            response.cancel_requested,
+                            response.reason,
+                            response.cleanup_warning
+                        );
+                    }
                 }
             }
             std::io::stdout().flush().context("stdout flush failed")

@@ -414,8 +414,9 @@ message AbortRunResponse {
   palyra.common.v1.CanonicalId run_id = 2;
   bool cancel_requested = 3;
   string reason = 4;
+  string cleanup_warning = 5;
 
-  reserved 5 to 12;
+  reserved 6 to 12;
 }
 
 message SessionSummary {

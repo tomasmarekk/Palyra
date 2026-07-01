@@ -2112,11 +2112,11 @@ pub(crate) async fn cleanup_run_resources(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
     reason: &str,
-) {
+) -> RunCleanupSummary {
     let resources = runtime_state.take_run_cleanup_resources(run_id);
     let detached_resources = runtime_state.take_run_detached_resources(run_id);
     if resources.is_empty() && detached_resources.is_empty() {
-        return;
+        return RunCleanupSummary::default();
     }
 
     let browser_session_count = resources.browser_session_ids.len();
@@ -2256,6 +2256,18 @@ pub(crate) async fn cleanup_run_resources(
         detached_background_process_count = detached_background_process_outcomes.len(),
         "cleaned up run-owned resources after terminal run"
     );
+
+    RunCleanupSummary {
+        cleanup_warning: detached_background_cleanup_warning(
+            detached_background_process_outcomes.as_slice(),
+        ),
+    }
+}
+
+/// Operator-visible summary of terminal cleanup side effects.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunCleanupSummary {
+    pub(crate) cleanup_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2705,6 +2717,71 @@ fn detached_background_process_cleanup_command_json(
         "pid": outcome.resource.pid,
         "command": command,
     }))
+}
+
+fn detached_background_cleanup_warning(
+    outcomes: &[DetachedBackgroundProcessHandoffOutcome],
+) -> Option<String> {
+    if outcomes.is_empty() {
+        return None;
+    }
+    let summaries =
+        outcomes.iter().map(detached_background_process_warning_entry).collect::<Vec<_>>();
+    Some(format!(
+        "Detached background process handoff: {}. Terminal run cleanup did not stop detached processes; inspect and stop them explicitly if they remain alive.",
+        summaries.join("; ")
+    ))
+}
+
+fn detached_background_process_warning_entry(
+    outcome: &DetachedBackgroundProcessHandoffOutcome,
+) -> String {
+    let alive = outcome.alive.map_or_else(|| "unknown".to_owned(), |alive| alive.to_string());
+    let ports = if outcome.resource.ports.is_empty() {
+        "none".to_owned()
+    } else {
+        outcome.resource.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+    };
+    let stop_command =
+        cleanup_command_label(outcome.resource.cleanup.pointer("/portable_stop_command"))
+            .unwrap_or_else(|| format!("palyra.process.stop {}", outcome.resource.pid));
+    let status_command =
+        cleanup_command_label(outcome.resource.cleanup.pointer("/portable_status_command"))
+            .unwrap_or_else(|| format!("palyra.process.status {}", outcome.resource.pid));
+    let start_context = start_command_context_label(&outcome.resource.start_command)
+        .map(|context| format!(" start_context={context}"))
+        .unwrap_or_default();
+    format!(
+        "pid={} alive={} lifetime_mode={} ports={} status_command=`{}` stop_command=`{}`{}",
+        outcome.resource.pid,
+        alive,
+        outcome.resource.lifetime_mode,
+        ports,
+        status_command,
+        stop_command,
+        start_context
+    )
+}
+
+fn cleanup_command_label(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let command = value.get("command").and_then(Value::as_str)?;
+    let mut parts = vec![command.to_owned()];
+    if let Some(args) = value.get("args").and_then(Value::as_array) {
+        parts.extend(args.iter().filter_map(Value::as_str).map(ToOwned::to_owned));
+    }
+    Some(truncate_with_ellipsis(parts.join(" "), 260))
+}
+
+fn start_command_context_label(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+        parts.push(format!("cwd={}", truncate_with_ellipsis(cwd.to_owned(), 180)));
+    }
+    if let Some(command) = cleanup_command_label(Some(value)) {
+        parts.push(format!("command={command}"));
+    }
+    (!parts.is_empty()).then(|| truncate_with_ellipsis(parts.join("; "), 420))
 }
 
 async fn terminate_run_background_process(pid: u32) -> Result<(), String> {

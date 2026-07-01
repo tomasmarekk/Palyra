@@ -5594,6 +5594,67 @@ async fn run_cleanup_tape_event_records_detached_background_handoff() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_run_resources_returns_detached_background_warning() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.clone(),
+            seq: 0,
+            event_type: "status".to_owned(),
+            payload_json: json!({"status":"cancelled"}).to_string(),
+        })
+        .await
+        .expect("seed tape event should append");
+    state.record_run_detached_background_process(
+        run_id.as_str(),
+        super::DetachedBackgroundProcessResource {
+            pid: 40660,
+            lifetime_mode: "detached".to_owned(),
+            ports: vec![5173],
+            lifetime_ms: Some(120000),
+            max_lifetime_ms: Some(180000),
+            start_command: json!({
+                "command": "node",
+                "args": [
+                    "C:/fixtures/S068/bin/slow-preview.js",
+                    "C:/fixtures/S068"
+                ],
+                "cwd": "C:/fixtures/S068",
+                "env": {"omitted": true, "provided_key_count": 0}
+            }),
+            cleanup: json!({
+                "portable_stop_command": {
+                    "command": "palyra.process.stop",
+                    "args": ["40660"]
+                },
+                "portable_status_command": {
+                    "command": "palyra.process.status",
+                    "args": ["40660"]
+                }
+            }),
+        },
+    );
+
+    let summary =
+        super::cleanup_run_resources(&state, run_id.as_str(), "cancelled by request").await;
+
+    let warning = summary.cleanup_warning.expect("detached process should produce warning");
+    assert!(warning.contains("pid=40660"), "{warning}");
+    assert!(warning.contains("alive="), "{warning}");
+    assert!(warning.contains("ports=5173"), "{warning}");
+    assert!(warning.contains("palyra.process.status 40660"), "{warning}");
+    assert!(warning.contains("palyra.process.stop 40660"), "{warning}");
+    assert!(warning.contains("C:/fixtures/S068"), "{warning}");
+    assert!(
+        state.take_run_detached_resources(run_id.as_str()).is_empty(),
+        "cleanup should drain detached handoff resources after reporting them"
+    );
+}
+
 #[test]
 fn process_list_entry_reports_runtime_status_details() {
     let payload = super::background_process_list_entry(

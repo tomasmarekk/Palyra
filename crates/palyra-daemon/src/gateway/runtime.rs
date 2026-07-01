@@ -1092,6 +1092,8 @@ pub struct RunCancelSnapshot {
     pub state: String,
     pub cancel_requested: bool,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6038,6 +6040,7 @@ impl GatewayRuntimeState {
             state: snapshot.state,
             cancel_requested: snapshot.cancel_requested,
             reason: snapshot.reason,
+            cleanup_warning: None,
         })
     }
 

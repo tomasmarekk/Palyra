@@ -12536,6 +12536,8 @@ struct RunCancelResponse {
     state: Option<String>,
     cancel_requested: bool,
     reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    cleanup_warning: String,
 }
 
 #[derive(Debug, Serialize)]
