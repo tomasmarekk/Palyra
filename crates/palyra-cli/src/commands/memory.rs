@@ -25,6 +25,14 @@ fn cli_inferred_workspace_memory_prefix() -> Option<String> {
     cli_project_memory_prefix_from_workspace_root(current_dir.as_path())
 }
 
+/// Normalizes a user-provided workspace-memory prefix without inventing one.
+fn cli_explicit_workspace_memory_prefix(prefix: Option<String>) -> Option<String> {
+    prefix.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
 /// Builds the `projects/project-<slug>-<hash>` prefix that scopes workspace memory to
 /// one workspace root; the hash pins the root identity so equally named directories in
 /// different locations do not share memory.
@@ -876,7 +884,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     1.0,
                     Some(0.0),
                 )?;
-                let prefix = prefix.or_else(cli_inferred_workspace_memory_prefix);
+                let prefix = cli_explicit_workspace_memory_prefix(prefix);
                 let path = build_console_query_path(
                     "console/v1/memory/workspace/search",
                     vec![
@@ -964,7 +972,7 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             let query = resolve_optional_query_arg(query, query_option, "memory search-all")?;
             let min_score =
                 parse_float_arg(min_score, "memory search-all --min-score", 0.0, 1.0, Some(0.0))?;
-            let workspace_prefix = workspace_prefix.or_else(cli_inferred_workspace_memory_prefix);
+            let workspace_prefix = cli_explicit_workspace_memory_prefix(workspace_prefix);
             let path = build_console_query_path(
                 "console/v1/memory/search-all",
                 vec![
@@ -1679,7 +1687,8 @@ fn attach_manual_ingest_visibility(payload: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_manual_ingest_visibility, memory_embeddings_degraded_line,
+        attach_manual_ingest_visibility, build_console_query_path,
+        cli_explicit_workspace_memory_prefix, memory_embeddings_degraded_line,
         memory_search_claim_boundary, memory_search_output_payload, memory_session_scope_label,
         replace_memory_item, resolve_optional_query_arg, validate_memory_purge_confirmation,
         MemoryReplaceOptions, MemoryReplaceRpc,
@@ -1912,6 +1921,60 @@ mod tests {
 
         assert!(prefix.starts_with("projects/project-client-portal-"), "{prefix}");
         assert_eq!(prefix.len(), "projects/project-client-portal-".len() + 10);
+    }
+
+    #[test]
+    fn cli_workspace_search_prefix_only_uses_explicit_value() {
+        let path = build_console_query_path(
+            "console/v1/memory/workspace/search",
+            vec![
+                ("query", Some("Playwright".to_owned())),
+                ("prefix", cli_explicit_workspace_memory_prefix(None)),
+            ],
+        );
+        assert_eq!(path, "console/v1/memory/workspace/search?query=Playwright");
+
+        let path = build_console_query_path(
+            "console/v1/memory/workspace/search",
+            vec![
+                ("query", Some("Playwright".to_owned())),
+                (
+                    "prefix",
+                    cli_explicit_workspace_memory_prefix(Some(" projects/workspace ".to_owned())),
+                ),
+            ],
+        );
+        assert_eq!(
+            path,
+            "console/v1/memory/workspace/search?query=Playwright&prefix=projects%2Fworkspace"
+        );
+    }
+
+    #[test]
+    fn cli_search_all_workspace_prefix_only_uses_explicit_value() {
+        let path = build_console_query_path(
+            "console/v1/memory/search-all",
+            vec![
+                ("q", Some("S033-PALYRA-E2E".to_owned())),
+                ("workspace_prefix", cli_explicit_workspace_memory_prefix(None)),
+            ],
+        );
+        assert_eq!(path, "console/v1/memory/search-all?q=S033-PALYRA-E2E");
+
+        let path = build_console_query_path(
+            "console/v1/memory/search-all",
+            vec![
+                ("q", Some("S033-PALYRA-E2E".to_owned())),
+                (
+                    "workspace_prefix",
+                    cli_explicit_workspace_memory_prefix(Some(" projects/workspace ".to_owned())),
+                ),
+            ],
+        );
+        assert_eq!(
+            path,
+            "console/v1/memory/search-all?q=S033-PALYRA-E2E&workspace_prefix=projects%2Fworkspace"
+        );
     }
 
     #[test]
