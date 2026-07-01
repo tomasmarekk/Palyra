@@ -190,7 +190,7 @@ pub(crate) fn ensure_agent_run_approval_flags(
     }
     if prompt_stdin && approval_mode == AgentApprovalModeArg::Prompt {
         anyhow::bail!(
-            "--approval-mode prompt cannot be combined with --prompt-stdin because stdin is consumed by the task prompt and cannot also receive tool approval decisions; use --approval-mode allow-once for unattended CLI runs, pass the task with --prompt from an interactive terminal, or use `palyra agent interactive`"
+            "--approval-mode prompt cannot be combined with --prompt-stdin because stdin is consumed by the task prompt and cannot also receive tool approval decisions; use --approval-mode deny for no-tools stdin smoke runs, use --approval-mode allow-once for reviewed unattended CLI runs, pass the task with --prompt from an interactive terminal, or use `palyra agent interactive`"
         );
     }
     Ok(())
@@ -1059,6 +1059,7 @@ mod tests {
 
         assert!(error.to_string().contains("--approval-mode prompt"), "{error}");
         assert!(error.to_string().contains("--prompt-stdin"), "{error}");
+        assert!(error.to_string().contains("--approval-mode deny"), "{error}");
         assert!(error.to_string().contains("palyra agent interactive"), "{error}");
     }
 
