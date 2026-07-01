@@ -1147,7 +1147,7 @@ fn request_desktop_managed_gateway_restart(
         stdout_log_path: None,
         stderr_log_path: None,
         detail: Some(format!(
-            "desktop-managed gateway restart requested by updating {}; health verified for service {} after supervisor reload",
+            "desktop-managed gateway restart requested by updating {}; HTTP health verified (/healthz) for service {} after supervisor reload; full gRPC/admin readiness may continue warming for a short interval",
             config_path.display(),
             health.service
         )),
