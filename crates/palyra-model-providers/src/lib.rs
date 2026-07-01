@@ -62,11 +62,11 @@ pub use errors::{
     classify_http_provider_failure, classify_network_provider_failure,
     classify_reqwest_provider_failure, classify_transport_provider_failure,
     fail_closed_provider_classification, failover_provider_classification,
-    invalid_response_classification, retry_provider_classification,
-    retryable_invalid_response_classification, user_action_provider_classification, ProviderError,
-    ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
-    ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
-    ProviderRecoveryPlanSnapshot,
+    invalid_response_classification, provider_probe_message_indicates_vault_unavailable,
+    retry_provider_classification, retryable_invalid_response_classification,
+    user_action_provider_classification, ProviderError, ProviderFailureAction,
+    ProviderFailureCategory, ProviderFailureClass, ProviderFailureClassification,
+    ProviderFailureSnapshot, ProviderRecoveryAction, ProviderRecoveryPlanSnapshot,
 };
 pub use providers::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,

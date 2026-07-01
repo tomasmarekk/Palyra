@@ -14,10 +14,10 @@ use palyra_model_providers::{
     model_id_supports_reasoning_effort, normalized_provider_filter_alias,
     parse_discovered_model_ids,
     provider_models_endpoint_for_probe as build_provider_models_endpoint_for_probe,
-    ProviderModelsEndpoint, ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID,
-    OPENAI_CODEX_BACKEND_BASE_URL,
+    provider_probe_message_indicates_vault_unavailable, ProviderModelsEndpoint,
+    ANTHROPIC_API_VERSION, OPENAI_API_DEFAULT_CHAT_MODEL_ID, OPENAI_CODEX_BACKEND_BASE_URL,
 };
-use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultRef};
+use palyra_vault::{Vault, VaultConfig as VaultConfigOptions, VaultError, VaultRef};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use std::{
@@ -2686,8 +2686,20 @@ fn probe_provider(
             return payload;
         }
         Err(error) => {
-            payload.state = "missing_auth".to_owned();
-            payload.message = sanitize_diagnostic_error(error.to_string().as_str());
+            if let Some(credential_source) =
+                unavailable_configured_credential_source(target, &error)
+            {
+                payload.credential_source = credential_source.to_owned();
+                payload.state = "degraded".to_owned();
+                payload.discovery_source = "registry".to_owned();
+                payload.message = format!(
+                    "provider credential is configured but the vault is unavailable: {}",
+                    sanitize_diagnostic_error(error.to_string().as_str())
+                );
+            } else {
+                payload.state = "missing_auth".to_owned();
+                payload.message = sanitize_diagnostic_error(error.to_string().as_str());
+            }
             return payload;
         }
     };
@@ -3058,6 +3070,30 @@ fn load_auth_profile_secret_utf8(
     )
 }
 
+fn unavailable_configured_credential_source<'a>(
+    target: &'a ProbeableProvider,
+    error: &anyhow::Error,
+) -> Option<&'a str> {
+    if !credential_error_indicates_vault_unavailable(error) {
+        return None;
+    }
+    if target.auth_profile_id.as_deref().and_then(normalize_optional_text).is_some() {
+        return Some("auth_profile");
+    }
+    target.vault_ref.as_deref().and_then(normalize_optional_text).map(|_| "config_vault_ref")
+}
+
+fn credential_error_indicates_vault_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<VaultError>().is_some_and(|error| {
+            matches!(
+                error,
+                VaultError::BackendUnavailable(_) | VaultError::Crypto(_) | VaultError::Io(_)
+            )
+        }) || provider_probe_message_indicates_vault_unavailable(cause.to_string().as_str())
+    })
+}
+
 fn open_auth_vault_candidate(candidate: &ProbeAuthVaultCandidate) -> Result<Vault> {
     Vault::open_with_config(VaultConfigOptions {
         root: Some(candidate.vault_root.clone()),
@@ -3395,6 +3431,27 @@ enabled = true
         let target = sample_probe_target("https://api.openai.com/v1", false);
 
         assert!(!console_missing_auth_matches_local_credentials(&[console_provider], &[target]));
+    }
+
+    #[test]
+    fn configured_auth_profile_vault_lock_is_degraded() {
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+        let error = anyhow::anyhow!(
+            "failed to load auth profile secret from candidate vault roots: C:\\state\\vault \
+             (vault I/O failure: timed out waiting for metadata lock \
+             C:\\state\\vault\\metadata.lock); C:\\state\\runtime\\vault (secret not found)"
+        );
+
+        assert_eq!(unavailable_configured_credential_source(&target, &error), Some("auth_profile"));
+    }
+
+    #[test]
+    fn missing_auth_profile_secret_stays_missing_auth() {
+        let target = sample_probe_target("https://api.openai.com/v1", false);
+        let error = anyhow::Error::from(VaultError::NotFound)
+            .context("failed to load vault secret 'openai_access'");
+
+        assert_eq!(unavailable_configured_credential_source(&target, &error), None);
     }
 
     #[test]

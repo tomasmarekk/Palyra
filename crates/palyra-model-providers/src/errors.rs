@@ -474,6 +474,27 @@ pub fn user_action_provider_classification(
     )
 }
 
+/// Detects provider-probe vault availability failures from sanitized diagnostic text.
+///
+/// The CLI and daemon can usually classify typed vault errors before text is
+/// generated, but multi-candidate auth-profile probes aggregate per-root errors
+/// into a redacted string. This matcher intentionally covers only availability
+/// failures; ordinary `secret not found` remains a missing credential.
+#[must_use]
+pub fn provider_probe_message_indicates_vault_unavailable(message: &str) -> bool {
+    let normalized = message.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized.contains("vault i/o failure")
+        || normalized.contains("vault backend unavailable")
+        || normalized.contains("failed to acquire metadata lock")
+        || normalized.contains("timed out waiting for metadata lock")
+        || normalized.contains("metadata.lock: access is denied")
+        || normalized.contains("metadata.lock: pristup byl odepren")
+        || normalized.contains("metadata.lock: stup byl odep")
+}
+
 /// Classifies an HTTP provider failure by status and response body.
 #[must_use]
 pub fn classify_http_provider_failure(
@@ -584,4 +605,29 @@ pub fn retryable_invalid_response_classification(
         None,
         provider_detail,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_probe_vault_unavailable_matches_lock_errors() {
+        assert!(provider_probe_message_indicates_vault_unavailable(
+            "failed to load auth profile secret from candidate vault roots: C:\\state\\vault \
+             (vault I/O failure: timed out waiting for metadata lock \
+             C:\\state\\vault\\metadata.lock); C:\\state\\runtime\\vault (secret not found)"
+        ));
+        assert!(provider_probe_message_indicates_vault_unavailable(
+            "failed to acquire metadata lock C:\\state\\vault\\metadata.lock: access is denied"
+        ));
+    }
+
+    #[test]
+    fn provider_probe_vault_unavailable_rejects_missing_secret() {
+        assert!(!provider_probe_message_indicates_vault_unavailable("secret not found"));
+        assert!(!provider_probe_message_indicates_vault_unavailable(
+            "failed to load vault secret 'openai_access': secret not found"
+        ));
+    }
 }
