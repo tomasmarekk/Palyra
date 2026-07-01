@@ -1006,10 +1006,16 @@ async fn run_browser_start(
             );
         }
         let metadata = read_browser_service_metadata()?;
+        let metadata_running = metadata.as_ref().is_some_and(|value| process_is_running(value.pid));
+        if metadata.is_none() {
+            lifecycle_warnings.push(browser_unmanaged_lifecycle_warning(true));
+        } else if !metadata_running {
+            lifecycle_warnings.push(browser_stale_lifecycle_metadata_warning());
+        }
         let payload = BrowserLifecyclePayload {
             action: "start".to_owned(),
             running: true,
-            pid: metadata.as_ref().map(|value| value.pid),
+            pid: metadata.as_ref().and_then(|value| metadata_running.then_some(value.pid)),
             grpc_url: resolved.connection.grpc_url,
             health_base_url: resolved.connection.health_base_url,
             stdout_log_path: metadata.as_ref().map(|value| value.stdout_log_path.clone()),
@@ -1173,17 +1179,14 @@ fn browser_start_readiness_timeout_detail(
 
 async fn run_browser_stop(json: bool) -> Result<()> {
     let Some(metadata) = read_browser_service_metadata()? else {
-        let payload = BrowserLifecyclePayload {
-            action: "stop".to_owned(),
-            running: false,
-            pid: None,
-            grpc_url: DEFAULT_BROWSER_GRPC_URL.to_owned(),
-            health_base_url: DEFAULT_BROWSER_HEALTH_BASE_URL.to_owned(),
-            stdout_log_path: None,
-            stderr_log_path: None,
-            detail: "no CLI-managed browser service metadata found".to_owned(),
-            warnings: Vec::new(),
-        };
+        let resolved = resolve_browser_config(None, None, None)?;
+        let (health_reachable, grpc_reachable) =
+            browser_service_connection_reachability(&resolved.connection).await;
+        let payload = browser_stop_without_metadata_payload(
+            &resolved.connection,
+            health_reachable,
+            grpc_reachable,
+        );
         let value =
             serde_json::to_value(&payload).context("failed to encode browser lifecycle payload")?;
         return emit_browser_value_with_json(
@@ -1308,6 +1311,42 @@ fn browser_service_metadata_ports_released(metadata: &BrowserServiceMetadata) ->
     browser_connection_port_diagnostics(&connection)
         .iter()
         .all(|diagnostic| diagnostic.bind_available)
+}
+
+async fn browser_service_connection_reachability(
+    connection: &BrowserServiceConnection,
+) -> (bool, bool) {
+    let health_reachable = fetch_browser_health(connection.health_base_url.as_str()).await.is_ok();
+    let grpc_reachable = probe_browser_start_grpc_reachability(connection).await.is_ok();
+    (health_reachable, grpc_reachable)
+}
+
+fn browser_stop_without_metadata_payload(
+    connection: &BrowserServiceConnection,
+    health_reachable: bool,
+    grpc_reachable: bool,
+) -> BrowserLifecyclePayload {
+    let browserd_reachable = health_reachable || grpc_reachable;
+    BrowserLifecyclePayload {
+        action: "stop".to_owned(),
+        running: browserd_reachable,
+        pid: None,
+        grpc_url: connection.grpc_url.clone(),
+        health_base_url: connection.health_base_url.clone(),
+        stdout_log_path: None,
+        stderr_log_path: None,
+        detail: if browserd_reachable {
+            "browser service endpoint is reachable, but no CLI-managed lifecycle metadata was found; no process was stopped"
+                .to_owned()
+        } else {
+            "no CLI-managed browser service metadata found and configured browser endpoints are not reachable"
+                .to_owned()
+        },
+        warnings: browserd_reachable
+            .then(|| browser_unmanaged_lifecycle_warning(health_reachable && grpc_reachable))
+            .into_iter()
+            .collect(),
+    }
 }
 
 async fn run_browser_open(args: BrowserOpenArgs) -> Result<()> {
@@ -3616,20 +3655,11 @@ fn browser_status_warnings(
             browser_gateway_auth_token_setup_warning(config_path)
         ));
     }
-    if browserd_reachable && !browserd_healthy && metadata.is_none() {
-        warnings.push(
-            "browserd is reachable, but no CLI lifecycle metadata exists; the service may have been started outside `palyra browser start` or a previous stop failed before cleanup"
-                .to_owned(),
-        );
+    if browserd_reachable && metadata.is_none() {
+        warnings.push(browser_unmanaged_lifecycle_warning(browserd_healthy));
     }
-    if browserd_reachable
-        && !browserd_healthy
-        && metadata.is_some_and(|entry| !process_is_running(entry.pid))
-    {
-        warnings.push(
-            "browserd is reachable, but the CLI-managed metadata pid is not running; the endpoint may be owned by an unmanaged or stale browser service"
-                .to_owned(),
-        );
+    if browserd_reachable && metadata.is_some_and(|entry| !process_is_running(entry.pid)) {
+        warnings.push(browser_stale_lifecycle_metadata_warning());
     }
     if policy.configured_enabled
         && control_plane.reachable
@@ -3686,9 +3716,25 @@ fn browser_port_diagnostic_warnings(
 
 fn effective_browser_lifecycle_running(
     cli_lifecycle_running: bool,
-    browserd_reachable: bool,
+    _browserd_reachable: bool,
 ) -> bool {
-    cli_lifecycle_running || browserd_reachable
+    cli_lifecycle_running
+}
+
+fn browser_unmanaged_lifecycle_warning(browserd_healthy: bool) -> String {
+    let readiness = if browserd_healthy {
+        "health and gRPC endpoints are reachable"
+    } else {
+        "one or more browser endpoints are reachable"
+    };
+    format!(
+        "browserd is reachable ({readiness}), but no CLI lifecycle metadata exists; treating it as unmanaged/degraded lifecycle state. `palyra browser stop` will not terminate it without CLI metadata; stop the owning supervisor/process or free the configured endpoints before rerunning `palyra browser start --setup`."
+    )
+}
+
+fn browser_stale_lifecycle_metadata_warning() -> String {
+    "browserd is reachable, but the CLI-managed metadata pid is not running; treating the endpoint as unmanaged/degraded until the stale process or endpoint owner is stopped"
+        .to_owned()
 }
 
 fn browser_profile_prerequisite_warnings(
@@ -5072,10 +5118,10 @@ mod tests {
         browser_snapshot_emits_json_to_stdout, browser_start_auth_token_warnings,
         browser_start_grpc_readiness_request, browser_start_grpc_readiness_result,
         browser_start_readiness_timeout_detail, browser_status_control_plane_policy_snapshot,
-        browser_status_warnings, effective_browser_lifecycle_running,
-        ensure_browser_command_success, ensure_browser_gateway_auth_token_alignment,
-        ensure_browser_service_enabled, ensure_browser_start_preflight,
-        ensure_browser_value_success, format_browser_console_text,
+        browser_status_warnings, browser_stop_without_metadata_payload,
+        effective_browser_lifecycle_running, ensure_browser_command_success,
+        ensure_browser_gateway_auth_token_alignment, ensure_browser_service_enabled,
+        ensure_browser_start_preflight, ensure_browser_value_success, format_browser_console_text,
         format_browser_session_summary_text, normalize_session_scoped_output,
         redact_browser_output_value, session_summary_value, BrowserControlPlaneSnapshot,
         BrowserOutputMode, BrowserPolicySnapshot, BrowserResolvedConfig, BrowserServiceConnection,
@@ -6013,15 +6059,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_status_treats_reachable_unmanaged_browserd_as_running() {
+    fn browser_status_treats_reachable_unmanaged_browserd_as_degraded_lifecycle() {
         let mut policy = disabled_policy();
         policy.configured_enabled = true;
         policy.browser_tools_allowlisted = true;
         policy.missing_browser_tools = Vec::new();
 
         assert!(
-            effective_browser_lifecycle_running(false, true),
-            "reachable browserd should not be rendered as lifecycle_running=false"
+            !effective_browser_lifecycle_running(false, true),
+            "reachable unmanaged browserd must not be rendered as CLI lifecycle-running"
         );
 
         let warnings = browser_status_warnings(
@@ -6039,8 +6085,12 @@ mod tests {
         );
 
         assert!(
-            warnings.iter().all(|warning| !warning.contains("no CLI lifecycle metadata")),
-            "healthy desktop-managed browserd should not warn about missing CLI lifecycle metadata: {warnings:?}"
+            warnings.iter().any(|warning| {
+                warning.contains("no CLI lifecycle metadata")
+                    && warning.contains("unmanaged/degraded")
+                    && warning.contains("palyra browser stop")
+            }),
+            "reachable unmanaged browserd should produce an actionable lifecycle warning: {warnings:?}"
         );
 
         let degraded_warnings = browser_status_warnings(
@@ -6062,6 +6112,26 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("no CLI lifecycle metadata")),
             "partially reachable unmanaged browserd should still produce a lifecycle warning: {degraded_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn browser_stop_without_metadata_reports_reachable_unmanaged_endpoint() {
+        let connection = resolved_browser_config_for_test().connection;
+        let payload = browser_stop_without_metadata_payload(&connection, true, true);
+
+        assert!(payload.running, "reachable endpoint should not be reported as stopped");
+        assert_eq!(payload.pid, None);
+        assert_eq!(payload.grpc_url, connection.grpc_url);
+        assert_eq!(payload.health_base_url, connection.health_base_url);
+        assert!(payload.detail.contains("no process was stopped"));
+        assert!(
+            payload.warnings.iter().any(|warning| {
+                warning.contains("no CLI lifecycle metadata")
+                    && warning.contains("unmanaged/degraded")
+                    && warning.contains("palyra browser start --setup")
+            }),
+            "unmanaged stop payload should explain recovery: {payload:?}"
         );
     }
 

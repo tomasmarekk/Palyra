@@ -178,8 +178,21 @@ variable = "PALYRA_BROWSER_SERVICE_AUTH_TOKEN"
 #[test]
 fn browser_stop_supports_json_without_lifecycle_metadata() -> Result<()> {
     let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let config_path = workdir.path().join("palyra.toml");
+    fs::write(
+        &config_path,
+        r#"
+version = 1
 
-    let stop = run_cli(&workdir, &["browser", "stop", "--json"])?;
+[tool_call.browser_service]
+endpoint = "http://127.0.0.1:1"
+health_base_url = "http://127.0.0.1:1"
+"#,
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+    let config_arg = config_path.to_string_lossy().into_owned();
+
+    let stop = run_cli(&workdir, &["--config", config_arg.as_str(), "browser", "stop", "--json"])?;
 
     assert!(
         stop.status.success(),
@@ -192,7 +205,8 @@ fn browser_stop_supports_json_without_lifecycle_metadata() -> Result<()> {
     assert_eq!(payload.get("running").and_then(Value::as_bool), Some(false));
     assert_eq!(
         payload.get("detail").and_then(Value::as_str),
-        Some("no CLI-managed browser service metadata found")
+        Some("no CLI-managed browser service metadata found and configured browser endpoints are not reachable")
     );
+    assert_eq!(payload.get("warnings").and_then(Value::as_array).map(Vec::len), Some(0));
     Ok(())
 }
