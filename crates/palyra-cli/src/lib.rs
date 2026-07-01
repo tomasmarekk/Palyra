@@ -5420,17 +5420,12 @@ fn next_agent_auto_continuation_request(
     auto_resume: AgentAutoResumePolicy,
     completed_continuations: usize,
 ) -> Option<AgentRunInput> {
-    let message = outcome.needs_continuation_message.as_deref()?;
-    if !auto_resume.allows_continuation(completed_continuations)
-        || !agent_needs_continuation_is_auto_resumable(message)
+    if outcome.needs_continuation_message.is_none()
+        || !auto_resume.allows_continuation(completed_continuations)
     {
         return None;
     }
     outcome.continuation_request.clone()
-}
-
-fn agent_needs_continuation_is_auto_resumable(message: &str) -> bool {
-    !matches!(agent_continuation_reason_code(message), Some("tool_followup_timeout"))
 }
 
 fn agent_continuation_blocked_state(
@@ -7242,7 +7237,7 @@ mod agent_stream_output_tests {
     }
 
     #[test]
-    fn auto_continuation_request_stops_for_tool_followup_timeout() {
+    fn auto_continuation_request_resumes_tool_followup_timeout() {
         let continuation_request = build_agent_run_input(AgentRunInputArgs {
             session_id: Some(common_v1::CanonicalId {
                 ulid: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
@@ -7280,7 +7275,7 @@ mod agent_stream_output_tests {
             },
             0
         )
-        .is_none());
+        .is_some());
     }
 
     #[test]
