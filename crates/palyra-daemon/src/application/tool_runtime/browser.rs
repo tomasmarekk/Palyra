@@ -99,6 +99,7 @@ const BROWSER_UPLOAD_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// a single `downloads.get` call.
 const BROWSER_DOWNLOAD_TOOL_DEFAULT_MAX_BYTES: u64 = 256 * 1024;
 const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
+const BROWSER_VIEWPORT_HEIGHT_TOLERANCE_PX: u32 = 80;
 const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
 const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
 /// Env var listing extra OS roots (split like `PATH`) approved for browser
@@ -4601,12 +4602,32 @@ fn browser_viewport_metric_mismatch_error(
     actual_width: u32,
     actual_height: u32,
 ) -> Option<String> {
-    if requested_width == actual_width && requested_height == actual_height {
+    if browser_viewport_dimensions_match(
+        requested_width,
+        requested_height,
+        (actual_width, actual_height),
+    ) {
         return None;
     }
     Some(format!(
         "palyra.browser.viewport reported viewport {actual_width}x{actual_height} after requesting {requested_width}x{requested_height}; mobile or responsive visual assertions are unverified"
     ))
+}
+
+fn browser_viewport_dimensions_match(
+    requested_width: u32,
+    requested_height: u32,
+    actual: (u32, u32),
+) -> bool {
+    let (actual_width, actual_height) = actual;
+    if actual_width != requested_width {
+        return false;
+    }
+    if actual_height == requested_height {
+        return true;
+    }
+    actual_height < requested_height
+        && requested_height.saturating_sub(actual_height) <= BROWSER_VIEWPORT_HEIGHT_TOLERANCE_PX
 }
 
 /// Converts element captures to redacted JSON, returning
@@ -5806,6 +5827,11 @@ mod tests {
     fn browser_viewport_metric_mismatch_is_agent_facing_failure() {
         let matching = browser_viewport_metric_mismatch_error(375, 812, 375, 812);
         assert!(matching.is_none());
+        let browser_chrome_delta = browser_viewport_metric_mismatch_error(375, 667, 375, 652);
+        assert!(
+            browser_chrome_delta.is_none(),
+            "exact width with small visible-height delta should remain usable for responsive assertions"
+        );
 
         let mismatch = browser_viewport_metric_mismatch_error(375, 812, 960, 2079)
             .expect("viewport mismatch should produce an explicit failure message");

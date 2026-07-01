@@ -80,6 +80,8 @@ pub(crate) struct ChromiumLayoutMetrics {
     pub(crate) vertical_overflow: bool,
 }
 
+const CHROMIUM_VIEWPORT_HEIGHT_TOLERANCE_PX: u32 = 80;
+
 #[derive(Debug, Default, Deserialize)]
 struct ChromiumElementCapturePayload {
     #[serde(default)]
@@ -3714,19 +3716,45 @@ fn parse_chromium_viewport_metrics(
     requested_height: u32,
     requested_device_scale_factor: f64,
 ) -> (u32, u32, f64) {
-    // In mobile emulation, `innerWidth` may still expose the page layout
-    // viewport (commonly 980px) before navigation/meta viewport state settles.
-    // The visual viewport is the CSS viewport the user asked to validate.
-    let actual_width =
-        chromium_u32_metric_prefer(&value, "visual_width", "width").unwrap_or(requested_width);
-    let actual_height =
-        chromium_u32_metric_prefer(&value, "visual_height", "height").unwrap_or(requested_height);
+    let visual = chromium_viewport_metric_pair(&value, "visual_width", "visual_height");
+    let layout = chromium_viewport_metric_pair(&value, "width", "height");
+    let (actual_width, actual_height) =
+        select_chromium_viewport_metric_pair(requested_width, requested_height, visual, layout)
+            .unwrap_or((requested_width, requested_height));
     let actual_device_scale_factor = value
         .get("device_scale_factor")
         .and_then(serde_json::Value::as_f64)
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(requested_device_scale_factor);
     (actual_width, actual_height, actual_device_scale_factor)
+}
+
+fn chromium_viewport_metric_pair(
+    value: &serde_json::Value,
+    width_field: &str,
+    height_field: &str,
+) -> Option<(u32, u32)> {
+    Some((
+        chromium_u32_metric_option(value, width_field)?,
+        chromium_u32_metric_option(value, height_field)?,
+    ))
+}
+
+fn select_chromium_viewport_metric_pair(
+    requested_width: u32,
+    requested_height: u32,
+    visual: Option<(u32, u32)>,
+    layout: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    [visual, layout]
+        .iter()
+        .flatten()
+        .copied()
+        .find(|candidate| {
+            chromium_viewport_dimensions_match(requested_width, requested_height, *candidate)
+        })
+        .or(visual)
+        .or(layout)
 }
 
 fn chromium_u32_metric_option(value: &serde_json::Value, field: &str) -> Option<u32> {
@@ -5406,7 +5434,27 @@ fn chromium_viewport_metrics_mismatch(
     actual_width: u32,
     actual_height: u32,
 ) -> bool {
-    actual_width != requested_width || actual_height != requested_height
+    !chromium_viewport_dimensions_match(
+        requested_width,
+        requested_height,
+        (actual_width, actual_height),
+    )
+}
+
+fn chromium_viewport_dimensions_match(
+    requested_width: u32,
+    requested_height: u32,
+    actual: (u32, u32),
+) -> bool {
+    let (actual_width, actual_height) = actual;
+    if actual_width != requested_width {
+        return false;
+    }
+    if actual_height == requested_height {
+        return true;
+    }
+    actual_height < requested_height
+        && requested_height.saturating_sub(actual_height) <= CHROMIUM_VIEWPORT_HEIGHT_TOLERANCE_PX
 }
 
 #[cfg(test)]
@@ -6210,8 +6258,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_chromium_viewport_metrics_uses_matching_layout_when_visual_is_scaled_noise() {
+        let raw = serde_json::json!({
+            "visual_width": 1208,
+            "visual_height": 2148,
+            "width": 375,
+            "height": 667,
+            "device_scale_factor": 2.0
+        });
+
+        let (width, height, device_scale_factor) =
+            parse_chromium_viewport_metrics(raw, 375, 667, 1.0);
+
+        assert_eq!(width, 375);
+        assert_eq!(height, 667);
+        assert_eq!(device_scale_factor, 2.0);
+    }
+
+    #[test]
     fn chromium_viewport_mismatch_allows_exact_css_viewport() {
         assert!(!chromium_viewport_metrics_mismatch(375, 812, 375, 812));
+    }
+
+    #[test]
+    fn chromium_viewport_mismatch_allows_small_visible_height_delta() {
+        assert!(!chromium_viewport_metrics_mismatch(375, 667, 375, 652));
     }
 
     #[test]
