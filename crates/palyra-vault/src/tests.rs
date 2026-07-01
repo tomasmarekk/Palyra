@@ -402,6 +402,38 @@ fn metadata_lock_reclaim_removes_dead_owner_when_stale_age_elapsed() -> Result<(
 }
 
 #[test]
+fn metadata_lock_reclaim_removes_dead_owner_before_stale_age_elapsed() -> Result<()> {
+    let temp = tempdir()?;
+    let lock_path = temp.path().join(METADATA_LOCK_FILE);
+    std::fs::write(&lock_path, format!("pid={} ts_ms=0\n", i32::MAX))?;
+
+    let reclaimed = maybe_reclaim_stale_lock_with_policy(
+        &lock_path,
+        std::time::SystemTime::now(),
+        Duration::from_secs(30),
+    )?;
+    assert!(reclaimed, "dead owner lock should be reclaimed without waiting for stale age");
+    assert!(!lock_path.exists(), "reclaimed lock file should be removed");
+    Ok(())
+}
+
+#[test]
+fn metadata_lock_reclaim_keeps_unparseable_lock_before_stale_age_elapsed() -> Result<()> {
+    let temp = tempdir()?;
+    let lock_path = temp.path().join(METADATA_LOCK_FILE);
+    std::fs::write(&lock_path, b"not a pid marker")?;
+
+    let reclaimed = maybe_reclaim_stale_lock_with_policy(
+        &lock_path,
+        std::time::SystemTime::now(),
+        Duration::from_secs(30),
+    )?;
+    assert!(!reclaimed, "unparseable young lock should not be reclaimed");
+    assert!(lock_path.exists(), "unparseable young lock file should remain");
+    Ok(())
+}
+
+#[test]
 fn metadata_lock_reclaim_treats_missing_lock_as_released() -> Result<()> {
     let temp = tempdir()?;
     let lock_path = temp.path().join(METADATA_LOCK_FILE);

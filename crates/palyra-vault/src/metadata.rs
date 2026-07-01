@@ -213,13 +213,14 @@ fn maybe_reclaim_stale_lock(lock_path: &Path) -> Result<bool, VaultError> {
     maybe_reclaim_stale_lock_with_policy(lock_path, SystemTime::now(), METADATA_LOCK_STALE_AGE)
 }
 
-/// Removes the lock file when it is older than `stale_age` and its owner is gone; returns
-/// whether the caller may immediately retry acquisition.
+/// Removes the lock file when a valid marker names a dead owner, or when an
+/// unparseable lock is older than `stale_age`; returns whether the caller may
+/// immediately retry acquisition.
 ///
-/// Reclaim requires both conditions: age alone would steal the lock from a live-but-slow
-/// holder, and any liveness ambiguity (recycled pid, permission-denied probe) keeps the lock —
-/// failing safe toward an acquisition timeout rather than double-acquisition. Unparseable
-/// markers fall back to age-only reclaim.
+/// A valid owner marker is stronger than file age: a dead owner cannot release
+/// the file later, while a live or ambiguous owner is never stolen. Unparseable
+/// markers fall back to age-only reclaim so arbitrary file contents cannot
+/// masquerade as a dead process.
 pub(crate) fn maybe_reclaim_stale_lock_with_policy(
     lock_path: &Path,
     now: SystemTime,
@@ -255,22 +256,27 @@ pub(crate) fn maybe_reclaim_stale_lock_with_policy(
             resolved_lock_path.display()
         ))
     })?;
-    if now.duration_since(modified).unwrap_or(Duration::ZERO) < stale_age {
-        return Ok(false);
-    }
     if let Ok(raw_marker) = fs::read_to_string(&resolved_lock_path) {
         if let Some(marker) = parse_metadata_lock_marker(raw_marker.as_str()) {
             if metadata_lock_owner_is_alive(marker.pid) {
                 return Ok(false);
             }
+            return remove_metadata_lock_file(resolved_lock_path.as_path());
         }
     }
-    match fs::remove_file(&resolved_lock_path) {
+    if now.duration_since(modified).unwrap_or(Duration::ZERO) < stale_age {
+        return Ok(false);
+    }
+    remove_metadata_lock_file(resolved_lock_path.as_path())
+}
+
+fn remove_metadata_lock_file(lock_path: &Path) -> Result<bool, VaultError> {
+    match fs::remove_file(lock_path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(VaultError::Io(format!(
             "failed to reclaim stale metadata lock {}: {error}",
-            resolved_lock_path.display()
+            lock_path.display()
         ))),
     }
 }
