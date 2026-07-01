@@ -10644,18 +10644,19 @@ async fn archived_objective_bound_dispatch_is_denied_before_orchestrator() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn routines_tool_gates_explicit_sensitive_posture_without_approval_mode() {
+async fn routines_tool_inherits_first_run_approval_for_sensitive_schedule_workdir() {
     let state = build_test_runtime_state(false);
     let _registry = configure_test_routines_runtime(&state, "http://127.0.0.1:9".to_owned());
     let context = routines_tool_test_context();
+    let workdir = unique_temp_test_root("palyra-routines-sensitive-workdir");
+    fs::create_dir_all(workdir.as_path()).expect("routine workdir should exist");
     let upsert_input = serde_json::to_vec(&json!({
         "operation": "upsert",
         "name": "Privileged heartbeat",
         "prompt": "Check privileged diagnostics and summarize action items.",
         "trigger_kind": "schedule",
         "natural_language_schedule": "every 2h",
-        "run_mode": "fresh_session",
-        "execution_posture": "sensitive_tools",
+        "workdir": workdir,
     }))
     .expect("routine upsert payload should serialize");
 
@@ -10683,6 +10684,47 @@ async fn routines_tool_gates_explicit_sensitive_posture_without_approval_mode() 
         routine.get("approval_mode").and_then(Value::as_str),
         Some("before_first_run"),
         "sensitive routine posture must not persist without an approval gate"
+    );
+    let routine_id = routine
+        .get("routine_id")
+        .and_then(Value::as_str)
+        .expect("upsert should return routine id")
+        .to_owned();
+    let approval = output
+        .get("approval")
+        .and_then(Value::as_object)
+        .expect("accepted control upsert should grant the first scheduled run approval");
+    assert_eq!(approval.get("decision").and_then(Value::as_str), Some("allow"));
+    assert_eq!(
+        approval.get("decision_reason").and_then(Value::as_str),
+        Some("first scheduled run approved by accepted palyra.routines.control upsert")
+    );
+
+    let job = state
+        .cron_job(routine_id.clone())
+        .await
+        .expect("cron job lookup should succeed")
+        .expect("upserted routine should have a backing cron job");
+    let outcome = crate::cron::trigger_job_now_with_options(
+        std::sync::Arc::clone(&state),
+        routines_tool_test_auth(),
+        "http://127.0.0.1:9".to_owned(),
+        job,
+        std::sync::Arc::new(Notify::new()),
+        crate::cron::TriggerJobOptions::default(),
+    )
+    .await
+    .expect("dispatch should report backend failures through cron runs, not transport errors");
+    let run_id = outcome.run_id.expect("dispatch should record a cron run");
+    let run = state
+        .cron_run(run_id)
+        .await
+        .expect("cron run lookup should succeed")
+        .expect("dispatch should persist a run record");
+    assert_ne!(
+        run.error_kind.as_deref(),
+        Some("approval_required"),
+        "first scheduled run should pass the routine approval gate after inherited approval"
     );
 }
 
