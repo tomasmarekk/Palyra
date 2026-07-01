@@ -975,12 +975,24 @@ fn normalize_contract_history(
     normalized.sort_by(|left, right| {
         left.created_at_unix_ms
             .cmp(&right.created_at_unix_ms)
+            .then_with(|| {
+                contract_audit_event_sort_rank(left.event_type.as_str())
+                    .cmp(&contract_audit_event_sort_rank(right.event_type.as_str()))
+            })
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
     if normalized.len() > MAX_HISTORY_ENTRIES {
         normalized = normalized.split_off(normalized.len() - MAX_HISTORY_ENTRIES);
     }
     Ok(normalized)
+}
+
+fn contract_audit_event_sort_rank(event_type: &str) -> u8 {
+    match event_type {
+        OBJECTIVE_CONTRACT_CREATED_EVENT => 0,
+        OBJECTIVE_CONTRACT_UPDATED_EVENT => 1,
+        _ => 2,
+    }
 }
 
 fn normalize_contract_text_list(
@@ -1236,8 +1248,9 @@ fn escape_context_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_objective_contract_context_block, ObjectiveApproachKind, ObjectiveApproachRecord,
-        ObjectiveAttemptRecord, ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveContract,
+        normalize_contract_history, render_objective_contract_context_block, ObjectiveApproachKind,
+        ObjectiveApproachRecord, ObjectiveAttemptRecord, ObjectiveAutomationBinding,
+        ObjectiveBudget, ObjectiveContract, ObjectiveContractAuditRecord,
         ObjectiveFinalizationMode, ObjectiveKind, ObjectiveLifecycleRecord, ObjectivePriority,
         ObjectiveRecord, ObjectiveRegistry, ObjectiveState, ObjectiveSuccessCriteria,
         ObjectiveSuccessCriterion, ObjectiveUpsert, ObjectiveWorkspaceBinding,
@@ -1426,6 +1439,36 @@ mod tests {
         assert_eq!(updated.contract_history.len(), 2);
         assert_eq!(updated.contract_history[1].event_type, OBJECTIVE_CONTRACT_UPDATED_EVENT);
         assert_eq!(updated.contract_history[1].reason_code, "objective_contract_test");
+    }
+
+    #[test]
+    fn contract_history_normalization_orders_create_before_update_for_equal_timestamps() {
+        let normalized = normalize_contract_history(vec![
+            ObjectiveContractAuditRecord {
+                event_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+                event_type: OBJECTIVE_CONTRACT_UPDATED_EVENT.to_owned(),
+                actor_principal: "operator".to_owned(),
+                reason_code: "objective_contract_test".to_owned(),
+                summary: "updated objective contract".to_owned(),
+                evidence_refs: vec!["test:update".to_owned()],
+                redaction_level: "metadata_only".to_owned(),
+                created_at_unix_ms: 42,
+            },
+            ObjectiveContractAuditRecord {
+                event_id: "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned(),
+                event_type: OBJECTIVE_CONTRACT_CREATED_EVENT.to_owned(),
+                actor_principal: "operator".to_owned(),
+                reason_code: "objective_contract_test".to_owned(),
+                summary: "created objective contract".to_owned(),
+                evidence_refs: vec!["test:create".to_owned()],
+                redaction_level: "metadata_only".to_owned(),
+                created_at_unix_ms: 42,
+            },
+        ])
+        .expect("history should normalize");
+
+        assert_eq!(normalized[0].event_type, OBJECTIVE_CONTRACT_CREATED_EVENT);
+        assert_eq!(normalized[1].event_type, OBJECTIVE_CONTRACT_UPDATED_EVENT);
     }
 
     #[test]
