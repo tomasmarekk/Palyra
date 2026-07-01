@@ -2,6 +2,7 @@
 //! error, in both text and JSON output.
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 use serde_json::Value;
 
 mod support;
@@ -71,5 +72,29 @@ fn logs_commands_accept_local_json_flag() -> Result<()> {
             args.join(" ")
         );
     }
+    Ok(())
+}
+
+#[test]
+fn logs_commands_report_missing_journal_events_table_as_notice() -> Result<()> {
+    let workdir = temp_workdir()?;
+    let journal_path = workdir.path().join("journal.sqlite3");
+    Connection::open(journal_path.as_path())
+        .with_context(|| format!("failed to create {}", journal_path.display()))?;
+
+    let output = run_cli(workdir.path(), &["logs", "--lines", "50"], &[])?;
+    assert!(
+        output.status.success(),
+        "logs should succeed without journal_events table\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
+    assert!(stdout.contains("logs.notice"), "missing table should emit a notice: {stdout}");
+    assert!(
+        stdout.contains("no journal or service logs exist yet"),
+        "missing table should use the same no-logs diagnostic: {stdout}"
+    );
     Ok(())
 }

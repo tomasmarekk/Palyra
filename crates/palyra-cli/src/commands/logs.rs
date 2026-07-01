@@ -177,7 +177,9 @@ fn resolve_log_input(db_path: Option<String>) -> Result<LogInput> {
     let root_context = app::current_root_context()
         .ok_or_else(|| anyhow!("CLI root context is unavailable for logs command"))?;
     let db_path = resolve_daemon_journal_db_path(db_path)?;
-    if db_path.is_file() {
+    let journal_db_exists_without_events =
+        db_path.is_file() && !journal_events_table_exists(db_path.as_path())?;
+    if db_path.is_file() && !journal_db_exists_without_events {
         return Ok(LogInput::Journal { db_path });
     }
 
@@ -192,7 +194,7 @@ fn resolve_log_input(db_path: Option<String>) -> Result<LogInput> {
         }
     }
 
-    if !db_path.exists() {
+    if !db_path.exists() || journal_db_exists_without_events {
         return Ok(LogInput::Unavailable {
             message: format!(
                 "no journal or service logs exist yet for state_root={}; start the daemon in foreground with `palyra gateway run` to inspect startup errors",
@@ -202,6 +204,16 @@ fn resolve_log_input(db_path: Option<String>) -> Result<LogInput> {
     }
     ensure_journal_db_exists(db_path.as_path())?;
     Ok(LogInput::Journal { db_path })
+}
+
+fn journal_events_table_exists(db_path: &Path) -> Result<bool> {
+    let connection = Connection::open(db_path)
+        .with_context(|| format!("failed to open journal database {}", db_path.display()))?;
+    let mut statement = connection.prepare(
+        "SELECT 1 FROM sqlite_master WHERE name = 'journal_events' AND type IN ('table', 'view') LIMIT 1",
+    )?;
+    let mut rows = statement.query([])?;
+    Ok(rows.next()?.is_some())
 }
 
 fn run_unavailable_logs(
