@@ -49,7 +49,7 @@ use crate::{
     },
     application::tool_registry::ModelVisibleToolCatalogSnapshot,
     application::tool_runtime::{
-        memory::project_memory_prefix_candidates_from_workspace_root,
+        memory::project_memory_prefix_from_workspace_root,
         workspace_scope::{
             workspace_roots_with_run_launch_context,
             workspace_roots_with_run_launch_context_for_agent_source,
@@ -907,7 +907,10 @@ async fn workspace_memory_auto_inject_prefixes(
     };
     let mut prefixes = Vec::new();
     for root in workspace_roots {
-        for prefix in project_memory_prefix_candidates_from_workspace_root(root.as_path()).await {
+        // Auto-inject runs before the model sees the prompt, so it only uses
+        // stable identity prefixes. Legacy basename prefixes remain available
+        // to explicit search, but are ambiguous across `.../workspace` roots.
+        if let Some(prefix) = project_memory_prefix_from_workspace_root(root.as_path()).await {
             push_unique_workspace_memory_prefix(&mut prefixes, prefix);
         }
     }

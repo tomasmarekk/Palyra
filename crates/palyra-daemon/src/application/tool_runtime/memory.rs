@@ -3763,7 +3763,7 @@ pub(crate) async fn project_memory_prefix_candidates_from_workspace_root(
 /// Derives the identity prefix `projects/project-<slug>-<hash10>` from the
 /// canonicalized root path, so two projects with the same directory name get
 /// distinct memory namespaces.
-async fn project_memory_prefix_from_workspace_root(root: &Path) -> Option<String> {
+pub(crate) async fn project_memory_prefix_from_workspace_root(root: &Path) -> Option<String> {
     let root_for_worker = root.to_path_buf();
     let fallback = root.to_path_buf();
     let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(root_for_worker))
