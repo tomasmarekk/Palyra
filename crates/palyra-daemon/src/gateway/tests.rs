@@ -178,6 +178,9 @@ fn process_runner_launch_root_selection_handles_generic_workspace_cwd() {
     assert!(process_runner_input_should_use_launch_root(
         br#"{"command":"node","args":["slow-report.js"],"cwd":"/workspace"}"#
     ));
+    assert!(process_runner_input_should_use_launch_root(
+        br#"{"command":"npm","args":["test"],"cwd":"/workspace/legacy-cjs"}"#
+    ));
     assert!(process_runner_input_should_use_launch_root(br#"{"command":"npm","args":["test"]}"#));
     assert!(!process_runner_input_should_use_launch_root(
         br#"{"command":"node","args":["C:/fixtures/project/slow-report.js"],"cwd":"/workspace"}"#
@@ -352,6 +355,86 @@ async fn process_runner_preserves_configured_root_for_sibling_agent_workspace() 
     .await;
 
     assert_eq!(config.process_runner.workspace_root, configured);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_runner_workspace_alias_subpaths_use_launch_root_outside_state_workspace() {
+    let tempdir = gateway_tempdir("gateway-");
+    let configured = tempdir.path().join("state").join("workspace");
+    let launch_workspace = tempdir.path().join("scenario-runs").join("S050").join("workspace");
+    let legacy_cjs = launch_workspace.join("legacy-cjs");
+    fs::create_dir_all(configured.as_path()).expect("configured root should exist");
+    fs::create_dir_all(legacy_cjs.as_path()).expect("legacy cjs root should exist");
+    let configured =
+        fs::canonicalize(configured.as_path()).expect("configured root should canonicalize");
+    let launch_workspace = fs::canonicalize(launch_workspace.as_path())
+        .expect("launch workspace root should canonicalize");
+
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.workspace_root = configured.clone();
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "process-launch-subpath-root".to_owned(),
+            display_name: "Process Launch Subpath Root".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![configured.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FR1",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FR2",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "process-launch-subpath-root-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": launch_workspace,
+                        "workspace_roots": [launch_workspace],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let config = process_runner_tool_config_for_session(
+        &state,
+        context,
+        br#"{"command":"npm","args":["test"],"cwd":"/workspace/legacy-cjs"}"#,
+    )
+    .await;
+
+    assert_eq!(
+        fs::canonicalize(config.process_runner.workspace_root.as_path())
+            .expect("selected workspace should canonicalize"),
+        launch_workspace,
+        "/workspace subpaths should resolve from launch cwd instead of configured state root {configured:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -10025,6 +10108,91 @@ async fn workspace_patch_tool_preserves_subdirectory_path_under_active_scenario_
     assert!(
         !preview.contains("*** Add File: workspace-report.md"),
         "redacted preview must not show a dropped path prefix: {payload}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_patch_tool_workspace_alias_uses_launch_root_outside_state_workspace() {
+    let state = build_test_runtime_state(false);
+    let harness_root = gateway_tempdir("gateway-");
+    let configured = harness_root.path().join("state").join("workspace");
+    let scenario_workspace =
+        harness_root.path().join("scenario-runs").join("S041").join("workspace");
+    let scenario_reports = scenario_workspace.join("reports");
+    fs::create_dir_all(configured.as_path()).expect("configured root should exist");
+    fs::create_dir_all(scenario_reports.as_path()).expect("scenario reports should exist");
+    let configured =
+        fs::canonicalize(configured.as_path()).expect("configured root should canonicalize");
+    let scenario_workspace = fs::canonicalize(scenario_workspace.as_path())
+        .expect("scenario workspace should canonicalize");
+
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "patcher-s041".to_owned(),
+            display_name: "Patcher S041".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![configured.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+        channel: Some("cli"),
+        session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        run_id: "01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    ensure_tool_context_session(&state, &context);
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: context.run_id.to_owned(),
+            session_id: context.session_id.to_owned(),
+            origin_kind: "workspace-patch-launch-root-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.to_owned()),
+            parameter_delta_json: Some(
+                json!({
+                    "cli_context": {
+                        "launch_cwd": scenario_workspace,
+                        "workspace_roots": [scenario_workspace],
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("orchestrator run should start with launch workspace metadata");
+
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: reports/workspace-report.md\n",
+        "+palyra-launch-root-ok\n",
+        "*** End Patch\n",
+    );
+    let input_json = serde_json::to_vec(&json!({ "workspace_root": "/workspace", "patch": patch }))
+        .expect("patch input should serialize");
+    let outcome = execute_workspace_patch_tool(
+        &state,
+        workspace_patch_test_request("01ARZ3NDEKTSV4RRFFQ69G5FB5", input_json.as_slice()),
+    )
+    .await;
+
+    assert!(outcome.success, "patch tool should apply at launch workspace root: {}", outcome.error);
+    assert!(
+        scenario_workspace.join("reports").join("workspace-report.md").exists(),
+        "patch should create the report below the launch scenario workspace"
+    );
+    assert!(
+        !configured.join("reports").join("workspace-report.md").exists(),
+        "patch must not fall back to the configured state workspace for /workspace"
     );
 }
 
