@@ -433,6 +433,7 @@ fn seed_e2e_skill_fixtures(state_root: &Path) -> Result<E2eSkillFixtureSeedRepor
     let skills_root = state_root.join("skills");
     let artifact = build_e2e_reporter_skill_artifact()?;
     let installed = ensure_e2e_reporter_skill_installed(skills_root.as_path(), &artifact)?;
+    ensure_e2e_reporter_fixture_trust_store(state_root, &artifact)?;
     let journal_path = state_root.join(DEFAULT_JOURNAL_DB_PATH);
     upsert_e2e_reporter_skill_status(journal_path.as_path())?;
     Ok(E2eSkillFixtureSeedReport {
@@ -622,6 +623,54 @@ fn ensure_e2e_reporter_skill_installed(
         }),
     )?;
     Ok(true)
+}
+
+fn ensure_e2e_reporter_fixture_trust_store(
+    state_root: &Path,
+    artifact: &E2eReporterSkillFixtureArtifact,
+) -> Result<()> {
+    let trust_store_path = state_root.join("skills").join("trust-store.json");
+    let mut trust_store = SkillTrustStore::load(trust_store_path.as_path()).with_context(|| {
+        format!("failed to load skills trust store {}", trust_store_path.display())
+    })?;
+    trust_store
+        .add_trusted_key(E2E_REPORTER_PUBLISHER, artifact.public_key_hex.as_str())
+        .context("failed to persist e2e.reporter fixture signing key trust")?;
+    trust_store.save(trust_store_path.as_path()).with_context(|| {
+        format!("failed to save skills trust store {}", trust_store_path.display())
+    })?;
+    let vault = open_e2e_harness_vault(state_root)?;
+    update_trust_store_integrity_digest_with_vault(trust_store_path.as_path(), &vault)
+        .with_context(|| {
+            format!(
+                "failed to update trust-store integrity for e2e fixture at {}",
+                trust_store_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn open_e2e_harness_vault(state_root: &Path) -> Result<Vault> {
+    let vault_root = match std::env::var("PALYRA_VAULT_DIR") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("PALYRA_VAULT_DIR must not be empty");
+            }
+            Some(PathBuf::from(trimmed))
+        }
+        Err(std::env::VarError::NotPresent) => Some(state_root.join("vault")),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("PALYRA_VAULT_DIR must contain valid UTF-8")
+        }
+    };
+    Vault::open_with_config(VaultConfigOptions {
+        root: vault_root,
+        identity_store_root: Some(state_root.join("identity")),
+        backend_preference: parse_cli_vault_backend_preference()?,
+        ..VaultConfigOptions::default()
+    })
+    .map_err(anyhow::Error::from)
 }
 
 fn e2e_reporter_fixture_trust_store(
@@ -2621,8 +2670,98 @@ fn run_skills_enable(command: SkillsEnableCommand) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env hold the shared app test env lock.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env hold the shared app test env lock.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: tests that mutate env hold the shared app test env lock.
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                // SAFETY: tests that mutate env hold the shared app test env lock.
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    struct E2eFixtureVaultEnv {
+        _vault_dir: ScopedEnvVar,
+        _vault_backend: ScopedEnvVar,
+    }
+
+    impl E2eFixtureVaultEnv {
+        fn new(root: &Path) -> Self {
+            Self {
+                _vault_dir: ScopedEnvVar::set("PALYRA_VAULT_DIR", &root.join("vault")),
+                _vault_backend: ScopedEnvVar::set_str("PALYRA_VAULT_BACKEND", "encrypted_file"),
+            }
+        }
+    }
+
     fn temp_procedure_root() -> PathBuf {
         std::env::temp_dir().join(format!("palyra-procedure-skills-{}", Ulid::new()))
+    }
+
+    fn assert_e2e_reporter_fixture_trust_store_allows_audit(state_root: &Path) -> Result<()> {
+        let skills_root = state_root.join("skills");
+        let trust_store_path = skills_root.join("trust-store.json");
+        let artifact = build_e2e_reporter_skill_artifact()?;
+        let trust_store = SkillTrustStore::load(trust_store_path.as_path())?;
+        let trusted_keys = trust_store
+            .trusted_publishers
+            .get(E2E_REPORTER_PUBLISHER)
+            .expect("e2e.reporter publisher should be persisted in trust store");
+        assert!(
+            trusted_keys.contains(&artifact.public_key_hex),
+            "e2e.reporter fixture signing key should be allowlisted"
+        );
+
+        let artifact_path = skills_root
+            .join(E2E_REPORTER_SKILL_ID)
+            .join(E2E_REPORTER_SKILL_VERSION)
+            .join(SKILLS_ARTIFACT_FILE_NAME);
+        let artifact_bytes = fs::read(artifact_path.as_path())?;
+        let mut audit_trust_store = SkillTrustStore::load(trust_store_path.as_path())?;
+        let report = audit_skill_artifact_security(
+            artifact_bytes.as_slice(),
+            &mut audit_trust_store,
+            false,
+            &SkillSecurityAuditPolicy::default(),
+        )?;
+        assert!(report.passed, "seeded fixture audit should pass");
+        assert!(
+            !report.should_quarantine,
+            "seeded fixture should not be quarantined by first audit"
+        );
+        assert_eq!(report.trust_decision, TrustDecision::Allowlisted);
+        Ok(())
     }
 
     #[test]
@@ -2735,17 +2874,16 @@ mod tests {
 
     #[test]
     fn seed_e2e_skill_fixtures_installs_reporter_and_active_status() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
+        let _vault_env = E2eFixtureVaultEnv::new(tempdir.path());
         let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
 
         let report = seed_e2e_skill_fixtures(state_root.as_path())?;
 
         assert!(report.installed, "first seed should install the e2e.reporter artifact");
         let skills_root = state_root.join("skills");
-        assert!(
-            !skills_root.join("trust-store.json").exists(),
-            "fixture seeding must not persist publisher trust pins"
-        );
+        assert_e2e_reporter_fixture_trust_store_allows_audit(state_root.as_path())?;
         let index = load_installed_skills_index(skills_root.as_path())?;
         let reporter = index
             .entries
@@ -2774,14 +2912,18 @@ mod tests {
         )?;
         assert_eq!(status, "active");
 
+        fs::remove_file(skills_root.join("trust-store.json").as_path())?;
         let second = seed_e2e_skill_fixtures(state_root.as_path())?;
         assert!(!second.installed, "second seed should be idempotent");
+        assert_e2e_reporter_fixture_trust_store_allows_audit(state_root.as_path())?;
         Ok(())
     }
 
     #[test]
     fn seed_e2e_skill_fixtures_replaces_preplanted_index_entry() -> Result<()> {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
         let tempdir = tempfile::tempdir()?;
+        let _vault_env = E2eFixtureVaultEnv::new(tempdir.path());
         let state_root = tempdir.path().join("Palyra-TestHarness").join("state");
         let skills_root = state_root.join("skills");
         fs::create_dir_all(skills_root.as_path())?;
@@ -2834,12 +2976,15 @@ mod tests {
                 .is_file(),
             "replacement should cache the verified fixture artifact"
         );
+        assert_e2e_reporter_fixture_trust_store_allows_audit(state_root.as_path())?;
         Ok(())
     }
 
     #[test]
     fn seed_e2e_skill_fixtures_rejects_non_harness_state_root() {
+        let _guard = crate::app::test_env_lock_for_tests().lock().expect("env lock");
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let _vault_env = E2eFixtureVaultEnv::new(tempdir.path());
         let state_root = tempdir.path().join("state");
 
         let error = seed_e2e_skill_fixtures(state_root.as_path())
