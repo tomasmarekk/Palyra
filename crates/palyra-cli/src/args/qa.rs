@@ -31,4 +31,17 @@ pub enum QaCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Run a QA Lab suite gate and maturity scorecard")]
+    Gate {
+        #[arg(long, default_value = "qa/suites/pr_smoke.yaml")]
+        suite: String,
+        #[arg(long)]
+        output_json: Option<String>,
+        #[arg(long)]
+        output_markdown: Option<String>,
+        #[arg(long, default_value_t = false)]
+        allow_live: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }

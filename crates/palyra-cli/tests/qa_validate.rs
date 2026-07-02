@@ -235,6 +235,219 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
 }
 
 #[test]
+fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let json_path = temp_dir.path().join("qa-lab").join("pr-smoke.json");
+    let markdown_path = temp_dir.path().join("qa-lab").join("pr-smoke.md");
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/pr_smoke.yaml", "--output-json"])
+        .arg(json_path.as_os_str())
+        .arg("--output-markdown")
+        .arg(markdown_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa gate")?;
+
+    assert!(
+        output.status.success(),
+        "qa gate pr_smoke should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout_payload: Value =
+        serde_json::from_slice(output.stdout.as_slice()).context("qa gate JSON should parse")?;
+    let file_payload: Value = serde_json::from_slice(
+        fs::read(json_path.as_path()).context("qa gate should write JSON report")?.as_slice(),
+    )
+    .context("written QA gate report should parse")?;
+    let markdown = fs::read_to_string(markdown_path.as_path())
+        .context("qa gate should write Markdown report")?;
+
+    assert_eq!(stdout_payload, file_payload, "stdout and JSON report should match");
+    assert_eq!(stdout_payload.pointer("/decision").and_then(Value::as_str), Some("pass"));
+    assert_eq!(stdout_payload.pointer("/summary/failed").and_then(Value::as_u64), Some(0));
+    assert!(markdown.contains("# QA Lab Gate: pr_smoke"));
+    assert!(markdown.contains("## Maturity Scorecard"));
+    Ok(())
+}
+
+#[test]
+fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/release.yaml", "--json"])
+        .output()
+        .context("failed to execute palyra qa gate release")?;
+
+    assert!(
+        output.status.success(),
+        "qa gate release should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("qa gate release JSON should parse")?;
+    let scorecard = payload
+        .get("maturity_scorecard")
+        .context("QA gate report should include maturity_scorecard")?;
+    let golden_path = repo_root().join("fixtures/golden/qa_release_maturity_scorecard.json");
+    let golden: Value = serde_json::from_slice(
+        fs::read(golden_path.as_path())
+            .with_context(|| format!("failed to read {}", golden_path.display()))?
+            .as_slice(),
+    )
+    .context("golden QA maturity scorecard should parse")?;
+
+    assert_eq!(scorecard, &golden, "release maturity scorecard drifted");
+    Ok(())
+}
+
+#[test]
+fn qa_gate_fails_unavailable_capability_without_skip_reason() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let suite_path = temp_dir.path().join("missing-skip-reason.yaml");
+    fs::write(
+        suite_path.as_path(),
+        format!(
+            r#"
+schema_version: 1
+id: missing_skip_reason
+mode: pr
+scenario_roots:
+  - "{}"
+include_tags: [release_smoke]
+allow_provider_modes: [mock]
+available_capabilities:
+  - qa_lab
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  categories:
+    - id: security
+      label: Security
+      labels: [security]
+"#,
+            repo_root().join("qa/scenarios").display().to_string().replace('\\', "/")
+        ),
+    )
+    .context("failed to write suite fixture")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["qa", "gate", "--suite"])
+        .arg(suite_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa gate missing skip reason")?;
+
+    assert!(!output.status.success(), "missing skip reason should fail the gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("failing QA gate JSON should parse")?;
+    assert_eq!(payload.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert!(payload.pointer("/policy_violations").and_then(Value::as_array).is_some_and(
+        |violations| violations.iter().any(|violation| {
+            violation.get("code").and_then(Value::as_str) == Some("missing_skip_reason")
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn qa_gate_release_blocks_failing_p0_scenario() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let scenario_dir = temp_dir.path().join("scenarios");
+    fs::create_dir_all(scenario_dir.as_path()).context("failed to create scenario dir")?;
+    fs::write(
+        scenario_dir.join("failing-p0.yaml"),
+        r#"
+schema_version: 1
+id: p0.fixture_missing
+area: tools
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  capabilities: [agent_run, qa_lab]
+  tools: []
+  fixtures:
+    - missing/fixture.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Exercise missing fixture handling."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains: ["done"]
+  events:
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events: []
+  artifacts: []
+  claims: []
+artifacts: []
+maturity:
+  labels: [p0]
+timeout:
+  run_ms: 30000
+"#,
+    )
+    .context("failed to write failing P0 scenario")?;
+    let suite_path = temp_dir.path().join("release.yaml");
+    fs::write(
+        suite_path.as_path(),
+        format!(
+            r#"
+schema_version: 1
+id: release_regression
+mode: release
+scenario_roots:
+  - "{}"
+include_tags: [p0]
+allow_provider_modes: [mock]
+require_p0_green: true
+available_capabilities:
+  - agent_run
+  - qa_lab
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  categories:
+    - id: execution_backends
+      label: Execution backends
+      areas: [tools]
+"#,
+            scenario_dir.display().to_string().replace('\\', "/")
+        ),
+    )
+    .context("failed to write release regression suite")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["qa", "gate", "--suite"])
+        .arg(suite_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa gate release regression")?;
+
+    assert!(!output.status.success(), "failing P0 scenario should fail release gate");
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("failing release gate JSON should parse")?;
+    assert_eq!(payload.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert_eq!(payload.pointer("/summary/failed").and_then(Value::as_u64), Some(1));
+    assert!(payload.pointer("/policy_violations").and_then(Value::as_array).is_some_and(
+        |violations| violations.iter().any(|violation| {
+            violation.get("code").and_then(Value::as_str) == Some("release_p0_not_green")
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn qa_validate_accepts_provider_compatibility_scenario_pack() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .current_dir(repo_root())

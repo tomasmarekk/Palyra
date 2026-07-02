@@ -16,9 +16,9 @@ use palyra_model_providers::{
     provider_compat_fixture_pack_report, ProviderCompatFixtureError, ProviderCompatFixtureIssue,
     ProviderCompatPackReport,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Runs a `palyra qa` subcommand.
 ///
@@ -34,6 +34,13 @@ pub(crate) fn run_qa(command: QaCommand) -> Result<()> {
         QaCommand::ProviderCompat { path, output, json } => {
             run_provider_compat(Path::new(path.as_str()), output.as_deref(), json)
         }
+        QaCommand::Gate { suite, output_json, output_markdown, allow_live, json } => run_gate(
+            Path::new(suite.as_str()),
+            output_json.as_deref(),
+            output_markdown.as_deref(),
+            allow_live,
+            json,
+        ),
     }
 }
 
@@ -99,6 +106,149 @@ struct QaProviderCompatReport {
     category_count: usize,
     missing_categories: Vec<String>,
     packs: Vec<ProviderCompatPackReport>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QaSuiteConfig {
+    schema_version: u32,
+    id: String,
+    mode: String,
+    scenario_roots: Vec<String>,
+    #[serde(default)]
+    include_tags: Vec<String>,
+    #[serde(default)]
+    exclude_tags: Vec<String>,
+    #[serde(default)]
+    allow_provider_modes: Vec<String>,
+    #[serde(default)]
+    allow_live_providers: bool,
+    #[serde(default)]
+    require_p0_green: bool,
+    #[serde(default)]
+    available_capabilities: Vec<String>,
+    #[serde(default)]
+    capability_skips: Vec<QaCapabilitySkipConfig>,
+    #[serde(default)]
+    flaky_policy: QaFlakyPolicyConfig,
+    scorecard: QaScorecardConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QaCapabilitySkipConfig {
+    capability: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct QaFlakyPolicyConfig {
+    max_retries: u32,
+    fail_on_flaky: bool,
+    require_issue: bool,
+}
+
+impl Default for QaFlakyPolicyConfig {
+    fn default() -> Self {
+        Self { max_retries: 0, fail_on_flaky: true, require_issue: true }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QaScorecardConfig {
+    #[serde(default)]
+    baseline_score_bps: Option<u32>,
+    #[serde(default)]
+    fail_on_required_blockers: bool,
+    categories: Vec<QaScorecardCategoryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QaScorecardCategoryConfig {
+    id: String,
+    label: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default)]
+    areas: Vec<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    baseline_score_bps: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct QaGateReport {
+    schema_version: u32,
+    format: &'static str,
+    suite_id: String,
+    suite_mode: String,
+    suite_path: String,
+    scenario_roots: Vec<String>,
+    decision: QaGateDecision,
+    summary: QaGateSummary,
+    flaky_policy: QaFlakyPolicyConfig,
+    policy_violations: Vec<QaGatePolicyViolation>,
+    maturity_scorecard: QaMaturityScorecard,
+    scenarios: Vec<QaPackScenarioReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct QaGateSummary {
+    scenario_count: usize,
+    selected_count: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    unsupported: usize,
+    p0_selected: usize,
+    p0_failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QaGateDecision {
+    Pass,
+    Fail,
+}
+
+impl QaGateDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct QaGatePolicyViolation {
+    code: String,
+    scenario_id: Option<String>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QaMaturityScorecard {
+    overall_score_bps: u32,
+    baseline_score_bps: Option<u32>,
+    trend_delta_bps: Option<i32>,
+    blockers: Vec<String>,
+    categories: Vec<QaMaturityCategoryScore>,
+}
+
+#[derive(Debug, Serialize)]
+struct QaMaturityCategoryScore {
+    id: String,
+    label: String,
+    required: bool,
+    score_bps: u32,
+    baseline_score_bps: Option<u32>,
+    trend_delta_bps: Option<i32>,
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    unsupported: usize,
+    blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -237,6 +387,511 @@ fn run_provider_compat(path: &Path, output: Option<&str>, json: bool) -> Result<
         std::io::stdout().flush().context("stdout flush failed")?;
     }
     Ok(())
+}
+
+fn run_gate(
+    suite_path: &Path,
+    output_json: Option<&str>,
+    output_markdown: Option<&str>,
+    allow_live: bool,
+    json: bool,
+) -> Result<()> {
+    let report = build_gate_report(suite_path, allow_live)?;
+    if let Some(output) = output_json {
+        let encoded =
+            serde_json::to_vec_pretty(&report).context("failed to encode QA gate report")?;
+        write_qa_report(Path::new(output), encoded.as_slice())?;
+    }
+    if let Some(output) = output_markdown {
+        let markdown = render_gate_markdown(&report);
+        write_qa_report(Path::new(output), markdown.as_bytes())?;
+    }
+    if output::preferred_json(json) {
+        output::print_json_pretty(&report, "failed to encode QA gate report as JSON")?;
+    } else {
+        println!(
+            "qa.gate decision={} suite={} scenarios={} selected={} pass={} fail={} skipped={} unsupported={} maturity_score_bps={}",
+            report.decision.as_str(),
+            report.suite_id,
+            report.summary.scenario_count,
+            report.summary.selected_count,
+            report.summary.passed,
+            report.summary.failed,
+            report.summary.skipped,
+            report.summary.unsupported,
+            report.maturity_scorecard.overall_score_bps
+        );
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    if report.decision != QaGateDecision::Pass {
+        anyhow::bail!(
+            "QA gate {} failed with {} failure(s), {} policy violation(s), and {} scorecard blocker(s)",
+            report.suite_id,
+            report.summary.failed,
+            report.policy_violations.len(),
+            report.maturity_scorecard.blockers.len()
+        );
+    }
+    Ok(())
+}
+
+fn build_gate_report(suite_path: &Path, allow_live: bool) -> Result<QaGateReport> {
+    let suite = load_suite_config(suite_path)?;
+    let scenario_paths = collect_suite_scenario_paths(&suite)?;
+    let available_capabilities =
+        suite.available_capabilities.iter().cloned().collect::<BTreeSet<_>>();
+    let capability_skip_reasons = suite
+        .capability_skips
+        .iter()
+        .map(|skip| (skip.capability.clone(), skip.reason.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut scenarios = Vec::with_capacity(scenario_paths.len());
+    for scenario_path in scenario_paths {
+        scenarios.push(build_gate_scenario_report(
+            scenario_path.as_path(),
+            &suite,
+            &available_capabilities,
+            &capability_skip_reasons,
+            allow_live,
+        ));
+    }
+    let summary = build_gate_summary(&scenarios);
+    let mut policy_violations = skip_reason_policy_violations(&scenarios);
+    if suite.require_p0_green && summary.p0_failed > 0 {
+        policy_violations.push(QaGatePolicyViolation {
+            code: "release_p0_not_green".to_owned(),
+            scenario_id: None,
+            detail: format!(
+                "suite requires green P0 scenarios but {} selected P0 scenario(s) failed or were unavailable",
+                summary.p0_failed
+            ),
+        });
+    }
+    let maturity_scorecard = build_maturity_scorecard(&suite.scorecard, &scenarios);
+    let required_scorecard_blockers = suite.scorecard.fail_on_required_blockers
+        && maturity_scorecard
+            .categories
+            .iter()
+            .any(|category| category.required && !category.blockers.is_empty());
+    let decision =
+        if summary.failed == 0 && policy_violations.is_empty() && !required_scorecard_blockers {
+            QaGateDecision::Pass
+        } else {
+            QaGateDecision::Fail
+        };
+    Ok(QaGateReport {
+        schema_version: 1,
+        format: "palyra-qa-gate-report",
+        suite_id: suite.id,
+        suite_mode: suite.mode,
+        suite_path: display_path_slash(suite_path),
+        scenario_roots: suite.scenario_roots,
+        decision,
+        summary,
+        flaky_policy: suite.flaky_policy,
+        policy_violations,
+        maturity_scorecard,
+        scenarios,
+    })
+}
+
+fn load_suite_config(path: &Path) -> Result<QaSuiteConfig> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read QA suite {}", path.display()))?;
+    let suite = yaml_serde::from_str::<QaSuiteConfig>(text.as_str())
+        .with_context(|| format!("failed to parse QA suite {}", path.display()))?;
+    validate_suite_config(&suite, path)?;
+    Ok(suite)
+}
+
+fn validate_suite_config(suite: &QaSuiteConfig, path: &Path) -> Result<()> {
+    if suite.schema_version != 1 {
+        anyhow::bail!(
+            "QA suite {} uses unsupported schema_version {}",
+            path.display(),
+            suite.schema_version
+        );
+    }
+    if suite.id.trim().is_empty() {
+        anyhow::bail!("QA suite {} must define a non-empty id", path.display());
+    }
+    if suite.scenario_roots.is_empty() {
+        anyhow::bail!("QA suite {} must define at least one scenario root", path.display());
+    }
+    if suite.scorecard.categories.is_empty() {
+        anyhow::bail!("QA suite {} must define scorecard categories", path.display());
+    }
+    for skip in &suite.capability_skips {
+        if skip.capability.trim().is_empty() || skip.reason.trim().is_empty() {
+            anyhow::bail!(
+                "QA suite {} capability skip entries must include capability and reason",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_suite_scenario_paths(suite: &QaSuiteConfig) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for root in &suite.scenario_roots {
+        paths.extend(collect_scenario_paths(Path::new(root))?);
+    }
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        anyhow::bail!("QA suite {} did not resolve any scenario manifests", suite.id);
+    }
+    Ok(paths)
+}
+
+fn build_gate_scenario_report(
+    path: &Path,
+    suite: &QaSuiteConfig,
+    available_capabilities: &BTreeSet<String>,
+    capability_skip_reasons: &BTreeMap<String, String>,
+    allow_live: bool,
+) -> QaPackScenarioReport {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            return pack_failure(path, "<unreadable>", "read_error", error.to_string());
+        }
+    };
+    let manifest = match parse_qa_scenario_manifest_yaml(text.as_str()) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return pack_failure(path, "<invalid>", "manifest_error", error.to_string());
+        }
+    };
+    if !matches_requested_tags(&manifest, suite.include_tags.as_slice())
+        || matches_excluded_tags(&manifest, suite.exclude_tags.as_slice())
+    {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Skipped,
+            "skipped",
+            Vec::new(),
+            Some("suite tag filter".to_owned()),
+        );
+    }
+    if !suite.allow_provider_modes.is_empty()
+        && !suite.allow_provider_modes.iter().any(|mode| mode == manifest.mode.provider.as_str())
+    {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Unsupported,
+            "unsupported",
+            Vec::new(),
+            Some(format!(
+                "provider mode {} is not enabled for suite {}",
+                manifest.mode.provider.as_str(),
+                suite.id
+            )),
+        );
+    }
+    if manifest.mode.provider == QaScenarioProviderMode::Live
+        && !(suite.allow_live_providers || allow_live)
+    {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Unsupported,
+            "unsupported",
+            Vec::new(),
+            capability_skip_reasons.get("live_provider").cloned(),
+        );
+    }
+    if let Some(missing_capability) = manifest
+        .requires
+        .capabilities
+        .iter()
+        .find(|capability| !available_capabilities.contains(capability.as_str()))
+    {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Unsupported,
+            "unsupported",
+            Vec::new(),
+            capability_skip_reasons.get(missing_capability).cloned(),
+        );
+    }
+    if manifest.mode.provider != QaScenarioProviderMode::Mock {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Unsupported,
+            "unsupported",
+            Vec::new(),
+            Some("local QA gate dry-run only executes mock-provider scenarios".to_owned()),
+        );
+    }
+    let fixture_issue_codes = validate_pack_fixtures(&manifest);
+    if !fixture_issue_codes.is_empty() {
+        return pack_manifest_report(
+            path,
+            &manifest,
+            QaPackScenarioStatus::Fail,
+            "failed",
+            fixture_issue_codes,
+            Some("required QA fixture validation failed".to_owned()),
+        );
+    }
+    let evidence = build_qa_evidence_bundle(&manifest, simulated_pack_evidence(&manifest));
+    let issue_codes = evidence
+        .checks
+        .iter()
+        .flat_map(|check| check.issues.iter().map(|issue| issue.code.clone()))
+        .collect::<Vec<_>>();
+    let status = if evidence.summary.verdict == QaEvidenceVerdict::Passed {
+        QaPackScenarioStatus::Pass
+    } else {
+        QaPackScenarioStatus::Fail
+    };
+    pack_manifest_report(
+        path,
+        &manifest,
+        status,
+        evidence.summary.verdict.as_str(),
+        issue_codes,
+        None,
+    )
+}
+
+fn build_gate_summary(scenarios: &[QaPackScenarioReport]) -> QaGateSummary {
+    let selected_count = scenarios
+        .iter()
+        .filter(|scenario| !matches!(scenario.status, QaPackScenarioStatus::Skipped))
+        .count();
+    let passed = count_status(scenarios, QaPackScenarioStatus::Pass);
+    let failed = count_status(scenarios, QaPackScenarioStatus::Fail);
+    let skipped = count_status(scenarios, QaPackScenarioStatus::Skipped);
+    let unsupported = count_status(scenarios, QaPackScenarioStatus::Unsupported);
+    let p0_selected = scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.labels.iter().any(|label| label == "p0")
+                && !matches!(scenario.status, QaPackScenarioStatus::Skipped)
+        })
+        .count();
+    let p0_failed = scenarios
+        .iter()
+        .filter(|scenario| {
+            scenario.labels.iter().any(|label| label == "p0")
+                && matches!(
+                    scenario.status,
+                    QaPackScenarioStatus::Fail | QaPackScenarioStatus::Unsupported
+                )
+        })
+        .count();
+    QaGateSummary {
+        scenario_count: scenarios.len(),
+        selected_count,
+        passed,
+        failed,
+        skipped,
+        unsupported,
+        p0_selected,
+        p0_failed,
+    }
+}
+
+fn skip_reason_policy_violations(scenarios: &[QaPackScenarioReport]) -> Vec<QaGatePolicyViolation> {
+    scenarios
+        .iter()
+        .filter(|scenario| {
+            matches!(
+                scenario.status,
+                QaPackScenarioStatus::Skipped | QaPackScenarioStatus::Unsupported
+            ) && scenario.reason.as_ref().is_none_or(|reason| reason.trim().is_empty())
+        })
+        .map(|scenario| QaGatePolicyViolation {
+            code: "missing_skip_reason".to_owned(),
+            scenario_id: Some(scenario.id.clone()),
+            detail: "skipped or unavailable scenario must include an explicit reason".to_owned(),
+        })
+        .collect()
+}
+
+fn build_maturity_scorecard(
+    config: &QaScorecardConfig,
+    scenarios: &[QaPackScenarioReport],
+) -> QaMaturityScorecard {
+    let categories = config
+        .categories
+        .iter()
+        .map(|category| build_maturity_category_score(category, scenarios))
+        .collect::<Vec<_>>();
+    let overall_score_bps = if categories.is_empty() {
+        0
+    } else {
+        let sum = categories.iter().map(|category| u64::from(category.score_bps)).sum::<u64>();
+        sum.checked_div(categories.len() as u64).unwrap_or(0) as u32
+    };
+    let blockers = categories
+        .iter()
+        .flat_map(|category| {
+            category.blockers.iter().map(|blocker| format!("{}:{blocker}", category.id))
+        })
+        .collect::<Vec<_>>();
+    QaMaturityScorecard {
+        overall_score_bps,
+        baseline_score_bps: config.baseline_score_bps,
+        trend_delta_bps: config
+            .baseline_score_bps
+            .map(|baseline| overall_score_bps as i32 - baseline as i32),
+        blockers,
+        categories,
+    }
+}
+
+fn build_maturity_category_score(
+    config: &QaScorecardCategoryConfig,
+    scenarios: &[QaPackScenarioReport],
+) -> QaMaturityCategoryScore {
+    let matching = scenarios
+        .iter()
+        .filter(|scenario| category_matches_scenario(config, scenario))
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let passed =
+        matching.iter().filter(|scenario| scenario.status == QaPackScenarioStatus::Pass).count();
+    let failed =
+        matching.iter().filter(|scenario| scenario.status == QaPackScenarioStatus::Fail).count();
+    let skipped =
+        matching.iter().filter(|scenario| scenario.status == QaPackScenarioStatus::Skipped).count();
+    let unsupported = matching
+        .iter()
+        .filter(|scenario| scenario.status == QaPackScenarioStatus::Unsupported)
+        .count();
+    let score_bps = ratio_bps(passed, total);
+    let mut blockers = Vec::new();
+    if total == 0 {
+        blockers.push("coverage_missing".to_owned());
+    }
+    if failed > 0 {
+        blockers.push("scenario_failed".to_owned());
+    }
+    if unsupported > 0 {
+        blockers.push("capability_unavailable".to_owned());
+    }
+    if skipped > 0 {
+        blockers.push("scenario_skipped".to_owned());
+    }
+    QaMaturityCategoryScore {
+        id: config.id.clone(),
+        label: config.label.clone(),
+        required: config.required,
+        score_bps,
+        baseline_score_bps: config.baseline_score_bps,
+        trend_delta_bps: config
+            .baseline_score_bps
+            .map(|baseline| score_bps as i32 - baseline as i32),
+        total,
+        passed,
+        failed,
+        skipped,
+        unsupported,
+        blockers,
+    }
+}
+
+fn ratio_bps(numerator: usize, denominator: usize) -> u32 {
+    numerator.checked_mul(10_000).and_then(|value| value.checked_div(denominator)).unwrap_or(0)
+        as u32
+}
+
+fn category_matches_scenario(
+    config: &QaScorecardCategoryConfig,
+    scenario: &QaPackScenarioReport,
+) -> bool {
+    config.labels.iter().any(|label| scenario.labels.iter().any(|value| value == label))
+        || config.areas.iter().any(|area| &scenario.area == area)
+}
+
+fn render_gate_markdown(report: &QaGateReport) -> String {
+    let mut markdown = String::new();
+    markdown.push_str(format!("# QA Lab Gate: {}\n\n", report.suite_id).as_str());
+    markdown.push_str(format!("- Decision: `{}`\n", report.decision.as_str()).as_str());
+    markdown.push_str(format!("- Suite mode: `{}`\n", report.suite_mode).as_str());
+    markdown
+        .push_str(format!("- Selected scenarios: `{}`\n", report.summary.selected_count).as_str());
+    markdown.push_str(format!("- Passed: `{}`\n", report.summary.passed).as_str());
+    markdown.push_str(format!("- Failed: `{}`\n", report.summary.failed).as_str());
+    markdown.push_str(format!("- Unsupported: `{}`\n", report.summary.unsupported).as_str());
+    markdown.push_str(
+        format!("- Maturity score: `{}` bps\n\n", report.maturity_scorecard.overall_score_bps)
+            .as_str(),
+    );
+    markdown.push_str("## Maturity Scorecard\n\n");
+    markdown.push_str(
+        "| Area | Required | Score bps | Trend bps | Total | Pass | Fail | Skip | Unsupported | Blockers |\n",
+    );
+    markdown.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
+    for category in &report.maturity_scorecard.categories {
+        let trend = category.trend_delta_bps.map_or("-".to_owned(), |value| value.to_string());
+        let blockers = if category.blockers.is_empty() {
+            "-".to_owned()
+        } else {
+            category.blockers.join(", ")
+        };
+        markdown.push_str(
+            format!(
+                "| {} | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} |\n",
+                markdown_escape(category.label.as_str()),
+                category.required,
+                category.score_bps,
+                trend,
+                category.total,
+                category.passed,
+                category.failed,
+                category.skipped,
+                category.unsupported,
+                markdown_escape(blockers.as_str())
+            )
+            .as_str(),
+        );
+    }
+    if !report.policy_violations.is_empty() {
+        markdown.push_str("\n## Policy Violations\n\n");
+        markdown.push_str("| Code | Scenario | Detail |\n");
+        markdown.push_str("| --- | --- | --- |\n");
+        for violation in &report.policy_violations {
+            markdown.push_str(
+                format!(
+                    "| `{}` | `{}` | {} |\n",
+                    markdown_escape(violation.code.as_str()),
+                    violation.scenario_id.as_deref().unwrap_or("-"),
+                    markdown_escape(violation.detail.as_str())
+                )
+                .as_str(),
+            );
+        }
+    }
+    markdown.push_str("\n## Scenario Results\n\n");
+    markdown.push_str("| Scenario | Status | Area | Labels | Reason |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    for scenario in &report.scenarios {
+        markdown.push_str(
+            format!(
+                "| `{}` | `{}` | `{}` | {} | {} |\n",
+                markdown_escape(scenario.id.as_str()),
+                scenario.status.as_str(),
+                markdown_escape(scenario.area.as_str()),
+                markdown_escape(scenario.labels.join(", ").as_str()),
+                markdown_escape(scenario.reason.as_deref().unwrap_or("-"))
+            )
+            .as_str(),
+        );
+    }
+    markdown
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
 }
 
 fn build_provider_compat_report(path: &Path) -> Result<QaProviderCompatReport> {
@@ -502,6 +1157,10 @@ fn simulated_final_answer(manifest: &QaScenarioManifest) -> String {
 
 fn matches_requested_tags(manifest: &QaScenarioManifest, requested_tags: &[String]) -> bool {
     requested_tags.iter().all(|tag| manifest.maturity.labels.iter().any(|label| label == tag))
+}
+
+fn matches_excluded_tags(manifest: &QaScenarioManifest, excluded_tags: &[String]) -> bool {
+    excluded_tags.iter().any(|tag| manifest.maturity.labels.iter().any(|label| label == tag))
 }
 
 fn manifest_requires_sandbox_fixture(manifest: &QaScenarioManifest) -> bool {

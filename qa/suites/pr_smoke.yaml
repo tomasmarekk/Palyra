@@ -1,0 +1,52 @@
+schema_version: 1
+id: pr_smoke
+mode: pr
+scenario_roots:
+  - qa/scenarios
+include_tags:
+  - release_smoke
+allow_provider_modes:
+  - mock
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - approvals
+  - provider_recovery
+  - redaction
+  - workspace_context
+capability_skips:
+  - capability: live_provider
+    reason: "Live provider scenarios require scheduled CI secrets and are excluded from PR smoke."
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: false
+  categories:
+    - id: api
+      label: API
+      areas: [text]
+      labels: [text_only]
+    - id: mcp
+      label: MCP
+      labels: [mcp]
+    - id: subagents
+      label: Subagents
+      labels: [delegation]
+    - id: provider_recovery
+      label: Provider recovery
+      labels: [provider]
+    - id: execution_backends
+      label: Execution backends
+      labels: [process, mutating]
+    - id: hooks
+      label: Hooks
+      labels: [security]
+    - id: observability
+      label: Observability
+      labels: [workflow]
+    - id: security
+      label: Security
+      labels: [security]

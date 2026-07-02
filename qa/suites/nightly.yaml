@@ -1,0 +1,65 @@
+schema_version: 1
+id: nightly
+mode: nightly
+scenario_roots:
+  - qa/scenarios
+  - qa/scenarios/provider
+include_tags:
+  - nightly
+allow_provider_modes:
+  - mock
+  - recorded
+  - live
+allow_live_providers: true
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - approvals
+  - context_compaction
+  - delegation
+  - gateway_recovery
+  - hook_policy
+  - patch_verification
+  - process_background
+  - provider_compat
+  - provider_recovery
+  - provider_routing
+  - provider_stream_normalizer
+  - redaction
+  - session_compaction
+capability_skips:
+  - capability: live_provider
+    reason: "Nightly live provider scenarios run only when provider secrets are present."
+flaky_policy:
+  max_retries: 1
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: false
+  categories:
+    - id: api
+      label: API
+      areas: [text]
+      labels: [text_only]
+    - id: mcp
+      label: MCP
+      labels: [mcp]
+    - id: subagents
+      label: Subagents
+      labels: [delegation]
+    - id: provider_recovery
+      label: Provider recovery
+      labels: [provider, provider_compat]
+    - id: execution_backends
+      label: Execution backends
+      labels: [process, mutating]
+    - id: hooks
+      label: Hooks
+      labels: [security]
+    - id: observability
+      label: Observability
+      labels: [workflow, gateway]
+    - id: security
+      label: Security
+      labels: [security]

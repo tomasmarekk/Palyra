@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `156`
-- Verified entries: `156`
+- Total entries: `157`
+- Verified entries: `157`
 - Regression entries: `0`
-- Help snapshot coverage: `156` entries
+- Help snapshot coverage: `157` entries
 
 ### Expected parity status counts
 
-- `done`: `152`
+- `done`: `153`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `156`
+- `verified`: `157`
 
 ## Entries
 
@@ -98,6 +98,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `qa validate` | `nested_surface` | `done` | `verified` | `qa-validate-help.txt` | - | `--path`, `--json` | - |
 | `qa run-pack` | `nested_surface` | `done` | `verified` | `qa-run-pack-help.txt` | - | `--path`, `--tag`, `--output`, `--json` | - |
 | `qa provider-compat` | `nested_surface` | `done` | `verified` | `qa-provider-compat-help.txt` | - | `--path`, `--output`, `--json` | - |
+| `qa gate` | `nested_surface` | `done` | `verified` | `qa-gate-help.txt` | - | `--suite`, `--output-json`, `--output-markdown`, `--allow-live`, `--json` | - |
 | `config` | `top_level` | `done` | `verified` | `config-help.txt` | - | - | - |
 | `models` | `top_level` | `done` | `verified` | `models-help.txt` | - | - | - |
 | `patch` | `top_level` | `done` | `verified` | `patch-help.txt` | - | - | - |

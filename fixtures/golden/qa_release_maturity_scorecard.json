@@ -1,0 +1,124 @@
+{
+  "overall_score_bps": 8750,
+  "baseline_score_bps": 0,
+  "trend_delta_bps": 8750,
+  "blockers": [
+    "mcp:coverage_missing"
+  ],
+  "categories": [
+    {
+      "id": "api",
+      "label": "API",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "mcp",
+      "label": "MCP",
+      "required": false,
+      "score_bps": 0,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": [
+        "coverage_missing"
+      ]
+    },
+    {
+      "id": "subagents",
+      "label": "Subagents",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "provider_recovery",
+      "label": "Provider recovery",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 14,
+      "passed": 14,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "execution_backends",
+      "label": "Execution backends",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 2,
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "hooks",
+      "label": "Hooks",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 2,
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "observability",
+      "label": "Observability",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 2,
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    },
+    {
+      "id": "security",
+      "label": "Security",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 2,
+      "passed": 2,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
+    }
+  ]
+}

@@ -118,6 +118,35 @@ fn parse_qa_provider_compat_with_output_and_json() {
 }
 
 #[test]
+fn parse_qa_gate_with_reports_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "qa",
+        "gate",
+        "--suite",
+        "qa/suites/release.yaml",
+        "--output-json",
+        "artifacts/qa-lab/release.json",
+        "--output-markdown",
+        "artifacts/qa-lab/release.md",
+        "--allow-live",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Qa {
+            command: QaCommand::Gate {
+                suite: "qa/suites/release.yaml".to_owned(),
+                output_json: Some("artifacts/qa-lab/release.json".to_owned()),
+                output_markdown: Some("artifacts/qa-lab/release.md".to_owned()),
+                allow_live: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_gateway_status_with_json_flag() {
     let parsed = Cli::parse_from(["palyra", "gateway", "status", "--json"]);
     assert_eq!(

@@ -305,6 +305,29 @@ jobs:
           name: cli-parity-acceptance-matrix
           path: artifacts/cli-parity-acceptance-matrix.md
 
+  qa-lab:
+    name: QA Lab PR smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.95.0
+
+      - name: Run QA Lab PR smoke gate
+        run: cargo run -p palyra-cli --locked -- qa gate --suite qa/suites/pr_smoke.yaml --output-json artifacts/qa-lab/pr-smoke.json --output-markdown artifacts/qa-lab/pr-smoke.md --json
+
+      - name: Upload QA Lab reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: qa-lab-pr-smoke
+          path: artifacts/qa-lab
+          if-no-files-found: error
+
   protocol-contracts:
     name: Protocol contracts (Rust + Kotlin)
     runs-on: ubuntu-latest

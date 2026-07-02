@@ -6,6 +6,7 @@ Commands:
   validate         Validate QA Lab scenario manifests
   run-pack         Run a local deterministic QA scenario pack
   provider-compat  Validate provider compatibility fixtures
+  gate             Run a QA Lab suite gate and maturity scorecard
 
 Options:
   -h, --help
