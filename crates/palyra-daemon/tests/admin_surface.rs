@@ -100,6 +100,109 @@ fn admin_status_requires_token_and_context() -> Result<()> {
 }
 
 #[test]
+fn admin_methods_registry_exposes_scoped_schema_descriptors() -> Result<()> {
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build HTTP client")?;
+    let url = format!("http://127.0.0.1:{admin_port}/admin/v1/methods");
+
+    let missing_auth = client.get(&url).send().context("failed to call admin methods")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
+    assert_admin_console_security_headers(missing_auth.headers())?;
+
+    let payload = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .header("x-palyra-channel", "cli")
+        .send()
+        .context("failed to call admin methods with valid context")?
+        .error_for_status()
+        .context("admin methods returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse admin methods payload")?;
+
+    assert_eq!(payload.get("schema_version").and_then(Value::as_u64), Some(1));
+    assert_eq!(payload.get("registry_version").and_then(Value::as_str), Some("method-registry.v1"));
+    let methods = payload
+        .get("methods")
+        .and_then(Value::as_array)
+        .context("method registry should include methods")?;
+    let scopes = payload
+        .get("scopes")
+        .and_then(Value::as_array)
+        .context("method registry should include scopes")?;
+    assert!(
+        scopes
+            .iter()
+            .any(|scope| { scope.get("scope").and_then(Value::as_str) == Some("admin.read") }),
+        "scope registry should explain admin.read"
+    );
+    assert!(
+        methods.iter().any(|method| {
+            method.get("http_method").and_then(Value::as_str) == Some("GET")
+                && method.get("route").and_then(Value::as_str) == Some("/admin/v1/status")
+                && method.get("required_scope").and_then(Value::as_str) == Some("admin.read")
+        }),
+        "admin status should be registered as an admin read method"
+    );
+    assert!(
+        methods.iter().any(|method| {
+            method.get("http_method").and_then(Value::as_str) == Some("POST")
+                && method.get("route").and_then(Value::as_str) == Some("/v1/chat/completions")
+                && method.get("required_scope").and_then(Value::as_str)
+                    == Some("compat.chat.create")
+        }),
+        "compat chat completions should expose its token scope"
+    );
+    for method in methods {
+        let route = method.get("route").and_then(Value::as_str).unwrap_or("<missing>");
+        let required_scope = method
+            .get("required_scope")
+            .and_then(Value::as_str)
+            .with_context(|| format!("method {route} should expose required_scope"))?;
+        assert!(!required_scope.trim().is_empty(), "method {route} scope must not be empty");
+        let request_schema_hash = method
+            .get("request_schema_hash")
+            .and_then(Value::as_str)
+            .with_context(|| format!("method {route} should expose request_schema_hash"))?;
+        let response_schema_hash = method
+            .get("response_schema_hash")
+            .and_then(Value::as_str)
+            .with_context(|| format!("method {route} should expose response_schema_hash"))?;
+        assert_eq!(request_schema_hash.len(), 64, "method {route} request hash should be SHA-256");
+        assert_eq!(
+            response_schema_hash.len(),
+            64,
+            "method {route} response hash should be SHA-256"
+        );
+        if method.get("stability").and_then(Value::as_str) == Some("deprecated") {
+            let deprecated = method
+                .get("deprecated")
+                .and_then(Value::as_object)
+                .with_context(|| format!("deprecated method {route} should expose metadata"))?;
+            assert!(
+                deprecated.get("replacement_method").and_then(Value::as_str).is_some()
+                    || deprecated
+                        .get("reason_code")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| !reason.trim().is_empty()),
+                "deprecated method {route} should expose replacement or reason code"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn admin_journal_recent_requires_token_and_returns_snapshot() -> Result<()> {
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports()?;
     let mut daemon = ChildGuard::new(child);

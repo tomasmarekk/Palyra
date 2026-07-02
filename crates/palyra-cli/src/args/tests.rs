@@ -5851,6 +5851,15 @@ fn parse_protocol_validate() {
 }
 
 #[test]
+fn parse_protocol_methods() {
+    let parsed = Cli::parse_from(["palyra", "protocol", "methods"]);
+    assert_eq!(
+        parsed.command,
+        Command::Protocol { command: ProtocolCommand::Methods { json: false } }
+    );
+}
+
+#[test]
 fn parse_protocol_json_flags() {
     let version = Cli::parse_from(["palyra", "protocol", "version", "--json"]);
     assert_eq!(
@@ -5862,6 +5871,12 @@ fn parse_protocol_json_flags() {
     assert_eq!(
         validate.command,
         Command::Protocol { command: ProtocolCommand::Validate { json: true } }
+    );
+
+    let methods = Cli::parse_from(["palyra", "protocol", "methods", "--json"]);
+    assert_eq!(
+        methods.command,
+        Command::Protocol { command: ProtocolCommand::Methods { json: true } }
     );
 
     let validate_id = Cli::parse_from([

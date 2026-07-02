@@ -9,7 +9,8 @@ use crate::*;
 /// Dispatches a `palyra protocol` subcommand.
 ///
 /// # Errors
-/// Fails when a canonical ID is invalid or output encoding fails.
+/// Fails when a canonical ID is invalid, runtime method introspection fails,
+/// or output encoding fails.
 pub(crate) fn run_protocol(command: ProtocolCommand) -> Result<()> {
     match command {
         ProtocolCommand::Version { json } => {
@@ -63,6 +64,23 @@ pub(crate) fn run_protocol(command: ProtocolCommand) -> Result<()> {
             );
             std::io::stdout().flush().context("stdout flush failed")
         }
+        ProtocolCommand::Methods { json } => {
+            let payload = load_runtime_method_registry_snapshot()?;
+            if output::preferred_json(json) {
+                return output::print_json_pretty(
+                    &payload,
+                    "failed to encode protocol methods output as JSON",
+                );
+            }
+            if output::preferred_ndjson(json, false) {
+                output::print_json_line(
+                    &payload,
+                    "failed to encode protocol methods output as NDJSON",
+                )?;
+                return std::io::stdout().flush().context("stdout flush failed");
+            }
+            print_protocol_methods_summary(&payload)
+        }
         ProtocolCommand::ValidateId { id, json } => {
             validate_canonical_id(&id).with_context(|| format!("invalid canonical ID: {}", id))?;
             if output::preferred_json(json) {
@@ -88,6 +106,64 @@ pub(crate) fn run_protocol(command: ProtocolCommand) -> Result<()> {
             std::io::stdout().flush().context("stdout flush failed")
         }
     }
+}
+
+fn load_runtime_method_registry_snapshot() -> Result<Value> {
+    let root_context = app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for protocol methods command"))?;
+    let connection = root_context.resolve_http_connection(
+        app::ConnectionOverrides::default(),
+        app::ConnectionDefaults::ADMIN,
+    )?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("failed to build HTTP client")?;
+    let mut payload = fetch_admin_json_payload_raw(
+        &client,
+        AdminJsonFetchRequest {
+            base_url: connection.base_url.as_str(),
+            path: "admin/v1/methods",
+            token: connection.token,
+            principal: connection.principal,
+            device_id: connection.device_id,
+            channel: Some(connection.channel),
+            trace_id: Some(connection.trace_id),
+        },
+    )?;
+    redact_json_value_tree(&mut payload, None);
+    Ok(payload)
+}
+
+fn print_protocol_methods_summary(payload: &Value) -> Result<()> {
+    let methods = payload
+        .get("methods")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("method registry payload did not include methods"))?;
+    let scopes = payload
+        .get("scopes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("method registry payload did not include scopes"))?;
+    let schema_version = payload.get("schema_version").and_then(Value::as_u64).unwrap_or(0);
+    let registry_version =
+        payload.get("registry_version").and_then(Value::as_str).unwrap_or("unknown");
+    println!(
+        "protocol.methods schema_version={} registry_version={} methods={} scopes={}",
+        schema_version,
+        registry_version,
+        methods.len(),
+        scopes.len()
+    );
+
+    let mut surfaces = BTreeMap::<String, usize>::new();
+    for method in methods {
+        let surface = method.get("surface").and_then(Value::as_str).unwrap_or("unknown");
+        *surfaces.entry(surface.to_owned()).or_default() += 1;
+    }
+    for (surface, count) in surfaces {
+        println!("protocol.methods.surface name={surface} count={count}");
+    }
+    std::io::stdout().flush().context("stdout flush failed")
 }
 
 fn protocol_validate_output_value() -> serde_json::Value {

@@ -76,6 +76,7 @@ mod journal;
 mod maintenance;
 mod media;
 mod media_derived;
+mod method_registry;
 mod model_provider;
 mod node_rpc;
 mod node_runtime;

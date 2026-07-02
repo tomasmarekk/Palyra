@@ -5,6 +5,7 @@ Usage: palyra protocol [OPTIONS] <COMMAND>
 Commands:
   version      Show protocol and schema contract versions
   validate     Validate committed protocol contract artifacts
+  methods      Fetch the live runtime method and scope registry
   validate-id  Validate a protocol identifier string
 
 Options:

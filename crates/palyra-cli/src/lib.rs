@@ -8201,28 +8201,64 @@ fn fetch_admin_status_payload_raw(
     channel: Option<String>,
     trace_id: Option<String>,
 ) -> Result<Value> {
-    let status_url = format!("{}/admin/v1/status", base_url.trim_end_matches('/'));
-    let mut request = client
-        .get(status_url)
-        .header("x-palyra-principal", principal)
-        .header("x-palyra-device-id", device_id);
-    if let Some(token) = token {
-        request = request.header("Authorization", format!("Bearer {token}"));
+    fetch_admin_json_payload_raw(
+        client,
+        AdminJsonFetchRequest {
+            base_url,
+            path: "admin/v1/status",
+            token,
+            principal,
+            device_id,
+            channel,
+            trace_id,
+        },
+    )
+}
+
+struct AdminJsonFetchRequest<'a> {
+    base_url: &'a str,
+    path: &'a str,
+    token: Option<String>,
+    principal: String,
+    device_id: String,
+    channel: Option<String>,
+    trace_id: Option<String>,
+}
+
+fn fetch_admin_json_payload_raw(
+    client: &Client,
+    fetch_request: AdminJsonFetchRequest<'_>,
+) -> Result<Value> {
+    let endpoint_url = format!(
+        "{}/{}",
+        fetch_request.base_url.trim_end_matches('/'),
+        fetch_request.path.trim_start_matches('/')
+    );
+    let mut http_request = client
+        .get(endpoint_url)
+        .header("x-palyra-principal", fetch_request.principal)
+        .header("x-palyra-device-id", fetch_request.device_id);
+    if let Some(token) = fetch_request.token {
+        http_request = http_request.header("Authorization", format!("Bearer {token}"));
     }
-    if let Some(channel) = channel {
-        request = request.header("x-palyra-channel", channel);
+    if let Some(channel) = fetch_request.channel {
+        http_request = http_request.header("x-palyra-channel", channel);
     }
-    if let Some(trace_id) = trace_id {
-        request = request.header("x-palyra-trace-id", trace_id);
+    if let Some(trace_id) = fetch_request.trace_id {
+        http_request = http_request.header("x-palyra-trace-id", trace_id);
     }
 
-    request
+    http_request
         .send()
-        .context("failed to call daemon admin status endpoint")?
+        .with_context(|| format!("failed to call daemon admin endpoint {}", fetch_request.path))?
         .error_for_status()
-        .context("daemon admin status endpoint returned non-success status")?
+        .with_context(|| {
+            format!("daemon admin endpoint {} returned non-success status", fetch_request.path)
+        })?
         .json()
-        .context("failed to parse daemon admin status payload")
+        .with_context(|| {
+            format!("failed to parse daemon admin endpoint {} payload", fetch_request.path)
+        })
 }
 
 fn fetch_admin_status(

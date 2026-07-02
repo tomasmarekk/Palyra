@@ -18,6 +18,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 - Capability catalog entries: `32`
 - CLI families: `59`
+- Method registry entries: `479`
 - Compat routes registered: `6/6`
 - Feature rollout flags: `26`
 - Runtime preview controls: `8` capabilities
@@ -40,6 +41,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 | `runtime_diagnostics` | `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`, `crates/palyra-daemon/src/runtime_diagnostics.rs` | runtime sections, health, metrics, roadmap, observability, and feature rollout payloads |
 | `runtime_preview_controls` | `crates/palyra-daemon/src/runtime_preview_controls.rs`, `crates/palyra-common/src/runtime_preview.rs`, `crates/palyra-daemon/src/config/schema.rs` | preview capability modes, rollout gates, activation blockers, and shared wire names |
 | `feature_rollout_maturity` | `crates/palyra-daemon/src/feature_rollout_maturity.rs`, `crates/palyra-daemon/src/config/schema.rs`, `crates/palyra-daemon/tests/current_state_inventory.rs` | rollout maturity states, owners, required tests, public exposure, and promotion blockers |
+| `method_registry` | `crates/palyra-daemon/src/method_registry.rs`, `crates/palyra-daemon/src/transport/http/router.rs`, `crates/palyra-daemon/src/access_control.rs` | public method descriptors, route scopes, schema hashes, streaming flags, and idempotency support |
 | `compat_routes` | `crates/palyra-daemon/src/transport/http/router.rs`, `crates/palyra-daemon/tests/current_state_inventory.rs` | registered OpenAI-compatible route surface probed by the live daemon harness |
 | `cli_families` | `crates/palyra-cli/tests/cli_parity_matrix.toml`, `crates/palyra-cli/tests/cli_parity_report.md` | top-level CLI families and parity status used by operator handoff surfaces |
 | `execution_backends` | `crates/palyra-daemon/src/execution_backends.rs`, `crates/palyra-daemon/src/application/tool_runtime` | local, desktop, Docker, networked worker, and SSH backend posture |

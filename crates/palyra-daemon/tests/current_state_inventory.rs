@@ -107,6 +107,7 @@ fn build_current_state_inventory_snapshot(
     let capability_catalog =
         harness.console_json("/console/v1/control-plane/capabilities", session)?;
     let diagnostics = harness.console_json("/console/v1/diagnostics", session)?;
+    let method_registry = harness.admin_json("/admin/v1/methods")?;
 
     let mut diagnostics_sections = diagnostics
         .as_object()
@@ -211,6 +212,7 @@ fn build_current_state_inventory_snapshot(
         "migration_notes": capability_catalog.get("migration_notes").cloned().unwrap_or(Value::Null),
         "feature_rollouts": diagnostics.get("feature_rollouts").cloned().unwrap_or(Value::Null),
         "feature_rollout_maturity": diagnostics.get("feature_rollout_maturity").cloned().unwrap_or(Value::Null),
+        "method_registry": method_registry,
         "runtime_roadmap": diagnostics.get("runtime_roadmap").cloned().unwrap_or(Value::Null),
         "runtime_controls": {
             "schema_version": runtime_controls.remove("schema_version").unwrap_or(Value::Null),
@@ -278,6 +280,9 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
     let execution_backends = required_array(snapshot, "/execution_backends")?;
     let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
     let feature_rollout_maturity = required_object(snapshot, "/feature_rollout_maturity")?;
+    let method_registry = required_object(snapshot, "/method_registry")?;
+    let method_registry_methods = required_array(snapshot, "/method_registry/methods")?;
+    let method_registry_scopes = required_array(snapshot, "/method_registry/scopes")?;
     let runtime_controls = required_object(snapshot, "/runtime_controls")?;
     let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
     let roadmap_area_map = roadmap_area_map();
@@ -304,6 +309,8 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
             "diagnostics_sections": required_array(snapshot, "/diagnostics_sections")?.len(),
             "execution_backends": execution_backends.len(),
             "feature_rollout_flags": feature_rollouts.len(),
+            "method_registry_methods": method_registry_methods.len(),
+            "method_registry_scopes": method_registry_scopes.len(),
             "runtime_control_capabilities": runtime_control_capabilities.len(),
         },
         "roadmap_area_status_counts": status_counts,
@@ -312,6 +319,11 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
             "schema_version": feature_rollout_maturity.get("schema_version").cloned().unwrap_or(Value::Null),
             "maturity_counts": count_feature_rollout_maturity(feature_rollouts)?,
             "migration_note": feature_rollout_maturity.get("migration_note").cloned().unwrap_or(Value::Null),
+        },
+        "method_registry": {
+            "schema_version": method_registry.get("schema_version").cloned().unwrap_or(Value::Null),
+            "registry_version": method_registry.get("registry_version").cloned().unwrap_or(Value::Null),
+            "surface_counts": count_method_registry_surfaces(method_registry_methods)?,
         },
         "runtime_control_state_counts": count_runtime_control_states(
             runtime_control_capabilities
@@ -363,6 +375,15 @@ fn runtime_audit_source_map() -> Vec<Value> {
                 "crates/palyra-daemon/tests/current_state_inventory.rs"
             ],
             "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
+        }),
+        json!({
+            "surface": "method_registry",
+            "source_paths": [
+                "crates/palyra-daemon/src/method_registry.rs",
+                "crates/palyra-daemon/src/transport/http/router.rs",
+                "crates/palyra-daemon/src/access_control.rs"
+            ],
+            "reason": "public method descriptors, route scopes, schema hashes, streaming flags, and idempotency support"
         }),
         json!({
             "surface": "compat_routes",
@@ -483,6 +504,36 @@ fn parse_feature_rollout_maturity(raw: &str) -> Result<&str> {
     }
 }
 
+fn count_method_registry_surfaces(methods: &[Value]) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for method in methods {
+        let surface = method
+            .get("surface")
+            .and_then(Value::as_str)
+            .context("method registry entry should expose surface")?;
+        let required_scope = method
+            .get("required_scope")
+            .and_then(Value::as_str)
+            .context("method registry entry should expose required_scope")?;
+        let request_schema_hash = method
+            .get("request_schema_hash")
+            .and_then(Value::as_str)
+            .context("method registry entry should expose request_schema_hash")?;
+        let response_schema_hash = method
+            .get("response_schema_hash")
+            .and_then(Value::as_str)
+            .context("method registry entry should expose response_schema_hash")?;
+        if required_scope.trim().is_empty() {
+            bail!("method registry entry should not use an empty required_scope");
+        }
+        if request_schema_hash.len() != 64 || response_schema_hash.len() != 64 {
+            bail!("method registry schema hashes should be 64-character SHA-256 hex strings");
+        }
+        *counts.entry(surface.to_owned()).or_default() += 1;
+    }
+    Ok(counts)
+}
+
 fn count_runtime_control_states(capabilities: &[Value]) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for entry in capabilities {
@@ -521,6 +572,7 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     let cli_families = required_array(snapshot, "/cli_families")?;
     let compat_routes = required_array(snapshot, "/compat_routes")?;
     let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
+    let method_registry_methods = required_array(snapshot, "/method_registry/methods")?;
     let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
     let source_of_truth = required_array(baseline, "/source_of_truth")?;
     let roadmap_areas = required_array(baseline, "/roadmap_area_map")?;
@@ -548,6 +600,9 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
     report.push_str("## Summary\n\n");
     report.push_str(format!("- Capability catalog entries: `{}`\n", capabilities.len()).as_str());
     report.push_str(format!("- CLI families: `{}`\n", cli_families.len()).as_str());
+    report.push_str(
+        format!("- Method registry entries: `{}`\n", method_registry_methods.len()).as_str(),
+    );
     report.push_str(
         format!(
             "- Compat routes registered: `{registered_compat_routes}/{}`\n",

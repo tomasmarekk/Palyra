@@ -127,6 +127,21 @@ impl DaemonHarness {
             .with_context(|| format!("failed to parse console endpoint {path} response json"))
     }
 
+    pub fn admin_json(&self, path: &str) -> Result<Value> {
+        self.client
+            .get(format!("http://127.0.0.1:{}{path}", self.admin_port))
+            .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+            .header("x-palyra-principal", CONSOLE_ADMIN_PRINCIPAL)
+            .header("x-palyra-device-id", DEVICE_ID)
+            .header("x-palyra-channel", "cli")
+            .send()
+            .with_context(|| format!("failed to call admin endpoint {path}"))?
+            .error_for_status()
+            .with_context(|| format!("admin endpoint {path} returned non-success status"))?
+            .json::<Value>()
+            .with_context(|| format!("failed to parse admin endpoint {path} response json"))
+    }
+
     pub fn route_registered(&self, method: Method, path: &str) -> Result<bool> {
         let url = format!("http://127.0.0.1:{}{path}", self.admin_port);
         let request = match method {

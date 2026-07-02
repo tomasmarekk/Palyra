@@ -25,6 +25,7 @@ use crate::{
 pub(crate) fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/admin/v1/status", get(admin::core::admin_status_handler))
+        .route("/admin/v1/methods", get(admin::core::admin_methods_handler))
         .route("/admin/v1/metrics", get(admin::core::admin_metrics_handler))
         .route("/admin/v1/journal/recent", get(admin::core::admin_journal_recent_handler))
         .route("/admin/v1/state/doctor", get(admin::core::admin_state_doctor_handler))

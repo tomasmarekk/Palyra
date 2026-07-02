@@ -131,6 +131,27 @@ pub(crate) async fn admin_status_handler(
     Ok(Json(payload))
 }
 
+/// Returns the machine-readable method and scope registry for public surfaces.
+///
+/// # Errors
+/// Returns an error response when admin authorization or request-context
+/// validation fails.
+pub(crate) async fn admin_methods_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::method_registry::MethodRegistrySnapshot>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    state.runtime.record_admin_status_request();
+    Ok(Json(crate::method_registry::build_method_registry_snapshot()))
+}
+
 /// Renders daemon runtime metrics in Prometheus text format.
 ///
 /// # Errors

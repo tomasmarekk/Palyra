@@ -16,6 +16,11 @@ pub enum ProtocolCommand {
         #[arg(long, default_value_t = false, help = "Print protocol validation results as JSON")]
         json: bool,
     },
+    #[command(about = "Fetch the live runtime method and scope registry")]
+    Methods {
+        #[arg(long, default_value_t = false, help = "Print method registry as JSON")]
+        json: bool,
+    },
     #[command(about = "Validate a protocol identifier string")]
     ValidateId {
         #[arg(long, help = "Protocol identifier to validate")]
