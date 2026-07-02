@@ -1805,6 +1805,16 @@ mod tests {
             serde_json::Value::Array(snapshot),
             json!([
                 {
+                    "path": "model_provider.qa_mock_fixture_path",
+                    "value_type": "path",
+                    "default_value": null,
+                    "env_vars": ["PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "qa_lab"
+                },
+                {
                     "path": "api_facade.mode",
                     "value_type": "enum(disabled|preview_only)",
                     "default_value": "disabled",
