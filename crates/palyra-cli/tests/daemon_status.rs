@@ -138,7 +138,8 @@ fn palyra_daemon_admin_status_without_token_fails_when_auth_is_required() -> Res
     );
     let stderr = String::from_utf8(output.stderr).context("stderr was not valid UTF-8")?;
     assert!(
-        stderr.contains("daemon admin status endpoint returned non-success status"),
+        stderr.contains("daemon admin endpoint admin/v1/status returned non-success status")
+            && stderr.contains("401 Unauthorized"),
         "expected CLI to fail on endpoint status, got: {stderr}"
     );
     Ok(())
