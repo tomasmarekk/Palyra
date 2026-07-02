@@ -80,7 +80,7 @@ pub(crate) async fn dispatch_realtime_command(
         return command_error(envelope, error, false);
     }
 
-    let idempotency = match begin_command_idempotency(state, &envelope).await {
+    let idempotency = match begin_command_idempotency(state, context, &envelope).await {
         Ok(outcome) => outcome,
         Err(error) => return command_error(envelope, error, false),
     };
@@ -99,7 +99,9 @@ pub(crate) async fn dispatch_realtime_command(
     let result = execute_command(state, context, &envelope).await;
     match result {
         Ok(value) => {
-            if let Err(error) = complete_command_idempotency(state, &envelope, &value).await {
+            if let Err(error) =
+                complete_command_idempotency(state, context, &envelope, &value).await
+            {
                 return command_error(envelope, error, false);
             }
             publish_command_event(state, context, command, &value);
@@ -118,7 +120,7 @@ pub(crate) async fn dispatch_realtime_command(
             command_ok(envelope, value, false)
         }
         Err(error) => {
-            let _ = fail_command_idempotency(state, &envelope, &error).await;
+            let _ = fail_command_idempotency(state, context, &envelope, &error).await;
             command_error(envelope, error, false)
         }
     }
@@ -799,6 +801,7 @@ fn publish_command_event(
 
 async fn begin_command_idempotency(
     state: &AppState,
+    context: &CommandRouterContext,
     envelope: &RealtimeCommandEnvelope,
 ) -> Result<CommandIdempotencyOutcome, StableErrorEnvelope> {
     let descriptor = descriptor_for_command(envelope.command).ok_or_else(|| {
@@ -826,10 +829,7 @@ async fn begin_command_idempotency(
             "send JSON-safe command params",
         )
     })?;
-    // The stored key is namespaced per command so reusing a raw client key
-    // across different commands can never replay the wrong result. The
-    // journal store is synchronous (SQLite), hence spawn_blocking.
-    let key = format!("realtime:{}:{raw_key}", envelope.command.as_str());
+    let key = command_idempotency_storage_key(context, envelope, raw_key);
     let runtime = Arc::clone(&state.runtime);
     let command = envelope.command;
     let payload_sha256 = crate::sha256_hex(payload.as_slice());
@@ -881,6 +881,23 @@ async fn begin_command_idempotency(
     }
 }
 
+fn command_idempotency_storage_key(
+    context: &CommandRouterContext,
+    envelope: &RealtimeCommandEnvelope,
+    raw_key: &str,
+) -> String {
+    let channel = context.request_context.channel.as_deref().unwrap_or("-");
+    let material = format!(
+        "principal={}\ndevice={}\nchannel={channel}\nclient={}\ncommand={}\nraw_key={raw_key}",
+        context.request_context.principal,
+        context.request_context.device_id,
+        context.realtime.client_id,
+        envelope.command.as_str(),
+    );
+    let digest = crate::sha256_hex(material.as_bytes());
+    format!("realtime:{}:{}", envelope.command.as_str(), &digest[..32])
+}
+
 fn replay_result_from_record(
     record: Option<&IdempotencyRecordSnapshot>,
 ) -> Result<Option<Value>, StableErrorEnvelope> {
@@ -899,6 +916,7 @@ fn replay_result_from_record(
 
 async fn complete_command_idempotency(
     state: &AppState,
+    context: &CommandRouterContext,
     envelope: &RealtimeCommandEnvelope,
     result: &Value,
 ) -> Result<(), StableErrorEnvelope> {
@@ -915,7 +933,7 @@ async fn complete_command_idempotency(
     if !descriptor.side_effecting {
         return Ok(());
     }
-    let key = format!("realtime:{}:{raw_key}", envelope.command.as_str());
+    let key = command_idempotency_storage_key(context, envelope, raw_key);
     let result_json = result.to_string();
     let runtime = Arc::clone(&state.runtime);
     tokio::task::spawn_blocking(move || {
@@ -943,6 +961,7 @@ async fn complete_command_idempotency(
 
 async fn fail_command_idempotency(
     state: &AppState,
+    context: &CommandRouterContext,
     envelope: &RealtimeCommandEnvelope,
     error: &StableErrorEnvelope,
 ) -> Result<(), StableErrorEnvelope> {
@@ -959,7 +978,7 @@ async fn fail_command_idempotency(
     if !descriptor.side_effecting {
         return Ok(());
     }
-    let key = format!("realtime:{}:{raw_key}", envelope.command.as_str());
+    let key = command_idempotency_storage_key(context, envelope, raw_key);
     let runtime = Arc::clone(&state.runtime);
     let error = error.clone();
     tokio::task::spawn_blocking(move || {
@@ -1176,6 +1195,41 @@ mod tests {
     }
 
     #[test]
+    fn command_idempotency_storage_key_scopes_owner_route_and_raw_key() {
+        let context = test_router_context("user:alpha", "01ARZ3NDEKTSV4RRFFQ69G5FAV", Some("cli"));
+        let other_owner =
+            test_router_context("user:bravo", "01ARZ3NDEKTSV4RRFFQ69G5FAV", Some("cli"));
+        let envelope = RealtimeCommandEnvelope {
+            request_id: "req-1".to_owned(),
+            command: RealtimeCommand::RunAbort,
+            params: json!({ "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+            idempotency_key: Some("client-secret-key".to_owned()),
+            expected_version: None,
+        };
+        let other_command = RealtimeCommandEnvelope {
+            command: RealtimeCommand::ApprovalDecide,
+            ..envelope.clone()
+        };
+
+        let key = command_idempotency_storage_key(&context, &envelope, "client-secret-key");
+        assert!(key.starts_with("realtime:run.abort:"));
+        assert!(
+            !key.contains("client-secret-key"),
+            "raw client idempotency key must not be stored in durable key"
+        );
+        assert_ne!(
+            key,
+            command_idempotency_storage_key(&other_owner, &envelope, "client-secret-key"),
+            "owner context must partition idempotency keys"
+        );
+        assert_ne!(
+            key,
+            command_idempotency_storage_key(&context, &other_command, "client-secret-key"),
+            "command route must partition idempotency keys"
+        );
+    }
+
+    #[test]
     fn approval_preflight_blocks_stale_version_and_abort_race() {
         let version_error =
             ensure_expected_approval_version(10, 9).expect_err("version mismatch should fail");
@@ -1185,5 +1239,30 @@ mod tests {
             ensure_approval_not_racing_abort(true, true).expect_err("abort race should fail");
         assert_eq!(race_error.code, "approval/abort_race");
         assert!(ensure_approval_not_racing_abort(false, true).is_ok());
+    }
+
+    fn test_router_context(
+        principal: &str,
+        device_id: &str,
+        channel: Option<&str>,
+    ) -> CommandRouterContext {
+        CommandRouterContext {
+            request_context: RequestContext {
+                principal: principal.to_owned(),
+                device_id: device_id.to_owned(),
+                channel: channel.map(str::to_owned),
+            },
+            realtime: RealtimeConnectionContext {
+                client_id: "client-a".to_owned(),
+                auth_subject: principal.to_owned(),
+                role: palyra_common::runtime_contracts::RealtimeRole::Operator,
+                scopes: Default::default(),
+                capabilities: Default::default(),
+                commands: Default::default(),
+                cursor: Default::default(),
+                heartbeat_interval_ms: REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
+                subscriptions: Vec::new(),
+            },
+        }
     }
 }

@@ -454,7 +454,7 @@
     },
     "snapshot_version": "runtime-contracts.acp.v1"
   },
-  "changelog_note": "Initial public runtime contract snapshot; breaking changes require a new snapshot version and migration note.",
+  "changelog_note": "Adds the canonical PalyraErrorEnvelope and public error category taxonomy; breaking changes require a new snapshot version and migration note.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -534,6 +534,86 @@
     }
   ],
   "public_error_envelopes": [
+    {
+      "categories": [
+        {
+          "canonical": "auth",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "validation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "policy",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "sandbox",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "mcp",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "execution_backend",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "conflict",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "not_found",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "rate_limit",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "dependency",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "availability",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "internal",
+          "deprecated_aliases": []
+        }
+      ],
+      "changelog_note": "Canonical public API, CLI, and stream error envelope with stable category and reason code.",
+      "name": "PalyraErrorEnvelope",
+      "optional_fields": [
+        "validation_errors"
+      ],
+      "required_fields": [
+        "schema_version",
+        "code",
+        "category",
+        "message",
+        "recovery_hint",
+        "retryable",
+        "redacted"
+      ],
+      "secret_material_allowed": false,
+      "snapshot_version": "runtime-contracts.palyra_error_envelope.v1"
+    },
     {
       "changelog_note": "Stable errors expose code, message, and recovery_hint only.",
       "name": "StableErrorEnvelope",
@@ -966,7 +1046,7 @@
     }
   ],
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v1",
+  "snapshot_version": "runtime-contracts.v2",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

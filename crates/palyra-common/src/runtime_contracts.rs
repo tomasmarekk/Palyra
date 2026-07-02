@@ -19,7 +19,7 @@ use std::fmt;
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v1";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v2";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,7 +121,7 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Initial public runtime contract snapshot; breaking changes require a new snapshot version and migration note.",
+        "changelog_note": "Adds the canonical PalyraErrorEnvelope and public error category taxonomy; breaking changes require a new snapshot version and migration note.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "runtime_enums": [
             enum_contract_snapshot(
@@ -322,6 +322,23 @@ pub fn public_runtime_contract_snapshot() -> Value {
             ],
         },
         "public_error_envelopes": [
+            {
+                "name": "PalyraErrorEnvelope",
+                "snapshot_version": "runtime-contracts.palyra_error_envelope.v1",
+                "changelog_note": "Canonical public API, CLI, and stream error envelope with stable category and reason code.",
+                "required_fields": [
+                    "schema_version",
+                    "code",
+                    "category",
+                    "message",
+                    "recovery_hint",
+                    "retryable",
+                    "redacted"
+                ],
+                "optional_fields": ["validation_errors"],
+                "categories": PalyraErrorCategory::wire_contract_values(),
+                "secret_material_allowed": false,
+            },
             {
                 "name": "StableErrorEnvelope",
                 "snapshot_version": "runtime-contracts.stable_error_envelope.v1",
@@ -696,6 +713,27 @@ runtime_contract_enum! {
     }
 }
 
+runtime_contract_enum! {
+    /// Coarse public error categories shared by API, CLI, stream events, providers, and tools.
+    pub enum PalyraErrorCategory {
+        Auth => "auth",
+        Validation => "validation",
+        Policy => "policy",
+        Approval => "approval",
+        Sandbox => "sandbox",
+        Mcp => "mcp",
+        ExecutionBackend => "execution_backend",
+        Provider => "provider",
+        Tool => "tool",
+        Conflict => "conflict",
+        NotFound => "not_found",
+        RateLimit => "rate_limit",
+        Dependency => "dependency",
+        Availability => "availability",
+        Internal => "internal"
+    }
+}
+
 /// Stable error envelope used by runtime contracts instead of leaking internal debug strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableErrorEnvelope {
@@ -713,6 +751,92 @@ impl StableErrorEnvelope {
         recovery_hint: impl Into<String>,
     ) -> Self {
         Self { code: code.into(), message: message.into(), recovery_hint: recovery_hint.into() }
+    }
+}
+
+/// One field-level validation issue inside a [`PalyraErrorEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PalyraValidationIssue {
+    /// Request field path that failed validation.
+    pub field: String,
+    /// Stable machine-readable issue code.
+    pub code: String,
+    /// Safe human-readable validation message.
+    pub message: String,
+}
+
+/// Canonical public error envelope for API responses, CLI output, and stream events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PalyraErrorEnvelope {
+    /// Envelope schema version; starts at 1 and changes only for incompatible shape updates.
+    pub schema_version: u32,
+    /// Stable reason code, usually `<surface>/<reason>`.
+    pub code: String,
+    /// Coarse failure category used for retry and UI behavior.
+    pub category: PalyraErrorCategory,
+    /// Safe human-readable message.
+    pub message: String,
+    /// Safe operator/client recovery hint.
+    pub recovery_hint: String,
+    /// Whether retrying the same request may succeed.
+    pub retryable: bool,
+    /// Whether sensitive detail was stripped from the message.
+    #[serde(default)]
+    pub redacted: bool,
+    /// Field-level validation issues for validation failures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_errors: Vec<PalyraValidationIssue>,
+}
+
+impl PalyraErrorEnvelope {
+    /// Creates a schema-version-1 envelope with no validation issues.
+    #[must_use]
+    pub fn new(
+        category: PalyraErrorCategory,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+        retryable: bool,
+        redacted: bool,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            code: code.into(),
+            category,
+            message: message.into(),
+            recovery_hint: recovery_hint.into(),
+            retryable,
+            redacted,
+            validation_errors: Vec::new(),
+        }
+    }
+
+    /// Builds a public envelope from a compact runtime stable error.
+    #[must_use]
+    pub fn from_stable_error(
+        category: PalyraErrorCategory,
+        error: StableErrorEnvelope,
+        retryable: bool,
+        redacted: bool,
+    ) -> Self {
+        Self::new(category, error.code, error.message, error.recovery_hint, retryable, redacted)
+    }
+
+    /// Returns this public envelope as the compact stable runtime error shape.
+    #[must_use]
+    pub fn stable_error(&self) -> StableErrorEnvelope {
+        StableErrorEnvelope::new(
+            self.code.clone(),
+            self.message.clone(),
+            self.recovery_hint.clone(),
+        )
+    }
+
+    /// Attaches validation issues and returns the updated envelope.
+    #[must_use]
+    pub fn with_validation_errors(mut self, validation_errors: Vec<PalyraValidationIssue>) -> Self {
+        self.validation_errors = validation_errors;
+        self
     }
 }
 
@@ -1876,12 +2000,13 @@ mod tests {
         AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord,
         AcpSessionMode, AcpTransportKind, ArtifactReadRequest, ArtifactRetentionDisposition,
         ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, DeliveryPolicy, FlowState,
-        FlowStepState, IdempotencyReplayDecision, PruningPolicyClass, QueueDecision, QueueMode,
-        QueuedInputState, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
-        RealtimeEventSensitivity, RealtimeEventTopic, RealtimeHandshakeRequest,
-        RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope, RealtimeSubscription,
-        RunLifecycleHookDecision, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
-        RunLifecyclePhase, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        FlowStepState, IdempotencyReplayDecision, PalyraErrorCategory, PalyraErrorEnvelope,
+        PalyraValidationIssue, PruningPolicyClass, QueueDecision, QueueMode, QueuedInputState,
+        RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope, RealtimeEventSensitivity,
+        RealtimeEventTopic, RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole,
+        RealtimeScope, RealtimeSubscription, RunLifecycleHookDecision,
+        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecyclePhase,
+        StableErrorEnvelope, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
         REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
@@ -2123,6 +2248,53 @@ mod tests {
         let budget = ToolTurnBudget::default();
         assert!(budget.max_model_inline_bytes > budget.max_model_summary_bytes);
         assert!(budget.max_artifact_read_bytes >= budget.max_model_inline_bytes);
+    }
+
+    #[test]
+    fn palyra_error_envelope_serializes_stable_public_shape() {
+        let envelope = PalyraErrorEnvelope::from_stable_error(
+            PalyraErrorCategory::Provider,
+            StableErrorEnvelope::new(
+                "provider/auth_failed",
+                "provider credentials were rejected",
+                "refresh the configured provider credential",
+            ),
+            false,
+            true,
+        )
+        .with_validation_errors(vec![PalyraValidationIssue {
+            field: "model".to_owned(),
+            code: "unsupported_model".to_owned(),
+            message: "model is not available for this provider".to_owned(),
+        }]);
+        let value = serde_json::to_value(&envelope).expect("error envelope should serialize");
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["category"], "provider");
+        assert_eq!(value["code"], "provider/auth_failed");
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["redacted"], true);
+        assert_eq!(value["validation_errors"][0]["field"], "model");
+        assert_eq!(envelope.stable_error().code, "provider/auth_failed");
+    }
+
+    #[test]
+    fn palyra_error_categories_cover_public_failure_sources() {
+        for category in [
+            PalyraErrorCategory::Provider,
+            PalyraErrorCategory::Policy,
+            PalyraErrorCategory::Approval,
+            PalyraErrorCategory::Sandbox,
+            PalyraErrorCategory::Mcp,
+            PalyraErrorCategory::ExecutionBackend,
+            PalyraErrorCategory::Validation,
+        ] {
+            assert!(
+                PalyraErrorCategory::parse(category.as_str()).is_some(),
+                "category {} should remain parseable",
+                category.as_str()
+            );
+        }
     }
 
     #[test]

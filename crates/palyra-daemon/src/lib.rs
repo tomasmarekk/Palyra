@@ -196,6 +196,7 @@ use palyra_common::{
         is_sensitive_key as redaction_key_is_sensitive, redact_auth_error, redact_url,
         redact_url_segments_in_text,
     },
+    runtime_contracts::{PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue},
     secret_refs::{SecretRef, SecretSource},
     validate_canonical_id,
 };
@@ -3336,18 +3337,72 @@ fn build_error_response(
     validation_errors: Vec<control_plane::ValidationIssue>,
     redacted: bool,
 ) -> Response {
-    (
-        status,
-        Json(control_plane::ErrorEnvelope {
-            error: message,
-            code: code.to_owned(),
-            category,
-            retryable,
-            redacted,
-            validation_errors,
-        }),
+    let recovery_hint = recovery_hint_for_error_category(&category, retryable);
+    let canonical = PalyraErrorEnvelope::new(
+        palyra_error_category_from_control_plane(&category),
+        code,
+        message,
+        recovery_hint,
+        retryable,
+        redacted,
     )
-        .into_response()
+    .with_validation_errors(
+        validation_errors
+            .into_iter()
+            .map(|issue| PalyraValidationIssue {
+                field: issue.field,
+                code: issue.code,
+                message: issue.message,
+            })
+            .collect(),
+    );
+    (status, Json(control_plane::ErrorEnvelope::from(canonical))).into_response()
+}
+
+fn palyra_error_category_from_control_plane(
+    category: &control_plane::ErrorCategory,
+) -> PalyraErrorCategory {
+    match category {
+        control_plane::ErrorCategory::Auth => PalyraErrorCategory::Auth,
+        control_plane::ErrorCategory::Validation => PalyraErrorCategory::Validation,
+        control_plane::ErrorCategory::Policy => PalyraErrorCategory::Policy,
+        control_plane::ErrorCategory::NotFound => PalyraErrorCategory::NotFound,
+        control_plane::ErrorCategory::Conflict => PalyraErrorCategory::Conflict,
+        control_plane::ErrorCategory::Dependency => PalyraErrorCategory::Dependency,
+        control_plane::ErrorCategory::Availability => PalyraErrorCategory::Availability,
+        control_plane::ErrorCategory::Internal => PalyraErrorCategory::Internal,
+    }
+}
+
+fn recovery_hint_for_error_category(
+    category: &control_plane::ErrorCategory,
+    retryable: bool,
+) -> &'static str {
+    if retryable {
+        return "retry the same request after the dependency or rate limit recovers";
+    }
+    match category {
+        control_plane::ErrorCategory::Auth => {
+            "refresh credentials or send a valid authorization header"
+        }
+        control_plane::ErrorCategory::Validation => "fix the request fields and retry",
+        control_plane::ErrorCategory::Policy => {
+            "request a permitted action or change policy through an authorized path"
+        }
+        control_plane::ErrorCategory::NotFound => {
+            "refresh state and retry with an existing resource"
+        }
+        control_plane::ErrorCategory::Conflict => "refresh state and retry with a new version",
+        control_plane::ErrorCategory::Dependency => {
+            "inspect dependency health before retrying this operation"
+        }
+        control_plane::ErrorCategory::Availability => {
+            "retry after the runtime reports the dependency is available"
+        }
+        control_plane::ErrorCategory::Internal => {
+            "inspect daemon logs and retry only after the fault is resolved"
+        }
+    }
 }
 
 /// Startup preflight: admin auth may not be enabled without a usable token,

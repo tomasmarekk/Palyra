@@ -142,6 +142,8 @@ impl ProviderErrorEnvelope {
             ProviderErrorSeverity::Fatal
         };
         let redacted_message = sanitize_remote_error(classification.message.as_str());
+        let mut redacted_classification = classification.clone();
+        redacted_classification.message = redacted_message.clone();
         let recovery_decision = provider_recovery_decision(
             kind,
             retryability,
@@ -156,7 +158,7 @@ impl ProviderErrorEnvelope {
             failover_eligible,
             redacted_message,
             provider_trace_ref: classification.provider_detail.clone(),
-            classification,
+            classification: redacted_classification,
             recovery_decision,
         }
     }
@@ -301,6 +303,31 @@ mod tests {
         assert_eq!(envelope.recovery_decision.reason_code, "provider.recovery.retry_after");
         assert!(!envelope.recovery_decision.redacted_message.contains("sk-secret-token"));
         assert!(!envelope.recovery_decision.classification.message.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn provider_auth_error_envelope_redacts_credential_material() {
+        let error = ProviderError::RequestFailed {
+            message: "401 unauthorized bearer live-token api_key=sk-secret-token".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                401,
+                false,
+                "openai_chat_http",
+                "invalid api key",
+            ),
+        };
+
+        let envelope = ProviderErrorEnvelope::from_error(&error);
+
+        assert_eq!(envelope.kind, ProviderErrorKind::Auth);
+        assert_eq!(envelope.retryability, ProviderRetryability::NotRetryable);
+        assert_eq!(envelope.recovery_decision.decision, ProviderRecoveryDecisionKind::AskUser);
+        assert!(!envelope.redacted_message.contains("live-token"));
+        assert!(!envelope.redacted_message.contains("sk-secret-token"));
+        assert!(!envelope.classification.message.contains("live-token"));
+        assert!(!envelope.recovery_decision.redacted_message.contains("sk-secret-token"));
     }
 
     #[test]
