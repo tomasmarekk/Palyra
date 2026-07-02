@@ -141,7 +141,7 @@ use palyra_common::{
     },
     daemon_config_schema::{
         redact_secret_config_values, FileModelProviderConfig, FileModelProviderRegistryEntry,
-        FileModelProviderRegistryModel, RootFileConfig,
+        FileModelProviderRegistryModel, RootFileConfig, SECRET_CONFIG_PATHS,
     },
     default_config_search_paths, parse_config_path, parse_daemon_bind_socket,
     redaction::{
@@ -2523,7 +2523,9 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
     let Some(path_value) = path.clone() else {
         return SupportBundleConfigSnapshot {
             path,
+            config_hash_sha256: None,
             redacted_document: None,
+            redacted_summary: None,
             fingerprint_sha256: None,
             migration: None,
             error: None,
@@ -2534,24 +2536,31 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
     if !path_ref.exists() {
         return SupportBundleConfigSnapshot {
             path,
+            config_hash_sha256: None,
             redacted_document: None,
+            redacted_summary: None,
             fingerprint_sha256: None,
             migration: None,
             error: Some("config path does not exist".to_owned()),
         };
     }
 
+    let config_hash_sha256 =
+        fs::read(path_ref.as_path()).ok().map(|bytes| sha256_hex(bytes.as_slice()));
     match load_document_from_existing_path(path_ref.as_path()) {
         Ok((mut document, migration)) => {
             redact_secret_config_values(&mut document);
             match serde_json::to_value(document) {
                 Ok(mut payload) => {
                     redact_json_value_tree(&mut payload, None);
+                    let redacted_summary = Some(redacted_config_summary(&payload));
                     let fingerprint_sha256 =
                         serde_json::to_vec(&payload).ok().map(|bytes| sha256_hex(bytes.as_slice()));
                     SupportBundleConfigSnapshot {
                         path,
+                        config_hash_sha256,
                         redacted_document: Some(payload),
+                        redacted_summary,
                         fingerprint_sha256,
                         migration: Some(config_migration_snapshot(migration)),
                         error: None,
@@ -2559,7 +2568,9 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
                 }
                 Err(error) => SupportBundleConfigSnapshot {
                     path,
+                    config_hash_sha256,
                     redacted_document: None,
+                    redacted_summary: None,
                     fingerprint_sha256: None,
                     migration: Some(config_migration_snapshot(migration)),
                     error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
@@ -2568,12 +2579,60 @@ fn build_support_bundle_config_snapshot() -> SupportBundleConfigSnapshot {
         }
         Err(error) => SupportBundleConfigSnapshot {
             path,
+            config_hash_sha256,
             redacted_document: None,
+            redacted_summary: None,
             fingerprint_sha256: None,
             migration: None,
             error: Some(sanitize_diagnostic_error(error.to_string().as_str())),
         },
     }
+}
+
+fn redacted_config_summary(redacted_document: &Value) -> Value {
+    let top_level_sections = redacted_document
+        .as_object()
+        .map(|object| {
+            object.keys().filter(|key| key.as_str() != "version").cloned().collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let roadmap_preview_modes = [
+        "api_facade.mode",
+        "mcp_servers.mode",
+        "execution_backend_profiles.mode",
+        "qa_lab.mode",
+        "observability_exporters.mode",
+        "hook_policy.mode",
+        "agent_harness_registry.mode",
+        "doctor_check_registry.mode",
+    ]
+    .into_iter()
+    .filter_map(|path| {
+        config_json_value_at_path(redacted_document, path)
+            .and_then(Value::as_str)
+            .map(|mode| (path.to_owned(), Value::String(mode.to_owned())))
+    })
+    .collect::<serde_json::Map<String, Value>>();
+    let secret_fields_redacted = SECRET_CONFIG_PATHS
+        .iter()
+        .filter(|path| config_json_value_at_path(redacted_document, path).is_some())
+        .copied()
+        .collect::<Vec<_>>();
+
+    json!({
+        "schema_version": 1,
+        "top_level_sections": top_level_sections,
+        "roadmap_preview_modes": roadmap_preview_modes,
+        "secret_fields_redacted": secret_fields_redacted,
+    })
+}
+
+fn config_json_value_at_path<'a>(document: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cursor = document;
+    for segment in path.split('.') {
+        cursor = cursor.as_object()?.get(segment)?;
+    }
+    Some(cursor)
 }
 
 fn build_support_bundle_diagnostics_snapshot() -> SupportBundleDiagnosticsSnapshot {
@@ -12330,7 +12389,11 @@ struct SupportBundleConfigSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    config_hash_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     redacted_document: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_summary: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fingerprint_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14293,13 +14356,13 @@ mod diagnostics_bundle_tests {
         connector_db_path_from_journal_path, encode_support_bundle_with_cap,
         extract_support_bundle_error_message, read_recent_support_bundle_recall_artifacts,
         read_support_bundle_channel_delivery, read_support_bundle_flow_timeline,
-        unavailable_support_bundle_channel_delivery, unavailable_support_bundle_queue_state,
-        unavailable_support_bundle_recall_artifacts, DoctorAccessSnapshot, DoctorBrowserSnapshot,
-        DoctorConfigSnapshot, DoctorConnectivityProbe, DoctorConnectivitySnapshot,
-        DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorFeatureRolloutsSnapshot,
-        DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
-        DoctorSummary, SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
-        SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
+        redacted_config_summary, unavailable_support_bundle_channel_delivery,
+        unavailable_support_bundle_queue_state, unavailable_support_bundle_recall_artifacts,
+        DoctorAccessSnapshot, DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
+        DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot,
+        DoctorFeatureRolloutsSnapshot, DoctorIdentitySnapshot, DoctorProviderAuthSnapshot,
+        DoctorReport, DoctorSandboxSnapshot, DoctorSummary, SkillsInventorySnapshot, SupportBundle,
+        SupportBundleBuildSnapshot, SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
         SupportBundleReplaySnapshot, SupportBundleRuntimeSupportSnapshot,
@@ -14438,6 +14501,32 @@ mod diagnostics_bundle_tests {
         }
     }
 
+    #[test]
+    fn redacted_config_summary_reports_paths_without_secret_values() {
+        let summary = redacted_config_summary(&json!({
+            "version": 1,
+            "admin": {
+                "auth_token": "secret-value"
+            },
+            "mcp_servers": {
+                "mode": "preview_only"
+            },
+            "model_provider": {
+                "openai_api_key": "sk-test-secret"
+            }
+        }));
+
+        let encoded = serde_json::to_string(&summary).expect("summary should serialize");
+        assert!(encoded.contains("admin.auth_token"));
+        assert!(encoded.contains("model_provider.openai_api_key"));
+        assert!(encoded.contains("mcp_servers"));
+        assert!(encoded.contains("preview_only"));
+        assert!(
+            !encoded.contains("secret-value") && !encoded.contains("sk-test-secret"),
+            "redacted summary must not include raw secret values: {encoded}"
+        );
+    }
+
     fn oversized_bundle() -> SupportBundle {
         let mut hashes = Vec::new();
         for index in 0..128 {
@@ -14488,12 +14577,22 @@ mod diagnostics_bundle_tests {
             })),
             config: SupportBundleConfigSnapshot {
                 path: Some("palyra.toml".to_owned()),
+                config_hash_sha256: Some("c".repeat(64)),
                 redacted_document: Some(json!({
                     "model_provider": {
                         "openai_api_key": "<redacted>",
                         "openai_api_key_vault_ref": "<redacted>",
                         "huge": "x".repeat(24_000),
                     }
+                })),
+                redacted_summary: Some(json!({
+                    "schema_version": 1,
+                    "top_level_sections": ["model_provider"],
+                    "roadmap_preview_modes": {},
+                    "secret_fields_redacted": [
+                        "model_provider.openai_api_key",
+                        "model_provider.openai_api_key_vault_ref"
+                    ]
                 })),
                 fingerprint_sha256: Some("f".repeat(64)),
                 migration: None,

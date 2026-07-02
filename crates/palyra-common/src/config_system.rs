@@ -39,6 +39,26 @@ pub struct ConfigMigrationInfo {
     pub migrated: bool,
 }
 
+/// Deprecated config key spelling accepted by the document migrator.
+///
+/// Migration happens before strict serde parsing, so removed key aliases do
+/// not trip `deny_unknown_fields` on old operator configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigKeyAlias {
+    pub from: &'static str,
+    pub to: &'static str,
+}
+
+/// Built-in config aliases kept for old installations.
+pub const DEPRECATED_CONFIG_KEY_ALIASES: &[ConfigKeyAlias] = &[
+    ConfigKeyAlias { from: "gateway.admin_token", to: "admin.auth_token" },
+    ConfigKeyAlias { from: "tool_call.denied_tools", to: "tool_call.disabled_tools" },
+    ConfigKeyAlias {
+        from: "model_provider.auth_profile_ref",
+        to: "model_provider.auth_profile_id",
+    },
+];
+
 /// Errors from config document parsing, editing, and persistence.
 #[derive(Debug, Error)]
 pub enum ConfigSystemError {
@@ -195,25 +215,51 @@ pub fn ensure_document_version(
 
     if source_version == 0 {
         table.insert("version".to_owned(), Value::Integer(i64::from(CONFIG_VERSION_V1)));
-        return Ok(ConfigMigrationInfo {
-            source_version,
-            target_version: CONFIG_VERSION_V1,
-            migrated: true,
+    } else if source_version != CONFIG_VERSION_V1 {
+        return Err(ConfigSystemError::UnsupportedVersion {
+            version: source_version,
+            supported: CONFIG_VERSION_V1,
         });
     }
 
-    if source_version == CONFIG_VERSION_V1 {
-        return Ok(ConfigMigrationInfo {
-            source_version,
-            target_version: CONFIG_VERSION_V1,
-            migrated: false,
-        });
-    }
-
-    Err(ConfigSystemError::UnsupportedVersion {
-        version: source_version,
-        supported: CONFIG_VERSION_V1,
+    let aliases_applied = apply_deprecated_config_key_aliases(document)?;
+    Ok(ConfigMigrationInfo {
+        source_version,
+        target_version: CONFIG_VERSION_V1,
+        migrated: source_version == 0 || aliases_applied,
     })
+}
+
+/// Applies all built-in deprecated config key aliases to a parsed document.
+///
+/// Canonical destinations win if both spellings exist. The deprecated source
+/// is removed either way so strict schema parsing sees only current keys.
+///
+/// # Errors
+/// Returns an error when an alias path crosses a scalar value or uses an
+/// invalid segment; those cases indicate a malformed operator config.
+pub fn apply_deprecated_config_key_aliases(
+    document: &mut Value,
+) -> Result<bool, ConfigSystemError> {
+    let mut applied = false;
+    for alias in DEPRECATED_CONFIG_KEY_ALIASES {
+        applied |= apply_config_key_alias(document, *alias)?;
+    }
+    Ok(applied)
+}
+
+fn apply_config_key_alias(
+    document: &mut Value,
+    alias: ConfigKeyAlias,
+) -> Result<bool, ConfigSystemError> {
+    let Some(value) = get_value_at_path(document, alias.from)?.cloned() else {
+        return Ok(false);
+    };
+    if get_value_at_path(document, alias.to)?.is_none() {
+        set_value_at_path(document, alias.to, value)?;
+    }
+    unset_value_at_path(document, alias.from)?;
+    Ok(true)
 }
 
 /// Serializes a table document to pretty-printed TOML.
@@ -763,6 +809,59 @@ mod tests {
             result,
             Err(ConfigSystemError::UnsupportedVersion { version: 2, supported: 1 })
         ));
+    }
+
+    #[test]
+    fn parse_document_with_migration_applies_deprecated_key_aliases() -> Result<()> {
+        let (document, migration) = parse_document_with_migration(
+            r#"
+            [gateway]
+            admin_token = "legacy-admin"
+            [tool_call]
+            denied_tools = ["shell"]
+            [model_provider]
+            auth_profile_ref = "local-openai"
+            "#,
+        )?;
+
+        assert!(migration.migrated, "legacy aliases should mark the document as migrated");
+        assert_eq!(
+            get_value_at_path(&document, "admin.auth_token")?.and_then(Value::as_str),
+            Some("legacy-admin")
+        );
+        assert!(get_value_at_path(&document, "gateway.admin_token")?.is_none());
+        assert_eq!(
+            get_value_at_path(&document, "model_provider.auth_profile_id")?.and_then(Value::as_str),
+            Some("local-openai")
+        );
+        assert!(get_value_at_path(&document, "model_provider.auth_profile_ref")?.is_none());
+        assert!(get_value_at_path(&document, "tool_call.denied_tools")?.is_none());
+        assert!(get_value_at_path(&document, "tool_call.disabled_tools")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_document_with_migration_preserves_canonical_key_over_alias() -> Result<()> {
+        let (document, migration) = parse_document_with_migration(
+            r#"
+            version = 1
+            [admin]
+            auth_token = "canonical-admin"
+            [gateway]
+            admin_token = "legacy-admin"
+            "#,
+        )?;
+
+        assert!(
+            migration.migrated,
+            "dropping a deprecated alias should mark the document as migrated"
+        );
+        assert_eq!(
+            get_value_at_path(&document, "admin.auth_token")?.and_then(Value::as_str),
+            Some("canonical-admin")
+        );
+        assert!(get_value_at_path(&document, "gateway.admin_token")?.is_none());
+        Ok(())
     }
 
     #[test]

@@ -29,7 +29,9 @@ use palyra_common::{
         parse_document_with_migration, serialize_document_pretty, ConfigMigrationInfo,
     },
     daemon_config_schema::{
-        FileMemoryRetrievalConfig, FileRetrievalSourceScoringProfile, RootFileConfig,
+        FileAgentHarnessConfig, FileDoctorCheckConfig, FileExecutionBackendProfileConfig,
+        FileMcpServerConfig, FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
+        FileRetrievalSourceScoringProfile, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
@@ -102,6 +104,14 @@ pub fn load_config() -> Result<LoadedConfig> {
     let mut delivery_arbitration = DeliveryArbitrationConfig::default();
     let mut replay_capture = ReplayCaptureConfig::default();
     let mut networked_workers = NetworkedWorkersConfig::default();
+    let mut api_facade = RoadmapPreviewSectionConfig::default();
+    let mut mcp_servers = McpServersConfig::default();
+    let mut execution_backend_profiles = ExecutionBackendProfilesConfig::default();
+    let mut qa_lab = RoadmapPreviewSectionConfig::default();
+    let mut observability_exporters = ObservabilityExportersConfig::default();
+    let mut hook_policy = RoadmapPreviewSectionConfig::default();
+    let mut agent_harness_registry = AgentHarnessRegistryConfig::default();
+    let mut doctor_check_registry = DoctorCheckRegistryConfig::default();
     let mut cron = CronConfig::default();
     let mut orchestrator = OrchestratorConfig::default();
     let mut memory = MemoryConfig::default();
@@ -451,6 +461,85 @@ pub fn load_config() -> Result<LoadedConfig> {
                         expected_artifact_digest_sha256.as_str(),
                         "networked_workers.expected_artifact_digest_sha256",
                     )?;
+            }
+        }
+        if let Some(file_api_facade) = parsed.api_facade {
+            if let Some(mode) = file_api_facade.mode {
+                api_facade.mode = parse_roadmap_preview_mode(mode.as_str(), "api_facade.mode")?;
+            }
+        }
+        if let Some(file_mcp_servers) = parsed.mcp_servers {
+            if let Some(mode) = file_mcp_servers.mode {
+                mcp_servers.mode = parse_roadmap_preview_mode(mode.as_str(), "mcp_servers.mode")?;
+            }
+            if let Some(servers) = file_mcp_servers.servers {
+                mcp_servers.servers = servers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_mcp_server_config(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        if let Some(file_execution_backend_profiles) = parsed.execution_backend_profiles {
+            if let Some(mode) = file_execution_backend_profiles.mode {
+                execution_backend_profiles.mode =
+                    parse_roadmap_preview_mode(mode.as_str(), "execution_backend_profiles.mode")?;
+            }
+            if let Some(profiles) = file_execution_backend_profiles.profiles {
+                execution_backend_profiles.profiles = profiles
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_execution_backend_profile_config(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        if let Some(file_qa_lab) = parsed.qa_lab {
+            if let Some(mode) = file_qa_lab.mode {
+                qa_lab.mode = parse_roadmap_preview_mode(mode.as_str(), "qa_lab.mode")?;
+            }
+        }
+        if let Some(file_observability_exporters) = parsed.observability_exporters {
+            if let Some(mode) = file_observability_exporters.mode {
+                observability_exporters.mode =
+                    parse_roadmap_preview_mode(mode.as_str(), "observability_exporters.mode")?;
+            }
+            if let Some(exporters) = file_observability_exporters.exporters {
+                observability_exporters.exporters = exporters
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_observability_exporter_config(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        if let Some(file_hook_policy) = parsed.hook_policy {
+            if let Some(mode) = file_hook_policy.mode {
+                hook_policy.mode = parse_roadmap_preview_mode(mode.as_str(), "hook_policy.mode")?;
+            }
+        }
+        if let Some(file_agent_harness_registry) = parsed.agent_harness_registry {
+            if let Some(mode) = file_agent_harness_registry.mode {
+                agent_harness_registry.mode =
+                    parse_roadmap_preview_mode(mode.as_str(), "agent_harness_registry.mode")?;
+            }
+            if let Some(harnesses) = file_agent_harness_registry.harnesses {
+                agent_harness_registry.harnesses = harnesses
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_agent_harness_config(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
+            }
+        }
+        if let Some(file_doctor_check_registry) = parsed.doctor_check_registry {
+            if let Some(mode) = file_doctor_check_registry.mode {
+                doctor_check_registry.mode =
+                    parse_roadmap_preview_mode(mode.as_str(), "doctor_check_registry.mode")?;
+            }
+            if let Some(checks) = file_doctor_check_registry.checks {
+                doctor_check_registry.checks = checks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, entry)| parse_doctor_check_config(entry, index))
+                    .collect::<Result<Vec<_>>>()?;
             }
         }
         if let Some(file_orchestrator) = parsed.orchestrator {
@@ -1327,7 +1416,11 @@ pub fn load_config() -> Result<LoadedConfig> {
         }
         source = path.to_string_lossy().into_owned();
         if migration.migrated {
-            source.push_str(" +migration(v0->v1)");
+            if migration.source_version == 0 {
+                source.push_str(" +migration(v0->v1)");
+            } else {
+                source.push_str(" +migration(aliases)");
+            }
         }
     }
 
@@ -1477,6 +1570,44 @@ pub fn load_config() -> Result<LoadedConfig> {
             .context("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED must be true or false")?;
         source.push_str(" +env(PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED)");
     }
+
+    api_facade.mode = apply_roadmap_preview_mode_env_override(
+        api_facade.mode,
+        "PALYRA_API_FACADE_MODE",
+        &mut source,
+    )?;
+    mcp_servers.mode = apply_roadmap_preview_mode_env_override(
+        mcp_servers.mode,
+        "PALYRA_MCP_SERVERS_MODE",
+        &mut source,
+    )?;
+    execution_backend_profiles.mode = apply_roadmap_preview_mode_env_override(
+        execution_backend_profiles.mode,
+        "PALYRA_EXECUTION_BACKEND_PROFILES_MODE",
+        &mut source,
+    )?;
+    qa_lab.mode =
+        apply_roadmap_preview_mode_env_override(qa_lab.mode, "PALYRA_QA_LAB_MODE", &mut source)?;
+    observability_exporters.mode = apply_roadmap_preview_mode_env_override(
+        observability_exporters.mode,
+        "PALYRA_OBSERVABILITY_EXPORTERS_MODE",
+        &mut source,
+    )?;
+    hook_policy.mode = apply_roadmap_preview_mode_env_override(
+        hook_policy.mode,
+        "PALYRA_HOOK_POLICY_MODE",
+        &mut source,
+    )?;
+    agent_harness_registry.mode = apply_roadmap_preview_mode_env_override(
+        agent_harness_registry.mode,
+        "PALYRA_AGENT_HARNESS_REGISTRY_MODE",
+        &mut source,
+    )?;
+    doctor_check_registry.mode = apply_roadmap_preview_mode_env_override(
+        doctor_check_registry.mode,
+        "PALYRA_DOCTOR_CHECK_REGISTRY_MODE",
+        &mut source,
+    )?;
 
     if let Ok(max_item_bytes) = env::var("PALYRA_MEMORY_MAX_ITEM_BYTES") {
         memory.max_item_bytes = parse_positive_usize(
@@ -2360,6 +2491,14 @@ pub fn load_config() -> Result<LoadedConfig> {
         delivery_arbitration,
         replay_capture,
         networked_workers,
+        api_facade,
+        mcp_servers,
+        execution_backend_profiles,
+        qa_lab,
+        observability_exporters,
+        hook_policy,
+        agent_harness_registry,
+        doctor_check_registry,
         cron,
         orchestrator,
         memory,
@@ -2404,6 +2543,193 @@ fn apply_feature_rollout_env_override(
     let enabled = parse_boolish_feature_rollout(raw.as_str(), env_name)?;
     source.push_str(&format!(" +env({env_name})"));
     Ok(FeatureRolloutSetting::from_env(enabled))
+}
+
+fn apply_roadmap_preview_mode_env_override(
+    current: RuntimePreviewMode,
+    env_name: &'static str,
+    source: &mut String,
+) -> Result<RuntimePreviewMode> {
+    let Ok(raw) = env::var(env_name) else {
+        return Ok(current);
+    };
+    let mode = parse_roadmap_preview_mode(raw.as_str(), env_name)?;
+    source.push_str(&format!(" +env({env_name})"));
+    Ok(mode)
+}
+
+fn parse_roadmap_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePreviewMode> {
+    let mode = parse_runtime_preview_mode(raw, source_name)?;
+    if matches!(mode, RuntimePreviewMode::Enabled) {
+        anyhow::bail!(
+            "{source_name}=enabled is reserved until the section reaches its maturity gate; use disabled or preview_only"
+        );
+    }
+    Ok(mode)
+}
+
+fn parse_mcp_server_config(entry: FileMcpServerConfig, index: usize) -> Result<McpServerConfig> {
+    let source_name = format!("mcp_servers.servers[{index}]");
+    let id = parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?;
+    let transport = parse_mcp_server_transport(
+        entry.transport.as_deref(),
+        format!("{source_name}.transport").as_str(),
+    )?;
+    let command =
+        parse_optional_command_argv(entry.command, format!("{source_name}.command").as_str())?;
+    let url =
+        parse_optional_preview_url(entry.url.as_deref(), format!("{source_name}.url").as_str())?;
+
+    match transport {
+        McpServerTransport::Stdio => {
+            if command.is_none() {
+                anyhow::bail!(
+                    "{source_name}.command is required when transport=stdio; set command = [\"mcp-server\", ...] or change transport"
+                );
+            }
+            if url.is_some() {
+                anyhow::bail!("{source_name}.url must be omitted when transport=stdio");
+            }
+        }
+        McpServerTransport::Http | McpServerTransport::Sse => {
+            if url.is_none() {
+                anyhow::bail!(
+                    "{source_name}.url is required when transport={}; set url = \"http://127.0.0.1:PORT\" or use transport=stdio with command",
+                    transport.as_str()
+                );
+            }
+            if command.is_some() {
+                anyhow::bail!(
+                    "{source_name}.command must be omitted when transport={}",
+                    transport.as_str()
+                );
+            }
+        }
+    }
+
+    Ok(McpServerConfig { id, enabled: entry.enabled.unwrap_or(false), transport, command, url })
+}
+
+fn parse_execution_backend_profile_config(
+    entry: FileExecutionBackendProfileConfig,
+    index: usize,
+) -> Result<ExecutionBackendProfileConfig> {
+    let source_name = format!("execution_backend_profiles.profiles[{index}]");
+    Ok(ExecutionBackendProfileConfig {
+        id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
+        enabled: entry.enabled.unwrap_or(false),
+        kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
+    })
+}
+
+fn parse_observability_exporter_config(
+    entry: FileObservabilityExporterConfig,
+    index: usize,
+) -> Result<ObservabilityExporterConfig> {
+    let source_name = format!("observability_exporters.exporters[{index}]");
+    Ok(ObservabilityExporterConfig {
+        id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
+        enabled: entry.enabled.unwrap_or(false),
+        kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
+    })
+}
+
+fn parse_agent_harness_config(
+    entry: FileAgentHarnessConfig,
+    index: usize,
+) -> Result<AgentHarnessConfig> {
+    let source_name = format!("agent_harness_registry.harnesses[{index}]");
+    Ok(AgentHarnessConfig {
+        id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
+        enabled: entry.enabled.unwrap_or(false),
+        kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
+    })
+}
+
+fn parse_doctor_check_config(
+    entry: FileDoctorCheckConfig,
+    index: usize,
+) -> Result<DoctorCheckConfig> {
+    let source_name = format!("doctor_check_registry.checks[{index}]");
+    Ok(DoctorCheckConfig {
+        id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
+        enabled: entry.enabled.unwrap_or(false),
+    })
+}
+
+fn parse_required_registry_id(raw: Option<String>, source_name: &str) -> Result<String> {
+    let raw = raw.ok_or_else(|| {
+        anyhow::anyhow!("{source_name} is required; set it to a stable ASCII identifier")
+    })?;
+    parse_registry_identifier(raw.as_str(), source_name)
+}
+
+fn parse_required_registry_kind(raw: Option<String>, source_name: &str) -> Result<String> {
+    let raw = raw.ok_or_else(|| {
+        anyhow::anyhow!("{source_name} is required; set it to a stable backend kind")
+    })?;
+    parse_registry_identifier(raw.as_str(), source_name)
+}
+
+fn parse_mcp_server_transport(raw: Option<&str>, source_name: &str) -> Result<McpServerTransport> {
+    let raw = raw
+        .ok_or_else(|| anyhow::anyhow!("{source_name} is required; choose stdio, http, or sse"))?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "stdio" => Ok(McpServerTransport::Stdio),
+        "http" | "streamable_http" | "streamable-http" => Ok(McpServerTransport::Http),
+        "sse" => Ok(McpServerTransport::Sse),
+        _ => anyhow::bail!("{source_name} must be one of: stdio, http, sse"),
+    }
+}
+
+fn parse_optional_command_argv(
+    raw: Option<Vec<String>>,
+    source_name: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        anyhow::bail!("{source_name} cannot be empty");
+    }
+    if raw.len() > 64 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 64)", raw.len());
+    }
+    let mut argv = Vec::with_capacity(raw.len());
+    for (index, value) in raw.into_iter().enumerate() {
+        let path = format!("{source_name}[{index}]");
+        let parsed = parse_non_empty_config_text(value.as_str(), path.as_str())?;
+        if parsed.len() > 512 {
+            anyhow::bail!("{path} exceeds maximum bytes ({} > 512)", parsed.len());
+        }
+        argv.push(parsed);
+    }
+    Ok(Some(argv))
+}
+
+fn parse_optional_preview_url(raw: Option<&str>, source_name: &str) -> Result<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("{source_name} must be a valid absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("{source_name} must use http or https scheme");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{source_name} must include a host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{source_name} must not embed credentials");
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{source_name} must not include query or fragment");
+    }
+    Ok(Some(parsed.as_str().trim_end_matches('/').to_owned()))
 }
 
 /// Validates the merged runtime-preview sections: every `enabled` mode must
@@ -4391,7 +4717,7 @@ mod tests {
         parse_channel_routing_rule, parse_content_type_allowlist, parse_cron_timezone_mode,
         parse_default_memory_ttl_ms, parse_direct_message_policy, parse_dns_suffix_allowlist,
         parse_exact_vault_ref_allowlist, parse_host_allowlist, parse_http_header_allowlist,
-        parse_journal_db_path, parse_memory_retention_vacuum_schedule,
+        parse_journal_db_path, parse_mcp_server_config, parse_memory_retention_vacuum_schedule,
         parse_model_provider_auth_provider_kind, parse_model_provider_registry_entry,
         parse_model_provider_registry_model, parse_openai_base_url, parse_openai_embeddings_dims,
         parse_optional_auth_profile_id, parse_optional_browser_state_dir,
@@ -4399,14 +4725,15 @@ mod tests {
         parse_optional_vault_ref_field, parse_positive_u32, parse_positive_usize,
         parse_process_executable_allowlist, parse_process_runner_egress_enforcement_mode,
         parse_process_runner_path_access_mode, parse_process_runner_tier,
-        parse_provider_reasoning_effort, parse_provider_service_tier, parse_root_file_config,
-        parse_storage_prefix_allowlist, parse_structured_secret_ref_field, parse_tool_allowlist,
-        parse_vault_dir, parse_vault_ref_allowlist, validate_runtime_preview_config, AdminConfig,
-        AuxiliaryExecutorConfig, BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig,
-        CronConfig, DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode,
-        FlowOrchestrationConfig, GatewayBindProfile, GatewayConfig, GatewayTlsConfig,
-        HttpFetchConfig, IdentityConfig, MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig,
-        OrchestratorConfig, ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
+        parse_provider_reasoning_effort, parse_provider_service_tier, parse_roadmap_preview_mode,
+        parse_root_file_config, parse_storage_prefix_allowlist, parse_structured_secret_ref_field,
+        parse_tool_allowlist, parse_vault_dir, parse_vault_ref_allowlist,
+        validate_runtime_preview_config, AdminConfig, AuxiliaryExecutorConfig,
+        BrowserServiceConfig, CanvasHostConfig, ChannelRouterConfig, CronConfig,
+        DeliveryArbitrationConfig, DeploymentConfig, DeploymentMode, FlowOrchestrationConfig,
+        GatewayBindProfile, GatewayConfig, GatewayTlsConfig, HttpFetchConfig, IdentityConfig,
+        MemoryConfig, ModelProviderConfig, NetworkedWorkersConfig, OrchestratorConfig,
+        ProcessRunnerConfig, PruningPolicyMatrixConfig, ReplayCaptureConfig,
         RetrievalDualPathConfig, SessionQueuePolicyConfig, StorageConfig, ToolCallConfig,
     };
     use crate::channel_router::{BroadcastStrategy, DirectMessagePolicy};
@@ -4418,7 +4745,8 @@ mod tests {
     use palyra_common::tool_catalog::ToolCatalogExposureMode;
     use palyra_common::{
         daemon_config_schema::{
-            FileModelProviderRegistryEntry, FileModelProviderRegistryModel, RootFileConfig,
+            FileMcpServerConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
+            RootFileConfig,
         },
         feature_rollouts::{
             FeatureRolloutSetting, FeatureRolloutSource, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
@@ -4727,6 +5055,87 @@ mod tests {
             &NetworkedWorkersConfig::default(),
         )
         .expect("preview defaults should validate");
+    }
+
+    #[test]
+    fn roadmap_preview_modes_reject_enabled_until_maturity_gate() {
+        let error = parse_roadmap_preview_mode("enabled", "mcp_servers.mode")
+            .expect_err("roadmap preview sections should not be fully enabled yet");
+        let rendered = error.to_string();
+        assert!(rendered.contains("mcp_servers.mode=enabled"));
+        assert!(rendered.contains("maturity gate"));
+    }
+
+    #[test]
+    fn daemon_config_migration_keeps_old_aliases_compatible_with_strict_schema() {
+        let (parsed, migration) = parse_root_file_config(
+            r#"
+            [gateway]
+            admin_token = "legacy-admin-token"
+            [tool_call]
+            denied_tools = ["palyra.http.fetch"]
+            [model_provider]
+            auth_profile_ref = "Local.OpenAI"
+            "#,
+        )
+        .expect("deprecated aliases should migrate before strict schema parsing");
+
+        assert!(migration.migrated);
+        assert_eq!(
+            parsed.admin.and_then(|admin| admin.auth_token),
+            Some("legacy-admin-token".to_owned())
+        );
+        assert_eq!(
+            parsed.tool_call.and_then(|tool_call| tool_call.disabled_tools),
+            Some(vec!["palyra.http.fetch".to_owned()])
+        );
+        assert_eq!(
+            parsed.model_provider.and_then(|provider| provider.auth_profile_id),
+            Some("Local.OpenAI".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_mcp_stdio_server_reports_command_path_and_hint() {
+        let error = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("filesystem".to_owned()),
+                enabled: Some(false),
+                transport: Some("stdio".to_owned()),
+                command: None,
+                url: None,
+            },
+            0,
+        )
+        .expect_err("stdio MCP server without a command should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("mcp_servers.servers[0].command"));
+        assert!(rendered.contains("set command"));
+    }
+
+    #[test]
+    fn valid_mcp_stdio_server_defaults_to_disabled_registry_entry() {
+        let server = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("Filesystem".to_owned()),
+                enabled: None,
+                transport: Some("stdio".to_owned()),
+                command: Some(vec![
+                    "mcp-filesystem".to_owned(),
+                    "--root".to_owned(),
+                    ".".to_owned(),
+                ]),
+                url: None,
+            },
+            0,
+        )
+        .expect("valid stdio MCP server should parse");
+
+        assert_eq!(server.id, "filesystem");
+        assert!(!server.enabled);
+        assert_eq!(server.transport, crate::config::McpServerTransport::Stdio);
+        assert_eq!(server.command.as_ref().map(Vec::len), Some(3));
     }
 
     #[test]

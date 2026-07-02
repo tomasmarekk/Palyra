@@ -66,6 +66,7 @@ const DEFAULT_REPLAY_MAX_EVENTS_PER_RUN: usize = 128;
 const DEFAULT_NETWORKED_WORKERS_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
 const DEFAULT_NETWORKED_WORKERS_LEASE_TTL_MS: u64 = 15 * 60 * 1_000;
 const DEFAULT_NETWORKED_WORKERS_REQUIRE_ATTESTATION: bool = true;
+const DEFAULT_ROADMAP_PREVIEW_SECTION_MODE: RuntimePreviewMode = RuntimePreviewMode::Disabled;
 const DEFAULT_MEMORY_MAX_ITEM_BYTES: usize = 16 * 1024;
 const DEFAULT_MEMORY_MAX_ITEM_TOKENS: usize = 2_048;
 const DEFAULT_MEMORY_DEFAULT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -171,6 +172,14 @@ pub struct LoadedConfig {
     pub delivery_arbitration: DeliveryArbitrationConfig,
     pub replay_capture: ReplayCaptureConfig,
     pub networked_workers: NetworkedWorkersConfig,
+    pub api_facade: RoadmapPreviewSectionConfig,
+    pub mcp_servers: McpServersConfig,
+    pub execution_backend_profiles: ExecutionBackendProfilesConfig,
+    pub qa_lab: RoadmapPreviewSectionConfig,
+    pub observability_exporters: ObservabilityExportersConfig,
+    pub hook_policy: RoadmapPreviewSectionConfig,
+    pub agent_harness_registry: AgentHarnessRegistryConfig,
+    pub doctor_check_registry: DoctorCheckRegistryConfig,
     pub cron: CronConfig,
     pub orchestrator: OrchestratorConfig,
     pub memory: MemoryConfig,
@@ -502,6 +511,146 @@ impl Default for NetworkedWorkersConfig {
             expected_artifact_digest_sha256: None,
         }
     }
+}
+
+/// Minimal preview section used for roadmap areas that are declared in config
+/// before their runtime implementation is allowed to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoadmapPreviewSectionConfig {
+    pub mode: RuntimePreviewMode,
+}
+
+impl Default for RoadmapPreviewSectionConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE }
+    }
+}
+
+/// MCP server registry preview. Entries are declarative only until the MCP
+/// supervisor milestones wire them into the tool catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServersConfig {
+    pub mode: RuntimePreviewMode,
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpServersConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, servers: Vec::new() }
+    }
+}
+
+/// Transport type for a declared MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerTransport {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl McpServerTransport {
+    /// Returns the canonical config value for this transport.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
+}
+
+/// One declared MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub transport: McpServerTransport,
+    pub command: Option<Vec<String>>,
+    pub url: Option<String>,
+}
+
+/// Execution backend profile registry preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendProfilesConfig {
+    pub mode: RuntimePreviewMode,
+    pub profiles: Vec<ExecutionBackendProfileConfig>,
+}
+
+impl Default for ExecutionBackendProfilesConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, profiles: Vec::new() }
+    }
+}
+
+/// One declared execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendProfileConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub kind: String,
+}
+
+/// Observability exporter registry preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityExportersConfig {
+    pub mode: RuntimePreviewMode,
+    pub exporters: Vec<ObservabilityExporterConfig>,
+}
+
+impl Default for ObservabilityExportersConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, exporters: Vec::new() }
+    }
+}
+
+/// One declared observability exporter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservabilityExporterConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub kind: String,
+}
+
+/// Native agent harness registry preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHarnessRegistryConfig {
+    pub mode: RuntimePreviewMode,
+    pub harnesses: Vec<AgentHarnessConfig>,
+}
+
+impl Default for AgentHarnessRegistryConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, harnesses: Vec::new() }
+    }
+}
+
+/// One declared agent harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHarnessConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub kind: String,
+}
+
+/// Doctor check registry preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCheckRegistryConfig {
+    pub mode: RuntimePreviewMode,
+    pub checks: Vec<DoctorCheckConfig>,
+}
+
+impl Default for DoctorCheckRegistryConfig {
+    fn default() -> Self {
+        Self { mode: DEFAULT_ROADMAP_PREVIEW_SECTION_MODE, checks: Vec::new() }
+    }
+}
+
+/// One declared doctor check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorCheckConfig {
+    pub id: String,
+    pub enabled: bool,
 }
 
 /// Memory subsystem limits, auto-injection, retention, and retrieval tuning.

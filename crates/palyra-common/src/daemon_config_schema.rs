@@ -298,6 +298,149 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Pinned expected worker image digest.",
     },
     ConfigSchemaEntry {
+        path: "api_facade.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_API_FACADE_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "api_facade",
+        description: "Preview posture for the public API facade before maturity gates enable serving it.",
+    },
+    ConfigSchemaEntry {
+        path: "mcp_servers.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_MCP_SERVERS_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "mcp_servers",
+        description: "Preview posture for imported MCP server declarations.",
+    },
+    ConfigSchemaEntry {
+        path: "mcp_servers.servers",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "mcp_servers",
+        description: "MCP server registry entries; env overrides intentionally do not replace structured registry data.",
+    },
+    ConfigSchemaEntry {
+        path: "execution_backend_profiles.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_EXECUTION_BACKEND_PROFILES_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "execution_backend_profiles",
+        description: "Preview posture for named execution backend profiles.",
+    },
+    ConfigSchemaEntry {
+        path: "execution_backend_profiles.profiles",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "execution_backend_profiles",
+        description: "Execution backend profile declarations; env overrides intentionally do not replace structured registry data.",
+    },
+    ConfigSchemaEntry {
+        path: "qa_lab.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_QA_LAB_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "qa_lab",
+        description: "Preview posture for QA Lab scenario and evidence surfaces.",
+    },
+    ConfigSchemaEntry {
+        path: "observability_exporters.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_OBSERVABILITY_EXPORTERS_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "observability_exporters",
+        description: "Preview posture for outbound observability exporter declarations.",
+    },
+    ConfigSchemaEntry {
+        path: "observability_exporters.exporters",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "observability_exporters",
+        description: "Observability exporter declarations without secret-bearing endpoint material.",
+    },
+    ConfigSchemaEntry {
+        path: "hook_policy.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_HOOK_POLICY_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "hook_policy",
+        description: "Preview posture for agent hook policy declarations.",
+    },
+    ConfigSchemaEntry {
+        path: "agent_harness_registry.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_AGENT_HARNESS_REGISTRY_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "agent_harness_registry",
+        description: "Preview posture for native agent harness registry declarations.",
+    },
+    ConfigSchemaEntry {
+        path: "agent_harness_registry.harnesses",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "agent_harness_registry",
+        description: "Agent harness registry entries; env overrides intentionally do not replace structured registry data.",
+    },
+    ConfigSchemaEntry {
+        path: "doctor_check_registry.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_DOCTOR_CHECK_REGISTRY_MODE"],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "doctor_check_registry",
+        description: "Preview posture for configurable doctor check registry declarations.",
+    },
+    ConfigSchemaEntry {
+        path: "doctor_check_registry.checks",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "doctor_check_registry",
+        description: "Doctor check registry entries; env overrides intentionally do not replace structured registry data.",
+    },
+    ConfigSchemaEntry {
         path: "orchestrator.runloop_v1_enabled",
         value_type: "bool",
         default_value: Some("false"),
@@ -479,6 +622,14 @@ pub struct RootFileConfig {
     pub delivery_arbitration: Option<FileDeliveryArbitrationConfig>,
     pub replay_capture: Option<FileReplayCaptureConfig>,
     pub networked_workers: Option<FileNetworkedWorkersConfig>,
+    pub api_facade: Option<FileRoadmapPreviewSectionConfig>,
+    pub mcp_servers: Option<FileMcpServersConfig>,
+    pub execution_backend_profiles: Option<FileExecutionBackendProfilesConfig>,
+    pub qa_lab: Option<FileRoadmapPreviewSectionConfig>,
+    pub observability_exporters: Option<FileObservabilityExportersConfig>,
+    pub hook_policy: Option<FileRoadmapPreviewSectionConfig>,
+    pub agent_harness_registry: Option<FileAgentHarnessRegistryConfig>,
+    pub doctor_check_registry: Option<FileDoctorCheckRegistryConfig>,
     pub cron: Option<FileCronConfig>,
     pub orchestrator: Option<FileOrchestratorConfig>,
     pub memory: Option<FileMemoryConfig>,
@@ -652,6 +803,100 @@ pub struct FileNetworkedWorkersConfig {
     pub expected_image_digest_sha256: Option<String>,
     pub expected_build_digest_sha256: Option<String>,
     pub expected_artifact_digest_sha256: Option<String>,
+}
+
+/// Shared shape for roadmap sections that are present only as preview
+/// gates until their implementation milestones mature.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRoadmapPreviewSectionConfig {
+    pub mode: Option<String>,
+}
+
+/// `[mcp_servers]`: preview MCP server registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMcpServersConfig {
+    pub mode: Option<String>,
+    pub servers: Option<Vec<FileMcpServerConfig>>,
+}
+
+/// One `[[mcp_servers.servers]]` declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMcpServerConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
+    pub transport: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub url: Option<String>,
+}
+
+/// `[execution_backend_profiles]`: preview execution profile registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileExecutionBackendProfilesConfig {
+    pub mode: Option<String>,
+    pub profiles: Option<Vec<FileExecutionBackendProfileConfig>>,
+}
+
+/// One `[[execution_backend_profiles.profiles]]` declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileExecutionBackendProfileConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
+    pub kind: Option<String>,
+}
+
+/// `[observability_exporters]`: preview exporter registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileObservabilityExportersConfig {
+    pub mode: Option<String>,
+    pub exporters: Option<Vec<FileObservabilityExporterConfig>>,
+}
+
+/// One `[[observability_exporters.exporters]]` declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileObservabilityExporterConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
+    pub kind: Option<String>,
+}
+
+/// `[agent_harness_registry]`: preview native harness registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAgentHarnessRegistryConfig {
+    pub mode: Option<String>,
+    pub harnesses: Option<Vec<FileAgentHarnessConfig>>,
+}
+
+/// One `[[agent_harness_registry.harnesses]]` declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAgentHarnessConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
+    pub kind: Option<String>,
+}
+
+/// `[doctor_check_registry]`: preview doctor check registry.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileDoctorCheckRegistryConfig {
+    pub mode: Option<String>,
+    pub checks: Option<Vec<FileDoctorCheckConfig>>,
+}
+
+/// One `[[doctor_check_registry.checks]]` declaration.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileDoctorCheckConfig {
+    pub id: Option<String>,
+    pub enabled: Option<bool>,
 }
 
 /// `[cron]`: scheduler timezone.
@@ -1072,7 +1317,12 @@ pub struct FileStorageConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_secret_config_path, redact_secret_config_values, RootFileConfig};
+    use serde_json::json;
+
+    use super::{
+        config_schema_entries, is_secret_config_path, known_config_env_vars,
+        redact_secret_config_values, RootFileConfig,
+    };
 
     #[test]
     fn secret_config_path_matching_is_case_insensitive() {
@@ -1426,6 +1676,256 @@ mod tests {
                 .and_then(|value| value.expected_image_digest_sha256.as_deref()),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn roadmap_preview_sections_parse_expected_fields() {
+        let parsed: RootFileConfig = toml::from_str(
+            r#"
+            [api_facade]
+            mode = "preview_only"
+
+            [mcp_servers]
+            mode = "preview_only"
+            [[mcp_servers.servers]]
+            id = "filesystem"
+            enabled = false
+            transport = "stdio"
+            command = ["mcp-filesystem", "--root", "."]
+
+            [execution_backend_profiles]
+            mode = "disabled"
+            [[execution_backend_profiles.profiles]]
+            id = "local-docker"
+            enabled = false
+            kind = "docker"
+
+            [qa_lab]
+            mode = "preview_only"
+
+            [observability_exporters]
+            mode = "disabled"
+            [[observability_exporters.exporters]]
+            id = "local-otlp"
+            enabled = false
+            kind = "otlp"
+
+            [hook_policy]
+            mode = "disabled"
+
+            [agent_harness_registry]
+            mode = "disabled"
+            [[agent_harness_registry.harnesses]]
+            id = "native"
+            enabled = false
+            kind = "rust"
+
+            [doctor_check_registry]
+            mode = "preview_only"
+            [[doctor_check_registry.checks]]
+            id = "mcp-server-config"
+            enabled = false
+            "#,
+        )
+        .expect("roadmap preview sections should parse");
+
+        assert_eq!(
+            parsed.api_facade.as_ref().and_then(|value| value.mode.as_deref()),
+            Some("preview_only")
+        );
+        let mcp_server = parsed
+            .mcp_servers
+            .as_ref()
+            .and_then(|value| value.servers.as_ref())
+            .and_then(|servers| servers.first())
+            .expect("mcp server declaration should parse");
+        assert_eq!(mcp_server.id.as_deref(), Some("filesystem"));
+        assert_eq!(mcp_server.transport.as_deref(), Some("stdio"));
+        assert_eq!(
+            mcp_server.command.as_ref().map(Vec::len),
+            Some(3),
+            "stdio command should be preserved as argv"
+        );
+        assert_eq!(
+            parsed.qa_lab.as_ref().and_then(|value| value.mode.as_deref()),
+            Some("preview_only")
+        );
+        assert_eq!(
+            parsed
+                .doctor_check_registry
+                .as_ref()
+                .and_then(|value| value.checks.as_ref())
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn roadmap_preview_config_schema_snapshot_has_safe_defaults() {
+        let roadmap_categories = [
+            "api_facade",
+            "mcp_servers",
+            "execution_backend_profiles",
+            "qa_lab",
+            "observability_exporters",
+            "hook_policy",
+            "agent_harness_registry",
+            "doctor_check_registry",
+        ];
+        let snapshot = config_schema_entries()
+            .iter()
+            .filter(|entry| roadmap_categories.contains(&entry.category))
+            .map(|entry| {
+                json!({
+                    "path": entry.path,
+                    "value_type": entry.value_type,
+                    "default_value": entry.default_value,
+                    "env_vars": entry.env_vars,
+                    "secret": entry.secret,
+                    "deprecated": entry.deprecated,
+                    "restart_required": entry.restart_required,
+                    "category": entry.category,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            serde_json::Value::Array(snapshot),
+            json!([
+                {
+                    "path": "api_facade.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_API_FACADE_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "api_facade"
+                },
+                {
+                    "path": "mcp_servers.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_MCP_SERVERS_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "mcp_servers"
+                },
+                {
+                    "path": "mcp_servers.servers",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "mcp_servers"
+                },
+                {
+                    "path": "execution_backend_profiles.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_EXECUTION_BACKEND_PROFILES_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "execution_backend_profiles"
+                },
+                {
+                    "path": "execution_backend_profiles.profiles",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "execution_backend_profiles"
+                },
+                {
+                    "path": "qa_lab.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_QA_LAB_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "qa_lab"
+                },
+                {
+                    "path": "observability_exporters.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_OBSERVABILITY_EXPORTERS_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "observability_exporters"
+                },
+                {
+                    "path": "observability_exporters.exporters",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "observability_exporters"
+                },
+                {
+                    "path": "hook_policy.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_HOOK_POLICY_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "hook_policy"
+                },
+                {
+                    "path": "agent_harness_registry.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_AGENT_HARNESS_REGISTRY_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "agent_harness_registry"
+                },
+                {
+                    "path": "agent_harness_registry.harnesses",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "agent_harness_registry"
+                },
+                {
+                    "path": "doctor_check_registry.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_DOCTOR_CHECK_REGISTRY_MODE"],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "doctor_check_registry"
+                },
+                {
+                    "path": "doctor_check_registry.checks",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "doctor_check_registry"
+                }
+            ])
+        );
+        assert!(known_config_env_vars().contains(&"PALYRA_MCP_SERVERS_MODE"));
+        assert!(!is_secret_config_path("mcp_servers.servers"));
     }
 
     #[test]
