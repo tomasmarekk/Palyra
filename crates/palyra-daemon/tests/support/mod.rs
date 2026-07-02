@@ -1,6 +1,6 @@
 //! Shared integration-test support: `DaemonHarness` for spawning a real
 //! `palyrad` with throwaway state, console session login/JSON helpers, and
-//! JSON golden assertions.
+//! golden assertions for deterministic artifacts.
 
 use std::{
     fs,
@@ -152,13 +152,7 @@ pub fn assert_json_golden(name: &str, actual: &Value) -> Result<()> {
     let serialized =
         serde_json::to_string_pretty(actual).context("failed to serialize actual golden json")?;
     if should_update_goldens() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create golden fixture directory {}", parent.display())
-            })?;
-        }
-        fs::write(&path, format!("{serialized}\n"))
-            .with_context(|| format!("failed to update golden fixture {}", path.display()))?;
+        write_golden(&path, format!("{serialized}\n").as_str())?;
         return Ok(());
     }
     let expected_raw = fs::read_to_string(&path)
@@ -172,6 +166,36 @@ pub fn assert_json_golden(name: &str, actual: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn assert_text_golden(name: &str, actual: &str) -> Result<()> {
+    assert_text_at_golden_path(&golden_path(name), actual)
+}
+
+fn assert_text_at_golden_path(path: &Path, actual: &str) -> Result<()> {
+    if should_update_goldens() {
+        write_golden(path, actual)?;
+        return Ok(());
+    }
+    let expected_raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read golden fixture {}", path.display()))?;
+    if expected_raw.replace("\r\n", "\n") != actual.replace("\r\n", "\n") {
+        bail!(
+            "golden fixture {} did not match actual output; rerun with PALYRA_UPDATE_GOLDENS=1 to update it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn write_golden(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create golden fixture directory {}", parent.display())
+        })?;
+    }
+    fs::write(path, contents)
+        .with_context(|| format!("failed to update golden fixture {}", path.display()))
 }
 
 fn golden_path(name: &str) -> PathBuf {

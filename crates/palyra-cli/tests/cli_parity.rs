@@ -9,9 +9,14 @@ use palyra_cli::cli_parity::{
     render_cli_parity_report_markdown, render_shared_chat_command_parity_markdown,
     validate_cli_parity_report, CliParityMatrix,
 };
+use serde_json::Value;
 
 const MATRIX_PATH: &str = "tests/cli_parity_matrix.toml";
 const SHARED_CHAT_COMMAND_SNAPSHOT_PATH: &str = "tests/shared_chat_command_parity.md";
+const RUNTIME_AUDIT_INVENTORY_PATH: &str =
+    "../palyra-daemon/tests/golden/current_state_inventory.json";
+const RUNTIME_AUDIT_REPORT_PATH: &str =
+    "../palyra-daemon/tests/golden/current_state_inventory_report.md";
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -97,6 +102,44 @@ fn cli_parity_report_covers_plugin_operability_surface() -> Result<()> {
     ] {
         assert!(report.contains(expected), "CLI parity report should mention {expected}");
     }
+    Ok(())
+}
+
+#[test]
+fn runtime_audit_report_matches_cli_inventory_counts() -> Result<()> {
+    let inventory_path = crate_root().join(RUNTIME_AUDIT_INVENTORY_PATH);
+    let inventory_raw = fs::read_to_string(&inventory_path)
+        .with_context(|| format!("failed to read {}", inventory_path.display()))?;
+    let inventory: Value = serde_json::from_str(inventory_raw.as_str())
+        .with_context(|| format!("failed to parse {}", inventory_path.display()))?;
+    let report_path = crate_root().join(RUNTIME_AUDIT_REPORT_PATH);
+    let report = fs::read_to_string(&report_path)
+        .with_context(|| format!("failed to read {}", report_path.display()))?;
+
+    let capabilities = inventory
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .context("runtime audit inventory should expose capabilities array")?;
+    let cli_families = inventory
+        .get("cli_families")
+        .and_then(Value::as_array)
+        .context("runtime audit inventory should expose cli_families array")?;
+    let feature_rollouts = inventory
+        .get("feature_rollouts")
+        .and_then(Value::as_object)
+        .context("runtime audit inventory should expose feature_rollouts object")?;
+
+    for expected in [
+        format!("- Capability catalog entries: `{}`", capabilities.len()),
+        format!("- CLI families: `{}`", cli_families.len()),
+        format!("- Feature rollout flags: `{}`", feature_rollouts.len()),
+    ] {
+        assert!(
+            report.contains(expected.as_str()),
+            "runtime audit report should include count line {expected}"
+        );
+    }
+
     Ok(())
 }
 

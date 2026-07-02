@@ -1327,5 +1327,174 @@
     "version",
     "webhooks",
     "workers"
-  ]
+  ],
+  "runtime_audit_baseline": {
+    "schema_version": 1,
+    "generation_commands": [
+      "pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1",
+      "bash scripts/dev/generate-runtime-audit-baseline.sh"
+    ],
+    "golden_snapshot": "crates/palyra-daemon/tests/golden/current_state_inventory.json",
+    "human_report": "crates/palyra-daemon/tests/golden/current_state_inventory_report.md",
+    "source_of_truth": [
+      {
+        "surface": "capability_catalog",
+        "source_paths": [
+          "crates/palyra-daemon/src/transport/http/handlers/console/auth.rs",
+          "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+          "crates/palyra-control-plane/src/models.rs"
+        ],
+        "reason": "public capability ids, surfaces, mutation classes, and contract paths"
+      },
+      {
+        "surface": "runtime_diagnostics",
+        "source_paths": [
+          "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+          "crates/palyra-daemon/src/runtime_diagnostics.rs"
+        ],
+        "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+      },
+      {
+        "surface": "runtime_preview_controls",
+        "source_paths": [
+          "crates/palyra-daemon/src/runtime_preview_controls.rs",
+          "crates/palyra-common/src/runtime_preview.rs",
+          "crates/palyra-daemon/src/config/schema.rs"
+        ],
+        "reason": "preview capability modes, rollout gates, activation blockers, and shared wire names"
+      },
+      {
+        "surface": "compat_routes",
+        "source_paths": [
+          "crates/palyra-daemon/src/transport/http/router.rs",
+          "crates/palyra-daemon/tests/current_state_inventory.rs"
+        ],
+        "reason": "registered OpenAI-compatible route surface probed by the live daemon harness"
+      },
+      {
+        "surface": "cli_families",
+        "source_paths": [
+          "crates/palyra-cli/tests/cli_parity_matrix.toml",
+          "crates/palyra-cli/tests/cli_parity_report.md"
+        ],
+        "reason": "top-level CLI families and parity status used by operator handoff surfaces"
+      },
+      {
+        "surface": "execution_backends",
+        "source_paths": [
+          "crates/palyra-daemon/src/execution_backends.rs",
+          "crates/palyra-daemon/src/application/tool_runtime"
+        ],
+        "reason": "local, desktop, Docker, networked worker, and SSH backend posture"
+      }
+    ],
+    "roadmap_area_map": [
+      {
+        "area": "api",
+        "status": "production",
+        "evidence": [
+          "/console/v1/control-plane/capabilities",
+          "/v1/models",
+          "/v1/chat/completions",
+          "/v1/responses"
+        ],
+        "reason": "console and compat routes are registered in the live daemon harness"
+      },
+      {
+        "area": "mcp",
+        "status": "scaffold",
+        "evidence": [
+          "cli family: mcp",
+          "roadmap phase 5"
+        ],
+        "reason": "MCP serve is discoverable, while external MCP import/supervision remains roadmap work"
+      },
+      {
+        "area": "subagents",
+        "status": "preview",
+        "evidence": [
+          "runtime_controls.auxiliary_executor",
+          "cli families: agent, agents, sessions"
+        ],
+        "reason": "delegated work surfaces exist behind preview controls before durable subagent records land"
+      },
+      {
+        "area": "execution_backends",
+        "status": "preview",
+        "evidence": [
+          "execution_backends",
+          "runtime_controls.networked_workers"
+        ],
+        "reason": "local sandbox is available, while remote backends and workers remain gated or disabled"
+      },
+      {
+        "area": "qa_lab",
+        "status": "scaffold",
+        "evidence": [
+          "runtime_roadmap.phase0_harness",
+          "fixtures/golden/release_eval_inventory.json"
+        ],
+        "reason": "regression fixtures exist before the dedicated QA Lab manifest and runner"
+      },
+      {
+        "area": "hooks",
+        "status": "preview",
+        "evidence": [
+          "capability: hooks",
+          "cli family: hooks"
+        ],
+        "reason": "basic hook operability is exposed before the full agent hook taxonomy"
+      },
+      {
+        "area": "observability",
+        "status": "production",
+        "evidence": [
+          "/console/v1/diagnostics",
+          "runtime_health",
+          "agent_runtime_metrics",
+          "opentelemetry"
+        ],
+        "reason": "diagnostics and metrics sections are emitted by the live daemon harness"
+      },
+      {
+        "area": "provider_recovery",
+        "status": "scaffold",
+        "evidence": [
+          "feature_rollouts.provider_stream_normalizer",
+          "feature_rollouts.tool_repair"
+        ],
+        "reason": "recovery flags are visible but default-off before classifier and stream-normalizer work"
+      }
+    ],
+    "surface_counts": {
+      "capability_catalog_entries": 32,
+      "cli_families": 59,
+      "compat_routes": 6,
+      "registered_compat_routes": 6,
+      "diagnostics_sections": 43,
+      "execution_backends": 5,
+      "feature_rollout_flags": 26,
+      "runtime_control_capabilities": 8
+    },
+    "roadmap_area_status_counts": {
+      "preview": 3,
+      "production": 2,
+      "scaffold": 3
+    },
+    "feature_rollout_counts": {
+      "disabled": 26
+    },
+    "runtime_control_state_counts": {
+      "disabled": 2,
+      "preview_only": 6
+    },
+    "runtime_controls_summary": {
+      "schema_version": 1,
+      "state": "mixed",
+      "preview_capabilities": 6,
+      "enabled_capabilities": 0,
+      "blocked_capabilities": 0,
+      "disabled_capabilities": 2
+    }
+  }
 }

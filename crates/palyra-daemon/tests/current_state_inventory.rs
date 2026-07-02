@@ -4,14 +4,14 @@
 
 mod support;
 
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use support::{assert_json_golden, DaemonHarness};
+use support::{assert_json_golden, assert_text_golden, DaemonHarness};
 
 #[derive(Debug, Deserialize)]
 struct CliParityMatrix {
@@ -68,8 +68,25 @@ fn current_state_inventory_snapshot_covers_capabilities_cli_and_compat_surface()
         "inventory should expose the current runtime execution backend inventory"
     );
 
+    let report = render_runtime_audit_report(&snapshot)?;
+    assert!(
+        report.contains("## Runtime Controls"),
+        "runtime audit report should expose runtime-control state"
+    );
+    assert_text_golden("current_state_inventory_report.md", report.as_str())?;
     assert_json_golden("current_state_inventory.json", &snapshot)?;
     Ok(())
+}
+
+#[test]
+fn runtime_audit_baseline_rejects_unknown_runtime_control_state() {
+    let error = parse_runtime_control_state("pilot")
+        .expect_err("unknown runtime control state should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown runtime control state pilot"),
+        "error should name the unknown runtime control state: {error}"
+    );
 }
 
 fn build_current_state_inventory_snapshot(
@@ -175,7 +192,7 @@ fn build_current_state_inventory_snapshot(
             .cmp(&right.get("capability").and_then(Value::as_str))
     });
 
-    Ok(json!({
+    let mut snapshot = json!({
         "contract": capability_catalog.get("contract").cloned().unwrap_or(Value::Null),
         "catalog_version": capability_catalog.get("version").cloned().unwrap_or(Value::Null),
         "diagnostics_sections": diagnostics_sections,
@@ -204,7 +221,500 @@ fn build_current_state_inventory_snapshot(
         "execution_backends": execution_backends,
         "compat_routes": compat_routes,
         "cli_families": cli_families,
+    });
+    let runtime_audit_baseline = build_runtime_audit_baseline(&snapshot)?;
+    let Some(snapshot_object) = snapshot.as_object_mut() else {
+        bail!("current state inventory snapshot should be a JSON object");
+    };
+    snapshot_object.insert("runtime_audit_baseline".to_owned(), runtime_audit_baseline);
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeControlState {
+    Enabled,
+    PreviewOnly,
+    Disabled,
+    Blocked,
+}
+
+impl RuntimeControlState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::PreviewOnly => "preview_only",
+            Self::Disabled => "disabled",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+fn parse_runtime_control_state(raw: &str) -> Result<RuntimeControlState> {
+    match raw {
+        "enabled" => Ok(RuntimeControlState::Enabled),
+        "preview_only" => Ok(RuntimeControlState::PreviewOnly),
+        "disabled" => Ok(RuntimeControlState::Disabled),
+        "blocked" => Ok(RuntimeControlState::Blocked),
+        other => bail!("unknown runtime control state {other}"),
+    }
+}
+
+fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
+    let capabilities = required_array(snapshot, "/capabilities")?;
+    let cli_families = required_array(snapshot, "/cli_families")?;
+    let compat_routes = required_array(snapshot, "/compat_routes")?;
+    let execution_backends = required_array(snapshot, "/execution_backends")?;
+    let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
+    let runtime_controls = required_object(snapshot, "/runtime_controls")?;
+    let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
+    let roadmap_area_map = roadmap_area_map();
+    let status_counts = count_roadmap_area_statuses(roadmap_area_map.as_slice())?;
+
+    Ok(json!({
+        "schema_version": 1,
+        "generation_commands": [
+            "pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1",
+            "bash scripts/dev/generate-runtime-audit-baseline.sh"
+        ],
+        "golden_snapshot": "crates/palyra-daemon/tests/golden/current_state_inventory.json",
+        "human_report": "crates/palyra-daemon/tests/golden/current_state_inventory_report.md",
+        "source_of_truth": runtime_audit_source_map(),
+        "roadmap_area_map": roadmap_area_map,
+        "surface_counts": {
+            "capability_catalog_entries": capabilities.len(),
+            "cli_families": cli_families.len(),
+            "compat_routes": compat_routes.len(),
+            "registered_compat_routes": compat_routes
+                .iter()
+                .filter(|entry| entry.get("registered").and_then(Value::as_bool) == Some(true))
+                .count(),
+            "diagnostics_sections": required_array(snapshot, "/diagnostics_sections")?.len(),
+            "execution_backends": execution_backends.len(),
+            "feature_rollout_flags": feature_rollouts.len(),
+            "runtime_control_capabilities": runtime_control_capabilities.len(),
+        },
+        "roadmap_area_status_counts": status_counts,
+        "feature_rollout_counts": count_feature_rollouts(feature_rollouts)?,
+        "runtime_control_state_counts": count_runtime_control_states(
+            runtime_control_capabilities
+        )?,
+        "runtime_controls_summary": {
+            "schema_version": runtime_controls.get("schema_version").cloned().unwrap_or(Value::Null),
+            "state": runtime_controls.get("state").cloned().unwrap_or(Value::Null),
+            "preview_capabilities": runtime_controls.get("preview_capabilities").cloned().unwrap_or(Value::Null),
+            "enabled_capabilities": runtime_controls.get("enabled_capabilities").cloned().unwrap_or(Value::Null),
+            "blocked_capabilities": runtime_controls.get("blocked_capabilities").cloned().unwrap_or(Value::Null),
+            "disabled_capabilities": runtime_controls.get("disabled_capabilities").cloned().unwrap_or(Value::Null),
+        }
     }))
+}
+
+fn runtime_audit_source_map() -> Vec<Value> {
+    vec![
+        json!({
+            "surface": "capability_catalog",
+            "source_paths": [
+                "crates/palyra-daemon/src/transport/http/handlers/console/auth.rs",
+                "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+                "crates/palyra-control-plane/src/models.rs"
+            ],
+            "reason": "public capability ids, surfaces, mutation classes, and contract paths"
+        }),
+        json!({
+            "surface": "runtime_diagnostics",
+            "source_paths": [
+                "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+                "crates/palyra-daemon/src/runtime_diagnostics.rs"
+            ],
+            "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+        }),
+        json!({
+            "surface": "runtime_preview_controls",
+            "source_paths": [
+                "crates/palyra-daemon/src/runtime_preview_controls.rs",
+                "crates/palyra-common/src/runtime_preview.rs",
+                "crates/palyra-daemon/src/config/schema.rs"
+            ],
+            "reason": "preview capability modes, rollout gates, activation blockers, and shared wire names"
+        }),
+        json!({
+            "surface": "compat_routes",
+            "source_paths": [
+                "crates/palyra-daemon/src/transport/http/router.rs",
+                "crates/palyra-daemon/tests/current_state_inventory.rs"
+            ],
+            "reason": "registered OpenAI-compatible route surface probed by the live daemon harness"
+        }),
+        json!({
+            "surface": "cli_families",
+            "source_paths": [
+                "crates/palyra-cli/tests/cli_parity_matrix.toml",
+                "crates/palyra-cli/tests/cli_parity_report.md"
+            ],
+            "reason": "top-level CLI families and parity status used by operator handoff surfaces"
+        }),
+        json!({
+            "surface": "execution_backends",
+            "source_paths": [
+                "crates/palyra-daemon/src/execution_backends.rs",
+                "crates/palyra-daemon/src/application/tool_runtime"
+            ],
+            "reason": "local, desktop, Docker, networked worker, and SSH backend posture"
+        }),
+    ]
+}
+
+fn roadmap_area_map() -> Vec<Value> {
+    vec![
+        json!({
+            "area": "api",
+            "status": "production",
+            "evidence": ["/console/v1/control-plane/capabilities", "/v1/models", "/v1/chat/completions", "/v1/responses"],
+            "reason": "console and compat routes are registered in the live daemon harness"
+        }),
+        json!({
+            "area": "mcp",
+            "status": "scaffold",
+            "evidence": ["cli family: mcp", "roadmap phase 5"],
+            "reason": "MCP serve is discoverable, while external MCP import/supervision remains roadmap work"
+        }),
+        json!({
+            "area": "subagents",
+            "status": "preview",
+            "evidence": ["runtime_controls.auxiliary_executor", "cli families: agent, agents, sessions"],
+            "reason": "delegated work surfaces exist behind preview controls before durable subagent records land"
+        }),
+        json!({
+            "area": "execution_backends",
+            "status": "preview",
+            "evidence": ["execution_backends", "runtime_controls.networked_workers"],
+            "reason": "local sandbox is available, while remote backends and workers remain gated or disabled"
+        }),
+        json!({
+            "area": "qa_lab",
+            "status": "scaffold",
+            "evidence": ["runtime_roadmap.phase0_harness", "fixtures/golden/release_eval_inventory.json"],
+            "reason": "regression fixtures exist before the dedicated QA Lab manifest and runner"
+        }),
+        json!({
+            "area": "hooks",
+            "status": "preview",
+            "evidence": ["capability: hooks", "cli family: hooks"],
+            "reason": "basic hook operability is exposed before the full agent hook taxonomy"
+        }),
+        json!({
+            "area": "observability",
+            "status": "production",
+            "evidence": ["/console/v1/diagnostics", "runtime_health", "agent_runtime_metrics", "opentelemetry"],
+            "reason": "diagnostics and metrics sections are emitted by the live daemon harness"
+        }),
+        json!({
+            "area": "provider_recovery",
+            "status": "scaffold",
+            "evidence": ["feature_rollouts.provider_stream_normalizer", "feature_rollouts.tool_repair"],
+            "reason": "recovery flags are visible but default-off before classifier and stream-normalizer work"
+        }),
+    ]
+}
+
+fn count_feature_rollouts(
+    feature_rollouts: &serde_json::Map<String, Value>,
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for (name, entry) in feature_rollouts {
+        let enabled = entry
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .with_context(|| format!("feature rollout {name} should expose enabled"))?;
+        let key = if enabled { "enabled" } else { "disabled" };
+        *counts.entry(key.to_owned()).or_default() += 1;
+    }
+    Ok(counts)
+}
+
+fn count_runtime_control_states(capabilities: &[Value]) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for entry in capabilities {
+        let state = entry
+            .get("effective_state")
+            .and_then(Value::as_str)
+            .context("runtime control capability should expose effective_state")?;
+        let state = parse_runtime_control_state(state)?;
+        *counts.entry(state.as_str().to_owned()).or_default() += 1;
+    }
+    Ok(counts)
+}
+
+fn count_roadmap_area_statuses(areas: &[Value]) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for area in areas {
+        let status = area
+            .get("status")
+            .and_then(Value::as_str)
+            .context("roadmap area should expose status")?;
+        match status {
+            "production" | "preview" | "disabled" | "scaffold" => {
+                *counts.entry(status.to_owned()).or_default() += 1;
+            }
+            other => bail!("unknown roadmap area status {other}"),
+        }
+    }
+    Ok(counts)
+}
+
+fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
+    let baseline = snapshot
+        .get("runtime_audit_baseline")
+        .context("runtime inventory should include runtime_audit_baseline")?;
+    let capabilities = required_array(snapshot, "/capabilities")?;
+    let cli_families = required_array(snapshot, "/cli_families")?;
+    let compat_routes = required_array(snapshot, "/compat_routes")?;
+    let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
+    let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
+    let source_of_truth = required_array(baseline, "/source_of_truth")?;
+    let roadmap_areas = required_array(baseline, "/roadmap_area_map")?;
+
+    let registered_compat_routes = compat_routes
+        .iter()
+        .filter(|entry| entry.get("registered").and_then(Value::as_bool) == Some(true))
+        .count();
+    let runtime_state_counts = count_runtime_control_states(runtime_control_capabilities)?;
+    let rollout_counts = count_feature_rollouts(feature_rollouts)?;
+
+    let mut report = String::new();
+    report.push_str("# Runtime Audit Baseline\n\n");
+    report.push_str("Generated from the live daemon harness and committed CLI parity matrix.\n\n");
+    report.push_str("Regenerate with one command:\n\n");
+    report.push_str("```powershell\n");
+    report.push_str("pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1\n");
+    report.push_str("```\n\n");
+    report.push_str("Linux/macOS equivalent:\n\n");
+    report.push_str("```bash\n");
+    report.push_str("bash scripts/dev/generate-runtime-audit-baseline.sh\n");
+    report.push_str("```\n\n");
+
+    report.push_str("## Summary\n\n");
+    report.push_str(format!("- Capability catalog entries: `{}`\n", capabilities.len()).as_str());
+    report.push_str(format!("- CLI families: `{}`\n", cli_families.len()).as_str());
+    report.push_str(
+        format!(
+            "- Compat routes registered: `{registered_compat_routes}/{}`\n",
+            compat_routes.len()
+        )
+        .as_str(),
+    );
+    report.push_str(format!("- Feature rollout flags: `{}`\n", feature_rollouts.len()).as_str());
+    report.push_str(
+        format!(
+            "- Runtime preview controls: `{}` capabilities\n",
+            runtime_control_capabilities.len()
+        )
+        .as_str(),
+    );
+    report.push('\n');
+
+    report.push_str("## State Buckets\n\n");
+    report.push_str("| Bucket | Count | Source |\n");
+    report.push_str("| --- | ---: | --- |\n");
+    push_count_row(
+        &mut report,
+        "production",
+        required_usize(baseline, "/roadmap_area_status_counts/production")?,
+        "roadmap area source map",
+    );
+    push_count_row(
+        &mut report,
+        "preview",
+        required_usize(baseline, "/roadmap_area_status_counts/preview")?,
+        "roadmap area source map",
+    );
+    push_count_row(
+        &mut report,
+        "disabled",
+        runtime_state_counts.get("disabled").copied().unwrap_or_default()
+            + runtime_state_counts.get("blocked").copied().unwrap_or_default(),
+        "runtime_controls effective_state",
+    );
+    push_count_row(
+        &mut report,
+        "scaffold",
+        required_usize(baseline, "/roadmap_area_status_counts/scaffold")?,
+        "roadmap area source map",
+    );
+    report.push('\n');
+
+    report.push_str("## Source Of Truth\n\n");
+    report.push_str("| Surface | Source paths | Why Palyra tracks it |\n");
+    report.push_str("| --- | --- | --- |\n");
+    for entry in source_of_truth {
+        report.push_str(
+            format!(
+                "| `{}` | {} | {} |\n",
+                required_str_field(entry, "surface")?,
+                format_string_array(entry, "source_paths")?,
+                required_str_field(entry, "reason")?
+            )
+            .as_str(),
+        );
+    }
+    report.push('\n');
+
+    report.push_str("## Roadmap Area Map\n\n");
+    report.push_str("| Area | Status | Evidence | Reason |\n");
+    report.push_str("| --- | --- | --- | --- |\n");
+    for area in roadmap_areas {
+        report.push_str(
+            format!(
+                "| `{}` | `{}` | {} | {} |\n",
+                required_str_field(area, "area")?,
+                required_str_field(area, "status")?,
+                format_string_array(area, "evidence")?,
+                required_str_field(area, "reason")?
+            )
+            .as_str(),
+        );
+    }
+    report.push('\n');
+
+    report.push_str("## Runtime Controls\n\n");
+    report.push_str("| Capability | Mode | Effective state | Rollout | Blockers |\n");
+    report.push_str("| --- | --- | --- | --- | --- |\n");
+    for entry in runtime_control_capabilities {
+        let state = required_str_field(entry, "effective_state")?;
+        parse_runtime_control_state(state)?;
+        report.push_str(
+            format!(
+                "| `{}` | `{}` | `{}` | `{}` from `{}` | {} |\n",
+                required_str_field(entry, "capability")?,
+                required_str_field(entry, "mode")?,
+                state,
+                required_bool_field(entry, "rollout_enabled")?,
+                required_str_field(entry, "rollout_source")?,
+                format_activation_blockers(entry)
+            )
+            .as_str(),
+        );
+    }
+    report.push('\n');
+
+    report.push_str("## Feature Rollouts\n\n");
+    report.push_str(
+        format!(
+            "- Enabled: `{}`\n- Disabled/default-off: `{}`\n\n",
+            rollout_counts.get("enabled").copied().unwrap_or_default(),
+            rollout_counts.get("disabled").copied().unwrap_or_default()
+        )
+        .as_str(),
+    );
+    report.push_str("| Flag | Enabled | Source | Config path | Env var |\n");
+    report.push_str("| --- | --- | --- | --- | --- |\n");
+    let mut rollout_names = feature_rollouts.keys().collect::<Vec<_>>();
+    rollout_names.sort();
+    for name in rollout_names {
+        let entry = feature_rollouts
+            .get(name)
+            .with_context(|| format!("feature rollout {name} should be present"))?;
+        report.push_str(
+            format!(
+                "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+                name,
+                required_bool_field(entry, "enabled")?,
+                required_str_field(entry, "source")?,
+                required_str_field(entry, "config_path")?,
+                required_str_field(entry, "env_var")?
+            )
+            .as_str(),
+        );
+    }
+    report.push('\n');
+
+    report.push_str("## Compat Routes\n\n");
+    report.push_str("| Method | Path | Registered |\n");
+    report.push_str("| --- | --- | --- |\n");
+    for route in compat_routes {
+        report.push_str(
+            format!(
+                "| `{}` | `{}` | `{}` |\n",
+                required_str_field(route, "method")?,
+                required_str_field(route, "path")?,
+                required_bool_field(route, "registered")?
+            )
+            .as_str(),
+        );
+    }
+
+    Ok(report)
+}
+
+fn push_count_row(report: &mut String, bucket: &str, count: usize, source: &str) {
+    report.push_str(format!("| `{bucket}` | `{count}` | {source} |\n").as_str());
+}
+
+fn required_array<'a>(value: &'a Value, pointer: &str) -> Result<&'a Vec<Value>> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .with_context(|| format!("runtime inventory should expose array at {pointer}"))
+}
+
+fn required_object<'a>(
+    value: &'a Value,
+    pointer: &str,
+) -> Result<&'a serde_json::Map<String, Value>> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_object)
+        .with_context(|| format!("runtime inventory should expose object at {pointer}"))
+}
+
+fn required_str_field<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("runtime inventory entry should expose string field {field}"))
+}
+
+fn required_bool_field(value: &Value, field: &str) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("runtime inventory entry should expose boolean field {field}"))
+}
+
+fn required_usize(value: &Value, pointer: &str) -> Result<usize> {
+    let raw = value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("runtime audit baseline should expose number at {pointer}"))?;
+    usize::try_from(raw).with_context(|| format!("runtime audit count at {pointer} exceeds usize"))
+}
+
+fn format_string_array(value: &Value, field: &str) -> Result<String> {
+    let entries = value
+        .get(field)
+        .and_then(Value::as_array)
+        .with_context(|| format!("runtime inventory entry should expose array field {field}"))?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .map(|raw| format!("`{raw}`"))
+                .with_context(|| format!("runtime inventory array {field} should contain strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(entries.join(", "))
+}
+
+fn format_activation_blockers(entry: &Value) -> String {
+    match entry.get("activation_blockers").and_then(Value::as_array) {
+        Some(blockers) if !blockers.is_empty() => blockers
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|blocker| format!("`{blocker}`"))
+            .collect::<Vec<_>>()
+            .join("<br>"),
+        _ => "-".to_owned(),
+    }
 }
 
 fn compat_route_probe(harness: &DaemonHarness, method: Method, path: &str) -> Result<Value> {
