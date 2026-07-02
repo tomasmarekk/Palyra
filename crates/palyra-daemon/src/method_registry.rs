@@ -148,9 +148,13 @@ fn parse_router_routes(source: &str) -> Vec<PublicRouteContract> {
             if pending_path.is_none() {
                 continue;
             }
-            if let Some(method) = extract_route_method(trimmed) {
+            let methods = extract_route_methods(trimmed);
+            if !methods.is_empty() {
                 if let Some(path) = pending_path.take() {
-                    routes.push(PublicRouteContract { http_method: method.to_owned(), path });
+                    routes.extend(methods.into_iter().map(|method| PublicRouteContract {
+                        http_method: method.to_owned(),
+                        path: path.clone(),
+                    }));
                 }
             }
             continue;
@@ -177,14 +181,17 @@ fn extract_quoted_path(line: &str) -> Option<String> {
     candidate.starts_with('/').then(|| candidate.to_owned())
 }
 
-fn extract_route_method(line: &str) -> Option<&'static str> {
-    if line.contains("get(") {
-        Some("GET")
-    } else if line.contains("post(") {
-        Some("POST")
-    } else {
-        None
-    }
+fn extract_route_methods(line: &str) -> Vec<&'static str> {
+    [
+        ("get(", "GET"),
+        ("post(", "POST"),
+        ("delete(", "DELETE"),
+        ("put(", "PUT"),
+        ("patch(", "PATCH"),
+    ]
+    .into_iter()
+    .filter_map(|(needle, method)| line.contains(needle).then_some(method))
+    .collect()
 }
 
 fn surface_for_path(path: &str) -> &'static str {
@@ -205,10 +212,20 @@ fn surface_for_path(path: &str) -> &'static str {
 
 fn required_scope_for_route(method: &str, path: &str) -> &'static str {
     match (method, path) {
-        ("GET", "/v1/models") | ("GET", "/v1/models/{model_id}") => PERMISSION_COMPAT_MODELS_READ,
+        ("GET", "/v1/models") | ("GET", "/v1/models/{model_id}") | ("GET", "/v1/capabilities") => {
+            PERMISSION_COMPAT_MODELS_READ
+        }
         ("POST", "/v1/chat/completions") => PERMISSION_COMPAT_CHAT_CREATE,
         ("POST", "/v1/embeddings") => PERMISSION_COMPAT_EMBEDDINGS_CREATE,
-        ("POST", "/v1/responses") => PERMISSION_COMPAT_RESPONSES_CREATE,
+        ("POST", "/v1/responses")
+        | ("GET", "/v1/responses/{response_id}")
+        | ("DELETE", "/v1/responses/{response_id}")
+        | ("POST", "/v1/runs")
+        | ("GET", "/v1/runs/{run_id}")
+        | ("GET", "/v1/runs/{run_id}/events")
+        | ("POST", "/v1/runs/{run_id}/stop")
+        | ("POST", "/v1/runs/{run_id}/detach")
+        | ("POST", "/v1/runs/{run_id}/approval") => PERMISSION_COMPAT_RESPONSES_CREATE,
         ("POST", "/v1/tools/invoke") => PERMISSION_COMPAT_TOOLS_INVOKE,
         _ if path.starts_with("/healthz") || path == "/runtime" => "public.read",
         _ if path.contains("/realtime/ws") => "realtime.stream",
@@ -238,11 +255,24 @@ fn stability_for_path(path: &str) -> &'static str {
 }
 
 fn route_supports_streaming(path: &str) -> bool {
-    path.ends_with("/ws") || path.ends_with("/tail") || path.contains("/stream")
+    path.ends_with("/ws")
+        || path.ends_with("/tail")
+        || path.ends_with("/events")
+        || path.contains("/stream")
 }
 
 fn route_supports_idempotency(method: &str, path: &str) -> bool {
-    method == "GET" || path.ends_with("/checkpoint") || path.ends_with("/retry")
+    method == "GET"
+        || matches!(
+            (method, path),
+            ("POST", "/v1/responses")
+                | ("POST", "/v1/runs")
+                | ("POST", "/v1/runs/{run_id}/stop")
+                | ("POST", "/v1/runs/{run_id}/detach")
+                | ("POST", "/v1/runs/{run_id}/approval")
+        )
+        || path.ends_with("/checkpoint")
+        || path.ends_with("/retry")
 }
 
 fn deprecated_route(_method: &str, _path: &str) -> Option<DeprecatedMethod> {
@@ -367,6 +397,12 @@ mod tests {
                 route.http_method == "POST" && route.path == "/v1/chat/completions"
             }),
             "compat chat route should be parsed from router.rs"
+        );
+        assert!(
+            contracts.iter().any(|route| {
+                route.http_method == "DELETE" && route.path == "/v1/responses/{response_id}"
+            }),
+            "chained compat delete route should be parsed from router.rs"
         );
         assert!(
             contracts.len() > 100,

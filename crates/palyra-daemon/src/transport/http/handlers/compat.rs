@@ -7,11 +7,11 @@
 
 use crate::{
     access_control::{
-        AccessRegistry, AccessRegistryError, AuthenticatedApiToken, FEATURE_API_TOKENS,
-        FEATURE_COMPAT_API, FEATURE_COMPAT_EMBEDDINGS_API, FEATURE_COMPAT_TOOLS_INVOKE,
-        PERMISSION_COMPAT_CHAT_CREATE, PERMISSION_COMPAT_EMBEDDINGS_CREATE,
-        PERMISSION_COMPAT_MODELS_READ, PERMISSION_COMPAT_RESPONSES_CREATE,
-        PERMISSION_COMPAT_TOOLS_INVOKE,
+        AccessRegistry, AccessRegistryError, AuthenticatedApiToken, FeatureFlagRecord,
+        FEATURE_API_TOKENS, FEATURE_COMPAT_API, FEATURE_COMPAT_EMBEDDINGS_API,
+        FEATURE_COMPAT_TOOLS_INVOKE, PERMISSION_COMPAT_CHAT_CREATE,
+        PERMISSION_COMPAT_EMBEDDINGS_CREATE, PERMISSION_COMPAT_MODELS_READ,
+        PERMISSION_COMPAT_RESPONSES_CREATE, PERMISSION_COMPAT_TOOLS_INVOKE,
     },
     app::state::CompatApiRateLimitEntry,
     *,
@@ -385,6 +385,42 @@ pub(crate) async fn compat_model_detail_handler(
         now,
     );
     Ok(Json(compat_model_json(&descriptor)))
+}
+
+/// Handles `GET /v1/capabilities` for compatibility client discovery.
+///
+/// # Errors
+/// Returns an error response when API-token authorization, rate limiting,
+/// embeddings posture lookup, or the system clock fails.
+pub(crate) async fn compat_capabilities_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let token =
+        authorize_compat_api_token(&state, &headers, PERMISSION_COMPAT_MODELS_READ, None, now)?;
+    enforce_compat_rate_limit(&state, token.token_id.as_str(), token.rate_limit_per_minute)?;
+    let provider = state.runtime.model_provider_status_snapshot();
+    let embeddings_status =
+        state.runtime.memory_embeddings_status().await.map_err(runtime_status_response)?;
+    let feature_flags = {
+        let registry = lock_access_registry(&state.access_registry);
+        registry.snapshot(token.principal.as_str()).feature_flags
+    };
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "read",
+        "capabilities_read",
+        Some(provider.kind.as_str()),
+        now,
+    );
+    Ok(Json(build_compat_capabilities_payload(
+        &provider,
+        &embeddings_status,
+        feature_flags.as_slice(),
+        now,
+    )))
 }
 
 /// Handles `POST /v1/embeddings` using the configured embeddings provider.
@@ -4078,6 +4114,333 @@ fn build_compat_models(provider: &model_provider::ProviderStatusSnapshot) -> Vec
         .collect()
 }
 
+fn build_compat_capabilities_payload(
+    provider: &model_provider::ProviderStatusSnapshot,
+    embeddings_status: &journal::MemoryEmbeddingsStatus,
+    feature_flags: &[FeatureFlagRecord],
+    generated_at_unix_ms: i64,
+) -> Value {
+    let models = build_compat_model_descriptors(provider);
+    let default_chat = models.iter().find(|model| model.role == "chat");
+    let default_chat_capabilities = default_chat.and_then(|model| model.capabilities.as_ref());
+    let compat_tools_invoke_enabled =
+        compat_feature_flag_enabled(feature_flags, FEATURE_COMPAT_TOOLS_INVOKE);
+    json!({
+        "object": "capabilities",
+        "schema_version": 1,
+        "generated_at": generated_at_unix_ms / 1_000,
+        "generated_at_unix_ms": generated_at_unix_ms,
+        "provider": {
+            "kind": provider.kind,
+            "health_status": provider.health.state,
+            "discovery_status": provider.discovery.status,
+            "default_model": default_chat.map(|model| model.id.clone()),
+            "models": models.iter().map(compat_model_capability_summary_json).collect::<Vec<_>>(),
+        },
+        "runtime": {
+            "maturity": "preview",
+            "feature_flags": {
+                "compat_api": compat_feature_flag_json(feature_flags, FEATURE_COMPAT_API),
+                "compat_embeddings_api": compat_feature_flag_json(feature_flags, FEATURE_COMPAT_EMBEDDINGS_API),
+                "compat_tools_invoke": compat_feature_flag_json(feature_flags, FEATURE_COMPAT_TOOLS_INVOKE),
+            },
+            "capabilities": build_compat_runtime_capabilities(
+                default_chat_capabilities,
+                embeddings_status,
+                compat_tools_invoke_enabled,
+            ),
+        },
+        "method_registry": compat_method_registry_json(),
+    })
+}
+
+fn compat_model_capability_summary_json(model: &CompatModelDescriptor) -> Value {
+    json!({
+        "id": model.id,
+        "role": model.role,
+        "default": model.default_model,
+        "enabled": model.enabled,
+        "health_status": model.health_status,
+        "discovery_status": model.discovery_status,
+        "capabilities": compat_model_capabilities_json(model.capabilities.as_ref()),
+    })
+}
+
+fn compat_model_capabilities_json(
+    capabilities: Option<&model_provider::ProviderCapabilitiesSnapshot>,
+) -> Value {
+    json!({
+        "streaming_tokens": capabilities.is_some_and(|value| value.streaming_tokens),
+        "tool_calls": capabilities.is_some_and(|value| value.tool_calls),
+        "structured_outputs": {
+            "supported": capabilities.is_some_and(|value| value.json_mode),
+            "source": "json_mode",
+            "schema_dialect": compat_schema_dialect(capabilities),
+            "strict_schema": false,
+        },
+        "json_mode": capabilities.is_some_and(|value| value.json_mode),
+        "reasoning": {
+            "supported": capabilities.is_some_and(|value| value.reasoning),
+            "posture": compat_reasoning_posture(capabilities),
+            "efforts": capabilities.map(|value| value.reasoning_efforts.clone()).unwrap_or_default(),
+        },
+        "vision": capabilities.is_some_and(|value| value.vision),
+        "audio_transcribe": capabilities.is_some_and(|value| value.audio_transcribe),
+        "embeddings": capabilities.is_some_and(|value| value.embeddings),
+        "service_tier": capabilities.is_some_and(|value| value.service_tier),
+        "service_tiers": capabilities.map(|value| value.service_tiers.clone()).unwrap_or_default(),
+        "max_context_tokens": capabilities.and_then(|value| value.max_context_tokens),
+        "cost_tier": capabilities.map(|value| value.cost_tier.clone()),
+        "latency_tier": capabilities.map(|value| value.latency_tier.clone()),
+        "recommended_use_cases": capabilities.map(|value| value.recommended_use_cases.clone()).unwrap_or_default(),
+        "known_limitations": capabilities.map(|value| value.known_limitations.clone()).unwrap_or_default(),
+        "operator_override": capabilities.is_some_and(|value| value.operator_override),
+        "metadata_source": capabilities.map(|value| value.metadata_source.clone()),
+    })
+}
+
+fn build_compat_runtime_capabilities(
+    default_chat_capabilities: Option<&model_provider::ProviderCapabilitiesSnapshot>,
+    embeddings_status: &journal::MemoryEmbeddingsStatus,
+    compat_tools_invoke_enabled: bool,
+) -> Vec<Value> {
+    let streaming_supported = default_chat_capabilities.is_some_and(|value| value.streaming_tokens);
+    let tool_calls_supported = default_chat_capabilities.is_some_and(|value| value.tool_calls);
+    let structured_outputs_supported =
+        default_chat_capabilities.is_some_and(|value| value.json_mode);
+    vec![
+        compat_runtime_capability_json(
+            "models",
+            true,
+            "stable",
+            None,
+            None,
+            &["GET /v1/models", "GET /v1/models/{model_id}"],
+            json!({ "scope": PERMISSION_COMPAT_MODELS_READ }),
+        ),
+        compat_runtime_capability_json(
+            "chat_completions",
+            true,
+            "stable",
+            None,
+            None,
+            &["POST /v1/chat/completions"],
+            json!({ "scope": PERMISSION_COMPAT_CHAT_CREATE }),
+        ),
+        compat_runtime_capability_json(
+            "streaming_tokens",
+            streaming_supported,
+            "stable",
+            (!streaming_supported).then_some("model_streaming_tokens_disabled"),
+            (!streaming_supported).then_some("Select a chat model with streaming_tokens support."),
+            &["POST /v1/chat/completions", "POST /v1/responses", "GET /v1/runs/{run_id}/events"],
+            json!({ "source": "provider_capabilities.streaming_tokens" }),
+        ),
+        compat_runtime_capability_json(
+            "tool_calls",
+            tool_calls_supported,
+            "preview",
+            (!tool_calls_supported).then_some("model_tool_calls_disabled"),
+            (!tool_calls_supported).then_some("Select a chat model with tool_calls support."),
+            &["POST /v1/responses"],
+            json!({ "source": "provider_capabilities.tool_calls" }),
+        ),
+        compat_runtime_capability_json(
+            "structured_outputs",
+            structured_outputs_supported,
+            "preview",
+            (!structured_outputs_supported).then_some("model_json_mode_disabled"),
+            (!structured_outputs_supported).then_some("Select a chat model with json_mode support."),
+            &["POST /v1/chat/completions", "POST /v1/responses"],
+            json!({
+                "source": "provider_capabilities.json_mode",
+                "schema_dialect": compat_schema_dialect(default_chat_capabilities),
+                "strict_schema": false,
+            }),
+        ),
+        compat_runtime_capability_json(
+            "embeddings",
+            embeddings_status.production_default_active,
+            "preview",
+            (!embeddings_status.production_default_active)
+                .then_some(embeddings_status.degraded_reason_code.as_deref())
+                .flatten(),
+            (!embeddings_status.production_default_active)
+                .then_some(embeddings_status.remediation.as_deref())
+                .flatten(),
+            &["POST /v1/embeddings"],
+            json!({
+                "quality": embeddings_status.quality,
+                "mode": embeddings_status.mode,
+            }),
+        ),
+        compat_runtime_capability_json(
+            "responses",
+            true,
+            "preview",
+            None,
+            None,
+            &["POST /v1/responses", "GET /v1/responses/{response_id}", "DELETE /v1/responses/{response_id}"],
+            json!({ "response_store": true, "idempotency": true, "sse": true }),
+        ),
+        compat_runtime_capability_json(
+            "sessions",
+            true,
+            "preview",
+            None,
+            None,
+            &["POST /v1/runs"],
+            json!({ "selectors": ["session.id", "session.key", "session.label"] }),
+        ),
+        compat_runtime_capability_json(
+            "runs",
+            true,
+            "preview",
+            None,
+            None,
+            &[
+                "POST /v1/runs",
+                "GET /v1/runs/{run_id}",
+                "GET /v1/runs/{run_id}/events",
+                "POST /v1/runs/{run_id}/stop",
+                "POST /v1/runs/{run_id}/detach",
+            ],
+            json!({ "durable_status": true, "event_replay": true, "stop": true, "detach": true }),
+        ),
+        compat_runtime_capability_json(
+            "approvals",
+            true,
+            "preview",
+            None,
+            None,
+            &["POST /v1/runs/{run_id}/approval"],
+            json!({ "decisions": ["approve", "deny", "timeout"], "modify": false }),
+        ),
+        compat_runtime_capability_json(
+            "direct_tool_invoke",
+            false,
+            "lab",
+            Some(if compat_tools_invoke_enabled {
+                "approval_bound_execution_not_ready"
+            } else {
+                "feature_flag_disabled"
+            }),
+            Some(if compat_tools_invoke_enabled {
+                "Use Responses or Runs tool-call flows until direct tool invocation is approval-bound."
+            } else {
+                "Enable compat_tools_invoke only for explicit operator testing."
+            }),
+            &["POST /v1/tools/invoke"],
+            json!({ "feature_flag_enabled": compat_tools_invoke_enabled }),
+        ),
+        compat_runtime_capability_json(
+            "mcp",
+            false,
+            "planned",
+            Some("not_exposed_on_compat_api"),
+            Some("Use native Palyra tool/runtime surfaces until MCP is published on the compat facade."),
+            &[],
+            Value::Null,
+        ),
+        compat_runtime_capability_json(
+            "subagents",
+            false,
+            "planned",
+            Some("not_exposed_on_compat_api"),
+            Some("Use native Palyra delegation surfaces until subagents are published on the compat facade."),
+            &[],
+            Value::Null,
+        ),
+    ]
+}
+
+fn compat_runtime_capability_json(
+    id: &str,
+    supported: bool,
+    maturity: &str,
+    disabled_reason_code: Option<&str>,
+    repair_hint: Option<&str>,
+    routes: &[&str],
+    details: Value,
+) -> Value {
+    json!({
+        "id": id,
+        "supported": supported,
+        "maturity": maturity,
+        "disabled_reason_code": disabled_reason_code,
+        "repair_hint": repair_hint,
+        "routes": routes,
+        "details": details,
+    })
+}
+
+fn compat_method_registry_json() -> Value {
+    let registry = crate::method_registry::build_method_registry_snapshot();
+    let methods = registry
+        .methods
+        .iter()
+        .filter(|method| method.surface == "compat")
+        .map(|method| {
+            json!({
+                "method_name": method.method_name,
+                "route": method.route,
+                "http_method": method.http_method,
+                "stability": method.stability,
+                "required_scope": method.required_scope,
+                "request_schema_id": method.request_schema_id,
+                "response_schema_id": method.response_schema_id,
+                "streaming_supported": method.streaming_supported,
+                "idempotency_supported": method.idempotency_supported,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": registry.schema_version,
+        "registry_version": registry.registry_version,
+        "methods": methods,
+    })
+}
+
+fn compat_feature_flag_json(feature_flags: &[FeatureFlagRecord], key: &str) -> Value {
+    feature_flags
+        .iter()
+        .find(|flag| flag.key == key)
+        .map(|flag| {
+            json!({
+                "enabled": flag.enabled,
+                "stage": flag.stage,
+                "depends_on": flag.depends_on,
+            })
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "enabled": false,
+                "stage": "missing",
+                "depends_on": [],
+            })
+        })
+}
+
+fn compat_feature_flag_enabled(feature_flags: &[FeatureFlagRecord], key: &str) -> bool {
+    feature_flags.iter().any(|flag| flag.key == key && flag.enabled)
+}
+
+fn compat_schema_dialect(
+    capabilities: Option<&model_provider::ProviderCapabilitiesSnapshot>,
+) -> Option<&'static str> {
+    capabilities.is_some_and(|value| value.json_mode).then_some("json_schema_draft_2020_12_subset")
+}
+
+fn compat_reasoning_posture(
+    capabilities: Option<&model_provider::ProviderCapabilitiesSnapshot>,
+) -> &'static str {
+    match capabilities {
+        Some(value) if value.reasoning => "native_reasoning",
+        Some(_) => "not_supported",
+        None => "unknown",
+    }
+}
+
 fn build_compat_model_descriptors(
     provider: &model_provider::ProviderStatusSnapshot,
 ) -> Vec<CompatModelDescriptor> {
@@ -4160,7 +4523,11 @@ fn compat_model_json(model: &CompatModelDescriptor) -> Value {
             "dimensions": model.dimensions,
             "supports_streaming_tokens": model.capabilities.as_ref().map(|value| value.streaming_tokens),
             "supports_tool_calls": model.capabilities.as_ref().map(|value| value.tool_calls),
+            "supports_structured_outputs": model.capabilities.as_ref().is_some_and(|value| value.json_mode),
             "supports_json_mode": model.capabilities.as_ref().map(|value| value.json_mode),
+            "schema_dialect": compat_schema_dialect(model.capabilities.as_ref()),
+            "reasoning_posture": compat_reasoning_posture(model.capabilities.as_ref()),
+            "reasoning_efforts": model.capabilities.as_ref().map(|value| value.reasoning_efforts.clone()).unwrap_or_default(),
             "supports_vision": model.capabilities.as_ref().map(|value| value.vision),
             "supports_audio_transcribe": model.capabilities.as_ref().map(|value| value.audio_transcribe),
             "supports_embeddings": model.capabilities.as_ref().map(|value| value.embeddings),
@@ -4170,6 +4537,7 @@ fn compat_model_json(model: &CompatModelDescriptor) -> Value {
             "recommended_use_cases": model.capabilities.as_ref().map(|value| value.recommended_use_cases.clone()).unwrap_or_default(),
             "known_limitations": model.capabilities.as_ref().map(|value| value.known_limitations.clone()).unwrap_or_default(),
             "metadata_source": model.capabilities.as_ref().map(|value| value.metadata_source.clone()),
+            "capabilities": compat_model_capabilities_json(model.capabilities.as_ref()),
         }
     })
 }

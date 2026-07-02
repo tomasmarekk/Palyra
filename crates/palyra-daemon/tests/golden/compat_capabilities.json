@@ -1,0 +1,484 @@
+{
+  "object": "capabilities",
+  "schema_version": 1,
+  "generated_at": 0,
+  "generated_at_unix_ms": 0,
+  "provider": {
+    "kind": "openai_compatible",
+    "health_status": "ok",
+    "discovery_status": "static",
+    "default_model": "gpt-4.1-mini",
+    "models": [
+      {
+        "id": "gpt-4.1-mini",
+        "role": "chat",
+        "default": true,
+        "enabled": true,
+        "health_status": "ok",
+        "discovery_status": "static",
+        "capabilities": {
+          "streaming_tokens": true,
+          "tool_calls": true,
+          "structured_outputs": {
+            "supported": true,
+            "source": "json_mode",
+            "schema_dialect": "json_schema_draft_2020_12_subset",
+            "strict_schema": false
+          },
+          "json_mode": true,
+          "reasoning": {
+            "supported": false,
+            "posture": "not_supported",
+            "efforts": []
+          },
+          "vision": true,
+          "audio_transcribe": true,
+          "embeddings": false,
+          "service_tier": true,
+          "service_tiers": [
+            "auto",
+            "default",
+            "priority",
+            "flex"
+          ],
+          "max_context_tokens": 128000,
+          "cost_tier": "standard",
+          "latency_tier": "standard",
+          "recommended_use_cases": [
+            "general chat",
+            "JSON workflows",
+            "vision requests"
+          ],
+          "known_limitations": [],
+          "operator_override": false,
+          "metadata_source": "static"
+        }
+      },
+      {
+        "id": "text-embedding-3-small",
+        "role": "embeddings",
+        "default": true,
+        "enabled": true,
+        "health_status": "ok",
+        "discovery_status": "static",
+        "capabilities": {
+          "streaming_tokens": false,
+          "tool_calls": false,
+          "structured_outputs": {
+            "supported": false,
+            "source": "json_mode",
+            "schema_dialect": null,
+            "strict_schema": false
+          },
+          "json_mode": false,
+          "reasoning": {
+            "supported": false,
+            "posture": "not_supported",
+            "efforts": []
+          },
+          "vision": false,
+          "audio_transcribe": false,
+          "embeddings": true,
+          "service_tier": false,
+          "service_tiers": [],
+          "max_context_tokens": 8192,
+          "cost_tier": "standard",
+          "latency_tier": "low",
+          "recommended_use_cases": [
+            "memory indexing"
+          ],
+          "known_limitations": [
+            "text embeddings only"
+          ],
+          "operator_override": false,
+          "metadata_source": "static"
+        }
+      }
+    ]
+  },
+  "runtime": {
+    "maturity": "preview",
+    "feature_flags": {
+      "compat_api": {
+        "enabled": true,
+        "stage": "test",
+        "depends_on": []
+      },
+      "compat_embeddings_api": {
+        "enabled": true,
+        "stage": "test",
+        "depends_on": [
+          "compat_api"
+        ]
+      },
+      "compat_tools_invoke": {
+        "enabled": false,
+        "stage": "lab",
+        "depends_on": [
+          "compat_api"
+        ]
+      }
+    },
+    "capabilities": [
+      {
+        "id": "models",
+        "supported": true,
+        "maturity": "stable",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "GET /v1/models",
+          "GET /v1/models/{model_id}"
+        ],
+        "details": {
+          "scope": "compat.models.read"
+        }
+      },
+      {
+        "id": "chat_completions",
+        "supported": true,
+        "maturity": "stable",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/chat/completions"
+        ],
+        "details": {
+          "scope": "compat.chat.create"
+        }
+      },
+      {
+        "id": "streaming_tokens",
+        "supported": true,
+        "maturity": "stable",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/chat/completions",
+          "POST /v1/responses",
+          "GET /v1/runs/{run_id}/events"
+        ],
+        "details": {
+          "source": "provider_capabilities.streaming_tokens"
+        }
+      },
+      {
+        "id": "tool_calls",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/responses"
+        ],
+        "details": {
+          "source": "provider_capabilities.tool_calls"
+        }
+      },
+      {
+        "id": "structured_outputs",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/chat/completions",
+          "POST /v1/responses"
+        ],
+        "details": {
+          "source": "provider_capabilities.json_mode",
+          "schema_dialect": "json_schema_draft_2020_12_subset",
+          "strict_schema": false
+        }
+      },
+      {
+        "id": "embeddings",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/embeddings"
+        ],
+        "details": {
+          "quality": "production_semantic",
+          "mode": "model_provider"
+        }
+      },
+      {
+        "id": "responses",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/responses",
+          "GET /v1/responses/{response_id}",
+          "DELETE /v1/responses/{response_id}"
+        ],
+        "details": {
+          "response_store": true,
+          "idempotency": true,
+          "sse": true
+        }
+      },
+      {
+        "id": "sessions",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/runs"
+        ],
+        "details": {
+          "selectors": [
+            "session.id",
+            "session.key",
+            "session.label"
+          ]
+        }
+      },
+      {
+        "id": "runs",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/runs",
+          "GET /v1/runs/{run_id}",
+          "GET /v1/runs/{run_id}/events",
+          "POST /v1/runs/{run_id}/stop",
+          "POST /v1/runs/{run_id}/detach"
+        ],
+        "details": {
+          "durable_status": true,
+          "event_replay": true,
+          "stop": true,
+          "detach": true
+        }
+      },
+      {
+        "id": "approvals",
+        "supported": true,
+        "maturity": "preview",
+        "disabled_reason_code": null,
+        "repair_hint": null,
+        "routes": [
+          "POST /v1/runs/{run_id}/approval"
+        ],
+        "details": {
+          "decisions": [
+            "approve",
+            "deny",
+            "timeout"
+          ],
+          "modify": false
+        }
+      },
+      {
+        "id": "direct_tool_invoke",
+        "supported": false,
+        "maturity": "lab",
+        "disabled_reason_code": "feature_flag_disabled",
+        "repair_hint": "Enable compat_tools_invoke only for explicit operator testing.",
+        "routes": [
+          "POST /v1/tools/invoke"
+        ],
+        "details": {
+          "feature_flag_enabled": false
+        }
+      },
+      {
+        "id": "mcp",
+        "supported": false,
+        "maturity": "planned",
+        "disabled_reason_code": "not_exposed_on_compat_api",
+        "repair_hint": "Use native Palyra tool/runtime surfaces until MCP is published on the compat facade.",
+        "routes": [],
+        "details": null
+      },
+      {
+        "id": "subagents",
+        "supported": false,
+        "maturity": "planned",
+        "disabled_reason_code": "not_exposed_on_compat_api",
+        "repair_hint": "Use native Palyra delegation surfaces until subagents are published on the compat facade.",
+        "routes": [],
+        "details": null
+      }
+    ]
+  },
+  "method_registry": {
+    "schema_version": 1,
+    "registry_version": "method-registry.v1",
+    "methods": [
+      {
+        "method_name": "compat.get.v1.capabilities",
+        "route": "/v1/capabilities",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.models.read",
+        "request_schema_id": "compat.get.v1.capabilities.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.capabilities.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.chat.completions",
+        "route": "/v1/chat/completions",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.chat.create",
+        "request_schema_id": "compat.post.v1.chat.completions.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.chat.completions.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "method_name": "compat.post.v1.embeddings",
+        "route": "/v1/embeddings",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.embeddings.create",
+        "request_schema_id": "compat.post.v1.embeddings.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.embeddings.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "method_name": "compat.get.v1.models",
+        "route": "/v1/models",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.models.read",
+        "request_schema_id": "compat.get.v1.models.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.models.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.get.v1.models.by_model_id",
+        "route": "/v1/models/{model_id}",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.models.read",
+        "request_schema_id": "compat.get.v1.models.by_model_id.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.models.by_model_id.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.responses",
+        "route": "/v1/responses",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.responses.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.responses.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.delete.v1.responses.by_response_id",
+        "route": "/v1/responses/{response_id}",
+        "http_method": "DELETE",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.delete.v1.responses.by_response_id.request.method-registry.v1",
+        "response_schema_id": "compat.delete.v1.responses.by_response_id.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "method_name": "compat.get.v1.responses.by_response_id",
+        "route": "/v1/responses/{response_id}",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.get.v1.responses.by_response_id.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.responses.by_response_id.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.runs",
+        "route": "/v1/runs",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.runs.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.runs.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.get.v1.runs.by_run_id",
+        "route": "/v1/runs/{run_id}",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.get.v1.runs.by_run_id.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.runs.by_run_id.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.runs.by_run_id.approval",
+        "route": "/v1/runs/{run_id}/approval",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.approval.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.approval.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.runs.by_run_id.detach",
+        "route": "/v1/runs/{run_id}/detach",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.detach.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.detach.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.get.v1.runs.by_run_id.events",
+        "route": "/v1/runs/{run_id}/events",
+        "http_method": "GET",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.get.v1.runs.by_run_id.events.request.method-registry.v1",
+        "response_schema_id": "compat.get.v1.runs.by_run_id.events.response.method-registry.v1",
+        "streaming_supported": true,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.runs.by_run_id.stop",
+        "route": "/v1/runs/{run_id}/stop",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.stop.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.stop.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "method_name": "compat.post.v1.tools.invoke",
+        "route": "/v1/tools/invoke",
+        "http_method": "POST",
+        "stability": "stable",
+        "required_scope": "compat.tools.invoke",
+        "request_schema_id": "compat.post.v1.tools.invoke.request.method-registry.v1",
+        "response_schema_id": "compat.post.v1.tools.invoke.response.method-registry.v1",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      }
+    ]
+  }
+}

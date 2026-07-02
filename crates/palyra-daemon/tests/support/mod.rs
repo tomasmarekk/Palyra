@@ -147,6 +147,7 @@ impl DaemonHarness {
         let request = match method {
             Method::GET => self.client.get(url),
             Method::POST => self.client.post(url).json(&serde_json::json!({})),
+            Method::DELETE => self.client.delete(url),
             other => bail!("unsupported method for test harness route probe: {other}"),
         };
         let status =

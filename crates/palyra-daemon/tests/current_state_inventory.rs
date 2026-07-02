@@ -169,11 +169,20 @@ fn build_current_state_inventory_snapshot(
 
     let cli_families = load_cli_families()?;
     let compat_routes = vec![
+        compat_route_probe(harness, Method::GET, "/v1/capabilities")?,
         compat_route_probe(harness, Method::GET, "/v1/models")?,
         compat_route_probe(harness, Method::GET, "/v1/models/compat-probe")?,
         compat_route_probe(harness, Method::POST, "/v1/embeddings")?,
         compat_route_probe(harness, Method::POST, "/v1/chat/completions")?,
         compat_route_probe(harness, Method::POST, "/v1/responses")?,
+        compat_route_probe(harness, Method::GET, "/v1/responses/resp_probe")?,
+        compat_route_probe(harness, Method::DELETE, "/v1/responses/resp_probe")?,
+        compat_route_probe(harness, Method::POST, "/v1/runs")?,
+        compat_route_probe(harness, Method::GET, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
+        compat_route_probe(harness, Method::GET, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/events")?,
+        compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stop")?,
+        compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/detach")?,
+        compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/approval")?,
         compat_route_probe(harness, Method::POST, "/v1/tools/invoke")?,
     ];
     let mut runtime_controls = diagnostics

@@ -15,7 +15,11 @@
     "dimensions": null,
     "supports_streaming_tokens": true,
     "supports_tool_calls": true,
+    "supports_structured_outputs": true,
     "supports_json_mode": true,
+    "schema_dialect": "json_schema_draft_2020_12_subset",
+    "reasoning_posture": "not_supported",
+    "reasoning_efforts": [],
     "supports_vision": true,
     "supports_audio_transcribe": true,
     "supports_embeddings": false,
@@ -28,6 +32,43 @@
       "vision requests"
     ],
     "known_limitations": [],
-    "metadata_source": "static"
+    "metadata_source": "static",
+    "capabilities": {
+      "streaming_tokens": true,
+      "tool_calls": true,
+      "structured_outputs": {
+        "supported": true,
+        "source": "json_mode",
+        "schema_dialect": "json_schema_draft_2020_12_subset",
+        "strict_schema": false
+      },
+      "json_mode": true,
+      "reasoning": {
+        "supported": false,
+        "posture": "not_supported",
+        "efforts": []
+      },
+      "vision": true,
+      "audio_transcribe": true,
+      "embeddings": false,
+      "service_tier": true,
+      "service_tiers": [
+        "auto",
+        "default",
+        "priority",
+        "flex"
+      ],
+      "max_context_tokens": 128000,
+      "cost_tier": "standard",
+      "latency_tier": "standard",
+      "recommended_use_cases": [
+        "general chat",
+        "JSON workflows",
+        "vision requests"
+      ],
+      "known_limitations": [],
+      "operator_override": false,
+      "metadata_source": "static"
+    }
   }
 }

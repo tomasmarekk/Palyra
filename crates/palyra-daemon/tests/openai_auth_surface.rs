@@ -751,6 +751,59 @@ fn compat_model_detail_and_embeddings_surface_publish_registry_backed_payloads()
         "compat model detail must not expose internal credential identifiers"
     );
     assert_json_golden("compat_model_detail.json", &model_detail)?;
+    let (embedding_model_status, embedding_model_detail) =
+        compat_get_json(&client, admin_port, "/v1/models/text-embedding-3-small", token.as_str())?;
+    assert_eq!(embedding_model_status, 200);
+    assert_eq!(
+        embedding_model_detail
+            .pointer("/metadata/capabilities/tool_calls")
+            .and_then(Value::as_bool),
+        Some(false),
+        "embeddings compat model must not advertise tool calls"
+    );
+    assert_eq!(
+        embedding_model_detail
+            .pointer("/metadata/capabilities/structured_outputs/supported")
+            .and_then(Value::as_bool),
+        Some(false),
+        "embeddings compat model must not advertise structured outputs"
+    );
+
+    let (capabilities_status, capabilities) =
+        compat_get_json(&client, admin_port, "/v1/capabilities", token.as_str())?;
+    assert_eq!(capabilities_status, 200, "capabilities response should succeed: {capabilities}");
+    assert_eq!(capabilities.get("object").and_then(Value::as_str), Some("capabilities"));
+    let runtime_capability_ids = capabilities
+        .pointer("/runtime/capabilities")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("capabilities response missing runtime capabilities"))?
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    for expected in ["streaming_tokens", "tool_calls", "approvals", "sessions", "runs", "responses"]
+    {
+        assert!(
+            runtime_capability_ids.contains(expected),
+            "capabilities response missing runtime capability {expected}: {capabilities}"
+        );
+    }
+    assert_eq!(
+        capabilities
+            .pointer("/method_registry/methods")
+            .and_then(Value::as_array)
+            .map(std::vec::Vec::len),
+        Some(15),
+        "capabilities response should expose current compat method registry"
+    );
+    let encoded_capabilities = capabilities.to_string();
+    assert!(
+        !encoded_capabilities.contains("sk-compat-openai") && !encoded_capabilities.contains(mock.base_url().as_str()),
+        "capabilities response must not leak provider secrets or private base URLs: {encoded_capabilities}"
+    );
+    let mut normalized_capabilities = capabilities.clone();
+    normalized_capabilities["generated_at"] = json!(0);
+    normalized_capabilities["generated_at_unix_ms"] = json!(0);
+    assert_json_golden("compat_capabilities.json", &normalized_capabilities)?;
 
     let (embeddings_status, embeddings_response) = compat_post_json(
         &client,
