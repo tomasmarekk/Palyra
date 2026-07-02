@@ -1119,6 +1119,7 @@ mod tests {
         WIT_WORLD_NAME,
     };
     use serde_json::Value;
+    use std::collections::BTreeMap;
 
     const EXPECTED_PLUGIN_SDK_CONTRACT_SNAPSHOT_JSON: &str =
         include_str!("../tests/golden/plugin_sdk_contract_snapshot.json");
@@ -1126,10 +1127,25 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/plugin_sdk_contract_snapshot.json");
 
     fn pretty_json(value: &Value) -> String {
+        let canonical = canonical_json_value(value);
         let mut encoded =
-            serde_json::to_string_pretty(value).expect("snapshot should serialize to json");
+            serde_json::to_string_pretty(&canonical).expect("snapshot should serialize to json");
         encoded.push('\n');
         encoded
+    }
+
+    fn canonical_json_value(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let sorted = object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), canonical_json_value(value)))
+                    .collect::<BTreeMap<_, _>>();
+                Value::Object(sorted.into_iter().collect())
+            }
+            Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+            scalar => scalar.clone(),
+        }
     }
 
     fn assert_snapshot_matches_golden(
@@ -1139,6 +1155,7 @@ mod tests {
         update_path: Option<&str>,
     ) -> Result<(), String> {
         let actual = pretty_json(actual);
+        let expected = expected.replace("\r\n", "\n");
         if std::env::var_os("PALYRA_UPDATE_CONTRACT_SNAPSHOTS").is_some() {
             if let Some(update_path) = update_path {
                 std::fs::write(update_path, actual.as_bytes())
