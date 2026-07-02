@@ -4,9 +4,21 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum QaCommand {
+    #[command(about = "Validate QA Lab scenario manifests")]
     Validate {
         #[arg(long, default_value = "qa/scenarios")]
         path: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Run a local deterministic QA scenario pack")]
+    RunPack {
+        #[arg(long, default_value = "qa/scenarios")]
+        path: String,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        output: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

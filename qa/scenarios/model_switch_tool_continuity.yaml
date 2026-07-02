@@ -1,0 +1,58 @@
+schema_version: 1
+id: model.switch_tool_continuity
+title: Model switch tool continuity
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - provider_routing
+  tools:
+    - palyra.echo
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the model switch continuity fixture and preserve tool context."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "model switch continuity preserved"
+  events:
+    - event_type: provider.route.changed
+      min_count: 1
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.echo
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - provider.context.lost
+  artifacts: []
+  claims:
+    - "lost context"
+artifacts:
+  - path: qa/reports/model_switch_tool_continuity.json
+    kind: report
+    required: true
+  - path: qa/reports/model_switch_tool_continuity.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider
+timeout:
+  run_ms: 45000
+  step_ms: 15000

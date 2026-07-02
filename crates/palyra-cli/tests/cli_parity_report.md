@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `153`
-- Verified entries: `153`
+- Total entries: `154`
+- Verified entries: `154`
 - Regression entries: `0`
-- Help snapshot coverage: `153` entries
+- Help snapshot coverage: `154` entries
 
 ### Expected parity status counts
 
-- `done`: `149`
+- `done`: `150`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `153`
+- `verified`: `154`
 
 ## Entries
 
@@ -96,6 +96,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `eval bundle create` | `nested_surface` | `done` | `verified` | `eval-bundle-create-help.txt` | - | `--name`, `--output`, `--run-id`, `--run-export`, `--replay-bundle`, `--scenario-manifest`, `--memory-fixture`, `--journal-db`, `--max-events`, `--fake-provider`, `--json` | - |
 | `qa` | `top_level` | `done` | `verified` | `qa-help.txt` | - | - | - |
 | `qa validate` | `nested_surface` | `done` | `verified` | `qa-validate-help.txt` | - | `--path`, `--json` | - |
+| `qa run-pack` | `nested_surface` | `done` | `verified` | `qa-run-pack-help.txt` | - | `--path`, `--tag`, `--output`, `--json` | - |
 | `config` | `top_level` | `done` | `verified` | `config-help.txt` | - | - | - |
 | `models` | `top_level` | `done` | `verified` | `models-help.txt` | - | - | - |
 | `patch` | `top_level` | `done` | `verified` | `patch-help.txt` | - | - | - |

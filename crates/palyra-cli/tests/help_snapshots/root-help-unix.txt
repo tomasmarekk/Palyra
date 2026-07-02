@@ -54,6 +54,7 @@ Commands:
   policy          Explain policy decisions and authorization posture
   protocol        Validate schema and protocol contract artifacts
   eval            Create local eval bundles and replay metadata
+  qa              Validate QA Lab scenario manifests and run local QA packs
   config          Inspect and validate local configuration
   workers         Inspect networked workers, leases, and cleanup evidence
   run             Export run trajectories for audit and evals
@@ -151,4 +152,5 @@ Canonical command map:
   update     Package update/check orchestration surface
   onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
   profile    First-class CLI profile lifecycle and environment selection
+  qa         QA Lab scenario manifest validation
   webhooks   Webhook-backed integration management surface

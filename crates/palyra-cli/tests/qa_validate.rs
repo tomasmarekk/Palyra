@@ -85,3 +85,93 @@ timeout:
     );
     Ok(())
 }
+
+#[test]
+fn qa_run_pack_accepts_full_p0_pack() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "run-pack", "--path", "qa/scenarios", "--tag", "p0", "--json"])
+        .output()
+        .context("failed to execute palyra qa run-pack")?;
+
+    assert!(
+        output.status.success(),
+        "qa run-pack p0 should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("qa run-pack JSON output should parse")?;
+    assert_eq!(payload.pointer("/selected_count").and_then(Value::as_u64), Some(11));
+    assert_eq!(payload.pointer("/passed").and_then(Value::as_u64), Some(11));
+    assert_eq!(payload.pointer("/failed").and_then(Value::as_u64), Some(0));
+    assert_eq!(payload.pointer("/skipped").and_then(Value::as_u64), Some(0));
+
+    let scenarios = payload
+        .pointer("/scenarios")
+        .and_then(Value::as_array)
+        .context("qa run-pack report should include scenarios")?;
+    for scenario_id in [
+        "compaction.retry_mutating_tool",
+        "process.background_verification",
+        "plugin_hook.blocks_tool",
+    ] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario.get("id").and_then(Value::as_str) == Some(scenario_id))
+            .with_context(|| format!("missing sandbox scenario {scenario_id}"))?;
+        assert_eq!(
+            scenario.get("status").and_then(Value::as_str),
+            Some("pass"),
+            "{scenario_id} should pass in the full P0 pack"
+        );
+        assert_eq!(
+            scenario.get("sandbox_fixture").and_then(Value::as_bool),
+            Some(true),
+            "{scenario_id} should declare a sandbox workspace fixture"
+        );
+        assert_eq!(
+            scenario.get("sandbox_cleanup_verified").and_then(Value::as_bool),
+            Some(true),
+            "{scenario_id} should report sandbox cleanup verification"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn qa_run_pack_filters_release_smoke_and_writes_aggregate_report() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let output_path = temp_dir.path().join("reports").join("qa-pack-report.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "run-pack", "--path", "qa/scenarios", "--tag", "release_smoke", "--output"])
+        .arg(output_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa run-pack")?;
+
+    assert!(
+        output.status.success(),
+        "qa run-pack release_smoke should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout_payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("qa run-pack JSON output should parse")?;
+    let file_payload: Value = serde_json::from_slice(
+        fs::read(output_path.as_path())
+            .context("qa run-pack should write an aggregate report")?
+            .as_slice(),
+    )
+    .context("written aggregate report should parse")?;
+    let golden_path = repo_root().join("fixtures/golden/qa_p0_release_smoke_pack_report.json");
+    let golden_payload: Value = serde_json::from_slice(
+        fs::read(golden_path.as_path())
+            .with_context(|| format!("failed to read {}", golden_path.display()))?
+            .as_slice(),
+    )
+    .context("golden aggregate report should parse")?;
+
+    assert_eq!(stdout_payload, file_payload, "stdout and report file should match");
+    assert_eq!(stdout_payload, golden_payload, "release_smoke aggregate report drifted");
+    Ok(())
+}

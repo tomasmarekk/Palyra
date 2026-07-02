@@ -1,0 +1,58 @@
+schema_version: 1
+id: tool_result.redaction
+title: Tool result redaction
+area: security
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - redaction
+  tools:
+    - palyra.fs.read_file
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the tool result redaction fixture and verify no secret appears."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "tool result redaction verified"
+  events:
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: redaction.applied
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.fs.read_file
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - secret.exposed
+  artifacts: []
+  claims:
+    - "sk-test-secret"
+artifacts:
+  - path: qa/reports/tool_result_redaction.json
+    kind: report
+    required: true
+  - path: qa/reports/tool_result_redaction.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - security
+timeout:
+  run_ms: 30000
+  step_ms: 10000

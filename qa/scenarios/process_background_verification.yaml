@@ -1,0 +1,62 @@
+schema_version: 1
+id: process.background_verification
+title: Process background verification
+area: workflow
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - process_background
+  tools:
+    - palyra.process.run
+    - palyra.process.status
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the process background verification fixture inside the sandbox workspace."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "background process verified"
+  events:
+    - event_type: process.background.started
+      min_count: 1
+    - event_type: process.background.verified
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.process.run
+      min_count: 1
+    - name: palyra.process.status
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - process.orphaned
+  artifacts: []
+  claims:
+    - "left running"
+artifacts:
+  - path: qa/reports/process_background_verification.json
+    kind: report
+    required: true
+  - path: qa/reports/process_background_verification.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - process
+timeout:
+  run_ms: 60000
+  step_ms: 20000

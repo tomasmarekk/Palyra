@@ -64,6 +64,35 @@ fn parse_qa_validate_with_path_and_json() {
 }
 
 #[test]
+fn parse_qa_run_pack_with_tags_output_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "qa",
+        "run-pack",
+        "--path",
+        "qa/scenarios",
+        "--tag",
+        "p0",
+        "--tag",
+        "release_smoke",
+        "--output",
+        "artifacts/qa-pack-report.json",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Qa {
+            command: QaCommand::RunPack {
+                path: "qa/scenarios".to_owned(),
+                tags: vec!["p0".to_owned(), "release_smoke".to_owned()],
+                output: Some("artifacts/qa-pack-report.json".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_gateway_status_with_json_flag() {
     let parsed = Cli::parse_from(["palyra", "gateway", "status", "--json"]);
     assert_eq!(

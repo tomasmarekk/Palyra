@@ -739,7 +739,7 @@ file = "eval-bundle-create-help.txt"
 path = "qa"
 category = "top_level"
 status = "done"
-summary = "QA Lab scenario manifest validation surface."
+summary = "QA Lab scenario manifest validation and local pack dry-run surface."
 
 [entries.snapshot]
 path = "qa"
@@ -755,6 +755,17 @@ required_flags = ["path", "json"]
 [entries.snapshot]
 path = "qa validate"
 file = "qa-validate-help.txt"
+
+[[entries]]
+path = "qa run-pack"
+category = "nested_surface"
+status = "done"
+summary = "Run deterministic local QA scenario packs for selected mock manifests."
+required_flags = ["path", "tag", "output", "json"]
+
+[entries.snapshot]
+path = "qa run-pack"
+file = "qa-run-pack-help.txt"
 
 [[entries]]
 path = "config"

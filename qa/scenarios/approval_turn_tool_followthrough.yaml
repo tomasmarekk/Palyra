@@ -1,0 +1,60 @@
+schema_version: 1
+id: approval.turn_tool_followthrough
+title: Approval turn tool followthrough
+area: approvals
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - approvals
+  tools:
+    - palyra.fs.read_file
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the approval followthrough fixture and finish after the approved read."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "approval followthrough completed"
+  events:
+    - event_type: approval.required
+      min_count: 1
+    - event_type: approval.resolved
+      min_count: 1
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.fs.read_file
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - secret.exposed
+  artifacts: []
+  claims:
+    - "skipped approval"
+artifacts:
+  - path: qa/reports/approval_turn_tool_followthrough.json
+    kind: report
+    required: true
+  - path: qa/reports/approval_turn_tool_followthrough.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - approvals
+timeout:
+  run_ms: 45000
+  step_ms: 15000

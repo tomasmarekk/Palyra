@@ -1,11 +1,13 @@
-Validate QA Lab scenario manifests
+Run a local deterministic QA scenario pack
 
-Usage: palyra qa validate [OPTIONS]
+Usage: palyra qa run-pack [OPTIONS]
 
 Options:
-      --path <PATH>  [default: qa/scenarios]
+      --path <PATH>      [default: qa/scenarios]
+      --tag <TAGS>
+      --output <OUTPUT>
       --json
-  -h, --help         Print help
+  -h, --help             Print help
 
 Global Options:
       --profile <PROFILE>

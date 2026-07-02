@@ -275,9 +275,12 @@ Examples:
   palyra qa validate
   palyra qa validate --path qa/scenarios/text_run_basic.yaml
   palyra qa validate --path qa/scenarios --json
+  palyra qa run-pack --tag p0 --json
+  palyra qa run-pack --tag release_smoke --output artifacts/qa-pack-report.json
 
 Discoverability:
-  `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.";
+  `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.
+  `qa run-pack` performs a local deterministic dry-run of selected mock scenarios.";
 
 const DEPLOYMENT_AFTER_HELP: &str = "\
 Examples:
@@ -990,7 +993,7 @@ pub enum Command {
         command: EvalCommand,
     },
     #[command(
-        about = "Validate QA Lab scenario manifests",
+        about = "Validate QA Lab scenario manifests and run local QA packs",
         after_long_help = QA_AFTER_HELP
     )]
     Qa {

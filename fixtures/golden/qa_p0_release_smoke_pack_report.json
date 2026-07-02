@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "format": "palyra-qa-pack-report",
+  "path": "qa/scenarios",
+  "requested_tags": [
+    "release_smoke"
+  ],
+  "scenario_count": 11,
+  "selected_count": 4,
+  "passed": 4,
+  "failed": 0,
+  "skipped": 7,
+  "unsupported": 0,
+  "scenarios": [
+    {
+      "id": "approval.turn_tool_followthrough",
+      "path": "qa/scenarios/approval_turn_tool_followthrough.yaml",
+      "status": "pass",
+      "area": "approvals",
+      "labels": [
+        "p0",
+        "release_smoke",
+        "approvals"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "passed",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": null
+    },
+    {
+      "id": "compaction.retry_mutating_tool",
+      "path": "qa/scenarios/compaction_retry_mutating_tool.yaml",
+      "status": "skipped",
+      "area": "workflow",
+      "labels": [
+        "p0",
+        "nightly",
+        "mutating"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": true,
+      "sandbox_cleanup_verified": false,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "delegation.handoff",
+      "path": "qa/scenarios/delegation_handoff.yaml",
+      "status": "skipped",
+      "area": "workflow",
+      "labels": [
+        "p0",
+        "nightly",
+        "delegation"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "empty_response.recovery",
+      "path": "qa/scenarios/empty_response_recovery.yaml",
+      "status": "pass",
+      "area": "provider",
+      "labels": [
+        "p0",
+        "release_smoke",
+        "provider"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "passed",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": null
+    },
+    {
+      "id": "gateway_restart.inflight_run",
+      "path": "qa/scenarios/gateway_restart_inflight_run.yaml",
+      "status": "skipped",
+      "area": "workflow",
+      "labels": [
+        "p0",
+        "nightly",
+        "gateway"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "model.switch_tool_continuity",
+      "path": "qa/scenarios/model_switch_tool_continuity.yaml",
+      "status": "skipped",
+      "area": "provider",
+      "labels": [
+        "p0",
+        "nightly",
+        "provider"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "plugin_hook.blocks_tool",
+      "path": "qa/scenarios/plugin_hook_blocks_tool.yaml",
+      "status": "skipped",
+      "area": "security",
+      "labels": [
+        "p0",
+        "nightly",
+        "security"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": true,
+      "sandbox_cleanup_verified": false,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "process.background_verification",
+      "path": "qa/scenarios/process_background_verification.yaml",
+      "status": "skipped",
+      "area": "workflow",
+      "labels": [
+        "p0",
+        "nightly",
+        "process"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": true,
+      "sandbox_cleanup_verified": false,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "repo.discovery_report",
+      "path": "qa/scenarios/repo_discovery_report.yaml",
+      "status": "pass",
+      "area": "workflow",
+      "labels": [
+        "p0",
+        "release_smoke",
+        "workflow"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "passed",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": null
+    },
+    {
+      "id": "text.run.basic",
+      "path": "qa/scenarios/text_run_basic.yaml",
+      "status": "skipped",
+      "area": "text",
+      "labels": [
+        "p0",
+        "deterministic",
+        "text_only"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "skipped",
+      "issue_codes": [],
+      "artifact_count": 1,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": "tag_filter"
+    },
+    {
+      "id": "tool_result.redaction",
+      "path": "qa/scenarios/tool_result_redaction.yaml",
+      "status": "pass",
+      "area": "security",
+      "labels": [
+        "p0",
+        "release_smoke",
+        "security"
+      ],
+      "provider_mode": "mock",
+      "evidence_verdict": "passed",
+      "issue_codes": [],
+      "artifact_count": 2,
+      "sandbox_fixture": false,
+      "sandbox_cleanup_verified": true,
+      "reason": null
+    }
+  ]
+}

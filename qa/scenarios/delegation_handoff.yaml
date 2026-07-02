@@ -1,0 +1,58 @@
+schema_version: 1
+id: delegation.handoff
+title: Delegation handoff
+area: workflow
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - delegation
+  tools:
+    - palyra.delegation.query
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the delegation handoff fixture and keep parent and child records linked."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "delegation handoff recorded"
+  events:
+    - event_type: delegation.child.created
+      min_count: 1
+    - event_type: delegation.handoff.recorded
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.delegation.query
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - delegation.link.stale
+  artifacts: []
+  claims:
+    - "child unavailable"
+artifacts:
+  - path: qa/reports/delegation_handoff.json
+    kind: report
+    required: true
+  - path: qa/reports/delegation_handoff.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - delegation
+timeout:
+  run_ms: 45000
+  step_ms: 15000

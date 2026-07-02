@@ -1,0 +1,112 @@
+schema_version: 1
+id: qa.mock.provider.p0_pack
+turns:
+  - id: approval_turn_tool_followthrough
+    match:
+      prompt_contains:
+        - approval followthrough fixture
+    behavior:
+      kind: approval_required
+      text: "approval followthrough completed"
+      tool_calls:
+        - proposal_id: p0-approval-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: qa/fixtures/p0_provider_pack.yaml
+  - id: model_switch_tool_continuity
+    match:
+      prompt_contains:
+        - model switch continuity fixture
+    behavior:
+      kind: tool_calls
+      text: "model switch continuity preserved tool context"
+      tool_calls:
+        - proposal_id: p0-model-switch-echo
+          tool_name: palyra.echo
+          input_json:
+            text: continuity-check
+  - id: repo_discovery_report
+    match:
+      prompt_contains:
+        - repo discovery report fixture
+    behavior:
+      kind: tool_calls
+      text: "repo discovery report produced"
+      tool_calls:
+        - proposal_id: p0-repo-list
+          tool_name: palyra.fs.list_dir
+          input_json:
+            path: .
+  - id: compaction_retry_mutating_tool
+    match:
+      prompt_contains:
+        - compaction retry mutating tool fixture
+    behavior:
+      kind: tool_calls
+      text: "compaction retry mutation verified"
+      tool_calls:
+        - proposal_id: p0-compaction-patch
+          tool_name: palyra.fs.apply_patch
+          input_json:
+            patch: "*** Begin Patch\n*** Add File: report.md\n+ok\n*** End Patch\n"
+  - id: delegation_handoff
+    match:
+      prompt_contains:
+        - delegation handoff fixture
+    behavior:
+      kind: tool_calls
+      text: "delegation handoff recorded"
+      tool_calls:
+        - proposal_id: p0-delegation-query
+          tool_name: palyra.delegation.query
+          input_json:
+            scope: current_session
+  - id: empty_response_recovery
+    match:
+      prompt_contains:
+        - empty response recovery fixture
+    behavior:
+      kind: text
+      text: "empty response recovered"
+  - id: process_background_verification
+    match:
+      prompt_contains:
+        - process background verification fixture
+    behavior:
+      kind: tool_calls
+      text: "background process verified"
+      tool_calls:
+        - proposal_id: p0-process-run
+          tool_name: palyra.process.run
+          input_json:
+            command: "echo qa"
+        - proposal_id: p0-process-status
+          tool_name: palyra.process.status
+          input_json:
+            handle: p0-process-run
+  - id: tool_result_redaction
+    match:
+      prompt_contains:
+        - tool result redaction fixture
+    behavior:
+      kind: tool_calls
+      text: "tool result redaction verified"
+      tool_calls:
+        - proposal_id: p0-redaction-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: qa/fixtures/p0_provider_pack.yaml
+  - id: gateway_restart_inflight_run
+    match:
+      prompt_contains:
+        - gateway restart inflight run fixture
+    behavior:
+      kind: text
+      text: "gateway restart inflight run recovered"
+  - id: plugin_hook_blocks_tool
+    match:
+      prompt_contains:
+        - plugin hook blocks tool fixture
+    behavior:
+      kind: text
+      text: "plugin hook blocked tool safely"

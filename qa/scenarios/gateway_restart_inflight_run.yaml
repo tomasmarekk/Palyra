@@ -1,0 +1,55 @@
+schema_version: 1
+id: gateway_restart.inflight_run
+title: Gateway restart inflight run
+area: workflow
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - gateway_recovery
+  tools: []
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the gateway restart inflight run fixture and recover the in-flight run."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "gateway restart inflight run recovered"
+  events:
+    - event_type: run.queued
+      min_count: 1
+    - event_type: gateway.restart.detected
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - run.lost
+  artifacts: []
+  claims:
+    - "start over"
+artifacts:
+  - path: qa/reports/gateway_restart_inflight_run.json
+    kind: report
+    required: true
+  - path: qa/reports/gateway_restart_inflight_run.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - gateway
+timeout:
+  run_ms: 60000
+  step_ms: 20000

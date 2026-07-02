@@ -1,0 +1,58 @@
+schema_version: 1
+id: repo.discovery_report
+title: Repo discovery report
+area: workflow
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - workspace_context
+  tools:
+    - palyra.fs.list_dir
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the repo discovery report fixture and summarize the workspace."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "repo discovery report produced"
+  events:
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: artifact.created
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.fs.list_dir
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - secret.exposed
+  artifacts: []
+  claims:
+    - "no files inspected"
+artifacts:
+  - path: qa/reports/repo_discovery_report.json
+    kind: report
+    required: true
+  - path: qa/reports/repo_discovery_report.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - workflow
+timeout:
+  run_ms: 30000
+  step_ms: 10000

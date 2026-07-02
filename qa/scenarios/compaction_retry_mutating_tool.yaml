@@ -1,0 +1,59 @@
+schema_version: 1
+id: compaction.retry_mutating_tool
+title: Compaction retry mutating tool
+area: workflow
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - session_compaction
+  tools:
+    - palyra.fs.apply_patch
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the compaction retry mutating tool fixture inside the sandbox workspace."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "compaction retry mutation verified"
+  events:
+    - event_type: session.compaction.applied
+      min_count: 1
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.fs.apply_patch
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - sandbox.escape
+  artifacts: []
+  claims:
+    - "patch skipped"
+artifacts:
+  - path: qa/reports/compaction_retry_mutating_tool.json
+    kind: report
+    required: true
+  - path: qa/reports/compaction_retry_mutating_tool.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - mutating
+timeout:
+  run_ms: 60000
+  step_ms: 20000

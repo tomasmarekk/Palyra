@@ -1,0 +1,55 @@
+schema_version: 1
+id: empty_response.recovery
+title: Empty response recovery
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - provider_recovery
+  tools: []
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the empty response recovery fixture and produce the fallback answer."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "empty response recovered"
+  events:
+    - event_type: provider.empty_response.detected
+      min_count: 1
+    - event_type: provider.retry.started
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - run.failed
+  artifacts: []
+  claims:
+    - "no answer"
+artifacts:
+  - path: qa/reports/empty_response_recovery.json
+    kind: report
+    required: true
+  - path: qa/reports/empty_response_recovery.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - provider
+timeout:
+  run_ms: 30000
+  step_ms: 10000

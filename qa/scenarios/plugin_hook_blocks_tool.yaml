@@ -1,0 +1,56 @@
+schema_version: 1
+id: plugin_hook.blocks_tool
+title: Plugin hook blocks tool
+area: security
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - hook_policy
+  tools:
+    - palyra.plugin.run
+  fixtures:
+    - qa/fixtures/p0_provider_pack.yaml
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the plugin hook blocks tool fixture inside the sandbox workspace."
+expect:
+  terminal_state: failed
+  final_answer:
+    contains:
+      - "plugin hook blocked tool safely"
+  events:
+    - event_type: hook.tool.blocked
+      min_count: 1
+    - event_type: run.failed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - palyra.plugin.run
+  events:
+    - policy.bypass
+  artifacts: []
+  claims:
+    - "plugin executed"
+artifacts:
+  - path: qa/reports/plugin_hook_blocks_tool.json
+    kind: report
+    required: true
+  - path: qa/reports/plugin_hook_blocks_tool.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - security
+timeout:
+  run_ms: 45000
+  step_ms: 15000
