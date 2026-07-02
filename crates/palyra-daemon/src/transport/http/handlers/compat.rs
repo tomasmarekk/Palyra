@@ -468,22 +468,15 @@ pub(crate) async fn compat_chat_completions_handler(
 /// Handles `POST /v1/responses`.
 ///
 /// # Errors
-/// Returns an error response when the request asks for unsupported streaming,
-/// contains no text-bearing input, fails authorization/rate limiting, or the
-/// backing gateway run fails.
+/// Returns an error response when the request contains no text-bearing input,
+/// fails authorization/rate limiting, or the backing gateway run fails before
+/// a streaming response can be opened.
 pub(crate) async fn compat_responses_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CompatResponsesRequest>,
 ) -> Result<Response, Response> {
-    if payload.stream.unwrap_or(false) {
-        return Err(compat_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "unsupported_stream",
-            "stream=true is not supported yet for /v1/responses",
-        ));
-    }
+    let stream = payload.stream.unwrap_or(false);
     let prompt_text = match payload.input {
         CompatResponsesInput::Text(text) => trim_to_option(text).ok_or_else(|| {
             compat_error_response(
@@ -515,6 +508,9 @@ pub(crate) async fn compat_responses_handler(
         PERMISSION_COMPAT_RESPONSES_CREATE,
     )
     .await?;
+    if stream {
+        return Ok(build_compat_responses_streaming_response(state, prepared));
+    }
     let token_id = prepared.token.token_id.clone();
     let run_id = prepared.run_id.clone();
     let execution = execute_compat_run(&state, prepared).await;
@@ -753,22 +749,66 @@ fn build_compat_chat_completion_payload(result: &CompatExecutionResult) -> Value
 }
 
 fn build_compat_responses_payload(result: &CompatExecutionResult) -> Value {
-    json!({
-        "id": format!("resp_{}", result.snapshot.run_id),
+    build_compat_responses_payload_from_parts(
+        format!("resp_{}", result.snapshot.run_id),
+        &result.snapshot,
+        "completed",
+        result.content.clone(),
+        result.tool_calls.as_slice(),
+        None,
+    )
+}
+
+fn build_compat_responses_payload_from_parts(
+    response_id: String,
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+    status: &str,
+    content: String,
+    tool_calls: &[CompatToolCall],
+    error: Option<Value>,
+) -> Value {
+    let mut payload = json!({
+        "id": response_id,
         "object": "response",
-        "created": result.snapshot.created_at_unix_ms / 1_000,
-        "status": "completed",
+        "created": snapshot.created_at_unix_ms / 1_000,
+        "status": status,
         "output": [{
             "type": "message",
             "role": "assistant",
             "content": [{
                 "type": "output_text",
-                "text": result.content,
+                "text": content,
             }],
         }],
-        "tool_calls": result.tool_calls.iter().map(compat_tool_call_json).collect::<Vec<Value>>(),
-        "usage": compat_usage_json(&result.snapshot),
-        "_palyra": compat_interop_json(&result.snapshot),
+        "tool_calls": tool_calls.iter().map(compat_tool_call_json).collect::<Vec<Value>>(),
+        "usage": compat_usage_json(snapshot),
+        "_palyra": compat_interop_json(snapshot),
+    });
+    if let Some(error) = error {
+        payload["error"] = error;
+    }
+    payload
+}
+
+fn build_compat_responses_created_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    created_seconds: i64,
+    model_name: &str,
+) -> Value {
+    json!({
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created": created_seconds,
+            "status": "in_progress",
+            "model": model_name,
+            "output": [],
+            "usage": Value::Null,
+            "_palyra": compat_stream_palyra_metadata(run_id, session_id, None),
+        },
     })
 }
 
@@ -1101,6 +1141,364 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+fn build_compat_responses_streaming_response(
+    state: AppState,
+    prepared: CompatPreparedRun,
+) -> Response {
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    tokio::spawn(async move {
+        let CompatPreparedRun {
+            token,
+            provider_kind: _,
+            model_name,
+            run_id,
+            session_id,
+            created_at_unix_ms,
+            request_sender,
+            run_request,
+        } = prepared;
+        let response_id = format!("resp_{run_id}");
+        let created_seconds = created_at_unix_ms / 1_000;
+        let message_item_id = format!("msg_{run_id}");
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut stream_error = None::<String>;
+        let mut public_event_sequence = 0_u64;
+        let mut last_public_terminal_event = None::<Value>;
+
+        if !send_sse_event(
+            &sender,
+            "response.created",
+            build_compat_responses_created_stream_payload(
+                response_id.as_str(),
+                run_id.as_str(),
+                session_id.as_str(),
+                created_seconds,
+                model_name.as_str(),
+            ),
+        )
+        .await
+        {
+            return;
+        }
+        if !send_sse_comment(&sender, "keepalive").await {
+            return;
+        }
+
+        let endpoint = match build_compat_gateway_endpoint(&state) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let _ = send_compat_responses_failed_stream_event(
+                    &sender,
+                    CompatResponsesFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        run_id: run_id.as_str(),
+                        session_id: session_id.as_str(),
+                        created_at_unix_ms,
+                        code: "gateway_unavailable",
+                        message: error,
+                        public_event: None,
+                    },
+                )
+                .await;
+                let _ = send_sse_done(&sender).await;
+                return;
+            }
+        };
+        let channel = match endpoint.connect().await {
+            Ok(channel) => channel,
+            Err(error) => {
+                let _ = send_compat_responses_failed_stream_event(
+                    &sender,
+                    CompatResponsesFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        run_id: run_id.as_str(),
+                        session_id: session_id.as_str(),
+                        created_at_unix_ms,
+                        code: "gateway_unavailable",
+                        message: format!("failed to connect compat API to gateway: {error}"),
+                        public_event: None,
+                    },
+                )
+                .await;
+                let _ = send_sse_done(&sender).await;
+                return;
+            }
+        };
+        let mut client = gateway_v1::gateway_service_client::GatewayServiceClient::new(channel);
+        let mut stream = match client.run_stream(run_request).await {
+            Ok(response) => response.into_inner(),
+            Err(error) => {
+                let _ = send_compat_responses_failed_stream_event(
+                    &sender,
+                    CompatResponsesFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        run_id: run_id.as_str(),
+                        session_id: session_id.as_str(),
+                        created_at_unix_ms,
+                        code: "gateway_stream_failed",
+                        message: sanitize_http_error_message(error.message()).to_owned(),
+                        public_event: None,
+                    },
+                )
+                .await;
+                let _ = send_sse_done(&sender).await;
+                return;
+            }
+        };
+
+        let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if !send_sse_comment(&sender, "keepalive").await {
+                        return;
+                    }
+                }
+                item = stream.next() => {
+                    let Some(item) = item else {
+                        break;
+                    };
+                    match item {
+                        Ok(event) => {
+                            public_event_sequence = public_event_sequence.saturating_add(1);
+                            let public_event_id =
+                                crate::application::run_stream::public_events::run_stream_public_event_id(
+                                    run_id.as_str(),
+                                    public_event_sequence,
+                                );
+                            let public_event = crate::application::run_stream::public_events::
+                                public_runtime_event_json_from_run_stream_event(
+                                    &event,
+                                    crate::application::run_stream::public_events::PublicRunStreamEventContext {
+                                        event_id: public_event_id.as_str(),
+                                        session_id: session_id.as_str(),
+                                        occurred_at_unix_ms: unix_ms_now().unwrap_or(created_at_unix_ms),
+                                        request_id: None,
+                                    },
+                                );
+                            match event.body {
+                                Some(common_v1::run_stream_event::Body::ModelToken(token_event)) => {
+                                    content.push_str(token_event.token.as_str());
+                                    if !send_sse_event(
+                                        &sender,
+                                        "response.output_text.delta",
+                                        json!({
+                                            "type": "response.output_text.delta",
+                                            "response_id": response_id,
+                                            "item_id": message_item_id,
+                                            "output_index": 0,
+                                            "content_index": 0,
+                                            "delta": token_event.token,
+                                            "_palyra": compat_stream_palyra_metadata(
+                                                run_id.as_str(),
+                                                session_id.as_str(),
+                                                public_event.as_ref()
+                                            ),
+                                        }),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
+                                Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
+                                    tool_calls.push(CompatToolCall {
+                                        id: proposal
+                                            .proposal_id
+                                            .as_ref()
+                                            .map(|value| value.ulid.clone())
+                                            .unwrap_or_else(|| Ulid::new().to_string()),
+                                        name: proposal.tool_name,
+                                        arguments: json_string_from_bytes(proposal.input_json.as_slice()),
+                                    });
+                                }
+                                Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
+                                    auto_deny_compat_tool_approval(
+                                        &request_sender,
+                                        session_id.as_str(),
+                                        run_id.as_str(),
+                                        &request,
+                                    )
+                                    .await;
+                                }
+                                Some(common_v1::run_stream_event::Body::Status(status))
+                                    if common_v1::stream_status::StatusKind::try_from(status.kind)
+                                        .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
+                                        == common_v1::stream_status::StatusKind::Failed =>
+                                {
+                                    last_public_terminal_event = public_event;
+                                    stream_error = Some(
+                                        sanitize_http_error_message(status.message.as_str()).to_owned(),
+                                    );
+                                    break;
+                                }
+                                Some(common_v1::run_stream_event::Body::Status(status))
+                                    if common_v1::stream_status::StatusKind::try_from(status.kind)
+                                        .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
+                                        == common_v1::stream_status::StatusKind::Done =>
+                                {
+                                    last_public_terminal_event = public_event;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(error) => {
+                            stream_error = Some(sanitize_http_error_message(error.message()).to_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = unix_ms_now().unwrap_or(created_at_unix_ms);
+        match stateful_run_snapshot(&state, run_id.as_str()).await {
+            Ok(snapshot) => {
+                if let Some(error) = stream_error.or_else(|| snapshot.last_error.clone()) {
+                    touch_compat_api_token(
+                        &state,
+                        token.token_id.as_str(),
+                        "run",
+                        "responses_failed",
+                        Some(run_id.as_str()),
+                        now,
+                    );
+                    let _ = send_compat_responses_failed_stream_event(
+                        &sender,
+                        CompatResponsesFailedStreamEvent {
+                            response_id: response_id.as_str(),
+                            run_id: run_id.as_str(),
+                            session_id: session_id.as_str(),
+                            created_at_unix_ms: snapshot.created_at_unix_ms,
+                            code: "run_failed",
+                            message: error,
+                            public_event: last_public_terminal_event.as_ref(),
+                        },
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
+                touch_compat_api_token(
+                    &state,
+                    token.token_id.as_str(),
+                    "run",
+                    "responses_completed",
+                    Some(run_id.as_str()),
+                    now,
+                );
+                let response = build_compat_responses_payload_from_parts(
+                    response_id,
+                    &snapshot,
+                    "completed",
+                    content,
+                    tool_calls.as_slice(),
+                    None,
+                );
+                let _ = send_sse_event(
+                    &sender,
+                    "response.completed",
+                    json!({
+                        "type": "response.completed",
+                        "response": response,
+                        "_palyra": compat_stream_palyra_metadata(
+                            run_id.as_str(),
+                            session_id.as_str(),
+                            last_public_terminal_event.as_ref()
+                        ),
+                    }),
+                )
+                .await;
+                let _ = send_sse_done(&sender).await;
+            }
+            Err(response) => {
+                touch_compat_api_token(
+                    &state,
+                    token.token_id.as_str(),
+                    "run",
+                    "responses_failed",
+                    Some(run_id.as_str()),
+                    now,
+                );
+                let body = compat_error_body_from_response(&response);
+                let _ = send_sse_event(
+                    &sender,
+                    "response.failed",
+                    json!({
+                        "type": "response.failed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "created": created_seconds,
+                            "status": "failed",
+                            "output": [],
+                            "usage": Value::Null,
+                            "error": body["error"].clone(),
+                            "_palyra": compat_stream_palyra_metadata(run_id.as_str(), session_id.as_str(), None),
+                        },
+                        "error": body["error"].clone(),
+                    }),
+                )
+                .await;
+                let _ = send_sse_done(&sender).await;
+            }
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+struct CompatResponsesFailedStreamEvent<'a> {
+    response_id: &'a str,
+    run_id: &'a str,
+    session_id: &'a str,
+    created_at_unix_ms: i64,
+    code: &'a str,
+    message: String,
+    public_event: Option<&'a Value>,
+}
+
+async fn send_compat_responses_failed_stream_event(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    event: CompatResponsesFailedStreamEvent<'_>,
+) -> bool {
+    let error = json!({
+        "type": "server_error",
+        "code": event.code,
+        "message": event.message,
+    });
+    send_sse_event(
+        sender,
+        "response.failed",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": event.response_id,
+                "object": "response",
+                "created": event.created_at_unix_ms / 1_000,
+                "status": "failed",
+                "output": [],
+                "usage": Value::Null,
+                "error": error,
+                "_palyra": compat_stream_palyra_metadata(
+                    event.run_id,
+                    event.session_id,
+                    event.public_event
+                ),
+            },
+            "error": error,
+        }),
+    )
+    .await
 }
 
 fn build_compat_models(provider: &model_provider::ProviderStatusSnapshot) -> Vec<Value> {
@@ -1762,12 +2160,42 @@ fn json_string_from_bytes(bytes: &[u8]) -> String {
 
 async fn send_sse_data(sender: &mpsc::Sender<Result<Bytes, Infallible>>, payload: Value) -> bool {
     let mut encoded = b"data: ".to_vec();
-    let Ok(mut body) = serde_json::to_vec(&payload) else {
-        return true;
+    let mut body = match serde_json::to_vec(&payload) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to serialize compat SSE data payload");
+            return false;
+        }
     };
     encoded.append(&mut body);
     encoded.extend_from_slice(b"\n\n");
     sender.send(Ok(Bytes::from(encoded))).await.is_ok()
+}
+
+async fn send_sse_event(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    event: &str,
+    payload: Value,
+) -> bool {
+    let mut body = match serde_json::to_vec(&payload) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                event,
+                "failed to serialize compat SSE event payload"
+            );
+            return false;
+        }
+    };
+    let mut encoded = format!("event: {event}\ndata: ").into_bytes();
+    encoded.append(&mut body);
+    encoded.extend_from_slice(b"\n\n");
+    sender.send(Ok(Bytes::from(encoded))).await.is_ok()
+}
+
+async fn send_sse_comment(sender: &mpsc::Sender<Result<Bytes, Infallible>>, comment: &str) -> bool {
+    sender.send(Ok(Bytes::from(format!(": {comment}\n\n")))).await.is_ok()
 }
 
 async fn send_sse_done(sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {

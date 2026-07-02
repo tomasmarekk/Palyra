@@ -1,0 +1,31 @@
+[
+  {
+    "event": "response.created",
+    "has_response_id": true,
+    "has_usage": false,
+    "response_object": "response",
+    "response_status": "in_progress",
+    "type": "response.created"
+  },
+  {
+    "content_index": 0,
+    "delta": "<text>",
+    "event": "response.output_text.delta",
+    "has_item_id": true,
+    "has_response_id": true,
+    "output_index": 0,
+    "type": "response.output_text.delta"
+  },
+  {
+    "event": "response.completed",
+    "has_response_id": true,
+    "has_usage": true,
+    "response_object": "response",
+    "response_status": "completed",
+    "type": "response.completed"
+  },
+  {
+    "event": null,
+    "type": "[DONE]"
+  }
+]

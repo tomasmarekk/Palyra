@@ -966,6 +966,183 @@ fn compat_tools_invoke_is_disabled_by_default_and_refuses_when_enabled() -> Resu
 }
 
 #[test]
+fn compat_responses_streams_text_events_and_preserves_non_stream_shape() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat responses token",
+        &["compat.responses.create"],
+    )?;
+
+    let (stream_status, stream_content_type, stream_body) = compat_post_sse(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &json!({
+            "input": "streamed responses text",
+            "stream": true
+        }),
+    )?;
+    assert_eq!(stream_status, 200, "responses stream should open successfully: {stream_body}");
+    assert!(
+        stream_content_type.starts_with("text/event-stream"),
+        "responses stream should use SSE content type: {stream_content_type}"
+    );
+    assert!(
+        stream_body.contains(": keepalive"),
+        "responses stream should emit SSE keepalive comments: {stream_body}"
+    );
+
+    let messages = parse_sse_messages(stream_body.as_str())?;
+    assert_json_golden(
+        "compat_responses_stream_text_events.json",
+        &normalize_responses_stream_grammar(messages.as_slice())?,
+    )?;
+
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    assert_eq!(
+        json_events.iter().filter_map(|event| event.0.as_deref()).collect::<Vec<_>>(),
+        vec!["response.created", "response.output_text.delta", "response.completed"],
+        "responses stream should preserve the public event order"
+    );
+
+    let created = &json_events[0].1;
+    let response_id = created
+        .pointer("/response/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("response.created missing response id"))?;
+    assert!(response_id.starts_with("resp_"));
+    assert_eq!(created.pointer("/response/status").and_then(Value::as_str), Some("in_progress"));
+
+    let delta_text = json_events[1]
+        .1
+        .get("delta")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("response.output_text.delta missing text"))?;
+    assert_eq!(delta_text, "streamed responses text");
+
+    let completed = &json_events[2].1;
+    assert_eq!(completed.pointer("/response/id").and_then(Value::as_str), Some(response_id));
+    assert_eq!(completed.pointer("/response/status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(
+        completed.pointer("/response/output/0/content/0/text").and_then(Value::as_str),
+        Some(delta_text),
+        "final response text should match streamed deltas"
+    );
+    assert!(
+        completed
+            .pointer("/response/usage/total_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0),
+        "response.completed should include final usage"
+    );
+    assert!(
+        messages.last().is_some_and(|(_, data)| data == "[DONE]"),
+        "responses stream should terminate with [DONE]"
+    );
+
+    let (non_stream_status, non_stream_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &json!({ "input": "non stream responses text" }),
+    )?;
+    assert_eq!(non_stream_status, 200, "non-stream responses should still succeed");
+    assert_eq!(non_stream_payload.get("object").and_then(Value::as_str), Some("response"));
+    assert_eq!(non_stream_payload.get("status").and_then(Value::as_str), Some("completed"));
+    assert!(
+        non_stream_payload
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("resp_")),
+        "non-stream response id shape should stay compatible"
+    );
+    assert_eq!(
+        non_stream_payload.pointer("/output/0/content/0/text").and_then(Value::as_str),
+        Some("non stream responses text")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn compat_responses_stream_maps_stream_failures_to_failed_event() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
+        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
+        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
+    )])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat responses failure token",
+        &["compat.responses.create"],
+    )?;
+
+    let (status, content_type, body) = compat_post_sse(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &json!({
+            "input": "stream should fail cleanly",
+            "stream": true
+        }),
+    )?;
+    assert_eq!(status, 200, "stream failures should be reported as SSE events: {body}");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "failed responses stream should still use SSE content type: {content_type}"
+    );
+
+    let messages = parse_sse_messages(body.as_str())?;
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    assert_eq!(
+        json_events.iter().filter_map(|event| event.0.as_deref()).collect::<Vec<_>>(),
+        vec!["response.created", "response.failed"],
+        "failed stream should emit created then failed"
+    );
+    let failed = &json_events[1].1;
+    assert_eq!(failed.get("type").and_then(Value::as_str), Some("response.failed"));
+    assert_eq!(failed.pointer("/response/status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(
+        failed.pointer("/error/code").and_then(Value::as_str),
+        Some("gateway_stream_failed")
+    );
+    assert!(
+        messages.last().is_some_and(|(_, data)| data == "[DONE]"),
+        "failed responses stream should still terminate with [DONE]"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_models_probe_redacts_provider_auth_failures() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;
@@ -2433,6 +2610,125 @@ fn compat_post_json(
         .json::<Value>()
         .with_context(|| format!("failed to parse compat POST {path} response json"))?;
     Ok((status, body))
+}
+
+fn compat_post_sse(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+    payload: &Value,
+) -> Result<(u16, String, String)> {
+    let response = client
+        .post(console_url(admin_port, path))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(payload)
+        .send()
+        .with_context(|| format!("failed to POST compat SSE path {path}"))?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body =
+        response.text().with_context(|| format!("failed to read compat SSE body for {path}"))?;
+    Ok((status, content_type, body))
+}
+
+fn parse_sse_messages(body: &str) -> Result<Vec<(Option<String>, String)>> {
+    let mut messages = Vec::new();
+    for raw_block in body.replace("\r\n", "\n").split("\n\n") {
+        let mut event = None;
+        let mut data_lines = Vec::new();
+        for line in raw_block.lines() {
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event:") {
+                event = Some(value.trim_start().to_owned());
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("data:") {
+                data_lines.push(value.trim_start().to_owned());
+            }
+        }
+        if event.is_some() || !data_lines.is_empty() {
+            messages.push((event, data_lines.join("\n")));
+        }
+    }
+    if messages.is_empty() {
+        anyhow::bail!("SSE body did not contain any messages: {body}");
+    }
+    Ok(messages)
+}
+
+fn parse_sse_json_events(
+    messages: &[(Option<String>, String)],
+) -> Result<Vec<(Option<String>, Value)>> {
+    messages
+        .iter()
+        .filter(|(_, data)| data != "[DONE]")
+        .map(|(event, data)| {
+            serde_json::from_str::<Value>(data)
+                .map(|value| (event.clone(), value))
+                .with_context(|| format!("failed to parse SSE data as JSON: {data}"))
+        })
+        .collect()
+}
+
+fn normalize_responses_stream_grammar(messages: &[(Option<String>, String)]) -> Result<Value> {
+    let mut normalized = Vec::new();
+    for (event, data) in messages {
+        if data == "[DONE]" {
+            normalized.push(json!({
+                "event": Value::Null,
+                "type": "[DONE]"
+            }));
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(data)
+            .with_context(|| format!("failed to parse SSE data as JSON: {data}"))?;
+        let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+        match event_type {
+            "response.created" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "response_object": value.pointer("/response/object").and_then(Value::as_str),
+                "response_status": value.pointer("/response/status").and_then(Value::as_str),
+                "has_response_id": value.pointer("/response/id").and_then(Value::as_str).is_some(),
+                "has_usage": !value.pointer("/response/usage").is_some_and(Value::is_null),
+            })),
+            "response.output_text.delta" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "output_index": value.get("output_index").and_then(Value::as_u64),
+                "content_index": value.get("content_index").and_then(Value::as_u64),
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_item_id": value.get("item_id").and_then(Value::as_str).is_some(),
+                "delta": "<text>",
+            })),
+            "response.completed" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "response_object": value.pointer("/response/object").and_then(Value::as_str),
+                "response_status": value.pointer("/response/status").and_then(Value::as_str),
+                "has_response_id": value.pointer("/response/id").and_then(Value::as_str).is_some(),
+                "has_usage": value.pointer("/response/usage/total_tokens").and_then(Value::as_u64).is_some(),
+            })),
+            "response.failed" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "response_object": value.pointer("/response/object").and_then(Value::as_str),
+                "response_status": value.pointer("/response/status").and_then(Value::as_str),
+                "has_response_id": value.pointer("/response/id").and_then(Value::as_str).is_some(),
+                "has_error": value.get("error").is_some(),
+            })),
+            other => anyhow::bail!("unexpected responses stream event type {other}: {value}"),
+        }
+    }
+    Ok(Value::Array(normalized))
 }
 
 fn find_profile<'a>(profiles: &'a Value, profile_id: &str) -> Result<&'a Value> {
