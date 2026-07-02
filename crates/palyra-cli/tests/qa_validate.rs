@@ -175,3 +175,90 @@ fn qa_run_pack_filters_release_smoke_and_writes_aggregate_report() -> Result<()>
     assert_eq!(stdout_payload, golden_payload, "release_smoke aggregate report drifted");
     Ok(())
 }
+
+#[test]
+fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+    let output_path = temp_dir.path().join("provider-compat").join("report.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "provider-compat", "--path", "fixtures/provider_compat", "--output"])
+        .arg(output_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra qa provider-compat")?;
+
+    assert!(
+        output.status.success(),
+        "qa provider-compat should pass: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout_payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("qa provider-compat JSON output should parse")?;
+    let file_payload: Value = serde_json::from_slice(
+        fs::read(output_path.as_path())
+            .context("qa provider-compat should write an aggregate report")?
+            .as_slice(),
+    )
+    .context("written provider compatibility report should parse")?;
+    assert_eq!(stdout_payload, file_payload, "stdout and report file should match");
+    assert_eq!(stdout_payload.pointer("/pack_count").and_then(Value::as_u64), Some(1));
+    assert_eq!(stdout_payload.pointer("/fixture_count").and_then(Value::as_u64), Some(12));
+    assert_eq!(stdout_payload.pointer("/category_count").and_then(Value::as_u64), Some(12));
+
+    let fixtures = stdout_payload
+        .pointer("/packs/0/fixtures")
+        .and_then(Value::as_array)
+        .context("provider compatibility report should include fixtures")?;
+    let invalid_json = fixtures
+        .iter()
+        .find(|fixture| {
+            fixture.get("category").and_then(Value::as_str) == Some("invalid_json_arguments")
+        })
+        .context("invalid JSON arguments fixture should be reported")?;
+    assert_eq!(
+        invalid_json.get("expected_failure_class").and_then(Value::as_str),
+        Some("malformed_response")
+    );
+    assert_eq!(
+        invalid_json.get("expected_recovery_decision").and_then(Value::as_str),
+        Some("fail_closed")
+    );
+    assert!(
+        invalid_json
+            .get("recovery_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.contains("Reject invalid tool JSON")),
+        "report should expose an actionable recovery path"
+    );
+    Ok(())
+}
+
+#[test]
+fn qa_validate_accepts_provider_compatibility_scenario_pack() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "validate", "--path", "qa/scenarios/provider", "--json"])
+        .output()
+        .context("failed to execute palyra qa validate for provider scenarios")?;
+
+    assert!(
+        output.status.success(),
+        "provider compatibility scenarios should validate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(output.stdout.as_slice())
+        .context("qa validate provider scenario JSON output should parse")?;
+    assert_eq!(payload.pointer("/valid").and_then(Value::as_bool), Some(true));
+    assert_eq!(payload.pointer("/scenario_count").and_then(Value::as_u64), Some(12));
+    let scenarios = payload
+        .pointer("/scenarios")
+        .and_then(Value::as_array)
+        .context("provider scenario report should include scenarios")?;
+    assert!(scenarios.iter().all(|scenario| {
+        scenario.get("maturity_labels").and_then(Value::as_array).is_some_and(|labels| {
+            labels.iter().any(|label| label.as_str() == Some("provider_compat"))
+        })
+    }));
+    Ok(())
+}

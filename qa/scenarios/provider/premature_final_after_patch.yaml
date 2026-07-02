@@ -1,0 +1,50 @@
+schema_version: 1
+id: provider.compat.premature_final_after_patch
+title: Provider compatibility premature final after patch
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - patch_verification
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the premature_final_after_patch provider compatibility fixture."
+expect:
+  terminal_state: failed
+  final_answer:
+    contains:
+      - "premature_final_after_patch"
+      - "verification"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - run.completed_unverified_patch
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/premature_final_after_patch.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

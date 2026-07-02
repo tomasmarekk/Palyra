@@ -1,0 +1,50 @@
+schema_version: 1
+id: provider.compat.tool_result_too_large
+title: Provider compatibility tool result too large
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - redaction
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the tool_result_too_large provider compatibility fixture."
+expect:
+  terminal_state: failed
+  final_answer:
+    contains:
+      - "tool_result_too_large"
+      - "fail_closed"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - tool.result.raw_dumped
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/tool_result_too_large.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

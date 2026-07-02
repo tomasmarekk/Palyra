@@ -1,0 +1,51 @@
+schema_version: 1
+id: provider.compat.auth_expired
+title: Provider compatibility auth expired
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - provider_recovery
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the auth_expired provider compatibility fixture."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "auth_expired"
+      - "refresh_credential"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - secret.exposed
+  artifacts: []
+  claims:
+    - "Bearer "
+artifacts:
+  - path: qa/reports/provider/auth_expired.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

@@ -1,0 +1,223 @@
+schema_version: 1
+id: provider_compat.p0_pack
+anonymization:
+  redaction_level: sanitized_raw_payload
+  placeholder_values:
+    - <redacted>
+    - <provider_response_id>
+    - <provider_request_id>
+    - <provider_account_id>
+    - <tool_call_id>
+  notes:
+    - Raw provider ids, account ids, request ids, and credentials are replaced with placeholders.
+    - Payloads are intentionally minimal but preserve the provider quirk shape.
+fixtures:
+  - id: truncated_tool_args
+    category: truncated_tool_args
+    title: Truncated tool arguments
+    raw_payload:
+      kind: response
+      content_type: application/json
+      status_code: 200
+      body: '{"id":"<provider_response_id>","choices":[{"message":{"tool_calls":[{"id":"<tool_call_id>","function":{"name":"palyra.fs.write_file","arguments":"{\"path\":\"src/main.rs\",\"content\":\"fn main() {"}}]},"finish_reason":"tool_calls"}]}'
+    mock_behavior:
+      kind: malformed_tool_args
+      finish_reason: tool_calls
+      error_message: Tool-call arguments ended before a complete JSON object.
+    expected:
+      verdict: fail_closed
+      failure_class: malformed_response
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Reject the incomplete tool proposal and surface malformed_response evidence.
+  - id: invalid_json_arguments
+    category: invalid_json_arguments
+    title: Invalid JSON tool arguments
+    raw_payload:
+      kind: response
+      content_type: application/json
+      status_code: 200
+      body: '{"id":"<provider_response_id>","output":[{"type":"function_call","call_id":"<tool_call_id>","name":"palyra.fs.read_file","arguments":"{path:README.md}"}]}'
+    mock_behavior:
+      kind: malformed_tool_args
+      finish_reason: tool_calls
+      error_message: Tool-call arguments are not valid JSON.
+    expected:
+      verdict: fail_closed
+      failure_class: malformed_response
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Reject invalid tool JSON before execution and include the JSON parser failure in QA evidence.
+  - id: invalid_tool_name
+    category: invalid_tool_name
+    title: Invalid provider tool name
+    raw_payload:
+      kind: response
+      content_type: application/json
+      status_code: 200
+      body: '{"id":"<provider_response_id>","output":[{"type":"function_call","call_id":"<tool_call_id>","name":"../../shell","arguments":"{\"cmd\":\"whoami\"}"}]}'
+    mock_behavior:
+      kind: malformed_tool_args
+      finish_reason: tool_calls
+      error_message: Provider emitted a tool name outside the model-visible catalog.
+    expected:
+      verdict: fail_closed
+      failure_class: malformed_response
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Deny the unknown tool name and do not dispatch any tool execution.
+  - id: empty_final_answer
+    category: empty_final_answer
+    title: Empty final answer
+    raw_payload:
+      kind: response
+      content_type: application/json
+      status_code: 200
+      body: '{"id":"<provider_response_id>","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"total_tokens":42}}'
+    mock_behavior:
+      kind: empty
+      finish_reason: stop
+      error_message: Provider returned an empty assistant final answer.
+    expected:
+      verdict: recover
+      failure_class: malformed_response
+      recovery_decision: retry_same_provider
+      fail_closed: false
+      recovery_path: Retry the same provider once with the prior context and record empty_response evidence.
+  - id: context_overflow
+    category: context_overflow
+    title: Context window overflow
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 400
+      body: '{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"maximum context length exceeded for request <provider_request_id>"}}'
+    mock_behavior:
+      kind: context_overflow
+      error_message: Maximum context length exceeded.
+    expected:
+      verdict: recover
+      failure_class: context_window_exceeded
+      recovery_decision: compact_and_retry
+      fail_closed: false
+      recovery_path: Compact the session context, preserve tool results, and retry with a smaller prompt.
+  - id: rate_limit
+    category: rate_limit
+    title: Provider rate limit
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 429
+      body: '{"error":{"type":"rate_limit_error","message":"rate limit exceeded","retry_after_ms":2000},"request_id":"<provider_request_id>"}'
+    mock_behavior:
+      kind: stream_error
+      error_message: Provider rate limit exceeded.
+    expected:
+      verdict: recover
+      failure_class: rate_limited
+      recovery_decision: retry_after
+      fail_closed: false
+      recovery_path: Respect retry-after/backoff before retrying the same provider.
+  - id: quota
+    category: quota
+    title: Provider quota exhausted
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 402
+      body: '{"error":{"type":"billing_error","code":"insufficient_quota","message":"quota exceeded for account <provider_account_id>"}}'
+    mock_behavior:
+      kind: stream_error
+      error_message: Provider quota exhausted.
+    expected:
+      verdict: fail_closed
+      failure_class: quota_exceeded
+      recovery_decision: ask_user
+      fail_closed: true
+      recovery_path: Stop the run and ask the operator to update billing or select another authorized provider.
+  - id: auth_expired
+    category: auth_expired
+    title: Expired provider credential
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 401
+      body: '{"error":{"type":"authentication_error","message":"Bearer <redacted> expired","code":"token_expired"},"request_id":"<provider_request_id>"}'
+    mock_behavior:
+      kind: stream_error
+      error_message: Provider credential expired.
+    expected:
+      verdict: recover
+      failure_class: auth_expired
+      recovery_decision: refresh_credential
+      fail_closed: false
+      recovery_path: Refresh the credential through the vault/auth profile boundary before retrying.
+  - id: unsupported_schema
+    category: unsupported_schema
+    title: Unsupported provider schema
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 400
+      body: '{"error":{"type":"invalid_request_error","message":"response_format json_schema is not supported by this model","param":"response_format"}}'
+    mock_behavior:
+      kind: malformed_output
+      error_message: Provider rejected the requested schema contract.
+    expected:
+      verdict: fail_closed
+      failure_class: permanent_upstream
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Fail closed unless a tested schema downgrade or fallback model is explicitly configured.
+  - id: malformed_sse_chunk
+    category: malformed_sse_chunk
+    title: Malformed SSE chunk
+    raw_payload:
+      kind: stream_chunk
+      content_type: text/event-stream
+      status_code: 200
+      body: 'data: {"id":"<provider_response_id>","choices":[{"delta":{"content":"hello"}'
+    mock_behavior:
+      kind: stream_error
+      error_message: Provider stream emitted malformed SSE JSON.
+    expected:
+      verdict: recover
+      failure_class: malformed_response
+      recovery_decision: retry_same_provider
+      fail_closed: false
+      recovery_path: Discard the partial chunk, mark the stream malformed, and retry through the stream normalizer.
+  - id: tool_result_too_large
+    category: tool_result_too_large
+    title: Tool result too large for provider follow-up
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 413
+      body: '{"error":{"type":"invalid_request_error","message":"tool result payload too large for follow-up request","request_id":"<provider_request_id>"}}'
+    mock_behavior:
+      kind: malformed_output
+      error_message: Tool result payload exceeded the provider follow-up limit.
+    expected:
+      verdict: fail_closed
+      failure_class: context_window_exceeded
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Refuse to resend the oversized tool result until a redacted or summarized artifact is available.
+  - id: premature_final_after_patch
+    category: premature_final_after_patch
+    title: Premature final answer after patch proposal
+    raw_payload:
+      kind: response
+      content_type: application/json
+      status_code: 200
+      body: '{"id":"<provider_response_id>","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Patch applied successfully."}]}],"previous_tool_call_id":"<tool_call_id>"}'
+    mock_behavior:
+      kind: text
+      finish_reason: stop
+      error_message: Provider emitted final text before patch verification completed.
+    expected:
+      verdict: fail_closed
+      failure_class: malformed_response
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Hold the run in verification-required state and reject the premature final answer.

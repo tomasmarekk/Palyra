@@ -1,0 +1,51 @@
+schema_version: 1
+id: provider.compat.truncated_tool_args
+title: Provider compatibility truncated tool args
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+  tools:
+    - palyra.fs.write_file
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the truncated_tool_args provider compatibility fixture."
+expect:
+  terminal_state: failed
+  final_answer:
+    contains:
+      - "truncated_tool_args"
+      - "malformed_response"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - palyra.fs.write_file
+  events:
+    - tool.call.started
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/truncated_tool_args.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

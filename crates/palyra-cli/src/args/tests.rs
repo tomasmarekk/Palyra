@@ -93,6 +93,30 @@ fn parse_qa_run_pack_with_tags_output_and_json() {
 }
 
 #[test]
+fn parse_qa_provider_compat_with_output_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "qa",
+        "provider-compat",
+        "--path",
+        "fixtures/provider_compat",
+        "--output",
+        "artifacts/provider-compat.json",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Qa {
+            command: QaCommand::ProviderCompat {
+                path: "fixtures/provider_compat".to_owned(),
+                output: Some("artifacts/provider-compat.json".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_gateway_status_with_json_flag() {
     let parsed = Cli::parse_from(["palyra", "gateway", "status", "--json"]);
     assert_eq!(

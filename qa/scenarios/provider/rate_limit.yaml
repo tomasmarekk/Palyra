@@ -1,0 +1,50 @@
+schema_version: 1
+id: provider.compat.rate_limit
+title: Provider compatibility rate limit
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - provider_recovery
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the rate_limit provider compatibility fixture."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "rate_limited"
+      - "retry_after"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - provider.retry.busy_loop
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/rate_limit.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

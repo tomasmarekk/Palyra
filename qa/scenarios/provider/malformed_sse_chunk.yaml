@@ -1,0 +1,50 @@
+schema_version: 1
+id: provider.compat.malformed_sse_chunk
+title: Provider compatibility malformed SSE chunk
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - provider_stream_normalizer
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the malformed_sse_chunk provider compatibility fixture."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "malformed_sse_chunk"
+      - "retry_same_provider"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - stream.partial_json.persisted
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/malformed_sse_chunk.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

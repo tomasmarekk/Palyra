@@ -1,0 +1,50 @@
+schema_version: 1
+id: provider.compat.context_overflow
+title: Provider compatibility context overflow
+area: provider
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - qa_lab
+    - provider_compat
+    - context_compaction
+  tools: []
+  fixtures:
+    - fixtures/provider_compat/p0_provider_compat_pack.yaml
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Classify the context_overflow provider compatibility fixture."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "context_window_exceeded"
+      - "compact_and_retry"
+  events:
+    - event_type: provider.compat.fixture.loaded
+      min_count: 1
+    - event_type: provider.recovery.decision
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls: []
+  events:
+    - context.raw_dumped
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/provider/context_overflow.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - provider_compat
+timeout:
+  run_ms: 30000
+  step_ms: 10000

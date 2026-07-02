@@ -22,4 +22,13 @@ pub enum QaCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Validate provider compatibility fixtures")]
+    ProviderCompat {
+        #[arg(long, default_value = "fixtures/provider_compat")]
+        path: String,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }

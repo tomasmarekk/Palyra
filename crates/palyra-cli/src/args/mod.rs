@@ -277,10 +277,12 @@ Examples:
   palyra qa validate --path qa/scenarios --json
   palyra qa run-pack --tag p0 --json
   palyra qa run-pack --tag release_smoke --output artifacts/qa-pack-report.json
+  palyra qa provider-compat --path fixtures/provider_compat --json
 
 Discoverability:
   `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.
-  `qa run-pack` performs a local deterministic dry-run of selected mock scenarios.";
+  `qa run-pack` performs a local deterministic dry-run of selected mock scenarios.
+  `qa provider-compat` validates sanitized provider quirk fixtures and recovery expectations.";
 
 const DEPLOYMENT_AFTER_HELP: &str = "\
 Examples:

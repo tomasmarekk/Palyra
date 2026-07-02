@@ -11,9 +11,14 @@ use palyra_common::{
         QaScenarioManifestIssue, QaScenarioProviderMode,
     },
 };
-use palyra_model_providers::parse_qa_mock_provider_fixture_yaml;
+use palyra_model_providers::{
+    parse_provider_compat_fixture_pack_yaml, parse_qa_mock_provider_fixture_yaml,
+    provider_compat_fixture_pack_report, ProviderCompatFixtureError, ProviderCompatFixtureIssue,
+    ProviderCompatPackReport,
+};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::BTreeSet;
 
 /// Runs a `palyra qa` subcommand.
 ///
@@ -25,6 +30,9 @@ pub(crate) fn run_qa(command: QaCommand) -> Result<()> {
         QaCommand::Validate { path, json } => run_validate(Path::new(path.as_str()), json),
         QaCommand::RunPack { path, tags, output, json } => {
             run_pack(Path::new(path.as_str()), tags.as_slice(), output.as_deref(), json)
+        }
+        QaCommand::ProviderCompat { path, output, json } => {
+            run_provider_compat(Path::new(path.as_str()), output.as_deref(), json)
         }
     }
 }
@@ -79,6 +87,18 @@ struct QaPackScenarioReport {
     sandbox_fixture: bool,
     sandbox_cleanup_verified: bool,
     reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QaProviderCompatReport {
+    schema_version: u32,
+    format: &'static str,
+    path: String,
+    pack_count: usize,
+    fixture_count: usize,
+    category_count: usize,
+    missing_categories: Vec<String>,
+    packs: Vec<ProviderCompatPackReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -178,6 +198,83 @@ fn run_pack(
         anyhow::bail!("QA pack failed with {} failing scenario(s)", report.failed);
     }
     Ok(())
+}
+
+fn run_provider_compat(path: &Path, output: Option<&str>, json: bool) -> Result<()> {
+    let report = build_provider_compat_report(path)?;
+    if let Some(output) = output {
+        let encoded = serde_json::to_vec_pretty(&report)
+            .context("failed to encode provider compatibility report")?;
+        write_qa_report(Path::new(output), encoded.as_slice())?;
+    }
+    if output::preferred_json(json) {
+        output::print_json_pretty(
+            &report,
+            "failed to encode provider compatibility report as JSON",
+        )?;
+    } else {
+        println!(
+            "qa.provider_compat status=ok path={} packs={} fixtures={} categories={} missing={}",
+            report.path,
+            report.pack_count,
+            report.fixture_count,
+            report.category_count,
+            report.missing_categories.len()
+        );
+        for pack in &report.packs {
+            for fixture in &pack.fixtures {
+                println!(
+                    "qa.provider_compat.fixture id={} category={} failure_class={} recovery_decision={} fail_closed={} recovery_path=\"{}\"",
+                    fixture.id,
+                    fixture.category,
+                    fixture.expected_failure_class,
+                    fixture.expected_recovery_decision,
+                    fixture.fail_closed,
+                    fixture.recovery_path
+                );
+            }
+        }
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    Ok(())
+}
+
+fn build_provider_compat_report(path: &Path) -> Result<QaProviderCompatReport> {
+    let pack_paths = collect_yaml_paths(path, "provider compatibility fixture")?;
+    let mut packs = Vec::with_capacity(pack_paths.len());
+    for pack_path in pack_paths {
+        packs.push(load_provider_compat_pack_report(pack_path.as_path())?);
+    }
+    let fixture_count = packs.iter().map(|pack| pack.fixture_count).sum();
+    let categories = packs
+        .iter()
+        .flat_map(|pack| pack.fixtures.iter().map(|fixture| fixture.category.clone()))
+        .collect::<BTreeSet<_>>();
+    let missing_categories = packs
+        .iter()
+        .flat_map(|pack| pack.missing_categories.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(QaProviderCompatReport {
+        schema_version: 1,
+        format: "palyra-qa-provider-compat-report",
+        path: display_path_slash(path),
+        pack_count: packs.len(),
+        fixture_count,
+        category_count: categories.len(),
+        missing_categories,
+        packs,
+    })
+}
+
+fn load_provider_compat_pack_report(path: &Path) -> Result<ProviderCompatPackReport> {
+    let text = fs::read_to_string(path).with_context(|| {
+        format!("failed to read provider compatibility fixture {}", path.display())
+    })?;
+    let pack = parse_provider_compat_fixture_pack_yaml(text.as_str())
+        .map_err(|error| render_provider_compat_error(path, error))?;
+    Ok(provider_compat_fixture_pack_report(&pack))
 }
 
 fn build_pack_report(path: &Path, requested_tags: &[String]) -> Result<QaPackAggregateReport> {
@@ -424,6 +521,7 @@ fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
                 .extension()
                 .and_then(OsStr::to_str)
                 .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+            && display_path_slash(path).starts_with("qa/fixtures/")
             && fixture.contains("provider")
         {
             match fs::read_to_string(path)
@@ -436,6 +534,39 @@ fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
         }
     }
     issue_codes
+}
+
+fn collect_yaml_paths(path: &Path, label: &str) -> Result<Vec<PathBuf>> {
+    if path.is_file() {
+        if is_yaml_path(path) {
+            return Ok(vec![path.to_path_buf()]);
+        }
+        anyhow::bail!("{} path {} is not a YAML file", label, path.display());
+    }
+    if !path.is_dir() {
+        anyhow::bail!("{} path {} is not a file or directory", label, path.display());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read {} directory {}", label, path.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to read {} directory entry in {}", label, path.display())
+        })?;
+        let entry_path = entry.path();
+        if entry_path.is_file() && is_yaml_path(entry_path.as_path()) {
+            paths.push(entry_path);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        anyhow::bail!(
+            "{} directory {} does not contain .yaml or .yml files",
+            label,
+            path.display()
+        );
+    }
+    Ok(paths)
 }
 
 fn count_status(scenarios: &[QaPackScenarioReport], status: QaPackScenarioStatus) -> usize {
@@ -516,6 +647,29 @@ fn render_manifest_error(path: &Path, error: QaScenarioManifestError) -> anyhow:
         ),
         None => anyhow::anyhow!("failed to parse QA scenario {}: {}", path.display(), error),
     }
+}
+
+fn render_provider_compat_error(path: &Path, error: ProviderCompatFixtureError) -> anyhow::Error {
+    match error.issues() {
+        Some(issues) => anyhow::anyhow!(
+            "provider compatibility fixture validation failed for {}: {}",
+            path.display(),
+            render_provider_compat_issues(issues)
+        ),
+        None => anyhow::anyhow!(
+            "failed to parse provider compatibility fixture {}: {}",
+            path.display(),
+            error
+        ),
+    }
+}
+
+fn render_provider_compat_issues(issues: &[ProviderCompatFixtureIssue]) -> String {
+    issues
+        .iter()
+        .map(|issue| format!("{} at {}: {}", issue.code, issue.path, issue.message))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn render_validation_issues(issues: &[QaScenarioManifestIssue]) -> String {

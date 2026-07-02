@@ -768,6 +768,17 @@ path = "qa run-pack"
 file = "qa-run-pack-help.txt"
 
 [[entries]]
+path = "qa provider-compat"
+category = "nested_surface"
+status = "done"
+summary = "Validate sanitized provider compatibility fixture packs and recovery expectations."
+required_flags = ["path", "output", "json"]
+
+[entries.snapshot]
+path = "qa provider-compat"
+file = "qa-provider-compat-help.txt"
+
+[[entries]]
 path = "config"
 category = "top_level"
 status = "done"

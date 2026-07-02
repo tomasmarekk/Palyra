@@ -1,0 +1,33 @@
+Validate provider compatibility fixtures
+
+Usage: palyra qa provider-compat [OPTIONS]
+
+Options:
+      --path <PATH>      [default: fixtures/provider_compat]
+      --output <OUTPUT>
+      --json
+  -h, --help             Print help
+
+Global Options:
+      --profile <PROFILE>
+          Use the named CLI profile from the local profile registry
+      --expect-profile <EXPECT_PROFILE>
+          Require the resolved active profile name to match this value
+      --config <CONFIG_PATH>
+          Use this palyra.toml config file
+      --state-root <STATE_ROOT>
+          Use this runtime state root directory
+  -v, --verbose...
+          Increase logging verbosity (-v => debug, -vv => trace)
+      --log-level <LOG_LEVEL>
+          Set diagnostic log verbosity [default: info] [possible values: error, warn, info, debug, trace]
+      --output-format <OUTPUT_FORMAT>
+          Select text, JSON, or NDJSON output for automation [default: text] [possible values: text, json, ndjson]
+      --plain
+          Disable styled terminal output
+      --no-color
+          Disable ANSI color output
+      --allow-profile-mismatch
+          Allow commands to continue when the selected profile differs from context
+      --allow-strict-profile-actions
+          Permit strict profile-scoped actions after explicit profile checks

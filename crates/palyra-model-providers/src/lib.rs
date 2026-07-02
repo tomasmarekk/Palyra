@@ -9,6 +9,7 @@ pub mod contract;
 pub mod discovery;
 pub mod error_envelope;
 pub mod errors;
+pub mod provider_compat;
 pub mod providers;
 pub mod qa_mock;
 pub mod snapshots;
@@ -68,6 +69,17 @@ pub use errors::{
     user_action_provider_classification, ProviderError, ProviderFailureAction,
     ProviderFailureCategory, ProviderFailureClass, ProviderFailureClassification,
     ProviderFailureSnapshot, ProviderRecoveryAction, ProviderRecoveryPlanSnapshot,
+};
+pub use provider_compat::{
+    parse_provider_compat_fixture_pack_yaml, provider_compat_fixture_pack_report,
+    provider_compat_fixture_schema_snapshot, redact_provider_compat_raw_payload,
+    ProviderCompatAnonymizationRules, ProviderCompatCategory, ProviderCompatExpectedOutcome,
+    ProviderCompatExpectedVerdict, ProviderCompatFixture, ProviderCompatFixtureError,
+    ProviderCompatFixtureIssue, ProviderCompatFixturePack, ProviderCompatFixtureReport,
+    ProviderCompatIssueSeverity, ProviderCompatMockBehavior, ProviderCompatPackReport,
+    ProviderCompatRawPayload, ProviderCompatRawPayloadKind, ProviderCompatValidationError,
+    PROVIDER_COMPAT_FIXTURE_FORMAT, PROVIDER_COMPAT_FIXTURE_SCHEMA_VERSION,
+    PROVIDER_COMPAT_REPORT_FORMAT,
 };
 pub use providers::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
