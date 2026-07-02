@@ -1,5 +1,7 @@
 //! `palyra run`: run trajectory export for audit and eval workflows.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::{commands::support_bundle, *};
 use palyra_common::replay_bundle::{
     canonical_replay_bundle_bytes, replay_bundle_offline, ReplayBundle, ReplayRunStatus,
@@ -26,6 +28,9 @@ pub(crate) fn run_run(command: RunCommand) -> Result<()> {
             max_events,
             trajectory,
         } => run_export(run_id, output, format, redacted, journal_db, max_events, trajectory),
+        RunCommand::Replay { input, golden, diff_output, json } => {
+            run_replay(input, golden, diff_output, json)
+        }
     }
 }
 
@@ -79,6 +84,51 @@ fn run_export(
         );
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_replay(
+    input: String,
+    golden: Option<String>,
+    diff_output: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let input_path = PathBuf::from(input);
+    let bytes = fs::read(input_path.as_path())
+        .with_context(|| format!("failed to read trajectory {}", input_path.display()))?;
+    let document = parse_run_trajectory_jsonl(bytes.as_slice())?;
+    let golden = golden
+        .map(|path| {
+            let path = PathBuf::from(path);
+            let bytes = fs::read(path.as_path())
+                .with_context(|| format!("failed to read replay golden {}", path.display()))?;
+            let value = serde_json::from_slice::<Value>(bytes.as_slice())
+                .with_context(|| format!("failed to parse replay golden {}", path.display()))?;
+            Ok::<_, anyhow::Error>(value)
+        })
+        .transpose()?;
+    let report = replay_trajectory_document(&document, golden.as_ref())?;
+    if let Some(output) = diff_output {
+        let output_path = PathBuf::from(output);
+        let markdown = render_replay_diff_markdown(&report);
+        support_bundle::write_replay_artifact(output_path.as_path(), markdown.as_bytes())?;
+    }
+    if output::preferred_json(json) {
+        output::print_json_pretty(&report, "failed to encode run replay report as JSON")?;
+    } else {
+        println!(
+            "run.replay status={} events={} tool_proposals={} diffs={} unsafe_mutations={}",
+            report.status,
+            report.summary.event_count,
+            report.summary.tool_proposals.len(),
+            report.diffs.len(),
+            report.unsafe_mutations.len()
+        );
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    if report.status != "passed" {
+        anyhow::bail!("run replay failed with {} diff(s)", report.diffs.len());
+    }
+    Ok(())
 }
 
 fn build_run_trajectory_jsonl(
@@ -419,6 +469,414 @@ fn sha256_json_value(value: &Value) -> Result<String> {
     Ok(crate::sha256_hex(bytes.as_slice()))
 }
 
+#[derive(Debug, Clone)]
+struct RunTrajectoryDocument {
+    manifest: Value,
+    events: Vec<Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayReport {
+    schema_version: u32,
+    format: &'static str,
+    status: &'static str,
+    summary: RunReplaySummary,
+    diffs: Vec<RunReplayDiff>,
+    unsafe_mutations: Vec<RunReplayUnsafeMutation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplaySummary {
+    event_count: usize,
+    event_categories: BTreeMap<String, usize>,
+    public_events: Vec<RunReplayPublicEvent>,
+    tool_proposals: Vec<RunReplayToolProposal>,
+    tool_outputs: Vec<String>,
+    final_answer_sha256: Option<String>,
+    artifact_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayPublicEvent {
+    event_type: String,
+    category: String,
+    stable_payload: Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayToolProposal {
+    proposal_id: String,
+    tool_name: String,
+    mutation_class: String,
+    recorded_output: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayDiff {
+    path: String,
+    expected: String,
+    actual: String,
+    context: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayUnsafeMutation {
+    proposal_id: String,
+    tool_name: String,
+    reason: String,
+}
+
+fn parse_run_trajectory_jsonl(bytes: &[u8]) -> Result<RunTrajectoryDocument> {
+    let text = std::str::from_utf8(bytes).context("trajectory JSONL must be UTF-8")?;
+    let mut rows = text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()).map(
+        |(index, line)| {
+            serde_json::from_str::<Value>(line)
+                .with_context(|| format!("failed to parse trajectory JSONL line {}", index + 1))
+        },
+    );
+    let manifest = rows.next().context("trajectory JSONL is empty")??;
+    if manifest.get("format").and_then(Value::as_str) != Some(RUN_TRAJECTORY_JSONL_FORMAT) {
+        anyhow::bail!("trajectory manifest format must be {}", RUN_TRAJECTORY_JSONL_FORMAT);
+    }
+    verify_trajectory_manifest_hash(&manifest)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let row = row?;
+        if row.get("line_type").and_then(Value::as_str) != Some("event") {
+            anyhow::bail!("trajectory JSONL contains non-event row after manifest");
+        }
+        events.push(row);
+    }
+    Ok(RunTrajectoryDocument { manifest, events })
+}
+
+fn verify_trajectory_manifest_hash(manifest: &Value) -> Result<()> {
+    let expected = manifest
+        .get("manifest_hash_sha256")
+        .and_then(Value::as_str)
+        .context("trajectory manifest is missing manifest_hash_sha256")?;
+    let mut without_hash = manifest.clone();
+    if let Some(object) = without_hash.as_object_mut() {
+        object.remove("manifest_hash_sha256");
+    }
+    let actual = sha256_json_value(&without_hash)?;
+    if expected != actual {
+        anyhow::bail!("trajectory manifest hash mismatch");
+    }
+    Ok(())
+}
+
+fn replay_trajectory_document(
+    document: &RunTrajectoryDocument,
+    golden: Option<&Value>,
+) -> Result<RunReplayReport> {
+    let summary = summarize_run_trajectory(document);
+    let unsafe_mutations = unsafe_mutations_without_recorded_outputs(&summary);
+    let mut diffs = Vec::new();
+    if !unsafe_mutations.is_empty() {
+        diffs.push(RunReplayDiff {
+            path: "$.tool_proposals".to_owned(),
+            expected: "non-idempotent mutations require recorded tool output".to_owned(),
+            actual: format!(
+                "{} unsafe mutation(s) without recorded output",
+                unsafe_mutations.len()
+            ),
+            context: "offline replay refuses to re-run mutating tools without recorded evidence"
+                .to_owned(),
+        });
+    }
+    if let Some(golden) = golden {
+        diffs.extend(compare_trajectory_summary_to_golden(&summary, golden)?);
+    }
+    let status = if diffs.is_empty() { "passed" } else { "failed" };
+    Ok(RunReplayReport {
+        schema_version: 1,
+        format: "palyra-run-replay-report",
+        status,
+        summary,
+        diffs,
+        unsafe_mutations,
+    })
+}
+
+fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummary {
+    let mut event_categories = BTreeMap::<String, usize>::new();
+    let mut public_events = Vec::with_capacity(document.events.len());
+    let mut tool_proposals = BTreeMap::<String, RunReplayToolProposal>::new();
+    let mut tool_outputs = BTreeSet::<String>::new();
+    let mut final_answer_sha256 = None;
+    let artifact_count =
+        document.manifest.get("artifact_index").and_then(Value::as_array).map_or(0, Vec::len);
+
+    for row in &document.events {
+        let category = row.get("category").and_then(Value::as_str).unwrap_or("unknown");
+        let event_type = row.get("event_type").and_then(Value::as_str).unwrap_or("unknown");
+        *event_categories.entry(category.to_owned()).or_insert(0) += 1;
+        public_events.push(public_event_for_row(row, event_type, category));
+        match event_type {
+            "tool_proposal" => {
+                if let Some(payload) = row.get("payload") {
+                    if let (Some(proposal_id), Some(tool_name)) =
+                        (payload_str(payload, "proposal_id"), payload_str(payload, "tool_name"))
+                    {
+                        tool_proposals.entry(proposal_id.to_owned()).or_insert_with(|| {
+                            RunReplayToolProposal {
+                                proposal_id: proposal_id.to_owned(),
+                                tool_name: tool_name.to_owned(),
+                                mutation_class: mutation_class_for_tool(tool_name, payload),
+                                recorded_output: false,
+                            }
+                        });
+                    }
+                }
+            }
+            "tool_output" => {
+                if let Some(proposal_id) =
+                    row.get("payload").and_then(|payload| payload_str(payload, "proposal_id"))
+                {
+                    tool_outputs.insert(proposal_id.to_owned());
+                    if let Some(proposal) = tool_proposals.get_mut(proposal_id) {
+                        proposal.recorded_output = true;
+                    }
+                }
+            }
+            "final_answer" => {
+                final_answer_sha256 = row
+                    .get("payload")
+                    .and_then(|payload| payload.get("sha256"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            _ => {}
+        }
+    }
+    let mut proposals = tool_proposals.into_values().collect::<Vec<_>>();
+    proposals.sort_by(|left, right| left.proposal_id.cmp(&right.proposal_id));
+    RunReplaySummary {
+        event_count: document.events.len(),
+        event_categories,
+        public_events,
+        tool_proposals: proposals,
+        tool_outputs: tool_outputs.into_iter().collect(),
+        final_answer_sha256,
+        artifact_count,
+    }
+}
+
+fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunReplayPublicEvent {
+    let payload = row.get("payload").unwrap_or(&Value::Null);
+    let stable_payload = match event_type {
+        "tool_proposal" => json!({
+            "tool_name": payload_str(payload, "tool_name"),
+            "mutation_class": payload_str(payload, "tool_name")
+                .map(|tool_name| mutation_class_for_tool(tool_name, payload)),
+        }),
+        "tool_output" => json!({
+            "tool_name": payload_str(payload, "tool_name"),
+            "recorded_output": payload_str(payload, "proposal_id").is_some(),
+            "has_output_artifact_ref": payload.pointer("/result/output_artifact_ref").is_some()
+                || payload.pointer("/payload/output_artifact_ref").is_some(),
+        }),
+        "final_answer" => json!({
+            "sha256": payload.get("sha256").and_then(Value::as_str),
+        }),
+        "usage" => json!({
+            "prompt_tokens": payload.get("prompt_tokens").and_then(Value::as_i64),
+            "completion_tokens": payload.get("completion_tokens").and_then(Value::as_i64),
+            "total_tokens": payload.get("total_tokens").and_then(Value::as_i64),
+        }),
+        _ => json!({}),
+    };
+    RunReplayPublicEvent {
+        event_type: event_type.to_owned(),
+        category: category.to_owned(),
+        stable_payload,
+    }
+}
+
+fn payload_str<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(Value::as_str).or_else(|| {
+        payload.get("payload").and_then(|nested| nested.get(key)).and_then(Value::as_str)
+    })
+}
+
+fn mutation_class_for_tool(tool_name: &str, payload: &Value) -> String {
+    if payload.get("input").and_then(|input| input.get("mutation_class")).and_then(Value::as_str)
+        == Some("non_idempotent")
+    {
+        return "non_idempotent".to_owned();
+    }
+    let normalized = tool_name.to_ascii_lowercase();
+    if ["write", "patch", "delete", "remove", "move", "rename", "shell", "exec"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        "non_idempotent".to_owned()
+    } else {
+        "replay_safe".to_owned()
+    }
+}
+
+fn unsafe_mutations_without_recorded_outputs(
+    summary: &RunReplaySummary,
+) -> Vec<RunReplayUnsafeMutation> {
+    summary
+        .tool_proposals
+        .iter()
+        .filter(|proposal| proposal.mutation_class == "non_idempotent" && !proposal.recorded_output)
+        .map(|proposal| RunReplayUnsafeMutation {
+            proposal_id: proposal.proposal_id.clone(),
+            tool_name: proposal.tool_name.clone(),
+            reason: "non-idempotent mutation lacks recorded tool output evidence".to_owned(),
+        })
+        .collect()
+}
+
+fn compare_trajectory_summary_to_golden(
+    summary: &RunReplaySummary,
+    golden: &Value,
+) -> Result<Vec<RunReplayDiff>> {
+    let expected = golden.get("expected").unwrap_or(golden);
+    let mut diffs = Vec::new();
+    compare_optional_usize(
+        &mut diffs,
+        "$.expected.event_count",
+        expected.get("event_count").and_then(Value::as_u64).map(|value| value as usize),
+        summary.event_count,
+        "trajectory event count",
+    );
+    if let Some(expected_hash) = expected.get("final_answer_sha256").and_then(Value::as_str) {
+        if summary.final_answer_sha256.as_deref() != Some(expected_hash) {
+            diffs.push(RunReplayDiff {
+                path: "$.expected.final_answer_sha256".to_owned(),
+                expected: expected_hash.to_owned(),
+                actual: summary
+                    .final_answer_sha256
+                    .clone()
+                    .unwrap_or_else(|| "<missing>".to_owned()),
+                context: "final answer hash changed".to_owned(),
+            });
+        }
+    }
+    if let Some(expected_tools) = expected.get("tool_proposals").and_then(Value::as_array) {
+        let actual_tools = summary
+            .tool_proposals
+            .iter()
+            .map(|proposal| proposal.tool_name.clone())
+            .collect::<Vec<_>>();
+        let expected_tools = expected_tools
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if expected_tools != actual_tools {
+            diffs.push(RunReplayDiff {
+                path: "$.expected.tool_proposals".to_owned(),
+                expected: format!("{expected_tools:?}"),
+                actual: format!("{actual_tools:?}"),
+                context: "tool proposal stream changed".to_owned(),
+            });
+        }
+    }
+    if let Some(expected_events) =
+        expected.get("events").or_else(|| expected.get("public_events")).and_then(Value::as_array)
+    {
+        diffs.extend(compare_public_events_to_golden(&summary.public_events, expected_events)?);
+    }
+    Ok(diffs)
+}
+
+fn compare_public_events_to_golden(
+    actual_events: &[RunReplayPublicEvent],
+    expected_events: &[Value],
+) -> Result<Vec<RunReplayDiff>> {
+    if expected_events.len() != actual_events.len() {
+        return Ok(vec![RunReplayDiff {
+            path: "$.expected.events".to_owned(),
+            expected: format!("{} public event(s)", expected_events.len()),
+            actual: format!("{} public event(s)", actual_events.len()),
+            context: "public event stream length changed".to_owned(),
+        }]);
+    }
+    for (index, (actual, expected)) in actual_events.iter().zip(expected_events).enumerate() {
+        if !public_event_matches_expected(actual, expected)? {
+            let actual = serde_json::to_string(actual)
+                .context("failed to encode actual public replay event")?;
+            return Ok(vec![RunReplayDiff {
+                path: format!("$.expected.events[{index}]"),
+                expected: expected.to_string(),
+                actual,
+                context: "public event stream changed".to_owned(),
+            }]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn public_event_matches_expected(actual: &RunReplayPublicEvent, expected: &Value) -> Result<bool> {
+    if let Some(event_type) = expected.as_str() {
+        return Ok(actual.event_type == event_type);
+    }
+    let Some(expected_object) = expected.as_object() else {
+        return Ok(false);
+    };
+    let actual_value =
+        serde_json::to_value(actual).context("failed to encode actual public replay event")?;
+    Ok(expected_object
+        .iter()
+        .all(|(key, expected_value)| actual_value.get(key) == Some(expected_value)))
+}
+
+fn compare_optional_usize(
+    diffs: &mut Vec<RunReplayDiff>,
+    path: &str,
+    expected: Option<usize>,
+    actual: usize,
+    context: &str,
+) {
+    if let Some(expected) = expected {
+        if expected != actual {
+            diffs.push(RunReplayDiff {
+                path: path.to_owned(),
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+                context: context.to_owned(),
+            });
+        }
+    }
+}
+
+fn render_replay_diff_markdown(report: &RunReplayReport) -> String {
+    let mut output = String::new();
+    output.push_str("# Run Replay Diff\n\n");
+    output.push_str(format!("- Status: `{}`\n", report.status).as_str());
+    output.push_str(format!("- Events: `{}`\n", report.summary.event_count).as_str());
+    output.push_str(format!("- Diffs: `{}`\n", report.diffs.len()).as_str());
+    if report.diffs.is_empty() {
+        output.push_str("\nNo meaningful trajectory differences found.\n");
+        return output;
+    }
+    output.push_str("\n| Path | Expected | Actual | Context |\n");
+    output.push_str("| --- | --- | --- | --- |\n");
+    for diff in &report.diffs {
+        output.push_str(
+            format!(
+                "| `{}` | `{}` | `{}` | {} |\n",
+                markdown_escape(diff.path.as_str()),
+                markdown_escape(diff.expected.as_str()),
+                markdown_escape(diff.actual.as_str()),
+                markdown_escape(diff.context.as_str())
+            )
+            .as_str(),
+        );
+    }
+    output
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
 fn build_run_export_payload(
     bundle: &ReplayBundle,
     format: RunExportFormatArg,
@@ -702,6 +1160,125 @@ mod tests {
                 == Some("large_tool_output")
         }));
         assert!(!text.contains(&"x".repeat(LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES + 32)));
+    }
+
+    #[test]
+    fn replay_simple_text_trajectory_passes() {
+        let document = RunTrajectoryDocument {
+            manifest: json!({ "artifact_index": [] }),
+            events: vec![json!({
+                "schema_version": 1,
+                "line_type": "event",
+                "seq": 0,
+                "event_type": "final_answer",
+                "category": "final_answer",
+                "payload": { "sha256": "b".repeat(64) },
+            })],
+        };
+
+        let report = replay_trajectory_document(&document, None).unwrap();
+        let expected_hash = "b".repeat(64);
+
+        assert_eq!(report.status, "passed");
+        assert_eq!(report.summary.event_count, 1);
+        assert_eq!(report.summary.final_answer_sha256.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn replay_tool_call_trajectory_passes_with_recorded_output() {
+        let bundle = fixture_bundle();
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let document = parse_run_trajectory_jsonl(bytes.as_slice()).unwrap();
+
+        let report = replay_trajectory_document(&document, None).unwrap();
+
+        assert_eq!(report.status, "passed");
+        assert!(report
+            .summary
+            .tool_proposals
+            .iter()
+            .any(|proposal| { proposal.tool_name == "palyra.shell" && proposal.recorded_output }));
+        assert!(report.unsafe_mutations.is_empty());
+    }
+
+    #[test]
+    fn replay_golden_compare_accepts_stable_public_event_stream() {
+        let bundle = fixture_bundle();
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let document = parse_run_trajectory_jsonl(bytes.as_slice()).unwrap();
+        let baseline = replay_trajectory_document(&document, None).unwrap();
+        let expected_events = baseline
+            .summary
+            .public_events
+            .iter()
+            .map(|event| {
+                json!({
+                    "event_type": event.event_type.as_str(),
+                    "category": event.category.as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let report = replay_trajectory_document(
+            &document,
+            Some(&json!({ "expected": { "events": expected_events } })),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "passed");
+    }
+
+    #[test]
+    fn replay_rejects_non_idempotent_mutation_without_recorded_evidence() {
+        let document = RunTrajectoryDocument {
+            manifest: json!({ "artifact_index": [] }),
+            events: vec![json!({
+                "schema_version": 1,
+                "line_type": "event",
+                "seq": 0,
+                "event_type": "tool_proposal",
+                "category": "tool_proposal",
+                "payload": {
+                    "proposal_id": "proposal-unsafe",
+                    "tool_name": "palyra.fs.write_file",
+                    "input": { "path": "state.json", "mutation_class": "non_idempotent" },
+                },
+            })],
+        };
+
+        let report = replay_trajectory_document(&document, None).unwrap();
+
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.unsafe_mutations.len(), 1);
+        assert_eq!(report.unsafe_mutations[0].proposal_id, "proposal-unsafe");
+        assert!(report.diffs.iter().any(|diff| diff.path == "$.tool_proposals"));
+    }
+
+    #[test]
+    fn replay_golden_diff_matches_snapshot() {
+        let bundle = fixture_bundle();
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let document = parse_run_trajectory_jsonl(bytes.as_slice()).unwrap();
+        let report = replay_trajectory_document(
+            &document,
+            Some(&json!({
+                "expected": {
+                    "event_count": 1,
+                    "tool_proposals": ["palyra.safe.read"],
+                }
+            })),
+        )
+        .unwrap();
+
+        let markdown = render_replay_diff_markdown(&report);
+
+        assert_eq!(
+            markdown,
+            include_str!("../../../../fixtures/golden/run_replay_diff.md").replace("\r\n", "\n")
+        );
     }
 
     fn fixture_bundle() -> ReplayBundle {

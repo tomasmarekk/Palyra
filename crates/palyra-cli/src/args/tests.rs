@@ -403,6 +403,32 @@ fn parse_run_export_with_trajectory_flag() {
 }
 
 #[test]
+fn parse_run_replay_with_golden_diff_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "run",
+        "replay",
+        "artifacts/run.jsonl",
+        "--golden",
+        "fixtures/golden/run_replay_expected.json",
+        "--diff-output",
+        "artifacts/run-diff.md",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Run {
+            command: RunCommand::Replay {
+                input: "artifacts/run.jsonl".to_owned(),
+                golden: Some("fixtures/golden/run_replay_expected.json".to_owned()),
+                diff_output: Some("artifacts/run-diff.md".to_owned()),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_jobs_commands() {
     let parsed = Cli::parse_from([
         "palyra",

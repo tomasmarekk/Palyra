@@ -3,7 +3,8 @@ Export run trajectories for audit and evals
 Usage: palyra run [OPTIONS] <COMMAND>
 
 Commands:
-  export
+  export  Export a redacted run trajectory
+  replay  Replay a trajectory JSONL offline
 
 Options:
   -h, --help  Print help

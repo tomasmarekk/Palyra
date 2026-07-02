@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `155`
-- Verified entries: `155`
+- Total entries: `156`
+- Verified entries: `156`
 - Regression entries: `0`
-- Help snapshot coverage: `155` entries
+- Help snapshot coverage: `156` entries
 
 ### Expected parity status counts
 
-- `done`: `151`
+- `done`: `152`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `155`
+- `verified`: `156`
 
 ## Entries
 
@@ -105,6 +105,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `workers` | `canonical_family` | `done` | `verified` | `workers-help.txt` | - | - | - |
 | `run` | `top_level` | `done` | `verified` | `run-help.txt` | - | - | - |
 | `run export` | `nested_surface` | `done` | `verified` | `run-export-help.txt` | - | `--run-id`, `--output`, `--format`, `--redacted`, `--journal-db`, `--max-events`, `--trajectory` | - |
+| `run replay` | `nested_surface` | `done` | `verified` | `run-replay-help.txt` | - | `--golden`, `--diff-output`, `--json` | - |
 | `skills` | `top_level` | `done` | `verified` | `skills-help.txt` | `skill` | - | - |
 | `secrets` | `top_level` | `done` | `verified` | `secrets-help.txt` | - | - | - |
 | `security` | `top_level` | `done` | `verified` | `security-help.txt` | - | - | - |

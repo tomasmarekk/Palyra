@@ -1,16 +1,15 @@
-Export a redacted run trajectory
+Replay a trajectory JSONL offline
 
-Usage: palyra run export [OPTIONS] --run-id <RUN_ID> --output <OUTPUT>
+Usage: palyra run replay [OPTIONS] <INPUT>
+
+Arguments:
+  <INPUT>
 
 Options:
-      --run-id <RUN_ID>
-      --output <OUTPUT>
-      --format <FORMAT>          [default: palyra-attested] [possible values: palyra-attested, sharegpt, atropos]
-      --redacted <REDACTED>      [default: true] [possible values: true, false]
-      --journal-db <JOURNAL_DB>
-      --max-events <MAX_EVENTS>  [default: 128]
-      --trajectory
-  -h, --help                     Print help
+      --golden <GOLDEN>
+      --diff-output <DIFF_OUTPUT>
+      --json
+  -h, --help                       Print help
 
 Global Options:
       --profile <PROFILE>

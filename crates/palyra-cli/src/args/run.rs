@@ -21,6 +21,7 @@ impl RunExportFormatArg {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum RunCommand {
+    #[command(about = "Export a redacted run trajectory")]
     Export {
         #[arg(long)]
         run_id: String,
@@ -41,5 +42,15 @@ pub enum RunCommand {
         max_events: usize,
         #[arg(long, default_value_t = false)]
         trajectory: bool,
+    },
+    #[command(about = "Replay a trajectory JSONL offline")]
+    Replay {
+        input: String,
+        #[arg(long)]
+        golden: Option<String>,
+        #[arg(long)]
+        diff_output: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }

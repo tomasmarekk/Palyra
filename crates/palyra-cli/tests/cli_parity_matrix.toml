@@ -850,6 +850,17 @@ path = "run export"
 file = "run-export-help.txt"
 
 [[entries]]
+path = "run replay"
+category = "nested_surface"
+status = "done"
+summary = "Replay a redacted trajectory JSONL offline and compare against optional golden expectations."
+required_flags = ["golden", "diff-output", "json"]
+
+[entries.snapshot]
+path = "run replay"
+file = "run-replay-help.txt"
+
+[[entries]]
 path = "skills"
 category = "top_level"
 status = "done"

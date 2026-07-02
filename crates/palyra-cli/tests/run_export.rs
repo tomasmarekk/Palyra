@@ -49,6 +49,21 @@ fn run_export_writes_redacted_trajectory_jsonl_from_journal() -> Result<()> {
         .iter()
         .skip(1)
         .any(|row| { row.get("category").and_then(Value::as_str) == Some("tool_output") }));
+
+    let replay = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .args(["run", "replay"])
+        .arg(output_path.as_os_str())
+        .arg("--json")
+        .output()
+        .context("failed to execute palyra run replay")?;
+    assert!(
+        replay.status.success(),
+        "run replay should pass: {}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_report = serde_json::from_slice::<Value>(replay.stdout.as_slice())
+        .context("run replay JSON should parse")?;
+    assert_eq!(replay_report.get("status").and_then(Value::as_str), Some("passed"));
     Ok(())
 }
 
