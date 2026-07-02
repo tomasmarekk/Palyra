@@ -24,6 +24,9 @@ const COMPAT_API_CHANNEL: &str = "compat-api";
 const COMPAT_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const COMPAT_RESPONSE_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMPAT_RESPONSE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const COMPAT_RUN_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const COMPAT_RUN_EVENTS_PAGE_LIMIT_DEFAULT: usize = 128;
+const COMPAT_RUN_EVENTS_PAGE_LIMIT_MAX: usize = 512;
 
 struct CompatHttpError(Box<Response>);
 
@@ -59,6 +62,53 @@ pub(crate) struct CompatResponsesRequest {
     stream: Option<bool>,
     user: Option<String>,
     metadata: Option<Value>,
+}
+
+/// Request body for the public runs endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct CompatRunsCreateRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    input: Option<CompatResponsesInput>,
+    #[serde(default)]
+    messages: Option<Vec<CompatChatMessage>>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    session: Option<CompatRunsSessionRequest>,
+    #[serde(default)]
+    tools: Option<Value>,
+    #[serde(default)]
+    tool_exposure_policy: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+/// Optional session selector for the public runs endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct CompatRunsSessionRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    require_existing: Option<bool>,
+    #[serde(default)]
+    reset: Option<bool>,
+}
+
+/// Query parameters for replaying a run's public event stream.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompatRunEventsQuery {
+    #[serde(default)]
+    after_seq: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// Request body for the compatibility embeddings endpoint.
@@ -130,6 +180,7 @@ pub(crate) struct CompatMessagePart {
 
 #[derive(Debug, Default)]
 struct CompatRequestOverrides {
+    session_id: Option<String>,
     session_key: Option<String>,
     session_label: Option<String>,
     require_existing: bool,
@@ -168,6 +219,17 @@ struct CompatResponseIdempotencyReservation {
 #[derive(Debug)]
 enum CompatResponseIdempotencyBegin {
     Reserved(CompatResponseIdempotencyReservation),
+    Replay(Value),
+}
+
+#[derive(Debug, Clone)]
+struct CompatRunIdempotencyReservation {
+    storage_key: String,
+}
+
+#[derive(Debug)]
+enum CompatRunIdempotencyBegin {
+    Reserved(CompatRunIdempotencyReservation),
     Replay(Value),
 }
 
@@ -677,6 +739,160 @@ pub(crate) async fn compat_responses_handler(
     }
 }
 
+/// Handles `POST /v1/runs`.
+///
+/// # Errors
+/// Returns an error response when request validation, API-token authorization,
+/// idempotency reservation, session resolution, or run queueing fails.
+pub(crate) async fn compat_runs_create_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CompatRunsCreateRequest>,
+) -> Result<Response, Response> {
+    let request_payload_bytes =
+        serde_json::to_vec(&payload).map_err(internal_runtime_error_response)?;
+    validate_compat_run_tool_request(&payload)?;
+    let idempotency_key = compat_idempotency_key(&headers)?;
+    let prompt_text = render_compat_runs_prompt(&payload)?;
+    let metadata = compat_runs_effective_metadata(&payload)?;
+    let authorized = authorize_compat_run_context(
+        &state,
+        &headers,
+        payload.model.as_deref(),
+        metadata.as_ref(),
+        PERMISSION_COMPAT_RESPONSES_CREATE,
+    )?;
+    let idempotency = if let Some(raw_key) = idempotency_key.as_deref() {
+        match begin_compat_runs_idempotency(
+            &state,
+            &authorized,
+            raw_key,
+            request_payload_bytes.as_slice(),
+        )
+        .await?
+        {
+            CompatRunIdempotencyBegin::Reserved(reservation) => Some(reservation),
+            CompatRunIdempotencyBegin::Replay(payload) => {
+                return Ok(Json(payload).into_response());
+            }
+        }
+    } else {
+        None
+    };
+    let prepared =
+        prepare_compat_run_from_context(&state, authorized, payload.user.as_deref(), prompt_text)
+            .await?;
+    let token_id = prepared.token.token_id.clone();
+    let run_id = prepared.run_id.clone();
+    let session_id = prepared.session_id.clone();
+    let principal = prepared.principal.clone();
+    let accepted_payload = build_compat_run_status_payload_from_prepared(&prepared);
+
+    if let Some(reservation) = idempotency {
+        complete_compat_run_idempotency(&state, &reservation, run_id.as_str(), session_id.as_str())
+            .await?;
+    }
+
+    let background_state = state.clone();
+    let background_token_id = token_id.clone();
+    let background_run_id = run_id.clone();
+    tokio::spawn(async move {
+        let execution = execute_compat_run(&background_state, prepared).await;
+        let now = unix_ms_now().unwrap_or_default();
+        match execution {
+            Ok(_) => {
+                touch_compat_api_token(
+                    &background_state,
+                    background_token_id.as_str(),
+                    "run",
+                    "runs_completed",
+                    Some(background_run_id.as_str()),
+                    now,
+                );
+            }
+            Err(response) => {
+                tracing::warn!(
+                    run_id = %background_run_id,
+                    error = %compat_error_body_from_response(&response),
+                    "public runs API background execution failed"
+                );
+                touch_compat_api_token(
+                    &background_state,
+                    background_token_id.as_str(),
+                    "run",
+                    "runs_failed",
+                    Some(background_run_id.as_str()),
+                    now,
+                );
+            }
+        }
+    });
+
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    touch_compat_api_token(
+        &state,
+        token_id.as_str(),
+        "run",
+        "runs_accepted",
+        Some(run_id.as_str()),
+        now,
+    );
+    tracing::info!(run_id = %run_id, principal = %principal, "public runs API request accepted");
+    Ok(Json(accepted_payload).into_response())
+}
+
+/// Handles `GET /v1/runs/{run_id}`.
+///
+/// # Errors
+/// Returns an error response when the token is unauthorized or the run does
+/// not exist for the token owner.
+pub(crate) async fn compat_run_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal) = authorize_compat_response_record_access(&state, &headers, now)?;
+    let payload =
+        load_compat_run_status_payload(&state, run_id.as_str(), owner_principal.as_str()).await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_get",
+        "run_loaded",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(payload).into_response())
+}
+
+/// Handles `GET /v1/runs/{run_id}/events`.
+///
+/// # Errors
+/// Returns an error response when the token is unauthorized or the run does
+/// not exist for the token owner.
+pub(crate) async fn compat_run_events_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Query(query): Query<CompatRunEventsQuery>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal) = authorize_compat_response_record_access(&state, &headers, now)?;
+    let snapshot =
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_events",
+        "run_events_opened",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(build_compat_run_events_streaming_response(state, snapshot, query.after_seq, query.limit))
+}
+
 /// Handles `GET /v1/responses/{response_id}`.
 ///
 /// # Errors
@@ -888,6 +1104,146 @@ fn compat_response_id_from_idempotency_record(
         })
 }
 
+async fn begin_compat_runs_idempotency(
+    state: &AppState,
+    context: &CompatAuthorizedRunContext,
+    raw_key: &str,
+    request_payload: &[u8],
+) -> Result<CompatRunIdempotencyBegin, Response> {
+    let storage_key = compat_run_idempotency_storage_key(
+        context.principal.as_str(),
+        context.token.token_id.as_str(),
+        raw_key,
+    );
+    let payload_sha256 = crate::sha256_hex(request_payload);
+    let runtime = Arc::clone(&state.runtime);
+    let begin_key = storage_key.clone();
+    let begin = tokio::task::spawn_blocking(move || {
+        runtime.journal_store.begin_idempotency_operation(&journal::IdempotencyBeginRequest {
+            key: begin_key,
+            scope: "compat.runs".to_owned(),
+            operation_kind: "runs.create".to_owned(),
+            payload_sha256,
+            expires_at_unix_ms: Some(
+                unix_ms_now().unwrap_or(0).saturating_add(COMPAT_RUN_IDEMPOTENCY_TTL_MS),
+            ),
+        })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_worker_failed",
+            "idempotency worker panicked",
+        )
+    })?
+    .map_err(compat_journal_error_response)?;
+
+    match begin.decision {
+        IdempotencyReplayDecision::CompletedReplayResult => {
+            let run_id = compat_run_id_from_idempotency_record(begin.record.as_ref())?;
+            let payload =
+                load_compat_run_status_payload(state, run_id.as_str(), context.principal.as_str())
+                    .await?;
+            Ok(CompatRunIdempotencyBegin::Replay(payload))
+        }
+        IdempotencyReplayDecision::ConflictingPayload => Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "idempotency_error",
+            "idempotency_conflict",
+            "Idempotency-Key was reused with a different /v1/runs request payload",
+        )),
+        IdempotencyReplayDecision::SamePayloadRetry => Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "idempotency_error",
+            "idempotency_in_progress",
+            "Idempotency-Key already has an in-progress /v1/runs request",
+        )),
+        IdempotencyReplayDecision::Reserved | IdempotencyReplayDecision::ExpiredRetry => {
+            Ok(CompatRunIdempotencyBegin::Reserved(CompatRunIdempotencyReservation { storage_key }))
+        }
+    }
+}
+
+fn compat_run_idempotency_storage_key(
+    owner_principal: &str,
+    token_id: &str,
+    raw_key: &str,
+) -> String {
+    let material = format!(
+        "surface=compat.runs\nowner={owner_principal}\ntoken={token_id}\nraw_key={raw_key}"
+    );
+    let digest = crate::sha256_hex(material.as_bytes());
+    format!("compat.runs:{}", &digest[..32])
+}
+
+fn compat_run_id_from_idempotency_record(
+    record: Option<&palyra_common::runtime_contracts::IdempotencyRecordSnapshot>,
+) -> CompatHttpResult<String> {
+    let result_json = record.and_then(|record| record.result_json.as_deref()).ok_or_else(|| {
+        CompatHttpError::from(compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_result_missing",
+            "stored idempotency result is missing a run id",
+        ))
+    })?;
+    let value = serde_json::from_str::<Value>(result_json).map_err(|error| {
+        CompatHttpError::from(compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_result_invalid",
+            format!("stored idempotency result is not valid JSON: {error}"),
+        ))
+    })?;
+    value
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CompatHttpError::from(compat_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "idempotency_result_invalid",
+                "stored idempotency result does not contain run_id",
+            ))
+        })
+}
+
+async fn complete_compat_run_idempotency(
+    state: &AppState,
+    reservation: &CompatRunIdempotencyReservation,
+    run_id: &str,
+    session_id: &str,
+) -> Result<(), Response> {
+    let result_json = json!({
+        "run_id": run_id,
+        "session_id": session_id,
+    })
+    .to_string();
+    let runtime = Arc::clone(&state.runtime);
+    let key = reservation.storage_key.clone();
+    tokio::task::spawn_blocking(move || {
+        runtime.journal_store.complete_idempotency_operation(&journal::IdempotencyCompleteRequest {
+            key,
+            result_json,
+        })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_worker_failed",
+            "idempotency worker panicked",
+        )
+    })?
+    .map(|_| ())
+    .map_err(compat_journal_error_response)
+}
+
 async fn complete_compat_response_idempotency(
     state: &AppState,
     reservation: &CompatResponseIdempotencyReservation,
@@ -1063,6 +1419,537 @@ async fn delete_compat_response_public_view(
     .map_err(compat_journal_error_response)
 }
 
+async fn load_compat_run_status_payload(
+    state: &AppState,
+    run_id: &str,
+    owner_principal: &str,
+) -> Result<Value, Response> {
+    let snapshot = load_compat_run_snapshot_for_owner(state, run_id, owner_principal).await?;
+    let pending_approval =
+        load_compat_pending_approval_for_run(state, snapshot.run_id.as_str(), owner_principal)
+            .await?;
+    Ok(build_compat_run_status_payload(&snapshot, pending_approval.as_ref()))
+}
+
+async fn load_compat_run_snapshot_for_owner(
+    state: &AppState,
+    run_id: &str,
+    owner_principal: &str,
+) -> Result<journal::OrchestratorRunStatusSnapshot, Response> {
+    validate_canonical_id(run_id).map_err(|_| {
+        compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_run_id",
+            "run_id must be a canonical ULID",
+        )
+    })?;
+    let snapshot = state
+        .runtime
+        .orchestrator_run_status_snapshot(run_id.to_owned())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| compat_run_not_found_response(run_id))?;
+    if snapshot.principal != owner_principal {
+        return Err(compat_run_not_found_response(run_id));
+    }
+    Ok(snapshot)
+}
+
+async fn load_compat_pending_approval_for_run(
+    state: &AppState,
+    run_id: &str,
+    owner_principal: &str,
+) -> Result<Option<journal::ApprovalRecord>, Response> {
+    let (approvals, _) = state
+        .runtime
+        .list_approval_records(
+            None,
+            Some(100),
+            None,
+            None,
+            None,
+            Some(owner_principal.to_owned()),
+            None,
+            None,
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(approvals
+        .into_iter()
+        .find(|approval| approval.run_id == run_id && approval.decision.is_none()))
+}
+
+fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -> Value {
+    json!({
+        "id": prepared.run_id,
+        "object": "run",
+        "status": "queued",
+        "queue_state": "accepted",
+        "active_phase": "queued",
+        "accepted_at": prepared.created_at_unix_ms / 1_000,
+        "accepted_at_unix_ms": prepared.created_at_unix_ms,
+        "session_id": prepared.session_id,
+        "model": prepared.model_name,
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+        "pending_approval": Value::Null,
+        "verification_summary": compat_run_verification_summary(None, None),
+        "last_error": Value::Null,
+        "_palyra": {
+            "principal": prepared.principal,
+            "device_id": prepared.device_id,
+            "channel": COMPAT_API_CHANNEL,
+            "origin": "runs_api",
+        },
+    })
+}
+
+fn build_compat_run_status_payload(
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+    pending_approval: Option<&journal::ApprovalRecord>,
+) -> Value {
+    json!({
+        "id": snapshot.run_id,
+        "object": "run",
+        "status": compat_run_public_status(snapshot.state.as_str()),
+        "queue_state": compat_run_queue_state(snapshot.state.as_str()),
+        "active_phase": compat_run_active_phase(snapshot.state.as_str(), pending_approval.is_some()),
+        "accepted_at": snapshot.created_at_unix_ms / 1_000,
+        "accepted_at_unix_ms": snapshot.created_at_unix_ms,
+        "started_at_unix_ms": snapshot.started_at_unix_ms,
+        "completed_at_unix_ms": snapshot.completed_at_unix_ms,
+        "session_id": snapshot.session_id,
+        "usage": {
+            "prompt_tokens": snapshot.prompt_tokens,
+            "completion_tokens": snapshot.completion_tokens,
+            "total_tokens": snapshot.total_tokens,
+        },
+        "pending_approval": pending_approval.map(compat_run_pending_approval_payload),
+        "verification_summary": compat_run_verification_summary(
+            snapshot.delegation.as_ref(),
+            snapshot.merge_result.as_ref(),
+        ),
+        "last_error": snapshot.last_error,
+        "_palyra": {
+            "wire_state": snapshot.state,
+            "cancel_requested": snapshot.cancel_requested,
+            "cancel_reason": snapshot.cancel_reason,
+            "origin_kind": snapshot.origin_kind,
+            "origin_run_id": snapshot.origin_run_id,
+            "parent_run_id": snapshot.parent_run_id,
+            "triggered_by_principal": snapshot.triggered_by_principal,
+            "tape_events": snapshot.tape_events,
+        },
+    })
+}
+
+fn compat_run_public_status(state: &str) -> &'static str {
+    match state {
+        "pending" | "accepted" => "queued",
+        "in_progress" => "running",
+        "done" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn compat_run_queue_state(state: &str) -> &'static str {
+    match state {
+        "pending" => "pending",
+        "accepted" => "accepted",
+        "in_progress" => "draining",
+        "done" | "failed" | "cancelled" => "empty",
+        _ => "unknown",
+    }
+}
+
+fn compat_run_active_phase(state: &str, pending_approval: bool) -> &'static str {
+    if pending_approval {
+        return "approval_pending";
+    }
+    match state {
+        "pending" | "accepted" => "queued",
+        "in_progress" => "running",
+        "done" => "completed",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn compat_run_pending_approval_payload(approval: &journal::ApprovalRecord) -> Value {
+    json!({
+        "approval_id": approval.approval_id,
+        "subject_type": approval.subject_type.as_str(),
+        "subject_id": approval.subject_id,
+        "request_summary": approval.request_summary,
+        "risk_level": approval.prompt.risk_level.as_str(),
+        "requested_at_unix_ms": approval.requested_at_unix_ms,
+    })
+}
+
+fn compat_run_verification_summary(
+    delegation: Option<&crate::delegation::DelegationSnapshot>,
+    merge_result: Option<&crate::delegation::DelegationMergeResult>,
+) -> Value {
+    let delegation = delegation.and_then(|value| serde_json::to_value(value).ok());
+    let merge_result = merge_result.and_then(|value| serde_json::to_value(value).ok());
+    json!({
+        "state": if merge_result.is_some() || delegation.is_some() {
+            "available"
+        } else {
+            "not_available"
+        },
+        "delegation": delegation,
+        "merge_result": merge_result,
+    })
+}
+
+fn build_compat_run_events_streaming_response(
+    state: AppState,
+    initial_snapshot: journal::OrchestratorRunStatusSnapshot,
+    after_seq: Option<i64>,
+    requested_limit: Option<usize>,
+) -> Response {
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    tokio::spawn(async move {
+        let run_id = initial_snapshot.run_id.clone();
+        let session_id = initial_snapshot.session_id.clone();
+        let created_at_unix_ms = initial_snapshot.created_at_unix_ms;
+        let limit = requested_limit
+            .unwrap_or(COMPAT_RUN_EVENTS_PAGE_LIMIT_DEFAULT)
+            .clamp(1, COMPAT_RUN_EVENTS_PAGE_LIMIT_MAX);
+        let mut cursor = after_seq;
+
+        loop {
+            let page = match state
+                .runtime
+                .orchestrator_tape_snapshot(run_id.clone(), cursor, Some(limit))
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    let _ = send_sse_event(
+                        &sender,
+                        "run.failed",
+                        compat_error_payload(
+                            "server_error",
+                            "run_events_failed",
+                            sanitize_http_error_message(error.message()),
+                        ),
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
+            };
+
+            for record in page.events {
+                cursor = Some(record.seq);
+                let Some(public_event) = public_runtime_event_json_from_tape_record(
+                    run_id.as_str(),
+                    session_id.as_str(),
+                    created_at_unix_ms,
+                    &record,
+                ) else {
+                    continue;
+                };
+                let event_name = public_event
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime.event")
+                    .to_owned();
+                if !send_sse_event(&sender, event_name.as_str(), public_event).await {
+                    return;
+                }
+            }
+
+            if page.next_after_seq.is_some() {
+                continue;
+            }
+            let snapshot =
+                match state.runtime.orchestrator_run_status_snapshot(run_id.clone()).await {
+                    Ok(Some(current)) => current,
+                    Ok(None) => {
+                        let _ = send_sse_done(&sender).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = send_sse_event(
+                            &sender,
+                            "run.failed",
+                            compat_error_payload(
+                                "server_error",
+                                "run_events_status_failed",
+                                sanitize_http_error_message(error.message()),
+                            ),
+                        )
+                        .await;
+                        let _ = send_sse_done(&sender).await;
+                        return;
+                    }
+                };
+            if compat_run_is_terminal(snapshot.state.as_str()) {
+                let _ = send_sse_done(&sender).await;
+                return;
+            }
+            if !send_sse_comment(&sender, "keepalive").await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
+    response.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn public_runtime_event_json_from_tape_record(
+    run_id: &str,
+    session_id: &str,
+    created_at_unix_ms: i64,
+    record: &journal::OrchestratorTapeRecord,
+) -> Option<Value> {
+    let event = run_stream_event_from_tape_record(run_id, record)?;
+    let sequence = u64::try_from(record.seq.saturating_add(1)).ok()?;
+    let event_id =
+        crate::application::run_stream::public_events::run_stream_public_event_id(run_id, sequence);
+    crate::application::run_stream::public_events::public_runtime_event_json_from_run_stream_event(
+        &event,
+        crate::application::run_stream::public_events::PublicRunStreamEventContext {
+            event_id: event_id.as_str(),
+            session_id,
+            occurred_at_unix_ms: created_at_unix_ms.saturating_add(record.seq.max(0)),
+            request_id: None,
+        },
+    )
+}
+
+fn run_stream_event_from_tape_record(
+    run_id: &str,
+    record: &journal::OrchestratorTapeRecord,
+) -> Option<common_v1::RunStreamEvent> {
+    let payload = serde_json::from_str::<Value>(record.payload_json.as_str()).ok()?;
+    let run_id = Some(common_v1::CanonicalId { ulid: run_id.to_owned() });
+    let body = match record.event_type.as_str() {
+        "status" => common_v1::run_stream_event::Body::Status(common_v1::StreamStatus {
+            kind: compat_tape_status_kind(&payload) as i32,
+            message: payload.get("message")?.as_str()?.to_owned(),
+        }),
+        "model_token" => common_v1::run_stream_event::Body::ModelToken(common_v1::ModelToken {
+            token: payload.get("token")?.as_str()?.to_owned(),
+            is_final: payload.get("is_final").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        "tool_proposal" => {
+            common_v1::run_stream_event::Body::ToolProposal(common_v1::ToolProposal {
+                proposal_id: compat_tape_canonical_id(&payload, "proposal_id"),
+                tool_name: payload.get("tool_name")?.as_str()?.to_owned(),
+                input_json: compat_tape_json_bytes(payload.get("input_json")),
+                approval_required: payload
+                    .get("approval_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        "tool_decision" => {
+            common_v1::run_stream_event::Body::ToolDecision(common_v1::ToolDecision {
+                proposal_id: compat_tape_canonical_id(&payload, "proposal_id"),
+                kind: if payload.get("kind").and_then(Value::as_str) == Some("allow") {
+                    common_v1::tool_decision::DecisionKind::Allow as i32
+                } else {
+                    common_v1::tool_decision::DecisionKind::Deny as i32
+                },
+                reason: payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                approval_required: payload
+                    .get("approval_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                policy_enforced: payload
+                    .get("policy_enforced")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        "tool_result" => common_v1::run_stream_event::Body::ToolResult(common_v1::ToolResult {
+            proposal_id: compat_tape_canonical_id(&payload, "proposal_id"),
+            success: payload.get("success").and_then(Value::as_bool).unwrap_or(false),
+            output_json: compat_tape_json_bytes(payload.get("output_json")),
+            error: payload.get("error").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        }),
+        "tool_approval_request" => {
+            common_v1::run_stream_event::Body::ToolApprovalRequest(common_v1::ToolApprovalRequest {
+                proposal_id: compat_tape_canonical_id(&payload, "proposal_id"),
+                tool_name: payload.get("tool_name")?.as_str()?.to_owned(),
+                input_json: compat_tape_json_bytes(payload.get("input_json")),
+                approval_required: payload
+                    .get("approval_required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                approval_id: compat_tape_canonical_id(&payload, "approval_id"),
+                prompt: compat_tape_approval_prompt(payload.get("prompt")),
+                request_summary: payload
+                    .get("request_summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        }
+        "tool_approval_response" => common_v1::run_stream_event::Body::ToolApprovalResponse(
+            common_v1::ToolApprovalResponse {
+                proposal_id: compat_tape_canonical_id(&payload, "proposal_id"),
+                approved: payload.get("approved").and_then(Value::as_bool).unwrap_or(false),
+                reason: payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                approval_id: compat_tape_canonical_id(&payload, "approval_id"),
+                decision_scope: compat_tape_approval_scope(
+                    payload.get("decision_scope").and_then(Value::as_str),
+                ) as i32,
+                decision_scope_ttl_ms: payload
+                    .get("decision_scope_ttl_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+            },
+        ),
+        _ => return None,
+    };
+    Some(common_v1::RunStreamEvent {
+        v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
+        run_id,
+        body: Some(body),
+    })
+}
+
+fn compat_tape_status_kind(payload: &Value) -> common_v1::stream_status::StatusKind {
+    match payload
+        .get("wire_kind")
+        .or_else(|| payload.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "accepted" => common_v1::stream_status::StatusKind::Accepted,
+        "in_progress" => common_v1::stream_status::StatusKind::InProgress,
+        "done" => common_v1::stream_status::StatusKind::Done,
+        "failed" | "cancelled" | "needs_continuation" => {
+            common_v1::stream_status::StatusKind::Failed
+        }
+        _ => common_v1::stream_status::StatusKind::Unspecified,
+    }
+}
+
+fn compat_tape_canonical_id(payload: &Value, field: &str) -> Option<common_v1::CanonicalId> {
+    payload.get(field).and_then(Value::as_str).and_then(|value| {
+        trim_to_option(value.to_owned()).map(|ulid| common_v1::CanonicalId { ulid })
+    })
+}
+
+fn compat_tape_json_bytes(value: Option<&Value>) -> Vec<u8> {
+    serde_json::to_vec(value.unwrap_or(&Value::Null)).unwrap_or_else(|_| b"null".to_vec())
+}
+
+fn compat_tape_approval_prompt(value: Option<&Value>) -> Option<common_v1::ApprovalPrompt> {
+    let value = value?;
+    let options = value
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|option| common_v1::ApprovalOption {
+                    option_id: option
+                        .get("option_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    label: option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    description: option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    default_selected: option
+                        .get("default_selected")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    decision_scope: compat_tape_approval_scope(
+                        option.get("decision_scope").and_then(Value::as_str),
+                    ) as i32,
+                    timebox_ttl_ms: option
+                        .get("timebox_ttl_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(common_v1::ApprovalPrompt {
+        title: value.get("title").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        risk_level: compat_tape_approval_risk(value.get("risk_level").and_then(Value::as_str))
+            as i32,
+        subject_id: value.get("subject_id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        summary: value.get("summary").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        options,
+        timeout_seconds: value.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(0) as u32,
+        details_json: compat_tape_json_bytes(value.get("details_json")),
+        policy_explanation: value
+            .get("policy_explanation")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
+fn compat_tape_approval_scope(value: Option<&str>) -> common_v1::ApprovalDecisionScope {
+    match value.unwrap_or_default() {
+        "once" => common_v1::ApprovalDecisionScope::Once,
+        "session" => common_v1::ApprovalDecisionScope::Session,
+        "timeboxed" => common_v1::ApprovalDecisionScope::Timeboxed,
+        _ => common_v1::ApprovalDecisionScope::Unspecified,
+    }
+}
+
+fn compat_tape_approval_risk(value: Option<&str>) -> common_v1::ApprovalRiskLevel {
+    match value.unwrap_or_default() {
+        "low" => common_v1::ApprovalRiskLevel::Low,
+        "medium" => common_v1::ApprovalRiskLevel::Medium,
+        "high" => common_v1::ApprovalRiskLevel::High,
+        "critical" => common_v1::ApprovalRiskLevel::Critical,
+        _ => common_v1::ApprovalRiskLevel::Unspecified,
+    }
+}
+
+fn compat_run_is_terminal(state: &str) -> bool {
+    matches!(state, "done" | "failed" | "cancelled")
+}
+
+fn compat_run_not_found_response(run_id: &str) -> Response {
+    compat_error_response(
+        StatusCode::NOT_FOUND,
+        "invalid_request_error",
+        "run_not_found",
+        format!("run was not found: {run_id}"),
+    )
+}
+
 fn compat_journal_error_response(error: journal::JournalError) -> Response {
     match error {
         journal::JournalError::CompatResponseNotFound { .. } => compat_error_response(
@@ -1153,12 +2040,17 @@ async fn prepare_compat_run_from_context(
         device_id,
     } = context;
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let session_key = derive_compat_session_key(&token, user, overrides.session_key.as_deref());
+    let session_id = overrides.session_id.clone();
+    let session_key = if session_id.is_some() && overrides.session_key.is_none() {
+        None
+    } else {
+        Some(derive_compat_session_key(&token, user, overrides.session_key.as_deref()))
+    };
     let session = state
         .runtime
         .resolve_orchestrator_session(journal::OrchestratorSessionResolveRequest {
-            session_id: None,
-            session_key: Some(session_key),
+            session_id,
+            session_key,
             session_label: overrides.session_label,
             principal: principal.clone(),
             device_id: device_id.clone(),
@@ -2788,6 +3680,152 @@ fn compat_embeddings_provider_error_response(
     }
 }
 
+fn validate_compat_run_tool_request(payload: &CompatRunsCreateRequest) -> CompatHttpResult<()> {
+    if payload.tools.is_some() {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "custom_tools_unsupported",
+            "/v1/runs uses the configured Palyra tool catalog; per-request tool schemas are not supported",
+        )
+        .into());
+    }
+    match payload
+        .tool_exposure_policy
+        .as_deref()
+        .and_then(|value| trim_to_option(value.to_owned()))
+        .as_deref()
+    {
+        None | Some("default" | "configured") => Ok(()),
+        Some("none") => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "tool_exposure_policy_unsupported",
+            "tool_exposure_policy='none' is not supported because the runtime tool catalog is policy-controlled",
+        )
+        .into()),
+        Some(_) => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_tool_exposure_policy",
+            "tool_exposure_policy must be omitted, 'default', or 'configured'",
+        )
+        .into()),
+    }
+}
+
+fn render_compat_runs_prompt(payload: &CompatRunsCreateRequest) -> CompatHttpResult<String> {
+    let mut sections = Vec::new();
+    if let Some(instructions) =
+        payload.instructions.as_ref().and_then(|value| trim_to_option(value.clone()))
+    {
+        sections.push(format!("SYSTEM:\n{instructions}"));
+    }
+    if let Some(messages) = payload.messages.as_ref() {
+        sections.push(render_compat_messages_prompt(messages.as_slice())?);
+    }
+    if let Some(input) = payload.input.as_ref() {
+        sections.push(render_compat_responses_input_prompt(input)?);
+    }
+    if sections.is_empty() {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "empty_run_input",
+            "/v1/runs requires instructions, messages, or input",
+        )
+        .into());
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn render_compat_responses_input_prompt(input: &CompatResponsesInput) -> CompatHttpResult<String> {
+    match input {
+        CompatResponsesInput::Text(text) => trim_to_option(text.clone()).ok_or_else(|| {
+            CompatHttpError::from(compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "empty_input",
+                "input cannot be empty",
+            ))
+        }),
+        CompatResponsesInput::Messages(messages) => {
+            let rendered = messages
+                .iter()
+                .cloned()
+                .map(|item| CompatChatMessage {
+                    role: item.role.unwrap_or_else(|| "user".to_owned()),
+                    content: item.content,
+                    name: item.name,
+                })
+                .collect::<Vec<_>>();
+            Ok(render_compat_messages_prompt(rendered.as_slice())?)
+        }
+    }
+}
+
+fn compat_runs_effective_metadata(
+    payload: &CompatRunsCreateRequest,
+) -> CompatHttpResult<Option<Value>> {
+    let mut object = match payload.metadata.as_ref() {
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => {
+            return Err(compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_metadata",
+                "metadata must be a JSON object when provided",
+            )
+            .into());
+        }
+        None => serde_json::Map::new(),
+    };
+
+    if let Some(session) = payload.session.as_ref() {
+        if let Some(session_id) =
+            session.id.as_ref().and_then(|value| trim_to_option(value.clone()))
+        {
+            validate_canonical_id(session_id.as_str()).map_err(|_| {
+                CompatHttpError::from(compat_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "invalid_session_id",
+                    "session.id must be a canonical ULID",
+                ))
+            })?;
+            object.insert("palyra_session_id".to_owned(), Value::String(session_id));
+        }
+        if let Some(session_key) =
+            session.key.as_ref().and_then(|value| trim_to_option(value.clone()))
+        {
+            object.insert("palyra_session_key".to_owned(), Value::String(session_key));
+        }
+        if let Some(session_label) =
+            session.label.as_ref().and_then(|value| trim_to_option(value.clone()))
+        {
+            object.insert("palyra_session_label".to_owned(), Value::String(session_label));
+        }
+        if let Some(require_existing) = session.require_existing {
+            object.insert("palyra_require_existing".to_owned(), Value::Bool(require_existing));
+        }
+        if let Some(reset_session) = session.reset {
+            object.insert("palyra_reset_session".to_owned(), Value::Bool(reset_session));
+        }
+    }
+
+    if let Some(policy) =
+        payload.tool_exposure_policy.as_ref().and_then(|value| trim_to_option(value.clone()))
+    {
+        object.insert("palyra_tool_exposure_policy".to_owned(), Value::String(policy));
+    }
+
+    if object.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(object)))
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_compat_requested_model(
     provider: &model_provider::ProviderStatusSnapshot,
@@ -2891,6 +3929,10 @@ fn parse_compat_request_overrides(
         ));
     };
     Ok(CompatRequestOverrides {
+        session_id: metadata_object
+            .get("palyra_session_id")
+            .and_then(Value::as_str)
+            .and_then(|value| trim_to_option(value.to_owned())),
         session_key: metadata_object
             .get("palyra_session_key")
             .and_then(Value::as_str)

@@ -1627,6 +1627,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/v1/responses/{response_id}",
             get(compat::compat_response_get_handler).delete(compat::compat_response_delete_handler),
         )
+        .route("/v1/runs", post(compat::compat_runs_create_handler))
+        .route("/v1/runs/{run_id}", get(compat::compat_run_get_handler))
+        .route("/v1/runs/{run_id}/events", get(compat::compat_run_events_handler))
         .route("/v1/tools/invoke", post(compat::compat_tools_invoke_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn(

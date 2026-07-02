@@ -1188,6 +1188,161 @@ fn compat_responses_store_get_delete_and_idempotency() -> Result<()> {
 }
 
 #[test]
+fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat runs token",
+        &["compat.responses.create"],
+    )?;
+    let unauthorized_token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat runs unauthorized token",
+        &["compat.models.read"],
+    )?;
+
+    let create_payload = json!({
+        "instructions": "Answer directly.",
+        "messages": [{
+            "role": "user",
+            "content": "runs API text"
+        }],
+        "session": {
+            "label": "Runs API integration"
+        },
+        "tool_exposure_policy": "configured"
+    });
+    let (create_status, create_response) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/runs",
+        token.as_str(),
+        &create_payload,
+        Some("runs-create-key-1"),
+    )?;
+    assert_eq!(create_status, 200, "run create should be accepted: {create_response}");
+    assert_eq!(create_response.get("object").and_then(Value::as_str), Some("run"));
+    assert_eq!(create_response.get("status").and_then(Value::as_str), Some("queued"));
+    assert_eq!(create_response.get("queue_state").and_then(Value::as_str), Some("accepted"));
+    assert!(create_response.get("accepted_at").and_then(Value::as_i64).is_some());
+    let run_id = create_response
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("run create response missing id"))?
+        .to_owned();
+
+    let terminal =
+        wait_for_compat_run_terminal(&client, admin_port, token.as_str(), run_id.as_str())?;
+    assert_eq!(terminal.get("id").and_then(Value::as_str), Some(run_id.as_str()));
+    assert_eq!(terminal.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(terminal.get("active_phase").and_then(Value::as_str), Some("completed"));
+    assert!(
+        terminal
+            .pointer("/usage/total_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|tokens| tokens > 0),
+        "run status should include usage: {terminal}"
+    );
+    assert_eq!(terminal.get("pending_approval"), Some(&Value::Null));
+    assert_eq!(
+        terminal.pointer("/verification_summary/state").and_then(Value::as_str),
+        Some("not_available")
+    );
+
+    let (replay_status, replay_response) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/runs",
+        token.as_str(),
+        &create_payload,
+        Some("runs-create-key-1"),
+    )?;
+    assert_eq!(replay_status, 200, "same run idempotency key should replay status");
+    assert_eq!(
+        replay_response.get("id").and_then(Value::as_str),
+        Some(run_id.as_str()),
+        "idempotency replay must not create a second run"
+    );
+
+    let (conflict_status, conflict_response) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/runs",
+        token.as_str(),
+        &json!({ "input": "changed runs API text" }),
+        Some("runs-create-key-1"),
+    )?;
+    assert_eq!(conflict_status, 409, "changed run payload should conflict");
+    assert_eq!(
+        conflict_response.pointer("/error/code").and_then(Value::as_str),
+        Some("idempotency_conflict")
+    );
+
+    let (unauthorized_status, unauthorized_response) = compat_get_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}").as_str(),
+        unauthorized_token.as_str(),
+    )?;
+    assert_eq!(unauthorized_status, 403, "token without runs scope must be rejected");
+    assert_eq!(
+        unauthorized_response.pointer("/error/code").and_then(Value::as_str),
+        Some("missing_scope")
+    );
+
+    let (events_status, events_content_type, events_body) = compat_get_sse(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/events").as_str(),
+        token.as_str(),
+    )?;
+    assert_eq!(events_status, 200, "run events stream should open: {events_body}");
+    assert!(
+        events_content_type.starts_with("text/event-stream"),
+        "run events should use SSE content type: {events_content_type}"
+    );
+    let messages = parse_sse_messages(events_body.as_str())?;
+    assert!(messages.last().is_some_and(|(_, data)| data == "[DONE]"));
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    let public_event_names = json_events
+        .iter()
+        .filter_map(|(_, event)| event.get("event").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        public_event_names.contains(&"run.queued")
+            && public_event_names.contains(&"run.started")
+            && public_event_names.contains(&"model.delta")
+            && public_event_names.contains(&"run.completed"),
+        "run events should replay public runtime taxonomy events: {public_event_names:?}"
+    );
+    assert!(
+        json_events.iter().all(|(_, event)| {
+            event.pointer("/correlation/run_id").and_then(Value::as_str) == Some(run_id.as_str())
+        }),
+        "all public run events should carry the requested run correlation"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compat_responses_stream_maps_stream_failures_to_failed_event() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
@@ -2800,6 +2955,26 @@ fn create_personal_api_token(
     label: &str,
     scopes: &[&str],
 ) -> Result<String> {
+    create_api_token_for_principal(
+        client,
+        admin_port,
+        cookie,
+        csrf_token,
+        label,
+        CONSOLE_ADMIN_PRINCIPAL,
+        scopes,
+    )
+}
+
+fn create_api_token_for_principal(
+    client: &Client,
+    admin_port: u16,
+    cookie: &str,
+    csrf_token: &str,
+    label: &str,
+    principal: &str,
+    scopes: &[&str],
+) -> Result<String> {
     let created = post_console_json(
         client,
         admin_port,
@@ -2809,7 +2984,7 @@ fn create_personal_api_token(
         &json!({
             "label": label,
             "scopes": scopes,
-            "principal": CONSOLE_ADMIN_PRINCIPAL,
+            "principal": principal,
             "role": "owner"
         }),
     )?;
@@ -2913,6 +3088,54 @@ fn compat_post_sse(
     let body =
         response.text().with_context(|| format!("failed to read compat SSE body for {path}"))?;
     Ok((status, content_type, body))
+}
+
+fn compat_get_sse(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+) -> Result<(u16, String, String)> {
+    let response = client
+        .get(console_url(admin_port, path))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .with_context(|| format!("failed to GET compat SSE path {path}"))?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body =
+        response.text().with_context(|| format!("failed to read compat SSE body for {path}"))?;
+    Ok((status, content_type, body))
+}
+
+fn wait_for_compat_run_terminal(
+    client: &Client,
+    admin_port: u16,
+    token: &str,
+    run_id: &str,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, payload) =
+            compat_get_json(client, admin_port, format!("/v1/runs/{run_id}").as_str(), token)?;
+        if status == 200
+            && payload
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"))
+        {
+            return Ok(payload);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("compat run {run_id} did not reach a terminal state: {payload}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn parse_sse_messages(body: &str) -> Result<Vec<(Option<String>, String)>> {
