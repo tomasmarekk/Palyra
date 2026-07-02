@@ -1823,6 +1823,54 @@ pub struct IdempotencyBeginOutcome {
     pub record: Option<IdempotencyRecordSnapshot>,
 }
 
+/// Durable public view of one OpenAI-compatible Responses API result.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CompatResponseRecord {
+    pub response_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub status: String,
+    pub response_json: String,
+    pub error_json: Option<String>,
+    pub redaction_state_json: String,
+    pub created_at_unix_ms: i64,
+    pub completed_at_unix_ms: Option<i64>,
+    pub updated_at_unix_ms: i64,
+    pub retention_expires_at_unix_ms: Option<i64>,
+    pub deleted_at_unix_ms: Option<i64>,
+    pub delete_reason: Option<String>,
+}
+
+/// Parameters for creating or replacing a compat response public view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatResponseUpsertRequest {
+    pub response_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub owner_principal: String,
+    pub device_id: String,
+    pub channel: Option<String>,
+    pub status: String,
+    pub response_json: String,
+    pub error_json: Option<String>,
+    pub redaction_state_json: String,
+    pub created_at_unix_ms: i64,
+    pub completed_at_unix_ms: Option<i64>,
+    pub retention_expires_at_unix_ms: Option<i64>,
+}
+
+/// Outcome of deleting the public compat response view without deleting audit records.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CompatResponseDeleteOutcome {
+    pub response_id: String,
+    pub deleted: bool,
+    pub already_deleted: bool,
+    pub deleted_at_unix_ms: i64,
+}
+
 /// Content and retention metadata for a new tool result artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultArtifactCreateRequest {
@@ -4333,6 +4381,10 @@ pub enum JournalError {
     ToolResultArtifactScopeMismatch { artifact_id: String },
     #[error("tool result artifact is not readable: {artifact_id}: {reason}")]
     ToolResultArtifactReadDenied { artifact_id: String, reason: String },
+    #[error("compat response not found: {response_id}")]
+    CompatResponseNotFound { response_id: String },
+    #[error("compat response scope mismatch: {response_id}")]
+    CompatResponseScopeMismatch { response_id: String },
     #[error("tool job already exists: {job_id}")]
     DuplicateToolJobId { job_id: String },
     #[error("tool job not found: {job_id}")]
@@ -6387,6 +6439,68 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 40,
+        name: "compat_response_store",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS compat_response_records (
+                response_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL UNIQUE,
+                owner_principal TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT,
+                status TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                error_json TEXT,
+                redaction_state_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                completed_at_unix_ms INTEGER,
+                updated_at_unix_ms INTEGER NOT NULL,
+                retention_expires_at_unix_ms INTEGER,
+                deleted_at_unix_ms INTEGER,
+                delete_reason TEXT,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_compat_response_records_owner_created
+                ON compat_response_records(owner_principal, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_compat_response_records_session
+                ON compat_response_records(session_ulid, created_at_unix_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_compat_response_records_run
+                ON compat_response_records(run_ulid);
+            CREATE INDEX IF NOT EXISTS idx_compat_response_records_retention
+                ON compat_response_records(retention_expires_at_unix_ms, deleted_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS compat_response_events (
+                event_ulid TEXT PRIMARY KEY,
+                response_ulid TEXT NOT NULL,
+                session_ulid TEXT NOT NULL,
+                run_ulid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_principal TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(response_ulid) REFERENCES compat_response_records(response_ulid),
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid),
+                FOREIGN KEY(run_ulid) REFERENCES orchestrator_runs(run_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_compat_response_events_response
+                ON compat_response_events(response_ulid, created_at_unix_ms ASC);
+            CREATE INDEX IF NOT EXISTS idx_compat_response_events_run
+                ON compat_response_events(run_ulid, created_at_unix_ms ASC);
+            CREATE TRIGGER IF NOT EXISTS trg_compat_response_events_prevent_update
+            BEFORE UPDATE ON compat_response_events
+            BEGIN
+                SELECT RAISE(ABORT, 'compat_response_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_compat_response_events_prevent_delete
+            BEFORE DELETE ON compat_response_events
+            BEGIN
+                SELECT RAISE(ABORT, 'compat_response_events is append-only');
+            END;
+        "#,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -6808,6 +6922,107 @@ fn hydrate_idempotency_record(
         updated_at_unix_ms: row.get(8)?,
         expires_at_unix_ms: row.get(9)?,
     })
+}
+
+fn hydrate_compat_response_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CompatResponseRecord> {
+    Ok(CompatResponseRecord {
+        response_id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        owner_principal: row.get(3)?,
+        device_id: row.get(4)?,
+        channel: row.get(5)?,
+        status: row.get(6)?,
+        response_json: row.get(7)?,
+        error_json: row.get(8)?,
+        redaction_state_json: row.get(9)?,
+        created_at_unix_ms: row.get(10)?,
+        completed_at_unix_ms: row.get(11)?,
+        updated_at_unix_ms: row.get(12)?,
+        retention_expires_at_unix_ms: row.get(13)?,
+        deleted_at_unix_ms: row.get(14)?,
+        delete_reason: row.get(15)?,
+    })
+}
+
+fn load_compat_response_record(
+    connection: &Connection,
+    response_id: &str,
+) -> Result<Option<CompatResponseRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    response_ulid,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    status,
+                    response_json,
+                    error_json,
+                    redaction_state_json,
+                    created_at_unix_ms,
+                    completed_at_unix_ms,
+                    updated_at_unix_ms,
+                    retention_expires_at_unix_ms,
+                    deleted_at_unix_ms,
+                    delete_reason
+                FROM compat_response_records
+                WHERE response_ulid = ?1
+            "#,
+            params![response_id],
+            hydrate_compat_response_record,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn append_compat_response_event_tx(
+    connection: &Connection,
+    max_payload_bytes: usize,
+    record: &CompatResponseRecord,
+    event_type: &str,
+    payload: Value,
+    now: i64,
+) -> Result<(), JournalError> {
+    let raw_payload = payload.to_string();
+    if raw_payload.len() > max_payload_bytes {
+        return Err(JournalError::PayloadTooLarge {
+            payload_kind: "compat_response_event",
+            actual_bytes: raw_payload.len(),
+            max_bytes: max_payload_bytes,
+        });
+    }
+    let (payload_json, _) = sanitize_payload(raw_payload.as_bytes())?;
+    connection.execute(
+        r#"
+            INSERT INTO compat_response_events (
+                event_ulid,
+                response_ulid,
+                session_ulid,
+                run_ulid,
+                event_type,
+                actor_principal,
+                payload_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![
+            Ulid::new().to_string(),
+            record.response_id,
+            record.session_id,
+            record.run_id,
+            event_type,
+            record.owner_principal,
+            payload_json,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 const TOOL_JOB_SELECT_COLUMNS: &str = r#"
@@ -9652,6 +9867,253 @@ impl JournalStore {
             records.push(row?);
         }
         Ok(records)
+    }
+
+    /// Creates or updates the public view for a compat Responses API result.
+    ///
+    /// The public response JSON is sanitized before storage. Deleting this
+    /// record later clears only the public view; run lifecycle and append-only
+    /// response events remain for governance and support bundles.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::InvalidArgument`], [`JournalError::PayloadTooLarge`],
+    /// [`JournalError::RunNotFound`], or [`JournalError`] on storage failure.
+    pub fn upsert_compat_response_record(
+        &self,
+        request: &CompatResponseUpsertRequest,
+    ) -> Result<CompatResponseRecord, JournalError> {
+        if request.response_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("response_id cannot be empty".to_owned()));
+        }
+        if request.session_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("session_id cannot be empty".to_owned()));
+        }
+        if request.run_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("run_id cannot be empty".to_owned()));
+        }
+        if request.owner_principal.trim().is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "owner_principal cannot be empty".to_owned(),
+            ));
+        }
+        if request.response_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "compat_response",
+                actual_bytes: request.response_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        if request.redaction_state_json.len() > self.config.max_payload_bytes {
+            return Err(JournalError::PayloadTooLarge {
+                payload_kind: "compat_response_redaction_state",
+                actual_bytes: request.redaction_state_json.len(),
+                max_bytes: self.config.max_payload_bytes,
+            });
+        }
+        let (response_json, _) = sanitize_payload(request.response_json.as_bytes())?;
+        let error_json = request
+            .error_json
+            .as_deref()
+            .map(|raw| sanitize_payload(raw.as_bytes()).map(|(sanitized, _)| sanitized))
+            .transpose()?;
+        let (redaction_state_json, _) = sanitize_payload(request.redaction_state_json.as_bytes())?;
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let run_exists = transaction
+            .query_row(
+                "SELECT 1 FROM orchestrator_runs WHERE run_ulid = ?1",
+                params![request.run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !run_exists {
+            return Err(JournalError::RunNotFound { run_id: request.run_id.clone() });
+        }
+        transaction.execute(
+            r#"
+                INSERT INTO compat_response_records (
+                    response_ulid,
+                    session_ulid,
+                    run_ulid,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    status,
+                    response_json,
+                    error_json,
+                    redaction_state_json,
+                    created_at_unix_ms,
+                    completed_at_unix_ms,
+                    updated_at_unix_ms,
+                    retention_expires_at_unix_ms,
+                    deleted_at_unix_ms,
+                    delete_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, NULL)
+                ON CONFLICT(response_ulid) DO UPDATE SET
+                    session_ulid = excluded.session_ulid,
+                    run_ulid = excluded.run_ulid,
+                    owner_principal = excluded.owner_principal,
+                    device_id = excluded.device_id,
+                    channel = excluded.channel,
+                    status = excluded.status,
+                    response_json = excluded.response_json,
+                    error_json = excluded.error_json,
+                    redaction_state_json = excluded.redaction_state_json,
+                    completed_at_unix_ms = excluded.completed_at_unix_ms,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms,
+                    retention_expires_at_unix_ms = excluded.retention_expires_at_unix_ms,
+                    deleted_at_unix_ms = NULL,
+                    delete_reason = NULL
+            "#,
+            params![
+                request.response_id,
+                request.session_id,
+                request.run_id,
+                request.owner_principal,
+                request.device_id,
+                request.channel,
+                request.status,
+                response_json,
+                error_json,
+                redaction_state_json,
+                request.created_at_unix_ms,
+                request.completed_at_unix_ms,
+                now,
+                request.retention_expires_at_unix_ms,
+            ],
+        )?;
+        let record = load_compat_response_record(&transaction, request.response_id.as_str())?
+            .ok_or_else(|| JournalError::CompatResponseNotFound {
+                response_id: request.response_id.clone(),
+            })?;
+        append_compat_response_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &record,
+            "upserted",
+            json!({
+                "status": record.status,
+                "deleted": false,
+                "retention_expires_at_unix_ms": record.retention_expires_at_unix_ms,
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Returns the public compat response record for its owner, excluding deleted views.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CompatResponseNotFound`],
+    /// [`JournalError::CompatResponseScopeMismatch`], or [`JournalError`] on storage failure.
+    pub fn compat_response_record_for_owner(
+        &self,
+        response_id: &str,
+        owner_principal: &str,
+    ) -> Result<CompatResponseRecord, JournalError> {
+        if response_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("response_id cannot be empty".to_owned()));
+        }
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let record = load_compat_response_record(&transaction, response_id)?.ok_or_else(|| {
+            JournalError::CompatResponseNotFound { response_id: response_id.to_owned() }
+        })?;
+        if record.owner_principal != owner_principal {
+            return Err(JournalError::CompatResponseScopeMismatch {
+                response_id: response_id.to_owned(),
+            });
+        }
+        if record.deleted_at_unix_ms.is_some() {
+            return Err(JournalError::CompatResponseNotFound {
+                response_id: response_id.to_owned(),
+            });
+        }
+        Ok(record)
+    }
+
+    /// Deletes only the public compat response view; audit records and lifecycle
+    /// metadata stay intact.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::CompatResponseNotFound`],
+    /// [`JournalError::CompatResponseScopeMismatch`], or [`JournalError`] on storage failure.
+    pub fn delete_compat_response_public_view(
+        &self,
+        response_id: &str,
+        owner_principal: &str,
+        reason: &str,
+    ) -> Result<CompatResponseDeleteOutcome, JournalError> {
+        if response_id.trim().is_empty() {
+            return Err(JournalError::InvalidArgument("response_id cannot be empty".to_owned()));
+        }
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let record = load_compat_response_record(&transaction, response_id)?.ok_or_else(|| {
+            JournalError::CompatResponseNotFound { response_id: response_id.to_owned() }
+        })?;
+        if record.owner_principal != owner_principal {
+            return Err(JournalError::CompatResponseScopeMismatch {
+                response_id: response_id.to_owned(),
+            });
+        }
+        if record.deleted_at_unix_ms.is_some() {
+            return Ok(CompatResponseDeleteOutcome {
+                response_id: response_id.to_owned(),
+                deleted: true,
+                already_deleted: true,
+                deleted_at_unix_ms: record.deleted_at_unix_ms.unwrap_or(now),
+            });
+        }
+
+        let tombstone_json = json!({
+            "id": response_id,
+            "object": "response",
+            "status": "deleted",
+            "deleted": true,
+        })
+        .to_string();
+        let (tombstone_json, _) = sanitize_payload(tombstone_json.as_bytes())?;
+        transaction.execute(
+            r#"
+                UPDATE compat_response_records
+                SET
+                    response_json = ?2,
+                    error_json = NULL,
+                    deleted_at_unix_ms = ?3,
+                    delete_reason = ?4,
+                    updated_at_unix_ms = ?3
+                WHERE response_ulid = ?1
+            "#,
+            params![response_id, tombstone_json, now, reason],
+        )?;
+        let deleted_record =
+            load_compat_response_record(&transaction, response_id)?.ok_or_else(|| {
+                JournalError::CompatResponseNotFound { response_id: response_id.to_owned() }
+            })?;
+        append_compat_response_event_tx(
+            &transaction,
+            self.config.max_payload_bytes,
+            &deleted_record,
+            "deleted",
+            json!({
+                "deleted": true,
+                "reason": reason,
+                "public_view_deleted": true,
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(CompatResponseDeleteOutcome {
+            response_id: response_id.to_owned(),
+            deleted: true,
+            already_deleted: false,
+            deleted_at_unix_ms: now,
+        })
     }
 
     /// Stores a tool result artifact with its content digest and retention
@@ -26637,18 +27099,19 @@ mod tests {
         ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
         ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStateTransitionRequest,
         CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter,
-        CommitmentUpdateRequest, CronConcurrencyPolicy, CronJobCreateRequest, CronJobsListFilter,
-        CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest, CronRunStartRequest,
-        CronRunStatus, CronRunsListFilter, CronScheduleType, HashMemoryEmbeddingProvider,
-        IdempotencyBeginRequest, IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig,
-        JournalError, JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest,
-        MemoryItemsListFilter, MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy,
-        MemorySearchRequest, MemorySource, OrchestratorCancelRequest,
-        OrchestratorQueuedInputCreateRequest, OrchestratorRunStartRequest,
-        OrchestratorSessionPinCreateRequest, OrchestratorSessionResolveRequest,
-        OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
-        ProgressDraftListFilter, ProgressDraftTapeEventRequest, RecallArtifactCreateRequest,
-        RecallArtifactListFilter, SessionProjectContextStateUpsertRequest, SessionSearchRequest,
+        CommitmentUpdateRequest, CompatResponseUpsertRequest, CronConcurrencyPolicy,
+        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
+        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
+        CronScheduleType, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
+        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
+        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
+        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
+        OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
+        OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
+        OrchestratorTapeAppendRequest, OrchestratorUsageDelta, ProgressDraftListFilter,
+        ProgressDraftTapeEventRequest, RecallArtifactCreateRequest, RecallArtifactListFilter,
+        SessionProjectContextStateUpsertRequest, SessionSearchRequest,
         SessionSearchUxSourceRefsProjection, SessionSearchUxSourceRefsReasonCode,
         SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
@@ -27764,6 +28227,76 @@ mod tests {
                 migration.version
             );
         }
+    }
+
+    #[test]
+    fn compat_response_store_persists_and_safe_deletes_public_view() {
+        let db_path = temp_db_path();
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5RA1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5RB1";
+        let response_id = "resp_01ARZ3NDEKTSV4RRFFQ69G5RB1";
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            upsert_orchestrator_session(&store, session_id);
+            start_orchestrator_run(&store, session_id, run_id);
+            store
+                .upsert_compat_response_record(&CompatResponseUpsertRequest {
+                    response_id: response_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    owner_principal: "user:ops".to_owned(),
+                    device_id: "device-1".to_owned(),
+                    channel: Some("compat-api".to_owned()),
+                    status: "completed".to_owned(),
+                    response_json: json!({
+                        "id": response_id,
+                        "object": "response",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "hello"}]
+                        }]
+                    })
+                    .to_string(),
+                    error_json: None,
+                    redaction_state_json: json!({"policy": "compat_response_store.v1"}).to_string(),
+                    created_at_unix_ms: 1_700_000_000_000,
+                    completed_at_unix_ms: Some(1_700_000_000_050),
+                    retention_expires_at_unix_ms: Some(1_700_086_400_000),
+                })
+                .expect("compat response should persist");
+        }
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let loaded = reopened
+            .compat_response_record_for_owner(response_id, "user:ops")
+            .expect("compat response should be readable after reopen");
+        assert_eq!(loaded.run_id, run_id);
+        assert_eq!(loaded.retention_expires_at_unix_ms, Some(1_700_086_400_000));
+        assert_eq!(
+            serde_json::from_str::<Value>(loaded.response_json.as_str())
+                .expect("response json should parse")
+                .pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello")
+        );
+
+        let outcome = reopened
+            .delete_compat_response_public_view(response_id, "user:ops", "test_delete")
+            .expect("compat response public view should delete");
+        assert!(outcome.deleted);
+        assert!(!outcome.already_deleted);
+        let get_after_delete = reopened
+            .compat_response_record_for_owner(response_id, "user:ops")
+            .expect_err("deleted public view should not be readable");
+        assert!(matches!(get_after_delete, JournalError::CompatResponseNotFound { .. }));
+        let second_delete = reopened
+            .delete_compat_response_public_view(response_id, "user:ops", "test_delete")
+            .expect("compat response delete should be idempotent");
+        assert!(second_delete.deleted);
+        assert!(second_delete.already_deleted);
     }
 
     #[test]

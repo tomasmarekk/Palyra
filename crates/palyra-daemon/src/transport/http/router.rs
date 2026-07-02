@@ -1623,6 +1623,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(compat::compat_embeddings_handler))
         .route("/v1/chat/completions", post(compat::compat_chat_completions_handler))
         .route("/v1/responses", post(compat::compat_responses_handler))
+        .route(
+            "/v1/responses/{response_id}",
+            get(compat::compat_response_get_handler).delete(compat::compat_response_delete_handler),
+        )
         .route("/v1/tools/invoke", post(compat::compat_tools_invoke_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn(

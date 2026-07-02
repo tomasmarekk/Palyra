@@ -16,9 +16,30 @@ use crate::{
     app::state::CompatApiRateLimitEntry,
     *,
 };
-use std::collections::HashSet;
+use palyra_common::runtime_contracts::{IdempotencyReplayDecision, StableErrorEnvelope};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, sync::Arc};
 
 const COMPAT_API_CHANNEL: &str = "compat-api";
+const COMPAT_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const COMPAT_RESPONSE_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const COMPAT_RESPONSE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+struct CompatHttpError(Box<Response>);
+
+impl From<Response> for CompatHttpError {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
+impl From<CompatHttpError> for Response {
+    fn from(error: CompatHttpError) -> Self {
+        *error.0
+    }
+}
+
+type CompatHttpResult<T> = Result<T, CompatHttpError>;
 
 /// Request body for the compatibility chat-completions endpoint.
 #[derive(Debug, Deserialize)]
@@ -31,7 +52,7 @@ pub(crate) struct CompatChatCompletionsRequest {
 }
 
 /// Request body for the compatibility responses endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CompatResponsesRequest {
     model: Option<String>,
     input: CompatResponsesInput,
@@ -56,7 +77,7 @@ pub(crate) struct CompatEmbeddingsRequest {
 }
 
 /// One chat-style message accepted by compatibility chat and responses inputs.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CompatChatMessage {
     role: String,
     content: CompatMessageContent,
@@ -65,7 +86,7 @@ pub(crate) struct CompatChatMessage {
 }
 
 /// Input forms accepted by the compatibility responses endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum CompatResponsesInput {
     Text(String),
@@ -81,7 +102,7 @@ pub(crate) enum CompatEmbeddingsInput {
 }
 
 /// One structured response-input message item.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CompatResponseInputItem {
     role: Option<String>,
     content: CompatMessageContent,
@@ -90,7 +111,7 @@ pub(crate) struct CompatResponseInputItem {
 }
 
 /// Text-bearing message content accepted by compatibility request formats.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum CompatMessageContent {
     Text(String),
@@ -99,7 +120,7 @@ pub(crate) enum CompatMessageContent {
 }
 
 /// One typed content part inside a compatibility message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CompatMessagePart {
     #[serde(rename = "type")]
     kind: String,
@@ -116,15 +137,51 @@ struct CompatRequestOverrides {
 }
 
 #[derive(Debug)]
+struct CompatAuthorizedRunContext {
+    token: AuthenticatedApiToken,
+    provider_kind: String,
+    model_name: String,
+    overrides: CompatRequestOverrides,
+    principal: String,
+    device_id: String,
+}
+
+#[derive(Debug)]
 struct CompatPreparedRun {
     token: AuthenticatedApiToken,
     provider_kind: String,
     model_name: String,
     run_id: String,
     session_id: String,
+    principal: String,
+    device_id: String,
     created_at_unix_ms: i64,
     request_sender: mpsc::Sender<common_v1::RunStreamRequest>,
     run_request: TonicRequest<ReceiverStream<common_v1::RunStreamRequest>>,
+}
+
+#[derive(Debug, Clone)]
+struct CompatResponseIdempotencyReservation {
+    storage_key: String,
+}
+
+#[derive(Debug)]
+enum CompatResponseIdempotencyBegin {
+    Reserved(CompatResponseIdempotencyReservation),
+    Replay(Value),
+}
+
+#[derive(Debug, Clone)]
+struct CompatResponsePersistRequest {
+    response_id: String,
+    session_id: String,
+    run_id: String,
+    owner_principal: String,
+    device_id: String,
+    status: String,
+    created_at_unix_ms: i64,
+    completed_at_unix_ms: Option<i64>,
+    payload: Value,
 }
 
 #[derive(Debug)]
@@ -485,7 +542,18 @@ pub(crate) async fn compat_responses_handler(
     headers: HeaderMap,
     Json(payload): Json<CompatResponsesRequest>,
 ) -> Result<Response, Response> {
+    let request_payload_bytes =
+        serde_json::to_vec(&payload).map_err(internal_runtime_error_response)?;
+    let idempotency_key = compat_idempotency_key(&headers)?;
     let stream = payload.stream.unwrap_or(false);
+    if stream && idempotency_key.is_some() {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "streaming_idempotency_unsupported",
+            "Idempotency-Key is supported for non-streaming /v1/responses create requests",
+        ));
+    }
     let prompt_text = match payload.input {
         CompatResponsesInput::Text(text) => trim_to_option(text).ok_or_else(|| {
             compat_error_response(
@@ -507,21 +575,40 @@ pub(crate) async fn compat_responses_handler(
             render_compat_messages_prompt(rendered.as_slice())?
         }
     };
-    let prepared = prepare_compat_run(
+    let authorized = authorize_compat_run_context(
         &state,
         &headers,
         payload.model.as_deref(),
-        payload.user.as_deref(),
         payload.metadata.as_ref(),
-        prompt_text,
         PERMISSION_COMPAT_RESPONSES_CREATE,
-    )
-    .await?;
+    )?;
+    let idempotency = if let Some(raw_key) = idempotency_key.as_deref() {
+        match begin_compat_responses_idempotency(
+            &state,
+            &authorized,
+            raw_key,
+            request_payload_bytes.as_slice(),
+        )
+        .await?
+        {
+            CompatResponseIdempotencyBegin::Reserved(reservation) => Some(reservation),
+            CompatResponseIdempotencyBegin::Replay(payload) => {
+                return Ok(Json(payload).into_response());
+            }
+        }
+    } else {
+        None
+    };
+    let prepared =
+        prepare_compat_run_from_context(&state, authorized, payload.user.as_deref(), prompt_text)
+            .await?;
     if stream {
         return Ok(build_compat_responses_streaming_response(state, prepared));
     }
     let token_id = prepared.token.token_id.clone();
     let run_id = prepared.run_id.clone();
+    let owner_principal = prepared.principal.clone();
+    let device_id = prepared.device_id.clone();
     let execution = execute_compat_run(&state, prepared).await;
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
     match execution {
@@ -534,7 +621,37 @@ pub(crate) async fn compat_responses_handler(
                 Some(run_id.as_str()),
                 now,
             );
-            Ok(Json(build_compat_responses_payload(&result)).into_response())
+            let response_payload = build_compat_responses_payload(&result);
+            persist_compat_response_payload(
+                &state,
+                CompatResponsePersistRequest {
+                    response_id: response_payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    session_id: result.snapshot.session_id.clone(),
+                    run_id: result.snapshot.run_id.clone(),
+                    owner_principal,
+                    device_id,
+                    status: "completed".to_owned(),
+                    created_at_unix_ms: result.snapshot.created_at_unix_ms,
+                    completed_at_unix_ms: result.snapshot.completed_at_unix_ms,
+                    payload: response_payload.clone(),
+                },
+            )
+            .await?;
+            if let Some(reservation) = idempotency {
+                complete_compat_response_idempotency(
+                    &state,
+                    &reservation,
+                    response_payload.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    result.snapshot.run_id.as_str(),
+                    result.snapshot.session_id.as_str(),
+                )
+                .await?;
+            }
+            Ok(Json(response_payload).into_response())
         }
         Err(response) => {
             touch_compat_api_token(
@@ -545,8 +662,439 @@ pub(crate) async fn compat_responses_handler(
                 Some(run_id.as_str()),
                 now,
             );
+            if let Some(reservation) = idempotency {
+                let _ = fail_compat_response_idempotency(
+                    &state,
+                    &reservation,
+                    "compat.responses/run_failed",
+                    "compat responses run failed",
+                    "retry with the same idempotency key after the transient failure is resolved",
+                )
+                .await;
+            }
             Err(response)
         }
+    }
+}
+
+/// Handles `GET /v1/responses/{response_id}`.
+///
+/// # Errors
+/// Returns an error response when the token is unauthorized or the response
+/// public view does not exist for the token owner.
+pub(crate) async fn compat_response_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal) = authorize_compat_response_record_access(&state, &headers, now)?;
+    let payload =
+        load_compat_response_payload(&state, response_id.as_str(), owner_principal.as_str())
+            .await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "responses_get",
+        "response_loaded",
+        Some(response_id.as_str()),
+        now,
+    );
+    Ok(Json(payload).into_response())
+}
+
+/// Handles `DELETE /v1/responses/{response_id}`.
+///
+/// # Errors
+/// Returns an error response when the token is unauthorized or the response
+/// does not belong to the token owner.
+pub(crate) async fn compat_response_delete_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal) = authorize_compat_response_record_access(&state, &headers, now)?;
+    let outcome =
+        delete_compat_response_public_view(&state, response_id.as_str(), owner_principal.as_str())
+            .await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "responses_delete",
+        if outcome.already_deleted { "already_deleted" } else { "deleted" },
+        Some(response_id.as_str()),
+        now,
+    );
+    Ok(Json(json!({
+        "id": outcome.response_id,
+        "object": "response.deleted",
+        "deleted": outcome.deleted,
+    }))
+    .into_response())
+}
+
+fn authorize_compat_response_record_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    now: i64,
+) -> CompatHttpResult<(AuthenticatedApiToken, String)> {
+    let token =
+        authorize_compat_api_token(state, headers, PERMISSION_COMPAT_RESPONSES_CREATE, None, now)?;
+    enforce_compat_rate_limit(state, token.token_id.as_str(), token.rate_limit_per_minute)?;
+    let (principal, _) =
+        resolve_compat_runtime_identity(state, &token, PERMISSION_COMPAT_RESPONSES_CREATE)?;
+    Ok((token, principal))
+}
+
+fn compat_idempotency_key(headers: &HeaderMap) -> CompatHttpResult<Option<String>> {
+    let Some(value) = headers.get(COMPAT_IDEMPOTENCY_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| {
+        compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_idempotency_key",
+            "Idempotency-Key must be valid visible ASCII",
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 256 {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "idempotency_key_too_long",
+            "Idempotency-Key must be at most 256 characters",
+        )
+        .into());
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+async fn begin_compat_responses_idempotency(
+    state: &AppState,
+    context: &CompatAuthorizedRunContext,
+    raw_key: &str,
+    request_payload: &[u8],
+) -> Result<CompatResponseIdempotencyBegin, Response> {
+    let storage_key = compat_response_idempotency_storage_key(
+        context.principal.as_str(),
+        context.token.token_id.as_str(),
+        raw_key,
+    );
+    let payload_sha256 = crate::sha256_hex(request_payload);
+    let runtime = Arc::clone(&state.runtime);
+    let begin_key = storage_key.clone();
+    let begin = tokio::task::spawn_blocking(move || {
+        runtime.journal_store.begin_idempotency_operation(&journal::IdempotencyBeginRequest {
+            key: begin_key,
+            scope: "compat.responses".to_owned(),
+            operation_kind: "responses.create".to_owned(),
+            payload_sha256,
+            expires_at_unix_ms: Some(
+                unix_ms_now().unwrap_or(0).saturating_add(COMPAT_RESPONSE_IDEMPOTENCY_TTL_MS),
+            ),
+        })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_worker_failed",
+            "idempotency worker panicked",
+        )
+    })?
+    .map_err(compat_journal_error_response)?;
+
+    match begin.decision {
+        IdempotencyReplayDecision::CompletedReplayResult => {
+            let response_id = compat_response_id_from_idempotency_record(begin.record.as_ref())?;
+            let payload = load_compat_response_payload(
+                state,
+                response_id.as_str(),
+                context.principal.as_str(),
+            )
+            .await?;
+            Ok(CompatResponseIdempotencyBegin::Replay(payload))
+        }
+        IdempotencyReplayDecision::ConflictingPayload => Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "idempotency_error",
+            "idempotency_conflict",
+            "Idempotency-Key was reused with a different /v1/responses request payload",
+        )),
+        IdempotencyReplayDecision::SamePayloadRetry => Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "idempotency_error",
+            "idempotency_in_progress",
+            "Idempotency-Key already has an in-progress /v1/responses request",
+        )),
+        IdempotencyReplayDecision::Reserved | IdempotencyReplayDecision::ExpiredRetry => {
+            Ok(CompatResponseIdempotencyBegin::Reserved(CompatResponseIdempotencyReservation {
+                storage_key,
+            }))
+        }
+    }
+}
+
+fn compat_response_idempotency_storage_key(
+    owner_principal: &str,
+    token_id: &str,
+    raw_key: &str,
+) -> String {
+    let material = format!(
+        "surface=compat.responses\nowner={owner_principal}\ntoken={token_id}\nraw_key={raw_key}"
+    );
+    let digest = crate::sha256_hex(material.as_bytes());
+    format!("compat.responses:{}", &digest[..32])
+}
+
+fn compat_response_id_from_idempotency_record(
+    record: Option<&palyra_common::runtime_contracts::IdempotencyRecordSnapshot>,
+) -> CompatHttpResult<String> {
+    let result_json = record.and_then(|record| record.result_json.as_deref()).ok_or_else(|| {
+        CompatHttpError::from(compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_result_missing",
+            "stored idempotency result is missing a response id",
+        ))
+    })?;
+    let value = serde_json::from_str::<Value>(result_json).map_err(|error| {
+        CompatHttpError::from(compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_result_invalid",
+            format!("stored idempotency result is not valid JSON: {error}"),
+        ))
+    })?;
+    value
+        .get("response_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            CompatHttpError::from(compat_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "idempotency_result_invalid",
+                "stored idempotency result does not contain response_id",
+            ))
+        })
+}
+
+async fn complete_compat_response_idempotency(
+    state: &AppState,
+    reservation: &CompatResponseIdempotencyReservation,
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+) -> Result<(), Response> {
+    let result_json = json!({
+        "response_id": response_id,
+        "run_id": run_id,
+        "session_id": session_id,
+    })
+    .to_string();
+    let runtime = Arc::clone(&state.runtime);
+    let key = reservation.storage_key.clone();
+    tokio::task::spawn_blocking(move || {
+        runtime.journal_store.complete_idempotency_operation(&journal::IdempotencyCompleteRequest {
+            key,
+            result_json,
+        })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_worker_failed",
+            "idempotency worker panicked",
+        )
+    })?
+    .map(|_| ())
+    .map_err(compat_journal_error_response)
+}
+
+async fn fail_compat_response_idempotency(
+    state: &AppState,
+    reservation: &CompatResponseIdempotencyReservation,
+    code: &str,
+    message: &str,
+    recovery_hint: &str,
+) -> Result<(), Response> {
+    let runtime = Arc::clone(&state.runtime);
+    let key = reservation.storage_key.clone();
+    let error = StableErrorEnvelope::new(code, message, recovery_hint);
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .journal_store
+            .fail_idempotency_operation(&journal::IdempotencyFailRequest { key, error })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "idempotency_worker_failed",
+            "idempotency worker panicked",
+        )
+    })?
+    .map(|_| ())
+    .map_err(compat_journal_error_response)
+}
+
+async fn persist_compat_response_payload(
+    state: &AppState,
+    request: CompatResponsePersistRequest,
+) -> Result<(), Response> {
+    if request.response_id.trim().is_empty() {
+        return Err(compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "missing_response_id",
+            "compat response payload did not include an id",
+        ));
+    }
+    let error_json = request.payload.get("error").map(Value::to_string);
+    let response_json = request.payload.to_string();
+    let redaction_state_json = json!({
+        "policy": "compat_response_store.v1",
+        "public_view": "sanitized",
+        "raw_tool_output": "artifact_ref_or_withheld",
+    })
+    .to_string();
+    let retention_expires_at_unix_ms =
+        Some(request.created_at_unix_ms.saturating_add(COMPAT_RESPONSE_RETENTION_MS));
+    let runtime = Arc::clone(&state.runtime);
+    tokio::task::spawn_blocking(move || {
+        runtime.journal_store.upsert_compat_response_record(&journal::CompatResponseUpsertRequest {
+            response_id: request.response_id,
+            session_id: request.session_id,
+            run_id: request.run_id,
+            owner_principal: request.owner_principal,
+            device_id: request.device_id,
+            channel: Some(COMPAT_API_CHANNEL.to_owned()),
+            status: request.status,
+            response_json,
+            error_json,
+            redaction_state_json,
+            created_at_unix_ms: request.created_at_unix_ms,
+            completed_at_unix_ms: request.completed_at_unix_ms,
+            retention_expires_at_unix_ms,
+        })
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "response_store_worker_failed",
+            "response store worker panicked",
+        )
+    })?
+    .map(|_| ())
+    .map_err(compat_journal_error_response)
+}
+
+async fn load_compat_response_payload(
+    state: &AppState,
+    response_id: &str,
+    owner_principal: &str,
+) -> Result<Value, Response> {
+    let runtime = Arc::clone(&state.runtime);
+    let response_id = response_id.to_owned();
+    let owner_principal = owner_principal.to_owned();
+    let record = tokio::task::spawn_blocking(move || {
+        runtime
+            .journal_store
+            .compat_response_record_for_owner(response_id.as_str(), owner_principal.as_str())
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "response_store_worker_failed",
+            "response store worker panicked",
+        )
+    })?
+    .map_err(compat_journal_error_response)?;
+    serde_json::from_str::<Value>(record.response_json.as_str()).map_err(|error| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "response_store_corrupt",
+            format!("stored response JSON is invalid: {error}"),
+        )
+    })
+}
+
+async fn delete_compat_response_public_view(
+    state: &AppState,
+    response_id: &str,
+    owner_principal: &str,
+) -> Result<journal::CompatResponseDeleteOutcome, Response> {
+    let runtime = Arc::clone(&state.runtime);
+    let response_id = response_id.to_owned();
+    let owner_principal = owner_principal.to_owned();
+    tokio::task::spawn_blocking(move || {
+        runtime.journal_store.delete_compat_response_public_view(
+            response_id.as_str(),
+            owner_principal.as_str(),
+            "compat_response_delete",
+        )
+    })
+    .await
+    .map_err(|_| {
+        compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "response_store_worker_failed",
+            "response store worker panicked",
+        )
+    })?
+    .map_err(compat_journal_error_response)
+}
+
+fn compat_journal_error_response(error: journal::JournalError) -> Response {
+    match error {
+        journal::JournalError::CompatResponseNotFound { .. } => compat_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            "response_not_found",
+            "response was not found or its public view was deleted",
+        ),
+        journal::JournalError::CompatResponseScopeMismatch { .. } => compat_error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            "response_not_found",
+            "response was not found or its public view was deleted",
+        ),
+        journal::JournalError::PayloadTooLarge { .. } => compat_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "response_store_payload_too_large",
+            error.to_string(),
+        ),
+        journal::JournalError::InvalidArgument(_) => compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "response_store_invalid_request",
+            error.to_string(),
+        ),
+        _ => compat_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "response_store_failed",
+            error.to_string(),
+        ),
     }
 }
 
@@ -559,24 +1107,52 @@ async fn prepare_compat_run(
     prompt_text: String,
     required_scope: &str,
 ) -> Result<CompatPreparedRun, Response> {
+    let context =
+        authorize_compat_run_context(state, headers, requested_model, metadata, required_scope)?;
+    prepare_compat_run_from_context(state, context, user, prompt_text).await
+}
+
+fn authorize_compat_run_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested_model: Option<&str>,
+    metadata: Option<&Value>,
+    required_scope: &str,
+) -> CompatHttpResult<CompatAuthorizedRunContext> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
     let token = authorize_compat_api_token(state, headers, required_scope, None, now)?;
     enforce_compat_rate_limit(state, token.token_id.as_str(), token.rate_limit_per_minute)?;
 
     let provider = state.runtime.model_provider_status_snapshot();
     let model_name = validate_compat_requested_model(&provider, requested_model)?;
+    let provider_kind = provider.kind;
     let overrides = parse_compat_request_overrides(metadata)?;
-    let (principal, device_id) = {
-        let registry = lock_access_registry(&state.access_registry);
-        let workspace_access = registry
-            .resolve_workspace_access_for_token(&token, required_scope)
-            .map_err(access_registry_to_compat_response)?;
-        if let Some(workspace_access) = workspace_access {
-            (workspace_access.runtime_principal, workspace_access.runtime_device_id)
-        } else {
-            (token.principal.clone(), token.token_id.clone())
-        }
-    };
+    let (principal, device_id) = resolve_compat_runtime_identity(state, &token, required_scope)?;
+    Ok(CompatAuthorizedRunContext {
+        token,
+        provider_kind,
+        model_name,
+        overrides,
+        principal,
+        device_id,
+    })
+}
+
+async fn prepare_compat_run_from_context(
+    state: &AppState,
+    context: CompatAuthorizedRunContext,
+    user: Option<&str>,
+    prompt_text: String,
+) -> Result<CompatPreparedRun, Response> {
+    let CompatAuthorizedRunContext {
+        token,
+        provider_kind,
+        model_name,
+        overrides,
+        principal,
+        device_id,
+    } = context;
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
     let session_key = derive_compat_session_key(&token, user, overrides.session_key.as_deref());
     let session = state
         .runtime
@@ -637,14 +1213,32 @@ async fn prepare_compat_run(
     )?;
     Ok(CompatPreparedRun {
         token,
-        provider_kind: provider.kind,
+        provider_kind,
         model_name,
         run_id,
         session_id: session.session.session_id,
+        principal,
+        device_id,
         created_at_unix_ms,
         request_sender,
         run_request,
     })
+}
+
+fn resolve_compat_runtime_identity(
+    state: &AppState,
+    token: &AuthenticatedApiToken,
+    required_scope: &str,
+) -> CompatHttpResult<(String, String)> {
+    let registry = lock_access_registry(&state.access_registry);
+    let workspace_access = registry
+        .resolve_workspace_access_for_token(token, required_scope)
+        .map_err(access_registry_to_compat_response)?;
+    if let Some(workspace_access) = workspace_access {
+        Ok((workspace_access.runtime_principal, workspace_access.runtime_device_id))
+    } else {
+        Ok((token.principal.clone(), token.token_id.clone()))
+    }
 }
 
 async fn execute_compat_run(
@@ -1159,6 +1753,8 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
             model_name,
             run_id,
             session_id,
+            principal: _,
+            device_id: _,
             created_at_unix_ms,
             request_sender,
             run_request,
@@ -1447,6 +2043,8 @@ fn build_compat_responses_streaming_response(
             model_name,
             run_id,
             session_id,
+            principal,
+            device_id,
             created_at_unix_ms,
             request_sender,
             run_request,
@@ -1820,6 +2418,53 @@ fn build_compat_responses_streaming_response(
                     tool_calls.as_slice(),
                     None,
                 );
+                if let Err(response_store_error) = persist_compat_response_payload(
+                    &state,
+                    CompatResponsePersistRequest {
+                        response_id: response
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        session_id: snapshot.session_id.clone(),
+                        run_id: snapshot.run_id.clone(),
+                        owner_principal: principal,
+                        device_id,
+                        status: "completed".to_owned(),
+                        created_at_unix_ms: snapshot.created_at_unix_ms,
+                        completed_at_unix_ms: snapshot.completed_at_unix_ms,
+                        payload: response.clone(),
+                    },
+                )
+                .await
+                {
+                    let body = compat_error_body_from_response(&response_store_error);
+                    let _ = send_sse_event(
+                        &sender,
+                        "response.failed",
+                        json!({
+                            "type": "response.failed",
+                            "response": {
+                                "id": response.get("id").and_then(Value::as_str).unwrap_or_default(),
+                                "object": "response",
+                                "created": snapshot.created_at_unix_ms / 1_000,
+                                "status": "failed",
+                                "output": [],
+                                "usage": Value::Null,
+                                "error": body["error"].clone(),
+                                "_palyra": compat_stream_palyra_metadata(
+                                    run_id.as_str(),
+                                    session_id.as_str(),
+                                    last_public_terminal_event.as_ref()
+                                ),
+                            },
+                            "error": body["error"].clone(),
+                        }),
+                    )
+                    .await;
+                    let _ = send_sse_done(&sender).await;
+                    return;
+                }
                 let _ = send_sse_event(
                     &sender,
                     "response.completed",

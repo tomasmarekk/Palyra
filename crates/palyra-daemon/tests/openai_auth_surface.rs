@@ -1082,6 +1082,112 @@ fn compat_responses_streams_text_events_and_preserves_non_stream_shape() -> Resu
 }
 
 #[test]
+fn compat_responses_store_get_delete_and_idempotency() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat responses store token",
+        &["compat.responses.create"],
+    )?;
+
+    let create_payload = json!({ "input": "stored response body" });
+    let (first_status, first_payload) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &create_payload,
+        Some("responses-store-key-1"),
+    )?;
+    assert_eq!(first_status, 200, "initial response create should succeed");
+    let response_id = first_payload
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("created response missing id"))?;
+    assert!(response_id.starts_with("resp_"));
+
+    let (get_status, get_payload) = compat_get_json(
+        &client,
+        admin_port,
+        format!("/v1/responses/{response_id}").as_str(),
+        token.as_str(),
+    )?;
+    assert_eq!(get_status, 200, "stored response should be readable");
+    assert_eq!(get_payload.get("id").and_then(Value::as_str), Some(response_id));
+    assert_eq!(
+        get_payload.pointer("/output/0/content/0/text").and_then(Value::as_str),
+        Some("stored response body")
+    );
+
+    let (replay_status, replay_payload) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &create_payload,
+        Some("responses-store-key-1"),
+    )?;
+    assert_eq!(replay_status, 200, "same idempotency key should replay");
+    assert_eq!(
+        replay_payload.get("id").and_then(Value::as_str),
+        Some(response_id),
+        "idempotency replay must not create a second response"
+    );
+
+    let (conflict_status, conflict_payload) = compat_post_json_with_idempotency_key(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &json!({ "input": "changed response body" }),
+        Some("responses-store-key-1"),
+    )?;
+    assert_eq!(conflict_status, 409, "changed payload should conflict");
+    assert_eq!(
+        conflict_payload.pointer("/error/code").and_then(Value::as_str),
+        Some("idempotency_conflict")
+    );
+
+    let (delete_status, delete_payload) = compat_delete_json(
+        &client,
+        admin_port,
+        format!("/v1/responses/{response_id}").as_str(),
+        token.as_str(),
+    )?;
+    assert_eq!(delete_status, 200, "delete should return a tombstone payload");
+    assert_eq!(delete_payload.get("deleted").and_then(Value::as_bool), Some(true));
+    assert_eq!(delete_payload.get("id").and_then(Value::as_str), Some(response_id));
+
+    let (missing_status, missing_payload) = compat_get_json(
+        &client,
+        admin_port,
+        format!("/v1/responses/{response_id}").as_str(),
+        token.as_str(),
+    )?;
+    assert_eq!(missing_status, 404, "deleted public response view should not be readable");
+    assert_eq!(
+        missing_payload.pointer("/error/code").and_then(Value::as_str),
+        Some("response_not_found")
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compat_responses_stream_maps_stream_failures_to_failed_event() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
@@ -2740,16 +2846,47 @@ fn compat_post_json(
     token: &str,
     payload: &Value,
 ) -> Result<(u16, Value)> {
-    let response = client
+    compat_post_json_with_idempotency_key(client, admin_port, path, token, payload, None)
+}
+
+fn compat_post_json_with_idempotency_key(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+    payload: &Value,
+    idempotency_key: Option<&str>,
+) -> Result<(u16, Value)> {
+    let mut request = client
         .post(console_url(admin_port, path))
         .header("Authorization", format!("Bearer {token}"))
-        .json(payload)
-        .send()
-        .with_context(|| format!("failed to POST compat path {path}"))?;
+        .json(payload);
+    if let Some(idempotency_key) = idempotency_key {
+        request = request.header("Idempotency-Key", idempotency_key);
+    }
+    let response = request.send().with_context(|| format!("failed to POST compat path {path}"))?;
     let status = response.status().as_u16();
     let body = response
         .json::<Value>()
         .with_context(|| format!("failed to parse compat POST {path} response json"))?;
+    Ok((status, body))
+}
+
+fn compat_delete_json(
+    client: &Client,
+    admin_port: u16,
+    path: &str,
+    token: &str,
+) -> Result<(u16, Value)> {
+    let response = client
+        .delete(console_url(admin_port, path))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .with_context(|| format!("failed to DELETE compat path {path}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .json::<Value>()
+        .with_context(|| format!("failed to parse compat DELETE {path} response json"))?;
     Ok((status, body))
 }
 
