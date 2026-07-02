@@ -1148,6 +1148,148 @@ fn compat_chat_stream_maps_stream_failures_to_failed_event() -> Result<()> {
 }
 
 #[test]
+fn compat_api_security_negative_matrix_covers_public_surface() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let matrix_token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat API matrix token",
+        &["compat.models.read", "compat.chat.create", "compat.responses.create"],
+    )?;
+    let models_only_token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat API models-only token",
+        &["compat.models.read"],
+    )?;
+
+    let models_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/v1/models"))
+        .header("Authorization", format!("Bearer {matrix_token}"))
+        .header("Origin", "https://evil.example")
+        .send()
+        .context("failed to call compat models matrix probe")?;
+    assert_eq!(models_response.status().as_u16(), 200);
+    assert_compat_security_headers(models_response.headers())?;
+    assert!(
+        models_response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| value != "*"),
+        "compat API must not emit wildcard CORS for arbitrary origins"
+    );
+
+    let capabilities_response = client
+        .get(format!("http://127.0.0.1:{admin_port}/v1/capabilities"))
+        .header("Authorization", format!("Bearer {matrix_token}"))
+        .send()
+        .context("failed to call compat capabilities matrix probe")?;
+    assert_eq!(capabilities_response.status().as_u16(), 200);
+
+    let missing_auth = client
+        .get(format!("http://127.0.0.1:{admin_port}/v1/models"))
+        .send()
+        .context("failed to call compat models without auth")?;
+    assert_eq!(missing_auth.status().as_u16(), 401, "compat API must require bearer auth");
+
+    let wrong_scope = client
+        .post(format!("http://127.0.0.1:{admin_port}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {models_only_token}"))
+        .json(&json!({
+            "messages": [{ "role": "user", "content": "scope check" }]
+        }))
+        .send()
+        .context("failed to call compat chat with wrong scope")?;
+    assert_eq!(wrong_scope.status().as_u16(), 403, "compat API must enforce per-route scopes");
+
+    let invalid_payload = client
+        .post(format!("http://127.0.0.1:{admin_port}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {matrix_token}"))
+        .json(&json!({ "stream": false }))
+        .send()
+        .context("failed to call compat chat with invalid payload")?;
+    assert!(
+        matches!(invalid_payload.status().as_u16(), 400 | 422),
+        "invalid compat chat payload should fail before run execution: {}",
+        invalid_payload.status()
+    );
+
+    let unsupported_route = client
+        .post(format!("http://127.0.0.1:{admin_port}/v1/unsupported"))
+        .header("Authorization", format!("Bearer {matrix_token}"))
+        .json(&json!({ "input": "unsupported" }))
+        .send()
+        .context("failed to call unsupported compat route")?;
+    assert!(
+        matches!(unsupported_route.status().as_u16(), 404 | 405),
+        "unsupported compat route should not fall through to a successful response: {}",
+        unsupported_route.status()
+    );
+
+    let oversized_body = json!({
+        "messages": [{ "role": "user", "content": "a".repeat(80 * 1024) }]
+    })
+    .to_string();
+    let oversized = client
+        .post(format!("http://127.0.0.1:{admin_port}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {matrix_token}"))
+        .header("content-type", "application/json")
+        .body(oversized_body)
+        .send()
+        .context("failed to call compat chat with oversized body")?;
+    assert_eq!(
+        oversized.status().as_u16(),
+        413,
+        "compat API should reject oversized request bodies with payload-too-large status"
+    );
+
+    let (run_status, run_payload) = compat_post_json(
+        &client,
+        admin_port,
+        "/v1/runs",
+        matrix_token.as_str(),
+        &json!({ "input": "matrix run" }),
+    )?;
+    assert_eq!(run_status, 200);
+    let run_id = run_payload
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("matrix run response missing id: {run_payload}"))?;
+    let terminal =
+        wait_for_compat_run_terminal(&client, admin_port, matrix_token.as_str(), run_id)?;
+    assert_eq!(terminal.get("status").and_then(Value::as_str), Some("completed"));
+    let (events_status, events_content_type, events_body) = compat_get_sse(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/events").as_str(),
+        matrix_token.as_str(),
+    )?;
+    assert_eq!(events_status, 200, "run events matrix stream should open: {events_body}");
+    assert!(
+        events_content_type.starts_with("text/event-stream"),
+        "run events matrix stream should use SSE content type: {events_content_type}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compat_responses_streams_text_events_and_preserves_non_stream_shape() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
@@ -3617,6 +3759,39 @@ fn normalize_responses_stream_grammar(messages: &[(Option<String>, String)]) -> 
         }
     }
     Ok(Value::Array(normalized))
+}
+
+fn assert_compat_security_headers(headers: &reqwest::header::HeaderMap) -> Result<()> {
+    assert_eq!(
+        required_header_value(headers, "cache-control")?,
+        "no-store",
+        "compat responses must disable cache persistence"
+    );
+    assert_eq!(
+        required_header_value(headers, "x-content-type-options")?,
+        "nosniff",
+        "compat responses must set X-Content-Type-Options=nosniff"
+    );
+    assert_eq!(
+        required_header_value(headers, "x-frame-options")?,
+        "DENY",
+        "compat responses must deny framing"
+    );
+    assert_eq!(
+        required_header_value(headers, "referrer-policy")?,
+        "no-referrer",
+        "compat responses must not leak referrer values"
+    );
+    Ok(())
+}
+
+fn required_header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Result<String> {
+    headers
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("missing expected response header {name}"))?
+        .to_str()
+        .with_context(|| format!("header {name} contains invalid UTF-8"))
+        .map(ToOwned::to_owned)
 }
 
 fn find_profile<'a>(profiles: &'a Value, profile_id: &str) -> Result<&'a Value> {
