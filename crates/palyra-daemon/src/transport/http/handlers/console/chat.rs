@@ -474,6 +474,7 @@ pub(crate) async fn console_chat_message_stream_handler(
             }
         };
 
+        let mut public_event_sequence = 0_u64;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(event) => {
@@ -498,11 +499,35 @@ pub(crate) async fn console_chat_message_stream_handler(
                     if let Some(kind) = run_stream_status_kind(&event) {
                         final_status = kind.to_owned();
                     }
+                    public_event_sequence = public_event_sequence.saturating_add(1);
+                    let public_event_id =
+                        crate::application::run_stream::public_events::run_stream_public_event_id(
+                            run_id_for_task.as_str(),
+                            public_event_sequence,
+                        );
+                    let public_event = crate::application::run_stream::public_events::
+                        public_runtime_event_json_from_run_stream_event(
+                            &event,
+                            crate::application::run_stream::public_events::PublicRunStreamEventContext {
+                                event_id: public_event_id.as_str(),
+                                session_id: session_id_for_task.as_str(),
+                                occurred_at_unix_ms: unix_ms_now().unwrap_or_default(),
+                                request_id: None,
+                            },
+                        );
+                    let mut event_json = console_run_stream_event_to_json(&event);
+                    if let (Some(object), Some(public_event)) =
+                        (event_json.as_object_mut(), public_event)
+                    {
+                        object
+                            .insert("public_event_type".to_owned(), public_event["event"].clone());
+                        object.insert("public_event".to_owned(), public_event);
+                    }
                     if !send_console_chat_line(
                         &line_sender,
                         json!({
                             "type": "event",
-                            "event": console_run_stream_event_to_json(&event),
+                            "event": event_json,
                         }),
                     )
                     .await

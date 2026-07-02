@@ -800,6 +800,24 @@ fn compat_interop_json(snapshot: &journal::OrchestratorRunStatusSnapshot) -> Val
     })
 }
 
+fn compat_stream_palyra_metadata(
+    run_id: &str,
+    session_id: &str,
+    public_event: Option<&Value>,
+) -> Value {
+    let mut metadata = json!({
+        "origin": "compat_api",
+        "run_id": run_id,
+        "session_id": session_id,
+        "approval_mode": "shared_palyra_approvals",
+    });
+    if let (Some(object), Some(public_event)) = (metadata.as_object_mut(), public_event) {
+        object.insert("public_event_type".to_owned(), public_event["event"].clone());
+        object.insert("public_event".to_owned(), public_event.clone());
+    }
+    metadata
+}
+
 fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPreparedRun) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
     tokio::spawn(async move {
@@ -818,6 +836,8 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         let mut finish_reason = "stop";
         let mut stream_error = None::<String>;
         let mut tool_call_index = 0usize;
+        let mut public_event_sequence = 0_u64;
+        let mut last_public_terminal_event = None::<Value>;
 
         if !send_sse_data(
             &sender,
@@ -832,12 +852,7 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                     "delta": { "role": "assistant" },
                     "finish_reason": Value::Null,
                 }],
-                "_palyra": {
-                    "origin": "compat_api",
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "approval_mode": "shared_palyra_approvals",
-                },
+                "_palyra": compat_stream_palyra_metadata(run_id.as_str(), session_id.as_str(), None),
             }),
         )
         .await
@@ -893,83 +908,120 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
 
         while let Some(item) = stream.next().await {
             match item {
-                Ok(event) => match event.body {
-                    Some(common_v1::run_stream_event::Body::ModelToken(token_event))
-                        if !send_sse_data(
-                            &sender,
-                            json!({
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_seconds,
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": { "content": token_event.token },
-                                    "finish_reason": Value::Null,
-                                }],
-                            }),
-                        )
-                        .await =>
-                    {
-                        return;
-                    }
-                    Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
-                        finish_reason = "tool_calls";
-                        let tool_call_id = proposal
-                            .proposal_id
-                            .as_ref()
-                            .map(|value| value.ulid.clone())
-                            .unwrap_or_else(|| Ulid::new().to_string());
-                        if !send_sse_data(
-                            &sender,
-                            json!({
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_seconds,
-                                "model": model_name,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": tool_call_index,
-                                            "id": tool_call_id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": proposal.tool_name,
-                                                "arguments": json_string_from_bytes(proposal.input_json.as_slice()),
-                                            },
-                                        }],
-                                    },
-                                    "finish_reason": Value::Null,
-                                }],
-                            }),
-                        )
-                        .await
+                Ok(event) => {
+                    public_event_sequence = public_event_sequence.saturating_add(1);
+                    let public_event_id =
+                        crate::application::run_stream::public_events::run_stream_public_event_id(
+                            run_id.as_str(),
+                            public_event_sequence,
+                        );
+                    let public_event = crate::application::run_stream::public_events::
+                        public_runtime_event_json_from_run_stream_event(
+                            &event,
+                            crate::application::run_stream::public_events::PublicRunStreamEventContext {
+                                event_id: public_event_id.as_str(),
+                                session_id: session_id.as_str(),
+                                occurred_at_unix_ms: unix_ms_now().unwrap_or(created_at_unix_ms),
+                                request_id: None,
+                            },
+                        );
+                    match event.body {
+                        Some(common_v1::run_stream_event::Body::ModelToken(token_event))
+                            if !send_sse_data(
+                                &sender,
+                                json!({
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_seconds,
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": { "content": token_event.token },
+                                        "finish_reason": Value::Null,
+                                    }],
+                                    "_palyra": compat_stream_palyra_metadata(
+                                        run_id.as_str(),
+                                        session_id.as_str(),
+                                        public_event.as_ref()
+                                    ),
+                                }),
+                            )
+                            .await =>
                         {
                             return;
                         }
-                        tool_call_index = tool_call_index.saturating_add(1);
+                        Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
+                            finish_reason = "tool_calls";
+                            let tool_call_id = proposal
+                                .proposal_id
+                                .as_ref()
+                                .map(|value| value.ulid.clone())
+                                .unwrap_or_else(|| Ulid::new().to_string());
+                            if !send_sse_data(
+                                &sender,
+                                json!({
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created_seconds,
+                                    "model": model_name,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": tool_call_index,
+                                                "id": tool_call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": proposal.tool_name,
+                                                    "arguments": json_string_from_bytes(proposal.input_json.as_slice()),
+                                                },
+                                            }],
+                                        },
+                                        "finish_reason": Value::Null,
+                                    }],
+                                    "_palyra": compat_stream_palyra_metadata(
+                                        run_id.as_str(),
+                                        session_id.as_str(),
+                                        public_event.as_ref()
+                                    ),
+                                }),
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            tool_call_index = tool_call_index.saturating_add(1);
+                        }
+                        Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
+                            auto_deny_compat_tool_approval(
+                                &request_sender,
+                                session_id.as_str(),
+                                run_id.as_str(),
+                                &request,
+                            )
+                            .await;
+                        }
+                        Some(common_v1::run_stream_event::Body::Status(status))
+                            if common_v1::stream_status::StatusKind::try_from(status.kind)
+                                .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
+                                == common_v1::stream_status::StatusKind::Failed =>
+                        {
+                            last_public_terminal_event = public_event;
+                            stream_error = Some(
+                                sanitize_http_error_message(status.message.as_str()).to_owned(),
+                            );
+                            break;
+                        }
+                        Some(common_v1::run_stream_event::Body::Status(status))
+                            if common_v1::stream_status::StatusKind::try_from(status.kind)
+                                .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
+                                == common_v1::stream_status::StatusKind::Done =>
+                        {
+                            last_public_terminal_event = public_event;
+                        }
+                        _ => {}
                     }
-                    Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
-                        auto_deny_compat_tool_approval(
-                            &request_sender,
-                            session_id.as_str(),
-                            run_id.as_str(),
-                            &request,
-                        )
-                        .await;
-                    }
-                    Some(common_v1::run_stream_event::Body::Status(status))
-                        if common_v1::stream_status::StatusKind::try_from(status.kind)
-                            .unwrap_or(common_v1::stream_status::StatusKind::Unspecified)
-                            == common_v1::stream_status::StatusKind::Failed =>
-                    {
-                        stream_error =
-                            Some(sanitize_http_error_message(status.message.as_str()).to_owned());
-                        break;
-                    }
-                    _ => {}
-                },
+                }
                 Err(error) => {
                     stream_error = Some(sanitize_http_error_message(error.message()).to_owned());
                     break;
@@ -1017,6 +1069,11 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                             "delta": {},
                             "finish_reason": finish_reason,
                         }],
+                        "_palyra": compat_stream_palyra_metadata(
+                            run_id.as_str(),
+                            session_id.as_str(),
+                            last_public_terminal_event.as_ref()
+                        ),
                     }),
                 )
                 .await;

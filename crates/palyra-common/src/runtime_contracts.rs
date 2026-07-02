@@ -14,12 +14,12 @@
 //!   instead of renaming canonical strings.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v2";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v3";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,8 +121,9 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds the canonical PalyraErrorEnvelope and public error category taxonomy; breaking changes require a new snapshot version and migration note.",
+        "changelog_note": "Adds the canonical public runtime event taxonomy for run, model, tool, approval, verification, and heartbeat streams.",
         "compatibility_policy": compatibility_policy_snapshot(),
+        "public_runtime_events": public_runtime_event_taxonomy_snapshot(),
         "runtime_enums": [
             enum_contract_snapshot(
                 "RunLifecyclePhase",
@@ -387,6 +388,20 @@ fn compatibility_policy_snapshot() -> Value {
     })
 }
 
+fn public_runtime_event_taxonomy_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.public_runtime_events.v1",
+        "changelog_note": "Public stream vocabulary is shared by Responses-compatible streaming, runs events, QA Lab, trajectory export, ACP, and observability.",
+        "event_schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "event_names": PublicRuntimeEventName::wire_contract_values(),
+        "visibility_levels": PublicRuntimeEventVisibility::wire_contract_values(),
+        "redaction_postures": PublicRuntimeEventRedactionPosture::wire_contract_values(),
+        "journal_mappings": PublicRuntimeEventJournalMapping::wire_contract_values(),
+        "events": PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
+    })
+}
+
 fn enum_contract_snapshot(
     name: &'static str,
     snapshot_version: &'static str,
@@ -483,6 +498,682 @@ fn contains_obvious_secret_marker(text: &str) -> bool {
         || lower.contains("access_token=")
         || lower.contains("secret_token=")
         || lower.contains("bearer ")
+}
+
+runtime_contract_enum! {
+    /// Public event names shared by runtime streams, QA exports, ACP bridges, and observability.
+    pub enum PublicRuntimeEventName {
+        RunCreated => "run.created",
+        RunQueued => "run.queued",
+        RunStarted => "run.started",
+        ModelDelta => "model.delta",
+        ToolCallStarted => "tool.call.started",
+        ToolCallDelta => "tool.call.delta",
+        ToolCallCompleted => "tool.call.completed",
+        ApprovalRequired => "approval.required",
+        ApprovalResolved => "approval.resolved",
+        VerificationNudge => "verification.nudge",
+        RunCompleted => "run.completed",
+        RunFailed => "run.failed",
+        RunCancelled => "run.cancelled",
+        Heartbeat => "heartbeat"
+    }
+}
+
+impl PublicRuntimeEventName {
+    /// Returns the public descriptor pinned by the runtime contract snapshot.
+    #[must_use]
+    pub fn descriptor(self) -> &'static PublicRuntimeEventDescriptor {
+        PUBLIC_RUNTIME_EVENT_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == self)
+            .expect("every public runtime event name must have a descriptor")
+    }
+
+    /// Returns `true` for terminal run lifecycle events.
+    #[must_use]
+    pub const fn is_terminal_run_event(self) -> bool {
+        matches!(self, Self::RunCompleted | Self::RunFailed | Self::RunCancelled)
+    }
+}
+
+runtime_contract_enum! {
+    /// Public visibility level applied before event serialization.
+    pub enum PublicRuntimeEventVisibility {
+        Public => "public",
+        Operator => "operator",
+        Internal => "internal",
+        Sensitive => "sensitive"
+    }
+}
+
+runtime_contract_enum! {
+    /// Redaction posture required before a public runtime event may be emitted.
+    pub enum PublicRuntimeEventRedactionPosture {
+        MetadataOnly => "metadata_only",
+        RedactedText => "redacted_text",
+        RedactedJson => "redacted_json",
+        NoPayloadSecrets => "no_payload_secrets"
+    }
+}
+
+runtime_contract_enum! {
+    /// Durable journal surface that should receive the event, when any.
+    pub enum PublicRuntimeEventJournalMapping {
+        RunLifecycleEvents => "run_lifecycle_events",
+        OrchestratorTape => "orchestrator_tape",
+        ApprovalPrompts => "approval_prompts",
+        VerificationJournal => "verification_journal",
+        EphemeralHeartbeat => "ephemeral_heartbeat"
+    }
+}
+
+/// One field in a public runtime event payload schema descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PublicRuntimeEventPayloadField {
+    /// Field name inside `payload`.
+    pub name: &'static str,
+    /// Compact JSON type label or named schema reference.
+    pub type_name: &'static str,
+    /// Whether producers must include the field.
+    pub required: bool,
+    /// Whether the field must be redacted or sanitized before public emission.
+    pub redacted: bool,
+}
+
+/// Snapshot-pinned public event descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PublicRuntimeEventDescriptor {
+    /// Canonical event name.
+    pub name: PublicRuntimeEventName,
+    /// Per-event schema version.
+    pub schema_version: u32,
+    /// Required correlation identifiers inside the event envelope.
+    pub required_correlation_ids: &'static [&'static str],
+    /// Public visibility level.
+    pub visibility: PublicRuntimeEventVisibility,
+    /// Required redaction posture.
+    pub redaction: PublicRuntimeEventRedactionPosture,
+    /// Journal mapping for replay, audit, or ephemeral streams.
+    pub journal_mapping: PublicRuntimeEventJournalMapping,
+    /// Coarse ordering phase for diagnostics and snapshot readers.
+    pub ordering_phase: u16,
+    /// Payload schema fields for compatibility tests and QA Lab assertions.
+    pub payload_schema: &'static [PublicRuntimeEventPayloadField],
+    /// Forward-compatibility policy for fields not known by this version.
+    pub unknown_extension_fields: &'static str,
+}
+
+const RUN_CORRELATION_IDS: &[&str] = &["run_id", "session_id"];
+const TOOL_CORRELATION_IDS: &[&str] = &["run_id", "session_id", "tool_call_id"];
+const APPROVAL_CORRELATION_IDS: &[&str] = &["run_id", "session_id", "tool_call_id", "approval_id"];
+
+const RUN_EVENT_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "status",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "message",
+        type_name: "string",
+        required: false,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "reason_code",
+        type_name: "string",
+        required: false,
+        redacted: false,
+    },
+];
+const MODEL_DELTA_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "delta",
+        type_name: "string",
+        required: true,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "is_final",
+        type_name: "boolean",
+        required: true,
+        redacted: false,
+    },
+];
+const TOOL_STARTED_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "tool_name",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "input_json",
+        type_name: "object",
+        required: true,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "approval_required",
+        type_name: "boolean",
+        required: true,
+        redacted: false,
+    },
+];
+const TOOL_DELTA_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "kind",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "reason",
+        type_name: "string",
+        required: false,
+        redacted: true,
+    },
+];
+const TOOL_COMPLETED_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "success",
+        type_name: "boolean",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "output_json",
+        type_name: "object",
+        required: false,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "error",
+        type_name: "string",
+        required: false,
+        redacted: true,
+    },
+];
+const APPROVAL_REQUIRED_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "tool_name",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "request_summary",
+        type_name: "string",
+        required: true,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "prompt",
+        type_name: "ApprovalPrompt",
+        required: true,
+        redacted: true,
+    },
+];
+const APPROVAL_RESOLVED_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "approved",
+        type_name: "boolean",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "reason",
+        type_name: "string",
+        required: true,
+        redacted: true,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "decision_scope",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+];
+const VERIFICATION_NUDGE_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "requirement",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "reason",
+        type_name: "string",
+        required: true,
+        redacted: true,
+    },
+];
+const HEARTBEAT_PAYLOAD_SCHEMA: &[PublicRuntimeEventPayloadField] = &[
+    PublicRuntimeEventPayloadField {
+        name: "status",
+        type_name: "string",
+        required: true,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "interval_ms",
+        type_name: "integer",
+        required: false,
+        redacted: false,
+    },
+    PublicRuntimeEventPayloadField {
+        name: "server_time_unix_ms",
+        type_name: "integer",
+        required: false,
+        redacted: false,
+    },
+];
+
+/// Public runtime events accepted by stream, QA, ACP, and observability adapters.
+pub const PUBLIC_RUNTIME_EVENT_DESCRIPTORS: &[PublicRuntimeEventDescriptor] = &[
+    public_event_descriptor(
+        PublicRuntimeEventName::RunCreated,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        100,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::RunQueued,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        200,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::RunStarted,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        300,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ModelDelta,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::RedactedText,
+        PublicRuntimeEventJournalMapping::OrchestratorTape,
+        400,
+        MODEL_DELTA_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ToolCallStarted,
+        TOOL_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedJson,
+        PublicRuntimeEventJournalMapping::OrchestratorTape,
+        500,
+        TOOL_STARTED_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ApprovalRequired,
+        APPROVAL_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedJson,
+        PublicRuntimeEventJournalMapping::ApprovalPrompts,
+        600,
+        APPROVAL_REQUIRED_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ApprovalResolved,
+        APPROVAL_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedText,
+        PublicRuntimeEventJournalMapping::ApprovalPrompts,
+        700,
+        APPROVAL_RESOLVED_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ToolCallDelta,
+        TOOL_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedText,
+        PublicRuntimeEventJournalMapping::OrchestratorTape,
+        800,
+        TOOL_DELTA_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::ToolCallCompleted,
+        TOOL_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedJson,
+        PublicRuntimeEventJournalMapping::OrchestratorTape,
+        900,
+        TOOL_COMPLETED_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::VerificationNudge,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Operator,
+        PublicRuntimeEventRedactionPosture::RedactedText,
+        PublicRuntimeEventJournalMapping::VerificationJournal,
+        950,
+        VERIFICATION_NUDGE_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::RunCompleted,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        1_000,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::RunFailed,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::RedactedText,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        1_000,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::RunCancelled,
+        RUN_CORRELATION_IDS,
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::RunLifecycleEvents,
+        1_000,
+        RUN_EVENT_PAYLOAD_SCHEMA,
+    ),
+    public_event_descriptor(
+        PublicRuntimeEventName::Heartbeat,
+        &[],
+        PublicRuntimeEventVisibility::Public,
+        PublicRuntimeEventRedactionPosture::MetadataOnly,
+        PublicRuntimeEventJournalMapping::EphemeralHeartbeat,
+        0,
+        HEARTBEAT_PAYLOAD_SCHEMA,
+    ),
+];
+
+const fn public_event_descriptor(
+    name: PublicRuntimeEventName,
+    required_correlation_ids: &'static [&'static str],
+    visibility: PublicRuntimeEventVisibility,
+    redaction: PublicRuntimeEventRedactionPosture,
+    journal_mapping: PublicRuntimeEventJournalMapping,
+    ordering_phase: u16,
+    payload_schema: &'static [PublicRuntimeEventPayloadField],
+) -> PublicRuntimeEventDescriptor {
+    PublicRuntimeEventDescriptor {
+        name,
+        schema_version: 1,
+        required_correlation_ids,
+        visibility,
+        redaction,
+        journal_mapping,
+        ordering_phase,
+        payload_schema,
+        unknown_extension_fields: "preserve_and_ignore_unknown_fields",
+    }
+}
+
+/// Correlation identifiers carried by every public runtime event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicRuntimeEventCorrelation {
+    /// Runtime run id for run-scoped events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Session id that owns or produced the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Parent run id when the event belongs to a delegated or nested run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Tool call id for tool and approval events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Approval prompt id for approval lifecycle events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    /// Transport request id when an adapter can correlate the event to an inbound request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl PublicRuntimeEventCorrelation {
+    fn has_required_id(&self, field: &str) -> bool {
+        match field {
+            "run_id" => has_nonempty_value(self.run_id.as_deref()),
+            "session_id" => has_nonempty_value(self.session_id.as_deref()),
+            "parent_run_id" => has_nonempty_value(self.parent_run_id.as_deref()),
+            "tool_call_id" => has_nonempty_value(self.tool_call_id.as_deref()),
+            "approval_id" => has_nonempty_value(self.approval_id.as_deref()),
+            "request_id" => has_nonempty_value(self.request_id.as_deref()),
+            _ => false,
+        }
+    }
+}
+
+/// Public runtime event envelope. Unknown fields are preserved as extension fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicRuntimeEventEnvelope {
+    /// Event schema version; currently pinned to the descriptor schema version.
+    pub schema_version: u32,
+    /// Canonical public event name.
+    pub event: PublicRuntimeEventName,
+    /// Unique event id within the emitting stream or journal.
+    pub event_id: String,
+    /// Event timestamp in Unix milliseconds.
+    pub occurred_at_unix_ms: i64,
+    /// Correlation ids used by clients, QA Lab, and observability.
+    pub correlation: PublicRuntimeEventCorrelation,
+    /// Visibility level applied before serialization.
+    pub visibility: PublicRuntimeEventVisibility,
+    /// Required redaction posture for the payload.
+    pub redaction: PublicRuntimeEventRedactionPosture,
+    /// Durable journal surface associated with this event.
+    pub journal_mapping: PublicRuntimeEventJournalMapping,
+    /// Event-specific payload described by the taxonomy snapshot.
+    #[serde(default)]
+    pub payload: Value,
+    /// Unknown forward-compatible fields preserved across deserialize/serialize.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+/// Validation failure for public runtime event grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRuntimeEventValidationError {
+    /// Stable machine-readable validation code.
+    pub code: &'static str,
+    /// Safe human-readable validation detail.
+    pub message: String,
+}
+
+impl PublicRuntimeEventValidationError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+impl fmt::Display for PublicRuntimeEventValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for PublicRuntimeEventValidationError {}
+
+/// Parses and validates a public runtime event name.
+///
+/// # Errors
+/// Returns a validation error when the event name is not in the public taxonomy.
+pub fn validate_public_runtime_event_name(
+    raw: &str,
+) -> Result<PublicRuntimeEventName, PublicRuntimeEventValidationError> {
+    let Some(name) = PublicRuntimeEventName::parse(raw) else {
+        return Err(PublicRuntimeEventValidationError::new(
+            "unknown_event",
+            format!("unknown public runtime event '{raw}'"),
+        ));
+    };
+    Ok(name)
+}
+
+/// Validates one public runtime event envelope against the pinned grammar.
+///
+/// # Errors
+/// Returns a validation error for schema-version mismatches, missing correlation
+/// identifiers, descriptor metadata drift, or heartbeat payloads that contain
+/// model tokens.
+pub fn validate_public_runtime_event(
+    event: &PublicRuntimeEventEnvelope,
+) -> Result<(), PublicRuntimeEventValidationError> {
+    if event.event_id.trim().is_empty() {
+        return Err(PublicRuntimeEventValidationError::new(
+            "missing_event_id",
+            "public runtime event_id must be non-empty",
+        ));
+    }
+    if event.occurred_at_unix_ms < 0 {
+        return Err(PublicRuntimeEventValidationError::new(
+            "invalid_timestamp",
+            "public runtime event timestamp must be non-negative",
+        ));
+    }
+    let descriptor = event.event.descriptor();
+    if event.schema_version != descriptor.schema_version {
+        return Err(PublicRuntimeEventValidationError::new(
+            "schema_version_mismatch",
+            format!(
+                "event {} schema_version {} does not match descriptor version {}",
+                event.event.as_str(),
+                event.schema_version,
+                descriptor.schema_version
+            ),
+        ));
+    }
+    if event.visibility != descriptor.visibility
+        || event.redaction != descriptor.redaction
+        || event.journal_mapping != descriptor.journal_mapping
+    {
+        return Err(PublicRuntimeEventValidationError::new(
+            "descriptor_metadata_mismatch",
+            format!("event {} metadata does not match its descriptor", event.event.as_str()),
+        ));
+    }
+    for required_id in descriptor.required_correlation_ids {
+        if !event.correlation.has_required_id(required_id) {
+            return Err(PublicRuntimeEventValidationError::new(
+                "missing_correlation_id",
+                format!("event {} requires correlation id {}", event.event.as_str(), required_id),
+            ));
+        }
+    }
+    if event.event == PublicRuntimeEventName::Heartbeat
+        && contains_model_token_payload(&event.payload)
+    {
+        return Err(PublicRuntimeEventValidationError::new(
+            "heartbeat_contains_model_token",
+            "heartbeat events must not carry model token or delta payloads",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates ordering-sensitive public runtime event grammar for tests and QA Lab.
+///
+/// # Errors
+/// Returns a validation error when an event is invalid, a tool or approval event
+/// appears before its start/request event, or non-heartbeat events appear after a
+/// terminal run event.
+pub fn validate_public_runtime_event_sequence(
+    events: &[PublicRuntimeEventEnvelope],
+) -> Result<(), PublicRuntimeEventValidationError> {
+    let mut seen_tool_calls = std::collections::BTreeSet::new();
+    let mut seen_approvals = std::collections::BTreeSet::new();
+    let mut terminal_run_event: Option<&'static str> = None;
+
+    for event in events {
+        validate_public_runtime_event(event)?;
+        if let Some(terminal) = terminal_run_event {
+            if event.event != PublicRuntimeEventName::Heartbeat {
+                return Err(PublicRuntimeEventValidationError::new(
+                    "event_after_terminal_run",
+                    format!("event {} appeared after terminal event {terminal}", event.event),
+                ));
+            }
+            continue;
+        }
+
+        match event.event {
+            PublicRuntimeEventName::ToolCallStarted => {
+                if let Some(tool_call_id) = event.correlation.tool_call_id.as_deref() {
+                    seen_tool_calls.insert(tool_call_id.to_owned());
+                }
+            }
+            PublicRuntimeEventName::ToolCallDelta | PublicRuntimeEventName::ToolCallCompleted => {
+                let Some(tool_call_id) = event.correlation.tool_call_id.as_deref() else {
+                    return Err(PublicRuntimeEventValidationError::new(
+                        "missing_tool_call_id",
+                        "tool event is missing tool_call_id",
+                    ));
+                };
+                if !seen_tool_calls.contains(tool_call_id) {
+                    return Err(PublicRuntimeEventValidationError::new(
+                        "tool_event_before_start",
+                        format!("tool event {} appeared before tool.call.started", event.event),
+                    ));
+                }
+            }
+            PublicRuntimeEventName::ApprovalRequired => {
+                if let Some(approval_id) = event.correlation.approval_id.as_deref() {
+                    seen_approvals.insert(approval_id.to_owned());
+                }
+            }
+            PublicRuntimeEventName::ApprovalResolved => {
+                let Some(approval_id) = event.correlation.approval_id.as_deref() else {
+                    return Err(PublicRuntimeEventValidationError::new(
+                        "missing_approval_id",
+                        "approval.resolved is missing approval_id",
+                    ));
+                };
+                if !seen_approvals.contains(approval_id) {
+                    return Err(PublicRuntimeEventValidationError::new(
+                        "approval_resolved_before_required",
+                        "approval.resolved appeared before approval.required",
+                    ));
+                }
+            }
+            event_name if event_name.is_terminal_run_event() => {
+                terminal_run_event = Some(event_name.as_str());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[must_use]
+fn has_nonempty_value(value: Option<&str>) -> bool {
+    value.is_some_and(|text| !text.trim().is_empty())
+}
+
+fn contains_model_token_payload(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(key, child)| {
+            matches!(key.as_str(), "token" | "model_token" | "delta")
+                || contains_model_token_payload(child)
+        }),
+        Value::Array(items) => items.iter().any(contains_model_token_payload),
+        _ => false,
+    }
 }
 
 runtime_contract_enum! {
@@ -1996,20 +2687,24 @@ runtime_contract_enum! {
 mod tests {
     use super::{
         public_runtime_contract_snapshot, validate_public_contract_snapshot,
-        AcpBindingConflictKind, AcpBindingRepairActionKind, AcpCapability, AcpClientContext,
-        AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord,
-        AcpSessionMode, AcpTransportKind, ArtifactReadRequest, ArtifactRetentionDisposition,
-        ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, DeliveryPolicy, FlowState,
-        FlowStepState, IdempotencyReplayDecision, PalyraErrorCategory, PalyraErrorEnvelope,
-        PalyraValidationIssue, PruningPolicyClass, QueueDecision, QueueMode, QueuedInputState,
-        RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope, RealtimeEventSensitivity,
-        RealtimeEventTopic, RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole,
-        RealtimeScope, RealtimeSubscription, RunLifecycleHookDecision,
-        RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecyclePhase,
-        StableErrorEnvelope, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        validate_public_runtime_event, validate_public_runtime_event_name,
+        validate_public_runtime_event_sequence, AcpBindingConflictKind, AcpBindingRepairActionKind,
+        AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange,
+        AcpScope, AcpSessionBindingRecord, AcpSessionMode, AcpTransportKind, ArtifactReadRequest,
+        ArtifactRetentionDisposition, ArtifactRetentionPolicy, AuxiliaryTaskKind,
+        AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
+        PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, PruningPolicyClass,
+        PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope, PublicRuntimeEventName,
+        QueueDecision, QueueMode, QueuedInputState, RealtimeCapability, RealtimeCommand,
+        RealtimeCommandEnvelope, RealtimeEventSensitivity, RealtimeEventTopic,
+        RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope,
+        RealtimeSubscription, RunLifecycleHookDecision, RunLifecycleHookDecisionKind,
+        RunLifecycleHookPhase, RunLifecyclePhase, StableErrorEnvelope,
+        ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
-        REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
+        PUBLIC_RUNTIME_EVENT_DESCRIPTORS, REALTIME_PROTOCOL_MAX_VERSION,
+        REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::{json, Value};
 
@@ -2105,6 +2800,202 @@ mod tests {
         let secret_error = validate_public_contract_snapshot(&secret_snapshot)
             .expect_err("obvious secret marker should be rejected");
         assert!(secret_error.contains("secret marker"));
+    }
+
+    fn public_event(
+        event: PublicRuntimeEventName,
+        correlation: PublicRuntimeEventCorrelation,
+        payload: Value,
+    ) -> PublicRuntimeEventEnvelope {
+        let descriptor = event.descriptor();
+        PublicRuntimeEventEnvelope {
+            schema_version: descriptor.schema_version,
+            event,
+            event_id: format!("evt_{}", event.as_str().replace('.', "_")),
+            occurred_at_unix_ms: 42,
+            correlation,
+            visibility: descriptor.visibility,
+            redaction: descriptor.redaction,
+            journal_mapping: descriptor.journal_mapping,
+            payload,
+            extensions: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn run_correlation() -> PublicRuntimeEventCorrelation {
+        PublicRuntimeEventCorrelation {
+            run_id: Some("run_01".to_owned()),
+            session_id: Some("session_01".to_owned()),
+            ..PublicRuntimeEventCorrelation::default()
+        }
+    }
+
+    fn tool_correlation() -> PublicRuntimeEventCorrelation {
+        PublicRuntimeEventCorrelation {
+            tool_call_id: Some("tool_01".to_owned()),
+            ..run_correlation()
+        }
+    }
+
+    fn approval_correlation() -> PublicRuntimeEventCorrelation {
+        PublicRuntimeEventCorrelation {
+            approval_id: Some("approval_01".to_owned()),
+            ..tool_correlation()
+        }
+    }
+
+    #[test]
+    fn public_runtime_event_taxonomy_lists_required_events_in_order() {
+        let event_names = PUBLIC_RUNTIME_EVENT_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            event_names,
+            vec![
+                "run.created",
+                "run.queued",
+                "run.started",
+                "model.delta",
+                "tool.call.started",
+                "approval.required",
+                "approval.resolved",
+                "tool.call.delta",
+                "tool.call.completed",
+                "verification.nudge",
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+                "heartbeat",
+            ]
+        );
+        assert_eq!(
+            validate_public_runtime_event_name("tool.call.completed")
+                .expect("tool event name should parse"),
+            PublicRuntimeEventName::ToolCallCompleted
+        );
+        assert!(validate_public_runtime_event_name("tool.completed").is_err());
+    }
+
+    #[test]
+    fn public_runtime_event_validator_rejects_heartbeat_model_tokens() {
+        let heartbeat = public_event(
+            PublicRuntimeEventName::Heartbeat,
+            PublicRuntimeEventCorrelation::default(),
+            json!({ "status": "alive", "interval_ms": 5_000 }),
+        );
+        validate_public_runtime_event(&heartbeat).expect("heartbeat metadata should validate");
+
+        let heartbeat_with_token = public_event(
+            PublicRuntimeEventName::Heartbeat,
+            PublicRuntimeEventCorrelation::default(),
+            json!({ "status": "alive", "delta": "must not be here" }),
+        );
+        let error = validate_public_runtime_event(&heartbeat_with_token)
+            .expect_err("heartbeat must not carry model deltas");
+        assert_eq!(error.code, "heartbeat_contains_model_token");
+    }
+
+    #[test]
+    fn public_runtime_event_unknown_extension_fields_round_trip() {
+        let raw = json!({
+            "schema_version": 1,
+            "event": "model.delta",
+            "event_id": "evt_model_delta",
+            "occurred_at_unix_ms": 42,
+            "correlation": {
+                "run_id": "run_01",
+                "session_id": "session_01"
+            },
+            "visibility": "public",
+            "redaction": "redacted_text",
+            "journal_mapping": "orchestrator_tape",
+            "payload": {
+                "delta": "hello",
+                "is_final": false
+            },
+            "future_event_field": {
+                "preserved": true
+            }
+        });
+
+        let event: PublicRuntimeEventEnvelope =
+            serde_json::from_value(raw).expect("event should deserialize with extension field");
+        validate_public_runtime_event(&event).expect("extension fields should be tolerated");
+        assert_eq!(event.extensions["future_event_field"]["preserved"], true);
+
+        let encoded = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(encoded["future_event_field"]["preserved"], true);
+    }
+
+    #[test]
+    fn public_runtime_event_ordering_accepts_tool_call_with_approval() {
+        let events = vec![
+            public_event(
+                PublicRuntimeEventName::RunStarted,
+                run_correlation(),
+                json!({ "status": "running" }),
+            ),
+            public_event(
+                PublicRuntimeEventName::ToolCallStarted,
+                tool_correlation(),
+                json!({
+                    "tool_name": "shell_command",
+                    "input_json": {},
+                    "approval_required": true
+                }),
+            ),
+            public_event(
+                PublicRuntimeEventName::ApprovalRequired,
+                approval_correlation(),
+                json!({
+                    "tool_name": "shell_command",
+                    "request_summary": "Run command",
+                    "prompt": {}
+                }),
+            ),
+            public_event(
+                PublicRuntimeEventName::ApprovalResolved,
+                approval_correlation(),
+                json!({
+                    "approved": true,
+                    "reason": "operator approved",
+                    "decision_scope": "once"
+                }),
+            ),
+            public_event(
+                PublicRuntimeEventName::ToolCallDelta,
+                tool_correlation(),
+                json!({ "kind": "allow", "reason": "approved" }),
+            ),
+            public_event(
+                PublicRuntimeEventName::ToolCallCompleted,
+                tool_correlation(),
+                json!({ "success": true, "output_json": {} }),
+            ),
+            public_event(
+                PublicRuntimeEventName::RunCompleted,
+                run_correlation(),
+                json!({ "status": "completed" }),
+            ),
+        ];
+
+        validate_public_runtime_event_sequence(events.as_slice())
+            .expect("tool call with approval should be valid");
+
+        let invalid = vec![public_event(
+            PublicRuntimeEventName::ApprovalResolved,
+            approval_correlation(),
+            json!({
+                "approved": true,
+                "reason": "operator approved",
+                "decision_scope": "once"
+            }),
+        )];
+        let error = validate_public_runtime_event_sequence(invalid.as_slice())
+            .expect_err("approval.resolved must follow approval.required");
+        assert_eq!(error.code, "approval_resolved_before_required");
     }
 
     #[test]

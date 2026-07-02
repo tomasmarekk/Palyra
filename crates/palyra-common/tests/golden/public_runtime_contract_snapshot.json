@@ -454,7 +454,7 @@
     },
     "snapshot_version": "runtime-contracts.acp.v1"
   },
-  "changelog_note": "Adds the canonical PalyraErrorEnvelope and public error category taxonomy; breaking changes require a new snapshot version and migration note.",
+  "changelog_note": "Adds the canonical public runtime event taxonomy for run, model, tool, approval, verification, and heartbeat streams.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -650,6 +650,578 @@
       "snapshot_version": "runtime-contracts.acp_error_envelope.v1"
     }
   ],
+  "public_runtime_events": {
+    "changelog_note": "Public stream vocabulary is shared by Responses-compatible streaming, runs events, QA Lab, trajectory export, ACP, and observability.",
+    "event_names": [
+      {
+        "canonical": "run.created",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "run.queued",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "run.started",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "model.delta",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "tool.call.started",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "tool.call.delta",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "tool.call.completed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "approval.required",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "approval.resolved",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "verification.nudge",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "run.completed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "run.failed",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "run.cancelled",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "heartbeat",
+        "deprecated_aliases": []
+      }
+    ],
+    "event_schema_version": 1,
+    "events": [
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.created",
+        "ordering_phase": 100,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.queued",
+        "ordering_phase": 200,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.started",
+        "ordering_phase": 300,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "orchestrator_tape",
+        "name": "model.delta",
+        "ordering_phase": 400,
+        "payload_schema": [
+          {
+            "name": "delta",
+            "redacted": true,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "is_final",
+            "redacted": false,
+            "required": true,
+            "type_name": "boolean"
+          }
+        ],
+        "redaction": "redacted_text",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "orchestrator_tape",
+        "name": "tool.call.started",
+        "ordering_phase": 500,
+        "payload_schema": [
+          {
+            "name": "tool_name",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "input_json",
+            "redacted": true,
+            "required": true,
+            "type_name": "object"
+          },
+          {
+            "name": "approval_required",
+            "redacted": false,
+            "required": true,
+            "type_name": "boolean"
+          }
+        ],
+        "redaction": "redacted_json",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id",
+          "tool_call_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "approval_prompts",
+        "name": "approval.required",
+        "ordering_phase": 600,
+        "payload_schema": [
+          {
+            "name": "tool_name",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "request_summary",
+            "redacted": true,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "prompt",
+            "redacted": true,
+            "required": true,
+            "type_name": "ApprovalPrompt"
+          }
+        ],
+        "redaction": "redacted_json",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id",
+          "tool_call_id",
+          "approval_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "approval_prompts",
+        "name": "approval.resolved",
+        "ordering_phase": 700,
+        "payload_schema": [
+          {
+            "name": "approved",
+            "redacted": false,
+            "required": true,
+            "type_name": "boolean"
+          },
+          {
+            "name": "reason",
+            "redacted": true,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "decision_scope",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "redacted_text",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id",
+          "tool_call_id",
+          "approval_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "orchestrator_tape",
+        "name": "tool.call.delta",
+        "ordering_phase": 800,
+        "payload_schema": [
+          {
+            "name": "kind",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "reason",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "redacted_text",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id",
+          "tool_call_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "orchestrator_tape",
+        "name": "tool.call.completed",
+        "ordering_phase": 900,
+        "payload_schema": [
+          {
+            "name": "success",
+            "redacted": false,
+            "required": true,
+            "type_name": "boolean"
+          },
+          {
+            "name": "output_json",
+            "redacted": true,
+            "required": false,
+            "type_name": "object"
+          },
+          {
+            "name": "error",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "redacted_json",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id",
+          "tool_call_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "verification_journal",
+        "name": "verification.nudge",
+        "ordering_phase": 950,
+        "payload_schema": [
+          {
+            "name": "requirement",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "reason",
+            "redacted": true,
+            "required": true,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "redacted_text",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "operator"
+      },
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.completed",
+        "ordering_phase": 1000,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.failed",
+        "ordering_phase": 1000,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "redacted_text",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "run_lifecycle_events",
+        "name": "run.cancelled",
+        "ordering_phase": 1000,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "message",
+            "redacted": true,
+            "required": false,
+            "type_name": "string"
+          },
+          {
+            "name": "reason_code",
+            "redacted": false,
+            "required": false,
+            "type_name": "string"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [
+          "run_id",
+          "session_id"
+        ],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      },
+      {
+        "journal_mapping": "ephemeral_heartbeat",
+        "name": "heartbeat",
+        "ordering_phase": 0,
+        "payload_schema": [
+          {
+            "name": "status",
+            "redacted": false,
+            "required": true,
+            "type_name": "string"
+          },
+          {
+            "name": "interval_ms",
+            "redacted": false,
+            "required": false,
+            "type_name": "integer"
+          },
+          {
+            "name": "server_time_unix_ms",
+            "redacted": false,
+            "required": false,
+            "type_name": "integer"
+          }
+        ],
+        "redaction": "metadata_only",
+        "required_correlation_ids": [],
+        "schema_version": 1,
+        "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+        "visibility": "public"
+      }
+    ],
+    "journal_mappings": [
+      {
+        "canonical": "run_lifecycle_events",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "orchestrator_tape",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "approval_prompts",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "verification_journal",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "ephemeral_heartbeat",
+        "deprecated_aliases": []
+      }
+    ],
+    "redaction_postures": [
+      {
+        "canonical": "metadata_only",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "redacted_text",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "redacted_json",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "no_payload_secrets",
+        "deprecated_aliases": []
+      }
+    ],
+    "snapshot_version": "runtime-contracts.public_runtime_events.v1",
+    "unknown_extension_fields": "preserve_and_ignore_unknown_fields",
+    "visibility_levels": [
+      {
+        "canonical": "public",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "operator",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "internal",
+        "deprecated_aliases": []
+      },
+      {
+        "canonical": "sensitive",
+        "deprecated_aliases": []
+      }
+    ]
+  },
   "realtime_protocol": {
     "changelog_note": "Realtime handshake, command, event, and error vocabularies are pinned for console and agent clients.",
     "enums": [
@@ -1046,7 +1618,7 @@
     }
   ],
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v2",
+  "snapshot_version": "runtime-contracts.v3",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [
