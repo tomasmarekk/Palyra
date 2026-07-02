@@ -843,7 +843,7 @@ path = "run export"
 category = "nested_surface"
 status = "done"
 summary = "Export a redacted run trajectory in evaluator-friendly formats."
-required_flags = ["run-id", "output", "format", "redacted", "journal-db", "max-events"]
+required_flags = ["run-id", "output", "format", "redacted", "journal-db", "max-events", "trajectory"]
 
 [entries.snapshot]
 path = "run export"

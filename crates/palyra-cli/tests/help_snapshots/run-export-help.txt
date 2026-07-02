@@ -7,6 +7,7 @@ Options:
       --redacted <REDACTED>      [default: true] [possible values: true, false]
       --journal-db <JOURNAL_DB>
       --max-events <MAX_EVENTS>  [default: 128]
+      --trajectory
   -h, --help                     Print help
 
 Global Options:

@@ -104,7 +104,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `patch bundles` | `nested_surface` | `done` | `verified` | `patch-bundles-help.txt` | - | - | - |
 | `workers` | `canonical_family` | `done` | `verified` | `workers-help.txt` | - | - | - |
 | `run` | `top_level` | `done` | `verified` | `run-help.txt` | - | - | - |
-| `run export` | `nested_surface` | `done` | `verified` | `run-export-help.txt` | - | `--run-id`, `--output`, `--format`, `--redacted`, `--journal-db`, `--max-events` | - |
+| `run export` | `nested_surface` | `done` | `verified` | `run-export-help.txt` | - | `--run-id`, `--output`, `--format`, `--redacted`, `--journal-db`, `--max-events`, `--trajectory` | - |
 | `skills` | `top_level` | `done` | `verified` | `skills-help.txt` | `skill` | - | - |
 | `secrets` | `top_level` | `done` | `verified` | `secrets-help.txt` | - | - | - |
 | `security` | `top_level` | `done` | `verified` | `security-help.txt` | - | - | - |

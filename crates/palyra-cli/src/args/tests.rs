@@ -26,11 +26,12 @@ use super::{
     RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
     RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
     RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
-    RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
-    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
-    WizardOverridesArg, WorkersCommand, WorkspaceRoleArg,
+    RoutinesCommand, RunCommand, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg,
+    SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
+    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand,
+    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkersCommand,
+    WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -361,6 +362,42 @@ fn parse_logs_with_local_json_flag() {
             follow: false,
             poll_interval_ms: 1000,
             json: true,
+        }
+    );
+}
+
+#[test]
+fn parse_run_export_with_trajectory_flag() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "run",
+        "export",
+        "--run-id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB2",
+        "--output",
+        "artifacts/run.jsonl",
+        "--format",
+        "palyra-attested",
+        "--redacted",
+        "true",
+        "--journal-db",
+        "data/journal.sqlite3",
+        "--max-events",
+        "256",
+        "--trajectory",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Run {
+            command: RunCommand::Export {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB2".to_owned(),
+                output: "artifacts/run.jsonl".to_owned(),
+                format: RunExportFormatArg::PalyraAttested,
+                redacted: true,
+                journal_db: Some("data/journal.sqlite3".to_owned()),
+                max_events: 256,
+                trajectory: true,
+            }
         }
     );
 }

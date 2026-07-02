@@ -39,5 +39,7 @@ pub enum RunCommand {
         journal_db: Option<String>,
         #[arg(long, default_value_t = 128)]
         max_events: usize,
+        #[arg(long, default_value_t = false)]
+        trajectory: bool,
     },
 }

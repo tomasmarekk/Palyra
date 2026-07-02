@@ -3,8 +3,12 @@
 use crate::{commands::support_bundle, *};
 use palyra_common::replay_bundle::{
     canonical_replay_bundle_bytes, replay_bundle_offline, ReplayBundle, ReplayRunStatus,
+    ReplayToolExchange,
 };
 use serde_json::{json, Value};
+
+const RUN_TRAJECTORY_JSONL_FORMAT: &str = "palyra-run-trajectory-jsonl";
+const LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES: usize = 1024;
 
 /// Runs a `palyra run` subcommand.
 ///
@@ -13,9 +17,15 @@ use serde_json::{json, Value};
 /// deterministic validation, or the requested artifact cannot be written.
 pub(crate) fn run_run(command: RunCommand) -> Result<()> {
     match command {
-        RunCommand::Export { run_id, output, format, redacted, journal_db, max_events } => {
-            run_export(run_id, output, format, redacted, journal_db, max_events)
-        }
+        RunCommand::Export {
+            run_id,
+            output,
+            format,
+            redacted,
+            journal_db,
+            max_events,
+            trajectory,
+        } => run_export(run_id, output, format, redacted, journal_db, max_events, trajectory),
     }
 }
 
@@ -26,6 +36,7 @@ fn run_export(
     redacted: bool,
     journal_db: Option<String>,
     max_events: usize,
+    trajectory: bool,
 ) -> Result<()> {
     if !redacted {
         anyhow::bail!(
@@ -38,23 +49,374 @@ fn run_export(
 
     let bundle =
         support_bundle::build_replay_bundle_from_journal(run_id.as_str(), journal_db, max_events)?;
-    let payload = build_run_export_payload(&bundle, format, redacted)?;
-    let bytes = serde_json::to_vec_pretty(&payload).context("failed to encode run export")?;
     let output_path = PathBuf::from(output);
-    support_bundle::write_replay_artifact(output_path.as_path(), bytes.as_slice())?;
-    println!(
-        "run.export path={} run_id={} format={} bytes={} canonical_sha256={}",
-        output_path.display(),
-        run_id,
-        format.as_str(),
-        bytes.len(),
-        payload
-            .get("manifest")
-            .and_then(|manifest| manifest.get("replay_bundle_sha256"))
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>")
-    );
+    if trajectory {
+        let (bytes, manifest_hash) = build_run_trajectory_jsonl(&bundle, format, redacted)?;
+        support_bundle::write_replay_artifact(output_path.as_path(), bytes.as_slice())?;
+        println!(
+            "run.export path={} run_id={} format={} trajectory=true bytes={} manifest_hash_sha256={}",
+            output_path.display(),
+            run_id,
+            RUN_TRAJECTORY_JSONL_FORMAT,
+            bytes.len(),
+            manifest_hash
+        );
+    } else {
+        let payload = build_run_export_payload(&bundle, format, redacted)?;
+        let bytes = serde_json::to_vec_pretty(&payload).context("failed to encode run export")?;
+        support_bundle::write_replay_artifact(output_path.as_path(), bytes.as_slice())?;
+        println!(
+            "run.export path={} run_id={} format={} bytes={} canonical_sha256={}",
+            output_path.display(),
+            run_id,
+            format.as_str(),
+            bytes.len(),
+            payload
+                .get("manifest")
+                .and_then(|manifest| manifest.get("replay_bundle_sha256"))
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+        );
+    }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn build_run_trajectory_jsonl(
+    bundle: &ReplayBundle,
+    format: RunExportFormatArg,
+    redacted: bool,
+) -> Result<(Vec<u8>, String)> {
+    let export_manifest = build_run_export_manifest(bundle, format, redacted)?;
+    let mut artifact_index = bundle
+        .artifact_refs
+        .iter()
+        .map(|artifact| {
+            json!({
+                "artifact_id": artifact.artifact_id,
+                "kind": artifact.kind,
+                "reference": artifact.reference,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let events = build_run_trajectory_events(bundle, &mut artifact_index)?;
+    let mut manifest_line = json!({
+        "schema_version": 1,
+        "line_type": "manifest",
+        "format": RUN_TRAJECTORY_JSONL_FORMAT,
+        "requested_format": format.as_str(),
+        "redacted": redacted,
+        "run_id": bundle.source.run_id,
+        "session_id": bundle.source.session_id,
+        "manifest": export_manifest,
+        "event_count": events.len(),
+        "artifact_index": artifact_index,
+        "large_output_projection": {
+            "threshold_bytes": LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES,
+            "mode": "artifact_ref"
+        },
+        "event_classes": [
+            "user_message",
+            "compiled_instructions",
+            "provider_selection",
+            "provider_stream",
+            "tool_proposal",
+            "approval",
+            "tool_output",
+            "memory_recall",
+            "compaction_boundary",
+            "subagent",
+            "mcp_import",
+            "policy_decision",
+            "final_answer",
+            "usage",
+            "artifact"
+        ],
+    });
+    let manifest_hash = sha256_json_value(&manifest_line)?;
+    if let Some(object) = manifest_line.as_object_mut() {
+        object.insert("manifest_hash_sha256".to_owned(), Value::String(manifest_hash.clone()));
+    }
+
+    let mut lines = Vec::with_capacity(events.len().saturating_add(1));
+    lines.push(
+        serde_json::to_string(&manifest_line).context("failed to encode trajectory manifest")?,
+    );
+    for event in events {
+        lines.push(serde_json::to_string(&event).context("failed to encode trajectory event")?);
+    }
+    let mut bytes = lines.join("\n").into_bytes();
+    bytes.push(b'\n');
+    Ok((bytes, manifest_hash))
+}
+
+fn build_run_trajectory_events(
+    bundle: &ReplayBundle,
+    artifact_index: &mut Vec<Value>,
+) -> Result<Vec<Value>> {
+    let mut rows = Vec::new();
+    let mut seq = 0_i64;
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "user_message",
+        "user_message",
+        json!({
+            "input": bundle.run.normalized_user_input,
+            "input_hash_sha256": bundle
+                .run
+                .normalized_user_input
+                .as_ref()
+                .map(sha256_json_value)
+                .transpose()?,
+        }),
+    );
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "compiled_instructions",
+        "compiled_instructions",
+        json!({
+            "instruction_hash_sha256": bundle
+                .run
+                .normalized_user_input
+                .as_ref()
+                .map(sha256_json_value)
+                .transpose()?,
+            "context_manifest_hash_sha256": sha256_json_value(&bundle.config_snapshot)?,
+        }),
+    );
+    for exchange in &bundle.model_exchanges {
+        push_trajectory_row(
+            &mut rows,
+            &mut seq,
+            "provider_selection",
+            "provider_selection",
+            json!({
+                "exchange_id": exchange.exchange_id,
+                "provider": exchange.provider,
+                "model": exchange.model,
+                "provider_request_hash_sha256": sha256_json_value(&exchange.request_metadata)?,
+                "provider_response_hash_sha256": sha256_json_value(&exchange.response)?,
+            }),
+        );
+    }
+    for event in &bundle.tape_events {
+        push_trajectory_row(
+            &mut rows,
+            &mut seq,
+            event.event_type.as_str(),
+            trajectory_event_category(event.event_type.as_str()),
+            json!({
+                "tape_seq": event.seq,
+                "payload": project_tape_payload(event.event_type.as_str(), &event.payload),
+                "payload_hash_sha256": sha256_json_value(&event.payload)?,
+            }),
+        );
+    }
+    for exchange in &bundle.tool_exchanges {
+        push_tool_exchange_rows(&mut rows, &mut seq, exchange, artifact_index)?;
+    }
+    for approval in &bundle.approvals {
+        push_trajectory_row(
+            &mut rows,
+            &mut seq,
+            "approval",
+            "approval",
+            json!({
+                "approval_id": approval.approval_id,
+                "proposal_id": approval.proposal_id,
+                "request": approval.request,
+                "response": approval.response,
+            }),
+        );
+    }
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "policy_decisions",
+        "policy_decision",
+        json!({
+            "approvals": bundle.approvals,
+            "queue_decisions": bundle.queue_decisions,
+            "auxiliary_tasks": bundle.auxiliary_tasks,
+            "flow_events": bundle.flow_events,
+        }),
+    );
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "final_answer",
+        "final_answer",
+        json!({
+            "summary": bundle.expected.final_answer_summary,
+            "sha256": bundle.expected.final_answer_sha256,
+        }),
+    );
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "usage",
+        "usage",
+        json!({
+            "prompt_tokens": bundle.run.prompt_tokens,
+            "completion_tokens": bundle.run.completion_tokens,
+            "total_tokens": bundle.run.total_tokens,
+        }),
+    );
+    for artifact in artifact_index.iter() {
+        push_trajectory_row(&mut rows, &mut seq, "artifact_ref", "artifact", artifact.clone());
+    }
+    Ok(rows)
+}
+
+fn push_tool_exchange_rows(
+    rows: &mut Vec<Value>,
+    seq: &mut i64,
+    exchange: &ReplayToolExchange,
+    artifact_index: &mut Vec<Value>,
+) -> Result<()> {
+    push_trajectory_row(
+        rows,
+        seq,
+        "tool_proposal",
+        "tool_proposal",
+        json!({
+            "proposal_id": exchange.proposal_id,
+            "tool_name": exchange.tool_name,
+            "input": exchange.input,
+            "input_hash_sha256": sha256_json_value(&exchange.input)?,
+        }),
+    );
+    if let Some(decision) = exchange.decision.as_ref() {
+        push_trajectory_row(
+            rows,
+            seq,
+            "tool_decision",
+            "approval",
+            json!({
+                "proposal_id": exchange.proposal_id,
+                "tool_name": exchange.tool_name,
+                "decision": decision,
+            }),
+        );
+    }
+    if let Some(result) = exchange.result.as_ref() {
+        push_trajectory_row(
+            rows,
+            seq,
+            "tool_output",
+            "tool_output",
+            json!({
+                "proposal_id": exchange.proposal_id,
+                "tool_name": exchange.tool_name,
+                "result": project_tool_result_for_trajectory(exchange, result, artifact_index)?,
+            }),
+        );
+    }
+    if let Some(attestation) = exchange.attestation.as_ref() {
+        push_trajectory_row(
+            rows,
+            seq,
+            "tool_attestation",
+            "tool_output",
+            json!({
+                "proposal_id": exchange.proposal_id,
+                "tool_name": exchange.tool_name,
+                "attestation": attestation,
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn project_tool_result_for_trajectory(
+    exchange: &ReplayToolExchange,
+    result: &Value,
+    artifact_index: &mut Vec<Value>,
+) -> Result<Value> {
+    let bytes =
+        serde_json::to_vec(result).context("failed to encode tool result for trajectory")?;
+    if bytes.len() <= LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES {
+        return Ok(result.clone());
+    }
+    let artifact = json!({
+        "artifact_id": format!("trajectory.tool_output.{}", exchange.proposal_id),
+        "kind": "large_tool_output",
+        "reference": format!("trajectory://tool-output/{}", exchange.proposal_id),
+        "sha256": crate::sha256_hex(bytes.as_slice()),
+        "size_bytes": bytes.len(),
+    });
+    artifact_index.push(artifact.clone());
+    Ok(json!({
+        "success": result.get("success").and_then(Value::as_bool),
+        "error": result.get("error").cloned().unwrap_or(Value::Null),
+        "output_artifact_ref": artifact,
+    }))
+}
+
+fn project_tape_payload(event_type: &str, payload: &Value) -> Value {
+    if matches!(event_type, "model_token" | "provider.stream.delta") {
+        return json!({
+            "token_sha256": payload
+                .get("token")
+                .and_then(Value::as_str)
+                .map(|token| crate::sha256_hex(token.as_bytes())),
+            "is_final": payload.get("is_final").and_then(Value::as_bool),
+        });
+    }
+    if event_type == "tool_result" {
+        if let Ok(bytes) = serde_json::to_vec(payload) {
+            if bytes.len() > LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES {
+                return json!({
+                    "large_payload_redacted": true,
+                    "payload_sha256": crate::sha256_hex(bytes.as_slice()),
+                    "size_bytes": bytes.len(),
+                });
+            }
+        }
+    }
+    payload.clone()
+}
+
+fn trajectory_event_category(event_type: &str) -> &'static str {
+    match event_type {
+        "model_token" | "provider.stream.delta" | "provider.stream.completed" => "provider_stream",
+        "tool_proposal" => "tool_proposal",
+        "tool_result" | "tool_attestation" => "tool_output",
+        "tool_decision" | "approval_request" | "approval_response" => "approval",
+        value if value.contains("memory") || value.contains("recall") => "memory_recall",
+        value if value.contains("compact") => "compaction_boundary",
+        value if value.contains("subagent") || value.contains("delegation") => "subagent",
+        value if value.contains("mcp") => "mcp_import",
+        value if value.contains("policy") || value.contains("decision") => "policy_decision",
+        "final_answer" | "run_completed" => "final_answer",
+        _ => "provider_stream",
+    }
+}
+
+fn push_trajectory_row(
+    rows: &mut Vec<Value>,
+    seq: &mut i64,
+    event_type: &str,
+    category: &str,
+    payload: Value,
+) {
+    rows.push(json!({
+        "schema_version": 1,
+        "line_type": "event",
+        "seq": *seq,
+        "event_type": event_type,
+        "category": category,
+        "payload": payload,
+    }));
+    *seq += 1;
+}
+
+fn sha256_json_value(value: &Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value).context("failed to encode JSON value for hashing")?;
+    Ok(crate::sha256_hex(bytes.as_slice()))
 }
 
 fn build_run_export_payload(
@@ -287,7 +649,72 @@ mod tests {
         assert!(!payload.to_string().contains("secret-token"));
     }
 
+    #[test]
+    fn trajectory_jsonl_includes_manifest_hash_and_event_classes() {
+        let bundle = fixture_bundle();
+
+        let (bytes, manifest_hash) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let text = String::from_utf8(bytes).expect("trajectory should be UTF-8");
+        let lines = text.lines().collect::<Vec<_>>();
+        let manifest: Value =
+            serde_json::from_str(lines.first().expect("manifest line should exist"))
+                .expect("manifest line should parse");
+
+        assert_eq!(
+            manifest.get("format").and_then(Value::as_str),
+            Some(RUN_TRAJECTORY_JSONL_FORMAT)
+        );
+        assert_eq!(
+            manifest.get("manifest_hash_sha256").and_then(Value::as_str),
+            Some(manifest_hash.as_str())
+        );
+        assert!(lines.iter().skip(1).any(|line| {
+            let event = serde_json::from_str::<Value>(line).expect("event line should parse");
+            event.get("category").and_then(Value::as_str) == Some("tool_output")
+        }));
+        assert!(!text.contains("secret-token"));
+    }
+
+    #[test]
+    fn trajectory_jsonl_projects_large_tool_output_to_artifact_ref() {
+        let bundle = fixture_bundle_with_tool_output(json!({
+            "success": true,
+            "output_json": { "body": "x".repeat(LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES + 32) },
+            "error": "",
+        }));
+
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let text = String::from_utf8(bytes).expect("trajectory should be UTF-8");
+        let values = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("jsonl row should parse"))
+            .collect::<Vec<_>>();
+
+        assert!(values[0].pointer("/artifact_index").and_then(Value::as_array).is_some_and(
+            |artifacts| artifacts.iter().any(|artifact| {
+                artifact.get("kind").and_then(Value::as_str) == Some("large_tool_output")
+            })
+        ));
+        assert!(values.iter().skip(1).any(|row| {
+            row.pointer("/payload/result/output_artifact_ref/kind").and_then(Value::as_str)
+                == Some("large_tool_output")
+        }));
+        assert!(!text.contains(&"x".repeat(LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES + 32)));
+    }
+
     fn fixture_bundle() -> ReplayBundle {
+        fixture_bundle_with_tool_output(json!({
+            "proposal_id": "proposal-1",
+            "success": true,
+            "output_json": "done",
+            "error": "",
+            "attestation": { "execution_sha256": "a".repeat(64) },
+        }))
+    }
+
+    fn fixture_bundle_with_tool_output(tool_output: Value) -> ReplayBundle {
         build_replay_bundle(ReplayBundleBuildInput {
             generated_at_unix_ms: 1_700_000_000_000,
             source: ReplaySource {
@@ -337,12 +764,7 @@ mod tests {
                 ReplayTapeEvent {
                     seq: 2,
                     event_type: "tool_result".to_owned(),
-                    payload: json!({
-                        "proposal_id": "proposal-1",
-                        "success": true,
-                        "output": "done",
-                        "attestation": { "execution_sha256": "a".repeat(64) },
-                    }),
+                    payload: with_proposal_id(tool_output, "proposal-1"),
                 },
                 ReplayTapeEvent {
                     seq: 3,
@@ -355,5 +777,12 @@ mod tests {
             artifact_refs: Vec::new(),
         })
         .expect("fixture bundle should build")
+    }
+
+    fn with_proposal_id(mut value: Value, proposal_id: &str) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("proposal_id".to_owned(), Value::String(proposal_id.to_owned()));
+        }
+        value
     }
 }
