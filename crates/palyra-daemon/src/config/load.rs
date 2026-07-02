@@ -2311,6 +2311,7 @@ pub fn load_config() -> Result<LoadedConfig> {
         &replay_capture,
         &networked_workers,
     )?;
+    crate::feature_rollout_maturity::validate_builtin_feature_rollout_maturity_matrix()?;
     if !process_runner_path_access_mode_explicit {
         tool_call.process_runner.path_access_mode =
             legacy_process_runner_path_access_mode(&tool_call.process_runner, deployment.mode);

@@ -44,6 +44,17 @@ fn unused_loopback_port_pair() -> Result<(u16, u16)> {
 }
 
 fn spawn_doctor_http_server(admin_token: &str) -> Result<(String, thread::JoinHandle<Result<()>>)> {
+    spawn_doctor_http_server_with_admin_body(
+        admin_token,
+        r#"{"status":"ok","counters":{"journal_events":1,"denied_requests":0},"auth":{"summary":{"total_profiles":0,"ok":0,"missing":0,"expired":0,"expiring":0}}}"#
+            .to_owned(),
+    )
+}
+
+fn spawn_doctor_http_server_with_admin_body(
+    admin_token: &str,
+    admin_body: String,
+) -> Result<(String, thread::JoinHandle<Result<()>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind doctor test server")?;
     let address = listener.local_addr().context("failed to read doctor test server address")?;
     listener.set_nonblocking(true).context("failed to mark doctor test server as non-blocking")?;
@@ -78,10 +89,7 @@ fn spawn_doctor_http_server(admin_token: &str) -> Result<(String, thread::JoinHa
                     request_lower.contains(expected_auth.as_str()),
                     "doctor admin probe should send configured admin bearer token: {request}"
                 );
-                (
-                    "200 OK",
-                    r#"{"status":"ok","counters":{"journal_events":1,"denied_requests":0},"auth":{"summary":{"total_profiles":0,"ok":0,"missing":0,"expired":0,"expiring":0}}}"#,
-                )
+                ("200 OK", admin_body.as_str())
             } else {
                 ("404 Not Found", r#"{"error":"not found"}"#)
             };
@@ -315,6 +323,136 @@ auth_token = "{admin_token}"
     assert!(
         payload.pointer("/diagnostics/connectivity/admin/message").is_none(),
         "doctor should not skip admin diagnostics when config resolves admin auth: {payload}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_json_surfaces_feature_rollout_maturity_from_admin_payload() -> Result<()> {
+    let workdir = TempDir::new().context("failed to create temporary workdir")?;
+    let admin_token = "config-admin-token";
+    let admin_body = r#"{
+        "status":"ok",
+        "counters":{"journal_events":1,"denied_requests":0},
+        "auth":{"summary":{"total_profiles":0,"ok":0,"missing":0,"expired":0,"expiring":0}},
+        "feature_rollouts":{
+            "tool_repair":{
+                "enabled":true,
+                "source":"env",
+                "maturity":"gated_production",
+                "owner_component":"run stream/tool repair",
+                "public_api_exposure":"operator diagnostics",
+                "activation_blockers":["tool repair fixes must remain replay-safe"],
+                "required_tests":["cargo test -p palyra-daemon --test current_state_inventory --locked"]
+            },
+            "networked_workers":{
+                "enabled":false,
+                "source":"default",
+                "maturity":"blocked",
+                "owner_component":"workerd/execution backends",
+                "public_api_exposure":"runtime preview controls",
+                "activation_blockers":["Enable feature_rollouts.execution_backend_networked_worker first"],
+                "required_tests":["bash scripts/test/run-critical-attack-scenarios.sh"]
+            }
+        },
+        "feature_rollout_maturity":{
+            "schema_version":1,
+            "migration_note":"flag renames must add deprecated_aliases before aliases are removed"
+        }
+    }"#;
+    let (daemon_url, server_handle) =
+        spawn_doctor_http_server_with_admin_body(admin_token, admin_body.to_owned())?;
+    let daemon_port =
+        daemon_url.rsplit(':').next().context("doctor test server URL should include a port")?;
+    let config_path = workdir.path().join("rollout-maturity-palyra.toml");
+    fs::write(
+        config_path.as_path(),
+        format!(
+            r#"
+version = 1
+
+[daemon]
+bind_addr = "127.0.0.1"
+port = {daemon_port}
+
+[admin]
+auth_token = "{admin_token}"
+"#
+        ),
+    )
+    .with_context(|| format!("failed to write {}", config_path.display()))?;
+
+    let config_path_string = config_path.to_string_lossy().into_owned();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
+    configure_cli_env(&mut command, &workdir);
+    command
+        .current_dir(workdir.path())
+        .args(["--config", config_path_string.as_str(), "doctor", "--json"])
+        .env("PALYRA_DAEMON_URL", daemon_url.as_str());
+    let output = command.output().with_context(|| {
+        format!("failed to execute palyra --config {} doctor --json", config_path.display())
+    })?;
+    let server_result = server_handle.join();
+    if let Err(panic) = server_result {
+        anyhow::bail!(
+            "doctor test server thread panicked: {:?}\nstdout={}\nstderr={}",
+            panic,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if let Err(error) = server_result.expect("server join result should exist") {
+        anyhow::bail!(
+            "doctor test server failed: {error:#}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert!(
+        output.status.success(),
+        "doctor --json should succeed with rollout maturity payload: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).context("stdout was not UTF-8")?;
+    let payload: Value = serde_json::from_str(stdout.as_str()).context("stdout was not JSON")?;
+
+    assert_eq!(
+        payload.pointer("/diagnostics/feature_rollouts/fetched").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.pointer("/diagnostics/feature_rollouts/flag_count").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/maturity_counts/blocked")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let inactive = payload
+        .pointer("/diagnostics/feature_rollouts/inactive")
+        .and_then(Value::as_array)
+        .context("doctor feature rollout snapshot should include inactive entries")?;
+    assert!(
+        inactive.iter().any(|entry| {
+            entry.get("flag").and_then(Value::as_str) == Some("networked_workers")
+                && entry.get("activation_blockers").and_then(Value::as_array).is_some_and(
+                    |blockers| {
+                        blockers.iter().any(|blocker| {
+                            blocker.as_str().is_some_and(|text| {
+                                text.contains("execution_backend_networked_worker")
+                            })
+                        })
+                    },
+                )
+        }),
+        "doctor should explain why networked workers are inactive: {payload}"
+    );
+    assert_eq!(
+        payload.pointer("/diagnostics/feature_rollouts/migration_note").and_then(Value::as_str),
+        Some("flag renames must add deprecated_aliases before aliases are removed")
     );
     Ok(())
 }

@@ -3100,6 +3100,30 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
     )?;
     output::print_text_line(
         format!(
+            "doctor.feature_rollouts fetched={} flags={} enabled={} inactive={}",
+            execution.diagnostics.feature_rollouts.fetched,
+            execution.diagnostics.feature_rollouts.flag_count,
+            execution.diagnostics.feature_rollouts.enabled_flags,
+            execution.diagnostics.feature_rollouts.inactive_flags
+        )
+        .as_str(),
+    )?;
+    for rollout in execution.diagnostics.feature_rollouts.inactive.iter().take(8) {
+        let blockers = if rollout.activation_blockers.is_empty() {
+            "none published".to_owned()
+        } else {
+            rollout.activation_blockers.join("; ")
+        };
+        output::print_text_line(
+            format!(
+                "doctor.feature_rollout flag={} maturity={} owner={} blockers={}",
+                rollout.flag, rollout.maturity, rollout.owner_component, blockers
+            )
+            .as_str(),
+        )?;
+    }
+    output::print_text_line(
+        format!(
             "doctor.tools exposure_mode={} visible_tools={} effective_allowed_tools={} profile_expansion_status={}",
             execution.tools.catalog_exposure_mode,
             execution.tools.final_visible_tools.len(),
@@ -3125,6 +3149,9 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
     }
     if let Some(message) = execution.diagnostics.connectivity.admin.message.as_deref() {
         output::print_text_line(format!("doctor.connectivity.admin_message={message}").as_str())?;
+    }
+    if let Some(error) = execution.diagnostics.feature_rollouts.error.as_deref() {
+        output::print_text_line(format!("doctor.feature_rollouts.error={error}").as_str())?;
     }
     if let Some(config_ref_health) = execution.diagnostics.config_ref_health.as_ref() {
         let state = config_ref_health.get("state").and_then(JsonValue::as_str).unwrap_or("unknown");

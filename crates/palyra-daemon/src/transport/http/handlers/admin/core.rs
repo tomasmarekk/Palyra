@@ -107,6 +107,18 @@ pub(crate) async fn admin_status_handler(
         map.insert("media".to_owned(), media_payload);
         map.insert("observability".to_owned(), observability_payload);
         map.insert(
+            "feature_rollouts".to_owned(),
+            crate::feature_rollout_maturity::build_feature_rollout_diagnostics(
+                &state.runtime.config.feature_rollouts,
+            ),
+        );
+        map.insert(
+            "feature_rollout_maturity".to_owned(),
+            crate::feature_rollout_maturity::build_feature_rollout_maturity_summary(
+                &state.runtime.config.feature_rollouts,
+            ),
+        );
+        map.insert(
             "runtime_health".to_owned(),
             serde_json::to_value(runtime_health).map_err(|error| {
                 runtime_status_response(tonic::Status::internal(format!(

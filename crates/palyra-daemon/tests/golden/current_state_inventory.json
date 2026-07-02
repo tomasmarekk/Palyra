@@ -19,6 +19,7 @@
     "delegation",
     "deployment",
     "execution_backends",
+    "feature_rollout_maturity",
     "feature_rollouts",
     "flows",
     "generated_at_unix_ms",
@@ -723,13 +724,51 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.dynamic_tool_builder",
-      "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER"
+      "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+      "maturity": "scaffold",
+      "owner_component": "skills/tool runtime",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.dynamic_tool_builder or PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER after required tests and owner acceptance pass.",
+        "builder output is not yet covered by signed skill artifact compatibility tests"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "dynamic_tool_builder is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "context_engine": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.context_engine",
       "env_var": "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE",
+      "maturity": "preview_only",
+      "owner_component": "application/context_engine",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.context_engine or PALYRA_EXPERIMENTAL_CONTEXT_ENGINE after required tests and owner acceptance pass.",
+        "context assembly traces must stay redacted and replay-compatible before production rollout"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "context_engine is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
       "trace_schema_version": 1,
       "trace_event_type": "context.engine.plan",
       "instruction_compiler_version": 32
@@ -738,103 +777,420 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_remote_node",
-      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE"
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
+      "maturity": "blocked",
+      "owner_component": "execution backends",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.execution_backend_remote_node or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE after required tests and owner acceptance pass.",
+        "remote-node runner contract is not production-backed by attestation and cleanup evidence"
+      ],
+      "acceptance_criteria": [
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "execution_backend_remote_node is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_networked_worker": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_networked_worker",
-      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER"
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
+      "maturity": "blocked",
+      "owner_component": "workerd/execution backends",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.execution_backend_networked_worker or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER after required tests and owner acceptance pass.",
+        "networked worker execution requires worker attestation and policy-bound remote tool subsets"
+      ],
+      "acceptance_criteria": [
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "execution_backend_networked_worker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_docker": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_docker",
-      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER"
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
+      "maturity": "blocked",
+      "owner_component": "execution backends",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.execution_backend_docker or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER after required tests and owner acceptance pass.",
+        "Docker runner isolation and patch writeback parity are still roadmap-gated"
+      ],
+      "acceptance_criteria": [
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "execution_backend_docker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_backend_ssh_tunnel": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
-      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL"
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
+      "maturity": "blocked",
+      "owner_component": "execution backends",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.execution_backend_ssh_tunnel or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL after required tests and owner acceptance pass.",
+        "SSH worker RPC envelope and transport trust chain are not complete"
+      ],
+      "acceptance_criteria": [
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "execution_backend_ssh_tunnel is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "safety_boundary": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.safety_boundary",
-      "env_var": "PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY"
+      "env_var": "PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY",
+      "maturity": "preview_only",
+      "owner_component": "safety",
+      "required_tests": [
+        "cargo test -p palyra-cli security --locked",
+        "bash scripts/check-high-risk-patterns.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.safety_boundary or PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY after required tests and owner acceptance pass.",
+        "safety transforms must preserve prompt-injection and secret-redaction regression coverage"
+      ],
+      "acceptance_criteria": [
+        "security audit output remains redacted",
+        "high-risk pattern scan covers new public posture fields"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "safety_boundary is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "execution_gate_pipeline_v2": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.execution_gate_pipeline_v2",
-      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2"
+      "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2",
+      "maturity": "preview_only",
+      "owner_component": "execution gate",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.execution_gate_pipeline_v2 or PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2 after required tests and owner acceptance pass.",
+        "execution gate v2 must keep denial and degraded outcomes byte-stable before production"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "execution_gate_pipeline_v2 is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "session_queue_policy": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.session_queue_policy",
-      "env_var": "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY"
+      "env_var": "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY",
+      "maturity": "preview_only",
+      "owner_component": "session lifecycle",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.session_queue_policy or PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY after required tests and owner acceptance pass.",
+        "queue depth and merge-window limits must remain bounded in preview controls"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "session_queue_policy is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "pruning_policy_matrix": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.pruning_policy_matrix",
-      "env_var": "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX"
+      "env_var": "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX",
+      "maturity": "preview_only",
+      "owner_component": "memory/context pruning",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.pruning_policy_matrix or PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX after required tests and owner acceptance pass.",
+        "manual apply and token-savings thresholds must be visible before production pruning"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "pruning_policy_matrix is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "retrieval_dual_path": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.retrieval_dual_path",
-      "env_var": "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH"
+      "env_var": "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH",
+      "maturity": "preview_only",
+      "owner_component": "memory/retrieval",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.retrieval_dual_path or PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH after required tests and owner acceptance pass.",
+        "branch timeout and prompt budget limits must stay bounded in runtime preview controls"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "retrieval_dual_path is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "auxiliary_executor": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.auxiliary_executor",
-      "env_var": "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR"
+      "env_var": "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR",
+      "maturity": "preview_only",
+      "owner_component": "agent delegation",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.auxiliary_executor or PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR after required tests and owner acceptance pass.",
+        "auxiliary task budget and count limits must remain enforced"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "auxiliary_executor is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "flow_orchestration": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.flow_orchestration",
-      "env_var": "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION"
+      "env_var": "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION",
+      "maturity": "preview_only",
+      "owner_component": "flow orchestration",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.flow_orchestration or PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION after required tests and owner acceptance pass.",
+        "flow cancellation gates and retry budgets must be replay-visible"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "flow_orchestration is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "delivery_arbitration": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.delivery_arbitration",
-      "env_var": "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION"
+      "env_var": "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION",
+      "maturity": "preview_only",
+      "owner_component": "channel delivery",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.delivery_arbitration or PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION after required tests and owner acceptance pass.",
+        "delivery arbitration depends on active flow orchestration and bounded suppression"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "delivery_arbitration is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "replay_capture": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.replay_capture",
-      "env_var": "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE"
+      "env_var": "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE",
+      "maturity": "preview_only",
+      "owner_component": "replay",
+      "required_tests": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.replay_capture or PALYRA_EXPERIMENTAL_REPLAY_CAPTURE after required tests and owner acceptance pass.",
+        "runtime decision capture must respect replay redaction limits"
+      ],
+      "acceptance_criteria": [
+        "runtime preview controls expose activation blockers for the capability",
+        "enabled mode requires the matching rollout flag",
+        "golden inventory records the effective state"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "replay_capture is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "networked_workers": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.networked_workers",
-      "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS"
+      "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
+      "maturity": "blocked",
+      "owner_component": "workerd/execution backends",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "runtime preview controls plus operator diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.networked_workers or PALYRA_EXPERIMENTAL_NETWORKED_WORKERS after required tests and owner acceptance pass.",
+        "networked workers also require feature_rollouts.execution_backend_networked_worker"
+      ],
+      "acceptance_criteria": [
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "networked_workers is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "tool_repair": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.tool_repair",
-      "env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR"
+      "env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR",
+      "maturity": "gated_production",
+      "owner_component": "run stream/tool repair",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.tool_repair or PALYRA_EXPERIMENTAL_TOOL_REPAIR after required tests and owner acceptance pass.",
+        "tool repair must keep proposed fixes replay-safe and operator-auditable"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "tool_repair is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "provider_stream_normalizer": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.provider_stream_normalizer",
-      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER"
+      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
+      "maturity": "preview_only",
+      "owner_component": "model provider streaming",
+      "required_tests": [
+        "cargo test -p palyra-model-providers --locked",
+        "cargo test -p palyra-daemon provider_stream --locked"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.provider_stream_normalizer or PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER after required tests and owner acceptance pass.",
+        "stream normalization needs provider compatibility fixtures before stable rollout"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "provider_stream_normalizer is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "channel_turn_kernel": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.channel_turn_kernel",
       "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
+      "maturity": "gated_production",
+      "owner_component": "channel router",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.channel_turn_kernel or PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL after required tests and owner acceptance pass.",
+        "production path is currently always on; rollout gate is diagnostic-only until channel kernel gating lands"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "channel_turn_kernel is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
       "production_path_enabled": true,
       "rollout_gate_effective": false,
       "ambient_context_rollout": "context_engine"
@@ -843,13 +1199,51 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.agent_plan_state",
-      "env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE"
+      "env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE",
+      "maturity": "preview_only",
+      "owner_component": "agent plan state",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.agent_plan_state or PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE after required tests and owner acceptance pass.",
+        "model-visible plan state must remain scoped to diagnostic-safe fields"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "agent_plan_state is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "objective_judge": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.objective_judge",
       "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
+      "maturity": "preview_only",
+      "owner_component": "objective judge",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.objective_judge or PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE after required tests and owner acceptance pass.",
+        "judge outcomes must stay advisory and replay-visible until acceptance gates land"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "objective_judge is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
       "contract": {
         "schema_version": 1,
         "rollout_enabled": false,
@@ -875,32 +1269,141 @@
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.verification_runtime",
-      "env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME"
+      "env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME",
+      "maturity": "gated_production",
+      "owner_component": "verification runtime",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.verification_runtime or PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME after required tests and owner acceptance pass.",
+        "verification evidence must remain redacted and durable before stable rollout"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "verification_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "progress_drafts": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.progress_drafts",
-      "env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS"
+      "env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS",
+      "maturity": "preview_only",
+      "owner_component": "progress drafts",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.progress_drafts or PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS after required tests and owner acceptance pass.",
+        "draft projection must not expose hidden transcript or secret material"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "progress_drafts is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "compaction_safeguard": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.compaction_safeguard",
-      "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD"
+      "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD",
+      "maturity": "gated_production",
+      "owner_component": "session compaction",
+      "required_tests": [
+        "cargo test -p palyra-daemon session_compaction --locked",
+        "bash scripts/test/run-replay-gate.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.compaction_safeguard or PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD after required tests and owner acceptance pass.",
+        "compaction decisions must be replay-safe and expose bounded evidence"
+      ],
+      "acceptance_criteria": [
+        "compaction path records replay-safe evidence",
+        "provider-backed work degrades to local evidence when rollout is disabled"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "compaction_safeguard is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "provider_backed_evidence_compaction": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.provider_backed_evidence_compaction",
-      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION"
+      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION",
+      "maturity": "preview_only",
+      "owner_component": "session compaction",
+      "required_tests": [
+        "cargo test -p palyra-daemon session_compaction --locked",
+        "bash scripts/test/run-replay-gate.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.provider_backed_evidence_compaction or PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION after required tests and owner acceptance pass.",
+        "provider-backed compaction must degrade to local evidence when provider calls fail"
+      ],
+      "acceptance_criteria": [
+        "compaction path records replay-safe evidence",
+        "provider-backed work degrades to local evidence when rollout is disabled"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "provider_backed_evidence_compaction is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
     "attack_surface_audit": {
       "enabled": false,
       "source": "default",
       "config_path": "feature_rollouts.attack_surface_audit",
-      "env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT"
+      "env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT",
+      "maturity": "preview_only",
+      "owner_component": "security audit",
+      "required_tests": [
+        "cargo test -p palyra-cli security --locked",
+        "bash scripts/check-high-risk-patterns.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.attack_surface_audit or PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT after required tests and owner acceptance pass.",
+        "attack-surface audit output must remain redacted and policy-aligned"
+      ],
+      "acceptance_criteria": [
+        "security audit output remains redacted",
+        "high-risk pattern scan covers new public posture fields"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "attack_surface_audit is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     }
+  },
+  "feature_rollout_maturity": {
+    "schema_version": 1,
+    "flag_count": 26,
+    "enabled_flags": 0,
+    "inactive_flags": 26,
+    "blocked_flags": 5,
+    "maturity_counts": {
+      "blocked": 5,
+      "deprecated": 0,
+      "gated_production": 4,
+      "preview_only": 16,
+      "scaffold": 1,
+      "stable": 0
+    },
+    "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
+    "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
   },
   "runtime_roadmap": {
     "schema_version": 1,
@@ -1364,6 +1867,15 @@
         "reason": "preview capability modes, rollout gates, activation blockers, and shared wire names"
       },
       {
+        "surface": "feature_rollout_maturity",
+        "source_paths": [
+          "crates/palyra-daemon/src/feature_rollout_maturity.rs",
+          "crates/palyra-daemon/src/config/schema.rs",
+          "crates/palyra-daemon/tests/current_state_inventory.rs"
+        ],
+        "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
+      },
+      {
         "surface": "compat_routes",
         "source_paths": [
           "crates/palyra-daemon/src/transport/http/router.rs",
@@ -1471,7 +1983,7 @@
       "cli_families": 59,
       "compat_routes": 6,
       "registered_compat_routes": 6,
-      "diagnostics_sections": 43,
+      "diagnostics_sections": 44,
       "execution_backends": 5,
       "feature_rollout_flags": 26,
       "runtime_control_capabilities": 8
@@ -1483,6 +1995,16 @@
     },
     "feature_rollout_counts": {
       "disabled": 26
+    },
+    "feature_rollout_maturity": {
+      "schema_version": 1,
+      "maturity_counts": {
+        "blocked": 5,
+        "gated_production": 4,
+        "preview_only": 16,
+        "scaffold": 1
+      },
+      "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
     },
     "runtime_control_state_counts": {
       "disabled": 2,

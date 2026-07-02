@@ -3167,10 +3167,53 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
     );
     assert_eq!(
         diagnostics_response
+            .pointer("/feature_rollouts/session_queue_policy/maturity")
+            .and_then(Value::as_str),
+        Some("preview_only"),
+        "diagnostics should publish session queue policy rollout maturity"
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/feature_rollouts/session_queue_policy/required_tests")
+            .and_then(Value::as_array)
+            .is_some_and(|required_tests| !required_tests.is_empty()),
+        "diagnostics should publish required tests for session queue policy rollout"
+    );
+    assert_eq!(
+        diagnostics_response
             .pointer("/feature_rollouts/tool_repair/config_path")
             .and_then(Value::as_str),
         Some("feature_rollouts.tool_repair"),
         "diagnostics should expose the roadmap rollout config path for tool repair"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/tool_repair/public_api_exposure")
+            .and_then(Value::as_str),
+        Some(
+            "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json"
+        ),
+        "diagnostics should publish tool repair public exposure"
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/feature_rollouts/networked_workers/activation_blockers")
+            .and_then(Value::as_array)
+            .is_some_and(|blockers| {
+                blockers.iter().any(|blocker| {
+                    blocker
+                        .as_str()
+                        .is_some_and(|text| text.contains("execution_backend_networked_worker"))
+                })
+            }),
+        "diagnostics should explain why networked workers are blocked"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollout_maturity/schema_version")
+            .and_then(Value::as_u64),
+        Some(1),
+        "diagnostics should publish the feature rollout maturity schema version"
     );
     assert_eq!(
         diagnostics_response.pointer("/runtime_roadmap/schema_version").and_then(Value::as_u64),

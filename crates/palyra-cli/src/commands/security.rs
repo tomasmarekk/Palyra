@@ -1095,6 +1095,16 @@ mod tests {
                 recent_health_failures: None,
                 error: None,
             },
+            feature_rollouts: DoctorFeatureRolloutsSnapshot {
+                fetched: true,
+                flag_count: 0,
+                enabled_flags: 0,
+                inactive_flags: 0,
+                maturity_counts: BTreeMap::new(),
+                inactive: Vec::new(),
+                migration_note: None,
+                error: None,
+            },
             access: DoctorAccessSnapshot {
                 registry_path: Some("state/access_registry.json".to_owned()),
                 registry_exists: true,

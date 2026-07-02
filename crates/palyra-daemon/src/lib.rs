@@ -67,6 +67,7 @@ mod cron;
 mod delegation;
 pub mod domain;
 mod execution_backends;
+mod feature_rollout_maturity;
 mod flows;
 mod gateway;
 mod hooks;

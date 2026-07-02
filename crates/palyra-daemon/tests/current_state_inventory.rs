@@ -89,6 +89,17 @@ fn runtime_audit_baseline_rejects_unknown_runtime_control_state() {
     );
 }
 
+#[test]
+fn runtime_audit_baseline_rejects_unknown_feature_rollout_maturity() {
+    let error = parse_feature_rollout_maturity("pilot")
+        .expect_err("unknown feature rollout maturity should be rejected");
+
+    assert!(
+        error.to_string().contains("unknown feature rollout maturity pilot"),
+        "error should name the unknown feature rollout maturity: {error}"
+    );
+}
+
 fn build_current_state_inventory_snapshot(
     harness: &DaemonHarness,
     session: &support::ConsoleSession,
@@ -199,6 +210,7 @@ fn build_current_state_inventory_snapshot(
         "capabilities": capabilities,
         "migration_notes": capability_catalog.get("migration_notes").cloned().unwrap_or(Value::Null),
         "feature_rollouts": diagnostics.get("feature_rollouts").cloned().unwrap_or(Value::Null),
+        "feature_rollout_maturity": diagnostics.get("feature_rollout_maturity").cloned().unwrap_or(Value::Null),
         "runtime_roadmap": diagnostics.get("runtime_roadmap").cloned().unwrap_or(Value::Null),
         "runtime_controls": {
             "schema_version": runtime_controls.remove("schema_version").unwrap_or(Value::Null),
@@ -265,6 +277,7 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
     let compat_routes = required_array(snapshot, "/compat_routes")?;
     let execution_backends = required_array(snapshot, "/execution_backends")?;
     let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
+    let feature_rollout_maturity = required_object(snapshot, "/feature_rollout_maturity")?;
     let runtime_controls = required_object(snapshot, "/runtime_controls")?;
     let runtime_control_capabilities = required_array(snapshot, "/runtime_controls/capabilities")?;
     let roadmap_area_map = roadmap_area_map();
@@ -295,6 +308,11 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
         },
         "roadmap_area_status_counts": status_counts,
         "feature_rollout_counts": count_feature_rollouts(feature_rollouts)?,
+        "feature_rollout_maturity": {
+            "schema_version": feature_rollout_maturity.get("schema_version").cloned().unwrap_or(Value::Null),
+            "maturity_counts": count_feature_rollout_maturity(feature_rollouts)?,
+            "migration_note": feature_rollout_maturity.get("migration_note").cloned().unwrap_or(Value::Null),
+        },
         "runtime_control_state_counts": count_runtime_control_states(
             runtime_control_capabilities
         )?,
@@ -336,6 +354,15 @@ fn runtime_audit_source_map() -> Vec<Value> {
                 "crates/palyra-daemon/src/config/schema.rs"
             ],
             "reason": "preview capability modes, rollout gates, activation blockers, and shared wire names"
+        }),
+        json!({
+            "surface": "feature_rollout_maturity",
+            "source_paths": [
+                "crates/palyra-daemon/src/feature_rollout_maturity.rs",
+                "crates/palyra-daemon/src/config/schema.rs",
+                "crates/palyra-daemon/tests/current_state_inventory.rs"
+            ],
+            "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
         }),
         json!({
             "surface": "compat_routes",
@@ -432,6 +459,30 @@ fn count_feature_rollouts(
     Ok(counts)
 }
 
+fn count_feature_rollout_maturity(
+    feature_rollouts: &serde_json::Map<String, Value>,
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = BTreeMap::new();
+    for (name, entry) in feature_rollouts {
+        let maturity = entry
+            .get("maturity")
+            .and_then(Value::as_str)
+            .with_context(|| format!("feature rollout {name} should expose maturity"))?;
+        let maturity = parse_feature_rollout_maturity(maturity)?;
+        *counts.entry(maturity.to_owned()).or_default() += 1;
+    }
+    Ok(counts)
+}
+
+fn parse_feature_rollout_maturity(raw: &str) -> Result<&str> {
+    match raw {
+        "scaffold" | "preview_only" | "gated_production" | "stable" | "deprecated" | "blocked" => {
+            Ok(raw)
+        }
+        other => bail!("unknown feature rollout maturity {other}"),
+    }
+}
+
 fn count_runtime_control_states(capabilities: &[Value]) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for entry in capabilities {
@@ -480,6 +531,7 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
         .count();
     let runtime_state_counts = count_runtime_control_states(runtime_control_capabilities)?;
     let rollout_counts = count_feature_rollouts(feature_rollouts)?;
+    let maturity_counts = count_feature_rollout_maturity(feature_rollouts)?;
 
     let mut report = String::new();
     report.push_str("# Runtime Audit Baseline\n\n");
@@ -508,6 +560,18 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
         format!(
             "- Runtime preview controls: `{}` capabilities\n",
             runtime_control_capabilities.len()
+        )
+        .as_str(),
+    );
+    report.push_str(
+        format!(
+            "- Feature rollout maturity: `scaffold={}`, `preview_only={}`, `gated_production={}`, `stable={}`, `deprecated={}`, `blocked={}`\n",
+            maturity_counts.get("scaffold").copied().unwrap_or_default(),
+            maturity_counts.get("preview_only").copied().unwrap_or_default(),
+            maturity_counts.get("gated_production").copied().unwrap_or_default(),
+            maturity_counts.get("stable").copied().unwrap_or_default(),
+            maturity_counts.get("deprecated").copied().unwrap_or_default(),
+            maturity_counts.get("blocked").copied().unwrap_or_default(),
         )
         .as_str(),
     );
@@ -606,8 +670,8 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
         )
         .as_str(),
     );
-    report.push_str("| Flag | Enabled | Source | Config path | Env var |\n");
-    report.push_str("| --- | --- | --- | --- | --- |\n");
+    report.push_str("| Flag | Enabled | Source | Maturity | Owner | Public API exposure | Config path | Env var | Blockers |\n");
+    report.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let mut rollout_names = feature_rollouts.keys().collect::<Vec<_>>();
     rollout_names.sort();
     for name in rollout_names {
@@ -616,12 +680,16 @@ fn render_runtime_audit_report(snapshot: &Value) -> Result<String> {
             .with_context(|| format!("feature rollout {name} should be present"))?;
         report.push_str(
             format!(
-                "| `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | {} | `{}` | `{}` | {} |\n",
                 name,
                 required_bool_field(entry, "enabled")?,
                 required_str_field(entry, "source")?,
+                parse_feature_rollout_maturity(required_str_field(entry, "maturity")?)?,
+                required_str_field(entry, "owner_component")?,
+                required_str_field(entry, "public_api_exposure")?,
                 required_str_field(entry, "config_path")?,
-                required_str_field(entry, "env_var")?
+                required_str_field(entry, "env_var")?,
+                format_activation_blockers(entry)
             )
             .as_str(),
         );

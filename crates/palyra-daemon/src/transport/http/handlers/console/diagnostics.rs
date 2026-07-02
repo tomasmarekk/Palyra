@@ -14,36 +14,7 @@
 //! leave the daemon.
 
 use crate::*;
-use palyra_common::feature_rollouts::{
-    AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH, AGENT_PLAN_STATE_ROLLOUT_ENV,
-    ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
-    AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
-    CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH, CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
-    COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
-    CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH, CONTEXT_ENGINE_ROLLOUT_ENV,
-    DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH, DELIVERY_ARBITRATION_ROLLOUT_ENV,
-    DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
-    EXECUTION_BACKEND_DOCKER_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
-    EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH,
-    EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
-    EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
-    EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH, EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
-    EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
-    FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH, FLOW_ORCHESTRATION_ROLLOUT_ENV,
-    NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH, NETWORKED_WORKERS_ROLLOUT_ENV,
-    OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH, OBJECTIVE_JUDGE_ROLLOUT_ENV,
-    PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH, PROGRESS_DRAFTS_ROLLOUT_ENV,
-    PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_CONFIG_PATH,
-    PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
-    PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
-    PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
-    REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH, REPLAY_CAPTURE_ROLLOUT_ENV,
-    RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
-    SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH, SAFETY_BOUNDARY_ROLLOUT_ENV,
-    SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH, SESSION_QUEUE_POLICY_ROLLOUT_ENV,
-    TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV,
-    VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH, VERIFICATION_RUNTIME_ROLLOUT_ENV,
-};
+use palyra_common::feature_rollouts::DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV;
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 use palyra_common::runtime_roadmap::{
@@ -327,6 +298,9 @@ pub(crate) async fn console_diagnostics_handler(
             "telemetry": access_snapshot.telemetry,
         },
         "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state),
+        "feature_rollout_maturity": crate::feature_rollout_maturity::build_feature_rollout_maturity_summary(
+            &state.runtime.config.feature_rollouts,
+        ),
         "runtime_roadmap": collect_console_runtime_roadmap_diagnostics(),
         "context_engine": context_engine_payload,
         "verification": verification_payload,
@@ -1056,174 +1030,43 @@ fn networked_worker_action_descriptors() -> Value {
 /// Reports every feature-rollout flag with its effective value and source,
 /// plus the config path and env var an operator can use to change it.
 fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
-    let feature_rollouts = &state.runtime.config.feature_rollouts;
-    json!({
-        "dynamic_tool_builder": {
-            "enabled": feature_rollouts.dynamic_tool_builder.enabled,
-            "source": feature_rollouts.dynamic_tool_builder.source,
-            "config_path": DYNAMIC_TOOL_BUILDER_ROLLOUT_CONFIG_PATH,
-            "env_var": DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
-        },
-        "context_engine": {
-            "enabled": feature_rollouts.context_engine.enabled,
-            "source": feature_rollouts.context_engine.source,
-            "config_path": CONTEXT_ENGINE_ROLLOUT_CONFIG_PATH,
-            "env_var": CONTEXT_ENGINE_ROLLOUT_ENV,
-            "trace_schema_version": application::context_engine::CONTEXT_ASSEMBLY_TRACE_SCHEMA_VERSION,
-            "trace_event_type": application::context_engine::CONTEXT_ENGINE_PLAN_EVENT,
-            "instruction_compiler_version": application::instruction_compiler::INSTRUCTION_COMPILER_VERSION,
-        },
-        "execution_backend_remote_node": {
-            "enabled": feature_rollouts.execution_backend_remote_node.enabled,
-            "source": feature_rollouts.execution_backend_remote_node.source,
-            "config_path": EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_CONFIG_PATH,
-            "env_var": EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
-        },
-        "execution_backend_networked_worker": {
-            "enabled": feature_rollouts.execution_backend_networked_worker.enabled,
-            "source": feature_rollouts.execution_backend_networked_worker.source,
-            "config_path": EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_CONFIG_PATH,
-            "env_var": EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV,
-        },
-        "execution_backend_docker": {
-            "enabled": feature_rollouts.execution_backend_docker.enabled,
-            "source": feature_rollouts.execution_backend_docker.source,
-            "config_path": EXECUTION_BACKEND_DOCKER_ROLLOUT_CONFIG_PATH,
-            "env_var": EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
-        },
-        "execution_backend_ssh_tunnel": {
-            "enabled": feature_rollouts.execution_backend_ssh_tunnel.enabled,
-            "source": feature_rollouts.execution_backend_ssh_tunnel.source,
-            "config_path": EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_CONFIG_PATH,
-            "env_var": EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
-        },
-        "safety_boundary": {
-            "enabled": feature_rollouts.safety_boundary.enabled,
-            "source": feature_rollouts.safety_boundary.source,
-            "config_path": SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH,
-            "env_var": SAFETY_BOUNDARY_ROLLOUT_ENV,
-        },
-        "execution_gate_pipeline_v2": {
-            "enabled": feature_rollouts.execution_gate_pipeline_v2.enabled,
-            "source": feature_rollouts.execution_gate_pipeline_v2.source,
-            "config_path": EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH,
-            "env_var": EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
-        },
-        "session_queue_policy": {
-            "enabled": feature_rollouts.session_queue_policy.enabled,
-            "source": feature_rollouts.session_queue_policy.source,
-            "config_path": SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH,
-            "env_var": SESSION_QUEUE_POLICY_ROLLOUT_ENV,
-        },
-        "pruning_policy_matrix": {
-            "enabled": feature_rollouts.pruning_policy_matrix.enabled,
-            "source": feature_rollouts.pruning_policy_matrix.source,
-            "config_path": PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH,
-            "env_var": PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
-        },
-        "retrieval_dual_path": {
-            "enabled": feature_rollouts.retrieval_dual_path.enabled,
-            "source": feature_rollouts.retrieval_dual_path.source,
-            "config_path": RETRIEVAL_DUAL_PATH_ROLLOUT_CONFIG_PATH,
-            "env_var": RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
-        },
-        "auxiliary_executor": {
-            "enabled": feature_rollouts.auxiliary_executor.enabled,
-            "source": feature_rollouts.auxiliary_executor.source,
-            "config_path": AUXILIARY_EXECUTOR_ROLLOUT_CONFIG_PATH,
-            "env_var": AUXILIARY_EXECUTOR_ROLLOUT_ENV,
-        },
-        "flow_orchestration": {
-            "enabled": feature_rollouts.flow_orchestration.enabled,
-            "source": feature_rollouts.flow_orchestration.source,
-            "config_path": FLOW_ORCHESTRATION_ROLLOUT_CONFIG_PATH,
-            "env_var": FLOW_ORCHESTRATION_ROLLOUT_ENV,
-        },
-        "delivery_arbitration": {
-            "enabled": feature_rollouts.delivery_arbitration.enabled,
-            "source": feature_rollouts.delivery_arbitration.source,
-            "config_path": DELIVERY_ARBITRATION_ROLLOUT_CONFIG_PATH,
-            "env_var": DELIVERY_ARBITRATION_ROLLOUT_ENV,
-        },
-        "replay_capture": {
-            "enabled": feature_rollouts.replay_capture.enabled,
-            "source": feature_rollouts.replay_capture.source,
-            "config_path": REPLAY_CAPTURE_ROLLOUT_CONFIG_PATH,
-            "env_var": REPLAY_CAPTURE_ROLLOUT_ENV,
-        },
-        "networked_workers": {
-            "enabled": feature_rollouts.networked_workers.enabled,
-            "source": feature_rollouts.networked_workers.source,
-            "config_path": NETWORKED_WORKERS_ROLLOUT_CONFIG_PATH,
-            "env_var": NETWORKED_WORKERS_ROLLOUT_ENV,
-        },
-        "tool_repair": {
-            "enabled": feature_rollouts.tool_repair.enabled,
-            "source": feature_rollouts.tool_repair.source,
-            "config_path": TOOL_REPAIR_ROLLOUT_CONFIG_PATH,
-            "env_var": TOOL_REPAIR_ROLLOUT_ENV,
-        },
-        "provider_stream_normalizer": {
-            "enabled": feature_rollouts.provider_stream_normalizer.enabled,
-            "source": feature_rollouts.provider_stream_normalizer.source,
-            "config_path": PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH,
-            "env_var": PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
-        },
-        "channel_turn_kernel": {
-            "enabled": feature_rollouts.channel_turn_kernel.enabled,
-            "source": feature_rollouts.channel_turn_kernel.source,
-            "config_path": CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH,
-            "env_var": CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
-            "production_path_enabled": true,
-            "rollout_gate_effective": false,
-            "ambient_context_rollout": "context_engine",
-        },
-        "agent_plan_state": {
-            "enabled": feature_rollouts.agent_plan_state.enabled,
-            "source": feature_rollouts.agent_plan_state.source,
-            "config_path": AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH,
-            "env_var": AGENT_PLAN_STATE_ROLLOUT_ENV,
-        },
-        "objective_judge": {
-            "enabled": feature_rollouts.objective_judge.enabled,
-            "source": feature_rollouts.objective_judge.source,
-            "config_path": OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH,
-            "env_var": OBJECTIVE_JUDGE_ROLLOUT_ENV,
-            "contract": crate::objective_judge::objective_judge_diagnostics_payload(
-                feature_rollouts.objective_judge.enabled,
+    let mut payload = crate::feature_rollout_maturity::build_feature_rollout_diagnostics(
+        &state.runtime.config.feature_rollouts,
+    );
+    let Some(entries) = payload.as_object_mut() else {
+        return payload;
+    };
+    if let Some(context_engine) = entries.get_mut("context_engine").and_then(Value::as_object_mut) {
+        context_engine.insert(
+            "trace_schema_version".to_owned(),
+            json!(application::context_engine::CONTEXT_ASSEMBLY_TRACE_SCHEMA_VERSION),
+        );
+        context_engine.insert(
+            "trace_event_type".to_owned(),
+            json!(application::context_engine::CONTEXT_ENGINE_PLAN_EVENT),
+        );
+        context_engine.insert(
+            "instruction_compiler_version".to_owned(),
+            json!(application::instruction_compiler::INSTRUCTION_COMPILER_VERSION),
+        );
+    }
+    if let Some(channel_turn_kernel) =
+        entries.get_mut("channel_turn_kernel").and_then(Value::as_object_mut)
+    {
+        channel_turn_kernel.insert("production_path_enabled".to_owned(), json!(true));
+        channel_turn_kernel.insert("rollout_gate_effective".to_owned(), json!(false));
+        channel_turn_kernel.insert("ambient_context_rollout".to_owned(), json!("context_engine"));
+    }
+    if let Some(objective_judge) = entries.get_mut("objective_judge").and_then(Value::as_object_mut)
+    {
+        objective_judge.insert(
+            "contract".to_owned(),
+            crate::objective_judge::objective_judge_diagnostics_payload(
+                state.runtime.config.feature_rollouts.objective_judge.enabled,
             ),
-        },
-        "verification_runtime": {
-            "enabled": feature_rollouts.verification_runtime.enabled,
-            "source": feature_rollouts.verification_runtime.source,
-            "config_path": VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH,
-            "env_var": VERIFICATION_RUNTIME_ROLLOUT_ENV,
-        },
-        "progress_drafts": {
-            "enabled": feature_rollouts.progress_drafts.enabled,
-            "source": feature_rollouts.progress_drafts.source,
-            "config_path": PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH,
-            "env_var": PROGRESS_DRAFTS_ROLLOUT_ENV,
-        },
-        "compaction_safeguard": {
-            "enabled": feature_rollouts.compaction_safeguard.enabled,
-            "source": feature_rollouts.compaction_safeguard.source,
-            "config_path": COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH,
-            "env_var": COMPACTION_SAFEGUARD_ROLLOUT_ENV,
-        },
-        "provider_backed_evidence_compaction": {
-            "enabled": feature_rollouts.provider_backed_evidence_compaction.enabled,
-            "source": feature_rollouts.provider_backed_evidence_compaction.source,
-            "config_path": PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_CONFIG_PATH,
-            "env_var": PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
-        },
-        "attack_surface_audit": {
-            "enabled": feature_rollouts.attack_surface_audit.enabled,
-            "source": feature_rollouts.attack_surface_audit.source,
-            "config_path": ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH,
-            "env_var": ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
-        },
-    })
+        );
+    }
+    payload
 }
 
 /// Reports the shared runtime-roadmap contract catalog used by upcoming

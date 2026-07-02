@@ -1229,6 +1229,8 @@ fn build_doctor_report_with_connectivity(
     let provider_auth =
         collect_doctor_provider_auth_snapshot(admin_payload.as_ref(), admin_error.as_deref());
     let browser = collect_doctor_browser_snapshot(admin_payload.as_ref(), admin_error.as_deref());
+    let feature_rollouts =
+        collect_doctor_feature_rollouts_snapshot(admin_payload.as_ref(), admin_error.as_deref());
     let access = collect_doctor_access_snapshot();
     let deployment = collect_doctor_deployment_snapshot();
     let skills = build_default_skills_inventory_snapshot();
@@ -1270,6 +1272,7 @@ fn build_doctor_report_with_connectivity(
         connectivity,
         provider_auth,
         browser,
+        feature_rollouts,
         access,
         skills,
         sandbox: DoctorSandboxSnapshot {
@@ -1701,6 +1704,96 @@ fn collect_doctor_browser_snapshot(
         recent_health_failures,
         error,
     }
+}
+
+fn collect_doctor_feature_rollouts_snapshot(
+    admin_payload: Option<&Value>,
+    admin_error: Option<&str>,
+) -> DoctorFeatureRolloutsSnapshot {
+    let Some(payload) = admin_payload else {
+        return DoctorFeatureRolloutsSnapshot {
+            fetched: false,
+            flag_count: 0,
+            enabled_flags: 0,
+            inactive_flags: 0,
+            maturity_counts: BTreeMap::new(),
+            inactive: Vec::new(),
+            migration_note: None,
+            error: Some(
+                admin_error
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| "admin diagnostics unavailable".to_owned()),
+            ),
+        };
+    };
+    let Some(feature_rollouts) = payload.get("feature_rollouts").and_then(Value::as_object) else {
+        return DoctorFeatureRolloutsSnapshot {
+            fetched: false,
+            flag_count: 0,
+            enabled_flags: 0,
+            inactive_flags: 0,
+            maturity_counts: BTreeMap::new(),
+            inactive: Vec::new(),
+            migration_note: None,
+            error: Some("admin status payload did not include feature_rollouts".to_owned()),
+        };
+    };
+
+    let mut maturity_counts = BTreeMap::new();
+    let mut enabled_flags = 0_usize;
+    let mut inactive = Vec::new();
+    for (flag, entry) in feature_rollouts {
+        let enabled = entry.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let maturity =
+            entry.get("maturity").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        *maturity_counts.entry(maturity.clone()).or_insert(0_usize) += 1;
+        if enabled {
+            enabled_flags = enabled_flags.saturating_add(1);
+        } else {
+            inactive.push(DoctorInactiveFeatureRolloutSnapshot {
+                flag: flag.clone(),
+                maturity,
+                owner_component: entry
+                    .get("owner_component")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                public_api_exposure: entry
+                    .get("public_api_exposure")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                activation_blockers: json_string_array_field(entry, "activation_blockers"),
+                required_tests: json_string_array_field(entry, "required_tests"),
+            });
+        }
+    }
+    inactive.sort_by(|left, right| left.flag.cmp(&right.flag));
+    let migration_note = payload
+        .pointer("/feature_rollout_maturity/migration_note")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    DoctorFeatureRolloutsSnapshot {
+        fetched: true,
+        flag_count: feature_rollouts.len(),
+        enabled_flags,
+        inactive_flags: inactive.len(),
+        maturity_counts,
+        inactive,
+        migration_note,
+        error: admin_error.map(ToOwned::to_owned),
+    }
+}
+
+fn json_string_array_field(entry: &Value, field: &str) -> Vec<String> {
+    entry
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn doctor_browser_diagnostics_unavailable_message(admin_error: Option<&str>) -> String {
@@ -11983,6 +12076,7 @@ struct DoctorReport {
     connectivity: DoctorConnectivitySnapshot,
     provider_auth: DoctorProviderAuthSnapshot,
     browser: DoctorBrowserSnapshot,
+    feature_rollouts: DoctorFeatureRolloutsSnapshot,
     access: DoctorAccessSnapshot,
     skills: SkillsInventorySnapshot,
     sandbox: DoctorSandboxSnapshot,
@@ -12087,6 +12181,30 @@ struct DoctorBrowserPortDiagnostic {
     bind_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     bind_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorFeatureRolloutsSnapshot {
+    fetched: bool,
+    flag_count: usize,
+    enabled_flags: usize,
+    inactive_flags: usize,
+    maturity_counts: BTreeMap<String, usize>,
+    inactive: Vec<DoctorInactiveFeatureRolloutSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorInactiveFeatureRolloutSnapshot {
+    flag: String,
+    maturity: String,
+    owner_component: String,
+    public_api_exposure: String,
+    activation_blockers: Vec<String>,
+    required_tests: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -14142,9 +14260,9 @@ mod diagnostics_bundle_tests {
         unavailable_support_bundle_channel_delivery, unavailable_support_bundle_queue_state,
         unavailable_support_bundle_recall_artifacts, DoctorAccessSnapshot, DoctorBrowserSnapshot,
         DoctorConfigSnapshot, DoctorConnectivityProbe, DoctorConnectivitySnapshot,
-        DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorIdentitySnapshot,
-        DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot, DoctorSummary,
-        SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
+        DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorFeatureRolloutsSnapshot,
+        DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
+        DoctorSummary, SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
         SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
@@ -14218,6 +14336,16 @@ mod diagnostics_bundle_tests {
                 active_sessions: Some(1),
                 recent_relay_action_failures: Some(0),
                 recent_health_failures: Some(0),
+                error: None,
+            },
+            feature_rollouts: DoctorFeatureRolloutsSnapshot {
+                fetched: true,
+                flag_count: 0,
+                enabled_flags: 0,
+                inactive_flags: 0,
+                maturity_counts: BTreeMap::new(),
+                inactive: Vec::new(),
+                migration_note: None,
                 error: None,
             },
             access: DoctorAccessSnapshot {
