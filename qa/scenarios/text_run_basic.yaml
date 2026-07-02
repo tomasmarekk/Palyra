@@ -1,0 +1,45 @@
+schema_version: 1
+id: text.run.basic
+title: Basic deterministic text run
+area: text
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+  tools: []
+  fixtures: []
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Reply with exactly one short friendly sentence."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "friendly"
+  events:
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - secret.exposed
+  artifacts: []
+artifacts:
+  - path: qa/reports/text_run_basic.json
+    kind: report
+    required: true
+maturity:
+  labels:
+    - p0
+    - deterministic
+    - text_only
+timeout:
+  run_ms: 30000
+  step_ms: 10000

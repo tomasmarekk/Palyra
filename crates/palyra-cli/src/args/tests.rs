@@ -22,12 +22,12 @@ use super::{
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
     PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg, ProfileModeArg,
-    ProfileRiskLevelArg, ProtocolCommand, RemoteVerificationModeArg, RequiredCommandIdArg,
-    ResetCommand, ResetScopeArg, RoutineApprovalModeArg, RoutineDeliveryModeArg,
-    RoutineExecutionPostureArg, RoutinePreviewTimezoneArg, RoutineRunModeArg,
-    RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand, RoutinesCommand,
-    SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand, SecurityCommand,
-    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    ProfileRiskLevelArg, ProtocolCommand, QaCommand, RemoteVerificationModeArg,
+    RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
+    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
+    RoutinesCommand, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
     SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
     SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
     WizardOverridesArg, WorkersCommand, WorkspaceRoleArg,
@@ -40,6 +40,27 @@ mod parser_stability_tests;
 fn parse_version_subcommand() {
     let parsed = Cli::parse_from(["palyra", "version"]);
     assert_eq!(parsed.command, Command::Version);
+}
+
+#[test]
+fn parse_qa_validate_with_path_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "qa",
+        "validate",
+        "--path",
+        "qa/scenarios/text_run_basic.yaml",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Qa {
+            command: QaCommand::Validate {
+                path: "qa/scenarios/text_run_basic.yaml".to_owned(),
+                json: true,
+            }
+        }
+    );
 }
 
 #[test]

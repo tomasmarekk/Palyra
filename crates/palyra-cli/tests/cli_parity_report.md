@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `114`
-- Verified entries: `114`
+- Total entries: `153`
+- Verified entries: `153`
 - Regression entries: `0`
-- Help snapshot coverage: `114` entries
+- Help snapshot coverage: `153` entries
 
 ### Expected parity status counts
 
-- `done`: `110`
+- `done`: `149`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `114`
+- `verified`: `153`
 
 ## Entries
 
@@ -40,10 +40,15 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `cron` | `top_level` | `done` | `verified` | `cron-help.txt` | - | - | - |
 | `routines` | `top_level` | `done` | `verified` | `routines-help.txt` | - | - | - |
 | `objectives` | `top_level` | `done` | `verified` | `objectives-help.txt` | - | - | - |
+| `flows` | `top_level` | `done` | `verified` | `flows-help.txt` | - | - | - |
+| `tasks` | `top_level` | `done` | `verified` | `tasks-help.txt` | - | - | - |
+| `tasks workboard` | `nested_surface` | `done` | `verified` | `tasks-workboard-help.txt` | - | - | - |
+| `commitments` | `top_level` | `done` | `verified` | `commitments-help.txt` | - | - | - |
 | `memory` | `top_level` | `done` | `verified` | `memory-help.txt` | - | - | - |
 | `memory learning` | `nested_surface` | `done` | `verified` | `memory-learning-help.txt` | - | - | - |
 | `memory learning list` | `nested_surface` | `done` | `verified` | `memory-learning-list-help.txt` | - | - | - |
 | `memory learning review` | `nested_surface` | `done` | `verified` | `memory-learning-review-help.txt` | - | - | - |
+| `memory learning apply` | `nested_surface` | `done` | `verified` | `memory-learning-apply-help.txt` | - | - | - |
 | `memory learning promote-procedure` | `nested_surface` | `done` | `verified` | `memory-learning-promote-procedure-help.txt` | - | - | - |
 | `message` | `top_level` | `done` | `verified` | `message-help.txt` | - | - | - |
 | `message read` | `nested_surface` | `done` | `verified` | `message-read-help.txt` | - | `--conversation-id`, `--message-id`, `--before-message-id`, `--after-message-id`, `--around-message-id`, `--limit` | - |
@@ -65,7 +70,14 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `node` | `top_level` | `done` | `verified` | `node-help.txt` | - | - | - |
 | `nodes` | `top_level` | `done` | `verified` | `nodes-help.txt` | - | - | - |
 | `browser` | `canonical_family` | `done` | `verified` | `browser-help.txt` | - | - | - |
+| `browser open` | `nested_surface` | `done` | `verified` | `browser-open-help.txt` | - | `--url`, `--principal`, `--channel`, `--allow-private-targets`, `--allow-downloads`, `--profile-id`, `--private-profile`, `--timeout-ms` | - |
 | `system` | `canonical_family` | `done` | `verified` | `system-help.txt` | - | - | - |
+| `state` | `canonical_family` | `done` | `verified` | `state-help.txt` | - | - | - |
+| `state doctor` | `nested_surface` | `done` | `verified` | `state-doctor-help.txt` | - | `--db-path`, `--fast-window`, `--full`, `--json` | - |
+| `state verify-hash-chain` | `nested_surface` | `done` | `verified` | `state-verify-hash-chain-help.txt` | - | `--db-path`, `--full`, `--limit`, `--json` | - |
+| `state repair` | `nested_surface` | `done` | `verified` | `state-repair-help.txt` | - | `--db-path`, `--dry-run`, `--fts-only`, `--actor-principal`, `--json` | - |
+| `state checkpoint` | `nested_surface` | `done` | `verified` | `state-checkpoint-help.txt` | - | `--db-path`, `--mode`, `--json` | - |
+| `state sidecars-prepare` | `nested_surface` | `done` | `verified` | `state-sidecars-prepare-help.txt` | - | `--db-path`, `--json` | - |
 | `sandbox` | `canonical_family` | `done` | `verified` | `sandbox-help.txt` | - | - | - |
 | `completion` | `top_level` | `done` | `verified` | `completion-help.txt` | - | `--shell` | - |
 | `onboarding` | `canonical_family` | `done` | `verified` | `onboarding-help.txt` | `onboard` | - | - |
@@ -79,9 +91,18 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `support-bundle` | `top_level` | `done` | `verified` | `support-bundle-help.txt` | - | - | - |
 | `policy` | `top_level` | `done` | `verified` | `policy-help.txt` | - | - | - |
 | `protocol` | `top_level` | `done` | `verified` | `protocol-help.txt` | - | - | - |
+| `eval` | `top_level` | `done` | `verified` | `eval-help.txt` | - | - | - |
+| `eval bundle` | `nested_surface` | `done` | `verified` | `eval-bundle-help.txt` | - | - | - |
+| `eval bundle create` | `nested_surface` | `done` | `verified` | `eval-bundle-create-help.txt` | - | `--name`, `--output`, `--run-id`, `--run-export`, `--replay-bundle`, `--scenario-manifest`, `--memory-fixture`, `--journal-db`, `--max-events`, `--fake-provider`, `--json` | - |
+| `qa` | `top_level` | `done` | `verified` | `qa-help.txt` | - | - | - |
+| `qa validate` | `nested_surface` | `done` | `verified` | `qa-validate-help.txt` | - | `--path`, `--json` | - |
 | `config` | `top_level` | `done` | `verified` | `config-help.txt` | - | - | - |
 | `models` | `top_level` | `done` | `verified` | `models-help.txt` | - | - | - |
 | `patch` | `top_level` | `done` | `verified` | `patch-help.txt` | - | - | - |
+| `patch bundles` | `nested_surface` | `done` | `verified` | `patch-bundles-help.txt` | - | - | - |
+| `workers` | `canonical_family` | `done` | `verified` | `workers-help.txt` | - | - | - |
+| `run` | `top_level` | `done` | `verified` | `run-help.txt` | - | - | - |
+| `run export` | `nested_surface` | `done` | `verified` | `run-export-help.txt` | - | `--run-id`, `--output`, `--format`, `--redacted`, `--journal-db`, `--max-events` | - |
 | `skills` | `top_level` | `done` | `verified` | `skills-help.txt` | `skill` | - | - |
 | `secrets` | `top_level` | `done` | `verified` | `secrets-help.txt` | - | - | - |
 | `security` | `top_level` | `done` | `verified` | `security-help.txt` | - | - | - |
@@ -94,6 +115,11 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `auth openai` | `nested_surface` | `done` | `verified` | `auth-openai-help.txt` | - | - | - |
 | `auth openai api-key` | `nested_surface` | `done` | `verified` | `auth-openai-api-key-help.txt` | - | `--profile-id`, `--api-key-stdin`, `--api-key-prompt`, `--set-default` | - |
 | `auth profiles list` | `nested_surface` | `done` | `verified` | `auth-profiles-list-help.txt` | - | - | - |
+| `auth profiles doctor` | `nested_surface` | `done` | `verified` | `auth-profiles-doctor-help.txt` | - | `--agent-id`, `--json` | - |
+| `auth profiles audit` | `nested_surface` | `done` | `verified` | `auth-profiles-audit-help.txt` | - | `--agent-id`, `--provider`, `--provider-name`, `--json` | - |
+| `auth profiles cooldown-clear` | `nested_surface` | `done` | `verified` | `auth-profiles-cooldown-clear-help.txt` | - | `--json` | - |
+| `auth profiles order-set` | `nested_surface` | `done` | `verified` | `auth-profiles-order-set-help.txt` | - | `--provider`, `--provider-name`, `--agent-id`, `--json` | - |
+| `auth profiles explain-selection` | `nested_surface` | `done` | `verified` | `auth-profiles-explain-selection-help.txt` | - | `--provider`, `--provider-name`, `--agent-id`, `--profile-id`, `--credential`, `--policy-denied-profile-id`, `--json` | - |
 | `browser session` | `nested_surface` | `done` | `verified` | `browser-session-help.txt` | - | - | - |
 | `browser session create` | `nested_surface` | `done` | `verified` | `browser-session-create-help.txt` | - | `--allow-private-targets`, `--allow-downloads`, `--allow-domain`, `--persistence-enabled` | - |
 | `browser profiles` | `nested_surface` | `done` | `verified` | `browser-profiles-help.txt` | - | - | - |
@@ -103,7 +129,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `browser navigate` | `nested_surface` | `done` | `verified` | `browser-navigate-help.txt` | - | `--url`, `--timeout-ms`, `--allow-redirects`, `--allow-private-targets` | - |
 | `browser upload` | `nested_surface` | `done` | `verified` | `browser-upload-help.txt` | - | `--selector`, `--file`, `--timeout-ms`, `--output`, `--json` | - |
 | `browser downloads` | `nested_surface` | `done` | `verified` | `browser-downloads-help.txt` | - | `--artifact-id`, `--output`, `--max-bytes`, `--limit`, `--quarantined-only`, `--json` | - |
-| `browser snapshot` | `nested_surface` | `done` | `verified` | `browser-snapshot-help.txt` | - | `--include-dom-snapshot`, `--include-visible-text`, `--output` | - |
+| `browser snapshot` | `nested_surface` | `done` | `verified` | `browser-snapshot-help.txt` | - | `--include-dom-snapshot`, `--include-visible-text`, `--output`, `--json` | - |
 | `browser trace` | `nested_surface` | `done` | `verified` | `browser-trace-help.txt` | - | `--output` | - |
 | `channels discord` | `nested_surface` | `done` | `verified` | `channels-discord-help.txt` | - | - | - |
 | `channels discord setup` | `nested_surface` | `done` | `verified` | `channels-discord-setup-help.txt` | - | `--account-id`, `--verify-channel-id`, `--json` | - |
@@ -125,14 +151,25 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `routines import` | `nested_surface` | `done` | `verified` | `routines-import-help.txt` | - | - | - |
 | `routines logs` | `nested_surface` | `done` | `verified` | `routines-logs-help.txt` | `runs` | `--id`, `--limit` | - |
 | `routines delete` | `nested_surface` | `done` | `verified` | `routines-delete-help.txt` | `rm` | `--id` | - |
+| `objectives upsert` | `nested_surface` | `done` | `verified` | `objectives-upsert-help.txt` | `apply` | `--kind`, `--name`, `--prompt` | - |
 | `hooks bind` | `nested_surface` | `done` | `verified` | `hooks-bind-help.txt` | `install` | `--event`, `--plugin-id`, `--disabled` | - |
 | `memory index` | `nested_surface` | `done` | `verified` | `memory-index-help.txt` | `reindex` | `--batch-size`, `--until-complete`, `--run-maintenance` | - |
-| `plugins install` | `nested_surface` | `done` | `verified` | `plugins-install-help.txt` | `bind` | `--artifact`, `--allow-tofu`, `--allow-untrusted` | - |
+| `plugins install` | `nested_surface` | `done` | `verified` | `plugins-install-help.txt` | `bind` | `--artifact`, `--config-json`, `--config-json-file`, `--config-json-stdin`, `--clear-config`, `--allow-tofu`, `--allow-untrusted`, `--json` | - |
+| `plugins inspect` | `nested_surface` | `done` | `verified` | `plugins-inspect-help.txt` | `info` | `--json` | - |
+| `plugins discover` | `nested_surface` | `done` | `verified` | `plugins-discover-help.txt` | - | `--plugin-id`, `--skill-id`, `--enabled-only`, `--ready-only`, `--json` | - |
+| `plugins explain` | `nested_surface` | `done` | `verified` | `plugins-explain-help.txt` | - | `--json` | - |
+| `plugins doctor` | `nested_surface` | `done` | `verified` | `plugins-doctor-help.txt` | - | `--plugin-id`, `--json` | - |
+| `plugins update` | `nested_surface` | `done` | `verified` | `plugins-update-help.txt` | - | `--artifact`, `--config-json`, `--config-json-file`, `--config-json-stdin`, `--clear-config`, `--allow-tofu`, `--allow-untrusted`, `--json` | - |
 | `sessions show` | `nested_surface` | `done` | `verified` | `sessions-show-help.txt` | `resume` | `--session-id`, `--session-key`, `--json` | - |
 | `skills package` | `nested_surface` | `done` | `verified` | `skills-package-help.txt` | - | - | - |
 | `skills package build` | `nested_surface` | `done` | `verified` | `skills-package-build-help.txt` | - | `--manifest`, `--sbom`, `--provenance`, `--output` | - |
 | `support-bundle export` | `nested_surface` | `done` | `verified` | `support-bundle-export-help.txt` | - | `--output`, `--max-bytes`, `--journal-hash-limit`, `--error-limit` | - |
+| `support-bundle replay-export` | `nested_surface` | `done` | `verified` | `support-bundle-replay-export-help.txt` | - | `--run-id`, `--output`, `--journal-db`, `--max-events` | - |
+| `support-bundle replay-import` | `nested_surface` | `done` | `verified` | `support-bundle-replay-import-help.txt` | - | `--input`, `--output-dir` | - |
+| `support-bundle replay-run` | `nested_surface` | `done` | `verified` | `support-bundle-replay-run-help.txt` | - | `--input`, `--diff-output` | - |
+| `support-bundle replay-baseline` | `nested_surface` | `done` | `verified` | `support-bundle-replay-baseline-help.txt` | - | `--input`, `--output` | - |
 | `system event` | `nested_surface` | `done` | `verified` | `system-event-help.txt` | `events` | - | - |
+| `system insights` | `nested_surface` | `done` | `verified` | `system-insights-help.txt` | - | `--json` | - |
 | `node install` | `nested_surface` | `done` | `verified` | `node-install-help.txt` | - | - | - |
 | `nodes invoke` | `nested_surface` | `done` | `verified` | `nodes-invoke-help.txt` | - | - | - |
 | `onboarding wizard` | `nested_surface` | `done` | `verified` | `onboarding-wizard-help.txt` | - | `--flow`, `--non-interactive`, `--accept-risk` | - |

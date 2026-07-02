@@ -43,6 +43,7 @@ pub mod plugins;
 pub mod policy;
 pub mod profile;
 pub mod protocol;
+pub mod qa;
 pub mod reset;
 pub mod routines;
 pub mod run;

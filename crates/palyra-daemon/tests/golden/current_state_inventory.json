@@ -8816,6 +8816,7 @@
     "policy",
     "profile",
     "protocol",
+    "qa",
     "reset",
     "routines",
     "run",
@@ -8996,7 +8997,7 @@
     ],
     "surface_counts": {
       "capability_catalog_entries": 32,
-      "cli_families": 59,
+      "cli_families": 60,
       "compat_routes": 15,
       "registered_compat_routes": 15,
       "diagnostics_sections": 44,

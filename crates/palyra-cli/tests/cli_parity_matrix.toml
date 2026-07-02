@@ -736,6 +736,27 @@ path = "eval bundle create"
 file = "eval-bundle-create-help.txt"
 
 [[entries]]
+path = "qa"
+category = "top_level"
+status = "done"
+summary = "QA Lab scenario manifest validation surface."
+
+[entries.snapshot]
+path = "qa"
+file = "qa-help.txt"
+
+[[entries]]
+path = "qa validate"
+category = "nested_surface"
+status = "done"
+summary = "Validate QA Lab scenario manifests before runner or replay tooling consumes them."
+required_flags = ["path", "json"]
+
+[entries.snapshot]
+path = "qa validate"
+file = "qa-validate-help.txt"
+
+[[entries]]
 path = "config"
 category = "top_level"
 status = "done"

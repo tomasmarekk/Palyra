@@ -1,0 +1,58 @@
+{
+  "areas": [
+    "text",
+    "tools",
+    "approvals",
+    "memory",
+    "browser",
+    "provider",
+    "workflow",
+    "security",
+    "replay"
+  ],
+  "artifact_kinds": [
+    "report",
+    "transcript",
+    "replay_bundle",
+    "trajectory",
+    "evidence"
+  ],
+  "encoding": "yaml",
+  "examples_root": "qa/scenarios",
+  "format": "palyra-qa-scenario",
+  "limits": {
+    "max_timeout_ms": 3600000
+  },
+  "path_convention": "jsonpath",
+  "provider_modes": [
+    "mock",
+    "recorded",
+    "live"
+  ],
+  "required_sections": [
+    "schema_version",
+    "id",
+    "area",
+    "mode",
+    "requires",
+    "steps",
+    "expect",
+    "forbidden",
+    "artifacts",
+    "maturity",
+    "timeout"
+  ],
+  "schema_version": 1,
+  "step_actions": [
+    "user_prompt",
+    "tool_result",
+    "approval_decision",
+    "wait_for_event"
+  ],
+  "terminal_states": [
+    "completed",
+    "failed",
+    "cancelled",
+    "approval_required"
+  ]
+}

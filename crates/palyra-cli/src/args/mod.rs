@@ -50,6 +50,7 @@ mod plugins;
 mod policy;
 mod profile;
 mod protocol;
+mod qa;
 mod reset;
 mod routines;
 mod run;
@@ -129,6 +130,7 @@ pub use plugins::PluginsCommand;
 pub use policy::PolicyCommand;
 pub use profile::{ProfileCommand, ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg};
 pub use protocol::ProtocolCommand;
+pub use qa::QaCommand;
 pub use reset::{ResetCommand, ResetScopeArg};
 pub use routines::{
     RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
@@ -191,6 +193,7 @@ Canonical command map:
   update     Package update/check orchestration surface
   onboarding Operator onboarding workflows (`onboard` stays as the shorthand alias)
   profile    First-class CLI profile lifecycle and environment selection
+  qa         QA Lab scenario manifest validation
   webhooks   Webhook-backed integration management surface";
 
 const SETUP_AFTER_HELP: &str = "\
@@ -266,6 +269,15 @@ Examples:
   palyra update --check
   palyra update --install-root ./install --archive ./artifacts/palyra-headless.zip --dry-run
   palyra update --install-root ./install --archive ./artifacts/palyra-headless.zip --yes --skip-service-restart";
+
+const QA_AFTER_HELP: &str = "\
+Examples:
+  palyra qa validate
+  palyra qa validate --path qa/scenarios/text_run_basic.yaml
+  palyra qa validate --path qa/scenarios --json
+
+Discoverability:
+  `qa validate` checks QA Lab scenario manifests before runner or replay tooling consumes them.";
 
 const DEPLOYMENT_AFTER_HELP: &str = "\
 Examples:
@@ -976,6 +988,14 @@ pub enum Command {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    #[command(
+        about = "Validate QA Lab scenario manifests",
+        after_long_help = QA_AFTER_HELP
+    )]
+    Qa {
+        #[command(subcommand)]
+        command: QaCommand,
     },
     #[command(about = "Inspect and validate local configuration")]
     Config {

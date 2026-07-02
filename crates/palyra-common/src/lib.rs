@@ -21,6 +21,7 @@ pub mod netguard;
 pub mod process_risk;
 pub mod process_runner_input;
 pub mod project_context;
+pub mod qa_scenarios;
 pub mod redaction;
 pub mod release_evals;
 pub mod replay_bundle;

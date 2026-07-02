@@ -84,6 +84,7 @@ wasmtime = { version = "46.0.1", default-features = false, features = ["cranelif
 webbrowser = "1.2.1"
 windows-sys = "0.61.2"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+yaml_serde = "0.10.4"
 zeroize = "1.8.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
