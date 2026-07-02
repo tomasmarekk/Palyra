@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, ToSocketAddrs},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result};
@@ -358,6 +359,8 @@ pub struct ModelProviderConfig {
     pub credential_source: Option<ModelProviderCredentialSource>,
     pub reasoning_effort: Option<ProviderReasoningEffort>,
     pub service_tier: Option<ProviderServiceTier>,
+    pub qa_mock_fixture_path: Option<PathBuf>,
+    pub qa_mock_fixture_enabled: bool,
     pub request_timeout_ms: u64,
     pub max_retries: u32,
     pub retry_backoff_ms: u64,
@@ -388,6 +391,8 @@ impl Default for ModelProviderConfig {
             credential_source: None,
             reasoning_effort: None,
             service_tier: None,
+            qa_mock_fixture_path: None,
+            qa_mock_fixture_enabled: false,
             request_timeout_ms: DEFAULT_MODEL_PROVIDER_REQUEST_TIMEOUT_MS,
             max_retries: 2,
             retry_backoff_ms: 150,
@@ -1116,7 +1121,22 @@ pub fn validate_model_provider_config(config: &ModelProviderConfig) -> Result<()
         }
         ModelProviderKind::Deterministic => {}
     }
-    let _ = config.normalized_registry()?;
+    let registry = config.normalized_registry()?;
+    if config.qa_mock_fixture_path.is_some() && !config.qa_mock_fixture_enabled {
+        anyhow::bail!(
+            "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
+        );
+    }
+    if config.qa_mock_fixture_path.is_some()
+        && !registry
+            .providers
+            .iter()
+            .any(|provider| provider.enabled && provider.kind == ModelProviderKind::Deterministic)
+    {
+        anyhow::bail!(
+            "model_provider.qa_mock_fixture_path requires an enabled deterministic model provider"
+        );
+    }
     Ok(())
 }
 

@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod error_envelope;
 pub mod errors;
 pub mod providers;
+pub mod qa_mock;
 pub mod snapshots;
 pub mod streaming;
 pub mod tool_repair;
@@ -79,6 +80,16 @@ pub use providers::{
     XAI_GROK_OAUTH_BASE_URL, XAI_OAUTH_CALLBACK_CORS_ORIGIN_ALLOWLIST, XAI_OAUTH_CALLBACK_HOST,
     XAI_OAUTH_CALLBACK_PATH, XAI_OAUTH_CALLBACK_PORT, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_DISCOVERY_URL,
     XAI_OAUTH_ISSUER, XAI_OAUTH_REDIRECT_URI, XAI_OAUTH_SCOPE,
+};
+pub use qa_mock::{
+    parse_qa_mock_provider_fixture_yaml, qa_mock_provider_events_for_turn,
+    qa_mock_provider_fixture_schema_snapshot, qa_mock_provider_output_for_turn,
+    qa_mock_provider_stream_events_for_turn, qa_mock_provider_turn_for_request,
+    QaMockProviderBehavior, QaMockProviderBehaviorKind, QaMockProviderFixture,
+    QaMockProviderFixtureError, QaMockProviderFixtureIssue, QaMockProviderIssueSeverity,
+    QaMockProviderToolCall, QaMockProviderTurn, QaMockProviderTurnMatcher,
+    QaMockProviderValidationError, QA_MOCK_PROVIDER_FIXTURE_FORMAT,
+    QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
 };
 pub use redaction::sanitize_remote_error;
 pub use snapshots::{

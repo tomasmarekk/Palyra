@@ -3203,6 +3203,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "ulid",
+ "yaml_serde",
 ]
 
 [[package]]

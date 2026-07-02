@@ -1,0 +1,31 @@
+{
+  "behavior_kinds": [
+    "text",
+    "tool_calls",
+    "empty",
+    "context_overflow",
+    "malformed_output",
+    "malformed_tool_args",
+    "stream_error",
+    "approval_required"
+  ],
+  "encoding": "yaml",
+  "examples_root": "qa/fixtures",
+  "finish_reasons": [
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "cancelled",
+    "error",
+    "unknown"
+  ],
+  "format": "palyra-qa-mock-provider-fixture",
+  "path_convention": "jsonpath",
+  "required_sections": [
+    "schema_version",
+    "id",
+    "turns"
+  ],
+  "schema_version": 1
+}

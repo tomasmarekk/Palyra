@@ -793,6 +793,12 @@ pub fn load_config() -> Result<LoadedConfig> {
                     "model_provider.service_tier",
                 )?);
             }
+            if let Some(qa_mock_fixture_path) = file_model_provider.qa_mock_fixture_path {
+                model_provider.qa_mock_fixture_path = parse_optional_qa_mock_fixture_path(
+                    qa_mock_fixture_path.as_str(),
+                    "model_provider.qa_mock_fixture_path",
+                )?;
+            }
             if let Some(request_timeout_ms) = file_model_provider.request_timeout_ms {
                 model_provider.request_timeout_ms =
                     parse_positive_u64(request_timeout_ms, "model_provider.request_timeout_ms")?;
@@ -1697,6 +1703,14 @@ pub fn load_config() -> Result<LoadedConfig> {
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_KIND)");
     }
 
+    if let Ok(qa_mock_fixture_path) = env::var("PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH") {
+        model_provider.qa_mock_fixture_path = parse_optional_qa_mock_fixture_path(
+            qa_mock_fixture_path.as_str(),
+            "PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH",
+        )?;
+        source.push_str(" +env(PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH)");
+    }
+
     if let Ok(openai_base_url) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL") {
         model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL)");
@@ -2423,6 +2437,12 @@ pub fn load_config() -> Result<LoadedConfig> {
         && model_provider.auth_profile_provider_kind.is_none()
     {
         model_provider.auth_profile_provider_kind = Some(ModelProviderAuthProviderKind::Openai);
+    }
+    model_provider.qa_mock_fixture_enabled = qa_lab.mode == RuntimePreviewMode::PreviewOnly;
+    if model_provider.qa_mock_fixture_path.is_some() && !model_provider.qa_mock_fixture_enabled {
+        anyhow::bail!(
+            "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
+        );
     }
     if model_provider.kind == ModelProviderKind::OpenAiCompatible {
         validate_openai_base_url_network_policy(
@@ -3926,6 +3946,17 @@ fn parse_openai_embeddings_dims(raw: u32, source_name: &str) -> Result<u32> {
     parse_positive_u32(raw, source_name)
 }
 
+fn parse_optional_qa_mock_fixture_path(raw: &str, source_name: &str) -> Result<Option<PathBuf>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("{source_name} cannot contain embedded NUL byte");
+    }
+    Ok(Some(PathBuf::from(trimmed)))
+}
+
 fn push_unique_string(values: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
     if seen.insert(value.clone()) {
         values.push(value);
@@ -4706,7 +4737,7 @@ fn parse_retries(value: u32, name: &str) -> Result<u32> {
 mod tests {
     use std::{
         ffi::OsString,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Mutex, OnceLock},
     };
 
@@ -5874,6 +5905,79 @@ mod tests {
         );
         assert_eq!(config.request_timeout_ms, 180_000);
         assert_eq!(config.max_retries, 2);
+        assert!(config.qa_mock_fixture_path.is_none());
+        assert!(
+            !config.qa_mock_fixture_enabled,
+            "QA mock-provider fixtures must be disabled unless QA Lab preview is explicit"
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_qa_mock_fixture_without_qa_lab_preview() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[model_provider]
+qa_mock_fixture_path = "qa/fixtures/provider_basic.yaml"
+"#,
+        )
+        .expect("QA mock fixture config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _qa_lab_mode = ScopedEnvVar::unset("PALYRA_QA_LAB_MODE");
+        let _qa_fixture = ScopedEnvVar::unset("PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH");
+
+        let error = super::load_config()
+            .expect_err("QA mock fixture path must require QA Lab preview mode");
+
+        assert!(
+            error.to_string().contains("qa_lab.mode=preview_only"),
+            "error should name the required gate: {error}"
+        );
+    }
+
+    #[test]
+    fn load_config_accepts_qa_mock_fixture_with_qa_lab_preview() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[qa_lab]
+mode = "preview_only"
+
+[model_provider]
+qa_mock_fixture_path = "qa/fixtures/provider_basic.yaml"
+"#,
+        )
+        .expect("QA mock fixture config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _qa_lab_mode = ScopedEnvVar::unset("PALYRA_QA_LAB_MODE");
+        let _qa_fixture = ScopedEnvVar::unset("PALYRA_QA_MOCK_PROVIDER_FIXTURE_PATH");
+
+        let loaded = super::load_config()
+            .expect("QA mock fixture path should load with QA Lab preview mode");
+
+        assert!(loaded.model_provider.qa_mock_fixture_enabled);
+        assert_eq!(
+            loaded.model_provider.qa_mock_fixture_path.as_deref(),
+            Some(Path::new("qa/fixtures/provider_basic.yaml"))
+        );
     }
 
     #[test]
@@ -6506,6 +6610,22 @@ state_dir = "browserd-state"
         .expect("model provider private-base-url opt-in should parse");
         let model_provider = parsed.model_provider.expect("model_provider section should exist");
         assert_eq!(model_provider.allow_private_base_url, Some(true));
+    }
+
+    #[test]
+    fn model_provider_config_parses_qa_mock_fixture_path() {
+        let (parsed, _) = parse_root_file_config(
+            r#"
+            [model_provider]
+            qa_mock_fixture_path = "qa/fixtures/provider_basic.yaml"
+            "#,
+        )
+        .expect("model provider QA mock fixture path should parse");
+        let model_provider = parsed.model_provider.expect("model_provider section should exist");
+        assert_eq!(
+            model_provider.qa_mock_fixture_path.as_deref(),
+            Some("qa/fixtures/provider_basic.yaml")
+        );
     }
 
     #[test]

@@ -1,0 +1,59 @@
+schema_version: 1
+id: qa.mock.provider.basic
+turns:
+  - id: text_stream
+    match:
+      prompt_contains:
+        - friendly deterministic answer
+    behavior:
+      kind: text
+      deltas:
+        - "This is a "
+        - "friendly deterministic answer."
+      finish_reason: stop
+      prompt_tokens: 5
+      completion_tokens: 5
+  - id: approval_tool_call
+    match:
+      prompt_contains:
+        - approval tool call
+    behavior:
+      kind: approval_required
+      text: "I need to inspect a fixture before continuing."
+      tool_calls:
+        - proposal_id: qa-approval-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: qa/fixtures/provider_basic.yaml
+            max_bytes: 4096
+      prompt_tokens: 6
+      completion_tokens: 12
+  - id: after_tool_result
+    match:
+      tool_result_call_id: qa-approval-read
+    behavior:
+      kind: text
+      text: "The fixture read-back completed and the QA provider turn is done."
+      prompt_tokens: 8
+      completion_tokens: 11
+  - id: malformed_tool_args
+    match:
+      prompt_contains:
+        - malformed tool args
+    behavior:
+      kind: malformed_tool_args
+      error_message: "fixture emitted malformed tool arguments"
+  - id: context_overflow
+    match:
+      prompt_contains:
+        - context overflow
+    behavior:
+      kind: context_overflow
+      error_message: "fixture exceeded the provider context window"
+  - id: stream_error
+    match:
+      prompt_contains:
+        - stream error
+    behavior:
+      kind: stream_error
+      error_message: "fixture stream terminated before completion"

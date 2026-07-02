@@ -18,6 +18,7 @@
 //! response-body based.
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
+    fs,
     future::Future,
     hash::{Hash, Hasher},
     pin::Pin,
@@ -41,6 +42,7 @@ use adapters::{
     openai_responses_tool_wire_name_map, AnthropicCompatibleChatAdapter,
     OpenAiCompatibleChatAdapter, OpenAiResponsesChatAdapter, ProviderChatAdapter,
 };
+use palyra_model_providers::parse_qa_mock_provider_fixture_yaml;
 #[cfg(test)]
 pub(crate) use palyra_model_providers::MAX_TOOL_ARGUMENT_BYTES;
 pub(crate) use palyra_model_providers::{
@@ -63,7 +65,8 @@ use palyra_model_providers::{
     classify_http_provider_failure, classify_reqwest_provider_failure,
     fail_closed_provider_classification, failover_provider_classification,
     invalid_response_classification, provider_output_from_text_and_tools,
-    provider_request_has_vision, retry_provider_classification,
+    provider_request_has_vision, qa_mock_provider_output_for_turn,
+    qa_mock_provider_turn_for_request, retry_provider_classification,
     retryable_invalid_response_classification, user_action_provider_classification,
     ANTHROPIC_API_VERSION, OPENAI_CODEX_BACKEND_BASE_URL as OPENAI_CODEX_RESPONSES_BASE_URL,
 };
@@ -92,7 +95,7 @@ pub use palyra_model_providers::{
     ProviderHealthProbeSnapshot, ProviderRegistryCredentialSnapshot, ProviderRegistryModelSnapshot,
     ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
     ProviderRetryPolicySnapshot, ProviderRouteCandidateTrace, ProviderRouteSelectionTrace,
-    ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
+    ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot, QaMockProviderFixture,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -1748,6 +1751,8 @@ fn build_registry_provider_runtime(
         credential_source: entry.credential_source.or(base_config.credential_source),
         reasoning_effort: base_config.reasoning_effort,
         service_tier: base_config.service_tier,
+        qa_mock_fixture_path: base_config.qa_mock_fixture_path.clone(),
+        qa_mock_fixture_enabled: base_config.qa_mock_fixture_enabled,
         request_timeout_ms: entry.request_timeout_ms,
         max_retries: entry.max_retries,
         retry_backoff_ms: entry.retry_backoff_ms,
@@ -1757,7 +1762,7 @@ fn build_registry_provider_runtime(
     };
     match entry.kind {
         ModelProviderKind::Deterministic => {
-            Ok(Arc::new(DeterministicProvider::new(config)) as Arc<dyn ModelProvider>)
+            Ok(Arc::new(DeterministicProvider::new(config)?) as Arc<dyn ModelProvider>)
         }
         ModelProviderKind::OpenAiCompatible => {
             config.openai_api_key = entry.api_key.clone().or_else(|| {
@@ -1815,12 +1820,18 @@ fn build_registry_provider_runtime(
 #[derive(Debug)]
 struct DeterministicProvider {
     config: ModelProviderConfig,
+    qa_mock_fixture: Option<QaMockProviderFixture>,
     runtime_metrics: Mutex<ProviderRuntimeMetrics>,
 }
 
 impl DeterministicProvider {
-    fn new(config: ModelProviderConfig) -> Self {
-        Self { config, runtime_metrics: Mutex::new(ProviderRuntimeMetrics::default()) }
+    fn new(config: ModelProviderConfig) -> Result<Self> {
+        let qa_mock_fixture = load_qa_mock_provider_fixture(&config)?;
+        Ok(Self {
+            config,
+            qa_mock_fixture,
+            runtime_metrics: Mutex::new(ProviderRuntimeMetrics::default()),
+        })
     }
 
     fn record_runtime_metrics(
@@ -1839,6 +1850,24 @@ impl DeterministicProvider {
     fn runtime_metrics_snapshot(&self) -> ProviderRuntimeMetricsSnapshot {
         lock_runtime_metrics(&self.runtime_metrics).snapshot()
     }
+}
+
+fn load_qa_mock_provider_fixture(
+    config: &ModelProviderConfig,
+) -> Result<Option<QaMockProviderFixture>> {
+    let Some(path) = config.qa_mock_fixture_path.as_deref() else {
+        return Ok(None);
+    };
+    if !config.qa_mock_fixture_enabled {
+        anyhow::bail!(
+            "model_provider.qa_mock_fixture_path requires qa_lab.mode=preview_only or PALYRA_QA_LAB_MODE=preview_only"
+        );
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read QA mock-provider fixture {}", path.display()))?;
+    parse_qa_mock_provider_fixture_yaml(text.as_str())
+        .with_context(|| format!("failed to parse QA mock-provider fixture {}", path.display()))
+        .map(Some)
 }
 
 // Scripted three-turn tool-call fixture for offline regression: turn 1
@@ -2051,7 +2080,48 @@ impl ModelProvider for DeterministicProvider {
             }
 
             let prompt_tokens = estimate_token_count(request.input_text.as_str());
-            let output =
+            let output = if let Some(fixture) = self.qa_mock_fixture.as_ref() {
+                let Some(turn) = qa_mock_provider_turn_for_request(fixture, &request) else {
+                    let error = ProviderError::RequestFailed {
+                        message: format!(
+                            "QA mock-provider fixture '{}' has no turn matching the request",
+                            fixture.id
+                        ),
+                        retryable: false,
+                        retry_count: 0,
+                        classification: fail_closed_provider_classification(
+                            "qa_mock_fixture_no_matching_turn",
+                        ),
+                    };
+                    self.record_runtime_metrics(
+                        true,
+                        prompt_tokens,
+                        0,
+                        0,
+                        elapsed_millis_since(started_at),
+                        Some(error.failure_snapshot()),
+                    );
+                    return Err(error);
+                };
+                match qa_mock_provider_output_for_turn(
+                    turn,
+                    &request,
+                    request.model_override.clone(),
+                ) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        self.record_runtime_metrics(
+                            true,
+                            prompt_tokens,
+                            0,
+                            error.retry_count(),
+                            elapsed_millis_since(started_at),
+                            Some(error.failure_snapshot()),
+                        );
+                        return Err(error);
+                    }
+                }
+            } else {
                 deterministic_tool_fixture_output(&request, prompt_tokens).unwrap_or_else(|| {
                     let completion_source = if request.json_mode {
                         r#"{"ack":"ok"}"#.to_owned()
@@ -2075,7 +2145,9 @@ impl ModelProvider for DeterministicProvider {
                         request.model_override.clone(),
                         "deterministic",
                     )
-                });
+                })
+            };
+            let prompt_tokens = output.usage.prompt_tokens;
             let completion_tokens = output.usage.completion_tokens;
             let events = provider_events_from_output(&output);
             let actual_model_id =
@@ -4835,6 +4907,7 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream},
+        path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -4864,6 +4937,19 @@ mod tests {
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use palyra_model_providers::classify_transport_provider_failure;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("daemon crate should have workspace crates parent")
+            .parent()
+            .expect("workspace crates directory should have repository parent")
+            .to_path_buf()
+    }
+
+    fn qa_mock_fixture_path() -> PathBuf {
+        repo_root().join("qa").join("fixtures").join("provider_basic.yaml")
+    }
 
     #[test]
     fn provider_seconds_to_millis_preserves_subsecond_precision() {
@@ -5780,6 +5866,71 @@ mod tests {
             response.prompt_tokens > response.completion_tokens,
             "augmented prompt accounting should still include model-visible context"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deterministic_provider_replays_qa_mock_fixture_when_explicitly_enabled() {
+        let provider = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_enabled: true,
+            qa_mock_fixture_path: Some(qa_mock_fixture_path()),
+            registry: ModelProviderRegistryConfig {
+                response_cache_enabled: false,
+                ..ModelProviderRegistryConfig::default()
+            },
+            ..ModelProviderConfig::default()
+        })
+        .expect("QA mock fixture provider should build when enabled");
+
+        let text_response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Say a friendly deterministic answer".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("text fixture turn should succeed");
+        assert!(text_response.output.full_text.contains("friendly deterministic answer"));
+        assert_eq!(text_response.output.usage.source, "qa_mock_fixture");
+
+        let tool_response = provider
+            .complete(ProviderRequest::from_input_text(
+                "Please propose the approval tool call".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("tool fixture turn should succeed");
+        assert_eq!(tool_response.output.finish_reason, ProviderFinishReason::ToolCalls);
+        assert!(matches!(
+            tool_response.events.last(),
+            Some(ProviderEvent::ToolProposal { proposal_id, tool_name, .. })
+                if proposal_id == "qa-approval-read" && tool_name == "palyra.fs.read_file"
+        ));
+
+        let error = provider
+            .complete(ProviderRequest::from_input_text(
+                "Trigger malformed tool args".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect_err("malformed fixture turn should fail");
+        assert!(matches!(error, ProviderError::InvalidResponse { .. }));
+        assert_eq!(error.classification().class, ProviderFailureClass::MalformedResponse);
+    }
+
+    #[test]
+    fn qa_mock_fixture_path_requires_explicit_preview_gate() {
+        let result = build_model_provider(&ModelProviderConfig {
+            qa_mock_fixture_path: Some(qa_mock_fixture_path()),
+            qa_mock_fixture_enabled: false,
+            ..ModelProviderConfig::default()
+        });
+
+        assert!(result.is_err(), "QA mock fixture must require explicit QA Lab preview mode");
     }
 
     #[tokio::test(flavor = "multi_thread")]
