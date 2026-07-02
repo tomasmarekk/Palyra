@@ -1104,7 +1104,7 @@ timeout:
             .expect("basic QA scenario should parse");
         let bundle = build_qa_evidence_bundle(&manifest, passing_input());
 
-        assert_eq!(qa_evidence_markdown_report(&bundle), MARKDOWN_GOLDEN);
+        assert_eq!(qa_evidence_markdown_report(&bundle), MARKDOWN_GOLDEN.replace("\r\n", "\n"));
     }
 
     fn passing_input() -> QaEvidenceBuildInput {
