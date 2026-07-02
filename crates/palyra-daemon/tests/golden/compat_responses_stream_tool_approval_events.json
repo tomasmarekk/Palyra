@@ -1,0 +1,132 @@
+[
+  {
+    "event": "response.created",
+    "type": "response.created",
+    "response_object": "response",
+    "response_status": "in_progress",
+    "has_response_id": true,
+    "has_usage": false
+  },
+  {
+    "event": "response.output_item.added",
+    "type": "response.output_item.added",
+    "output_index": 1,
+    "has_response_id": true,
+    "has_item_id": true,
+    "item_type": "function_call",
+    "item_status": "in_progress",
+    "tool_name": "palyra.fs.apply_patch",
+    "arguments": ""
+  },
+  {
+    "event": "response.function_call_arguments.delta",
+    "type": "response.function_call_arguments.delta",
+    "output_index": 1,
+    "has_response_id": true,
+    "has_item_id": true,
+    "delta": "<json>"
+  },
+  {
+    "event": "response.function_call_arguments.done",
+    "type": "response.function_call_arguments.done",
+    "output_index": 1,
+    "has_response_id": true,
+    "has_item_id": true,
+    "has_arguments": true
+  },
+  {
+    "event": "approval.required",
+    "type": "approval.required",
+    "has_response_id": true,
+    "has_approval_id": true,
+    "has_tool_call_id": true,
+    "tool_name": "palyra.fs.apply_patch",
+    "approval_required": true,
+    "risk_level": "high",
+    "has_raw_input_json": false
+  },
+  {
+    "event": "approval.resolved",
+    "type": "approval.resolved",
+    "has_response_id": true,
+    "has_approval_id": true,
+    "has_tool_call_id": true,
+    "approved": false,
+    "has_reason": true,
+    "decision_scope": "once"
+  },
+  {
+    "event": "response.output_item.done",
+    "type": "response.output_item.done",
+    "output_index": 1,
+    "has_response_id": true,
+    "has_item_id": true,
+    "item_type": "function_call",
+    "item_status": "failed",
+    "tool_name": "palyra.fs.apply_patch",
+    "tool_success": false,
+    "output_visibility": "artifact_ref",
+    "has_output_ref": true
+  },
+  {
+    "event": "response.output_item.added",
+    "type": "response.output_item.added",
+    "output_index": 2,
+    "has_response_id": true,
+    "has_item_id": true,
+    "item_type": "function_call",
+    "item_status": "in_progress",
+    "tool_name": "palyra.fs.read_file",
+    "arguments": ""
+  },
+  {
+    "event": "response.function_call_arguments.delta",
+    "type": "response.function_call_arguments.delta",
+    "output_index": 2,
+    "has_response_id": true,
+    "has_item_id": true,
+    "delta": "<json>"
+  },
+  {
+    "event": "response.function_call_arguments.done",
+    "type": "response.function_call_arguments.done",
+    "output_index": 2,
+    "has_response_id": true,
+    "has_item_id": true,
+    "has_arguments": true
+  },
+  {
+    "event": "response.output_item.done",
+    "type": "response.output_item.done",
+    "output_index": 2,
+    "has_response_id": true,
+    "has_item_id": true,
+    "item_type": "function_call",
+    "item_status": "failed",
+    "tool_name": "palyra.fs.read_file",
+    "tool_success": false,
+    "output_visibility": "artifact_ref",
+    "has_output_ref": true
+  },
+  {
+    "event": "response.output_text.delta",
+    "type": "response.output_text.delta",
+    "output_index": 0,
+    "content_index": 0,
+    "has_response_id": true,
+    "has_item_id": true,
+    "delta": "<text>"
+  },
+  {
+    "event": "response.completed",
+    "type": "response.completed",
+    "response_object": "response",
+    "response_status": "completed",
+    "has_response_id": true,
+    "has_usage": true
+  },
+  {
+    "event": null,
+    "type": "[DONE]"
+  }
+]

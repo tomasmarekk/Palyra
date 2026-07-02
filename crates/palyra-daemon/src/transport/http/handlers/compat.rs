@@ -16,6 +16,7 @@ use crate::{
     app::state::CompatApiRateLimitEntry,
     *,
 };
+use std::collections::HashSet;
 
 const COMPAT_API_CHANNEL: &str = "compat-api";
 
@@ -139,6 +140,14 @@ struct CompatToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompatStreamToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+    output_index: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -812,6 +821,216 @@ fn build_compat_responses_created_stream_payload(
     })
 }
 
+fn build_compat_responses_tool_call_added_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    tool_call: &CompatStreamToolCall,
+    public_event: Option<&Value>,
+) -> Value {
+    json!({
+        "type": "response.output_item.added",
+        "response_id": response_id,
+        "output_index": tool_call.output_index,
+        "item": {
+            "id": tool_call.id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": tool_call.id,
+            "name": tool_call.name,
+            "arguments": "",
+        },
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
+fn build_compat_responses_tool_call_arguments_delta_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    tool_call: &CompatStreamToolCall,
+    public_event: Option<&Value>,
+) -> Value {
+    json!({
+        "type": "response.function_call_arguments.delta",
+        "response_id": response_id,
+        "item_id": tool_call.id,
+        "output_index": tool_call.output_index,
+        "delta": tool_call.arguments,
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
+fn build_compat_responses_tool_call_arguments_done_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    tool_call: &CompatStreamToolCall,
+    public_event: Option<&Value>,
+) -> Value {
+    json!({
+        "type": "response.function_call_arguments.done",
+        "response_id": response_id,
+        "item_id": tool_call.id,
+        "output_index": tool_call.output_index,
+        "arguments": tool_call.arguments,
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
+fn build_compat_responses_tool_result_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    tool_call: Option<&CompatStreamToolCall>,
+    result: &common_v1::ToolResult,
+    public_event: Option<&Value>,
+) -> Value {
+    let fallback_id = compat_tool_call_id(result.proposal_id.as_ref())
+        .unwrap_or_else(|| "tool_unknown".to_owned());
+    let item_id = tool_call.map(|value| value.id.as_str()).unwrap_or(fallback_id.as_str());
+    let name = tool_call.map(|value| value.name.as_str()).unwrap_or("unknown");
+    let arguments = tool_call.map(|value| value.arguments.as_str()).unwrap_or_default();
+    let output_index = tool_call.map(|value| value.output_index).unwrap_or(1);
+    let error = if result.error.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(sanitize_http_error_message(result.error.as_str()))
+    };
+    let has_output = !result.output_json.is_empty();
+    let output_ref = if has_output {
+        json!({
+            "kind": "run_journal_tool_output",
+            "run_id": run_id,
+            "tool_call_id": item_id,
+        })
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "type": "response.output_item.done",
+        "response_id": response_id,
+        "output_index": output_index,
+        "item": {
+            "id": item_id,
+            "type": "function_call",
+            "status": if result.success { "completed" } else { "failed" },
+            "call_id": item_id,
+            "name": name,
+            "arguments": arguments,
+        },
+        "tool_result": {
+            "success": result.success,
+            "error": error,
+            "output_visibility": if has_output { "artifact_ref" } else { "none" },
+            "output_bytes": result.output_json.len(),
+            "output_ref": output_ref,
+        },
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
+fn build_compat_responses_approval_required_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    request: &common_v1::ToolApprovalRequest,
+    public_event: Option<&Value>,
+) -> Value {
+    let approval_id =
+        compat_approval_response_id(request.approval_id.as_ref(), request.proposal_id.as_ref());
+    let tool_call_id = compat_tool_call_id(request.proposal_id.as_ref())
+        .unwrap_or_else(|| "tool_unknown".to_owned());
+    let prompt = request.prompt.as_ref();
+    let summary = if request.request_summary.trim().is_empty() {
+        prompt.map(|value| value.summary.as_str()).unwrap_or_default()
+    } else {
+        request.request_summary.as_str()
+    };
+
+    json!({
+        "type": "approval.required",
+        "response_id": response_id,
+        "approval_id": approval_id,
+        "tool_call_id": tool_call_id,
+        "tool_name": request.tool_name,
+        "summary": summary,
+        "approval_required": request.approval_required,
+        "risk_level": prompt
+            .map(|value| compat_approval_risk_level_label(value.risk_level))
+            .unwrap_or("unspecified"),
+        "prompt": prompt.map(|value| {
+            json!({
+                "title": value.title,
+                "summary": value.summary,
+                "subject_id": value.subject_id,
+                "timeout_seconds": value.timeout_seconds,
+                "policy_explanation": value.policy_explanation,
+                "options": value.options.iter().map(|option| {
+                    json!({
+                        "option_id": option.option_id,
+                        "label": option.label,
+                        "description": option.description,
+                        "default_selected": option.default_selected,
+                        "decision_scope": compat_approval_scope_label(option.decision_scope),
+                        "timebox_ttl_ms": option.timebox_ttl_ms,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        }),
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
+fn build_compat_responses_approval_resolved_stream_payload(
+    response_id: &str,
+    run_id: &str,
+    session_id: &str,
+    response: &common_v1::ToolApprovalResponse,
+    public_event: Option<&Value>,
+) -> Value {
+    json!({
+        "type": "approval.resolved",
+        "response_id": response_id,
+        "approval_id": compat_approval_response_id(
+            response.approval_id.as_ref(),
+            response.proposal_id.as_ref()
+        ),
+        "tool_call_id": compat_tool_call_id(response.proposal_id.as_ref())
+            .unwrap_or_else(|| "tool_unknown".to_owned()),
+        "approved": response.approved,
+        "reason": sanitize_http_error_message(response.reason.as_str()),
+        "decision_scope": compat_approval_scope_label(response.decision_scope),
+        "decision_scope_ttl_ms": response.decision_scope_ttl_ms,
+        "_palyra": compat_stream_palyra_metadata_sanitized(
+            run_id,
+            session_id,
+            public_event
+        ),
+    })
+}
+
 fn compat_tool_call_json(tool_call: &CompatToolCall) -> Value {
     json!({
         "id": tool_call.id,
@@ -856,6 +1075,79 @@ fn compat_stream_palyra_metadata(
         object.insert("public_event".to_owned(), public_event.clone());
     }
     metadata
+}
+
+fn compat_stream_palyra_metadata_sanitized(
+    run_id: &str,
+    session_id: &str,
+    public_event: Option<&Value>,
+) -> Value {
+    let sanitized_event = public_event.map(sanitize_public_event_for_compat_stream);
+    compat_stream_palyra_metadata(run_id, session_id, sanitized_event.as_ref())
+}
+
+fn sanitize_public_event_for_compat_stream(public_event: &Value) -> Value {
+    let mut sanitized = public_event.clone();
+    let event_name = sanitized.get("event").and_then(Value::as_str).map(str::to_owned);
+    if let Some(payload) = sanitized.get_mut("payload").and_then(Value::as_object_mut) {
+        match event_name.as_deref() {
+            Some("tool.call.started") => {
+                payload.insert("input_json".to_owned(), json!({ "visibility": "withheld" }));
+            }
+            Some("tool.call.completed") => {
+                payload.insert("output_json".to_owned(), json!({ "visibility": "artifact_ref" }));
+            }
+            Some("approval.required") => {
+                payload.insert("input_json".to_owned(), json!({ "visibility": "withheld" }));
+                if let Some(prompt) = payload.get_mut("prompt").and_then(Value::as_object_mut) {
+                    prompt.insert("details_json".to_owned(), json!({ "visibility": "withheld" }));
+                }
+            }
+            _ => {}
+        }
+    }
+    sanitized
+}
+
+fn compat_tool_call_id(id: Option<&common_v1::CanonicalId>) -> Option<String> {
+    id.and_then(|value| {
+        let ulid = value.ulid.trim();
+        (!ulid.is_empty()).then(|| ulid.to_owned())
+    })
+}
+
+fn compat_approval_response_id(
+    approval_id: Option<&common_v1::CanonicalId>,
+    proposal_id: Option<&common_v1::CanonicalId>,
+) -> String {
+    compat_tool_call_id(approval_id).unwrap_or_else(|| {
+        let tool_call_id =
+            compat_tool_call_id(proposal_id).unwrap_or_else(|| "tool_unknown".to_owned());
+        format!("approval_{tool_call_id}")
+    })
+}
+
+fn compat_approval_scope_label(raw: i32) -> &'static str {
+    match common_v1::ApprovalDecisionScope::try_from(raw)
+        .unwrap_or(common_v1::ApprovalDecisionScope::Unspecified)
+    {
+        common_v1::ApprovalDecisionScope::Once => "once",
+        common_v1::ApprovalDecisionScope::Session => "session",
+        common_v1::ApprovalDecisionScope::Timeboxed => "timeboxed",
+        common_v1::ApprovalDecisionScope::Unspecified => "unspecified",
+    }
+}
+
+fn compat_approval_risk_level_label(raw: i32) -> &'static str {
+    match common_v1::ApprovalRiskLevel::try_from(raw)
+        .unwrap_or(common_v1::ApprovalRiskLevel::Unspecified)
+    {
+        common_v1::ApprovalRiskLevel::Low => "low",
+        common_v1::ApprovalRiskLevel::Medium => "medium",
+        common_v1::ApprovalRiskLevel::High => "high",
+        common_v1::ApprovalRiskLevel::Critical => "critical",
+        common_v1::ApprovalRiskLevel::Unspecified => "unspecified",
+    }
 }
 
 fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPreparedRun) -> Response {
@@ -1164,6 +1456,8 @@ fn build_compat_responses_streaming_response(
         let message_item_id = format!("msg_{run_id}");
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut stream_tool_calls = HashMap::<String, CompatStreamToolCall>::new();
+        let mut emitted_approval_resolutions = HashSet::<String>::new();
         let mut stream_error = None::<String>;
         let mut public_event_sequence = 0_u64;
         let mut last_public_terminal_event = None::<Value>;
@@ -1306,7 +1600,7 @@ fn build_compat_responses_streaming_response(
                                     }
                                 }
                                 Some(common_v1::run_stream_event::Body::ToolProposal(proposal)) => {
-                                    tool_calls.push(CompatToolCall {
+                                    let tool_call = CompatStreamToolCall {
                                         id: proposal
                                             .proposal_id
                                             .as_ref()
@@ -1314,16 +1608,143 @@ fn build_compat_responses_streaming_response(
                                             .unwrap_or_else(|| Ulid::new().to_string()),
                                         name: proposal.tool_name,
                                         arguments: json_string_from_bytes(proposal.input_json.as_slice()),
+                                        output_index: tool_calls.len().saturating_add(1) as u64,
+                                    };
+                                    tool_calls.push(CompatToolCall {
+                                        id: tool_call.id.clone(),
+                                        name: tool_call.name.clone(),
+                                        arguments: tool_call.arguments.clone(),
                                     });
+                                    stream_tool_calls
+                                        .insert(tool_call.id.clone(), tool_call.clone());
+                                    if !send_sse_event(
+                                        &sender,
+                                        "response.output_item.added",
+                                        build_compat_responses_tool_call_added_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            &tool_call,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    if !send_sse_event(
+                                        &sender,
+                                        "response.function_call_arguments.delta",
+                                        build_compat_responses_tool_call_arguments_delta_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            &tool_call,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    if !send_sse_event(
+                                        &sender,
+                                        "response.function_call_arguments.done",
+                                        build_compat_responses_tool_call_arguments_done_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            &tool_call,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                                 Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
-                                    auto_deny_compat_tool_approval(
+                                    if !send_sse_event(
+                                        &sender,
+                                        "approval.required",
+                                        build_compat_responses_approval_required_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            &request,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                    let response = auto_deny_compat_tool_approval(
                                         &request_sender,
                                         session_id.as_str(),
                                         run_id.as_str(),
                                         &request,
                                     )
                                     .await;
+                                    let approval_id =
+                                        compat_approval_response_id(response.approval_id.as_ref(), response.proposal_id.as_ref());
+                                    emitted_approval_resolutions.insert(approval_id);
+                                    if !send_sse_event(
+                                        &sender,
+                                        "approval.resolved",
+                                        build_compat_responses_approval_resolved_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            &response,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
+                                Some(common_v1::run_stream_event::Body::ToolApprovalResponse(response)) => {
+                                    let approval_id =
+                                        compat_approval_response_id(response.approval_id.as_ref(), response.proposal_id.as_ref());
+                                    if emitted_approval_resolutions.insert(approval_id)
+                                        && !send_sse_event(
+                                            &sender,
+                                            "approval.resolved",
+                                            build_compat_responses_approval_resolved_stream_payload(
+                                                response_id.as_str(),
+                                                run_id.as_str(),
+                                                session_id.as_str(),
+                                                &response,
+                                                public_event.as_ref(),
+                                            ),
+                                        )
+                                        .await
+                                    {
+                                        return;
+                                    }
+                                }
+                                Some(common_v1::run_stream_event::Body::ToolResult(result)) => {
+                                    let tool_call_id = compat_tool_call_id(result.proposal_id.as_ref())
+                                        .unwrap_or_else(|| "tool_unknown".to_owned());
+                                    let tool_call = stream_tool_calls.get(tool_call_id.as_str());
+                                    if !send_sse_event(
+                                        &sender,
+                                        "response.output_item.done",
+                                        build_compat_responses_tool_result_stream_payload(
+                                            response_id.as_str(),
+                                            run_id.as_str(),
+                                            session_id.as_str(),
+                                            tool_call,
+                                            &result,
+                                            public_event.as_ref(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                                 Some(common_v1::run_stream_event::Body::Status(status))
                                     if common_v1::stream_status::StatusKind::try_from(status.kind)
@@ -2001,7 +2422,7 @@ async fn auto_deny_compat_tool_approval(
     session_id: &str,
     run_id: &str,
     request: &common_v1::ToolApprovalRequest,
-) {
+) -> common_v1::ToolApprovalResponse {
     let response = common_v1::ToolApprovalResponse {
         proposal_id: request.proposal_id.clone(),
         approved: false,
@@ -2010,6 +2431,7 @@ async fn auto_deny_compat_tool_approval(
         decision_scope: common_v1::ApprovalDecisionScope::Once as i32,
         decision_scope_ttl_ms: 0,
     };
+    let response_for_request = response.clone();
     let _ = request_sender
         .send(common_v1::RunStreamRequest {
             v: palyra_common::CANONICAL_PROTOCOL_MAJOR,
@@ -2021,13 +2443,14 @@ async fn auto_deny_compat_tool_approval(
             session_label: String::new(),
             reset_session: false,
             require_existing: true,
-            tool_approval_response: Some(response),
+            tool_approval_response: Some(response_for_request),
             origin_kind: String::new(),
             origin_run_id: None,
             parameter_delta_json: Vec::new(),
             queued_input_id: None,
         })
         .await;
+    response
 }
 
 fn build_compat_gateway_endpoint(state: &AppState) -> Result<tonic::transport::Endpoint, String> {
@@ -2277,5 +2700,120 @@ mod tests {
         let mut invalid_headers = HeaderMap::new();
         invalid_headers.insert("authorization", HeaderValue::from_static("Basic abc"));
         assert!(extract_bearer_token(&invalid_headers).is_err());
+    }
+
+    #[test]
+    fn responses_tool_result_stream_payload_uses_artifact_ref_without_raw_output() {
+        let tool_call = CompatStreamToolCall {
+            id: "tool_01".to_owned(),
+            name: "palyra.fs.read_file".to_owned(),
+            arguments: r#"{"path":"report.md"}"#.to_owned(),
+            output_index: 1,
+        };
+        let public_event = json!({
+            "event": "tool.call.completed",
+            "payload": {
+                "success": true,
+                "output_json": { "secret": "sk-test-secret" },
+                "error": ""
+            }
+        });
+        let result = common_v1::ToolResult {
+            proposal_id: Some(common_v1::CanonicalId { ulid: "tool_01".to_owned() }),
+            success: true,
+            output_json: br#"{"secret":"sk-test-secret"}"#.to_vec(),
+            error: String::new(),
+        };
+
+        let payload = build_compat_responses_tool_result_stream_payload(
+            "resp_01",
+            "run_01",
+            "session_01",
+            Some(&tool_call),
+            &result,
+            Some(&public_event),
+        );
+        let encoded = payload.to_string();
+
+        assert_eq!(payload.pointer("/tool_result/success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.pointer("/tool_result/output_visibility").and_then(Value::as_str),
+            Some("artifact_ref")
+        );
+        assert_eq!(
+            payload.pointer("/tool_result/output_ref/kind").and_then(Value::as_str),
+            Some("run_journal_tool_output")
+        );
+        assert_eq!(
+            payload
+                .pointer("/_palyra/public_event/payload/output_json/visibility")
+                .and_then(Value::as_str),
+            Some("artifact_ref")
+        );
+        assert!(
+            !encoded.contains("sk-test-secret"),
+            "Responses SSE tool result payload must not contain raw tool output: {encoded}"
+        );
+    }
+
+    #[test]
+    fn responses_approval_required_stream_payload_withholds_raw_input_details() {
+        let public_event = json!({
+            "event": "approval.required",
+            "payload": {
+                "input_json": { "secret": "raw-command" },
+                "prompt": {
+                    "details_json": { "secret": "raw-details" }
+                }
+            }
+        });
+        let request = common_v1::ToolApprovalRequest {
+            proposal_id: Some(common_v1::CanonicalId { ulid: "tool_01".to_owned() }),
+            tool_name: "palyra.fs.apply_patch".to_owned(),
+            input_json: br#"{"secret":"raw-command"}"#.to_vec(),
+            approval_required: true,
+            approval_id: Some(common_v1::CanonicalId { ulid: "approval_01".to_owned() }),
+            prompt: Some(common_v1::ApprovalPrompt {
+                title: "Apply patch".to_owned(),
+                risk_level: common_v1::ApprovalRiskLevel::Medium as i32,
+                subject_id: "tool_01".to_owned(),
+                summary: "Patch workspace".to_owned(),
+                options: Vec::new(),
+                timeout_seconds: 30,
+                details_json: br#"{"secret":"raw-details"}"#.to_vec(),
+                policy_explanation: "workspace write requires approval".to_owned(),
+            }),
+            request_summary: "Patch workspace".to_owned(),
+        };
+
+        let payload = build_compat_responses_approval_required_stream_payload(
+            "resp_01",
+            "run_01",
+            "session_01",
+            &request,
+            Some(&public_event),
+        );
+        let encoded = payload.to_string();
+
+        assert_eq!(payload.get("type").and_then(Value::as_str), Some("approval.required"));
+        assert_eq!(payload.get("approval_id").and_then(Value::as_str), Some("approval_01"));
+        assert_eq!(payload.get("tool_call_id").and_then(Value::as_str), Some("tool_01"));
+        assert_eq!(payload.get("risk_level").and_then(Value::as_str), Some("medium"));
+        assert_eq!(
+            payload
+                .pointer("/_palyra/public_event/payload/input_json/visibility")
+                .and_then(Value::as_str),
+            Some("withheld")
+        );
+        assert_eq!(
+            payload
+                .pointer("/_palyra/public_event/payload/prompt/details_json/visibility")
+                .and_then(Value::as_str),
+            Some("withheld")
+        );
+        assert!(
+            !encoded.contains("raw-command") && !encoded.contains("raw-details"),
+            "approval SSE payload must not contain raw approval input details: {encoded}"
+        );
     }
 }

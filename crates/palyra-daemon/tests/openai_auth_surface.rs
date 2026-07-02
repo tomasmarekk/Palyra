@@ -1143,6 +1143,147 @@ fn compat_responses_stream_maps_stream_failures_to_failed_event() -> Result<()> 
 }
 
 #[test]
+fn compat_responses_stream_maps_tool_call_and_approval_events() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+        (
+            "PALYRA_TOOL_CALL_ALLOWED_TOOLS".to_owned(),
+            "palyra.fs.apply_patch,palyra.fs.read_file".to_owned(),
+        ),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat responses tools token",
+        &["compat.responses.create"],
+    )?;
+
+    let (status, content_type, body) = compat_post_sse(
+        &client,
+        admin_port,
+        "/v1/responses",
+        token.as_str(),
+        &json!({
+            "input": "Create reports/deterministic-provider.md and verify the fixture.",
+            "stream": true
+        }),
+    )?;
+    assert_eq!(status, 200, "responses tool stream should open successfully: {body}");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "responses tool stream should use SSE content type: {content_type}"
+    );
+
+    let messages = parse_sse_messages(body.as_str())?;
+    assert_json_golden(
+        "compat_responses_stream_tool_approval_events.json",
+        &normalize_responses_stream_grammar(messages.as_slice())?,
+    )?;
+
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    let event_names = json_events.iter().filter_map(|event| event.0.as_deref()).collect::<Vec<_>>();
+    let tool_added_index = event_names
+        .iter()
+        .position(|event| *event == "response.output_item.added")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing tool item added event"))?;
+    let args_delta_index = event_names
+        .iter()
+        .position(|event| *event == "response.function_call_arguments.delta")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing tool arguments delta"))?;
+    let args_done_index = event_names
+        .iter()
+        .position(|event| *event == "response.function_call_arguments.done")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing tool arguments done"))?;
+    let approval_required_index = event_names
+        .iter()
+        .position(|event| *event == "approval.required")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing approval.required"))?;
+    let approval_resolved_index = event_names
+        .iter()
+        .position(|event| *event == "approval.resolved")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing approval.resolved"))?;
+    let tool_result_index = event_names
+        .iter()
+        .position(|event| *event == "response.output_item.done")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing tool result completion"))?;
+    let terminal_index = event_names
+        .iter()
+        .position(|event| *event == "response.failed" || *event == "response.completed")
+        .ok_or_else(|| anyhow::anyhow!("responses stream missing terminal response event"))?;
+    assert!(
+        tool_added_index < args_delta_index
+            && args_delta_index < args_done_index
+            && args_done_index < approval_required_index
+            && approval_required_index < approval_resolved_index
+            && approval_resolved_index < tool_result_index
+            && tool_result_index < terminal_index,
+        "responses tool stream events should preserve proposal/approval/result/final order: {event_names:?}"
+    );
+
+    let args_delta = json_events[args_delta_index]
+        .1
+        .get("delta")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("tool arguments delta missing"))?;
+    let args_done = json_events[args_done_index]
+        .1
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("tool arguments done missing"))?;
+    assert_eq!(args_delta, args_done, "tool call arguments should be reconstructable");
+    assert!(
+        args_done.contains("reports/deterministic-provider.md"),
+        "tool call arguments should include deterministic fixture path: {args_done}"
+    );
+
+    let approval_required = &json_events[approval_required_index].1;
+    assert_eq!(approval_required.get("type").and_then(Value::as_str), Some("approval.required"));
+    assert_eq!(
+        approval_required.get("tool_name").and_then(Value::as_str),
+        Some("palyra.fs.apply_patch")
+    );
+    assert!(
+        approval_required.get("input_json").is_none(),
+        "approval.required should not expose raw tool input: {approval_required}"
+    );
+
+    let approval_resolved = &json_events[approval_resolved_index].1;
+    assert_eq!(approval_resolved.get("approved").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        approval_resolved.get("reason").and_then(Value::as_str),
+        Some("interactive_tool_approval_not_supported_for_compat_api")
+    );
+    let tool_result = &json_events[tool_result_index].1;
+    assert_eq!(tool_result.pointer("/item/status").and_then(Value::as_str), Some("failed"));
+    assert_eq!(tool_result.pointer("/tool_result/success").and_then(Value::as_bool), Some(false));
+    assert!(
+        tool_result.get("output_json").is_none(),
+        "Responses SSE tool result must not expose raw output: {tool_result}"
+    );
+    assert!(
+        !tool_result.pointer("/tool_result/output_ref").is_some_and(Value::is_null),
+        "Responses SSE tool result should reference the journal artifact when output exists"
+    );
+    assert!(
+        messages.last().is_some_and(|(_, data)| data == "[DONE]"),
+        "responses tool stream should terminate with [DONE]"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn console_models_probe_redacts_provider_auth_failures() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let mock = OpenAiMockServer::new(None, None)?;
@@ -2708,6 +2849,67 @@ fn normalize_responses_stream_grammar(messages: &[(Option<String>, String)]) -> 
                 "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
                 "has_item_id": value.get("item_id").and_then(Value::as_str).is_some(),
                 "delta": "<text>",
+            })),
+            "response.output_item.added" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "output_index": value.get("output_index").and_then(Value::as_u64),
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_item_id": value.pointer("/item/id").and_then(Value::as_str).is_some(),
+                "item_type": value.pointer("/item/type").and_then(Value::as_str),
+                "item_status": value.pointer("/item/status").and_then(Value::as_str),
+                "tool_name": value.pointer("/item/name").and_then(Value::as_str),
+                "arguments": value.pointer("/item/arguments").and_then(Value::as_str),
+            })),
+            "response.function_call_arguments.delta" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "output_index": value.get("output_index").and_then(Value::as_u64),
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_item_id": value.get("item_id").and_then(Value::as_str).is_some(),
+                "delta": "<json>",
+            })),
+            "response.function_call_arguments.done" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "output_index": value.get("output_index").and_then(Value::as_u64),
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_item_id": value.get("item_id").and_then(Value::as_str).is_some(),
+                "has_arguments": value.get("arguments").and_then(Value::as_str).is_some(),
+            })),
+            "response.output_item.done" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "output_index": value.get("output_index").and_then(Value::as_u64),
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_item_id": value.pointer("/item/id").and_then(Value::as_str).is_some(),
+                "item_type": value.pointer("/item/type").and_then(Value::as_str),
+                "item_status": value.pointer("/item/status").and_then(Value::as_str),
+                "tool_name": value.pointer("/item/name").and_then(Value::as_str),
+                "tool_success": value.pointer("/tool_result/success").and_then(Value::as_bool),
+                "output_visibility": value.pointer("/tool_result/output_visibility").and_then(Value::as_str),
+                "has_output_ref": !value.pointer("/tool_result/output_ref").is_some_and(Value::is_null),
+            })),
+            "approval.required" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_approval_id": value.get("approval_id").and_then(Value::as_str).is_some(),
+                "has_tool_call_id": value.get("tool_call_id").and_then(Value::as_str).is_some(),
+                "tool_name": value.get("tool_name").and_then(Value::as_str),
+                "approval_required": value.get("approval_required").and_then(Value::as_bool),
+                "risk_level": value.get("risk_level").and_then(Value::as_str),
+                "has_raw_input_json": value.get("input_json").is_some(),
+            })),
+            "approval.resolved" => normalized.push(json!({
+                "event": event,
+                "type": event_type,
+                "has_response_id": value.get("response_id").and_then(Value::as_str).is_some(),
+                "has_approval_id": value.get("approval_id").and_then(Value::as_str).is_some(),
+                "has_tool_call_id": value.get("tool_call_id").and_then(Value::as_str).is_some(),
+                "approved": value.get("approved").and_then(Value::as_bool),
+                "has_reason": value.get("reason").and_then(Value::as_str).is_some(),
+                "decision_scope": value.get("decision_scope").and_then(Value::as_str),
             })),
             "response.completed" => normalized.push(json!({
                 "event": event,
