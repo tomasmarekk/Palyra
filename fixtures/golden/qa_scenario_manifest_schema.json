@@ -19,6 +19,12 @@
   ],
   "encoding": "yaml",
   "examples_root": "qa/scenarios",
+  "forbidden_fields": [
+    "tool_calls",
+    "events",
+    "artifacts",
+    "claims"
+  ],
   "format": "palyra-qa-scenario",
   "limits": {
     "max_timeout_ms": 3600000

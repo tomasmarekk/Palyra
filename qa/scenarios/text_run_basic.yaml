@@ -31,6 +31,7 @@ forbidden:
   events:
     - secret.exposed
   artifacts: []
+  claims: []
 artifacts:
   - path: qa/reports/text_run_basic.json
     kind: report

@@ -59,7 +59,7 @@ pub struct QaScenarioManifest {
     pub steps: Vec<QaScenarioStep>,
     /// Expected terminal outcome and observable assertions.
     pub expect: QaScenarioExpect,
-    /// Events, tool calls, or artifacts that must not appear.
+    /// Events, tool calls, artifacts, or answer claims that must not appear.
     pub forbidden: QaScenarioForbidden,
     /// Artifacts the runner should produce or inspect.
     pub artifacts: Vec<QaScenarioArtifact>,
@@ -310,6 +310,8 @@ pub struct QaScenarioForbidden {
     pub events: Vec<String>,
     /// Artifact path or kind tokens that must not appear.
     pub artifacts: Vec<String>,
+    /// Final-answer substrings that must not appear.
+    pub claims: Vec<String>,
 }
 
 /// Scenario artifact kind.
@@ -573,6 +575,8 @@ struct QaScenarioForbiddenWire {
     events: Vec<String>,
     #[serde(default)]
     artifacts: Vec<String>,
+    #[serde(default)]
+    claims: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -639,6 +643,12 @@ pub fn qa_scenario_manifest_schema_snapshot() -> Value {
         "step_actions": STEP_ACTION_VALUES,
         "terminal_states": TERMINAL_STATE_VALUES,
         "artifact_kinds": ARTIFACT_KIND_VALUES,
+        "forbidden_fields": [
+            "tool_calls",
+            "events",
+            "artifacts",
+            "claims"
+        ],
         "path_convention": "jsonpath",
         "limits": {
             "max_timeout_ms": MAX_TIMEOUT_MS
@@ -1059,7 +1069,7 @@ fn validate_forbidden(
             "missing_forbidden",
             "$.forbidden",
             "forbidden section is required",
-            "Declare forbidden tool calls, events, and artifacts; use empty lists if none apply.",
+            "Declare forbidden tool calls, events, artifacts, and claims; use empty lists if none apply.",
         );
         return None;
     };
@@ -1084,10 +1094,18 @@ fn validate_forbidden(
         false,
         issues,
     );
+    validate_string_list(
+        value.claims.as_slice(),
+        "$.forbidden.claims",
+        "forbidden claim",
+        false,
+        issues,
+    );
     Some(QaScenarioForbidden {
         tool_calls: value.tool_calls,
         events: value.events,
         artifacts: value.artifacts,
+        claims: value.claims,
     })
 }
 
