@@ -2297,6 +2297,34 @@
       },
       {
         "surface": "compat",
+        "route": "/v1/runs/{run_id}/approval",
+        "http_method": "POST",
+        "method_name": "compat.post.v1.runs.by_run_id.approval",
+        "stability": "stable",
+        "required_scope": "public.read",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.approval.request.method-registry.v1",
+        "request_schema_hash": "6b3106124423dfb76e5db79371de7e33d2094a3c0551ad2793581e8d52580492",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.approval.response.method-registry.v1",
+        "response_schema_hash": "ccd092e945792c9ef9da7a331ef969ccc039b3f009ffce757bcdb438606c907b",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "compat",
+        "route": "/v1/runs/{run_id}/detach",
+        "http_method": "POST",
+        "method_name": "compat.post.v1.runs.by_run_id.detach",
+        "stability": "stable",
+        "required_scope": "public.read",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.detach.request.method-registry.v1",
+        "request_schema_hash": "5d483fd7cd05a6507b2d650867d4cd7d7e49665958fda616ad6c4317eef52a32",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.detach.response.method-registry.v1",
+        "response_schema_hash": "9773f0cfc3e96f2cb792625025b23a55c90280d3d0caaf7d8a9d420e7a04c4b2",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "compat",
         "route": "/v1/runs/{run_id}/events",
         "http_method": "GET",
         "method_name": "compat.get.v1.runs.by_run_id.events",
@@ -2308,6 +2336,20 @@
         "response_schema_hash": "6c1609b56734bc2a6ecc11b968897992a2252c6824d0d70067e374b237a90215",
         "streaming_supported": false,
         "idempotency_supported": true
+      },
+      {
+        "surface": "compat",
+        "route": "/v1/runs/{run_id}/stop",
+        "http_method": "POST",
+        "method_name": "compat.post.v1.runs.by_run_id.stop",
+        "stability": "stable",
+        "required_scope": "public.read",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.stop.request.method-registry.v1",
+        "request_schema_hash": "683ad70e4f44bcb6ab43642f310f7941d8e16262dbf1ba0d9f7dd95e291911ea",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.stop.response.method-registry.v1",
+        "response_schema_hash": "1c7505ae1a6a74299b352131f54fea257aa4c7860666e519296acf21c7f35495",
+        "streaming_supported": false,
+        "idempotency_supported": false
       },
       {
         "surface": "compat",
@@ -8887,7 +8929,7 @@
       "diagnostics_sections": 44,
       "execution_backends": 5,
       "feature_rollout_flags": 26,
-      "method_registry_methods": 483,
+      "method_registry_methods": 486,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -8915,7 +8957,7 @@
       "surface_counts": {
         "admin": 50,
         "canvas": 5,
-        "compat": 10,
+        "compat": 13,
         "console": 415,
         "public": 2,
         "realtime": 1

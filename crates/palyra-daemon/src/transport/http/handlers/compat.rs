@@ -16,7 +16,13 @@ use crate::{
     app::state::CompatApiRateLimitEntry,
     *,
 };
-use palyra_common::runtime_contracts::{IdempotencyReplayDecision, StableErrorEnvelope};
+use palyra_common::{
+    runtime_contracts::{IdempotencyReplayDecision, StableErrorEnvelope},
+    runtime_preview::{
+        RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
+        RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef,
+    },
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, sync::Arc};
 
@@ -109,6 +115,45 @@ pub(crate) struct CompatRunEventsQuery {
     after_seq: Option<i64>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Request body for stopping a public run.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompatRunStopRequest {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    cleanup_policy: Option<String>,
+}
+
+/// Request body for detaching from a public run stream.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompatRunDetachRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Request body for resolving a run approval through the public API.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompatRunApprovalRequest {
+    #[serde(default)]
+    approval_id: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    decision: Option<String>,
+    #[serde(default)]
+    approved: Option<bool>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    decision_scope: Option<String>,
+    #[serde(default)]
+    decision_scope_ttl_ms: Option<i64>,
+    #[serde(default)]
+    expected_version: Option<u64>,
 }
 
 /// Request body for the compatibility embeddings endpoint.
@@ -878,10 +923,26 @@ pub(crate) async fn compat_run_events_handler(
     Query(query): Query<CompatRunEventsQuery>,
 ) -> Result<Response, Response> {
     let now = unix_ms_now().map_err(internal_clock_error_response)?;
-    let (token, owner_principal) = authorize_compat_response_record_access(&state, &headers, now)?;
+    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
     let snapshot =
         load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
             .await?;
+    record_compat_run_flow_audit(
+        &state,
+        &snapshot,
+        owner_principal.as_str(),
+        device_id.as_str(),
+        "compat_run_events_opened",
+        json!({
+            "action": "events_stream_opened",
+            "disconnect_policy": "detach",
+            "cancel_on_disconnect": false,
+            "after_seq": query.after_seq,
+            "limit": query.limit,
+        }),
+        now,
+    )
+    .await?;
     touch_compat_api_token(
         &state,
         token.token_id.as_str(),
@@ -891,6 +952,232 @@ pub(crate) async fn compat_run_events_handler(
         now,
     );
     Ok(build_compat_run_events_streaming_response(state, snapshot, query.after_seq, query.limit))
+}
+
+/// Handles `POST /v1/runs/{run_id}/stop`.
+///
+/// # Errors
+/// Returns an error response when authorization, run ownership validation,
+/// stop request validation, or the runtime cancel operation fails.
+pub(crate) async fn compat_run_stop_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(payload): Json<CompatRunStopRequest>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal, _device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let snapshot =
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?;
+    let stop_mode = parse_compat_run_stop_mode(payload.mode.as_deref())?;
+    let cleanup_policy = parse_compat_run_cleanup_policy(payload.cleanup_policy.as_deref())?;
+    let reason = payload
+        .reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| format!("compat_runs_stop:{stop_mode}"));
+    let outcome = state
+        .runtime
+        .apply_turn_control(crate::application::turn_control::TurnControlRequest {
+            operation: crate::application::turn_control::TurnControlOperation::CancelRun,
+            actor_principal: owner_principal.clone(),
+            session_id: Some(snapshot.session_id.clone()),
+            run_id: Some(snapshot.run_id.clone()),
+            queued_input_id: None,
+            priority_lane: None,
+            reason: Some(reason.clone()),
+            dry_run: false,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let status =
+        load_compat_run_status_payload(&state, run_id.as_str(), owner_principal.as_str()).await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_stop",
+        "run_stop_requested",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(json!({
+        "id": run_id,
+        "object": "run.stop",
+        "stopped": outcome.effect.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false),
+        "mode": stop_mode,
+        "cleanup_policy": cleanup_policy,
+        "reason": reason,
+        "run": status,
+        "_palyra": {
+            "turn_control": outcome.decision,
+            "effect": outcome.effect,
+        },
+    }))
+    .into_response())
+}
+
+/// Handles `POST /v1/runs/{run_id}/detach`.
+///
+/// # Errors
+/// Returns an error response when authorization, run ownership validation, or
+/// detach audit persistence fails.
+pub(crate) async fn compat_run_detach_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(payload): Json<CompatRunDetachRequest>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let snapshot =
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?;
+    let reason =
+        payload.reason.and_then(trim_to_option).unwrap_or_else(|| "compat_runs_detach".to_owned());
+    record_compat_run_flow_audit(
+        &state,
+        &snapshot,
+        owner_principal.as_str(),
+        device_id.as_str(),
+        reason.as_str(),
+        json!({
+            "action": "detach",
+            "disconnect_policy": "detach",
+            "cancel_on_disconnect": false,
+        }),
+        now,
+    )
+    .await?;
+    let status = build_compat_run_status_payload(&snapshot, None);
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_detach",
+        "run_detached",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(json!({
+        "id": run_id,
+        "object": "run.detach",
+        "detached": true,
+        "disconnect_policy": "detach",
+        "cancel_on_disconnect": false,
+        "reason": reason,
+        "run": status,
+    }))
+    .into_response())
+}
+
+/// Handles `POST /v1/runs/{run_id}/approval`.
+///
+/// # Errors
+/// Returns an error response when authorization, approval ownership, decision
+/// validation, conflict checks, or approval persistence fails.
+pub(crate) async fn compat_run_approval_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(payload): Json<CompatRunApprovalRequest>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal, device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let snapshot =
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?;
+    let decision = parse_compat_run_approval_decision(&payload)?;
+    let decision_scope = parse_compat_approval_decision_scope(payload.decision_scope.as_deref())?;
+    validate_compat_approval_ttl(decision_scope, payload.decision_scope_ttl_ms)?;
+    let reason =
+        compat_approval_reason(payload.reason.clone(), decision, "compat_runs_approval_decision");
+    let approval = load_compat_run_approval_target(
+        &state,
+        &payload,
+        run_id.as_str(),
+        owner_principal.as_str(),
+    )
+    .await?;
+
+    if let Some(existing_decision) = approval.decision {
+        return compat_resolved_approval_replay_response(
+            &state,
+            &token,
+            run_id,
+            &approval,
+            existing_decision,
+            decision,
+            now,
+        )
+        .await;
+    }
+    ensure_compat_approval_expected_version(&approval, payload.expected_version)?;
+    if compat_approval_is_expired(&approval, now) {
+        return Err(compat_error_response(
+            StatusCode::GONE,
+            "invalid_request_error",
+            "approval_expired",
+            "approval prompt expired before the public runs API decision was received",
+        ));
+    }
+    if decision == journal::ApprovalDecision::Allow && snapshot.cancel_requested {
+        return Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "approval_abort_race",
+            "approval allow raced with an already requested run stop",
+        ));
+    }
+
+    let resolved = state
+        .runtime
+        .resolve_approval_record(journal::ApprovalResolveRequest {
+            approval_id: approval.approval_id.clone(),
+            decision,
+            decision_scope,
+            decision_reason: reason.clone(),
+            decision_scope_ttl_ms: payload.decision_scope_ttl_ms,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let context = RequestContext {
+        principal: owner_principal.clone(),
+        device_id,
+        channel: Some(COMPAT_API_CHANNEL.to_owned()),
+    };
+    crate::application::approvals::record_approval_resolved_journal_event(
+        &state.runtime,
+        &context,
+        resolved.session_id.as_str(),
+        resolved.run_id.as_str(),
+        None,
+        resolved.approval_id.as_str(),
+        decision,
+        decision_scope,
+        payload.decision_scope_ttl_ms,
+        reason.as_str(),
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    let status =
+        load_compat_run_status_payload(&state, run_id.as_str(), owner_principal.as_str()).await?;
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_approval",
+        "approval_resolved",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(json!({
+        "id": run_id,
+        "object": "run.approval",
+        "approval": compat_run_approval_payload(&resolved),
+        "run": status,
+        "_palyra": {
+            "idempotent_replay": false,
+        },
+    }))
+    .into_response())
 }
 
 /// Handles `GET /v1/responses/{response_id}`.
@@ -955,12 +1242,21 @@ fn authorize_compat_response_record_access(
     headers: &HeaderMap,
     now: i64,
 ) -> CompatHttpResult<(AuthenticatedApiToken, String)> {
+    let (token, principal, _) = authorize_compat_run_access(state, headers, now)?;
+    Ok((token, principal))
+}
+
+fn authorize_compat_run_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    now: i64,
+) -> CompatHttpResult<(AuthenticatedApiToken, String, String)> {
     let token =
         authorize_compat_api_token(state, headers, PERMISSION_COMPAT_RESPONSES_CREATE, None, now)?;
     enforce_compat_rate_limit(state, token.token_id.as_str(), token.rate_limit_per_minute)?;
-    let (principal, _) =
+    let (principal, device_id) =
         resolve_compat_runtime_identity(state, &token, PERMISSION_COMPAT_RESPONSES_CREATE)?;
-    Ok((token, principal))
+    Ok((token, principal, device_id))
 }
 
 fn compat_idempotency_key(headers: &HeaderMap) -> CompatHttpResult<Option<String>> {
@@ -1478,6 +1774,322 @@ async fn load_compat_pending_approval_for_run(
     Ok(approvals
         .into_iter()
         .find(|approval| approval.run_id == run_id && approval.decision.is_none()))
+}
+
+async fn load_compat_run_approval_target(
+    state: &AppState,
+    payload: &CompatRunApprovalRequest,
+    run_id: &str,
+    owner_principal: &str,
+) -> Result<journal::ApprovalRecord, Response> {
+    if let Some(approval_id) =
+        payload.approval_id.as_ref().and_then(|value| trim_to_option(value.clone()))
+    {
+        validate_canonical_id(approval_id.as_str()).map_err(|_| {
+            compat_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_approval_id",
+                "approval_id must be a canonical ULID",
+            )
+        })?;
+        let approval = state
+            .runtime
+            .approval_record(approval_id.clone())
+            .await
+            .map_err(runtime_status_response)?
+            .ok_or_else(|| compat_approval_not_found_response(run_id))?;
+        if approval.run_id != run_id || approval.principal != owner_principal {
+            return Err(compat_approval_not_found_response(run_id));
+        }
+        return Ok(approval);
+    }
+
+    load_compat_pending_approval_for_run(state, run_id, owner_principal)
+        .await?
+        .ok_or_else(|| compat_approval_not_found_response(run_id))
+}
+
+fn parse_compat_run_stop_mode(raw: Option<&str>) -> CompatHttpResult<&'static str> {
+    let Some(mode) = raw.and_then(|value| trim_to_option(value.to_owned())) else {
+        return Ok("cancel");
+    };
+    match mode.to_ascii_lowercase().as_str() {
+        "cancel" | "graceful" | "cooperative" => Ok("cancel"),
+        _ => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_stop_mode",
+            "mode must be omitted or one of cancel|graceful|cooperative",
+        )
+        .into()),
+    }
+}
+
+fn parse_compat_run_cleanup_policy(raw: Option<&str>) -> CompatHttpResult<&'static str> {
+    let Some(policy) = raw.and_then(|value| trim_to_option(value.to_owned())) else {
+        return Ok("runtime_default");
+    };
+    match policy.to_ascii_lowercase().as_str() {
+        "runtime_default" | "default" => Ok("runtime_default"),
+        "none" | "noop" => Ok("none"),
+        _ => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_cleanup_policy",
+            "cleanup_policy must be omitted or one of runtime_default|default|none|noop",
+        )
+        .into()),
+    }
+}
+
+fn parse_compat_run_approval_decision(
+    payload: &CompatRunApprovalRequest,
+) -> CompatHttpResult<journal::ApprovalDecision> {
+    let text_decision = payload
+        .action
+        .as_ref()
+        .or(payload.decision.as_ref())
+        .and_then(|value| trim_to_option(value.clone()))
+        .map(|value| parse_compat_run_approval_decision_text(value.as_str()))
+        .transpose()?;
+    let bool_decision = payload.approved.map(|approved| {
+        if approved {
+            journal::ApprovalDecision::Allow
+        } else {
+            journal::ApprovalDecision::Deny
+        }
+    });
+    match (text_decision, bool_decision) {
+        (Some(text), Some(from_bool)) if text != from_bool => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "conflicting_approval_decision",
+            "approved conflicts with action/decision",
+        )
+        .into()),
+        (Some(decision), _) | (None, Some(decision)) => Ok(decision),
+        (None, None) => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "missing_approval_decision",
+            "approval request requires action, decision, or approved",
+        )
+        .into()),
+    }
+}
+
+fn parse_compat_run_approval_decision_text(
+    value: &str,
+) -> CompatHttpResult<journal::ApprovalDecision> {
+    match value.to_ascii_lowercase().as_str() {
+        "approve" | "allow" | "approved" => Ok(journal::ApprovalDecision::Allow),
+        "deny" | "reject" | "rejected" => Ok(journal::ApprovalDecision::Deny),
+        "timeout" | "timed_out" => Ok(journal::ApprovalDecision::Timeout),
+        "modify" | "modified" => Err(compat_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_error",
+            "approval_modify_unsupported",
+            "approval modify is not supported by the current Palyra approval store; approve, deny, or timeout explicitly",
+        )
+        .into()),
+        _ => Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_approval_decision",
+            "approval decision must be approve|allow|deny|reject|timeout",
+        )
+        .into()),
+    }
+}
+
+fn parse_compat_approval_decision_scope(
+    raw: Option<&str>,
+) -> CompatHttpResult<journal::ApprovalDecisionScope> {
+    let Some(scope) = raw.and_then(|value| trim_to_option(value.to_owned())) else {
+        return Ok(journal::ApprovalDecisionScope::Once);
+    };
+    journal::ApprovalDecisionScope::from_str(scope.to_ascii_lowercase().as_str()).ok_or_else(|| {
+        compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_decision_scope",
+            "decision_scope must be omitted or one of once|session|timeboxed",
+        )
+        .into()
+    })
+}
+
+fn validate_compat_approval_ttl(
+    scope: journal::ApprovalDecisionScope,
+    ttl_ms: Option<i64>,
+) -> CompatHttpResult<()> {
+    if ttl_ms.is_some_and(|value| value <= 0) {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_decision_scope_ttl",
+            "decision_scope_ttl_ms must be greater than zero when provided",
+        )
+        .into());
+    }
+    if scope == journal::ApprovalDecisionScope::Timeboxed && ttl_ms.is_none() {
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "missing_decision_scope_ttl",
+            "timeboxed approval decisions require decision_scope_ttl_ms",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_compat_approval_expected_version(
+    approval: &journal::ApprovalRecord,
+    expected_version: Option<u64>,
+) -> CompatHttpResult<()> {
+    let Some(expected_version) = expected_version else {
+        return Ok(());
+    };
+    if u64::try_from(approval.updated_at_unix_ms).ok() == Some(expected_version) {
+        return Ok(());
+    }
+    Err(compat_error_response(
+        StatusCode::CONFLICT,
+        "invalid_request_error",
+        "approval_version_conflict",
+        "approval version changed before the public runs API decision",
+    )
+    .into())
+}
+
+fn compat_approval_is_expired(approval: &journal::ApprovalRecord, now: i64) -> bool {
+    if approval.prompt.timeout_seconds == 0 {
+        return false;
+    }
+    let timeout_ms = i64::from(approval.prompt.timeout_seconds).saturating_mul(1_000);
+    now > approval.requested_at_unix_ms.saturating_add(timeout_ms)
+}
+
+fn compat_approval_reason(
+    raw_reason: Option<String>,
+    decision: journal::ApprovalDecision,
+    default_prefix: &str,
+) -> String {
+    raw_reason
+        .and_then(trim_to_option)
+        .unwrap_or_else(|| format!("{default_prefix}:{}", decision.as_str()))
+}
+
+async fn compat_resolved_approval_replay_response(
+    state: &AppState,
+    token: &AuthenticatedApiToken,
+    run_id: String,
+    approval: &journal::ApprovalRecord,
+    existing_decision: journal::ApprovalDecision,
+    requested_decision: journal::ApprovalDecision,
+    now: i64,
+) -> Result<Response, Response> {
+    if existing_decision != requested_decision {
+        return Err(compat_error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "approval_already_resolved",
+            "approval has already reached a different terminal decision",
+        ));
+    }
+    let status =
+        load_compat_run_status_payload(state, run_id.as_str(), approval.principal.as_str()).await?;
+    touch_compat_api_token(
+        state,
+        token.token_id.as_str(),
+        "runs_approval",
+        "approval_replayed",
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(json!({
+        "id": run_id,
+        "object": "run.approval",
+        "approval": compat_run_approval_payload(approval),
+        "run": status,
+        "_palyra": {
+            "idempotent_replay": true,
+        },
+    }))
+    .into_response())
+}
+
+fn compat_run_approval_payload(approval: &journal::ApprovalRecord) -> Value {
+    json!({
+        "approval_id": approval.approval_id,
+        "run_id": approval.run_id,
+        "session_id": approval.session_id,
+        "subject_type": approval.subject_type.as_str(),
+        "subject_id": approval.subject_id,
+        "request_summary": approval.request_summary,
+        "risk_level": approval.prompt.risk_level.as_str(),
+        "requested_at_unix_ms": approval.requested_at_unix_ms,
+        "resolved_at_unix_ms": approval.resolved_at_unix_ms,
+        "decision": approval.decision.map(|decision| decision.as_str()),
+        "decision_scope": approval.decision_scope.map(|scope| scope.as_str()),
+        "decision_reason": approval.decision_reason,
+        "decision_scope_ttl_ms": approval.decision_scope_ttl_ms,
+        "version": approval.updated_at_unix_ms,
+    })
+}
+
+async fn record_compat_run_flow_audit(
+    state: &AppState,
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+    principal: &str,
+    device_id: &str,
+    reason: &str,
+    details: Value,
+    observed_at_unix_ms: i64,
+) -> Result<(), Response> {
+    let context = RequestContext {
+        principal: principal.to_owned(),
+        device_id: device_id.to_owned(),
+        channel: Some(COMPAT_API_CHANNEL.to_owned()),
+    };
+    let payload = RuntimeDecisionPayload::new(
+        RuntimeDecisionEventType::FlowLifecycle,
+        RuntimeDecisionActor::new(
+            RuntimeDecisionActorKind::Operator,
+            principal,
+            device_id,
+            Some(COMPAT_API_CHANNEL.to_owned()),
+        ),
+        reason,
+        "compat.runs.lifecycle.v1",
+        RuntimeDecisionTiming::observed(observed_at_unix_ms),
+    )
+    .with_input(
+        RuntimeEntityRef::new("target", "run", snapshot.run_id.clone())
+            .with_state(snapshot.state.clone()),
+    )
+    .with_details(details);
+    state
+        .runtime
+        .record_runtime_decision_event(
+            &context,
+            Some(snapshot.session_id.as_str()),
+            Some(snapshot.run_id.as_str()),
+            payload,
+        )
+        .await
+        .map_err(runtime_status_response)
+}
+
+fn compat_approval_not_found_response(run_id: &str) -> Response {
+    compat_error_response(
+        StatusCode::NOT_FOUND,
+        "invalid_request_error",
+        "approval_not_found",
+        format!("no pending approval was found for run '{run_id}'"),
+    )
 }
 
 fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -> Value {
@@ -4502,5 +5114,98 @@ mod tests {
             !encoded.contains("raw-command") && !encoded.contains("raw-details"),
             "approval SSE payload must not contain raw approval input details: {encoded}"
         );
+    }
+
+    #[test]
+    fn run_approval_validation_accepts_supported_decisions_and_rejects_unsafe_forms() {
+        let allow = CompatRunApprovalRequest {
+            action: Some("approve".to_owned()),
+            decision: None,
+            approved: Some(true),
+            approval_id: None,
+            reason: None,
+            decision_scope: Some("once".to_owned()),
+            decision_scope_ttl_ms: None,
+            expected_version: None,
+        };
+        assert_eq!(
+            parse_compat_run_approval_decision(&allow)
+                .unwrap_or_else(|_| panic!("approve should parse")),
+            journal::ApprovalDecision::Allow
+        );
+        assert_eq!(
+            parse_compat_approval_decision_scope(allow.decision_scope.as_deref())
+                .unwrap_or_else(|_| panic!("once scope should parse")),
+            journal::ApprovalDecisionScope::Once
+        );
+
+        let deny = CompatRunApprovalRequest {
+            action: Some("deny".to_owned()),
+            decision: None,
+            approved: Some(false),
+            approval_id: None,
+            reason: None,
+            decision_scope: Some("session".to_owned()),
+            decision_scope_ttl_ms: None,
+            expected_version: None,
+        };
+        assert_eq!(
+            parse_compat_run_approval_decision(&deny)
+                .unwrap_or_else(|_| panic!("deny should parse")),
+            journal::ApprovalDecision::Deny
+        );
+
+        let timeout = CompatRunApprovalRequest {
+            action: Some("timeout".to_owned()),
+            decision: None,
+            approved: None,
+            approval_id: None,
+            reason: None,
+            decision_scope: Some("timeboxed".to_owned()),
+            decision_scope_ttl_ms: Some(60_000),
+            expected_version: None,
+        };
+        let timeout_scope = parse_compat_approval_decision_scope(timeout.decision_scope.as_deref())
+            .unwrap_or_else(|_| panic!("timeboxed scope should parse"));
+        assert_eq!(
+            parse_compat_run_approval_decision(&timeout)
+                .unwrap_or_else(|_| panic!("timeout should parse")),
+            journal::ApprovalDecision::Timeout
+        );
+        validate_compat_approval_ttl(timeout_scope, timeout.decision_scope_ttl_ms)
+            .unwrap_or_else(|_| panic!("timeboxed scope with ttl should pass"));
+
+        let conflicting = CompatRunApprovalRequest {
+            action: Some("approve".to_owned()),
+            decision: None,
+            approved: Some(false),
+            approval_id: None,
+            reason: None,
+            decision_scope: None,
+            decision_scope_ttl_ms: None,
+            expected_version: None,
+        };
+        assert!(
+            parse_compat_run_approval_decision(&conflicting).is_err(),
+            "conflicting approved/action inputs must fail closed"
+        );
+
+        let modify = CompatRunApprovalRequest {
+            action: Some("modify".to_owned()),
+            decision: None,
+            approved: None,
+            approval_id: None,
+            reason: None,
+            decision_scope: None,
+            decision_scope_ttl_ms: None,
+            expected_version: None,
+        };
+        assert!(
+            parse_compat_run_approval_decision(&modify).is_err(),
+            "modify is unsupported until the approval store can persist safe input deltas"
+        );
+
+        validate_compat_approval_ttl(journal::ApprovalDecisionScope::Timeboxed, None)
+            .expect_err("timeboxed approvals require an explicit ttl");
     }
 }

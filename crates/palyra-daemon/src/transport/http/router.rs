@@ -1630,6 +1630,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/v1/runs", post(compat::compat_runs_create_handler))
         .route("/v1/runs/{run_id}", get(compat::compat_run_get_handler))
         .route("/v1/runs/{run_id}/events", get(compat::compat_run_events_handler))
+        .route("/v1/runs/{run_id}/stop", post(compat::compat_run_stop_handler))
+        .route("/v1/runs/{run_id}/detach", post(compat::compat_run_detach_handler))
+        .route("/v1/runs/{run_id}/approval", post(compat::compat_run_approval_handler))
         .route("/v1/tools/invoke", post(compat::compat_tools_invoke_handler))
         .layer(DefaultBodyLimit::max(HTTP_MAX_REQUEST_BODY_BYTES))
         .route_layer(middleware::from_fn(

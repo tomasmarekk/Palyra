@@ -1339,6 +1339,102 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         "all public run events should carry the requested run correlation"
     );
 
+    let (detach_status, detach_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/detach").as_str(),
+        token.as_str(),
+        &json!({ "reason": "test client closed stream" }),
+    )?;
+    assert_eq!(detach_status, 200, "run detach should be accepted: {detach_response}");
+    assert_eq!(detach_response.get("object").and_then(Value::as_str), Some("run.detach"));
+    assert_eq!(detach_response.get("detached").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        detach_response.get("cancel_on_disconnect").and_then(Value::as_bool),
+        Some(false),
+        "detach must not cancel the underlying run"
+    );
+
+    let (approval_missing_status, approval_missing_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/approval").as_str(),
+        token.as_str(),
+        &json!({ "action": "approve", "decision_scope": "once" }),
+    )?;
+    assert_eq!(
+        approval_missing_status, 404,
+        "approval decision without a pending approval should be explicit: {approval_missing_response}"
+    );
+    assert_eq!(
+        approval_missing_response.pointer("/error/code").and_then(Value::as_str),
+        Some("approval_not_found")
+    );
+
+    let (modify_status, modify_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/approval").as_str(),
+        token.as_str(),
+        &json!({ "action": "modify" }),
+    )?;
+    assert_eq!(modify_status, 422, "modify must fail closed: {modify_response}");
+    assert_eq!(
+        modify_response.pointer("/error/code").and_then(Value::as_str),
+        Some("approval_modify_unsupported")
+    );
+
+    let stop_create_payload = json!({
+        "input": "run stop API text",
+        "session": {
+            "label": "Runs stop integration"
+        }
+    });
+    let (stop_create_status, stop_create_response) =
+        compat_post_json(&client, admin_port, "/v1/runs", token.as_str(), &stop_create_payload)?;
+    assert_eq!(
+        stop_create_status, 200,
+        "run create before stop should be accepted: {stop_create_response}"
+    );
+    let stop_run_id = stop_create_response
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("stop run create response missing id"))?
+        .to_owned();
+    let _visible_stop_run =
+        wait_for_compat_run_visible(&client, admin_port, token.as_str(), stop_run_id.as_str())?;
+    let (stop_status, stop_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{stop_run_id}/stop").as_str(),
+        token.as_str(),
+        &json!({
+            "reason": "integration requested stop",
+            "mode": "graceful",
+            "cleanup_policy": "none"
+        }),
+    )?;
+    assert_eq!(stop_status, 200, "run stop should be accepted: {stop_response}");
+    assert_eq!(stop_response.get("object").and_then(Value::as_str), Some("run.stop"));
+    assert_eq!(stop_response.get("mode").and_then(Value::as_str), Some("cancel"));
+    assert_eq!(stop_response.get("cleanup_policy").and_then(Value::as_str), Some("none"));
+    if stop_response.get("stopped").and_then(Value::as_bool) == Some(true) {
+        assert_eq!(
+            stop_response.pointer("/run/status").and_then(Value::as_str),
+            Some("cancelled"),
+            "accepted stop should publish cancelled run status"
+        );
+    }
+    let stopped_terminal =
+        wait_for_compat_run_terminal(&client, admin_port, token.as_str(), stop_run_id.as_str())?;
+    assert!(
+        stopped_terminal
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "cancelled" | "completed")),
+        "stopped run should be terminal without failing: {stopped_terminal}"
+    );
+
     Ok(())
 }
 
@@ -3133,6 +3229,26 @@ fn wait_for_compat_run_terminal(
         }
         if Instant::now() >= deadline {
             anyhow::bail!("compat run {run_id} did not reach a terminal state: {payload}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_compat_run_visible(
+    client: &Client,
+    admin_port: u16,
+    token: &str,
+    run_id: &str,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, payload) =
+            compat_get_json(client, admin_port, format!("/v1/runs/{run_id}").as_str(), token)?;
+        if status == 200 {
+            return Ok(payload);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("compat run {run_id} did not become visible: {payload}");
         }
         thread::sleep(Duration::from_millis(100));
     }
