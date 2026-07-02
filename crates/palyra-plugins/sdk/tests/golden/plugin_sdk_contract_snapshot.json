@@ -1,0 +1,605 @@
+{
+  "changelog_note": "Initial plugin SDK contract snapshot; breaking changes require an ABI migration note.",
+  "compatibility_policy": {
+    "breaking_change_requires_migration_note": true,
+    "breaking_change_requires_version_bump": true,
+    "enum_changes_are_additive_without_major_bump": true
+  },
+  "host_capability_services": [
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 250,
+      "max_payload_bytes": 8192,
+      "redacted_fields": [],
+      "returns_secret_material": false,
+      "service": "logging"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 250,
+      "max_payload_bytes": 8192,
+      "redacted_fields": [],
+      "returns_secret_material": false,
+      "service": "events"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 500,
+      "max_payload_bytes": 16384,
+      "redacted_fields": [
+        "config.default_value"
+      ],
+      "returns_secret_material": false,
+      "service": "config_lookup"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 32768,
+      "redacted_fields": [
+        "task.payload"
+      ],
+      "required_capability_class": "storage_prefixes",
+      "returns_secret_material": false,
+      "service": "tasks_create"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 32768,
+      "redacted_fields": [
+        "task.payload"
+      ],
+      "required_capability_class": "storage_prefixes",
+      "returns_secret_material": false,
+      "service": "tasks_update"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 500,
+      "max_payload_bytes": 16384,
+      "redacted_fields": [
+        "flow.context"
+      ],
+      "returns_secret_material": false,
+      "service": "flow_signal"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 32768,
+      "redacted_fields": [
+        "message.body"
+      ],
+      "required_capability_class": "channels",
+      "returns_secret_material": false,
+      "service": "channel_send_intent"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 32768,
+      "redacted_fields": [
+        "candidate.content"
+      ],
+      "required_capability_class": "storage_prefixes",
+      "returns_secret_material": false,
+      "service": "memory_propose_candidate"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 2000,
+      "max_payload_bytes": 65536,
+      "redacted_fields": [
+        "prompt",
+        "completion.preview"
+      ],
+      "required_capability_class": "http_hosts",
+      "returns_secret_material": false,
+      "service": "bounded_llm_complete"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 8192,
+      "redacted_fields": [
+        "secret.ref",
+        "lease.metadata"
+      ],
+      "required_capability_class": "secrets",
+      "returns_secret_material": false,
+      "service": "vault_secret_lease_request"
+    }
+  ],
+  "schema_version": 1,
+  "sdk_abi_major": 1,
+  "sdk_abi_max_major": 1,
+  "sdk_abi_min_major": 1,
+  "sdk_abi_version": "palyra.plugins.sdk.abi.v1",
+  "snapshot_version": "plugin-sdk-contracts.v1",
+  "typed_contracts": [
+    {
+      "allowed_capability_classes": [
+        "http_hosts",
+        "secrets",
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "binding.negotiated",
+        "memory.embedding_runtime",
+        "memory.embedding_failure"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "embed_request_failed",
+        "invalid_embedding_dimensions",
+        "degraded_fallback_active"
+      ],
+      "input_schema": "palyra.plugin.memory_provider.input.v1",
+      "kind": "memory_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "memory.embedding_runtime",
+        "memory.embedding_backfill",
+        "memory.embedding_degradation"
+      ],
+      "operations": [
+        "provide_memory"
+      ],
+      "output_schema": "palyra.plugin.memory_provider.output.v1",
+      "redacted_fields": [
+        "config.credentials",
+        "request.input_text",
+        "response.embedding_preview"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "http_hosts",
+        "secrets",
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "binding.negotiated",
+        "context.plan",
+        "context.segment_drop"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "context_plan_failed",
+        "segment_budget_exceeded",
+        "segment_redaction_required"
+      ],
+      "input_schema": "palyra.plugin.context_engine.input.v1",
+      "kind": "context_engine",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "context.plan",
+        "context.compaction",
+        "context.recall_mix"
+      ],
+      "operations": [
+        "plan_context"
+      ],
+      "output_schema": "palyra.plugin.context_engine.output.v1",
+      "redacted_fields": [
+        "context.segment.preview",
+        "context.compaction.summary",
+        "context.references.inline"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "http_hosts",
+        "secrets",
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "binding.negotiated",
+        "routing.decision",
+        "routing.budget_gate"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "routing_decision_failed",
+        "budget_gate_blocked",
+        "provider_selection_rejected"
+      ],
+      "input_schema": "palyra.plugin.routing_strategy.input.v1",
+      "kind": "routing_strategy",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "routing.decision",
+        "routing.model_mix",
+        "routing.provider_health"
+      ],
+      "operations": [
+        "route_model"
+      ],
+      "output_schema": "palyra.plugin.routing_strategy.output.v1",
+      "redacted_fields": [
+        "routing.prompt_preview",
+        "routing.provider_credentials",
+        "routing.override_payload"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [],
+      "audit_hooks": [
+        "hook.dispatched",
+        "hook.failed",
+        "hook.decision"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "hook_timeout",
+        "hook_panic",
+        "terminal_decision_conflict"
+      ],
+      "input_schema": "palyra.plugin.run_lifecycle_hook.input.v1",
+      "kind": "run_lifecycle_hook",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "hook.latency",
+        "hook.terminal_decision"
+      ],
+      "operations": [
+        "decide_run_lifecycle"
+      ],
+      "output_schema": "palyra.plugin.run_lifecycle_hook.decision.v1",
+      "redacted_fields": [
+        "hook.payload.preview",
+        "hook.decision.reason"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "http_hosts",
+        "secrets",
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "compaction.provider_invoked",
+        "compaction.provider_failed"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "compaction_budget_exceeded",
+        "compaction_output_invalid"
+      ],
+      "input_schema": "palyra.plugin.compaction_provider.input.v1",
+      "kind": "compaction_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "compaction.provider_latency"
+      ],
+      "operations": [
+        "compact_context"
+      ],
+      "output_schema": "palyra.plugin.compaction_provider.output.v1",
+      "redacted_fields": [
+        "compaction.input.preview",
+        "compaction.output.summary"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "diagnostics.provider_invoked"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "diagnostics_redaction_required",
+        "diagnostics_output_invalid"
+      ],
+      "input_schema": "palyra.plugin.diagnostics_provider.input.v1",
+      "kind": "diagnostics_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "diagnostics.provider_latency"
+      ],
+      "operations": [
+        "emit_diagnostics"
+      ],
+      "output_schema": "palyra.plugin.diagnostics_provider.output.v1",
+      "redacted_fields": [
+        "diagnostics.raw_payload",
+        "diagnostics.secret_like_values"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [],
+      "audit_hooks": [
+        "policy.signal.provider_invoked"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "policy_signal_invalid"
+      ],
+      "input_schema": "palyra.plugin.policy_signal_provider.input.v1",
+      "kind": "policy_signal_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "policy.signal.count"
+      ],
+      "operations": [
+        "emit_policy_signal"
+      ],
+      "output_schema": "palyra.plugin.policy_signal_provider.output.v1",
+      "redacted_fields": [
+        "policy.signal.context"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "channels"
+      ],
+      "audit_hooks": [
+        "binding.provider_invoked",
+        "binding.repair_hint"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "binding_collision",
+        "binding_validation_failed"
+      ],
+      "input_schema": "palyra.plugin.channel_binding_provider.input.v1",
+      "kind": "channel_binding_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "binding.provider_latency"
+      ],
+      "operations": [
+        "discover_binding",
+        "validate_binding",
+        "repair_binding_hint",
+        "explain_binding"
+      ],
+      "output_schema": "palyra.plugin.channel_binding_provider.output.v1",
+      "redacted_fields": [
+        "binding.external_identity"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "internal",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "channels"
+      ],
+      "audit_hooks": [
+        "delivery.adapter_invoked",
+        "delivery.receipt"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "delivery_ack_unknown",
+        "delivery_duplicate_ack",
+        "delivery_nack"
+      ],
+      "input_schema": "palyra.plugin.delivery_adapter.input.v1",
+      "kind": "delivery_adapter",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "delivery.latency",
+        "delivery.retry_class"
+      ],
+      "operations": [
+        "deliver_message"
+      ],
+      "output_schema": "palyra.plugin.delivery_adapter.receipt.v1",
+      "redacted_fields": [
+        "delivery.message_preview"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "storage_prefixes"
+      ],
+      "audit_hooks": [
+        "scheduler.provider_invoked"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "scheduler_task_invalid",
+        "wake_gate_denied"
+      ],
+      "input_schema": "palyra.plugin.scheduler_task_provider.input.v1",
+      "kind": "scheduler_task_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "scheduler.task_count"
+      ],
+      "operations": [
+        "schedule_task"
+      ],
+      "output_schema": "palyra.plugin.scheduler_task_provider.output.v1",
+      "redacted_fields": [
+        "scheduler.task_payload"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "internal",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "secrets"
+      ],
+      "audit_hooks": [
+        "model_auth.provider_invoked"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "credential_handle_missing",
+        "rate_limit_metadata_invalid"
+      ],
+      "input_schema": "palyra.plugin.model_auth_provider.input.v1",
+      "kind": "model_auth_provider",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "model_auth.rate_limit"
+      ],
+      "operations": [
+        "resolve_model_auth"
+      ],
+      "output_schema": "palyra.plugin.model_auth_provider.output.v1",
+      "redacted_fields": [
+        "model_auth.credential_handle"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "secret",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [
+        "http_hosts",
+        "secrets",
+        "storage_prefixes",
+        "channels"
+      ],
+      "audit_hooks": [
+        "connector.adapter_invoked",
+        "connector.binding_discovered"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "connector_reconnect_failed",
+        "connector_duplicate_inbound",
+        "connector_delivery_nack"
+      ],
+      "input_schema": "palyra.plugin.connector_adapter.input.v1",
+      "kind": "connector_adapter",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "connector.rate_limit",
+        "connector.delivery_latency"
+      ],
+      "operations": [
+        "connector_inbound",
+        "connector_outbound",
+        "connector_rate_limit",
+        "discover_binding"
+      ],
+      "output_schema": "palyra.plugin.connector_adapter.output.v1",
+      "redacted_fields": [
+        "connector.inbound.body",
+        "connector.outbound.body",
+        "connector.auth.handle"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    }
+  ],
+  "wit_package_id": "palyra:plugins/sdk@0.1.0"
+}

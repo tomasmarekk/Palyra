@@ -50,6 +50,10 @@ pub const WIT_SOURCE: &str = include_str!("../wit/palyra-sdk.wit");
 pub const DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION: u32 = 1;
 /// Default per-invocation timeout for typed plugin contracts.
 pub const DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS: u64 = 2_000;
+/// Schema version for the public plugin SDK contract snapshot.
+pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Version identifier for the current plugin SDK contract snapshot.
+pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION: &str = "plugin-sdk-contracts.v1";
 
 /// Typed plugin extension points the host can negotiate.
 ///
@@ -172,6 +176,46 @@ pub struct HostCapabilityServiceDescriptor {
     pub redacted_fields: Vec<String>,
     /// Whether the service can return raw secret material.
     pub returns_secret_material: bool,
+}
+
+/// Compatibility policy attached to the plugin SDK contract snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSdkCompatibilityPolicy {
+    /// Whether breaking SDK ABI changes must bump the snapshot version.
+    pub breaking_change_requires_version_bump: bool,
+    /// Whether breaking SDK ABI changes must include a migration note.
+    pub breaking_change_requires_migration_note: bool,
+    /// Whether new public enum values must be additive unless the ABI major changes.
+    pub enum_changes_are_additive_without_major_bump: bool,
+}
+
+/// Public plugin SDK contract snapshot consumed by daemon diagnostics and CI gates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSdkContractSnapshot {
+    /// Snapshot schema version.
+    pub schema_version: u32,
+    /// Version identifier for this snapshot payload.
+    pub snapshot_version: String,
+    /// Operator-readable note explaining the latest compatibility posture.
+    pub changelog_note: String,
+    /// Compatibility rules applied when this snapshot changes.
+    pub compatibility_policy: PluginSdkCompatibilityPolicy,
+    /// WIT package identifier published by this SDK.
+    pub wit_package_id: String,
+    /// Host/plugin ABI marker independent from the crate package version.
+    pub sdk_abi_version: String,
+    /// Current SDK ABI major version.
+    pub sdk_abi_major: u32,
+    /// Oldest accepted SDK ABI major version.
+    pub sdk_abi_min_major: u32,
+    /// Newest accepted SDK ABI major version.
+    pub sdk_abi_max_major: u32,
+    /// Built-in typed plugin contracts exposed by the host.
+    pub typed_contracts: Vec<TypedPluginContractDescriptor>,
+    /// Capability-scoped host service descriptors exposed to plugins.
+    pub host_capability_services: Vec<HostCapabilityServiceDescriptor>,
 }
 
 /// Sensitivity classification applied to a contract's payload data.
@@ -853,6 +897,52 @@ pub fn supported_host_capability_services() -> Vec<HostCapabilityServiceDescript
     .collect()
 }
 
+/// Returns the public plugin SDK contract snapshot used by runtime contract gates.
+#[must_use]
+pub fn plugin_sdk_contract_snapshot() -> PluginSdkContractSnapshot {
+    PluginSdkContractSnapshot {
+        schema_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION.to_owned(),
+        changelog_note:
+            "Initial plugin SDK contract snapshot; breaking changes require an ABI migration note."
+                .to_owned(),
+        compatibility_policy: PluginSdkCompatibilityPolicy {
+            breaking_change_requires_version_bump: true,
+            breaking_change_requires_migration_note: true,
+            enum_changes_are_additive_without_major_bump: true,
+        },
+        wit_package_id: wit_package_id().to_owned(),
+        sdk_abi_version: sdk_abi_version().to_owned(),
+        sdk_abi_major: SDK_ABI_MAJOR,
+        sdk_abi_min_major: SDK_ABI_MIN_MAJOR,
+        sdk_abi_max_major: SDK_ABI_MAX_MAJOR,
+        typed_contracts: supported_typed_plugin_contracts(),
+        host_capability_services: supported_host_capability_services(),
+    }
+}
+
+/// Returns a line-oriented ABI snapshot used for a compact typed-contract fingerprint.
+#[must_use]
+pub fn typed_contract_abi_snapshot() -> String {
+    let mut lines = vec![format!(
+        "package={}|abi={}|range={}..{}",
+        wit_package_id(),
+        sdk_abi_version(),
+        sdk_abi_compatibility().min_abi_major,
+        sdk_abi_compatibility().max_abi_major
+    )];
+    for descriptor in supported_typed_plugin_contracts() {
+        lines.push(descriptor_abi_line(&descriptor));
+    }
+    lines.join("\n")
+}
+
+/// Returns the stable fingerprint for the current typed plugin ABI snapshot.
+#[must_use]
+pub fn typed_contract_abi_fingerprint() -> u64 {
+    stable_fingerprint(typed_contract_abi_snapshot().as_str())
+}
+
 /// Returns the descriptor for one capability-scoped host service.
 #[must_use]
 pub fn host_capability_service_descriptor(
@@ -909,6 +999,50 @@ pub fn host_capability_service_descriptor(
         redacted_fields,
         returns_secret_material: false,
     }
+}
+
+fn descriptor_abi_line(descriptor: &TypedPluginContractDescriptor) -> String {
+    format!(
+        "{}|v{}|abi{}|timeout{}|sensitivity={}|input={}|output={}|lifecycle={}|ops={}|caps={}|errors={}|redacted={}|audit={}|obs={}",
+        descriptor.kind.as_str(),
+        descriptor.version,
+        descriptor.sdk_abi_major,
+        descriptor.default_timeout_ms,
+        descriptor.sensitivity.as_str(),
+        descriptor.input_schema,
+        descriptor.output_schema,
+        descriptor
+            .lifecycle
+            .iter()
+            .map(|phase| phase.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        descriptor
+            .operations
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        descriptor
+            .allowed_capability_classes
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        descriptor.error_codes.join(","),
+        descriptor.redacted_fields.join(","),
+        descriptor.audit_hooks.join(","),
+        descriptor.observability_hooks.join(",")
+    )
+}
+
+fn stable_fingerprint(input: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    input
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME))
 }
 
 fn default_lifecycle() -> Vec<TypedPluginContractLifecyclePhase> {
@@ -972,10 +1106,11 @@ mod tests {
     use super::{
         all_typed_plugin_contract_kinds, built_in_sdk_contract_fixtures,
         default_typed_plugin_contract_version, host_capability_service_descriptor,
-        sdk_abi_compatibility, sdk_abi_version, simulate_sdk_contract_fixture,
-        supported_host_capability_services, supported_typed_plugin_contracts,
-        typed_plugin_contract_descriptor, wit_package_id, wit_source, HostCapabilityServiceKind,
-        TypedPluginCapabilityClass, TypedPluginContractDescriptor, TypedPluginContractKind,
+        plugin_sdk_contract_snapshot, sdk_abi_compatibility, sdk_abi_version,
+        simulate_sdk_contract_fixture, supported_host_capability_services,
+        supported_typed_plugin_contracts, typed_contract_abi_fingerprint,
+        typed_contract_abi_snapshot, typed_plugin_contract_descriptor, wit_package_id, wit_source,
+        HostCapabilityServiceKind, TypedPluginCapabilityClass, TypedPluginContractKind,
         TypedPluginContractOperation, HOST_CAPABILITIES_IMPORT_MODULE,
         HOST_CAPABILITY_CHANNEL_COUNT_FN, HOST_CAPABILITY_CHANNEL_HANDLE_FN,
         HOST_CAPABILITY_HTTP_COUNT_FN, HOST_CAPABILITY_HTTP_HANDLE_FN,
@@ -983,6 +1118,52 @@ mod tests {
         HOST_CAPABILITY_STORAGE_COUNT_FN, HOST_CAPABILITY_STORAGE_HANDLE_FN, SDK_ABI_MAJOR,
         WIT_WORLD_NAME,
     };
+    use serde_json::Value;
+
+    const EXPECTED_PLUGIN_SDK_CONTRACT_SNAPSHOT_JSON: &str =
+        include_str!("../tests/golden/plugin_sdk_contract_snapshot.json");
+    const PLUGIN_SDK_CONTRACT_SNAPSHOT_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/plugin_sdk_contract_snapshot.json");
+
+    fn pretty_json(value: &Value) -> String {
+        let mut encoded =
+            serde_json::to_string_pretty(value).expect("snapshot should serialize to json");
+        encoded.push('\n');
+        encoded
+    }
+
+    fn assert_snapshot_matches_golden(
+        label: &str,
+        actual: &Value,
+        expected: &str,
+        update_path: Option<&str>,
+    ) -> Result<(), String> {
+        let actual = pretty_json(actual);
+        if std::env::var_os("PALYRA_UPDATE_CONTRACT_SNAPSHOTS").is_some() {
+            if let Some(update_path) = update_path {
+                std::fs::write(update_path, actual.as_bytes())
+                    .map_err(|error| format!("failed to update {update_path}: {error}"))?;
+                return Ok(());
+            }
+        }
+        if actual == expected {
+            return Ok(());
+        }
+        let expected_lines = expected.lines().collect::<Vec<_>>();
+        let actual_lines = actual.lines().collect::<Vec<_>>();
+        let mismatch_index = expected_lines
+            .iter()
+            .zip(actual_lines.iter())
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| expected_lines.len().min(actual_lines.len()));
+        let expected_line = expected_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+        let actual_line = actual_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+
+        Err(format!(
+            "{label} changed at line {}.\nexpected: {expected_line}\nactual:   {actual_line}\nNext step: if this plugin SDK public contract change is intentional, update the matching golden snapshot, bump the changed snapshot_version, and include a changelog_note/migration note in the same change.\nFull actual snapshot:\n{actual}",
+            mismatch_index + 1
+        ))
+    }
 
     #[test]
     fn wit_package_id_is_stable() {
@@ -1095,67 +1276,27 @@ mod tests {
         const EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT: u64 = 0xf789_73f0_e89b_94ec;
         let snapshot = typed_contract_abi_snapshot();
         assert_eq!(
-            stable_fingerprint(snapshot.as_str()),
+            typed_contract_abi_fingerprint(),
             EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT,
             "typed contract ABI snapshot changed:\n{snapshot}"
         );
     }
 
-    fn typed_contract_abi_snapshot() -> String {
-        let mut lines = vec![format!(
-            "package={}|abi={}|range={}..{}",
-            wit_package_id(),
-            sdk_abi_version(),
-            sdk_abi_compatibility().min_abi_major,
-            sdk_abi_compatibility().max_abi_major
-        )];
-        for descriptor in supported_typed_plugin_contracts() {
-            lines.push(descriptor_abi_line(&descriptor));
-        }
-        lines.join("\n")
-    }
-
-    fn descriptor_abi_line(descriptor: &TypedPluginContractDescriptor) -> String {
-        format!(
-            "{}|v{}|abi{}|timeout{}|sensitivity={}|input={}|output={}|lifecycle={}|ops={}|caps={}|errors={}|redacted={}|audit={}|obs={}",
-            descriptor.kind.as_str(),
-            descriptor.version,
-            descriptor.sdk_abi_major,
-            descriptor.default_timeout_ms,
-            descriptor.sensitivity.as_str(),
-            descriptor.input_schema,
-            descriptor.output_schema,
-            descriptor
-                .lifecycle
-                .iter()
-                .map(|phase| phase.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            descriptor
-                .operations
-                .iter()
-                .map(|operation| operation.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            descriptor
-                .allowed_capability_classes
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            descriptor.error_codes.join(","),
-            descriptor.redacted_fields.join(","),
-            descriptor.audit_hooks.join(","),
-            descriptor.observability_hooks.join(",")
+    #[test]
+    fn plugin_sdk_contract_snapshot_matches_golden() {
+        let snapshot = serde_json::to_value(plugin_sdk_contract_snapshot())
+            .expect("plugin SDK snapshot should serialize");
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(snapshot["snapshot_version"], "plugin-sdk-contracts.v1");
+        assert!(snapshot["compatibility_policy"]["breaking_change_requires_migration_note"]
+            .as_bool()
+            .unwrap_or_default());
+        assert_snapshot_matches_golden(
+            "plugin SDK contract snapshot",
+            &snapshot,
+            EXPECTED_PLUGIN_SDK_CONTRACT_SNAPSHOT_JSON,
+            Some(PLUGIN_SDK_CONTRACT_SNAPSHOT_PATH),
         )
-    }
-
-    fn stable_fingerprint(input: &str) -> u64 {
-        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        input
-            .as_bytes()
-            .iter()
-            .fold(FNV_OFFSET_BASIS, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME))
+        .unwrap_or_else(|error| panic!("{error}"));
     }
 }

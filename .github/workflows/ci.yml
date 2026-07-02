@@ -138,6 +138,25 @@ jobs:
       - name: Run deterministic core suite
         run: bash scripts/test/run-deterministic-core.sh
 
+  runtime-contract-snapshots:
+    name: Runtime contract snapshot gates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust-toolchain
+        with:
+          toolchain: 1.95.0
+
+      - name: Run runtime contract snapshot gates
+        run: bash scripts/test/check-runtime-contract-snapshots.sh
+
   critical-attack-scenarios:
     name: Critical attack scenarios
     runs-on: ubuntu-latest

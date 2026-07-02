@@ -1,0 +1,1091 @@
+{
+  "acp_protocol": {
+    "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned.",
+    "enums": [
+      {
+        "changelog_note": "ACP transport labels identify the bridge ingress.",
+        "name": "AcpTransportKind",
+        "snapshot_version": "runtime-contracts.acp_transport_kind.v1",
+        "values": [
+          {
+            "canonical": "stdio",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "http",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "websocket",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP scopes are authorization inputs and must remain explicit.",
+        "name": "AcpScope",
+        "snapshot_version": "runtime-contracts.acp_scope.v1",
+        "values": [
+          {
+            "canonical": "sessions:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "sessions:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "runs:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "runs:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approvals:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approvals:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "bindings:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "bindings:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "events:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "events:sensitive",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP capabilities are negotiated bridge features.",
+        "name": "AcpCapability",
+        "snapshot_version": "runtime-contracts.acp_capability.v1",
+        "values": [
+          {
+            "canonical": "runtime_status",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_list",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_load",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_new",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_replay",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run_control",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval_bridge",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "pending_prompts",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_config",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_fork",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_compact",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session_explain",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "conversation_bindings",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding_repair",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "sensitive_replay",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP command names are public method identifiers; acp.status remains an alias.",
+        "name": "AcpCommand",
+        "snapshot_version": "runtime-contracts.acp_command.v1",
+        "values": [
+          {
+            "canonical": "status",
+            "deprecated_aliases": [
+              "acp.status"
+            ]
+          },
+          {
+            "canonical": "session.list",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.load",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.new",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.replay",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.resume",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.fork",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.compact.preview",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.compact.apply",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.explain",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.mode.set",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "session.config.set",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.create",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.abort",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.list",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.request",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.decide",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.list",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.upsert",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.get",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.detach",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.repair.plan",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.repair.apply",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "binding.explain",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "reconnect",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP session modes are policy-visible execution states.",
+        "name": "AcpSessionMode",
+        "snapshot_version": "runtime-contracts.acp_session_mode.v1",
+        "values": [
+          {
+            "canonical": "normal",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "planning",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "review",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "read_only",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Permission bridge outcomes mirror approval results.",
+        "name": "AcpPermissionDecision",
+        "snapshot_version": "runtime-contracts.acp_permission_decision.v1",
+        "values": [
+          {
+            "canonical": "allow",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "deny",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "timeout",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "error",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP ledger event kinds are retained for reconnect replay.",
+        "name": "AcpEventLedgerKind",
+        "snapshot_version": "runtime-contracts.acp_event_ledger_kind.v1",
+        "values": [
+          {
+            "canonical": "session_update",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "tool_call_update",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval_prompt",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval_decision",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "terminal",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "cancel",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Conversation binding sensitivity drives connector-independent filtering.",
+        "name": "ConversationBindingSensitivity",
+        "snapshot_version": "runtime-contracts.conversation_binding_sensitivity.v1",
+        "values": [
+          {
+            "canonical": "public",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "internal",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "sensitive",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Conversation binding conflict states are explain and repair inputs.",
+        "name": "ConversationBindingConflictState",
+        "snapshot_version": "runtime-contracts.conversation_binding_conflict_state.v1",
+        "values": [
+          {
+            "canonical": "none",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "duplicate_active_binding",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "duplicate_external_identity",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "duplicate_session",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "stale_thread",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "principal_mismatch",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "workspace_mismatch",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "expired_reference",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "parent_missing",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "detached",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP binding conflict kinds keep expired_reference as a deprecated alias.",
+        "name": "AcpBindingConflictKind",
+        "snapshot_version": "runtime-contracts.acp_binding_conflict_kind.v1",
+        "values": [
+          {
+            "canonical": "duplicate_active_binding",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "stale_thread",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "principal_mismatch",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "workspace_mismatch",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "expired_referenced",
+            "deprecated_aliases": [
+              "expired_reference"
+            ]
+          },
+          {
+            "canonical": "parent_missing",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "ACP repair action names are audited apply inputs.",
+        "name": "AcpBindingRepairActionKind",
+        "snapshot_version": "runtime-contracts.acp_binding_repair_action_kind.v1",
+        "values": [
+          {
+            "canonical": "detach",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "rebind",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "expire",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "split",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "mark_stale",
+            "deprecated_aliases": []
+          }
+        ]
+      }
+    ],
+    "protocol_versions": {
+      "max": 1,
+      "min": 1
+    },
+    "snapshot_version": "runtime-contracts.acp.v1"
+  },
+  "changelog_note": "Initial public runtime contract snapshot; breaking changes require a new snapshot version and migration note.",
+  "compatibility_policy": {
+    "breaking_change_requires_migration_note": true,
+    "breaking_change_requires_version_bump": true,
+    "changelog_note": "Breaking public contract changes require a snapshot version bump plus migration note in the same change.",
+    "deprecated_wire_names_must_remain_aliases": true,
+    "snapshot_version": "runtime-contracts.compatibility_policy.v1",
+    "unknown_fields_fail_closed_where_declared": true
+  },
+  "hook_enums": [
+    {
+      "changelog_note": "Hook phases accept short names and legacy run:* event names.",
+      "name": "RunLifecycleHookPhase",
+      "snapshot_version": "runtime-contracts.run_lifecycle_hook_phase.v1",
+      "values": [
+        {
+          "canonical": "before_run",
+          "deprecated_aliases": [
+            "run:before_run"
+          ]
+        },
+        {
+          "canonical": "before_tool",
+          "deprecated_aliases": [
+            "run:before_tool"
+          ]
+        },
+        {
+          "canonical": "after_tool",
+          "deprecated_aliases": [
+            "run:after_tool"
+          ]
+        },
+        {
+          "canonical": "before_delivery",
+          "deprecated_aliases": [
+            "run:before_delivery"
+          ]
+        },
+        {
+          "canonical": "after_run",
+          "deprecated_aliases": [
+            "run:after_run"
+          ]
+        }
+      ]
+    },
+    {
+      "changelog_note": "Hook decision names are arbitration inputs and may not be renamed without a migration.",
+      "name": "RunLifecycleHookDecisionKind",
+      "snapshot_version": "runtime-contracts.run_lifecycle_hook_decision_kind.v1",
+      "values": [
+        {
+          "canonical": "continue",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "annotate",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "request_approval",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "block",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "transform_preview",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "fail_run",
+          "deprecated_aliases": []
+        }
+      ]
+    }
+  ],
+  "public_error_envelopes": [
+    {
+      "changelog_note": "Stable errors expose code, message, and recovery_hint only.",
+      "name": "StableErrorEnvelope",
+      "required_fields": [
+        "code",
+        "message",
+        "recovery_hint"
+      ],
+      "secret_material_allowed": false,
+      "snapshot_version": "runtime-contracts.stable_error_envelope.v1"
+    },
+    {
+      "changelog_note": "Realtime compatibility errors may include supported protocol version range.",
+      "name": "RealtimeErrorEnvelope",
+      "optional_fields": [
+        "supported_protocol_versions"
+      ],
+      "required_fields": [
+        "error"
+      ],
+      "secret_material_allowed": false,
+      "snapshot_version": "runtime-contracts.realtime_error_envelope.v1"
+    },
+    {
+      "changelog_note": "ACP compatibility errors may include supported protocol version range.",
+      "name": "AcpErrorEnvelope",
+      "optional_fields": [
+        "supported_protocol_versions"
+      ],
+      "required_fields": [
+        "error"
+      ],
+      "secret_material_allowed": false,
+      "snapshot_version": "runtime-contracts.acp_error_envelope.v1"
+    }
+  ],
+  "realtime_protocol": {
+    "changelog_note": "Realtime handshake, command, event, and error vocabularies are pinned for console and agent clients.",
+    "enums": [
+      {
+        "changelog_note": "Realtime roles are negotiated during handshake.",
+        "name": "RealtimeRole",
+        "snapshot_version": "runtime-contracts.realtime_role.v1",
+        "values": [
+          {
+            "canonical": "operator",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "read_only",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "agent",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "connector",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Realtime scopes are authorization inputs and must remain explicit.",
+        "name": "RealtimeScope",
+        "snapshot_version": "runtime-contracts.realtime_scope.v1",
+        "values": [
+          {
+            "canonical": "runs:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "runs:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approvals:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approvals:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "nodes:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "nodes:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config:write",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "events:read",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "events:sensitive",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Realtime capabilities are feature negotiation outputs.",
+        "name": "RealtimeCapability",
+        "snapshot_version": "runtime-contracts.realtime_capability.v1",
+        "values": [
+          {
+            "canonical": "event_stream",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "snapshot_refresh",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run_control",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval_control",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node_presence",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "capability_grant",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config_schema_lookup",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config_reload",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "sensitive_events",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Realtime command names are public method identifiers.",
+        "name": "RealtimeCommand",
+        "snapshot_version": "runtime-contracts.realtime_command.v1",
+        "values": [
+          {
+            "canonical": "run.create",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.wait",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.events",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.abort",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.get",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.list",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.get",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval.decide",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node.presence",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node.capability.grant",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node.capability.revoke",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config.schema.lookup",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config.reload.plan",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config.reload.apply",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Realtime event topics drive subscription filtering.",
+        "name": "RealtimeEventTopic",
+        "snapshot_version": "runtime-contracts.realtime_event_topic.v1",
+        "values": [
+          {
+            "canonical": "run",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "node",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "config",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "system",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Realtime event sensitivity labels are applied before serialization.",
+        "name": "RealtimeEventSensitivity",
+        "snapshot_version": "runtime-contracts.realtime_event_sensitivity.v1",
+        "values": [
+          {
+            "canonical": "public",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "internal",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "sensitive",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "secret",
+            "deprecated_aliases": []
+          }
+        ]
+      }
+    ],
+    "protocol_versions": {
+      "max": 1,
+      "min": 1
+    },
+    "snapshot_version": "runtime-contracts.realtime.v1"
+  },
+  "runtime_enums": [
+    {
+      "changelog_note": "Run states keep legacy persisted labels as deprecated aliases.",
+      "name": "RunLifecyclePhase",
+      "snapshot_version": "runtime-contracts.run_lifecycle_phase.v1",
+      "values": [
+        {
+          "canonical": "queued",
+          "deprecated_aliases": [
+            "pending",
+            "accepted"
+          ]
+        },
+        {
+          "canonical": "running",
+          "deprecated_aliases": [
+            "in_progress",
+            "streaming"
+          ]
+        },
+        {
+          "canonical": "waiting_for_approval",
+          "deprecated_aliases": [
+            "approval_wait",
+            "awaiting_approval",
+            "waiting"
+          ]
+        },
+        {
+          "canonical": "paused",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "completed",
+          "deprecated_aliases": [
+            "done",
+            "succeeded"
+          ]
+        },
+        {
+          "canonical": "failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "aborted",
+          "deprecated_aliases": [
+            "cancelled",
+            "canceled"
+          ]
+        },
+        {
+          "canonical": "expired",
+          "deprecated_aliases": [
+            "timed_out",
+            "timeout"
+          ]
+        }
+      ]
+    },
+    {
+      "changelog_note": "Audit actor names are stable and user remains an alias for principal.",
+      "name": "RuntimeActorKind",
+      "snapshot_version": "runtime-contracts.runtime_actor_kind.v1",
+      "values": [
+        {
+          "canonical": "system",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "principal",
+          "deprecated_aliases": [
+            "user"
+          ]
+        },
+        {
+          "canonical": "agent",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "connector",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "scheduler",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "worker",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "policy",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "replay",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    {
+      "changelog_note": "Idempotency state labels preserve in_progress and succeeded aliases.",
+      "name": "IdempotencyOperationState",
+      "snapshot_version": "runtime-contracts.idempotency_operation_state.v1",
+      "values": [
+        {
+          "canonical": "started",
+          "deprecated_aliases": [
+            "in_progress"
+          ]
+        },
+        {
+          "canonical": "completed",
+          "deprecated_aliases": [
+            "succeeded"
+          ]
+        },
+        {
+          "canonical": "failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "expired",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    {
+      "changelog_note": "Replay decision names are canonical public reason codes.",
+      "name": "IdempotencyReplayDecision",
+      "snapshot_version": "runtime-contracts.idempotency_replay_decision.v1",
+      "values": [
+        {
+          "canonical": "reserved",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "same_payload_retry",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "completed_replay_result",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "conflicting_payload",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "expired_retry",
+          "deprecated_aliases": []
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "snapshot_version": "runtime-contracts.v1",
+  "tool_result_projection": {
+    "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
+    "enums": [
+      {
+        "changelog_note": "Visibility values define what reaches the model, audit artifact, or redacted preview.",
+        "name": "ToolResultVisibility",
+        "snapshot_version": "runtime-contracts.tool_result_visibility.v1",
+        "values": [
+          {
+            "canonical": "model_inline",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "model_summary",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "audit_artifact",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "redacted_preview",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Projection policy names are policy-visible and persisted in audit records.",
+        "name": "ToolResultProjectionPolicyKind",
+        "snapshot_version": "runtime-contracts.tool_result_projection_policy_kind.v1",
+        "values": [
+          {
+            "canonical": "inline_unless_large",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "summarize_and_artifact",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "redacted_preview_and_artifact",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Projection decisions are audit-visible and must remain stable.",
+        "name": "ToolResultProjectionDecisionKind",
+        "snapshot_version": "runtime-contracts.tool_result_projection_decision_kind.v1",
+        "values": [
+          {
+            "canonical": "model_inline",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "spilled_to_artifact",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Sensitivity labels drive artifact read gates and must not be broadened silently.",
+        "name": "ToolResultSensitivity",
+        "snapshot_version": "runtime-contracts.tool_result_sensitivity.v1",
+        "values": [
+          {
+            "canonical": "public",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "internal_path",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "stdout_stderr",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "personal_data",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "secret",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "provider_raw_payload",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "approval_risk_data",
+            "deprecated_aliases": []
+          }
+        ]
+      },
+      {
+        "changelog_note": "Retention dispositions are durable artifact lifecycle vocabulary.",
+        "name": "ArtifactRetentionDisposition",
+        "snapshot_version": "runtime-contracts.artifact_retention_disposition.v1",
+        "values": [
+          {
+            "canonical": "keep",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "expire_after",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "purge_on_request",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "audit_legal_hold",
+            "deprecated_aliases": []
+          }
+        ]
+      }
+    ],
+    "snapshot_version": "runtime-contracts.tool_result_projection.v1"
+  }
+}

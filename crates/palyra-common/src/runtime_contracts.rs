@@ -13,8 +13,22 @@
 //!   snapshot gate (`scripts/test/check-runtime-contract-snapshots.sh`): add aliases
 //!   instead of renaming canonical strings.
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fmt;
+
+/// Schema version for the public runtime contract snapshot emitted by this crate.
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Version identifier for the current public runtime contract snapshot.
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v1";
+
+/// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RuntimeContractEnumValue {
+    /// Canonical value emitted by new payloads.
+    pub canonical: &'static str,
+    /// Previously public wire names still accepted on input.
+    pub deprecated_aliases: &'static [&'static str],
+}
 
 macro_rules! runtime_contract_enum {
     (
@@ -43,6 +57,22 @@ macro_rules! runtime_contract_enum {
                         Self::$variant => $canonical,
                     )+
                 }
+            }
+
+            /// Stable enum values covered by the public runtime contract snapshot.
+            pub const WIRE_CONTRACT_VALUES: &'static [RuntimeContractEnumValue] = &[
+                $(
+                    RuntimeContractEnumValue {
+                        canonical: $canonical,
+                        deprecated_aliases: &[$($alias),*],
+                    },
+                )+
+            ];
+
+            /// Returns canonical wire values and deprecated aliases for snapshot gates.
+            #[must_use]
+            pub const fn wire_contract_values() -> &'static [RuntimeContractEnumValue] {
+                Self::WIRE_CONTRACT_VALUES
             }
 
             /// Parses a canonical wire name or backward-compatible alias.
@@ -82,6 +112,360 @@ macro_rules! runtime_contract_enum {
             }
         }
     };
+}
+
+/// Builds a public snapshot covering runtime wire enums, hook vocabularies, tool result
+/// projection contracts, and stable error envelopes.
+#[must_use]
+pub fn public_runtime_contract_snapshot() -> Value {
+    json!({
+        "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+        "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
+        "changelog_note": "Initial public runtime contract snapshot; breaking changes require a new snapshot version and migration note.",
+        "compatibility_policy": compatibility_policy_snapshot(),
+        "runtime_enums": [
+            enum_contract_snapshot(
+                "RunLifecyclePhase",
+                "runtime-contracts.run_lifecycle_phase.v1",
+                "Run states keep legacy persisted labels as deprecated aliases.",
+                RunLifecyclePhase::wire_contract_values(),
+            ),
+            enum_contract_snapshot(
+                "RuntimeActorKind",
+                "runtime-contracts.runtime_actor_kind.v1",
+                "Audit actor names are stable and user remains an alias for principal.",
+                RuntimeActorKind::wire_contract_values(),
+            ),
+            enum_contract_snapshot(
+                "IdempotencyOperationState",
+                "runtime-contracts.idempotency_operation_state.v1",
+                "Idempotency state labels preserve in_progress and succeeded aliases.",
+                IdempotencyOperationState::wire_contract_values(),
+            ),
+            enum_contract_snapshot(
+                "IdempotencyReplayDecision",
+                "runtime-contracts.idempotency_replay_decision.v1",
+                "Replay decision names are canonical public reason codes.",
+                IdempotencyReplayDecision::wire_contract_values(),
+            ),
+        ],
+        "hook_enums": [
+            enum_contract_snapshot(
+                "RunLifecycleHookPhase",
+                "runtime-contracts.run_lifecycle_hook_phase.v1",
+                "Hook phases accept short names and legacy run:* event names.",
+                RunLifecycleHookPhase::wire_contract_values(),
+            ),
+            enum_contract_snapshot(
+                "RunLifecycleHookDecisionKind",
+                "runtime-contracts.run_lifecycle_hook_decision_kind.v1",
+                "Hook decision names are arbitration inputs and may not be renamed without a migration.",
+                RunLifecycleHookDecisionKind::wire_contract_values(),
+            ),
+        ],
+        "tool_result_projection": {
+            "snapshot_version": "runtime-contracts.tool_result_projection.v1",
+            "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
+            "enums": [
+                enum_contract_snapshot(
+                    "ToolResultVisibility",
+                    "runtime-contracts.tool_result_visibility.v1",
+                    "Visibility values define what reaches the model, audit artifact, or redacted preview.",
+                    ToolResultVisibility::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ToolResultProjectionPolicyKind",
+                    "runtime-contracts.tool_result_projection_policy_kind.v1",
+                    "Projection policy names are policy-visible and persisted in audit records.",
+                    ToolResultProjectionPolicyKind::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ToolResultProjectionDecisionKind",
+                    "runtime-contracts.tool_result_projection_decision_kind.v1",
+                    "Projection decisions are audit-visible and must remain stable.",
+                    ToolResultProjectionDecisionKind::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ToolResultSensitivity",
+                    "runtime-contracts.tool_result_sensitivity.v1",
+                    "Sensitivity labels drive artifact read gates and must not be broadened silently.",
+                    ToolResultSensitivity::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ArtifactRetentionDisposition",
+                    "runtime-contracts.artifact_retention_disposition.v1",
+                    "Retention dispositions are durable artifact lifecycle vocabulary.",
+                    ArtifactRetentionDisposition::wire_contract_values(),
+                ),
+            ],
+        },
+        "realtime_protocol": {
+            "snapshot_version": "runtime-contracts.realtime.v1",
+            "changelog_note": "Realtime handshake, command, event, and error vocabularies are pinned for console and agent clients.",
+            "protocol_versions": {
+                "min": REALTIME_PROTOCOL_MIN_VERSION,
+                "max": REALTIME_PROTOCOL_MAX_VERSION,
+            },
+            "enums": [
+                enum_contract_snapshot(
+                    "RealtimeRole",
+                    "runtime-contracts.realtime_role.v1",
+                    "Realtime roles are negotiated during handshake.",
+                    RealtimeRole::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "RealtimeScope",
+                    "runtime-contracts.realtime_scope.v1",
+                    "Realtime scopes are authorization inputs and must remain explicit.",
+                    RealtimeScope::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "RealtimeCapability",
+                    "runtime-contracts.realtime_capability.v1",
+                    "Realtime capabilities are feature negotiation outputs.",
+                    RealtimeCapability::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "RealtimeCommand",
+                    "runtime-contracts.realtime_command.v1",
+                    "Realtime command names are public method identifiers.",
+                    RealtimeCommand::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "RealtimeEventTopic",
+                    "runtime-contracts.realtime_event_topic.v1",
+                    "Realtime event topics drive subscription filtering.",
+                    RealtimeEventTopic::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "RealtimeEventSensitivity",
+                    "runtime-contracts.realtime_event_sensitivity.v1",
+                    "Realtime event sensitivity labels are applied before serialization.",
+                    RealtimeEventSensitivity::wire_contract_values(),
+                ),
+            ],
+        },
+        "acp_protocol": {
+            "snapshot_version": "runtime-contracts.acp.v1",
+            "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned.",
+            "protocol_versions": {
+                "min": ACP_PROTOCOL_MIN_VERSION,
+                "max": ACP_PROTOCOL_MAX_VERSION,
+            },
+            "enums": [
+                enum_contract_snapshot(
+                    "AcpTransportKind",
+                    "runtime-contracts.acp_transport_kind.v1",
+                    "ACP transport labels identify the bridge ingress.",
+                    AcpTransportKind::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpScope",
+                    "runtime-contracts.acp_scope.v1",
+                    "ACP scopes are authorization inputs and must remain explicit.",
+                    AcpScope::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpCapability",
+                    "runtime-contracts.acp_capability.v1",
+                    "ACP capabilities are negotiated bridge features.",
+                    AcpCapability::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpCommand",
+                    "runtime-contracts.acp_command.v1",
+                    "ACP command names are public method identifiers; acp.status remains an alias.",
+                    AcpCommand::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpSessionMode",
+                    "runtime-contracts.acp_session_mode.v1",
+                    "ACP session modes are policy-visible execution states.",
+                    AcpSessionMode::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpPermissionDecision",
+                    "runtime-contracts.acp_permission_decision.v1",
+                    "Permission bridge outcomes mirror approval results.",
+                    AcpPermissionDecision::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpEventLedgerKind",
+                    "runtime-contracts.acp_event_ledger_kind.v1",
+                    "ACP ledger event kinds are retained for reconnect replay.",
+                    AcpEventLedgerKind::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ConversationBindingSensitivity",
+                    "runtime-contracts.conversation_binding_sensitivity.v1",
+                    "Conversation binding sensitivity drives connector-independent filtering.",
+                    ConversationBindingSensitivity::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "ConversationBindingConflictState",
+                    "runtime-contracts.conversation_binding_conflict_state.v1",
+                    "Conversation binding conflict states are explain and repair inputs.",
+                    ConversationBindingConflictState::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpBindingConflictKind",
+                    "runtime-contracts.acp_binding_conflict_kind.v1",
+                    "ACP binding conflict kinds keep expired_reference as a deprecated alias.",
+                    AcpBindingConflictKind::wire_contract_values(),
+                ),
+                enum_contract_snapshot(
+                    "AcpBindingRepairActionKind",
+                    "runtime-contracts.acp_binding_repair_action_kind.v1",
+                    "ACP repair action names are audited apply inputs.",
+                    AcpBindingRepairActionKind::wire_contract_values(),
+                ),
+            ],
+        },
+        "public_error_envelopes": [
+            {
+                "name": "StableErrorEnvelope",
+                "snapshot_version": "runtime-contracts.stable_error_envelope.v1",
+                "changelog_note": "Stable errors expose code, message, and recovery_hint only.",
+                "required_fields": ["code", "message", "recovery_hint"],
+                "secret_material_allowed": false,
+            },
+            {
+                "name": "RealtimeErrorEnvelope",
+                "snapshot_version": "runtime-contracts.realtime_error_envelope.v1",
+                "changelog_note": "Realtime compatibility errors may include supported protocol version range.",
+                "required_fields": ["error"],
+                "optional_fields": ["supported_protocol_versions"],
+                "secret_material_allowed": false,
+            },
+            {
+                "name": "AcpErrorEnvelope",
+                "snapshot_version": "runtime-contracts.acp_error_envelope.v1",
+                "changelog_note": "ACP compatibility errors may include supported protocol version range.",
+                "required_fields": ["error"],
+                "optional_fields": ["supported_protocol_versions"],
+                "secret_material_allowed": false,
+            },
+        ],
+    })
+}
+
+/// Validates that a public contract snapshot carries version notes and no local paths or secrets.
+///
+/// # Errors
+/// Returns a human-readable pointer to the offending field when snapshot metadata,
+/// local absolute paths, or obvious secret markers are present.
+pub fn validate_public_contract_snapshot(snapshot: &Value) -> Result<(), String> {
+    validate_snapshot_metadata("$", snapshot)?;
+    validate_snapshot_strings("$", snapshot)
+}
+
+fn compatibility_policy_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.compatibility_policy.v1",
+        "changelog_note": "Breaking public contract changes require a snapshot version bump plus migration note in the same change.",
+        "breaking_change_requires_version_bump": true,
+        "breaking_change_requires_migration_note": true,
+        "deprecated_wire_names_must_remain_aliases": true,
+        "unknown_fields_fail_closed_where_declared": true,
+    })
+}
+
+fn enum_contract_snapshot(
+    name: &'static str,
+    snapshot_version: &'static str,
+    changelog_note: &'static str,
+    values: &'static [RuntimeContractEnumValue],
+) -> Value {
+    json!({
+        "name": name,
+        "snapshot_version": snapshot_version,
+        "changelog_note": changelog_note,
+        "values": values,
+    })
+}
+
+fn validate_snapshot_metadata(path: &str, value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(fields) => {
+            if fields.contains_key("snapshot_version") {
+                require_non_empty_string(fields.get("snapshot_version"), path, "snapshot_version")?;
+                require_non_empty_string(fields.get("changelog_note"), path, "changelog_note")?;
+            }
+            for (key, child) in fields {
+                let child_path = format!("{path}/{key}");
+                validate_snapshot_metadata(child_path.as_str(), child)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}/{index}");
+                validate_snapshot_metadata(child_path.as_str(), child)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn require_non_empty_string(value: Option<&Value>, path: &str, field: &str) -> Result<(), String> {
+    match value.and_then(Value::as_str).map(str::trim) {
+        Some(text) if !text.is_empty() => Ok(()),
+        _ => Err(format!("{path} has snapshot_version but missing non-empty {field}")),
+    }
+}
+
+fn validate_snapshot_strings(path: &str, value: &Value) -> Result<(), String> {
+    match value {
+        Value::String(text) => {
+            if contains_local_absolute_path(text) {
+                return Err(format!("{path} contains a local absolute path"));
+            }
+            if contains_obvious_secret_marker(text) {
+                return Err(format!("{path} contains an obvious secret marker"));
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}/{index}");
+                validate_snapshot_strings(child_path.as_str(), child)?;
+            }
+            Ok(())
+        }
+        Value::Object(fields) => {
+            for (key, child) in fields {
+                let child_path = format!("{path}/{key}");
+                validate_snapshot_strings(child_path.as_str(), child)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn contains_local_absolute_path(text: &str) -> bool {
+    if text.starts_with("\\\\") {
+        return true;
+    }
+    let normalized = text.replace('\\', "/").to_ascii_lowercase();
+    normalized.starts_with("/users/")
+        || normalized.starts_with("/home/")
+        || normalized.starts_with("/tmp/")
+        || normalized.starts_with("/var/folders/")
+        || normalized
+            .as_bytes()
+            .windows(3)
+            .any(|window| window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'/')
+}
+
+fn contains_obvious_secret_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("-----BEGIN ")
+        || lower.contains("api_key=")
+        || lower.contains("access_token=")
+        || lower.contains("secret_token=")
+        || lower.contains("bearer ")
 }
 
 runtime_contract_enum! {
@@ -1487,6 +1871,7 @@ runtime_contract_enum! {
 #[cfg(test)]
 mod tests {
     use super::{
+        public_runtime_contract_snapshot, validate_public_contract_snapshot,
         AcpBindingConflictKind, AcpBindingRepairActionKind, AcpCapability, AcpClientContext,
         AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange, AcpScope, AcpSessionBindingRecord,
         AcpSessionMode, AcpTransportKind, ArtifactReadRequest, ArtifactRetentionDisposition,
@@ -1501,7 +1886,101 @@ mod tests {
         ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
         REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    const EXPECTED_PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_JSON: &str =
+        include_str!("../tests/golden/public_runtime_contract_snapshot.json");
+    const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_PATH: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/public_runtime_contract_snapshot.json");
+
+    fn pretty_json(value: &Value) -> String {
+        let mut encoded =
+            serde_json::to_string_pretty(value).expect("snapshot should serialize to json");
+        encoded.push('\n');
+        encoded
+    }
+
+    fn assert_snapshot_matches_golden(
+        label: &str,
+        actual: &Value,
+        expected: &str,
+        update_path: Option<&str>,
+    ) -> Result<(), String> {
+        let actual = pretty_json(actual);
+        if std::env::var_os("PALYRA_UPDATE_CONTRACT_SNAPSHOTS").is_some() {
+            if let Some(update_path) = update_path {
+                std::fs::write(update_path, actual.as_bytes())
+                    .map_err(|error| format!("failed to update {update_path}: {error}"))?;
+                return Ok(());
+            }
+        }
+        if actual == expected {
+            return Ok(());
+        }
+        let expected_lines = expected.lines().collect::<Vec<_>>();
+        let actual_lines = actual.lines().collect::<Vec<_>>();
+        let mismatch_index = expected_lines
+            .iter()
+            .zip(actual_lines.iter())
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| expected_lines.len().min(actual_lines.len()));
+        let expected_line = expected_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+        let actual_line = actual_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+
+        Err(format!(
+            "{label} changed at line {}.\nexpected: {expected_line}\nactual:   {actual_line}\nNext step: if this public contract change is intentional, update the matching golden snapshot, bump the changed snapshot_version, and include a changelog_note/migration note in the same change.\nFull actual snapshot:\n{actual}",
+            mismatch_index + 1
+        ))
+    }
+
+    #[test]
+    fn public_runtime_contract_snapshot_matches_golden() {
+        let snapshot = public_runtime_contract_snapshot();
+        validate_public_contract_snapshot(&snapshot)
+            .expect("runtime contract snapshot should be public-safe");
+        assert_snapshot_matches_golden(
+            "public runtime contract snapshot",
+            &snapshot,
+            EXPECTED_PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_JSON,
+            Some(PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_PATH),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    #[test]
+    fn public_runtime_contract_snapshot_rejects_breaking_enum_rename() {
+        let mut snapshot = public_runtime_contract_snapshot();
+        *snapshot
+            .pointer_mut("/runtime_enums/0/values/1/canonical")
+            .expect("run lifecycle running value should exist") =
+            Value::String("in_progress".to_owned());
+
+        let error = assert_snapshot_matches_golden(
+            "public runtime contract snapshot",
+            &snapshot,
+            EXPECTED_PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_JSON,
+            None,
+        )
+        .expect_err("breaking enum rename must fail the golden gate");
+        assert!(error.contains("public runtime contract snapshot changed"));
+        assert!(error.contains("bump the changed snapshot_version"));
+    }
+
+    #[test]
+    fn public_runtime_contract_snapshot_rejects_absolute_paths_and_secret_markers() {
+        let mut local_path_snapshot = public_runtime_contract_snapshot();
+        local_path_snapshot["changelog_note"] =
+            Value::String("local path C:\\Users\\Palo\\Desktop\\palyra".to_owned());
+        let path_error = validate_public_contract_snapshot(&local_path_snapshot)
+            .expect_err("local absolute path should be rejected");
+        assert!(path_error.contains("local absolute path"));
+
+        let mut secret_snapshot = public_runtime_contract_snapshot();
+        secret_snapshot["changelog_note"] = Value::String("-----BEGIN PRIVATE KEY-----".to_owned());
+        let secret_error = validate_public_contract_snapshot(&secret_snapshot)
+            .expect_err("obvious secret marker should be rejected");
+        assert!(secret_error.contains("secret marker"));
+    }
 
     #[test]
     fn queue_modes_round_trip_with_canonical_serialization() {

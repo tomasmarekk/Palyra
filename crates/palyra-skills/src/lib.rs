@@ -11,6 +11,7 @@
 mod artifact;
 mod audit;
 mod constants;
+mod contract;
 mod error;
 mod extension;
 mod install_policy;
@@ -27,6 +28,10 @@ pub use constants::{
     DEFAULT_SKILL_AUDIT_MAX_EXPORTED_FUNCTIONS, DEFAULT_SKILL_AUDIT_MAX_MODULE_BYTES,
     PROVENANCE_PATH, SBOM_PATH, SIGNATURE_PATH, SKILL_ARTIFACT_EXTENSION, SKILL_MANIFEST_PATH,
     SKILL_MANIFEST_VERSION, SKILL_VERIFICATION_EVENT_KIND,
+};
+pub use contract::{
+    skill_manifest_contract_snapshot, SKILL_MANIFEST_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+    SKILL_MANIFEST_CONTRACT_SNAPSHOT_VERSION,
 };
 pub use error::SkillPackagingError;
 pub use extension::*;

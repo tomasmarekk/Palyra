@@ -11,15 +11,62 @@ use super::{
     extension_enable_gate, extension_record_from_skill_artifact,
     extract_self_improvement_candidate, inspect_skill_artifact, parse_ed25519_signing_key,
     parse_manifest_toml, plan_self_improvement_rollback, policy_requests_from_manifest,
-    skill_eval_run_record, skill_extension_package_id, skill_scaffold_artifact_plan,
-    verify_skill_artifact, ArtifactFile, ExtensionCapabilityClass, ExtensionCapabilityGrant,
-    ExtensionContractFixture, ExtensionLifecycleTransitionRequest, ExtensionPackageSource,
-    ExtensionPackageStatus, InMemoryExtensionPackageRegistry, SkillArtifactBuildRequest,
-    SkillAuditCheckStatus, SkillEvalFixture, SkillEvalOutcome, SkillPackagingError,
-    SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision, MAX_ARTIFACT_BYTES, MAX_ENTRIES,
-    SBOM_PATH, SIGNATURE_PATH, SKILL_MANIFEST_PATH, SKILL_MANIFEST_VERSION,
+    skill_eval_run_record, skill_extension_package_id, skill_manifest_contract_snapshot,
+    skill_scaffold_artifact_plan, verify_skill_artifact, ArtifactFile, ExtensionCapabilityClass,
+    ExtensionCapabilityGrant, ExtensionContractFixture, ExtensionLifecycleTransitionRequest,
+    ExtensionPackageSource, ExtensionPackageStatus, InMemoryExtensionPackageRegistry,
+    SkillArtifactBuildRequest, SkillAuditCheckStatus, SkillEvalFixture, SkillEvalOutcome,
+    SkillPackagingError, SkillSecurityAuditPolicy, SkillTrustStore, TrustDecision,
+    MAX_ARTIFACT_BYTES, MAX_ENTRIES, SBOM_PATH, SIGNATURE_PATH, SKILL_MANIFEST_PATH,
+    SKILL_MANIFEST_VERSION,
 };
 use base64::Engine as _;
+use palyra_common::runtime_contracts::validate_public_contract_snapshot;
+use serde_json::Value;
+
+const EXPECTED_SKILL_MANIFEST_CONTRACT_SNAPSHOT_JSON: &str =
+    include_str!("../tests/golden/skill_manifest_contract_snapshot.json");
+const SKILL_MANIFEST_CONTRACT_SNAPSHOT_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/skill_manifest_contract_snapshot.json");
+
+fn pretty_json(value: &Value) -> String {
+    let mut encoded = serde_json::to_string_pretty(value).expect("snapshot should serialize");
+    encoded.push('\n');
+    encoded
+}
+
+fn assert_snapshot_matches_golden(
+    label: &str,
+    actual: &Value,
+    expected: &str,
+    update_path: Option<&str>,
+) -> Result<(), String> {
+    let actual = pretty_json(actual);
+    if std::env::var_os("PALYRA_UPDATE_CONTRACT_SNAPSHOTS").is_some() {
+        if let Some(update_path) = update_path {
+            std::fs::write(update_path, actual.as_bytes())
+                .map_err(|error| format!("failed to update {update_path}: {error}"))?;
+            return Ok(());
+        }
+    }
+    if actual == expected {
+        return Ok(());
+    }
+    let expected_lines = expected.lines().collect::<Vec<_>>();
+    let actual_lines = actual.lines().collect::<Vec<_>>();
+    let mismatch_index = expected_lines
+        .iter()
+        .zip(actual_lines.iter())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| expected_lines.len().min(actual_lines.len()));
+    let expected_line = expected_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+    let actual_line = actual_lines.get(mismatch_index).copied().unwrap_or("<missing>");
+
+    Err(format!(
+        "{label} changed at line {}.\nexpected: {expected_line}\nactual:   {actual_line}\nNext step: if this skill manifest public contract change is intentional, update the matching golden snapshot, bump the changed snapshot_version, and include a changelog_note/migration note in the same change.\nFull actual snapshot:\n{actual}",
+        mismatch_index + 1
+    ))
+}
 
 fn sample_manifest() -> String {
     r#"
@@ -99,6 +146,25 @@ redacted = true
 "#
     .trim()
     .to_owned()
+}
+
+#[test]
+fn skill_manifest_contract_snapshot_matches_golden() {
+    let snapshot = skill_manifest_contract_snapshot();
+    validate_public_contract_snapshot(&snapshot)
+        .expect("skill manifest contract snapshot should be public-safe");
+    assert_eq!(snapshot["schema_version"], 1);
+    assert_eq!(snapshot["snapshot_version"], "skill-manifest-contracts.v1");
+    assert!(snapshot["compatibility_policy"]["breaking_change_requires_migration_note"]
+        .as_bool()
+        .unwrap_or_default());
+    assert_snapshot_matches_golden(
+        "skill manifest contract snapshot",
+        &snapshot,
+        EXPECTED_SKILL_MANIFEST_CONTRACT_SNAPSHOT_JSON,
+        Some(SKILL_MANIFEST_CONTRACT_SNAPSHOT_PATH),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[test]

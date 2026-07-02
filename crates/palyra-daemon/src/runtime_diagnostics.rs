@@ -28,6 +28,15 @@ use crate::{
     journal::{ToolJobRecord, ToolJobState},
     model_provider::ProviderRuntimeMetricsSnapshot,
 };
+#[cfg(test)]
+use palyra_common::runtime_contracts::{
+    public_runtime_contract_snapshot, validate_public_contract_snapshot,
+    PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
+};
+#[cfg(test)]
+use palyra_plugins_sdk::plugin_sdk_contract_snapshot;
+#[cfg(test)]
+use palyra_skills::skill_manifest_contract_snapshot;
 
 /// Schema version stamped on runtime health snapshots; bump on any
 /// backward-incompatible shape change.
@@ -965,6 +974,15 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
     let channel_registry = ChannelCommandRegistry::builtin();
     json!({
         "schema_version": CONTRACT_SNAPSHOT_SCHEMA_VERSION,
+        "compatibility_policy": {
+            "snapshot_version": "runtime-diagnostics.contract_snapshot_policy.v1",
+            "changelog_note": "Runtime contract snapshot drift requires updating the golden snapshot plus a migration note.",
+            "breaking_change_requires_version_bump": true,
+            "breaking_change_requires_migration_note": true,
+        },
+        "runtime_contracts_abi": public_runtime_contract_snapshot(),
+        "plugin_sdk_abi": plugin_sdk_contract_snapshot(),
+        "skill_manifest_abi": skill_manifest_contract_snapshot(),
         "provider_abi": {
             "required_fields": [
                 "kind",
@@ -1696,6 +1714,21 @@ mod tests {
             .as_str()
             .expect("snapshot id")
             .starts_with("toolcat_"));
+        assert_eq!(
+            snapshot["runtime_contracts_abi"]["snapshot_version"],
+            PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION
+        );
+        validate_public_contract_snapshot(&snapshot["runtime_contracts_abi"])
+            .expect("runtime contracts snapshot should be public-safe");
+        assert_eq!(snapshot["plugin_sdk_abi"]["snapshot_version"], "plugin-sdk-contracts.v1");
+        validate_public_contract_snapshot(&snapshot["plugin_sdk_abi"])
+            .expect("plugin SDK snapshot should be public-safe");
+        assert_eq!(
+            snapshot["skill_manifest_abi"]["snapshot_version"],
+            "skill-manifest-contracts.v1"
+        );
+        validate_public_contract_snapshot(&snapshot["skill_manifest_abi"])
+            .expect("skill manifest snapshot should be public-safe");
         assert!(
             snapshot["channel_command_abi"]["native_spec_count"].as_u64().unwrap_or_default() > 0
         );
