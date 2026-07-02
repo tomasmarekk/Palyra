@@ -1,0 +1,42 @@
+[
+  {
+    "event": null,
+    "object": "chat.completion.chunk",
+    "has_id": true,
+    "has_model": true,
+    "delta_role": "assistant",
+    "delta_content": null,
+    "has_tool_calls": false,
+    "finish_reason": null,
+    "error_code": null,
+    "palyra_public_event_type": null
+  },
+  {
+    "event": null,
+    "object": "chat.completion.chunk",
+    "has_id": true,
+    "has_model": true,
+    "delta_role": null,
+    "delta_content": "<text>",
+    "has_tool_calls": false,
+    "finish_reason": null,
+    "error_code": null,
+    "palyra_public_event_type": "model.delta"
+  },
+  {
+    "event": null,
+    "object": "chat.completion.chunk",
+    "has_id": true,
+    "has_model": true,
+    "delta_role": null,
+    "delta_content": null,
+    "has_tool_calls": false,
+    "finish_reason": "stop",
+    "error_code": null,
+    "palyra_public_event_type": "run.completed"
+  },
+  {
+    "event": null,
+    "type": "[DONE]"
+  }
+]

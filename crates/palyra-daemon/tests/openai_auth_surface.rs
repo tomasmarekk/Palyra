@@ -1019,6 +1019,135 @@ fn compat_tools_invoke_is_disabled_by_default_and_refuses_when_enabled() -> Resu
 }
 
 #[test]
+fn compat_chat_streams_text_with_keepalive_and_structured_finish() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
+        ("PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(), CONSOLE_ADMIN_PRINCIPAL.to_owned()),
+        ("PALYRA_ORCHESTRATOR_RUNLOOP_V1_ENABLED".to_owned(), "true".to_owned()),
+    ])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat chat stream token",
+        &["compat.chat.create"],
+    )?;
+
+    let (status, content_type, body) = compat_post_sse(
+        &client,
+        admin_port,
+        "/v1/chat/completions",
+        token.as_str(),
+        &json!({
+            "messages": [{ "role": "user", "content": "streamed chat text" }],
+            "stream": true
+        }),
+    )?;
+    assert_eq!(status, 200, "chat stream should open successfully: {body}");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "chat stream should use SSE content type: {content_type}"
+    );
+    assert!(body.contains(": keepalive"), "chat stream should emit SSE keepalive comments: {body}");
+
+    let messages = parse_sse_messages(body.as_str())?;
+    assert_json_golden(
+        "compat_chat_stream_text_events.json",
+        &normalize_chat_stream_grammar(messages.as_slice())?,
+    )?;
+
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    assert!(
+        json_events.len() >= 3,
+        "chat stream should emit role, text, and terminal chunks: {json_events:?}"
+    );
+    assert_eq!(
+        json_events.last().and_then(|(_, event)| event
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)),
+        Some("stop")
+    );
+    assert!(
+        messages.last().is_some_and(|(_, data)| data == "[DONE]"),
+        "chat stream should terminate with [DONE]"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn compat_chat_stream_maps_stream_failures_to_failed_event() -> Result<()> {
+    let _test_guard = lock_openai_auth_surface_test();
+    let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[(
+        "PALYRA_ADMIN_BOUND_PRINCIPAL".to_owned(),
+        CONSOLE_ADMIN_PRINCIPAL.to_owned(),
+    )])?;
+    let mut daemon = ChildGuard::new(child);
+    wait_for_health(admin_port, daemon.child_mut())?;
+
+    let client = http_client()?;
+    let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "compat_api")?;
+    enable_access_feature_flag(&client, admin_port, &cookie, &csrf_token, "api_tokens")?;
+    let token = create_personal_api_token(
+        &client,
+        admin_port,
+        &cookie,
+        &csrf_token,
+        "Compat chat failure token",
+        &["compat.chat.create"],
+    )?;
+
+    let (status, content_type, body) = compat_post_sse(
+        &client,
+        admin_port,
+        "/v1/chat/completions",
+        token.as_str(),
+        &json!({
+            "messages": [{ "role": "user", "content": "stream should fail cleanly" }],
+            "stream": true
+        }),
+    )?;
+    assert_eq!(status, 200, "chat stream failures should be reported as SSE events: {body}");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "failed chat stream should still use SSE content type: {content_type}"
+    );
+
+    let messages = parse_sse_messages(body.as_str())?;
+    let json_events = parse_sse_json_events(messages.as_slice())?;
+    assert_eq!(
+        json_events.iter().filter_map(|event| event.0.as_deref()).collect::<Vec<_>>(),
+        vec!["chat.failed"],
+        "failed chat stream should emit one typed failure event after opening chunk"
+    );
+    let failed = json_events
+        .iter()
+        .find_map(|(event, value)| (event.as_deref() == Some("chat.failed")).then_some(value))
+        .ok_or_else(|| anyhow::anyhow!("failed chat stream missing chat.failed event"))?;
+    assert_eq!(failed.get("object").and_then(Value::as_str), Some("chat.completion.chunk"));
+    assert_eq!(failed.pointer("/choices/0/finish_reason").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        failed.pointer("/error/code").and_then(Value::as_str),
+        Some("gateway_stream_failed")
+    );
+    assert!(
+        messages.last().is_some_and(|(_, data)| data == "[DONE]"),
+        "failed chat stream should still terminate with [DONE]"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn compat_responses_streams_text_events_and_preserves_non_stream_shape() -> Result<()> {
     let _test_guard = lock_openai_auth_surface_test();
     let (child, admin_port) = spawn_palyrad_with_dynamic_ports(&[
@@ -3346,6 +3475,34 @@ fn parse_sse_json_events(
                 .with_context(|| format!("failed to parse SSE data as JSON: {data}"))
         })
         .collect()
+}
+
+fn normalize_chat_stream_grammar(messages: &[(Option<String>, String)]) -> Result<Value> {
+    let mut normalized = Vec::new();
+    for (event, data) in messages {
+        if data == "[DONE]" {
+            normalized.push(json!({
+                "event": Value::Null,
+                "type": "[DONE]"
+            }));
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(data)
+            .with_context(|| format!("failed to parse SSE data as JSON: {data}"))?;
+        normalized.push(json!({
+            "event": event,
+            "object": value.get("object").and_then(Value::as_str),
+            "has_id": value.get("id").and_then(Value::as_str).is_some(),
+            "has_model": value.get("model").and_then(Value::as_str).is_some(),
+            "delta_role": value.pointer("/choices/0/delta/role").and_then(Value::as_str),
+            "delta_content": value.pointer("/choices/0/delta/content").and_then(Value::as_str).map(|_| "<text>"),
+            "has_tool_calls": value.pointer("/choices/0/delta/tool_calls").is_some(),
+            "finish_reason": value.pointer("/choices/0/finish_reason").and_then(Value::as_str),
+            "error_code": value.pointer("/error/code").and_then(Value::as_str),
+            "palyra_public_event_type": value.pointer("/_palyra/public_event_type").and_then(Value::as_str),
+        }));
+    }
+    Ok(Value::Array(normalized))
 }
 
 fn normalize_responses_stream_grammar(messages: &[(Option<String>, String)]) -> Result<Value> {

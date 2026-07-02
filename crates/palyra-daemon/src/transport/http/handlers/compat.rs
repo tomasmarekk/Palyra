@@ -33,6 +33,9 @@ const COMPAT_RESPONSE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 const COMPAT_RUN_IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const COMPAT_RUN_EVENTS_PAGE_LIMIT_DEFAULT: usize = 128;
 const COMPAT_RUN_EVENTS_PAGE_LIMIT_MAX: usize = 512;
+const COMPAT_SSE_CHANNEL_CAPACITY: usize = 32;
+const COMPAT_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const COMPAT_SSE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct CompatHttpError(Box<Response>);
 
@@ -56,6 +59,7 @@ pub(crate) struct CompatChatCompletionsRequest {
     model: Option<String>,
     messages: Vec<CompatChatMessage>,
     stream: Option<bool>,
+    cancel_on_disconnect: Option<bool>,
     user: Option<String>,
     metadata: Option<Value>,
 }
@@ -312,6 +316,17 @@ struct CompatStreamToolCall {
     name: String,
     arguments: String,
     output_index: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CompatChatStreamContext {
+    token_id: String,
+    run_id: String,
+    session_id: String,
+    principal: String,
+    device_id: String,
+    cancel_on_disconnect: bool,
+    created_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -642,7 +657,11 @@ pub(crate) async fn compat_chat_completions_handler(
     )
     .await?;
     if payload.stream.unwrap_or(false) {
-        return Ok(build_compat_chat_streaming_response(state, prepared));
+        return Ok(build_compat_chat_streaming_response(
+            state,
+            prepared,
+            payload.cancel_on_disconnect.unwrap_or(true),
+        ));
     }
     let token_id = prepared.token.token_id.clone();
     let run_id = prepared.run_id.clone();
@@ -2264,7 +2283,8 @@ fn build_compat_run_events_streaming_response(
     after_seq: Option<i64>,
     requested_limit: Option<usize>,
 ) -> Response {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    let (sender, receiver) =
+        mpsc::channel::<Result<Bytes, Infallible>>(COMPAT_SSE_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let run_id = initial_snapshot.run_id.clone();
         let session_id = initial_snapshot.session_id.clone();
@@ -3284,8 +3304,13 @@ fn compat_approval_risk_level_label(raw: i32) -> &'static str {
     }
 }
 
-fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPreparedRun) -> Response {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+fn build_compat_chat_streaming_response(
+    state: AppState,
+    prepared: CompatPreparedRun,
+    cancel_on_disconnect: bool,
+) -> Response {
+    let (sender, receiver) =
+        mpsc::channel::<Result<Bytes, Infallible>>(COMPAT_SSE_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let CompatPreparedRun {
             token,
@@ -3293,12 +3318,21 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
             model_name,
             run_id,
             session_id,
-            principal: _,
-            device_id: _,
+            principal,
+            device_id,
             created_at_unix_ms,
             request_sender,
             run_request,
         } = prepared;
+        let stream_context = CompatChatStreamContext {
+            token_id: token.token_id.clone(),
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            principal,
+            device_id,
+            cancel_on_disconnect,
+            created_at_unix_ms,
+        };
         let response_id = compat_completion_id(run_id.as_str());
         let created_seconds = created_at_unix_ms / 1_000;
         let mut finish_reason = "stop";
@@ -3307,8 +3341,10 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         let mut public_event_sequence = 0_u64;
         let mut last_public_terminal_event = None::<Value>;
 
-        if !send_sse_data(
+        if !send_compat_chat_sse_data(
             &sender,
+            &state,
+            &stream_context,
             json!({
                 "id": response_id,
                 "object": "chat.completion.chunk",
@@ -3327,13 +3363,25 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         {
             return;
         }
+        if !send_compat_chat_sse_comment(&sender, &state, &stream_context, "keepalive").await {
+            return;
+        }
 
         let endpoint = match build_compat_gateway_endpoint(&state) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                let _ = send_sse_data(
+                let _ = send_compat_chat_failed_stream_event(
                     &sender,
-                    compat_error_payload("server_error", "gateway_unavailable", error),
+                    &state,
+                    &stream_context,
+                    CompatChatFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        created_seconds,
+                        model_name: model_name.as_str(),
+                        code: "gateway_unavailable",
+                        message: error,
+                        public_event: None,
+                    },
                 )
                 .await;
                 let _ = send_sse_done(&sender).await;
@@ -3343,13 +3391,18 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         let channel = match endpoint.connect().await {
             Ok(channel) => channel,
             Err(error) => {
-                let _ = send_sse_data(
+                let _ = send_compat_chat_failed_stream_event(
                     &sender,
-                    compat_error_payload(
-                        "server_error",
-                        "gateway_unavailable",
-                        format!("failed to connect compat API to gateway: {error}"),
-                    ),
+                    &state,
+                    &stream_context,
+                    CompatChatFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        created_seconds,
+                        model_name: model_name.as_str(),
+                        code: "gateway_unavailable",
+                        message: format!("failed to connect compat API to gateway: {error}"),
+                        public_event: None,
+                    },
                 )
                 .await;
                 let _ = send_sse_done(&sender).await;
@@ -3360,13 +3413,18 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
         let mut stream = match client.run_stream(run_request).await {
             Ok(response) => response.into_inner(),
             Err(error) => {
-                let _ = send_sse_data(
+                let _ = send_compat_chat_failed_stream_event(
                     &sender,
-                    compat_error_payload(
-                        "server_error",
-                        "gateway_stream_failed",
-                        sanitize_http_error_message(error.message()),
-                    ),
+                    &state,
+                    &stream_context,
+                    CompatChatFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        created_seconds,
+                        model_name: model_name.as_str(),
+                        code: "gateway_stream_failed",
+                        message: sanitize_http_error_message(error.message()).to_owned(),
+                        public_event: None,
+                    },
                 )
                 .await;
                 let _ = send_sse_done(&sender).await;
@@ -3374,8 +3432,20 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
             }
         };
 
-        while let Some(item) = stream.next().await {
-            match item {
+        let mut keepalive = tokio::time::interval(COMPAT_SSE_KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    if !send_compat_chat_sse_comment(&sender, &state, &stream_context, "keepalive").await {
+                        return;
+                    }
+                }
+                item = stream.next() => {
+                    let Some(item) = item else {
+                        break;
+                    };
+                    match item {
                 Ok(event) => {
                     public_event_sequence = public_event_sequence.saturating_add(1);
                     let public_event_id =
@@ -3395,8 +3465,10 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                         );
                     match event.body {
                         Some(common_v1::run_stream_event::Body::ModelToken(token_event))
-                            if !send_sse_data(
+                            if !send_compat_chat_sse_data(
                                 &sender,
+                                &state,
+                                &stream_context,
                                 json!({
                                     "id": response_id,
                                     "object": "chat.completion.chunk",
@@ -3425,8 +3497,10 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                                 .as_ref()
                                 .map(|value| value.ulid.clone())
                                 .unwrap_or_else(|| Ulid::new().to_string());
-                            if !send_sse_data(
+                            if !send_compat_chat_sse_data(
                                 &sender,
+                                &state,
+                                &stream_context,
                                 json!({
                                     "id": response_id,
                                     "object": "chat.completion.chunk",
@@ -3461,6 +3535,7 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                             tool_call_index = tool_call_index.saturating_add(1);
                         }
                         Some(common_v1::run_stream_event::Body::ToolApprovalRequest(request)) => {
+                            finish_reason = "approval_required";
                             auto_deny_compat_tool_approval(
                                 &request_sender,
                                 session_id.as_str(),
@@ -3495,6 +3570,8 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                     break;
                 }
             }
+                }
+            }
         }
 
         let now = unix_ms_now().unwrap_or(created_at_unix_ms);
@@ -3503,15 +3580,24 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                 if let Some(error) = stream_error.or_else(|| snapshot.last_error.clone()) {
                     touch_compat_api_token(
                         &state,
-                        token.token_id.as_str(),
+                        stream_context.token_id.as_str(),
                         "run",
                         "chat_failed",
                         Some(run_id.as_str()),
                         now,
                     );
-                    let _ = send_sse_data(
+                    let _ = send_compat_chat_failed_stream_event(
                         &sender,
-                        compat_error_payload("server_error", "run_failed", error),
+                        &state,
+                        &stream_context,
+                        CompatChatFailedStreamEvent {
+                            response_id: response_id.as_str(),
+                            created_seconds,
+                            model_name: model_name.as_str(),
+                            code: "run_failed",
+                            message: error,
+                            public_event: last_public_terminal_event.as_ref(),
+                        },
                     )
                     .await;
                     let _ = send_sse_done(&sender).await;
@@ -3519,14 +3605,18 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                 }
                 touch_compat_api_token(
                     &state,
-                    token.token_id.as_str(),
+                    stream_context.token_id.as_str(),
                     "run",
                     "chat_completed",
                     Some(run_id.as_str()),
                     now,
                 );
-                let _ = send_sse_data(
+                let final_finish_reason =
+                    if snapshot.cancel_requested { "cancelled" } else { finish_reason };
+                let _ = send_compat_chat_sse_data(
                     &sender,
+                    &state,
+                    &stream_context,
                     json!({
                         "id": response_id,
                         "object": "chat.completion.chunk",
@@ -3535,7 +3625,7 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
                         "choices": [{
                             "index": 0,
                             "delta": {},
-                            "finish_reason": finish_reason,
+                            "finish_reason": final_finish_reason,
                         }],
                         "_palyra": compat_stream_palyra_metadata(
                             run_id.as_str(),
@@ -3550,14 +3640,34 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
             Err(response) => {
                 touch_compat_api_token(
                     &state,
-                    token.token_id.as_str(),
+                    stream_context.token_id.as_str(),
                     "run",
                     "chat_failed",
                     Some(run_id.as_str()),
                     now,
                 );
                 let body = compat_error_body_from_response(&response);
-                let _ = send_sse_data(&sender, body).await;
+                let _ = send_compat_chat_failed_stream_event(
+                    &sender,
+                    &state,
+                    &stream_context,
+                    CompatChatFailedStreamEvent {
+                        response_id: response_id.as_str(),
+                        created_seconds,
+                        model_name: model_name.as_str(),
+                        code: body
+                            .pointer("/error/code")
+                            .and_then(Value::as_str)
+                            .unwrap_or("request_failed"),
+                        message: body
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("compat API request failed")
+                            .to_owned(),
+                        public_event: None,
+                    },
+                )
+                .await;
                 let _ = send_sse_done(&sender).await;
             }
         }
@@ -3571,11 +3681,180 @@ fn build_compat_chat_streaming_response(state: AppState, prepared: CompatPrepare
     response
 }
 
+struct CompatChatFailedStreamEvent<'a> {
+    response_id: &'a str,
+    created_seconds: i64,
+    model_name: &'a str,
+    code: &'a str,
+    message: String,
+    public_event: Option<&'a Value>,
+}
+
+async fn send_compat_chat_sse_data(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    state: &AppState,
+    context: &CompatChatStreamContext,
+    payload: Value,
+) -> bool {
+    if send_sse_data(sender, payload).await {
+        true
+    } else {
+        handle_compat_chat_stream_disconnect(state, context).await;
+        false
+    }
+}
+
+async fn send_compat_chat_sse_comment(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    state: &AppState,
+    context: &CompatChatStreamContext,
+    comment: &str,
+) -> bool {
+    if send_sse_comment(sender, comment).await {
+        true
+    } else {
+        handle_compat_chat_stream_disconnect(state, context).await;
+        false
+    }
+}
+
+async fn send_compat_chat_failed_stream_event(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    state: &AppState,
+    context: &CompatChatStreamContext,
+    event: CompatChatFailedStreamEvent<'_>,
+) -> bool {
+    let error = json!({
+        "type": "server_error",
+        "code": event.code,
+        "message": event.message,
+    });
+    if send_sse_event(
+        sender,
+        "chat.failed",
+        json!({
+            "id": event.response_id,
+            "object": "chat.completion.chunk",
+            "created": event.created_seconds,
+            "model": event.model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "error",
+            }],
+            "error": error,
+            "_palyra": compat_stream_palyra_metadata(
+                context.run_id.as_str(),
+                context.session_id.as_str(),
+                event.public_event,
+            ),
+        }),
+    )
+    .await
+    {
+        true
+    } else {
+        handle_compat_chat_stream_disconnect(state, context).await;
+        false
+    }
+}
+
+async fn handle_compat_chat_stream_disconnect(state: &AppState, context: &CompatChatStreamContext) {
+    let now = unix_ms_now().unwrap_or(context.created_at_unix_ms);
+    if context.cancel_on_disconnect {
+        match state
+            .runtime
+            .apply_turn_control(crate::application::turn_control::TurnControlRequest {
+                operation: crate::application::turn_control::TurnControlOperation::CancelRun,
+                actor_principal: context.principal.clone(),
+                session_id: Some(context.session_id.clone()),
+                run_id: Some(context.run_id.clone()),
+                queued_input_id: None,
+                priority_lane: None,
+                reason: Some("compat_chat_stream_client_disconnect".to_owned()),
+                dry_run: false,
+            })
+            .await
+        {
+            Ok(outcome) => {
+                let cancel_requested = outcome
+                    .effect
+                    .get("cancel_requested")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                tracing::info!(
+                    run_id = %context.run_id,
+                    cancel_requested,
+                    "compat chat stream disconnected; requested run cancellation"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %context.run_id,
+                    error = %error,
+                    "failed to cancel compat chat run after client disconnect"
+                );
+            }
+        }
+        touch_compat_api_token(
+            state,
+            context.token_id.as_str(),
+            "run",
+            "chat_disconnected_cancelled",
+            Some(context.run_id.as_str()),
+            now,
+        );
+        return;
+    }
+
+    match stateful_run_snapshot(state, context.run_id.as_str()).await {
+        Ok(snapshot) => {
+            if let Err(response) = record_compat_run_flow_audit(
+                state,
+                &snapshot,
+                context.principal.as_str(),
+                context.device_id.as_str(),
+                "compat_chat_stream_client_disconnect",
+                json!({
+                    "action": "client_disconnect",
+                    "disconnect_policy": "detach",
+                    "cancel_on_disconnect": false,
+                }),
+                now,
+            )
+            .await
+            {
+                tracing::warn!(
+                    run_id = %context.run_id,
+                    status = %response.status(),
+                    "failed to audit compat chat detach after client disconnect"
+                );
+            }
+        }
+        Err(response) => {
+            tracing::warn!(
+                run_id = %context.run_id,
+                status = %response.status(),
+                "failed to load compat chat run snapshot after client disconnect"
+            );
+        }
+    }
+    touch_compat_api_token(
+        state,
+        context.token_id.as_str(),
+        "run",
+        "chat_disconnected_detached",
+        Some(context.run_id.as_str()),
+        now,
+    );
+}
+
 fn build_compat_responses_streaming_response(
     state: AppState,
     prepared: CompatPreparedRun,
 ) -> Response {
-    let (sender, receiver) = mpsc::channel::<Result<Bytes, Infallible>>(32);
+    let (sender, receiver) =
+        mpsc::channel::<Result<Bytes, Infallible>>(COMPAT_SSE_CHANNEL_CAPACITY);
     tokio::spawn(async move {
         let CompatPreparedRun {
             token,
@@ -5259,7 +5538,7 @@ async fn send_sse_data(sender: &mpsc::Sender<Result<Bytes, Infallible>>, payload
     };
     encoded.append(&mut body);
     encoded.extend_from_slice(b"\n\n");
-    sender.send(Ok(Bytes::from(encoded))).await.is_ok()
+    send_sse_bytes(sender, Bytes::from(encoded), "data").await
 }
 
 async fn send_sse_event(
@@ -5281,15 +5560,43 @@ async fn send_sse_event(
     let mut encoded = format!("event: {event}\ndata: ").into_bytes();
     encoded.append(&mut body);
     encoded.extend_from_slice(b"\n\n");
-    sender.send(Ok(Bytes::from(encoded))).await.is_ok()
+    send_sse_bytes(sender, Bytes::from(encoded), event).await
 }
 
 async fn send_sse_comment(sender: &mpsc::Sender<Result<Bytes, Infallible>>, comment: &str) -> bool {
-    sender.send(Ok(Bytes::from(format!(": {comment}\n\n")))).await.is_ok()
+    send_sse_bytes(sender, Bytes::from(format!(": {comment}\n\n")), "comment").await
 }
 
 async fn send_sse_done(sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
-    sender.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await.is_ok()
+    send_sse_bytes(sender, Bytes::from_static(b"data: [DONE]\n\n"), "done").await
+}
+
+async fn send_sse_bytes(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    bytes: Bytes,
+    frame_kind: &str,
+) -> bool {
+    send_sse_bytes_with_timeout(sender, bytes, frame_kind, COMPAT_SSE_SEND_TIMEOUT).await
+}
+
+async fn send_sse_bytes_with_timeout(
+    sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+    bytes: Bytes,
+    frame_kind: &str,
+    timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(timeout, sender.send(Ok(bytes))).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_closed)) => false,
+        Err(_elapsed) => {
+            tracing::warn!(
+                frame_kind,
+                timeout_ms = timeout.as_millis(),
+                "compat SSE stream buffer did not drain before timeout"
+            );
+            false
+        }
+    }
 }
 
 fn internal_clock_error_response(error: impl std::fmt::Display) -> Response {
@@ -5367,6 +5674,31 @@ mod tests {
         let mut invalid_headers = HeaderMap::new();
         invalid_headers.insert("authorization", HeaderValue::from_static("Basic abc"));
         assert!(extract_bearer_token(&invalid_headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_send_returns_false_when_bounded_buffer_does_not_drain() {
+        let (sender, _receiver) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+        assert!(
+            send_sse_bytes_with_timeout(
+                &sender,
+                Bytes::from_static(b"data: first\n\n"),
+                "test",
+                Duration::from_millis(1),
+            )
+            .await,
+            "first frame should fit in the bounded SSE buffer"
+        );
+        assert!(
+            !send_sse_bytes_with_timeout(
+                &sender,
+                Bytes::from_static(b"data: second\n\n"),
+                "test",
+                Duration::from_millis(1),
+            )
+            .await,
+            "full SSE buffer should fail instead of blocking indefinitely"
+        );
     }
 
     #[test]
