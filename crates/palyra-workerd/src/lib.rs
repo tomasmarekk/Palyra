@@ -225,6 +225,414 @@ pub struct WorkerCleanupReport {
     pub failure_reason: Option<String>,
 }
 
+impl WorkerCleanupReport {
+    /// Returns whether the worker reported complete removal of all run-scoped state.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.removed_workspace_scope
+            && self.removed_artifacts
+            && self.removed_logs
+            && self.failure_reason.is_none()
+    }
+}
+
+/// Wire protocol identifier for remote worker tool execution envelopes.
+pub const WORKER_REMOTE_TOOL_PROTOCOL: &str = "palyra-worker-rpc/v1";
+/// Schema version for [`WorkerRemoteToolRequestEnvelope`] and
+/// [`WorkerRemoteToolResultEnvelope`].
+pub const WORKER_REMOTE_TOOL_SCHEMA_VERSION: u32 = 1;
+
+/// Tool families a networked worker may execute through the remote RPC envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemoteToolKind {
+    FsRead,
+    FsList,
+    FsSearch,
+    ProcessRun,
+    ApplyPatch,
+    ArtifactRead,
+    ToolProgramRun,
+}
+
+impl WorkerRemoteToolKind {
+    /// Stable lowercase label used in worker RPC envelopes and attestations.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FsRead => "fs_read",
+            Self::FsList => "fs_list",
+            Self::FsSearch => "fs_search",
+            Self::ProcessRun => "process_run",
+            Self::ApplyPatch => "apply_patch",
+            Self::ArtifactRead => "artifact_read",
+            Self::ToolProgramRun => "tool_program_run",
+        }
+    }
+
+    /// Resolves the canonical Palyra tool name to a remote worker tool kind.
+    #[must_use]
+    pub fn from_tool_name(tool_name: &str) -> Option<Self> {
+        match tool_name.trim().to_ascii_lowercase().as_str() {
+            "palyra.fs.read_file" => Some(Self::FsRead),
+            "palyra.fs.list_dir" => Some(Self::FsList),
+            "palyra.fs.search" => Some(Self::FsSearch),
+            "palyra.process.run" => Some(Self::ProcessRun),
+            "palyra.fs.apply_patch" => Some(Self::ApplyPatch),
+            "palyra.artifact.read" => Some(Self::ArtifactRead),
+            "palyra.tool_program.run" => Some(Self::ToolProgramRun),
+            _ => None,
+        }
+    }
+
+    /// Canonical Palyra tool name represented by this kind.
+    #[must_use]
+    pub fn tool_name(self) -> &'static str {
+        match self {
+            Self::FsRead => "palyra.fs.read_file",
+            Self::FsList => "palyra.fs.list_dir",
+            Self::FsSearch => "palyra.fs.search",
+            Self::ProcessRun => "palyra.process.run",
+            Self::ApplyPatch => "palyra.fs.apply_patch",
+            Self::ArtifactRead => "palyra.artifact.read",
+            Self::ToolProgramRun => "palyra.tool_program.run",
+        }
+    }
+
+    /// Capability string that must be present on the worker lease.
+    #[must_use]
+    pub fn required_capability(self) -> String {
+        format!("tool:{}", self.tool_name())
+    }
+}
+
+/// Immutable worker identity copied into remote request and result envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRemoteIdentity {
+    pub worker_id: String,
+    pub image_digest_sha256: String,
+    pub build_digest_sha256: String,
+    pub artifact_digest_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_authority_sha256: Option<String>,
+    pub sdk_protocol_version: u32,
+    pub wit_abi_version: String,
+}
+
+impl From<&WorkerAttestation> for WorkerRemoteIdentity {
+    fn from(attestation: &WorkerAttestation) -> Self {
+        Self {
+            worker_id: attestation.worker_id.clone(),
+            image_digest_sha256: attestation.image_digest_sha256.clone(),
+            build_digest_sha256: attestation.build_digest_sha256.clone(),
+            artifact_digest_sha256: attestation.artifact_digest_sha256.clone(),
+            capability_authority_sha256: attestation.capability_authority_sha256.clone(),
+            sdk_protocol_version: attestation.sdk_protocol_version,
+            wit_abi_version: attestation.wit_abi_version.clone(),
+        }
+    }
+}
+
+/// Workspace transfer mode used to prepare a remote worker run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemoteWorkspaceTransferMode {
+    Manifest,
+    ScopedBundle,
+}
+
+impl WorkerRemoteWorkspaceTransferMode {
+    /// Stable lowercase label used in worker RPC envelopes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::ScopedBundle => "scoped_bundle",
+        }
+    }
+}
+
+/// Integrity metadata for workspace material made visible to a remote worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRemoteWorkspaceTransfer {
+    pub mode: WorkerRemoteWorkspaceTransferMode,
+    pub workspace_manifest_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_bundle_sha256: Option<String>,
+    pub writeback_mode: String,
+}
+
+impl WorkerRemoteWorkspaceTransfer {
+    /// Builds a manifest-only transfer descriptor for read-only remote runs.
+    #[must_use]
+    pub fn manifest(workspace_manifest_sha256: String) -> Self {
+        Self {
+            mode: WorkerRemoteWorkspaceTransferMode::Manifest,
+            workspace_manifest_sha256,
+            scoped_bundle_sha256: None,
+            writeback_mode: "patch_bundle".to_owned(),
+        }
+    }
+}
+
+/// Lease fields copied into the worker RPC request so the worker can verify its grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRemoteLeaseBinding {
+    pub lease_id: String,
+    pub worker_id: String,
+    pub run_id: String,
+    pub grant_id: String,
+    pub grant_tool_name: String,
+    pub expires_at_unix_ms: i64,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    pub workspace_scope: WorkerWorkspaceScope,
+    pub artifact_transport: WorkerArtifactTransport,
+}
+
+impl From<&WorkerLease> for WorkerRemoteLeaseBinding {
+    fn from(lease: &WorkerLease) -> Self {
+        Self {
+            lease_id: lease.lease_id.clone(),
+            worker_id: lease.worker_id.clone(),
+            run_id: lease.run_id.clone(),
+            grant_id: lease.grant.grant_id.clone(),
+            grant_tool_name: lease.grant.tool_name.clone(),
+            expires_at_unix_ms: lease.expires_at_unix_ms,
+            required_capabilities: lease.required_capabilities.clone(),
+            workspace_scope: lease.workspace_scope.clone(),
+            artifact_transport: lease.artifact_transport.clone(),
+        }
+    }
+}
+
+/// Request envelope sent to a leased networked worker for one tool execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRemoteToolRequestEnvelope {
+    pub protocol: String,
+    pub schema_version: u32,
+    pub request_id: String,
+    pub proposal_id: String,
+    pub tool_name: String,
+    pub tool_kind: WorkerRemoteToolKind,
+    pub input_json: String,
+    pub input_json_sha256: String,
+    pub lease: WorkerRemoteLeaseBinding,
+    pub worker_identity: WorkerRemoteIdentity,
+    pub workspace_transfer: WorkerRemoteWorkspaceTransfer,
+}
+
+impl WorkerRemoteToolRequestEnvelope {
+    /// Validates protocol, tool-kind, manifest, identity, and lease invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerRemoteToolContractError`] when the envelope is malformed,
+    /// expired, unsupported, or not bound to the requested worker lease.
+    pub fn validate(&self, now_unix_ms: i64) -> Result<(), WorkerRemoteToolContractError> {
+        validate_protocol(self.protocol.as_str(), self.schema_version)?;
+        validate_required_string(self.request_id.as_str(), "request_id")?;
+        validate_required_string(self.proposal_id.as_str(), "proposal_id")?;
+        validate_required_string(self.tool_name.as_str(), "tool_name")?;
+        validate_required_string(self.input_json.as_str(), "input_json")?;
+        validate_sha256_hex(self.input_json_sha256.as_str(), "input_json_sha256")?;
+        validate_sha256_hex(
+            self.workspace_transfer.workspace_manifest_sha256.as_str(),
+            "workspace_manifest_sha256",
+        )?;
+        if matches!(self.workspace_transfer.mode, WorkerRemoteWorkspaceTransferMode::ScopedBundle)
+            && self.workspace_transfer.scoped_bundle_sha256.is_none()
+        {
+            return Err(WorkerRemoteToolContractError::MissingScopedBundleDigest);
+        }
+        if let Some(digest) = self.workspace_transfer.scoped_bundle_sha256.as_deref() {
+            validate_sha256_hex(digest, "scoped_bundle_sha256")?;
+        }
+        let expected_kind = WorkerRemoteToolKind::from_tool_name(self.tool_name.as_str())
+            .ok_or_else(|| WorkerRemoteToolContractError::UnsupportedTool {
+                tool_name: self.tool_name.clone(),
+            })?;
+        if expected_kind != self.tool_kind {
+            return Err(WorkerRemoteToolContractError::ToolKindMismatch {
+                tool_name: self.tool_name.clone(),
+                expected: expected_kind.as_str(),
+                actual: self.tool_kind.as_str(),
+            });
+        }
+        if self.lease.worker_id != self.worker_identity.worker_id {
+            return Err(WorkerRemoteToolContractError::WorkerIdentityMismatch {
+                expected: self.lease.worker_id.clone(),
+                actual: self.worker_identity.worker_id.clone(),
+            });
+        }
+        if self.lease.grant_tool_name != self.tool_name {
+            return Err(WorkerRemoteToolContractError::LeaseToolMismatch {
+                expected: self.tool_name.clone(),
+                actual: self.lease.grant_tool_name.clone(),
+            });
+        }
+        let required_capability = self.tool_kind.required_capability();
+        if !self
+            .lease
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == required_capability.as_str())
+        {
+            return Err(WorkerRemoteToolContractError::MissingRequiredCapability {
+                capability: required_capability,
+            });
+        }
+        if self.lease.expires_at_unix_ms <= now_unix_ms {
+            return Err(WorkerRemoteToolContractError::LeaseExpired {
+                lease_id: self.lease.lease_id.clone(),
+                expires_at_unix_ms: self.lease.expires_at_unix_ms,
+                observed_at_unix_ms: now_unix_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Response envelope returned by a remote worker after executing one tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerRemoteToolResultEnvelope {
+    pub protocol: String,
+    pub schema_version: u32,
+    pub request_id: String,
+    pub proposal_id: String,
+    pub tool_name: String,
+    pub tool_kind: WorkerRemoteToolKind,
+    pub worker_id: String,
+    pub lease_id: String,
+    pub success: bool,
+    pub output_json: String,
+    pub output_json_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub output_manifest_sha256: String,
+    pub cleanup_report: WorkerCleanupReport,
+    pub worker_identity: WorkerRemoteIdentity,
+    pub completed_at_unix_ms: i64,
+}
+
+impl WorkerRemoteToolResultEnvelope {
+    /// Validates a remote result against its original request envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerRemoteToolContractError`] when the worker changed identity,
+    /// the lease expired, cleanup was incomplete, or result fields do not match
+    /// the request binding.
+    pub fn validate_against_request(
+        &self,
+        request: &WorkerRemoteToolRequestEnvelope,
+        now_unix_ms: i64,
+    ) -> Result<(), WorkerRemoteToolContractError> {
+        request.validate(now_unix_ms)?;
+        validate_protocol(self.protocol.as_str(), self.schema_version)?;
+        validate_sha256_hex(self.output_json_sha256.as_str(), "output_json_sha256")?;
+        validate_sha256_hex(self.output_manifest_sha256.as_str(), "output_manifest_sha256")?;
+        if self.request_id != request.request_id
+            || self.proposal_id != request.proposal_id
+            || self.tool_name != request.tool_name
+            || self.tool_kind != request.tool_kind
+            || self.lease_id != request.lease.lease_id
+        {
+            return Err(WorkerRemoteToolContractError::ResultBindingMismatch);
+        }
+        if self.worker_id != request.lease.worker_id
+            || self.worker_identity != request.worker_identity
+        {
+            return Err(WorkerRemoteToolContractError::WorkerIdentityMismatch {
+                expected: request.worker_identity.worker_id.clone(),
+                actual: self.worker_identity.worker_id.clone(),
+            });
+        }
+        if self.completed_at_unix_ms > request.lease.expires_at_unix_ms {
+            return Err(WorkerRemoteToolContractError::LeaseExpired {
+                lease_id: request.lease.lease_id.clone(),
+                expires_at_unix_ms: request.lease.expires_at_unix_ms,
+                observed_at_unix_ms: self.completed_at_unix_ms,
+            });
+        }
+        if !self.cleanup_report.is_verified() {
+            return Err(WorkerRemoteToolContractError::CleanupGap {
+                lease_id: request.lease.lease_id.clone(),
+                reason: self
+                    .cleanup_report
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "incomplete_cleanup_report".to_owned()),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Validation failures for networked worker RPC envelopes.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum WorkerRemoteToolContractError {
+    #[error("unsupported remote worker tool '{tool_name}'")]
+    UnsupportedTool { tool_name: String },
+    #[error("worker remote tool envelope uses unsupported protocol or schema")]
+    UnsupportedProtocol,
+    #[error("worker remote tool envelope missing required field '{field}'")]
+    MissingRequiredField { field: &'static str },
+    #[error("worker remote tool envelope has invalid SHA-256 digest in '{field}'")]
+    InvalidSha256Digest { field: &'static str },
+    #[error("worker remote scoped bundle transfer requires scoped_bundle_sha256")]
+    MissingScopedBundleDigest,
+    #[error("worker remote tool kind mismatch for {tool_name}: expected {expected}, got {actual}")]
+    ToolKindMismatch { tool_name: String, expected: &'static str, actual: &'static str },
+    #[error("worker remote lease tool mismatch: expected {expected}, got {actual}")]
+    LeaseToolMismatch { expected: String, actual: String },
+    #[error("worker remote lease missing capability '{capability}'")]
+    MissingRequiredCapability { capability: String },
+    #[error("worker remote lease '{lease_id}' expired at {expires_at_unix_ms}; observed at {observed_at_unix_ms}")]
+    LeaseExpired { lease_id: String, expires_at_unix_ms: i64, observed_at_unix_ms: i64 },
+    #[error("worker remote identity mismatch: expected {expected}, got {actual}")]
+    WorkerIdentityMismatch { expected: String, actual: String },
+    #[error("worker remote result does not match the request binding")]
+    ResultBindingMismatch,
+    #[error("worker remote cleanup gap for lease '{lease_id}': {reason}")]
+    CleanupGap { lease_id: String, reason: String },
+}
+
+fn validate_protocol(
+    protocol: &str,
+    schema_version: u32,
+) -> Result<(), WorkerRemoteToolContractError> {
+    if protocol == WORKER_REMOTE_TOOL_PROTOCOL
+        && schema_version == WORKER_REMOTE_TOOL_SCHEMA_VERSION
+    {
+        Ok(())
+    } else {
+        Err(WorkerRemoteToolContractError::UnsupportedProtocol)
+    }
+}
+
+fn validate_required_string(
+    value: &str,
+    field: &'static str,
+) -> Result<(), WorkerRemoteToolContractError> {
+    if value.trim().is_empty() {
+        Err(WorkerRemoteToolContractError::MissingRequiredField { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_sha256_hex(
+    value: &str,
+    field: &'static str,
+) -> Result<(), WorkerRemoteToolContractError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(WorkerRemoteToolContractError::InvalidSha256Digest { field })
+    }
+}
+
 /// Audit record of a single worker lifecycle transition.
 ///
 /// `reason_code` is a stable machine-readable code (for example `worker.registered`).
@@ -1128,8 +1536,15 @@ mod tests {
     use super::{
         WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerFleetManager,
         WorkerFleetPolicy, WorkerLeaseRequest, WorkerLifecycleError, WorkerLifecycleState,
-        WorkerRunGrant, WorkerWorkspaceScope,
+        WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolContractError,
+        WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope,
+        WorkerRemoteWorkspaceTransfer, WorkerRunGrant, WorkerWorkspaceScope,
+        WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
     };
+
+    fn hex_digest(byte: &str) -> String {
+        byte.repeat(64)
+    }
 
     fn attestation(worker_id: &str) -> WorkerAttestation {
         WorkerAttestation {
@@ -1175,6 +1590,143 @@ mod tests {
 
     fn policy_for(capability: &str) -> WorkerFleetPolicy {
         WorkerFleetPolicy { trusted_capabilities: vec![capability.into()], ..Default::default() }
+    }
+
+    fn remote_identity(worker_id: &str) -> WorkerRemoteIdentity {
+        WorkerRemoteIdentity {
+            worker_id: worker_id.to_owned(),
+            image_digest_sha256: hex_digest("a"),
+            build_digest_sha256: hex_digest("b"),
+            artifact_digest_sha256: hex_digest("c"),
+            capability_authority_sha256: Some(hex_digest("d")),
+            sdk_protocol_version: 1,
+            wit_abi_version: "palyra-worker-abi/v1".to_owned(),
+        }
+    }
+
+    fn remote_request(tool_name: &str) -> WorkerRemoteToolRequestEnvelope {
+        let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name)
+            .expect("test tool should be remote-capable");
+        WorkerRemoteToolRequestEnvelope {
+            protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+            schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+            request_id: "remote-request-01".to_owned(),
+            proposal_id: "proposal-01".to_owned(),
+            tool_name: tool_name.to_owned(),
+            tool_kind,
+            input_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
+            input_json_sha256: hex_digest("1"),
+            lease: WorkerRemoteLeaseBinding {
+                lease_id: "lease-01".to_owned(),
+                worker_id: "worker-remote-01".to_owned(),
+                run_id: "run-01".to_owned(),
+                grant_id: "grant-01".to_owned(),
+                grant_tool_name: tool_name.to_owned(),
+                expires_at_unix_ms: 3_000,
+                required_capabilities: vec![tool_kind.required_capability()],
+                workspace_scope: WorkerWorkspaceScope {
+                    workspace_root: "/workspace".to_owned(),
+                    allowed_paths: vec!["src".to_owned()],
+                    read_only: true,
+                },
+                artifact_transport: WorkerArtifactTransport {
+                    input_manifest_sha256: hex_digest("2"),
+                    output_manifest_sha256: hex_digest("3"),
+                    log_stream_id: "logs/run-01/proposal-01".to_owned(),
+                    scratch_directory_id: "scratch/run-01/proposal-01".to_owned(),
+                },
+            },
+            worker_identity: remote_identity("worker-remote-01"),
+            workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(hex_digest("4")),
+        }
+    }
+
+    fn remote_result(
+        request: &WorkerRemoteToolRequestEnvelope,
+        output_json: &str,
+    ) -> WorkerRemoteToolResultEnvelope {
+        WorkerRemoteToolResultEnvelope {
+            protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+            schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+            request_id: request.request_id.clone(),
+            proposal_id: request.proposal_id.clone(),
+            tool_name: request.tool_name.clone(),
+            tool_kind: request.tool_kind,
+            worker_id: request.lease.worker_id.clone(),
+            lease_id: request.lease.lease_id.clone(),
+            success: true,
+            output_json: output_json.to_owned(),
+            output_json_sha256: hex_digest("5"),
+            error: None,
+            output_manifest_sha256: hex_digest("6"),
+            cleanup_report: WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+            worker_identity: request.worker_identity.clone(),
+            completed_at_unix_ms: 2_000,
+        }
+    }
+
+    #[test]
+    fn remote_tool_kind_maps_m043_subset() {
+        let cases = [
+            ("palyra.fs.read_file", WorkerRemoteToolKind::FsRead),
+            ("palyra.fs.list_dir", WorkerRemoteToolKind::FsList),
+            ("palyra.fs.search", WorkerRemoteToolKind::FsSearch),
+            ("palyra.process.run", WorkerRemoteToolKind::ProcessRun),
+            ("palyra.fs.apply_patch", WorkerRemoteToolKind::ApplyPatch),
+            ("palyra.artifact.read", WorkerRemoteToolKind::ArtifactRead),
+            ("palyra.tool_program.run", WorkerRemoteToolKind::ToolProgramRun),
+        ];
+
+        for (tool_name, expected) in cases {
+            assert_eq!(WorkerRemoteToolKind::from_tool_name(tool_name), Some(expected));
+            assert_eq!(expected.tool_name(), tool_name);
+            assert_eq!(expected.required_capability(), format!("tool:{tool_name}"));
+        }
+        assert_eq!(WorkerRemoteToolKind::from_tool_name("palyra.http.fetch"), None);
+    }
+
+    #[test]
+    fn remote_request_validates_lease_and_manifest_contract() {
+        let request = remote_request("palyra.fs.read_file");
+        request.validate(2_000).expect("well-formed request should validate");
+
+        let mut expired = request.clone();
+        expired.lease.expires_at_unix_ms = 1_999;
+        let error = expired.validate(2_000).expect_err("expired lease must fail closed");
+        assert!(matches!(error, WorkerRemoteToolContractError::LeaseExpired { .. }));
+
+        let mut missing_capability = request.clone();
+        missing_capability.lease.required_capabilities.clear();
+        let error = missing_capability
+            .validate(2_000)
+            .expect_err("missing tool capability must fail closed");
+        assert!(matches!(error, WorkerRemoteToolContractError::MissingRequiredCapability { .. }));
+    }
+
+    #[test]
+    fn remote_result_requires_cleanup_and_identity_stability() {
+        let request = remote_request("palyra.process.run");
+        let result = remote_result(&request, r#"{"schema_version":2,"exit_code":0}"#);
+        result.validate_against_request(&request, 2_000).expect("matching result should validate");
+
+        let mut cleanup_gap = result.clone();
+        cleanup_gap.cleanup_report.removed_logs = false;
+        let error = cleanup_gap
+            .validate_against_request(&request, 2_000)
+            .expect_err("cleanup gaps must fail closed");
+        assert!(matches!(error, WorkerRemoteToolContractError::CleanupGap { .. }));
+
+        let mut identity_mismatch = result;
+        identity_mismatch.worker_identity.worker_id = "worker-remote-02".to_owned();
+        let error = identity_mismatch
+            .validate_against_request(&request, 2_000)
+            .expect_err("identity drift must fail closed");
+        assert!(matches!(error, WorkerRemoteToolContractError::WorkerIdentityMismatch { .. }));
     }
 
     #[test]
