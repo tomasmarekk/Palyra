@@ -223,6 +223,7 @@ fn required_scope_for_route(method: &str, path: &str) -> &'static str {
         | ("POST", "/v1/runs")
         | ("GET", "/v1/runs/{run_id}")
         | ("GET", "/v1/runs/{run_id}/events")
+        | ("POST", "/v1/runs/{run_id}/wait")
         | ("POST", "/v1/runs/{run_id}/stop")
         | ("POST", "/v1/runs/{run_id}/detach")
         | ("POST", "/v1/runs/{run_id}/approval") => PERMISSION_COMPAT_RESPONSES_CREATE,
@@ -267,6 +268,7 @@ fn route_supports_idempotency(method: &str, path: &str) -> bool {
             (method, path),
             ("POST", "/v1/responses")
                 | ("POST", "/v1/runs")
+                | ("POST", "/v1/runs/{run_id}/wait")
                 | ("POST", "/v1/runs/{run_id}/stop")
                 | ("POST", "/v1/runs/{run_id}/detach")
                 | ("POST", "/v1/runs/{run_id}/approval")

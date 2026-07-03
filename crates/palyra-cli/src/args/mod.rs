@@ -1012,7 +1012,7 @@ pub enum Command {
         #[command(subcommand)]
         command: WorkersCommand,
     },
-    #[command(about = "Export run trajectories for audit and evals")]
+    #[command(about = "Wait for runs and export trajectories for audit and evals")]
     Run {
         #[command(subcommand)]
         command: RunCommand,

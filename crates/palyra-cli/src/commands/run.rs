@@ -1,6 +1,9 @@
 //! `palyra run`: run trajectory export for audit and eval workflows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use crate::{commands::support_bundle, *};
 use palyra_common::replay_bundle::{
@@ -19,6 +22,9 @@ const LARGE_TRAJECTORY_TOOL_OUTPUT_BYTES: usize = 1024;
 /// deterministic validation, or the requested artifact cannot be written.
 pub(crate) fn run_run(command: RunCommand) -> Result<()> {
     match command {
+        RunCommand::Wait { run_id, timeout_ms, return_on_waiting, json } => {
+            run_wait(run_id, timeout_ms, return_on_waiting, json)
+        }
         RunCommand::Export {
             run_id,
             output,
@@ -32,6 +38,61 @@ pub(crate) fn run_run(command: RunCommand) -> Result<()> {
             run_replay(input, golden, diff_output, json)
         }
     }
+}
+
+fn run_wait(
+    run_id: String,
+    timeout_ms: u64,
+    return_on_waiting: bool,
+    json_output: bool,
+) -> Result<()> {
+    validate_canonical_id(run_id.as_str())
+        .context("run_id must be a canonical ULID for run wait")?;
+    let timeout_ms = timeout_ms.clamp(1, 120_000);
+    let connection = run_root_context()?.resolve_http_connection(
+        app::ConnectionOverrides::default(),
+        app::ConnectionDefaults::ADMIN,
+    )?;
+    let endpoint = format!(
+        "{}/admin/v1/runs/{}/wait",
+        connection.base_url.trim_end_matches('/'),
+        percent_encode_component(run_id.as_str())
+    );
+    let request_timeout = Duration::from_millis(timeout_ms.saturating_add(5_000));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(request_timeout)
+        .build()
+        .context("failed to build run wait HTTP client")?;
+    let response: Value = apply_run_http_connection_headers(client.post(endpoint), &connection)
+        .json(&json!({
+            "timeout_ms": timeout_ms,
+            "return_on_waiting": return_on_waiting,
+        }))
+        .send()
+        .context("failed to call daemon run wait endpoint")?
+        .error_for_status()
+        .context("daemon run wait endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon run wait payload")?;
+    if output::preferred_json(json_output) {
+        output::print_json_pretty(&response, "failed to encode run wait output as JSON")?;
+    } else {
+        let status = response.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let state = response.pointer("/run/state").and_then(Value::as_str).unwrap_or("unknown");
+        let session_id =
+            response.pointer("/run/session_id").and_then(Value::as_str).unwrap_or("none");
+        println!(
+            "run.wait run_id={} status={} state={} timed_out={} timeout_ms={} session_id={}",
+            response.get("run_id").and_then(Value::as_str).unwrap_or(run_id.as_str()),
+            status,
+            state,
+            response.get("timed_out").and_then(Value::as_bool).unwrap_or(false),
+            response.get("timeout_ms").and_then(Value::as_u64).unwrap_or(timeout_ms),
+            session_id
+        );
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    Ok(())
 }
 
 fn run_export(
@@ -84,6 +145,42 @@ fn run_export(
         );
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_root_context() -> Result<app::RootCommandContext> {
+    app::current_root_context()
+        .ok_or_else(|| anyhow!("CLI root context is unavailable for run command"))
+}
+
+fn apply_run_http_connection_headers(
+    request: reqwest::blocking::RequestBuilder,
+    connection: &app::HttpConnection,
+) -> reqwest::blocking::RequestBuilder {
+    let mut request = request
+        .header("x-palyra-principal", connection.principal.clone())
+        .header("x-palyra-device-id", connection.device_id.clone())
+        .header("x-palyra-channel", connection.channel.clone())
+        .header("x-palyra-trace-id", connection.trace_id.clone());
+    if let Some(token) = connection.token.as_ref() {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    request
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            other => {
+                encoded.push('%');
+                encoded.push_str(format!("{other:02X}").as_str());
+            }
+        }
+    }
+    encoded
 }
 
 fn run_replay(

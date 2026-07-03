@@ -458,6 +458,31 @@ fn parse_run_replay_with_golden_diff_and_json() {
 }
 
 #[test]
+fn parse_run_wait_with_timeout_and_json() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "run",
+        "wait",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+        "--timeout-ms",
+        "1500",
+        "--return-on-waiting",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Run {
+            command: RunCommand::Wait {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                timeout_ms: 1500,
+                return_on_waiting: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_jobs_commands() {
     let parsed = Cli::parse_from([
         "palyra",

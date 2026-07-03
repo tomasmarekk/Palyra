@@ -42,6 +42,7 @@
     "runtime_health",
     "runtime_roadmap",
     "runtime_watchdog",
+    "session_write_leases",
     "skills",
     "task_projection",
     "task_reconciler",
@@ -2003,6 +2004,20 @@
       },
       {
         "surface": "admin",
+        "route": "/admin/v1/runs/{run_id}/wait",
+        "http_method": "POST",
+        "method_name": "admin.post.admin.v1.runs.by_run_id.wait",
+        "stability": "stable",
+        "required_scope": "admin.write",
+        "request_schema_id": "admin.post.admin.v1.runs.by_run_id.wait.request.method-registry.v1",
+        "request_schema_hash": "216f1291a997d3aafeb0f2fdac1395d7dc68997bbbf1d49681a4a52c1009a882",
+        "response_schema_id": "admin.post.admin.v1.runs.by_run_id.wait.response.method-registry.v1",
+        "response_schema_hash": "7a0f629b8a92ff204b09b614c622cbb265161b206d3d3acb703e4e043c121965",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "admin",
         "route": "/admin/v1/skills/{skill_id}/enable",
         "http_method": "POST",
         "method_name": "admin.post.admin.v1.skills.by_skill_id.enable",
@@ -2376,6 +2391,20 @@
         "request_schema_hash": "683ad70e4f44bcb6ab43642f310f7941d8e16262dbf1ba0d9f7dd95e291911ea",
         "response_schema_id": "compat.post.v1.runs.by_run_id.stop.response.method-registry.v1",
         "response_schema_hash": "1c7505ae1a6a74299b352131f54fea257aa4c7860666e519296acf21c7f35495",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "compat",
+        "route": "/v1/runs/{run_id}/wait",
+        "http_method": "POST",
+        "method_name": "compat.post.v1.runs.by_run_id.wait",
+        "stability": "stable",
+        "required_scope": "compat.responses.create",
+        "request_schema_id": "compat.post.v1.runs.by_run_id.wait.request.method-registry.v1",
+        "request_schema_hash": "9fbbd3602fda11d421508ccb0aa7cab469797819f261179d986962fc1ca63e0f",
+        "response_schema_id": "compat.post.v1.runs.by_run_id.wait.response.method-registry.v1",
+        "response_schema_hash": "0520993cb452101259d09487edf87f77f71b1078034cf4c6830b6fd268615be1",
         "streaming_supported": false,
         "idempotency_supported": true
       },
@@ -7477,6 +7506,20 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/sessions/{session_id}/snapshot",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.sessions.by_session_id.snapshot",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.sessions.by_session_id.snapshot.request.method-registry.v1",
+        "request_schema_hash": "969235ab96f17497eeefea1d46a35d372a1c8165e36c505049167858de7fc275",
+        "response_schema_id": "console.get.console.v1.sessions.by_session_id.snapshot.response.method-registry.v1",
+        "response_schema_hash": "f8edd52fa5f0322470d62b21f92c0ed16af11cc9f09b1a6645597c4c44d49185",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/skills",
         "http_method": "GET",
         "method_name": "console.get.console.v1.skills",
@@ -8757,6 +8800,11 @@
       "registered": true
     },
     {
+      "path": "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/wait",
+      "method": "POST",
+      "registered": true
+    },
+    {
       "path": "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stop",
       "method": "POST",
       "registered": true
@@ -8998,12 +9046,12 @@
     "surface_counts": {
       "capability_catalog_entries": 32,
       "cli_families": 60,
-      "compat_routes": 15,
-      "registered_compat_routes": 15,
-      "diagnostics_sections": 44,
+      "compat_routes": 16,
+      "registered_compat_routes": 16,
+      "diagnostics_sections": 45,
       "execution_backends": 5,
       "feature_rollout_flags": 26,
-      "method_registry_methods": 488,
+      "method_registry_methods": 491,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -9029,10 +9077,10 @@
       "schema_version": 1,
       "registry_version": "method-registry.v1",
       "surface_counts": {
-        "admin": 50,
+        "admin": 51,
         "canvas": 5,
-        "compat": 15,
-        "console": 415,
+        "compat": 16,
+        "console": 416,
         "public": 2,
         "realtime": 1
       }

@@ -792,7 +792,7 @@ fn compat_model_detail_and_embeddings_surface_publish_registry_backed_payloads()
             .pointer("/method_registry/methods")
             .and_then(Value::as_array)
             .map(std::vec::Vec::len),
-        Some(15),
+        Some(16),
         "capabilities response should expose current compat method registry"
     );
     let encoded_capabilities = capabilities.to_string();
@@ -1571,6 +1571,35 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("run create response missing id"))?
         .to_owned();
+    assert_eq!(create_response.get("run_id").and_then(Value::as_str), Some(run_id.as_str()));
+    let status_url = format!("/v1/runs/{run_id}");
+    let events_url = format!("/v1/runs/{run_id}/events");
+    assert_eq!(
+        create_response.get("status_url").and_then(Value::as_str),
+        Some(status_url.as_str())
+    );
+    assert_eq!(
+        create_response.get("events_url").and_then(Value::as_str),
+        Some(events_url.as_str())
+    );
+
+    let wait_timeout = create_compat_run_wait_timeout(
+        &client,
+        admin_port,
+        token.as_str(),
+        &json!({ "input": "runs API wait timeout text" }),
+    )?;
+    assert_eq!(wait_timeout.get("object").and_then(Value::as_str), Some("run.wait"));
+    assert_eq!(wait_timeout.get("status").and_then(Value::as_str), Some("timeout"));
+    assert_eq!(wait_timeout.get("timed_out").and_then(Value::as_bool), Some(true));
+    assert_eq!(wait_timeout.get("timeout_ms").and_then(Value::as_u64), Some(1));
+    assert!(
+        wait_timeout
+            .pointer("/run/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "queued" | "running")),
+        "timeout payload should include current run status: {wait_timeout}"
+    );
 
     let terminal =
         wait_for_compat_run_terminal(&client, admin_port, token.as_str(), run_id.as_str())?;
@@ -1588,6 +1617,25 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
     assert_eq!(
         terminal.pointer("/verification_summary/state").and_then(Value::as_str),
         Some("not_available")
+    );
+
+    let (wait_completed_status, wait_completed_response) = compat_post_json(
+        &client,
+        admin_port,
+        format!("/v1/runs/{run_id}/wait").as_str(),
+        token.as_str(),
+        &json!({ "timeout_ms": 5000 }),
+    )?;
+    assert_eq!(
+        wait_completed_status, 200,
+        "terminal wait should succeed: {wait_completed_response}"
+    );
+    assert_eq!(wait_completed_response.get("object").and_then(Value::as_str), Some("run.wait"));
+    assert_eq!(wait_completed_response.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(wait_completed_response.get("timed_out").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        wait_completed_response.pointer("/run/status").and_then(Value::as_str),
+        Some("completed")
     );
 
     let (replay_status, replay_response) = compat_post_json_with_idempotency_key(
@@ -3576,6 +3624,49 @@ fn wait_for_compat_run_visible(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn create_compat_run_wait_timeout(
+    client: &Client,
+    admin_port: u16,
+    token: &str,
+    payload: &Value,
+) -> Result<Value> {
+    let mut last_payload = Value::Null;
+    for attempt in 0..8 {
+        let (create_status, create_response) =
+            compat_post_json(client, admin_port, "/v1/runs?mode=accepted", token, payload)?;
+        assert_eq!(
+            create_status, 200,
+            "run create for wait timeout attempt {attempt} should be accepted: {create_response}"
+        );
+        let run_id = create_response
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("wait timeout create response missing id"))?;
+        let visible = wait_for_compat_run_visible(client, admin_port, token, run_id)?;
+        if visible
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"))
+        {
+            last_payload = visible;
+            continue;
+        }
+        let (wait_status, wait_payload) = compat_post_json(
+            client,
+            admin_port,
+            format!("/v1/runs/{run_id}/wait").as_str(),
+            token,
+            &json!({ "timeout_ms": 1 }),
+        )?;
+        assert_eq!(wait_status, 200, "run wait should return a JSON payload: {wait_payload}");
+        if wait_payload.get("timed_out").and_then(Value::as_bool) == Some(true) {
+            return Ok(wait_payload);
+        }
+        last_payload = wait_payload;
+    }
+    anyhow::bail!("compat run wait did not observe a timeout; last payload: {last_payload}")
 }
 
 fn parse_sse_messages(body: &str) -> Result<Vec<(Option<String>, String)>> {

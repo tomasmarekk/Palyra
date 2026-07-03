@@ -80,6 +80,8 @@ pub(crate) struct CompatRunsCreateRequest {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
     input: Option<CompatResponsesInput>,
     #[serde(default)]
     messages: Option<Vec<CompatChatMessage>>,
@@ -95,6 +97,13 @@ pub(crate) struct CompatRunsCreateRequest {
     tool_exposure_policy: Option<String>,
     #[serde(default)]
     metadata: Option<Value>,
+}
+
+/// Query parameters for creating a public run.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct CompatRunsCreateQuery {
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Optional session selector for the public runs endpoint.
@@ -119,6 +128,15 @@ pub(crate) struct CompatRunEventsQuery {
     after_seq: Option<i64>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// Request body for waiting on a public run.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct CompatRunWaitRequest {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    return_on_waiting: Option<bool>,
 }
 
 /// Request body for stopping a public run.
@@ -847,8 +865,10 @@ pub(crate) async fn compat_responses_handler(
 pub(crate) async fn compat_runs_create_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<CompatRunsCreateQuery>,
     Json(payload): Json<CompatRunsCreateRequest>,
 ) -> Result<Response, Response> {
+    validate_compat_run_create_mode(query.mode.as_deref(), payload.mode.as_deref())?;
     let request_payload_bytes =
         serde_json::to_vec(&payload).map_err(internal_runtime_error_response)?;
     validate_compat_run_tool_request(&payload)?;
@@ -1007,6 +1027,81 @@ pub(crate) async fn compat_run_events_handler(
         now,
     );
     Ok(build_compat_run_events_streaming_response(state, snapshot, query.after_seq, query.limit))
+}
+
+/// Handles `POST /v1/runs/{run_id}/wait`.
+///
+/// # Errors
+/// Returns an error response when authorization, run ownership validation, or
+/// runtime status loading fails. A deadline expiry is returned as a successful
+/// wait payload with the current run status so clients can retry without
+/// mutating the run.
+pub(crate) async fn compat_run_wait_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    payload: Option<Json<CompatRunWaitRequest>>,
+) -> Result<Response, Response> {
+    let now = unix_ms_now().map_err(internal_clock_error_response)?;
+    let (token, owner_principal, _device_id) = authorize_compat_run_access(&state, &headers, now)?;
+    let request = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let timeout_ms = compat_run_wait_timeout_ms(request.timeout_ms);
+    let return_on_waiting = request.return_on_waiting.unwrap_or(false);
+
+    let initial_snapshot =
+        load_compat_run_snapshot_for_owner(&state, run_id.as_str(), owner_principal.as_str())
+            .await?;
+    let outcome = state
+        .runtime
+        .wait_for_orchestrator_run(crate::gateway::OrchestratorRunWaitRequest {
+            run_id: initial_snapshot.run_id.clone(),
+            timeout: Duration::from_millis(timeout_ms),
+            poll_interval: Duration::from_millis(250),
+            return_on_waiting,
+        })
+        .await;
+
+    let payload = match outcome {
+        Ok(outcome) => {
+            if outcome.snapshot.principal != owner_principal {
+                return Err(compat_run_not_found_response(run_id.as_str()));
+            }
+            let run = build_compat_run_status_payload_for_snapshot(
+                &state,
+                &outcome.snapshot,
+                owner_principal.as_str(),
+            )
+            .await?;
+            build_compat_run_wait_payload(
+                outcome.snapshot.run_id.as_str(),
+                timeout_ms,
+                false,
+                Some(outcome.canonical_state.as_str()),
+                run,
+            )
+        }
+        Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
+            let run =
+                load_compat_run_status_payload(&state, run_id.as_str(), owner_principal.as_str())
+                    .await?;
+            build_compat_run_wait_payload(run_id.as_str(), timeout_ms, true, None, run)
+        }
+        Err(error) => return Err(runtime_status_response(error)),
+    };
+
+    touch_compat_api_token(
+        &state,
+        token.token_id.as_str(),
+        "runs_wait",
+        if payload.get("timed_out").and_then(Value::as_bool) == Some(true) {
+            "run_wait_timeout"
+        } else {
+            "run_wait_completed"
+        },
+        Some(run_id.as_str()),
+        now,
+    );
+    Ok(Json(payload).into_response())
 }
 
 /// Handles `POST /v1/runs/{run_id}/stop`.
@@ -1776,10 +1871,18 @@ async fn load_compat_run_status_payload(
     owner_principal: &str,
 ) -> Result<Value, Response> {
     let snapshot = load_compat_run_snapshot_for_owner(state, run_id, owner_principal).await?;
+    build_compat_run_status_payload_for_snapshot(state, &snapshot, owner_principal).await
+}
+
+async fn build_compat_run_status_payload_for_snapshot(
+    state: &AppState,
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+    owner_principal: &str,
+) -> Result<Value, Response> {
     let pending_approval =
         load_compat_pending_approval_for_run(state, snapshot.run_id.as_str(), owner_principal)
             .await?;
-    Ok(build_compat_run_status_payload(&snapshot, pending_approval.as_ref()))
+    Ok(build_compat_run_status_payload(snapshot, pending_approval.as_ref()))
 }
 
 async fn load_compat_run_snapshot_for_owner(
@@ -2147,9 +2250,68 @@ fn compat_approval_not_found_response(run_id: &str) -> Response {
     )
 }
 
+fn validate_compat_run_create_mode(
+    query_mode: Option<&str>,
+    body_mode: Option<&str>,
+) -> CompatHttpResult<()> {
+    for raw_mode in [query_mode, body_mode].into_iter().flatten() {
+        let mode = raw_mode.trim();
+        if mode.is_empty() || mode.eq_ignore_ascii_case("accepted") {
+            continue;
+        }
+        return Err(compat_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_run_mode",
+            "run create mode must be 'accepted' when provided",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn compat_run_wait_timeout_ms(raw_timeout_ms: Option<u64>) -> u64 {
+    raw_timeout_ms.unwrap_or(30_000).clamp(1, 120_000)
+}
+
+fn compat_run_status_url(run_id: &str) -> String {
+    format!("/v1/runs/{run_id}")
+}
+
+fn compat_run_events_url(run_id: &str) -> String {
+    format!("/v1/runs/{run_id}/events")
+}
+
+fn build_compat_run_wait_payload(
+    run_id: &str,
+    timeout_ms: u64,
+    timed_out: bool,
+    canonical_state: Option<&str>,
+    run: Value,
+) -> Value {
+    let status = if timed_out {
+        "timeout"
+    } else {
+        run.get("status").and_then(Value::as_str).unwrap_or("unknown")
+    };
+    json!({
+        "id": run_id,
+        "run_id": run_id,
+        "object": "run.wait",
+        "status": status,
+        "timed_out": timed_out,
+        "timeout_ms": timeout_ms,
+        "canonical_state": canonical_state,
+        "status_url": compat_run_status_url(run_id),
+        "events_url": compat_run_events_url(run_id),
+        "run": run,
+    })
+}
+
 fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -> Value {
     json!({
         "id": prepared.run_id,
+        "run_id": prepared.run_id,
         "object": "run",
         "status": "queued",
         "queue_state": "accepted",
@@ -2157,6 +2319,8 @@ fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -
         "accepted_at": prepared.created_at_unix_ms / 1_000,
         "accepted_at_unix_ms": prepared.created_at_unix_ms,
         "session_id": prepared.session_id,
+        "status_url": compat_run_status_url(prepared.run_id.as_str()),
+        "events_url": compat_run_events_url(prepared.run_id.as_str()),
         "model": prepared.model_name,
         "usage": {
             "prompt_tokens": 0,
@@ -2181,6 +2345,7 @@ fn build_compat_run_status_payload(
 ) -> Value {
     json!({
         "id": snapshot.run_id,
+        "run_id": snapshot.run_id,
         "object": "run",
         "status": compat_run_public_status(snapshot.state.as_str()),
         "queue_state": compat_run_queue_state(snapshot.state.as_str()),
@@ -2190,6 +2355,8 @@ fn build_compat_run_status_payload(
         "started_at_unix_ms": snapshot.started_at_unix_ms,
         "completed_at_unix_ms": snapshot.completed_at_unix_ms,
         "session_id": snapshot.session_id,
+        "status_url": compat_run_status_url(snapshot.run_id.as_str()),
+        "events_url": compat_run_events_url(snapshot.run_id.as_str()),
         "usage": {
             "prompt_tokens": snapshot.prompt_tokens,
             "completion_tokens": snapshot.completion_tokens,
@@ -4581,10 +4748,17 @@ fn build_compat_runtime_capabilities(
                 "POST /v1/runs",
                 "GET /v1/runs/{run_id}",
                 "GET /v1/runs/{run_id}/events",
+                "POST /v1/runs/{run_id}/wait",
                 "POST /v1/runs/{run_id}/stop",
                 "POST /v1/runs/{run_id}/detach",
             ],
-            json!({ "durable_status": true, "event_replay": true, "stop": true, "detach": true }),
+            json!({
+                "durable_status": true,
+                "event_replay": true,
+                "wait": true,
+                "stop": true,
+                "detach": true,
+            }),
         ),
         compat_runtime_capability_json(
             "approvals",

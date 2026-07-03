@@ -18,8 +18,8 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 - Capability catalog entries: `32`
 - CLI families: `60`
-- Method registry entries: `488`
-- Compat routes registered: `15/15`
+- Method registry entries: `491`
+- Compat routes registered: `16/16`
 - Feature rollout flags: `26`
 - Runtime preview controls: `8` capabilities
 - Feature rollout maturity: `scaffold=1`, `preview_only=16`, `gated_production=4`, `stable=0`, `deprecated=0`, `blocked=5`
@@ -121,6 +121,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 | `POST` | `/v1/runs` | `true` |
 | `GET` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV` | `true` |
 | `GET` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/events` | `true` |
+| `POST` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/wait` | `true` |
 | `POST` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stop` | `true` |
 | `POST` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/detach` | `true` |
 | `POST` | `/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/approval` | `true` |

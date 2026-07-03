@@ -180,6 +180,7 @@ fn build_current_state_inventory_snapshot(
         compat_route_probe(harness, Method::POST, "/v1/runs")?,
         compat_route_probe(harness, Method::GET, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV")?,
         compat_route_probe(harness, Method::GET, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/events")?,
+        compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/wait")?,
         compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/stop")?,
         compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/detach")?,
         compat_route_probe(harness, Method::POST, "/v1/runs/01ARZ3NDEKTSV4RRFFQ69G5FAV/approval")?,

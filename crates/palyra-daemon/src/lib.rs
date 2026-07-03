@@ -411,6 +411,12 @@ struct RunCancelRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RunWaitRequest {
+    timeout_ms: Option<u64>,
+    return_on_waiting: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SkillStatusRequest {
     version: String,
     reason: Option<String>,

@@ -843,11 +843,22 @@ file = "workers-help.txt"
 path = "run"
 category = "top_level"
 status = "done"
-summary = "Run trajectory export workflows for audit and evals."
+summary = "Run wait and trajectory export workflows for operations, audit, and evals."
 
 [entries.snapshot]
 path = "run"
 file = "run-help.txt"
+
+[[entries]]
+path = "run wait"
+category = "nested_surface"
+status = "done"
+summary = "Wait for a daemon run to finish through the local admin surface."
+required_flags = ["timeout-ms", "return-on-waiting", "json"]
+
+[entries.snapshot]
+path = "run wait"
+file = "run-wait-help.txt"
 
 [[entries]]
 path = "run export"

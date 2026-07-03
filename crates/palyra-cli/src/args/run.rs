@@ -21,6 +21,16 @@ impl RunExportFormatArg {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum RunCommand {
+    #[command(about = "Wait for a daemon run to finish")]
+    Wait {
+        run_id: String,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        return_on_waiting: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     #[command(about = "Export a redacted run trajectory")]
     Export {
         #[arg(long)]

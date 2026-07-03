@@ -563,6 +563,102 @@ fn continuation_reason_code(message: &str) -> Option<&str> {
     (!reason.is_empty()).then_some(reason)
 }
 
+/// Waits for an orchestrator run to finish through the admin diagnostics API.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// run-id validation, diagnostics run-id resolution, or status snapshot lookup
+/// fails. A wait deadline is returned as a successful payload containing the
+/// current run status.
+pub(crate) async fn admin_run_wait_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    payload: Option<Json<RunWaitRequest>>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let _context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    validate_canonical_id(run_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    state.runtime.record_admin_status_request();
+    let diagnostics_run_id = resolve_admin_diagnostics_run_id(&state, run_id.as_str()).await?;
+    let request = payload
+        .map(|Json(payload)| payload)
+        .unwrap_or(RunWaitRequest { timeout_ms: None, return_on_waiting: None });
+    let timeout_ms = request.timeout_ms.unwrap_or(30_000).clamp(1, 120_000);
+    let outcome = state
+        .runtime
+        .wait_for_orchestrator_run(crate::gateway::OrchestratorRunWaitRequest {
+            run_id: diagnostics_run_id.clone(),
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            poll_interval: std::time::Duration::from_millis(250),
+            return_on_waiting: request.return_on_waiting.unwrap_or(false),
+        })
+        .await;
+    let payload = match outcome {
+        Ok(outcome) => admin_run_wait_payload(
+            outcome.snapshot.run_id.as_str(),
+            timeout_ms,
+            false,
+            Some(outcome.canonical_state.as_str()),
+            run_status_payload(&outcome.snapshot)
+                .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
+        ),
+        Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
+            let snapshot = state
+                .runtime
+                .orchestrator_run_status_snapshot(diagnostics_run_id.clone())
+                .await
+                .map_err(runtime_status_response)?
+                .ok_or_else(|| {
+                    runtime_status_response(tonic::Status::not_found(format!(
+                        "orchestrator run not found after resolving {run_id} to {diagnostics_run_id}"
+                    )))
+                })?;
+            admin_run_wait_payload(
+                snapshot.run_id.as_str(),
+                timeout_ms,
+                true,
+                None,
+                run_status_payload(&snapshot)
+                    .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
+            )
+        }
+        Err(error) => return Err(runtime_status_response(error)),
+    };
+    Ok(Json(payload))
+}
+
+fn admin_run_wait_payload(
+    run_id: &str,
+    timeout_ms: u64,
+    timed_out: bool,
+    canonical_state: Option<&str>,
+    run: Value,
+) -> Value {
+    let status = if timed_out {
+        "timeout"
+    } else {
+        run.get("state").and_then(Value::as_str).unwrap_or("unknown")
+    };
+    json!({
+        "run_id": run_id,
+        "object": "run.wait",
+        "status": status,
+        "timed_out": timed_out,
+        "timeout_ms": timeout_ms,
+        "canonical_state": canonical_state,
+        "run": run,
+    })
+}
+
 /// Returns a paginated orchestrator run tape for admin diagnostics.
 ///
 /// # Errors

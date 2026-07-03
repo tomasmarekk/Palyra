@@ -1,14 +1,15 @@
-Wait for runs and export trajectories for audit and evals
+Wait for a daemon run to finish
 
-Usage: palyra run [OPTIONS] <COMMAND>
+Usage: palyra run wait [OPTIONS] <RUN_ID>
 
-Commands:
-  wait    Wait for a daemon run to finish
-  export  Export a redacted run trajectory
-  replay  Replay a trajectory JSONL offline
+Arguments:
+  <RUN_ID>
 
 Options:
-  -h, --help  Print help
+      --timeout-ms <TIMEOUT_MS>  [default: 30000]
+      --return-on-waiting
+      --json
+  -h, --help                     Print help
 
 Global Options:
       --profile <PROFILE>
