@@ -4980,7 +4980,7 @@ async fn load_console_session_queue_snapshot(
 
 /// Returns (active stream exists, approval pending, active run id) for a
 /// session by inspecting the in-process run-stream registry.
-fn active_session_queue_boundary(
+pub(super) fn active_session_queue_boundary(
     state: &AppState,
     session_id: &str,
 ) -> (bool, bool, Option<String>) {

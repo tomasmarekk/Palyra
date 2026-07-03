@@ -1518,6 +1518,17 @@ path = "sessions show"
 file = "sessions-show-help.txt"
 
 [[entries]]
+path = "sessions status"
+category = "nested_surface"
+status = "done"
+summary = "Public session status snapshot over the console session API."
+required_flags = ["session-key", "json"]
+
+[entries.snapshot]
+path = "sessions status"
+file = "sessions-status-help.txt"
+
+[[entries]]
 path = "skills package"
 category = "nested_surface"
 status = "done"

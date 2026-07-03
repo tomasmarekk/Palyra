@@ -165,6 +165,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `plugins doctor` | `nested_surface` | `done` | `verified` | `plugins-doctor-help.txt` | - | `--plugin-id`, `--json` | - |
 | `plugins update` | `nested_surface` | `done` | `verified` | `plugins-update-help.txt` | - | `--artifact`, `--config-json`, `--config-json-file`, `--config-json-stdin`, `--clear-config`, `--allow-tofu`, `--allow-untrusted`, `--json` | - |
 | `sessions show` | `nested_surface` | `done` | `verified` | `sessions-show-help.txt` | `resume` | `--session-id`, `--session-key`, `--json` | - |
+| `sessions status` | `nested_surface` | `done` | `verified` | `sessions-status-help.txt` | - | `--session-key`, `--json` | - |
 | `skills package` | `nested_surface` | `done` | `verified` | `skills-package-help.txt` | - | - | - |
 | `skills package build` | `nested_surface` | `done` | `verified` | `skills-package-build-help.txt` | - | `--manifest`, `--sbom`, `--provenance`, `--output` | - |
 | `support-bundle export` | `nested_surface` | `done` | `verified` | `support-bundle-export-help.txt` | - | `--output`, `--max-bytes`, `--journal-hash-limit`, `--error-limit` | - |

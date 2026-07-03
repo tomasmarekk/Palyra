@@ -38,6 +38,7 @@ pub(crate) async fn run_sessions_async(
         SessionsCommand::List { json, .. }
         | SessionsCommand::History { json, .. }
         | SessionsCommand::Show { json, .. }
+        | SessionsCommand::Status { json, .. }
         | SessionsCommand::Resolve { json, .. }
         | SessionsCommand::Rename { json, .. }
         | SessionsCommand::Reset { json, .. }
@@ -236,6 +237,25 @@ pub(crate) async fn run_sessions_async(
                     optional_unix_ms_text(session.archived_at_unix_ms)
                 );
             }
+        }
+        SessionsCommand::Status { session_id, session_key, json: _ } => {
+            let session = load_session_summary_for_show(&runtime, session_id, session_key).await?;
+            let session_id = session
+                .session_id
+                .as_ref()
+                .map(|id| id.ulid.trim())
+                .filter(|ulid| !ulid.is_empty())
+                .map(ToOwned::to_owned)
+                .context("session status resolved a session without a session_id")?;
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/sessions/{}/snapshot",
+                    percent_encode_component(session_id.as_str())
+                ))
+                .await?;
+            print_session_status_payload(&payload, json)?;
         }
         SessionsCommand::Resolve {
             session_id,
@@ -1387,6 +1407,32 @@ fn print_session_queue_payload(action: &str, payload: &Value, json_output: bool)
                 .unwrap_or_else(|| "none".to_owned())
         );
     }
+    Ok(())
+}
+
+fn print_session_status_payload(payload: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(payload)?);
+        return Ok(());
+    }
+    let snapshot = payload.pointer("/snapshot").unwrap_or(payload);
+    let lifecycle = snapshot.pointer("/lifecycle").unwrap_or(&Value::Null);
+    let queue = snapshot.pointer("/queue").unwrap_or(&Value::Null);
+    let approvals = snapshot.pointer("/approvals").unwrap_or(&Value::Null);
+    let usage = snapshot.pointer("/usage/tokens").unwrap_or(&Value::Null);
+    let safe_operations = snapshot.pointer("/safe_operations").unwrap_or(&Value::Null);
+    println!(
+        "sessions.status state={} queue={} pending_depth={} active_run_id={} approvals_pending={} can_start_run={} can_cancel={} can_compact={} token_total={}",
+        json_optional_string_in(lifecycle, "/state").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_in(queue, "/busy_state").unwrap_or_else(|| "unknown".to_owned()),
+        queue.pointer("/pending_depth").and_then(Value::as_u64).unwrap_or_default(),
+        redacted_optional_identifier_for_output(queue.pointer("/active_run_id").and_then(Value::as_str)),
+        approvals.pointer("/pending").and_then(Value::as_bool).unwrap_or(false),
+        safe_operations.pointer("/can_start_run").and_then(Value::as_bool).unwrap_or(false),
+        safe_operations.pointer("/can_cancel").and_then(Value::as_bool).unwrap_or(false),
+        safe_operations.pointer("/can_compact").and_then(Value::as_bool).unwrap_or(false),
+        usage.pointer("/total").and_then(Value::as_u64).map(|value| value.to_string()).unwrap_or_else(|| "none".to_owned())
+    );
     Ok(())
 }
 

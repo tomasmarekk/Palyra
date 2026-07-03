@@ -15,12 +15,14 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::{
     agents::{
         AgentBindingQuery, AgentBindingRequest, AgentRecord, AgentUnbindRequest,
         SessionAgentBinding,
     },
+    application::session_queue::{analyze_session_queue, pending_queue_depth, SessionQueuePolicy},
     *,
 };
 
@@ -33,6 +35,8 @@ const SESSION_CATALOG_TITLE_LEN: usize = 72;
 const SESSION_CATALOG_PREVIEW_LEN: usize = 180;
 const SESSION_CATALOG_RELATIVES_LIMIT: usize = 4;
 const SESSION_CATALOG_RECAP_ITEMS_LIMIT: usize = 4;
+const SESSION_PUBLIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SESSION_PUBLIC_SNAPSHOT_REDACTED: &str = "<redacted>";
 
 /// Query parameters accepted by the session catalog list endpoint; every
 /// field is optional and missing filters leave the catalog unrestricted.
@@ -143,6 +147,186 @@ pub(crate) struct SessionCatalogRunAbortEnvelope {
     run_id: String,
     cancel_requested: bool,
     reason: String,
+}
+
+/// Wire envelope for `GET /console/v1/sessions/{session_id}/snapshot`:
+/// a redacted, operator-facing aggregate of lifecycle, queue, binding, usage,
+/// approval, and safe-operation state for one session.
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionPublicSnapshotEnvelope {
+    contract: control_plane::ContractDescriptor,
+    snapshot: SessionPublicSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionPublicSnapshot {
+    schema_version: u32,
+    identity: SessionSnapshotIdentity,
+    lifecycle: SessionSnapshotLifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_run: Option<SessionSnapshotRun>,
+    queue: SessionSnapshotQueue,
+    binding: SessionSnapshotBinding,
+    compaction: SessionSnapshotCompaction,
+    suspend_resume: SessionSnapshotSuspendResume,
+    approvals: SessionSnapshotApprovals,
+    usage: SessionSnapshotUsage,
+    safe_operations: SessionSnapshotSafeOperations,
+    subagents: SessionSnapshotSubagents,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotIdentity {
+    session_id: String,
+    session_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_label: Option<String>,
+    title: String,
+    branch_state: String,
+    owner: SessionSnapshotOwner,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotOwner {
+    principal: &'static str,
+    device_id: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    redaction_level: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotLifecycle {
+    state: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_state: Option<String>,
+    queue_busy_state: String,
+    updated_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotRun {
+    run_id: String,
+    state: String,
+    cancel_requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at_unix_ms: Option<i64>,
+    origin_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotQueue {
+    paused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pause_reason: Option<String>,
+    control_updated_at_unix_ms: i64,
+    active_run_id: Option<String>,
+    pending_depth: usize,
+    total_count: usize,
+    terminal_count: usize,
+    busy_state: String,
+    recommendation: String,
+    can_accept_followups: bool,
+    safe_boundary: crate::application::session_queue::SessionQueueSafeBoundary,
+    policy: Value,
+    metrics: Value,
+    analysis: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotBinding {
+    agent: SessionCatalogQuickControlRecord,
+    model: SessionCatalogQuickControlRecord,
+    thinking: SessionCatalogToggleControlRecord,
+    trace: SessionCatalogToggleControlRecord,
+    verbose: SessionCatalogToggleControlRecord,
+    reset_to_default_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotCompaction {
+    state: String,
+    can_preview: bool,
+    can_apply: bool,
+    artifact_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotSuspendResume {
+    paused: bool,
+    can_pause: bool,
+    can_resume: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pause_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotApprovals {
+    pending: bool,
+    pending_count: usize,
+    active_run_pending_approval: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotUsage {
+    tokens: SessionSnapshotTokenCounters,
+    cost: SessionSnapshotCostCounters,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotTokenCounters {
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    total: Option<u64>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotCostCounters {
+    estimated_usd: Option<f64>,
+    currency: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotSafeOperations {
+    can_start_run: bool,
+    can_cancel: bool,
+    can_fork: bool,
+    can_compact: bool,
+    can_repair_binding: bool,
+    can_pause_queue: bool,
+    can_resume_queue: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocking_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionSnapshotSubagents {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<String>,
+    child_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    child_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +532,17 @@ struct SessionWorkspaceSummary {
 struct SessionDetailContext {
     recent_artifacts: Vec<SessionCatalogArtifactRecord>,
     artifact_count: usize,
+    compaction_artifact_count: usize,
+    latest_compaction_artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPublicQueueContext {
+    queued_inputs: Vec<journal::OrchestratorQueuedInputRecord>,
+    control: journal::OrchestratorSessionQueueControlRecord,
+    policy: SessionQueuePolicy,
+    safe_boundary: crate::application::session_queue::SessionQueueSafeBoundary,
+    active_run_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -524,6 +719,68 @@ pub(crate) async fn console_session_detail_handler(
     })?;
     let record = load_session_catalog_record(&state, &session.context, session_id.as_str()).await?;
     Ok(Json(SessionCatalogDetailEnvelope { contract: contract_descriptor(), session: record }))
+}
+
+/// Handles `GET /console/v1/sessions/{session_id}/snapshot`: returns a
+/// redacted, decision-ready public snapshot for one session.
+///
+/// # Errors
+/// Returns an error response when console authorization fails, when the
+/// session id is not a canonical ULID, when the session is missing from the
+/// caller's scope, or when session, queue, approval, run, or binding state
+/// cannot be loaded.
+pub(crate) async fn console_session_snapshot_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<SessionPublicSnapshotEnvelope>, Response> {
+    let console_session = authorize_console_session(&state, &headers, false)?;
+    validate_canonical_id(session_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument(
+            "session_id must be a canonical ULID",
+        ))
+    })?;
+    let base_sessions = load_scoped_sessions(
+        &state,
+        console_session.context.principal.as_str(),
+        console_session.context.device_id.as_str(),
+        console_session.context.channel.as_deref(),
+        true,
+    )
+    .await
+    .map_err(runtime_status_response)?;
+    let base_session =
+        base_sessions.iter().find(|record| record.session_id == session_id).cloned().ok_or_else(
+            || runtime_status_response(tonic::Status::not_found("session was not found")),
+        )?;
+    let catalog_context =
+        load_session_catalog_context(&state, &console_session.context, &base_sessions).await?;
+    let detail_context = load_session_detail_context(
+        &state,
+        &console_session.context,
+        base_session.session_id.as_str(),
+    )
+    .await?;
+    let catalog_record = build_session_catalog_record(
+        &state,
+        &catalog_context,
+        base_session.clone(),
+        Some(detail_context.clone()),
+    )
+    .await?;
+    let queue_context =
+        load_session_public_queue_context(&state, &console_session.context, &catalog_record)
+            .await?;
+    let snapshot = build_session_public_snapshot(
+        &state,
+        &base_sessions,
+        &catalog_context,
+        &detail_context,
+        &catalog_record,
+        queue_context,
+    )
+    .await?;
+    Ok(Json(SessionPublicSnapshotEnvelope { contract: contract_descriptor(), snapshot }))
 }
 
 /// Handles `GET /console/v1/sessions/{session_id}/project-context`: returns
@@ -1160,6 +1417,423 @@ async fn load_session_catalog_record(
     build_session_catalog_record(state, &catalog_context, base, Some(detail_context)).await
 }
 
+async fn load_session_public_queue_context(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    record: &SessionCatalogRecord,
+) -> Result<SessionPublicQueueContext, Response> {
+    let queued_inputs = state
+        .runtime
+        .list_orchestrator_queued_inputs(record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?;
+    let control = state
+        .runtime
+        .get_orchestrator_session_queue_control(record.session_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .unwrap_or_else(|| default_public_session_queue_control(record.session_id.clone()));
+    let policy = SessionQueuePolicy::from_config(
+        &state.runtime.config.session_queue_policy,
+        record.session_id.as_str(),
+        context.channel.as_deref(),
+        None,
+    );
+    let (active_run_stream, pending_approval, active_run_id) =
+        super::chat::active_session_queue_boundary(state, record.session_id.as_str());
+    let safe_boundary = crate::application::session_queue::SessionQueueSafeBoundary::active(
+        active_run_stream,
+        pending_approval,
+    );
+    Ok(SessionPublicQueueContext { queued_inputs, control, policy, safe_boundary, active_run_id })
+}
+
+fn default_public_session_queue_control(
+    session_id: String,
+) -> journal::OrchestratorSessionQueueControlRecord {
+    journal::OrchestratorSessionQueueControlRecord {
+        session_id,
+        paused: false,
+        pause_reason: None,
+        updated_at_unix_ms: 0,
+    }
+}
+
+async fn build_session_public_snapshot(
+    state: &AppState,
+    base_sessions: &[journal::OrchestratorSessionRecord],
+    catalog_context: &SessionCatalogContext,
+    detail_context: &SessionDetailContext,
+    record: &SessionCatalogRecord,
+    queue_context: SessionPublicQueueContext,
+) -> Result<SessionPublicSnapshot, Response> {
+    let last_run_snapshot = record
+        .last_run_id
+        .as_ref()
+        .and_then(|run_id| catalog_context.run_snapshot_by_id.get(run_id))
+        .cloned();
+    let active_run_id = queue_context
+        .active_run_id
+        .clone()
+        .or_else(|| active_run_id_from_last_run(record, last_run_snapshot.as_ref()));
+    let active_run_snapshot =
+        load_snapshot_run(state, active_run_id.as_deref(), last_run_snapshot.as_ref()).await?;
+    let run_for_usage = active_run_snapshot.as_ref().or(last_run_snapshot.as_ref());
+    let queue = build_session_snapshot_queue(queue_context);
+    let active_run = build_session_snapshot_run(
+        active_run_id.as_deref(),
+        active_run_snapshot.as_ref(),
+        record.last_run_state.as_deref(),
+    );
+    let active_run_state = active_run.as_ref().map(|run| run.state.as_str());
+    let pending_approval = record.pending_approvals > 0 || queue.safe_boundary.pending_approval;
+    let lifecycle = derive_session_snapshot_lifecycle(SessionSnapshotLifecycleInputs {
+        archived: record.archived,
+        archived_at_unix_ms: record.archived_at_unix_ms,
+        updated_at_unix_ms: record.updated_at_unix_ms,
+        last_run_state: record.last_run_state.as_deref(),
+        active_run_state,
+        active_run_stream: queue.safe_boundary.active_run_stream,
+        pending_approval,
+        pending_depth: queue.pending_depth,
+        queue_busy_state: queue.busy_state.as_str(),
+    });
+    let compaction = build_session_snapshot_compaction(
+        record,
+        detail_context,
+        queue.safe_boundary.active_run_stream,
+    );
+    let suspend_resume = SessionSnapshotSuspendResume {
+        paused: queue.paused,
+        can_pause: !record.archived && !queue.paused,
+        can_resume: !record.archived && queue.paused,
+        pause_reason: queue.pause_reason.clone(),
+    };
+    let approvals = SessionSnapshotApprovals {
+        pending: pending_approval,
+        pending_count: record.pending_approvals,
+        active_run_pending_approval: queue.safe_boundary.pending_approval,
+    };
+    let usage = build_session_snapshot_usage(run_for_usage);
+    let safe_operations = derive_session_safe_operations(SessionSafeOperationInputs {
+        archived: record.archived,
+        active_run_id_present: active_run_id.is_some(),
+        active_run_state,
+        active_run_stream: queue.safe_boundary.active_run_stream,
+        queue_paused: queue.paused,
+        pending_depth: queue.pending_depth,
+        can_compact: compaction.can_preview,
+        can_repair_binding: record.quick_controls.reset_to_default_available
+            || record.quick_controls.agent.value.is_none(),
+    });
+    let subagents = build_session_snapshot_subagents(record, base_sessions);
+    let last_error = active_run_snapshot
+        .as_ref()
+        .and_then(|run| run.last_error.as_deref())
+        .or_else(|| last_run_snapshot.as_ref().and_then(|run| run.last_error.as_deref()))
+        .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN));
+
+    Ok(SessionPublicSnapshot {
+        schema_version: SESSION_PUBLIC_SNAPSHOT_SCHEMA_VERSION,
+        identity: SessionSnapshotIdentity {
+            session_id: record.session_id.clone(),
+            session_key: record.session_key.clone(),
+            session_label: record.session_label.clone(),
+            title: record.title.clone(),
+            branch_state: record.branch_state.clone(),
+            owner: SessionSnapshotOwner {
+                principal: SESSION_PUBLIC_SNAPSHOT_REDACTED,
+                device_id: SESSION_PUBLIC_SNAPSHOT_REDACTED,
+                channel: record.channel.clone(),
+                redaction_level: "owner_and_path_metadata",
+            },
+            created_at_unix_ms: record.created_at_unix_ms,
+            updated_at_unix_ms: record.updated_at_unix_ms,
+        },
+        lifecycle,
+        active_run,
+        queue,
+        binding: SessionSnapshotBinding {
+            agent: record.quick_controls.agent.clone(),
+            model: record.quick_controls.model.clone(),
+            thinking: record.quick_controls.thinking.clone(),
+            trace: record.quick_controls.trace.clone(),
+            verbose: record.quick_controls.verbose.clone(),
+            reset_to_default_available: record.quick_controls.reset_to_default_available,
+        },
+        compaction,
+        suspend_resume,
+        approvals,
+        usage,
+        safe_operations,
+        subagents,
+        last_error,
+    })
+}
+
+async fn load_snapshot_run(
+    state: &AppState,
+    run_id: Option<&str>,
+    cached: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> Result<Option<journal::OrchestratorRunStatusSnapshot>, Response> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    if cached.is_some_and(|run| run.run_id == run_id) {
+        return Ok(cached.cloned());
+    }
+    state
+        .runtime
+        .orchestrator_run_status_snapshot(run_id.to_owned())
+        .await
+        .map_err(runtime_status_response)
+}
+
+fn active_run_id_from_last_run(
+    record: &SessionCatalogRecord,
+    last_run: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> Option<String> {
+    let state = last_run.map(|run| run.state.as_str()).or(record.last_run_state.as_deref())?;
+    run_state_is_active(state).then(|| record.last_run_id.clone()).flatten()
+}
+
+fn build_session_snapshot_queue(context: SessionPublicQueueContext) -> SessionSnapshotQueue {
+    let pending_depth = pending_queue_depth(
+        context.queued_inputs.as_slice(),
+        Some(context.policy.coalescing_group.as_str()),
+    );
+    let analysis = analyze_session_queue(
+        context.queued_inputs.as_slice(),
+        &context.policy,
+        &context.safe_boundary,
+        context.control.paused,
+        crate::gateway::current_unix_ms(),
+    );
+    let metrics = analysis.metrics.snapshot_json();
+    let analysis_json = analysis.snapshot_json();
+    SessionSnapshotQueue {
+        paused: context.control.paused,
+        pause_reason: context
+            .control
+            .pause_reason
+            .as_deref()
+            .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN)),
+        control_updated_at_unix_ms: context.control.updated_at_unix_ms,
+        active_run_id: context.active_run_id,
+        pending_depth,
+        total_count: analysis.metrics.total_count,
+        terminal_count: analysis.metrics.terminal_count,
+        busy_state: analysis.busy_state.as_str().to_owned(),
+        recommendation: analysis.recommendation.clone(),
+        can_accept_followups: context.safe_boundary.can_steer()
+            || (!context.control.paused && pending_depth < context.policy.cap),
+        safe_boundary: context.safe_boundary,
+        policy: context.policy.snapshot_json(),
+        metrics,
+        analysis: analysis_json,
+    }
+}
+
+fn build_session_snapshot_run(
+    active_run_id: Option<&str>,
+    run: Option<&journal::OrchestratorRunStatusSnapshot>,
+    fallback_state: Option<&str>,
+) -> Option<SessionSnapshotRun> {
+    let run_id =
+        active_run_id.map(str::to_owned).or_else(|| run.map(|snapshot| snapshot.run_id.clone()))?;
+    Some(SessionSnapshotRun {
+        run_id,
+        state: run
+            .map(|snapshot| snapshot.state.clone())
+            .or_else(|| fallback_state.map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned()),
+        cancel_requested: run.is_some_and(|snapshot| snapshot.cancel_requested),
+        cancel_reason: run
+            .and_then(|snapshot| snapshot.cancel_reason.as_deref())
+            .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN)),
+        started_at_unix_ms: run.map(|snapshot| snapshot.started_at_unix_ms),
+        updated_at_unix_ms: run.map(|snapshot| snapshot.updated_at_unix_ms),
+        completed_at_unix_ms: run.and_then(|snapshot| snapshot.completed_at_unix_ms),
+        origin_kind: run.map(|snapshot| snapshot.origin_kind.clone()).unwrap_or_default(),
+        origin_run_id: run.and_then(|snapshot| snapshot.origin_run_id.clone()),
+        parent_run_id: run.and_then(|snapshot| snapshot.parent_run_id.clone()),
+    })
+}
+
+struct SessionSnapshotLifecycleInputs<'a> {
+    archived: bool,
+    archived_at_unix_ms: Option<i64>,
+    updated_at_unix_ms: i64,
+    last_run_state: Option<&'a str>,
+    active_run_state: Option<&'a str>,
+    active_run_stream: bool,
+    pending_approval: bool,
+    pending_depth: usize,
+    queue_busy_state: &'a str,
+}
+
+fn derive_session_snapshot_lifecycle(
+    input: SessionSnapshotLifecycleInputs<'_>,
+) -> SessionSnapshotLifecycle {
+    let run_state = input.active_run_state.or(input.last_run_state).map(str::to_owned);
+    let (state, reason) = if input.archived {
+        ("archived", "session_archived")
+    } else if input.pending_approval {
+        ("approval_pending", "approval_pending")
+    } else if input.active_run_stream || input.active_run_state.is_some_and(run_state_is_active) {
+        ("running", "active_run")
+    } else if input.pending_depth > 0 {
+        ("queued", "queued_inputs_pending")
+    } else if input.active_run_state.or(input.last_run_state).is_some_and(run_state_is_failed) {
+        ("failed", "last_run_failed")
+    } else {
+        ("idle", "no_active_run_or_queue")
+    };
+    SessionSnapshotLifecycle {
+        state: state.to_owned(),
+        reason: reason.to_owned(),
+        run_state,
+        queue_busy_state: input.queue_busy_state.to_owned(),
+        updated_at_unix_ms: input.updated_at_unix_ms,
+        archived_at_unix_ms: input.archived_at_unix_ms,
+    }
+}
+
+fn build_session_snapshot_compaction(
+    record: &SessionCatalogRecord,
+    detail_context: &SessionDetailContext,
+    active_run_stream: bool,
+) -> SessionSnapshotCompaction {
+    let can_preview = !record.archived && !active_run_stream;
+    let state = if record.archived {
+        "archived"
+    } else if active_run_stream {
+        "blocked_active_run"
+    } else if detail_context.compaction_artifact_count > 0 {
+        "available"
+    } else {
+        "not_requested"
+    };
+    SessionSnapshotCompaction {
+        state: state.to_owned(),
+        can_preview,
+        can_apply: can_preview,
+        artifact_count: detail_context.compaction_artifact_count,
+        latest_artifact_id: detail_context.latest_compaction_artifact_id.clone(),
+    }
+}
+
+fn build_session_snapshot_usage(
+    run: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> SessionSnapshotUsage {
+    let tokens = run
+        .map(|snapshot| SessionSnapshotTokenCounters {
+            prompt: Some(snapshot.prompt_tokens),
+            completion: Some(snapshot.completion_tokens),
+            total: Some(snapshot.total_tokens),
+            source: "run_snapshot".to_owned(),
+        })
+        .unwrap_or_else(|| SessionSnapshotTokenCounters {
+            prompt: None,
+            completion: None,
+            total: None,
+            source: "unavailable".to_owned(),
+        });
+    SessionSnapshotUsage {
+        tokens,
+        cost: SessionSnapshotCostCounters {
+            estimated_usd: None,
+            currency: None,
+            source: "unavailable".to_owned(),
+        },
+    }
+}
+
+struct SessionSafeOperationInputs<'a> {
+    archived: bool,
+    active_run_id_present: bool,
+    active_run_state: Option<&'a str>,
+    active_run_stream: bool,
+    queue_paused: bool,
+    pending_depth: usize,
+    can_compact: bool,
+    can_repair_binding: bool,
+}
+
+fn derive_session_safe_operations(
+    input: SessionSafeOperationInputs<'_>,
+) -> SessionSnapshotSafeOperations {
+    let active_run_blocks_start = input.active_run_stream
+        || input.active_run_state.is_some_and(run_state_is_active)
+        || input.active_run_id_present;
+    let can_start_run = !input.archived
+        && !input.queue_paused
+        && !active_run_blocks_start
+        && input.pending_depth == 0;
+    let can_cancel = !input.archived
+        && input.active_run_id_present
+        && input.active_run_state.is_none_or(|state| !run_state_is_terminal(state));
+    let can_fork = !input.archived;
+    let can_pause_queue = !input.archived && !input.queue_paused;
+    let can_resume_queue = !input.archived && input.queue_paused;
+    let mut blocking_reasons = Vec::new();
+    if input.archived {
+        blocking_reasons.push("session_archived".to_owned());
+    }
+    if input.queue_paused {
+        blocking_reasons.push("queue_paused".to_owned());
+    }
+    if active_run_blocks_start {
+        blocking_reasons.push("active_run_present".to_owned());
+    }
+    if input.pending_depth > 0 {
+        blocking_reasons.push("queued_inputs_pending".to_owned());
+    }
+    SessionSnapshotSafeOperations {
+        can_start_run,
+        can_cancel,
+        can_fork,
+        can_compact: input.can_compact,
+        can_repair_binding: input.can_repair_binding,
+        can_pause_queue,
+        can_resume_queue,
+        blocking_reasons,
+    }
+}
+
+fn build_session_snapshot_subagents(
+    record: &SessionCatalogRecord,
+    base_sessions: &[journal::OrchestratorSessionRecord],
+) -> SessionSnapshotSubagents {
+    let mut child_session_ids = base_sessions
+        .iter()
+        .filter(|candidate| {
+            candidate.parent_session_id.as_deref() == Some(record.session_id.as_str())
+        })
+        .map(|candidate| candidate.session_id.clone())
+        .collect::<Vec<_>>();
+    child_session_ids.sort();
+    SessionSnapshotSubagents {
+        parent_session_id: record.parent_session_id.clone(),
+        child_count: child_session_ids.len(),
+        child_session_ids,
+    }
+}
+
+fn run_state_is_active(state: &str) -> bool {
+    crate::orchestrator::RunLifecycleState::from_str(state)
+        .is_some_and(|state| !state.is_terminal())
+}
+
+fn run_state_is_failed(state: &str) -> bool {
+    state == crate::orchestrator::RunLifecycleState::Failed.as_str()
+}
+
+fn run_state_is_terminal(state: &str) -> bool {
+    crate::orchestrator::RunLifecycleState::from_str(state)
+        .is_some_and(crate::orchestrator::RunLifecycleState::is_terminal)
+}
+
 async fn build_session_project_context_envelope(
     state: &AppState,
     context: &gateway::RequestContext,
@@ -1515,7 +2189,12 @@ async fn load_session_detail_context(
         }
     }));
 
-    Ok(SessionDetailContext { recent_artifacts, artifact_count })
+    Ok(SessionDetailContext {
+        recent_artifacts,
+        artifact_count,
+        compaction_artifact_count: compactions.len(),
+        latest_compaction_artifact_id: compactions.first().map(|entry| entry.artifact_id.clone()),
+    })
 }
 
 /// Assembles one wire-facing catalog record from the base session, the shared
@@ -2074,6 +2753,59 @@ mod tests {
             default_agent_id: Some("agent-default".to_owned()),
             effective_model_profile: effective_model_profile.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn public_snapshot_lifecycle_prioritizes_pending_approval() {
+        let lifecycle = derive_session_snapshot_lifecycle(SessionSnapshotLifecycleInputs {
+            archived: false,
+            archived_at_unix_ms: None,
+            updated_at_unix_ms: 42,
+            last_run_state: Some("in_progress"),
+            active_run_state: Some("in_progress"),
+            active_run_stream: true,
+            pending_approval: true,
+            pending_depth: 0,
+            queue_busy_state: "waiting_on_approval",
+        });
+
+        assert_eq!(lifecycle.state, "approval_pending");
+        assert_eq!(lifecycle.reason, "approval_pending");
+        assert_eq!(lifecycle.run_state.as_deref(), Some("in_progress"));
+        assert_eq!(lifecycle.queue_busy_state, "waiting_on_approval");
+    }
+
+    #[test]
+    fn public_snapshot_safe_operations_block_start_for_active_or_queued_work() {
+        let active = derive_session_safe_operations(SessionSafeOperationInputs {
+            archived: false,
+            active_run_id_present: true,
+            active_run_state: Some("in_progress"),
+            active_run_stream: true,
+            queue_paused: false,
+            pending_depth: 0,
+            can_compact: false,
+            can_repair_binding: false,
+        });
+        assert!(!active.can_start_run);
+        assert!(active.can_cancel);
+        assert!(active.blocking_reasons.iter().any(|reason| reason == "active_run_present"));
+
+        let queued = derive_session_safe_operations(SessionSafeOperationInputs {
+            archived: false,
+            active_run_id_present: false,
+            active_run_state: None,
+            active_run_stream: false,
+            queue_paused: false,
+            pending_depth: 2,
+            can_compact: true,
+            can_repair_binding: true,
+        });
+        assert!(!queued.can_start_run);
+        assert!(!queued.can_cancel);
+        assert!(queued.can_compact);
+        assert!(queued.can_repair_binding);
+        assert!(queued.blocking_reasons.iter().any(|reason| reason == "queued_inputs_pending"));
     }
 
     #[test]

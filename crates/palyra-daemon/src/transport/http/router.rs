@@ -683,6 +683,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::sessions::console_session_detail_handler),
         )
         .route(
+            "/console/v1/sessions/{session_id}/snapshot",
+            get(console::sessions::console_session_snapshot_handler),
+        )
+        .route(
             "/console/v1/sessions/{session_id}/project-context",
             get(console::sessions::console_session_project_context_handler),
         )

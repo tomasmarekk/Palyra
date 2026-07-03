@@ -1284,6 +1284,50 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     assert_eq!(sessions_show_payload.get("reset_applied").and_then(Value::as_bool), Some(false));
     assert!(sessions_show_payload.get("session").is_some());
 
+    let sessions_status_output = run_cli_json(
+        &workdir,
+        &["sessions", "status", "--session-key", "workflow:browser", "--json"],
+        &browser_cli_env,
+    )?;
+    let sessions_status_payload = assert_json_success(sessions_status_output, "sessions status")?;
+    let status_snapshot = sessions_status_payload
+        .get("snapshot")
+        .context("sessions status should return snapshot payload")?;
+    assert_eq!(
+        status_snapshot.pointer("/identity/session_id").and_then(Value::as_str),
+        Some(gateway_session_id.as_str()),
+        "sessions status should report the resolved session"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/lifecycle/state").and_then(Value::as_str),
+        Some("idle"),
+        "freshly resolved session should be idle before a run starts"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/safe_operations/can_start_run").and_then(Value::as_bool),
+        Some(true),
+        "idle session should allow a new run"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/safe_operations/can_cancel").and_then(Value::as_bool),
+        Some(false),
+        "idle session should not advertise cancellation"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/owner/principal").and_then(Value::as_str),
+        None,
+        "owner fields should live under identity and stay redacted"
+    );
+    assert_eq!(
+        status_snapshot.pointer("/identity/owner/principal").and_then(Value::as_str),
+        Some("<redacted>"),
+        "session status should redact owner principal"
+    );
+    assert!(
+        status_snapshot.pointer("/usage/tokens/total").is_some_and(Value::is_null),
+        "token counters should be nullable when no run snapshot is available"
+    );
+
     let sessions_after_show = assert_json_success(
         run_cli_json(&workdir, &["sessions", "list", "--json"], &browser_cli_env)?,
         "sessions list after show",
@@ -1291,7 +1335,7 @@ fn browser_channels_and_session_workflows_are_regression_tested() -> Result<()> 
     let updated_after_show = session_updated_at(&sessions_after_show, "workflow:browser")?;
     assert_eq!(
         updated_after_show, updated_before_show,
-        "sessions show must not mutate session recency"
+        "sessions show/status must not mutate session recency"
     );
 
     let sessions_reset_output = run_cli_json(

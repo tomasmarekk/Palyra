@@ -1073,6 +1073,17 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
         .send()
         .context("failed to call session catalog endpoint without session")?;
     assert_eq!(no_session.status().as_u16(), 403, "session catalog endpoint must require session");
+    let unauthenticated_snapshot = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/01ARZ3NDEKTSV4RRFFQ69G5FB0/snapshot"
+        ))
+        .send()
+        .context("failed to call session snapshot endpoint without session")?;
+    assert_eq!(
+        unauthenticated_snapshot.status().as_u16(),
+        403,
+        "session snapshot endpoint must require session"
+    );
 
     let (cookie, csrf_token) = login_console_session(&client, admin_port, CONSOLE_ADMIN_PRINCIPAL)?;
 
@@ -1129,6 +1140,64 @@ fn console_session_catalog_endpoints_require_session_and_csrf() -> Result<()> {
             .and_then(Value::as_str),
         Some(catalog_session_ref),
         "session catalog detail should return the requested session"
+    );
+
+    let snapshot_response = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{catalog_session_ref}/snapshot"
+        ))
+        .header("Cookie", cookie.clone())
+        .send()
+        .context("failed to fetch public session snapshot")?
+        .error_for_status()
+        .context("public session snapshot returned non-success status")?
+        .json::<Value>()
+        .context("failed to parse public session snapshot response json")?;
+    assert_eq!(
+        snapshot_response.pointer("/snapshot/identity/session_id").and_then(Value::as_str),
+        Some(catalog_session_ref),
+        "public session snapshot should return the requested session"
+    );
+    assert_eq!(
+        snapshot_response.pointer("/snapshot/lifecycle/state").and_then(Value::as_str),
+        Some("idle"),
+        "newly created session should be idle"
+    );
+    assert_eq!(
+        snapshot_response
+            .pointer("/snapshot/safe_operations/can_start_run")
+            .and_then(Value::as_bool),
+        Some(true),
+        "idle session should advertise start-run availability"
+    );
+    assert!(
+        snapshot_response.pointer("/snapshot/usage/tokens/total").is_some_and(Value::is_null),
+        "token counters should be nullable when no run snapshot exists"
+    );
+    assert_eq!(
+        snapshot_response.pointer("/snapshot/identity/owner/principal").and_then(Value::as_str),
+        Some("<redacted>"),
+        "snapshot must redact owner principal"
+    );
+
+    let (other_device_cookie, _) = login_console_session_with_device(
+        &client,
+        admin_port,
+        CONSOLE_ADMIN_PRINCIPAL,
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1",
+        "web-alt",
+    )?;
+    let foreign_snapshot = client
+        .get(format!(
+            "http://127.0.0.1:{admin_port}/console/v1/sessions/{catalog_session_ref}/snapshot"
+        ))
+        .header("Cookie", other_device_cookie)
+        .send()
+        .context("failed to fetch foreign public session snapshot")?;
+    assert_eq!(
+        foreign_snapshot.status().as_u16(),
+        404,
+        "snapshot endpoint should not reveal sessions outside the authenticated device scope"
     );
 
     let archive_without_csrf = client

@@ -1475,6 +1475,19 @@ fn parse_sessions_rename_and_abort() {
 
 #[test]
 fn parse_sessions_queue_controls() {
+    let status =
+        Cli::parse_from(["palyra", "sessions", "status", "--session-key", "e2e-context", "--json"]);
+    assert_eq!(
+        status.command,
+        Command::Sessions {
+            command: SessionsCommand::Status {
+                session_id: None,
+                session_key: Some("e2e-context".to_owned()),
+                json: true,
+            }
+        }
+    );
+
     let policy = Cli::parse_from([
         "palyra",
         "sessions",

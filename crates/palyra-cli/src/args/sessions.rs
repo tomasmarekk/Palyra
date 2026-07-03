@@ -46,6 +46,15 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false, help = "Print the session as JSON")]
         json: bool,
     },
+    #[command(about = "Show a public session status snapshot")]
+    Status {
+        #[arg(value_name = "SESSION_ID", required_unless_present = "session_key")]
+        session_id: Option<String>,
+        #[arg(long, conflicts_with = "session_id")]
+        session_key: Option<String>,
+        #[arg(long, default_value_t = false, help = "Print the snapshot as JSON")]
+        json: bool,
+    },
     #[command(about = "Resolve a session selector into a concrete session")]
     Resolve {
         #[arg(long)]
