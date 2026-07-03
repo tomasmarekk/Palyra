@@ -1,9 +1,8 @@
-//! Arguments for `palyra mcp serve`: the stdio MCP server facade. Connection
-//! and session defaults reuse the shared ACP structs from `acp.rs`; the facade
-//! never imports external MCP servers. Help text is pinned by snapshot tests;
-//! see the doc-comment rules in `mod.rs`.
+//! Arguments for `palyra mcp`: external MCP registry management plus the
+//! stdio MCP server facade. `serve` exposes Palyra to external MCP clients;
+//! registry subcommands only edit local config for later import milestones.
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 
 use super::{AcpConnectionArgs, AcpSessionDefaultsArgs};
 
@@ -25,10 +24,150 @@ pub enum McpSubcommand {
         #[arg(long, default_value_t = false)]
         allow_sensitive_tools: bool,
     },
+    #[command(about = "List configured external MCP servers")]
+    List {
+        #[arg(long, help = "Read this palyra.toml path")]
+        path: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Show one configured external MCP server")]
+    Show {
+        id: String,
+        #[arg(long, help = "Read this palyra.toml path")]
+        path: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Add one external MCP server to local config")]
+    Add(McpRegistryMutateArgs),
+    #[command(about = "Update one external MCP server in local config")]
+    Set(McpRegistryMutateArgs),
+    #[command(about = "Enable one external MCP server")]
+    Enable(McpRegistryToggleArgs),
+    #[command(about = "Disable one external MCP server")]
+    Disable(McpRegistryToggleArgs),
+    #[command(about = "Remove one external MCP server")]
+    Remove(McpRegistryToggleArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct McpCommand {
     #[command(subcommand)]
     pub subcommand: McpSubcommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpRegistryMutateArgs {
+    pub id: String,
+    #[arg(long, help = "Edit this palyra.toml path")]
+    pub path: Option<String>,
+    #[arg(long, value_enum)]
+    pub transport: McpTransportArg,
+    #[arg(long, help = "External MCP namespace; defaults to the server id")]
+    pub namespace: Option<String>,
+    #[arg(long, help = "Stdio command path when transport=stdio")]
+    pub command: Option<String>,
+    #[arg(long = "arg", help = "Repeatable stdio command argument")]
+    pub args: Vec<String>,
+    #[arg(long, help = "HTTP or SSE URL when transport=http|sse")]
+    pub url: Option<String>,
+    #[arg(
+        long = "env-vault-ref",
+        help = "Repeatable vault-backed env binding in NAME=scope/key form"
+    )]
+    pub env_vault_refs: Vec<String>,
+    #[arg(long, value_enum, default_value_t = McpTrustLevelArg::External)]
+    pub trust_level: McpTrustLevelArg,
+    #[arg(long, value_enum, default_value_t = McpApprovalProfileArg::RequireApproval)]
+    pub approval_profile: McpApprovalProfileArg,
+    #[arg(long, value_enum, default_value_t = McpEgressPolicyArg::DenyAll)]
+    pub egress_policy: McpEgressPolicyArg,
+    #[arg(long = "egress-host", help = "Repeatable egress allowlist host")]
+    pub egress_allowlist: Vec<String>,
+    #[arg(long = "tool-allow", help = "Repeatable raw MCP tool allowlist entry")]
+    pub tool_allowlist: Vec<String>,
+    #[arg(long = "tool-deny", help = "Repeatable raw MCP tool denylist entry")]
+    pub tool_denylist: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub enabled: bool,
+    #[arg(long, default_value_t = 5, help = "Number of backup files to retain")]
+    pub backups: usize,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpRegistryToggleArgs {
+    pub id: String,
+    #[arg(long, help = "Edit this palyra.toml path")]
+    pub path: Option<String>,
+    #[arg(long, default_value_t = 5, help = "Number of backup files to retain")]
+    pub backups: usize,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpTransportArg {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl McpTransportArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpTrustLevelArg {
+    Local,
+    Workspace,
+    External,
+}
+
+impl McpTrustLevelArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Workspace => "workspace",
+            Self::External => "external",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpApprovalProfileArg {
+    Safe,
+    RequireApproval,
+}
+
+impl McpApprovalProfileArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::RequireApproval => "require_approval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpEgressPolicyArg {
+    DenyAll,
+    Allowlist,
+}
+
+impl McpEgressPolicyArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyAll => "deny_all",
+            Self::Allowlist => "allowlist",
+        }
+    }
 }

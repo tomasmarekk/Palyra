@@ -30,7 +30,8 @@ use palyra_common::{
     },
     daemon_config_schema::{
         FileAgentHarnessConfig, FileDoctorCheckConfig, FileExecutionBackendProfileConfig,
-        FileMcpServerConfig, FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
+        FileMcpCommandValue, FileMcpEnvVaultRefConfig, FileMcpServerConfig,
+        FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
         FileRetrievalSourceScoringProfile, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
@@ -468,16 +469,31 @@ pub fn load_config() -> Result<LoadedConfig> {
                 api_facade.mode = parse_roadmap_preview_mode(mode.as_str(), "api_facade.mode")?;
             }
         }
-        if let Some(file_mcp_servers) = parsed.mcp_servers {
+        let file_mcp_servers = match (parsed.mcp, parsed.mcp_servers) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "mcp and mcp_servers cannot both be set; use canonical [mcp] / [[mcp.servers]]"
+                );
+            }
+            (Some(config), None) => Some(("mcp", config)),
+            (None, Some(config)) => Some(("mcp_servers", config)),
+            (None, None) => None,
+        };
+        if let Some((section_name, file_mcp_servers)) = file_mcp_servers {
             if let Some(mode) = file_mcp_servers.mode {
-                mcp_servers.mode = parse_roadmap_preview_mode(mode.as_str(), "mcp_servers.mode")?;
+                mcp_servers.mode = parse_roadmap_preview_mode(
+                    mode.as_str(),
+                    format!("{section_name}.mode").as_str(),
+                )?;
             }
             if let Some(servers) = file_mcp_servers.servers {
-                mcp_servers.servers = servers
+                let parsed_servers = servers
                     .into_iter()
                     .enumerate()
-                    .map(|(index, entry)| parse_mcp_server_config(entry, index))
+                    .map(|(index, entry)| parse_mcp_server_config(entry, index, section_name))
                     .collect::<Result<Vec<_>>>()?;
+                validate_mcp_server_registry(parsed_servers.as_slice(), section_name)?;
+                mcp_servers.servers = parsed_servers;
             }
         }
         if let Some(file_execution_backend_profiles) = parsed.execution_backend_profiles {
@@ -2588,23 +2604,69 @@ fn parse_roadmap_preview_mode(raw: &str, source_name: &str) -> Result<RuntimePre
     Ok(mode)
 }
 
-fn parse_mcp_server_config(entry: FileMcpServerConfig, index: usize) -> Result<McpServerConfig> {
-    let source_name = format!("mcp_servers.servers[{index}]");
+fn parse_mcp_server_config(
+    entry: FileMcpServerConfig,
+    index: usize,
+    section_name: &str,
+) -> Result<McpServerConfig> {
+    let source_name = format!("{section_name}.servers[{index}]");
     let id = parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?;
+    let namespace = parse_mcp_namespace(
+        entry.namespace.as_deref().unwrap_or(id.as_str()),
+        format!("{source_name}.namespace").as_str(),
+    )?;
     let transport = parse_mcp_server_transport(
         entry.transport.as_deref(),
         format!("{source_name}.transport").as_str(),
     )?;
-    let command =
-        parse_optional_command_argv(entry.command, format!("{source_name}.command").as_str())?;
+    let command = parse_mcp_command_argv(
+        entry.command,
+        entry.args,
+        format!("{source_name}.command").as_str(),
+        format!("{source_name}.args").as_str(),
+    )?;
     let url =
         parse_optional_preview_url(entry.url.as_deref(), format!("{source_name}.url").as_str())?;
+    let env_vault_refs = parse_mcp_env_vault_refs(
+        entry.env_vault_refs,
+        format!("{source_name}.env_vault_refs").as_str(),
+    )?;
+    let trust_level = parse_mcp_server_trust_level(
+        entry.trust_level.as_deref(),
+        format!("{source_name}.trust_level").as_str(),
+    )?;
+    let approval_profile = parse_mcp_server_approval_profile(
+        entry.approval_profile.as_deref(),
+        format!("{source_name}.approval_profile").as_str(),
+    )?;
+    let egress_policy = parse_mcp_server_egress_policy(
+        entry.egress_policy.as_deref(),
+        format!("{source_name}.egress_policy").as_str(),
+    )?;
+    let egress_allowlist = parse_optional_string_list(
+        entry.egress_allowlist,
+        format!("{source_name}.egress_allowlist").as_str(),
+        128,
+        253,
+    )?;
+    let tool_allowlist = parse_optional_string_list(
+        entry.tool_allowlist,
+        format!("{source_name}.tool_allowlist").as_str(),
+        256,
+        128,
+    )?;
+    let tool_denylist = parse_optional_string_list(
+        entry.tool_denylist,
+        format!("{source_name}.tool_denylist").as_str(),
+        256,
+        128,
+    )?;
 
     match transport {
         McpServerTransport::Stdio => {
             if command.is_none() {
                 anyhow::bail!(
-                    "{source_name}.command is required when transport=stdio; set command = [\"mcp-server\", ...] or change transport"
+                    "{source_name}.command is required when transport=stdio; set command = \"mcp-server\" with optional args = [...] or change transport"
                 );
             }
             if url.is_some() {
@@ -2626,8 +2688,25 @@ fn parse_mcp_server_config(entry: FileMcpServerConfig, index: usize) -> Result<M
             }
         }
     }
+    if matches!(egress_policy, McpServerEgressPolicy::Allowlist) && egress_allowlist.is_empty() {
+        anyhow::bail!("{source_name}.egress_allowlist is required when egress_policy=allowlist");
+    }
 
-    Ok(McpServerConfig { id, enabled: entry.enabled.unwrap_or(false), transport, command, url })
+    Ok(McpServerConfig {
+        id,
+        enabled: entry.enabled.unwrap_or(false),
+        namespace,
+        transport,
+        command,
+        url,
+        env_vault_refs,
+        trust_level,
+        approval_profile,
+        egress_policy,
+        egress_allowlist,
+        tool_allowlist,
+        tool_denylist,
+    })
 }
 
 fn parse_execution_backend_profile_config(
@@ -2702,6 +2781,88 @@ fn parse_mcp_server_transport(raw: Option<&str>, source_name: &str) -> Result<Mc
     }
 }
 
+fn parse_mcp_namespace(raw: &str, source_name: &str) -> Result<String> {
+    let namespace = parse_registry_identifier(raw, source_name)?;
+    if namespace.len() > 64 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 64)", namespace.len());
+    }
+    let first_segment = namespace.split(['.', ':']).next().unwrap_or(namespace.as_str());
+    if matches!(
+        first_segment,
+        "palyra" | "builtin" | "skill" | "skills" | "plugin" | "plugins" | "mcp"
+    ) {
+        anyhow::bail!(
+            "{source_name} uses reserved namespace '{first_segment}'; choose an external server namespace"
+        );
+    }
+    Ok(namespace)
+}
+
+fn parse_mcp_server_trust_level(
+    raw: Option<&str>,
+    source_name: &str,
+) -> Result<McpServerTrustLevel> {
+    match raw.unwrap_or("external").trim().to_ascii_lowercase().as_str() {
+        "local" => Ok(McpServerTrustLevel::Local),
+        "workspace" => Ok(McpServerTrustLevel::Workspace),
+        "external" => Ok(McpServerTrustLevel::External),
+        _ => anyhow::bail!("{source_name} must be one of: local, workspace, external"),
+    }
+}
+
+fn parse_mcp_server_approval_profile(
+    raw: Option<&str>,
+    source_name: &str,
+) -> Result<McpServerApprovalProfile> {
+    match raw.unwrap_or("require_approval").trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "safe" => Ok(McpServerApprovalProfile::Safe),
+        "require_approval" => Ok(McpServerApprovalProfile::RequireApproval),
+        _ => anyhow::bail!("{source_name} must be one of: safe, require_approval"),
+    }
+}
+
+fn parse_mcp_server_egress_policy(
+    raw: Option<&str>,
+    source_name: &str,
+) -> Result<McpServerEgressPolicy> {
+    match raw.unwrap_or("deny_all").trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "deny_all" => Ok(McpServerEgressPolicy::DenyAll),
+        "allowlist" => Ok(McpServerEgressPolicy::Allowlist),
+        _ => anyhow::bail!("{source_name} must be one of: deny_all, allowlist"),
+    }
+}
+
+fn parse_mcp_command_argv(
+    command: Option<FileMcpCommandValue>,
+    args: Option<Vec<String>>,
+    command_source: &str,
+    args_source: &str,
+) -> Result<Option<Vec<String>>> {
+    match command {
+        Some(FileMcpCommandValue::Command(command)) => {
+            let mut argv = vec![parse_non_empty_config_text(command.as_str(), command_source)?];
+            if let Some(args) = parse_optional_command_argv(args, args_source)? {
+                argv.extend(args);
+            }
+            Ok(Some(argv))
+        }
+        Some(FileMcpCommandValue::Argv(argv)) => {
+            if args.is_some() {
+                anyhow::bail!(
+                    "{args_source} must be omitted when {command_source} is already an argv array"
+                );
+            }
+            parse_optional_command_argv(Some(argv), command_source)
+        }
+        None => {
+            if args.is_some() {
+                anyhow::bail!("{args_source} requires {command_source}");
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn parse_optional_command_argv(
     raw: Option<Vec<String>>,
     source_name: &str,
@@ -2725,6 +2886,106 @@ fn parse_optional_command_argv(
         argv.push(parsed);
     }
     Ok(Some(argv))
+}
+
+fn parse_mcp_env_vault_refs(
+    raw: Option<Vec<FileMcpEnvVaultRefConfig>>,
+    source_name: &str,
+) -> Result<Vec<McpServerEnvVaultRef>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > 128)", raw.len());
+    }
+    let mut refs = Vec::with_capacity(raw.len());
+    let mut seen_names = HashSet::new();
+    for (index, entry) in raw.into_iter().enumerate() {
+        let name_source = format!("{source_name}[{index}].name");
+        let vault_ref_source = format!("{source_name}[{index}].vault_ref");
+        let name = parse_mcp_env_name(entry.name.as_deref(), name_source.as_str())?;
+        if !seen_names.insert(name.clone()) {
+            anyhow::bail!("{name_source} duplicates env binding '{name}'");
+        }
+        let vault_ref = parse_mcp_vault_ref(entry.vault_ref.as_deref(), vault_ref_source.as_str())?;
+        refs.push(McpServerEnvVaultRef { name, vault_ref });
+    }
+    Ok(refs)
+}
+
+fn parse_mcp_env_name(raw: Option<&str>, source_name: &str) -> Result<String> {
+    let raw =
+        raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required for env_vault_refs entries"))?;
+    let name = parse_non_empty_config_text(raw, source_name)?;
+    if name.len() > 128 {
+        anyhow::bail!("{source_name} exceeds maximum bytes ({} > 128)", name.len());
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty env name should have a first char");
+    if !(first == '_' || first.is_ascii_uppercase()) {
+        anyhow::bail!("{source_name} must start with '_' or an uppercase ASCII letter");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
+        anyhow::bail!("{source_name} must contain only uppercase ASCII letters, digits, or '_'");
+    }
+    Ok(name)
+}
+
+fn parse_mcp_vault_ref(raw: Option<&str>, source_name: &str) -> Result<String> {
+    let raw =
+        raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required for env_vault_refs entries"))?;
+    let value = parse_non_empty_config_text(raw, source_name)?;
+    VaultRef::parse(value.as_str()).map_err(|error| {
+        anyhow::anyhow!("{source_name} contains invalid vault ref '{}': {error}", value)
+    })?;
+    Ok(value)
+}
+
+fn parse_optional_string_list(
+    raw: Option<Vec<String>>,
+    source_name: &str,
+    max_entries: usize,
+    max_bytes_per_entry: usize,
+) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.len() > max_entries {
+        anyhow::bail!("{source_name} exceeds maximum entries ({} > {max_entries})", raw.len());
+    }
+    let mut values = Vec::with_capacity(raw.len());
+    let mut seen = HashSet::new();
+    for (index, value) in raw.into_iter().enumerate() {
+        let path = format!("{source_name}[{index}]");
+        let parsed = parse_non_empty_config_text(value.as_str(), path.as_str())?;
+        if parsed.len() > max_bytes_per_entry {
+            anyhow::bail!(
+                "{path} exceeds maximum bytes ({} > {max_bytes_per_entry})",
+                parsed.len()
+            );
+        }
+        if seen.insert(parsed.clone()) {
+            values.push(parsed);
+        }
+    }
+    Ok(values)
+}
+
+fn validate_mcp_server_registry(servers: &[McpServerConfig], section_name: &str) -> Result<()> {
+    let mut ids = HashSet::new();
+    let mut namespaces = HashSet::new();
+    for (index, server) in servers.iter().enumerate() {
+        if !ids.insert(server.id.as_str()) {
+            anyhow::bail!("{section_name}.servers[{index}].id duplicates '{}'", server.id);
+        }
+        if !namespaces.insert(server.namespace.as_str()) {
+            anyhow::bail!(
+                "{section_name}.servers[{index}].namespace duplicates '{}'",
+                server.namespace
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_optional_preview_url(raw: Option<&str>, source_name: &str) -> Result<Option<String>> {
@@ -4776,8 +5037,8 @@ mod tests {
     use palyra_common::tool_catalog::ToolCatalogExposureMode;
     use palyra_common::{
         daemon_config_schema::{
-            FileMcpServerConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
-            RootFileConfig,
+            FileMcpCommandValue, FileMcpServerConfig, FileModelProviderRegistryEntry,
+            FileModelProviderRegistryModel, RootFileConfig,
         },
         feature_rollouts::{
             FeatureRolloutSetting, FeatureRolloutSource, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
@@ -5135,13 +5396,15 @@ mod tests {
                 transport: Some("stdio".to_owned()),
                 command: None,
                 url: None,
+                ..Default::default()
             },
             0,
+            "mcp",
         )
         .expect_err("stdio MCP server without a command should fail");
 
         let rendered = error.to_string();
-        assert!(rendered.contains("mcp_servers.servers[0].command"));
+        assert!(rendered.contains("mcp.servers[0].command"));
         assert!(rendered.contains("set command"));
     }
 
@@ -5152,21 +5415,89 @@ mod tests {
                 id: Some("Filesystem".to_owned()),
                 enabled: None,
                 transport: Some("stdio".to_owned()),
-                command: Some(vec![
+                command: Some(FileMcpCommandValue::Argv(vec![
                     "mcp-filesystem".to_owned(),
                     "--root".to_owned(),
                     ".".to_owned(),
-                ]),
+                ])),
                 url: None,
+                ..Default::default()
             },
             0,
+            "mcp",
         )
         .expect("valid stdio MCP server should parse");
 
         assert_eq!(server.id, "filesystem");
         assert!(!server.enabled);
+        assert_eq!(server.namespace, "filesystem");
         assert_eq!(server.transport, crate::config::McpServerTransport::Stdio);
         assert_eq!(server.command.as_ref().map(Vec::len), Some(3));
+        assert_eq!(server.trust_level, crate::config::McpServerTrustLevel::External);
+        assert_eq!(
+            server.approval_profile,
+            crate::config::McpServerApprovalProfile::RequireApproval
+        );
+        assert_eq!(server.egress_policy, crate::config::McpServerEgressPolicy::DenyAll);
+    }
+
+    #[test]
+    fn mcp_registry_rejects_duplicate_namespace() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+            version = 1
+
+            [mcp]
+            mode = "preview_only"
+
+            [[mcp.servers]]
+            id = "docs"
+            transport = "stdio"
+            command = "mcp-docs"
+            namespace = "shared"
+
+            [[mcp.servers]]
+            id = "wiki"
+            transport = "stdio"
+            command = "mcp-wiki"
+            namespace = "shared"
+            "#,
+        )
+        .expect("MCP registry config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _mcp_mode = ScopedEnvVar::unset("PALYRA_MCP_SERVERS_MODE");
+
+        let error = super::load_config().expect_err("duplicate MCP namespaces should fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("mcp.servers[1].namespace"));
+        assert!(rendered.contains("duplicates"));
+    }
+
+    #[test]
+    fn mcp_registry_rejects_plain_env_bindings() {
+        let error = parse_root_file_config(
+            r#"
+            [mcp]
+            mode = "preview_only"
+
+            [[mcp.servers]]
+            id = "docs"
+            transport = "stdio"
+            command = "mcp-docs"
+            env = { DOCS_TOKEN = "plain-secret" }
+            "#,
+        )
+        .expect_err("plain MCP env bindings should fail schema validation");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("unknown field `env`"), "unexpected error: {rendered}");
     }
 
     #[test]

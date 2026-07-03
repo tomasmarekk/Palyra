@@ -10,7 +10,7 @@ Commands:
   logs            Tail local gateway journal diagnostics
   status          Show transport and admin status across HTTP/gRPC surfaces
   acp             Run the ACP stdio bridge and legacy compatibility shim
-  mcp             Run the MCP stdio facade
+  mcp             Manage MCP registry and run the stdio facade
   agent           Run one-off or interactive agent sessions
   agents          Manage daemon agent registry, bindings, and defaults
   routines        Manage unified automation routines across schedules and event triggers

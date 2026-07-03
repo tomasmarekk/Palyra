@@ -1,16 +1,25 @@
-//! `palyra mcp serve`: a stdio MCP server facade over Palyra sessions, transcripts,
-//! memory, and approvals, speaking Content-Length framed JSON-RPC.
+//! `palyra mcp`: external MCP registry management plus a stdio MCP server
+//! facade over Palyra sessions, transcripts, memory, and approvals.
 //!
-//! This is server-only: it exposes Palyra to external MCP clients and never imports
-//! external MCP tools into agent runs. Mutating tools are gated by `--read-only`.
+//! Registry subcommands only edit local config. `serve` exposes Palyra to
+//! external MCP clients and never imports external MCP tools into agent runs.
+//! Mutating facade tools are gated by `--read-only`.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::{
+    collections::HashSet,
+    io::{self, BufRead, BufReader, Write},
+    path::Path,
+};
 
 use anyhow::{anyhow, Context, Result};
+use palyra_vault::VaultRef;
 use serde_json::{json, Map, Value};
 use tonic::Request;
 
-use crate::cli::{AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpSubcommand};
+use crate::cli::{
+    AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpEgressPolicyArg,
+    McpRegistryMutateArgs, McpRegistryToggleArgs, McpSubcommand, McpTransportArg,
+};
 use crate::*;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -50,7 +59,506 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
         McpSubcommand::Serve { connection, session_defaults, read_only, allow_sensitive_tools } => {
             run_mcp_serve(connection, session_defaults, read_only, allow_sensitive_tools)
         }
+        McpSubcommand::List { path, json } => run_mcp_registry_list(path, json),
+        McpSubcommand::Show { id, path, json } => run_mcp_registry_show(path, &id, json),
+        McpSubcommand::Add(args) => run_mcp_registry_add(args),
+        McpSubcommand::Set(args) => run_mcp_registry_set(args),
+        McpSubcommand::Enable(args) => run_mcp_registry_toggle(args, true),
+        McpSubcommand::Disable(args) => run_mcp_registry_toggle(args, false),
+        McpSubcommand::Remove(args) => run_mcp_registry_remove(args),
     }
+}
+
+fn run_mcp_registry_list(path: Option<String>, json: bool) -> Result<()> {
+    let path = resolve_config_path(path, true)?;
+    let (mut document, _) = load_document_from_existing_path(Path::new(&path))
+        .with_context(|| format!("failed to parse {path}"))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let servers = read_mcp_server_entries(&document)?;
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            &json!({
+                "source": path,
+                "servers": servers,
+            }),
+            "failed to encode MCP registry list as JSON",
+        );
+    }
+    println!("mcp.list source={} count={}", path, servers.len());
+    for server in servers {
+        println!(
+            "mcp.server id={} enabled={} namespace={} transport={}",
+            json_string(&server, "id").unwrap_or("unknown"),
+            json_bool(&server, "enabled").unwrap_or(false),
+            json_string(&server, "namespace").unwrap_or("unknown"),
+            json_string(&server, "transport").unwrap_or("unknown")
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_registry_show(path: Option<String>, id: &str, json: bool) -> Result<()> {
+    let path = resolve_config_path(path, true)?;
+    let (mut document, _) = load_document_from_existing_path(Path::new(&path))
+        .with_context(|| format!("failed to parse {path}"))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let server = find_mcp_server_entry(&document, id)?
+        .ok_or_else(|| anyhow!("MCP server `{id}` is not configured"))?;
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            &json!({
+                "source": path,
+                "server": server,
+            }),
+            "failed to encode MCP registry server as JSON",
+        );
+    }
+    println!(
+        "mcp.show source={} id={} enabled={} namespace={} transport={}",
+        path,
+        json_string(&server, "id").unwrap_or("unknown"),
+        json_bool(&server, "enabled").unwrap_or(false),
+        json_string(&server, "namespace").unwrap_or("unknown"),
+        json_string(&server, "transport").unwrap_or("unknown")
+    );
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_registry_add(args: McpRegistryMutateArgs) -> Result<()> {
+    mutate_mcp_registry(args, McpRegistryMutation::Add)
+}
+
+fn run_mcp_registry_set(args: McpRegistryMutateArgs) -> Result<()> {
+    mutate_mcp_registry(args, McpRegistryMutation::Set)
+}
+
+fn run_mcp_registry_toggle(args: McpRegistryToggleArgs, enabled: bool) -> Result<()> {
+    let path = resolve_config_path(args.path, true)?;
+    let path_ref = Path::new(&path);
+    let (mut document, _) = load_document_from_existing_path(path_ref)
+        .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let server = mcp_server_entry_mut(&mut document, &args.id)?
+        .ok_or_else(|| anyhow!("MCP server `{}` is not configured", args.id))?;
+    let table = server
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("MCP server `{}` is not a TOML table", args.id))?;
+    table.insert("enabled".to_owned(), toml::Value::Boolean(enabled));
+    persist_mcp_registry_document(path_ref, &document, args.backups)?;
+    let payload = json!({
+        "source": path_ref.display().to_string(),
+        "id": args.id,
+        "enabled": enabled,
+        "backups": args.backups,
+    });
+    if output::preferred_json(args.json) {
+        output::print_json_pretty(&payload, "failed to encode MCP registry toggle as JSON")
+    } else {
+        println!(
+            "mcp.{} id={} source={} backups={}",
+            if enabled { "enable" } else { "disable" },
+            payload["id"].as_str().unwrap_or("unknown"),
+            path_ref.display(),
+            args.backups
+        );
+        std::io::stdout().flush().context("stdout flush failed")
+    }
+}
+
+fn run_mcp_registry_remove(args: McpRegistryToggleArgs) -> Result<()> {
+    let path = resolve_config_path(args.path, true)?;
+    let path_ref = Path::new(&path);
+    let (mut document, _) = load_document_from_existing_path(path_ref)
+        .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let removed = remove_mcp_server_entry(&mut document, &args.id)?;
+    if !removed {
+        anyhow::bail!("MCP server `{}` is not configured", args.id);
+    }
+    persist_mcp_registry_document(path_ref, &document, args.backups)?;
+    let payload = json!({
+        "source": path_ref.display().to_string(),
+        "id": args.id,
+        "removed": true,
+        "backups": args.backups,
+    });
+    if output::preferred_json(args.json) {
+        output::print_json_pretty(&payload, "failed to encode MCP registry remove as JSON")
+    } else {
+        println!(
+            "mcp.remove id={} source={} backups={}",
+            payload["id"].as_str().unwrap_or("unknown"),
+            path_ref.display(),
+            args.backups
+        );
+        std::io::stdout().flush().context("stdout flush failed")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpRegistryMutation {
+    Add,
+    Set,
+}
+
+fn mutate_mcp_registry(args: McpRegistryMutateArgs, mutation: McpRegistryMutation) -> Result<()> {
+    let normalized_id = normalize_mcp_config_identifier(args.id.as_str(), "id")?;
+    let path = resolve_config_path(args.path.clone(), false)?;
+    let path_ref = Path::new(&path);
+    let (mut document, migration) = load_document_for_mutation(path_ref)
+        .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let server = mcp_server_table(&args)?;
+    let servers = mcp_servers_array_mut(&mut document)?;
+    let existing = servers
+        .iter()
+        .position(|entry| toml_table_string(entry, "id") == Some(normalized_id.as_str()));
+    match (mutation, existing) {
+        (McpRegistryMutation::Add, Some(_)) => {
+            anyhow::bail!("MCP server `{}` is already configured; use `palyra mcp set`", args.id);
+        }
+        (McpRegistryMutation::Add, None) => servers.push(server),
+        (McpRegistryMutation::Set, Some(index)) => servers[index] = server,
+        (McpRegistryMutation::Set, None) => {
+            anyhow::bail!("MCP server `{}` is not configured; use `palyra mcp add`", args.id);
+        }
+    }
+    persist_mcp_registry_document(path_ref, &document, args.backups)?;
+    let action = match mutation {
+        McpRegistryMutation::Add => "add",
+        McpRegistryMutation::Set => "set",
+    };
+    let payload = json!({
+        "source": path_ref.display().to_string(),
+        "id": normalized_id,
+        "action": action,
+        "enabled": args.enabled,
+        "backups": args.backups,
+        "migrated": migration.migrated,
+    });
+    if output::preferred_json(args.json) {
+        output::print_json_pretty(&payload, "failed to encode MCP registry mutation as JSON")
+    } else {
+        println!(
+            "mcp.{action} id={} source={} enabled={} backups={} migrated={}",
+            payload["id"].as_str().unwrap_or("unknown"),
+            path_ref.display(),
+            args.enabled,
+            args.backups,
+            migration.migrated
+        );
+        std::io::stdout().flush().context("stdout flush failed")
+    }
+}
+
+fn persist_mcp_registry_document(
+    path: &Path,
+    document: &toml::Value,
+    backups: usize,
+) -> Result<()> {
+    validate_mcp_registry_document(document)
+        .with_context(|| format!("mutated MCP registry in {} is invalid", path.display()))?;
+    validate_daemon_compatible_document(document).with_context(|| {
+        format!("mutated config {} does not match daemon schema", path.display())
+    })?;
+    write_document_with_backups(path, document, backups)
+        .with_context(|| format!("failed to persist config {}", path.display()))
+}
+
+fn mcp_server_table(args: &McpRegistryMutateArgs) -> Result<toml::Value> {
+    let id = normalize_mcp_config_identifier(args.id.as_str(), "id")?;
+    let namespace =
+        normalize_mcp_namespace(args.namespace.as_deref().unwrap_or(id.as_str()), "namespace")?;
+    validate_mcp_transport_args(args)?;
+    let mut table = toml::map::Map::new();
+    table.insert("id".to_owned(), toml::Value::String(id));
+    table.insert("enabled".to_owned(), toml::Value::Boolean(args.enabled));
+    table.insert("namespace".to_owned(), toml::Value::String(namespace));
+    table.insert("transport".to_owned(), toml::Value::String(args.transport.as_str().to_owned()));
+    match args.transport {
+        McpTransportArg::Stdio => {
+            let command = args.command.as_deref().expect("stdio command validated as present");
+            table.insert("command".to_owned(), toml::Value::String(command.to_owned()));
+            if !args.args.is_empty() {
+                table.insert("args".to_owned(), string_array_toml(args.args.as_slice()));
+            }
+            if !args.env_vault_refs.is_empty() {
+                table.insert(
+                    "env_vault_refs".to_owned(),
+                    toml::Value::Array(parse_env_vault_ref_tables(args.env_vault_refs.as_slice())?),
+                );
+            }
+        }
+        McpTransportArg::Http | McpTransportArg::Sse => {
+            let url = args.url.as_deref().expect("HTTP/SSE URL validated as present");
+            table.insert("url".to_owned(), toml::Value::String(url.to_owned()));
+        }
+    }
+    table.insert(
+        "trust_level".to_owned(),
+        toml::Value::String(args.trust_level.as_str().to_owned()),
+    );
+    table.insert(
+        "approval_profile".to_owned(),
+        toml::Value::String(args.approval_profile.as_str().to_owned()),
+    );
+    table.insert(
+        "egress_policy".to_owned(),
+        toml::Value::String(args.egress_policy.as_str().to_owned()),
+    );
+    if !args.egress_allowlist.is_empty() {
+        table.insert(
+            "egress_allowlist".to_owned(),
+            string_array_toml(args.egress_allowlist.as_slice()),
+        );
+    }
+    if !args.tool_allowlist.is_empty() {
+        table
+            .insert("tool_allowlist".to_owned(), string_array_toml(args.tool_allowlist.as_slice()));
+    }
+    if !args.tool_denylist.is_empty() {
+        table.insert("tool_denylist".to_owned(), string_array_toml(args.tool_denylist.as_slice()));
+    }
+    Ok(toml::Value::Table(table))
+}
+
+fn validate_mcp_registry_document(document: &toml::Value) -> Result<()> {
+    let Some(value) = get_value_at_path(document, "mcp.servers")
+        .context("invalid MCP registry path mcp.servers")?
+    else {
+        return Ok(());
+    };
+    let servers = value.as_array().ok_or_else(|| anyhow!("mcp.servers must be a TOML array"))?;
+    let mut ids = HashSet::new();
+    let mut namespaces = HashSet::new();
+    for (index, server) in servers.iter().enumerate() {
+        let source = format!("mcp.servers[{index}]");
+        let table = server.as_table().ok_or_else(|| anyhow!("{source} must be a TOML table"))?;
+        if table.contains_key("env") {
+            anyhow::bail!(
+                "{source}.env is not supported; use env_vault_refs with NAME=scope/key bindings"
+            );
+        }
+        let id_source = format!("{source}.id");
+        let id = table
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| anyhow!("{id_source} is required"))?;
+        let normalized_id = normalize_mcp_config_identifier(id, id_source.as_str())?;
+        if !ids.insert(normalized_id.clone()) {
+            anyhow::bail!("{id_source} duplicates `{normalized_id}`");
+        }
+
+        let namespace_source = format!("{source}.namespace");
+        let namespace = match table.get("namespace").and_then(toml::Value::as_str) {
+            Some(raw) => normalize_mcp_namespace(raw, namespace_source.as_str())?,
+            None => normalized_id,
+        };
+        if !namespaces.insert(namespace.clone()) {
+            anyhow::bail!("{namespace_source} duplicates `{namespace}`");
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_transport_args(args: &McpRegistryMutateArgs) -> Result<()> {
+    match args.transport {
+        McpTransportArg::Stdio => {
+            if args.command.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                anyhow::bail!("--command is required when --transport stdio");
+            }
+            if args.url.is_some() {
+                anyhow::bail!("--url must be omitted when --transport stdio");
+            }
+        }
+        McpTransportArg::Http | McpTransportArg::Sse => {
+            if args.url.as_deref().is_none_or(|value| value.trim().is_empty()) {
+                anyhow::bail!("--url is required when --transport {}", args.transport.as_str());
+            }
+            if args.command.is_some() || !args.args.is_empty() || !args.env_vault_refs.is_empty() {
+                anyhow::bail!(
+                    "--command, --arg, and --env-vault-ref are only valid when --transport stdio"
+                );
+            }
+        }
+    }
+    if matches!(args.egress_policy, McpEgressPolicyArg::Allowlist)
+        && args.egress_allowlist.is_empty()
+    {
+        anyhow::bail!("--egress-host is required when --egress-policy allowlist");
+    }
+    Ok(())
+}
+
+fn canonicalize_mcp_registry_section(document: &mut toml::Value) -> Result<()> {
+    let root = document
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config document root must be a TOML table"))?;
+    if root.contains_key("mcp") && root.contains_key("mcp_servers") {
+        anyhow::bail!(
+            "mcp and mcp_servers cannot both be set; use canonical [mcp] / [[mcp.servers]]"
+        );
+    }
+    if !root.contains_key("mcp") {
+        if let Some(legacy) = root.remove("mcp_servers") {
+            root.insert("mcp".to_owned(), legacy);
+        }
+    }
+    Ok(())
+}
+
+fn mcp_servers_array_mut(document: &mut toml::Value) -> Result<&mut Vec<toml::Value>> {
+    let root = document
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config document root must be a TOML table"))?;
+    let section = root
+        .entry("mcp".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("mcp must be a TOML table"))?;
+    section
+        .entry("mode".to_owned())
+        .or_insert_with(|| toml::Value::String("preview_only".to_owned()));
+    section
+        .entry("servers".to_owned())
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("mcp.servers must be a TOML array"))
+}
+
+fn read_mcp_server_entries(document: &toml::Value) -> Result<Vec<Value>> {
+    let Some(value) = get_value_at_path(document, "mcp.servers")
+        .context("invalid MCP registry path mcp.servers")?
+    else {
+        return Ok(Vec::new());
+    };
+    let servers = value.as_array().ok_or_else(|| anyhow!("mcp.servers must be a TOML array"))?;
+    servers.iter().map(toml_server_to_json).collect::<Result<Vec<_>>>()
+}
+
+fn find_mcp_server_entry(document: &toml::Value, id: &str) -> Result<Option<Value>> {
+    let id = normalize_mcp_config_identifier(id, "id")?;
+    Ok(read_mcp_server_entries(document)?
+        .into_iter()
+        .find(|server| json_string(server, "id") == Some(id.as_str())))
+}
+
+fn mcp_server_entry_mut<'a>(
+    document: &'a mut toml::Value,
+    id: &str,
+) -> Result<Option<&'a mut toml::Value>> {
+    let id = normalize_mcp_config_identifier(id, "id")?;
+    Ok(mcp_servers_array_mut(document)?
+        .iter_mut()
+        .find(|server| toml_table_string(server, "id") == Some(id.as_str())))
+}
+
+fn remove_mcp_server_entry(document: &mut toml::Value, id: &str) -> Result<bool> {
+    let id = normalize_mcp_config_identifier(id, "id")?;
+    let servers = mcp_servers_array_mut(document)?;
+    let Some(index) =
+        servers.iter().position(|server| toml_table_string(server, "id") == Some(id.as_str()))
+    else {
+        return Ok(false);
+    };
+    servers.remove(index);
+    Ok(true)
+}
+
+fn parse_env_vault_ref_tables(raw_refs: &[String]) -> Result<Vec<toml::Value>> {
+    raw_refs
+        .iter()
+        .map(|raw| {
+            let (name, vault_ref) = raw.split_once('=').ok_or_else(|| {
+                anyhow!("--env-vault-ref must use NAME=scope/key syntax, got `{raw}`")
+            })?;
+            let name = validate_mcp_env_name(name)?;
+            let vault_ref = validate_mcp_vault_ref(vault_ref)?;
+            let mut table = toml::map::Map::new();
+            table.insert("name".to_owned(), toml::Value::String(name));
+            table.insert("vault_ref".to_owned(), toml::Value::String(vault_ref));
+            Ok(toml::Value::Table(table))
+        })
+        .collect()
+}
+
+fn string_array_toml(values: &[String]) -> toml::Value {
+    toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
+}
+
+fn toml_server_to_json(value: &toml::Value) -> Result<Value> {
+    serde_json::to_value(value).context("failed to encode MCP registry entry as JSON")
+}
+
+fn toml_table_string<'a>(value: &'a toml::Value, key: &str) -> Option<&'a str> {
+    value.as_table()?.get(key)?.as_str()
+}
+
+fn json_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str()
+}
+
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+fn normalize_mcp_config_identifier(raw: &str, field_name: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("{field_name} cannot be empty");
+    }
+    if normalized.len() > 128 {
+        anyhow::bail!("{field_name} exceeds maximum bytes ({} > 128)", normalized.len());
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        anyhow::bail!("{field_name} contains invalid identifier `{raw}`");
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_namespace(raw: &str, field_name: &str) -> Result<String> {
+    let namespace = normalize_mcp_config_identifier(raw, field_name)?;
+    let first_segment = namespace.split(['.', ':']).next().unwrap_or(namespace.as_str());
+    if matches!(
+        first_segment,
+        "palyra" | "builtin" | "skill" | "skills" | "plugin" | "plugins" | "mcp"
+    ) {
+        anyhow::bail!(
+            "{field_name} uses reserved namespace `{first_segment}`; choose an external server namespace"
+        );
+    }
+    Ok(namespace)
+}
+
+fn validate_mcp_env_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        anyhow::bail!("env vault ref name cannot be empty");
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty env name should have a first char");
+    if !(first == '_' || first.is_ascii_uppercase()) {
+        anyhow::bail!("env vault ref name must start with '_' or an uppercase ASCII letter");
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit()) {
+        anyhow::bail!(
+            "env vault ref name must contain only uppercase ASCII letters, digits, or '_'"
+        );
+    }
+    Ok(name.to_owned())
+}
+
+fn validate_mcp_vault_ref(raw: &str) -> Result<String> {
+    let vault_ref = raw.trim();
+    if vault_ref.is_empty() {
+        anyhow::bail!("env vault ref value cannot be empty");
+    }
+    VaultRef::parse(vault_ref)
+        .map_err(|error| anyhow!("env vault ref `{vault_ref}` is invalid: {error}"))?;
+    Ok(vault_ref.to_owned())
 }
 
 fn run_mcp_serve(
@@ -1362,6 +1870,7 @@ fn next_distinct_session_page_cursor(
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::{McpApprovalProfileArg, McpTrustLevelArg};
     use crate::output::{classify_error, CliExitCode};
 
     use super::*;
@@ -1394,6 +1903,88 @@ mod tests {
             Err(anyhow!("status: permission denied: authorization token is invalid")
                 .context("failed to call ListSessions"))
         }
+    }
+
+    fn stdio_registry_args() -> McpRegistryMutateArgs {
+        McpRegistryMutateArgs {
+            id: "Docs".to_owned(),
+            path: None,
+            transport: McpTransportArg::Stdio,
+            namespace: Some("docs".to_owned()),
+            command: Some("mcp-docs".to_owned()),
+            args: vec!["--root".to_owned(), "docs".to_owned()],
+            url: None,
+            env_vault_refs: vec!["DOCS_TOKEN=global/docs-token".to_owned()],
+            trust_level: McpTrustLevelArg::Workspace,
+            approval_profile: McpApprovalProfileArg::RequireApproval,
+            egress_policy: McpEgressPolicyArg::DenyAll,
+            egress_allowlist: Vec::new(),
+            tool_allowlist: vec!["search".to_owned()],
+            tool_denylist: Vec::new(),
+            enabled: false,
+            backups: 5,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn mcp_registry_table_uses_vault_refs_and_canonical_namespace() {
+        let args = stdio_registry_args();
+        let server = mcp_server_table(&args).expect("valid MCP registry args should encode");
+        assert_eq!(toml_table_string(&server, "id"), Some("docs"));
+        assert_eq!(toml_table_string(&server, "namespace"), Some("docs"));
+        assert_eq!(toml_table_string(&server, "transport"), Some("stdio"));
+        assert_eq!(toml_table_string(&server, "command"), Some("mcp-docs"));
+
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        mcp_servers_array_mut(&mut document).expect("mcp section should be created").push(server);
+        validate_daemon_compatible_document(&document)
+            .expect("generated MCP registry document should match daemon schema");
+    }
+
+    #[test]
+    fn mcp_registry_rejects_plain_env_secret_and_reserved_namespace() {
+        let mut args = stdio_registry_args();
+        args.env_vault_refs = vec!["DOCS_TOKEN=plain-secret".to_owned()];
+        let error = mcp_server_table(&args).expect_err("plain env secret should be rejected");
+        assert!(error.to_string().contains("env vault ref"));
+
+        let mut args = stdio_registry_args();
+        args.namespace = Some("palyra.memory".to_owned());
+        let error = mcp_server_table(&args).expect_err("reserved namespace should be rejected");
+        assert!(error.to_string().contains("reserved namespace"));
+    }
+
+    #[test]
+    fn mcp_registry_document_rejects_duplicate_namespace_and_env_table() {
+        let first = mcp_server_table(&stdio_registry_args())
+            .expect("valid MCP registry args should encode");
+        let mut second_args = stdio_registry_args();
+        second_args.id = "wiki".to_owned();
+        second_args.namespace = Some("docs".to_owned());
+        let second =
+            mcp_server_table(&second_args).expect("valid duplicate namespace server should encode");
+
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        let servers = mcp_servers_array_mut(&mut document).expect("mcp section should be created");
+        servers.push(first);
+        servers.push(second);
+        let error = validate_mcp_registry_document(&document)
+            .expect_err("duplicate namespace should be rejected before persist");
+        assert!(error.to_string().contains("namespace"));
+        assert!(error.to_string().contains("duplicates"));
+
+        let mut server = mcp_server_table(&stdio_registry_args())
+            .expect("valid MCP registry args should encode");
+        server
+            .as_table_mut()
+            .expect("server should be a table")
+            .insert("env".to_owned(), toml::Value::Table(toml::map::Map::new()));
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        mcp_servers_array_mut(&mut document).expect("mcp section should be created").push(server);
+        let error = validate_mcp_registry_document(&document)
+            .expect_err("inline env table should be rejected before persist");
+        assert!(error.to_string().contains("env_vault_refs"));
     }
 
     #[test]

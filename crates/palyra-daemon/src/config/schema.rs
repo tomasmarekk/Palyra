@@ -565,9 +565,46 @@ impl McpServerTransport {
 pub struct McpServerConfig {
     pub id: String,
     pub enabled: bool,
+    pub namespace: String,
     pub transport: McpServerTransport,
     pub command: Option<Vec<String>>,
     pub url: Option<String>,
+    pub env_vault_refs: Vec<McpServerEnvVaultRef>,
+    pub trust_level: McpServerTrustLevel,
+    pub approval_profile: McpServerApprovalProfile,
+    pub egress_policy: McpServerEgressPolicy,
+    pub egress_allowlist: Vec<String>,
+    pub tool_allowlist: Vec<String>,
+    pub tool_denylist: Vec<String>,
+}
+
+/// Vault-backed environment binding for an MCP stdio server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerEnvVaultRef {
+    pub name: String,
+    pub vault_ref: String,
+}
+
+/// Operator-assigned trust tier for an external MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerTrustLevel {
+    Local,
+    Workspace,
+    External,
+}
+
+/// Default approval posture for tools imported from an MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerApprovalProfile {
+    Safe,
+    RequireApproval,
+}
+
+/// Egress posture for an MCP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerEgressPolicy {
+    DenyAll,
+    Allowlist,
 }
 
 /// Execution backend profile registry preview.

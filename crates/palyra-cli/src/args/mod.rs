@@ -108,7 +108,10 @@ pub use hooks::HooksCommand;
 pub use ids::RequiredCommandIdArg;
 pub use init::{InitModeArg, InitTlsScaffoldArg};
 pub use jobs::JobsCommand;
-pub use mcp::{McpCommand, McpSubcommand};
+pub use mcp::{
+    McpApprovalProfileArg, McpCommand, McpEgressPolicyArg, McpRegistryMutateArgs,
+    McpRegistryToggleArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg,
+};
 pub use memory::{
     MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MemoryWorkspaceCommand,
 };
@@ -354,13 +357,16 @@ Discoverability:
 
 const MCP_AFTER_HELP: &str = "\
 Examples:
+  palyra mcp list
+  palyra mcp add docs --transport stdio --command mcp-docs --arg=--root --arg docs --namespace docs
+  palyra mcp disable docs
   palyra mcp serve --read-only
   palyra mcp serve --session-key ops:triage
   palyra mcp serve --allow-sensitive-tools
 
 Discoverability:
-  `mcp serve` exposes Palyra as a stdio MCP server facade over the same connection, access control, and approval model used by the rest of the CLI.
-  It does not import external MCP servers or register external MCP client tools such as `ticket.read` into Palyra agent runs.";
+  `mcp add|set|enable|disable|remove` manages durable external MCP server declarations in palyra.toml.
+  `mcp serve` exposes Palyra as a stdio MCP server facade over the same connection, access control, and approval model used by the rest of the CLI.";
 
 const DOCS_AFTER_HELP: &str = "\
 Examples:
@@ -615,7 +621,7 @@ pub enum Command {
         #[command(flatten)]
         command: AcpCommand,
     },
-    #[command(about = "Run the MCP stdio facade", after_long_help = MCP_AFTER_HELP)]
+    #[command(about = "Manage MCP registry and run the stdio facade", after_long_help = MCP_AFTER_HELP)]
     Mcp {
         #[command(flatten)]
         command: McpCommand,

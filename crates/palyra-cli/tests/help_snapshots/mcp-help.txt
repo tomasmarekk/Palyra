@@ -1,9 +1,16 @@
-Run the MCP stdio facade
+Manage MCP registry and run the stdio facade
 
 Usage: palyra mcp [OPTIONS] <COMMAND>
 
 Commands:
-  serve  Run the stdio MCP server
+  serve    Run the stdio MCP server
+  list     List configured external MCP servers
+  show     Show one configured external MCP server
+  add      Add one external MCP server to local config
+  set      Update one external MCP server in local config
+  enable   Enable one external MCP server
+  disable  Disable one external MCP server
+  remove   Remove one external MCP server
 
 Options:
   -h, --help
@@ -50,10 +57,13 @@ Global Options:
           Permit strict profile-scoped actions after explicit profile checks
 
 Examples:
+  palyra mcp list
+  palyra mcp add docs --transport stdio --command mcp-docs --arg=--root --arg docs --namespace docs
+  palyra mcp disable docs
   palyra mcp serve --read-only
   palyra mcp serve --session-key ops:triage
   palyra mcp serve --allow-sensitive-tools
 
 Discoverability:
+  `mcp add|set|enable|disable|remove` manages durable external MCP server declarations in palyra.toml.
   `mcp serve` exposes Palyra as a stdio MCP server facade over the same connection, access control, and approval model used by the rest of the CLI.
-  It does not import external MCP servers or register external MCP client tools such as `ticket.read` into Palyra agent runs.

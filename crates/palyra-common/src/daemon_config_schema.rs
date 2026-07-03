@@ -320,7 +320,7 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Preview posture for the public API facade before maturity gates enable serving it.",
     },
     ConfigSchemaEntry {
-        path: "mcp_servers.mode",
+        path: "mcp.mode",
         value_type: "enum(disabled|preview_only)",
         default_value: Some("disabled"),
         env_vars: &["PALYRA_MCP_SERVERS_MODE"],
@@ -331,7 +331,7 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Preview posture for imported MCP server declarations.",
     },
     ConfigSchemaEntry {
-        path: "mcp_servers.servers",
+        path: "mcp.servers",
         value_type: "array<table>",
         default_value: Some("[]"),
         env_vars: &[],
@@ -339,7 +339,29 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         deprecated: false,
         restart_required: true,
         category: "mcp_servers",
-        description: "MCP server registry entries; env overrides intentionally do not replace structured registry data.",
+        description: "Canonical MCP server registry entries; env overrides intentionally do not replace structured registry data.",
+    },
+    ConfigSchemaEntry {
+        path: "mcp_servers.mode",
+        value_type: "enum(disabled|preview_only)",
+        default_value: Some("disabled"),
+        env_vars: &["PALYRA_MCP_SERVERS_MODE"],
+        secret: false,
+        deprecated: true,
+        restart_required: true,
+        category: "mcp_servers",
+        description: "Deprecated alias for mcp.mode.",
+    },
+    ConfigSchemaEntry {
+        path: "mcp_servers.servers",
+        value_type: "array<table>",
+        default_value: Some("[]"),
+        env_vars: &[],
+        secret: false,
+        deprecated: true,
+        restart_required: true,
+        category: "mcp_servers",
+        description: "Deprecated alias for mcp.servers.",
     },
     ConfigSchemaEntry {
         path: "execution_backend_profiles.mode",
@@ -634,6 +656,7 @@ pub struct RootFileConfig {
     pub replay_capture: Option<FileReplayCaptureConfig>,
     pub networked_workers: Option<FileNetworkedWorkersConfig>,
     pub api_facade: Option<FileRoadmapPreviewSectionConfig>,
+    pub mcp: Option<FileMcpServersConfig>,
     pub mcp_servers: Option<FileMcpServersConfig>,
     pub execution_backend_profiles: Option<FileExecutionBackendProfilesConfig>,
     pub qa_lab: Option<FileRoadmapPreviewSectionConfig>,
@@ -832,15 +855,40 @@ pub struct FileMcpServersConfig {
     pub servers: Option<Vec<FileMcpServerConfig>>,
 }
 
-/// One `[[mcp_servers.servers]]` declaration.
+/// One `[[mcp.servers]]` declaration.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMcpServerConfig {
     pub id: Option<String>,
     pub enabled: Option<bool>,
+    pub namespace: Option<String>,
     pub transport: Option<String>,
-    pub command: Option<Vec<String>>,
+    pub command: Option<FileMcpCommandValue>,
+    pub args: Option<Vec<String>>,
     pub url: Option<String>,
+    pub env_vault_refs: Option<Vec<FileMcpEnvVaultRefConfig>>,
+    pub trust_level: Option<String>,
+    pub approval_profile: Option<String>,
+    pub egress_policy: Option<String>,
+    pub egress_allowlist: Option<Vec<String>>,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub tool_denylist: Option<Vec<String>>,
+}
+
+/// Stdio command declaration, accepting both legacy argv arrays and canonical command strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum FileMcpCommandValue {
+    Command(String),
+    Argv(Vec<String>),
+}
+
+/// One vault-backed environment binding for an MCP stdio server.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMcpEnvVaultRefConfig {
+    pub name: Option<String>,
+    pub vault_ref: Option<String>,
 }
 
 /// `[execution_backend_profiles]`: preview execution profile registry.
@@ -1333,7 +1381,7 @@ mod tests {
 
     use super::{
         config_schema_entries, is_secret_config_path, known_config_env_vars,
-        redact_secret_config_values, RootFileConfig,
+        redact_secret_config_values, FileMcpCommandValue, RootFileConfig,
     };
 
     #[test]
@@ -1697,13 +1745,21 @@ mod tests {
             [api_facade]
             mode = "preview_only"
 
-            [mcp_servers]
+            [mcp]
             mode = "preview_only"
-            [[mcp_servers.servers]]
+            [[mcp.servers]]
             id = "filesystem"
             enabled = false
+            namespace = "filesystem"
             transport = "stdio"
-            command = ["mcp-filesystem", "--root", "."]
+            command = "mcp-filesystem"
+            args = ["--root", "."]
+            trust_level = "workspace"
+            approval_profile = "require_approval"
+            egress_policy = "deny_all"
+            [[mcp.servers.env_vault_refs]]
+            name = "FILESYSTEM_TOKEN"
+            vault_ref = "global/mcp-filesystem-token"
 
             [execution_backend_profiles]
             mode = "disabled"
@@ -1746,17 +1802,26 @@ mod tests {
             Some("preview_only")
         );
         let mcp_server = parsed
-            .mcp_servers
+            .mcp
             .as_ref()
             .and_then(|value| value.servers.as_ref())
             .and_then(|servers| servers.first())
             .expect("mcp server declaration should parse");
         assert_eq!(mcp_server.id.as_deref(), Some("filesystem"));
+        assert_eq!(mcp_server.namespace.as_deref(), Some("filesystem"));
         assert_eq!(mcp_server.transport.as_deref(), Some("stdio"));
+        assert!(matches!(
+            mcp_server.command.as_ref(),
+            Some(FileMcpCommandValue::Command(command)) if command == "mcp-filesystem"
+        ));
+        assert_eq!(mcp_server.args.as_ref().map(Vec::len), Some(2));
         assert_eq!(
-            mcp_server.command.as_ref().map(Vec::len),
-            Some(3),
-            "stdio command should be preserved as argv"
+            mcp_server
+                .env_vault_refs
+                .as_ref()
+                .and_then(|refs| refs.first())
+                .and_then(|env_ref| env_ref.name.as_deref()),
+            Some("FILESYSTEM_TOKEN")
         );
         assert_eq!(
             parsed.qa_lab.as_ref().and_then(|value| value.mode.as_deref()),
@@ -1825,7 +1890,7 @@ mod tests {
                     "category": "api_facade"
                 },
                 {
-                    "path": "mcp_servers.mode",
+                    "path": "mcp.mode",
                     "value_type": "enum(disabled|preview_only)",
                     "default_value": "disabled",
                     "env_vars": ["PALYRA_MCP_SERVERS_MODE"],
@@ -1835,12 +1900,32 @@ mod tests {
                     "category": "mcp_servers"
                 },
                 {
-                    "path": "mcp_servers.servers",
+                    "path": "mcp.servers",
                     "value_type": "array<table>",
                     "default_value": "[]",
                     "env_vars": [],
                     "secret": false,
                     "deprecated": false,
+                    "restart_required": true,
+                    "category": "mcp_servers"
+                },
+                {
+                    "path": "mcp_servers.mode",
+                    "value_type": "enum(disabled|preview_only)",
+                    "default_value": "disabled",
+                    "env_vars": ["PALYRA_MCP_SERVERS_MODE"],
+                    "secret": false,
+                    "deprecated": true,
+                    "restart_required": true,
+                    "category": "mcp_servers"
+                },
+                {
+                    "path": "mcp_servers.servers",
+                    "value_type": "array<table>",
+                    "default_value": "[]",
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": true,
                     "restart_required": true,
                     "category": "mcp_servers"
                 },

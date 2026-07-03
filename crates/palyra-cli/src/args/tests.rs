@@ -16,22 +16,24 @@ use super::{
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
     DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
-    JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
-    MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
-    ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
-    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
-    PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
-    PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg, ProfileModeArg,
-    ProfileRiskLevelArg, ProtocolCommand, QaCommand, RemoteVerificationModeArg,
-    RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
-    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
-    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
-    RoutinesCommand, RunCommand, RunControlActivePhaseArg, RunControlCommandArg,
-    RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
-    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
-    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, TasksCommand, TuiCommand, UninstallCommand, UpdateCommand,
-    WebhooksCommand, WizardOverridesArg, WorkboardCommand, WorkersCommand, WorkspaceRoleArg,
+    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpEgressPolicyArg,
+    McpRegistryMutateArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg, MemoryCommand,
+    MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand,
+    NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg,
+    ObjectiveUpsertCommandArgs, ObjectivesCommand, OnboardingAuthMethodArg, OnboardingCommand,
+    OnboardingFlowArg, PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg,
+    PatchBundleCommand, PatchCommand, PluginsCommand, PolicyCommand, ProfileCommand,
+    ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand, QaCommand,
+    RemoteVerificationModeArg, RequiredCommandIdArg, ResetCommand, ResetScopeArg,
+    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
+    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
+    RoutineUpsertCommand, RoutinesCommand, RunCommand, RunControlActivePhaseArg,
+    RunControlCommandArg, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
+    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
+    SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand, SupportBundleCommand,
+    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TasksCommand, TuiCommand,
+    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkboardCommand,
+    WorkersCommand, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -141,6 +143,61 @@ fn parse_qa_gate_with_reports_and_json() {
                 output_markdown: Some("artifacts/qa-lab/release.md".to_owned()),
                 allow_live: true,
                 json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_mcp_add_registry_server() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "mcp",
+        "add",
+        "docs",
+        "--transport",
+        "stdio",
+        "--command",
+        "mcp-docs",
+        "--arg=--root",
+        "--arg",
+        "docs",
+        "--namespace",
+        "docs",
+        "--env-vault-ref",
+        "DOCS_TOKEN=global/docs-token",
+        "--trust-level",
+        "workspace",
+        "--approval-profile",
+        "require-approval",
+        "--tool-allow",
+        "search",
+        "--enabled",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Add(McpRegistryMutateArgs {
+                    id: "docs".to_owned(),
+                    path: None,
+                    transport: McpTransportArg::Stdio,
+                    namespace: Some("docs".to_owned()),
+                    command: Some("mcp-docs".to_owned()),
+                    args: vec!["--root".to_owned(), "docs".to_owned()],
+                    url: None,
+                    env_vault_refs: vec!["DOCS_TOKEN=global/docs-token".to_owned()],
+                    trust_level: McpTrustLevelArg::Workspace,
+                    approval_profile: McpApprovalProfileArg::RequireApproval,
+                    egress_policy: McpEgressPolicyArg::DenyAll,
+                    egress_allowlist: Vec::new(),
+                    tool_allowlist: vec!["search".to_owned()],
+                    tool_denylist: Vec::new(),
+                    enabled: true,
+                    backups: 5,
+                    json: true,
+                })
             }
         }
     );
