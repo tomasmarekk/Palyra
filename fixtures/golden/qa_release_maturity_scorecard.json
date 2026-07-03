@@ -1,10 +1,8 @@
 {
-  "overall_score_bps": 8750,
+  "overall_score_bps": 10000,
   "baseline_score_bps": 0,
-  "trend_delta_bps": 8750,
-  "blockers": [
-    "mcp:coverage_missing"
-  ],
+  "trend_delta_bps": 10000,
+  "blockers": [],
   "categories": [
     {
       "id": "api",
@@ -24,17 +22,15 @@
       "id": "mcp",
       "label": "MCP",
       "required": false,
-      "score_bps": 0,
+      "score_bps": 10000,
       "baseline_score_bps": null,
       "trend_delta_bps": null,
-      "total": 0,
-      "passed": 0,
+      "total": 6,
+      "passed": 6,
       "failed": 0,
       "skipped": 0,
       "unsupported": 0,
-      "blockers": [
-        "coverage_missing"
-      ]
+      "blockers": []
     },
     {
       "id": "subagents",
@@ -85,8 +81,8 @@
       "score_bps": 10000,
       "baseline_score_bps": null,
       "trend_delta_bps": null,
-      "total": 2,
-      "passed": 2,
+      "total": 4,
+      "passed": 4,
       "failed": 0,
       "skipped": 0,
       "unsupported": 0,
@@ -113,8 +109,8 @@
       "score_bps": 10000,
       "baseline_score_bps": null,
       "trend_delta_bps": null,
-      "total": 2,
-      "passed": 2,
+      "total": 4,
+      "passed": 4,
       "failed": 0,
       "skipped": 0,
       "unsupported": 0,

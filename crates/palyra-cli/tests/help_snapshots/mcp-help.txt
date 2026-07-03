@@ -5,8 +5,14 @@ Usage: palyra mcp [OPTIONS] <COMMAND>
 Commands:
   serve    Run the stdio MCP server
   status   Show external MCP runtime supervisor status
+  doctor   Run external MCP runtime doctor checks
+  probe    Show external MCP runtime probe status
+  tools    Show external MCP tool catalog availability
+  reload   Reload external MCP runtime configuration
   list     List configured external MCP servers
   show     Show one configured external MCP server
+  login    Store an OAuth grant for one external MCP server
+  logout   Revoke an OAuth grant for one external MCP server
   add      Add one external MCP server to local config
   set      Update one external MCP server in local config
   enable   Enable one external MCP server

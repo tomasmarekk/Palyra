@@ -3664,6 +3664,9 @@ enabled = true
 
     #[test]
     fn openai_chatgpt_oauth_status_detection_checks_desktop_runtime_registry() {
+        let _env_guard =
+            crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
+        let _auth_profiles_path = ScopedAuthProfilesPath::unset();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
         let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
@@ -3870,6 +3873,32 @@ enabled = true
 
     struct ScopedVaultBackend {
         previous: Option<std::ffi::OsString>,
+    }
+
+    struct ScopedAuthProfilesPath {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedAuthProfilesPath {
+        fn unset() -> Self {
+            let previous = std::env::var_os("PALYRA_AUTH_PROFILES_PATH");
+            // SAFETY: this test holds the shared CLI test env lock while the override is active.
+            unsafe {
+                std::env::remove_var("PALYRA_AUTH_PROFILES_PATH");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedAuthProfilesPath {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: this test holds the shared CLI test env lock while the override is active.
+                unsafe {
+                    std::env::set_var("PALYRA_AUTH_PROFILES_PATH", previous);
+                }
+            }
+        }
     }
 
     impl ScopedVaultBackend {
