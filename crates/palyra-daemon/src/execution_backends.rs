@@ -11,10 +11,10 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::BTreeSet,
-    env,
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
     future::Future,
-    path::Path,
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
     time::Instant,
@@ -30,6 +30,10 @@ use palyra_common::{
     process_risk::{classify_process_run, ProcessRiskContext},
     process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
     redaction::{is_sensitive_key, redact_diagnostic_text},
+    workspace_patch::{
+        apply_workspace_patch, compute_patch_sha256, redact_patch_preview, WorkspacePatchLimits,
+        WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
+    },
 };
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
 use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
@@ -1553,6 +1557,8 @@ pub(crate) struct DockerPatchBundle {
     pub(crate) reviewed: bool,
     pub(crate) patch_sha256: String,
     pub(crate) file_count: usize,
+    pub(crate) files: Vec<String>,
+    pub(crate) redacted_preview: String,
 }
 
 /// Result returned by a Docker engine after running a container.
@@ -1588,29 +1594,21 @@ pub(crate) struct DockerCliEngine;
 impl DockerEngine for DockerCliEngine {
     fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
         Box::pin(async move {
-            if plan.mounts.iter().any(|mount| !mount.read_only) {
-                return Err(DockerEngineError {
-                    reason_code: "docker.writeback.capture_unavailable".to_owned(),
-                    message: format!(
-                        "Docker profile {} declares a writable workspace mount; patch-bundle capture is required before host writeback is allowed",
-                        plan.profile_id
-                    ),
-                });
-            }
             let started = Instant::now();
+            let (run_plan, writeback_capture) = prepare_docker_run_plan(&plan)?;
             let mut command = tokio::process::Command::new("docker");
             command.arg("run").arg("--rm");
-            if plan.readonly_rootfs {
+            if run_plan.readonly_rootfs {
                 command.arg("--read-only");
             }
-            command.arg("--user").arg(plan.user.as_str());
-            command.arg("--network").arg(docker_network_arg(plan.network));
-            command.arg("--workdir").arg(plan.working_dir.as_str());
-            command.arg("--memory").arg(format!("{}b", plan.limits.memory_limit_bytes));
-            for mount in &plan.mounts {
+            command.arg("--user").arg(run_plan.user.as_str());
+            command.arg("--network").arg(docker_network_arg(run_plan.network));
+            command.arg("--workdir").arg(run_plan.working_dir.as_str());
+            command.arg("--memory").arg(format!("{}b", run_plan.limits.memory_limit_bytes));
+            for mount in &run_plan.mounts {
                 command.arg("--mount").arg(docker_mount_arg(mount));
             }
-            for binding in &plan.env {
+            for binding in &run_plan.env {
                 match binding.source_kind {
                     ContainerEnvSourceKind::LiteralSafeValue => {
                         command.arg("--env").arg(format!("{}={}", binding.name, binding.value));
@@ -1620,22 +1618,26 @@ impl DockerEngine for DockerCliEngine {
                             reason_code: "docker.env.vault_resolution_unavailable".to_owned(),
                             message: format!(
                                 "Docker profile {} declares Vault env binding {}; vault resolution is not wired into DockerRunner yet",
-                                plan.profile_id, binding.name
+                                run_plan.profile_id, binding.name
                             ),
                         });
                     }
                 }
             }
-            command.arg(plan.image.as_str());
-            command.arg(plan.command.as_str());
-            command.args(plan.args.iter().map(String::as_str));
+            command.arg(run_plan.image.as_str());
+            command.arg(run_plan.command.as_str());
+            command.args(run_plan.args.iter().map(String::as_str));
             let output = command.output().await.map_err(|error| DockerEngineError {
                 reason_code: "docker.spawn_failed".to_owned(),
                 message: format!(
                     "failed to launch Docker CLI for profile {}: {error}",
-                    plan.profile_id
+                    run_plan.profile_id
                 ),
             })?;
+            let patch_bundle = match writeback_capture {
+                Some(capture) => capture.finish()?,
+                None => None,
+            };
             Ok(DockerRunReport {
                 exit_code: output.status.code().unwrap_or(1),
                 stdout: output.stdout,
@@ -1650,12 +1652,427 @@ impl DockerEngine for DockerCliEngine {
                     container_removed: true,
                     volume_removed: true,
                     success: true,
-                    reason_code: "docker.cleanup.run_rm".to_owned(),
+                    reason_code: "docker.cleanup.ok".to_owned(),
                 },
-                patch_bundle: None,
+                patch_bundle,
             })
         })
     }
+}
+
+#[derive(Debug)]
+struct DockerWorkspaceWritebackCapture {
+    original_root: PathBuf,
+    temp_workspace: PathBuf,
+    tempdir: tempfile::TempDir,
+}
+
+impl DockerWorkspaceWritebackCapture {
+    fn finish(self) -> Result<Option<DockerPatchBundle>, DockerEngineError> {
+        let patch_bundle =
+            docker_patch_bundle_from_workspace_diff(&self.original_root, &self.temp_workspace)?;
+        self.tempdir.close().map_err(|error| DockerEngineError {
+            reason_code: "docker.cleanup.volume_remove_failed".to_owned(),
+            message: format!("failed to remove Docker writeback temp workspace: {error}"),
+        })?;
+        Ok(patch_bundle)
+    }
+}
+
+fn prepare_docker_run_plan(
+    plan: &DockerRunPlan,
+) -> Result<(DockerRunPlan, Option<DockerWorkspaceWritebackCapture>), DockerEngineError> {
+    let mut run_plan = plan.clone();
+    let writable_mount_indexes = run_plan
+        .mounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mount)| (!mount.read_only).then_some(index))
+        .collect::<Vec<_>>();
+    if writable_mount_indexes.len() > 1 {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.multiple_mounts_unsupported".to_owned(),
+            message: format!(
+                "Docker profile {} declares multiple writable workspace mounts; patch-bundle capture supports exactly one",
+                plan.profile_id
+            ),
+        });
+    }
+
+    for (index, mount) in run_plan.mounts.iter_mut().enumerate() {
+        let canonical_host_path = canonical_docker_mount_host_path(mount.host_path.as_str())?;
+        if writable_mount_indexes.first().copied() == Some(index) {
+            let tempdir = tempfile::Builder::new()
+                .prefix("palyra-docker-writeback-")
+                .tempdir()
+                .map_err(|error| DockerEngineError {
+                    reason_code: "docker.writeback.temp_workspace_failed".to_owned(),
+                    message: format!("failed to create Docker writeback temp workspace: {error}"),
+                })?;
+            let temp_workspace = tempdir.path().join("workspace");
+            copy_workspace_tree(canonical_host_path.as_path(), temp_workspace.as_path())?;
+            mount.host_path = temp_workspace.display().to_string();
+            return Ok((
+                run_plan,
+                Some(DockerWorkspaceWritebackCapture {
+                    original_root: canonical_host_path,
+                    temp_workspace,
+                    tempdir,
+                }),
+            ));
+        }
+        mount.host_path = canonical_host_path.display().to_string();
+    }
+    Ok((run_plan, None))
+}
+
+fn canonical_docker_mount_host_path(raw: &str) -> Result<PathBuf, DockerEngineError> {
+    if raw.contains('\0') {
+        return Err(DockerEngineError {
+            reason_code: "docker.mount.path_invalid".to_owned(),
+            message: "Docker mount host path contains an embedded NUL byte".to_owned(),
+        });
+    }
+    let raw_path = Path::new(raw);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|error| DockerEngineError {
+                reason_code: "docker.mount.cwd_unavailable".to_owned(),
+                message: format!("failed to resolve current directory for Docker mount: {error}"),
+            })?
+            .join(raw_path)
+    };
+    let canonical = candidate.canonicalize().map_err(|error| DockerEngineError {
+        reason_code: "docker.mount.path_unavailable".to_owned(),
+        message: format!("Docker mount host path {} is unavailable: {error}", candidate.display()),
+    })?;
+    if !canonical.is_dir() {
+        return Err(DockerEngineError {
+            reason_code: "docker.mount.not_directory".to_owned(),
+            message: format!("Docker mount host path {} is not a directory", canonical.display()),
+        });
+    }
+    Ok(canonical)
+}
+
+fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<(), DockerEngineError> {
+    fs::create_dir_all(destination).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.copy_failed".to_owned(),
+        message: format!(
+            "failed to create Docker writeback workspace {}: {error}",
+            destination.display()
+        ),
+    })?;
+    let mut entries = fs::read_dir(source)
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.copy_failed".to_owned(),
+            message: format!("failed to read workspace {}: {error}", source.display()),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.copy_failed".to_owned(),
+            message: format!("failed to enumerate workspace {}: {error}", source.display()),
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata =
+            fs::symlink_metadata(source_path.as_path()).map_err(|error| DockerEngineError {
+                reason_code: "docker.writeback.copy_failed".to_owned(),
+                message: format!(
+                    "failed to inspect workspace path {}: {error}",
+                    source_path.display()
+                ),
+            })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(DockerEngineError {
+                reason_code: "docker.writeback.symlink_unsupported".to_owned(),
+                message: format!("Docker writeback refuses symlink path {}", source_path.display()),
+            });
+        }
+        if file_type.is_dir() {
+            copy_workspace_tree(source_path.as_path(), destination_path.as_path())?;
+        } else if file_type.is_file() {
+            fs::copy(source_path.as_path(), destination_path.as_path()).map_err(|error| {
+                DockerEngineError {
+                    reason_code: "docker.writeback.copy_failed".to_owned(),
+                    message: format!(
+                        "failed to copy workspace file {}: {error}",
+                        source_path.display()
+                    ),
+                }
+            })?;
+        } else {
+            return Err(DockerEngineError {
+                reason_code: "docker.writeback.special_file_unsupported".to_owned(),
+                message: format!(
+                    "Docker writeback refuses non-regular workspace path {}",
+                    source_path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerWorkspaceFileSnapshot {
+    bytes: Vec<u8>,
+}
+
+fn docker_patch_bundle_from_workspace_diff(
+    original_root: &Path,
+    mutated_root: &Path,
+) -> Result<Option<DockerPatchBundle>, DockerEngineError> {
+    let before = collect_workspace_file_snapshots(original_root, original_root)?;
+    let after = collect_workspace_file_snapshots(mutated_root, mutated_root)?;
+    let Some((patch_document, files)) = docker_patch_document_from_snapshots(&before, &after)?
+    else {
+        return Ok(None);
+    };
+    let limits = WorkspacePatchLimits::default();
+    let redaction_policy = WorkspacePatchRedactionPolicy::default();
+    let request = WorkspacePatchRequest {
+        patch: patch_document.clone(),
+        dry_run: true,
+        redaction_policy: redaction_policy.clone(),
+    };
+    apply_workspace_patch(&[original_root.to_path_buf()], &request, &limits).map_err(|error| {
+        DockerEngineError {
+            reason_code: "docker.writeback.patch_validation_failed".to_owned(),
+            message: format!("generated Docker writeback patch failed dry-run validation: {error}"),
+        }
+    })?;
+    Ok(Some(DockerPatchBundle {
+        schema_version: 1,
+        reviewed: true,
+        patch_sha256: compute_patch_sha256(patch_document.as_str()),
+        file_count: files.len(),
+        files,
+        redacted_preview: redact_patch_preview(
+            patch_document.as_str(),
+            &redaction_policy,
+            limits.max_preview_bytes,
+        ),
+    }))
+}
+
+fn collect_workspace_file_snapshots(
+    root: &Path,
+    current: &Path,
+) -> Result<BTreeMap<String, DockerWorkspaceFileSnapshot>, DockerEngineError> {
+    let mut snapshots = BTreeMap::new();
+    collect_workspace_file_snapshots_into(root, current, &mut snapshots)?;
+    Ok(snapshots)
+}
+
+fn collect_workspace_file_snapshots_into(
+    root: &Path,
+    current: &Path,
+    snapshots: &mut BTreeMap<String, DockerWorkspaceFileSnapshot>,
+) -> Result<(), DockerEngineError> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to read workspace {}: {error}", current.display()),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to enumerate workspace {}: {error}", current.display()),
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(path.as_path()).map_err(|error| DockerEngineError {
+            reason_code: "docker.writeback.diff_failed".to_owned(),
+            message: format!("failed to inspect workspace path {}: {error}", path.display()),
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(DockerEngineError {
+                reason_code: "docker.writeback.symlink_unsupported".to_owned(),
+                message: format!("Docker writeback refuses symlink path {}", path.display()),
+            });
+        }
+        if file_type.is_dir() {
+            collect_workspace_file_snapshots_into(root, path.as_path(), snapshots)?;
+        } else if file_type.is_file() {
+            let relative_path = workspace_relative_patch_path(root, path.as_path())?;
+            let bytes = fs::read(path.as_path()).map_err(|error| DockerEngineError {
+                reason_code: "docker.writeback.diff_failed".to_owned(),
+                message: format!("failed to read workspace file {}: {error}", path.display()),
+            })?;
+            snapshots.insert(relative_path, DockerWorkspaceFileSnapshot { bytes });
+        } else {
+            return Err(DockerEngineError {
+                reason_code: "docker.writeback.special_file_unsupported".to_owned(),
+                message: format!(
+                    "Docker writeback refuses non-regular workspace path {}",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn workspace_relative_patch_path(root: &Path, path: &Path) -> Result<String, DockerEngineError> {
+    let relative = path.strip_prefix(root).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.diff_failed".to_owned(),
+        message: format!(
+            "workspace path {} is outside root {}: {error}",
+            path.display(),
+            root.display()
+        ),
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(DockerEngineError {
+                        reason_code: "docker.writeback.non_utf8_path".to_owned(),
+                        message: format!("Docker writeback path {} is not UTF-8", path.display()),
+                    });
+                };
+                if part.is_empty() {
+                    return Err(DockerEngineError {
+                        reason_code: "docker.writeback.path_invalid".to_owned(),
+                        message: format!("Docker writeback path {} is empty", path.display()),
+                    });
+                }
+                parts.push(part.to_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(DockerEngineError {
+                    reason_code: "docker.writeback.path_invalid".to_owned(),
+                    message: format!(
+                        "Docker writeback path {} is not workspace-relative",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.path_invalid".to_owned(),
+            message: format!("Docker writeback path {} has no relative file name", path.display()),
+        });
+    }
+    Ok(parts.join("/"))
+}
+
+fn docker_patch_document_from_snapshots(
+    before: &BTreeMap<String, DockerWorkspaceFileSnapshot>,
+    after: &BTreeMap<String, DockerWorkspaceFileSnapshot>,
+) -> Result<Option<(String, Vec<String>)>, DockerEngineError> {
+    let mut paths = BTreeSet::new();
+    paths.extend(before.keys().cloned());
+    paths.extend(after.keys().cloned());
+
+    let mut changed_files = Vec::new();
+    let mut patch = String::from("*** Begin Patch\n");
+    for path in paths {
+        match (before.get(path.as_str()), after.get(path.as_str())) {
+            (None, Some(after_file)) => {
+                append_docker_full_file_patch(
+                    &mut patch,
+                    "*** Add File",
+                    path.as_str(),
+                    after_file,
+                )?;
+                changed_files.push(path);
+            }
+            (Some(_), None) => {
+                patch.push_str("*** Delete File: ");
+                patch.push_str(path.as_str());
+                patch.push('\n');
+                changed_files.push(path);
+            }
+            (Some(before_file), Some(after_file)) if before_file.bytes != after_file.bytes => {
+                append_docker_full_file_patch(
+                    &mut patch,
+                    "*** Replace File",
+                    path.as_str(),
+                    after_file,
+                )?;
+                changed_files.push(path);
+            }
+            _ => {}
+        }
+    }
+    if changed_files.is_empty() {
+        return Ok(None);
+    }
+    patch.push_str("*** End Patch\n");
+    Ok(Some((patch, changed_files)))
+}
+
+fn append_docker_full_file_patch(
+    patch: &mut String,
+    operation: &str,
+    path: &str,
+    file: &DockerWorkspaceFileSnapshot,
+) -> Result<(), DockerEngineError> {
+    let text = std::str::from_utf8(file.bytes.as_slice()).map_err(|error| DockerEngineError {
+        reason_code: "docker.writeback.binary_unsupported".to_owned(),
+        message: format!("Docker writeback file {path} is not UTF-8 text: {error}"),
+    })?;
+    if text.is_empty() || !text.ends_with('\n') {
+        return Err(DockerEngineError {
+            reason_code: "docker.writeback.patch_unsupported".to_owned(),
+            message: format!(
+                "Docker writeback file {path} cannot be represented as a full-file Palyra patch because it is empty or lacks a trailing newline"
+            ),
+        });
+    }
+    patch.push_str(operation);
+    patch.push_str(": ");
+    patch.push_str(path);
+    patch.push('\n');
+    let without_final_newline = text.strip_suffix('\n').unwrap_or(text);
+    for line in without_final_newline.split('\n') {
+        append_docker_full_file_patch_line(patch, line);
+    }
+    Ok(())
+}
+
+fn append_docker_full_file_patch_line(patch: &mut String, line: &str) {
+    if docker_patch_line_needs_body_prefix(line) {
+        patch.push('+');
+    }
+    patch.push_str(line);
+    patch.push('\n');
+}
+
+fn docker_patch_line_needs_body_prefix(line: &str) -> bool {
+    let control_line = line.trim_end_matches([' ', '\t']);
+    let trimmed = line.trim_start();
+    line.starts_with('+')
+        || control_line == "*** End Patch"
+        || control_line.starts_with("*** ")
+        || trimmed.starts_with("diff --git ")
+        || trimmed.starts_with("index ")
+        || docker_patch_line_is_unified_header(trimmed, "---")
+        || docker_patch_line_is_unified_header(trimmed, "+++")
+        || trimmed.starts_with("@@")
+        || trimmed.starts_with("<<<<<<<")
+        || trimmed.starts_with("=======")
+        || trimmed.starts_with(">>>>>>>")
+}
+
+fn docker_patch_line_is_unified_header(line: &str, prefix: &str) -> bool {
+    let Some(rest) = line.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.starts_with([' ', '\t']) && !rest.trim().is_empty()
 }
 
 /// Docker runner adapter. Profile validation happens before any engine call.
@@ -2919,6 +3336,7 @@ fn aggregate_node_capabilities(nodes: &[&RegisteredNodeRecord]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
@@ -2944,13 +3362,13 @@ mod tests {
     use super::{
         apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
-        parse_execution_backend_preference, plan_stuck_tool_job_recovery,
+        parse_execution_backend_preference, plan_stuck_tool_job_recovery, prepare_docker_run_plan,
         resolve_execution_backend, resolve_execution_backend_for_request,
         validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
-        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerCliEngine,
-        DockerEngine, DockerEngineError, DockerEngineFuture, DockerPatchBundle,
-        DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
+        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
+        DockerEngineError, DockerEngineFuture, DockerPatchBundle, DockerResourceUsage,
+        DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
@@ -3278,9 +3696,14 @@ mod tests {
         assert!(error.contains("at most one Docker profile"), "{error}");
     }
 
-    #[tokio::test]
-    async fn docker_cli_engine_rejects_writable_mount_without_patch_capture() {
-        let profile = safe_container_profile();
+    #[test]
+    fn docker_writeback_capture_returns_patch_bundle_without_host_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::write(workspace.join("notes.txt"), "alpha\n").expect("seed file should be written");
+        let mut profile = safe_container_profile();
+        profile.mounts[0].host_path = workspace.display().to_string();
         let plan = DockerRunPlan {
             profile_id: profile.profile_id,
             image: profile.image,
@@ -3299,12 +3722,30 @@ mod tests {
             cleanup_strategy: profile.cleanup_strategy,
         };
 
-        let error = DockerCliEngine
-            .run(plan)
-            .await
-            .expect_err("writable workspace mounts require patch capture before Docker CLI launch");
+        let (run_plan, capture) = prepare_docker_run_plan(&plan)
+            .expect("writable mount should be copied into a writeback capture workspace");
+        let capture = capture.expect("writable mount should create a writeback capture");
+        let temp_workspace = PathBuf::from(run_plan.mounts[0].host_path.as_str());
+        fs::write(temp_workspace.join("notes.txt"), "beta\n")
+            .expect("container workspace mutation should be simulated");
+        fs::write(temp_workspace.join("new.txt"), "created\n")
+            .expect("container workspace add should be simulated");
 
-        assert_eq!(error.reason_code, "docker.writeback.capture_unavailable");
+        let bundle = capture
+            .finish()
+            .expect("writeback capture should finish")
+            .expect("workspace mutation should produce a patch bundle");
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("notes.txt")).expect("host workspace should read"),
+            "alpha\n",
+            "host workspace must not be mutated by Docker writeback capture"
+        );
+        assert_eq!(bundle.file_count, 2);
+        assert!(bundle.files.iter().any(|path| path == "notes.txt"));
+        assert!(bundle.files.iter().any(|path| path == "new.txt"));
+        assert!(bundle.redacted_preview.contains("*** Replace File: notes.txt"));
+        assert!(bundle.redacted_preview.contains("*** Add File: new.txt"));
     }
 
     #[tokio::test]
@@ -3427,6 +3868,8 @@ mod tests {
             patch_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
                 .to_owned(),
             file_count: 2,
+            files: vec!["a.txt".to_owned(), "b.txt".to_owned()],
+            redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
         });
         let (engine, _) = FakeDockerEngine::new(Ok(report));
         let runner = DockerRunner::new(safe_container_profile(), engine)
