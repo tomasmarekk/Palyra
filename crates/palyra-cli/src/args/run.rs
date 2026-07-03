@@ -3,6 +3,52 @@
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunControlCommandArg {
+    Cancel,
+    Pause,
+    Redirect,
+    Resume,
+    Steer,
+    Yield,
+}
+
+impl RunControlCommandArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Pause => "pause",
+            Self::Redirect => "redirect",
+            Self::Resume => "resume",
+            Self::Steer => "steer",
+            Self::Yield => "yield",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RunControlActivePhaseArg {
+    ProviderStream,
+    ToolExecution,
+    ApprovalPending,
+    Queue,
+    BackgroundTask,
+    Idle,
+}
+
+impl RunControlActivePhaseArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderStream => "provider_stream",
+            Self::ToolExecution => "tool_execution",
+            Self::ApprovalPending => "approval_pending",
+            Self::Queue => "queue",
+            Self::BackgroundTask => "background_task",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RunExportFormatArg {
     PalyraAttested,
     Sharegpt,
@@ -28,6 +74,26 @@ pub enum RunCommand {
         timeout_ms: u64,
         #[arg(long, default_value_t = false)]
         return_on_waiting: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(about = "Apply a unified control command to a daemon run")]
+    Control {
+        run_id: String,
+        #[arg(long, value_enum)]
+        command: RunControlCommandArg,
+        #[arg(long, value_enum)]
+        active_phase: Option<RunControlActivePhaseArg>,
+        #[arg(long)]
+        instruction: Option<String>,
+        #[arg(long)]
+        queued_input_id: Option<String>,
+        #[arg(long)]
+        priority_lane: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

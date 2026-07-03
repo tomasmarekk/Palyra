@@ -397,11 +397,24 @@ fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> R
         .context("failed to build HTTP client")?;
     let status_url = format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}");
     let cancel_url = format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}/cancel");
+    let control_url = format!("http://127.0.0.1:{admin_port}/admin/v1/runs/{RUN_ID}/control");
 
     let missing_auth =
         client.get(&status_url).send().context("failed to call admin run status without auth")?;
     assert_eq!(missing_auth.status().as_u16(), 401, "missing auth must be rejected");
     assert_admin_console_security_headers(missing_auth.headers())?;
+
+    let missing_control_auth = client
+        .post(&control_url)
+        .json(&serde_json::json!({"command": "yield", "dry_run": true}))
+        .send()
+        .context("failed to call admin run control without auth")?;
+    assert_eq!(
+        missing_control_auth.status().as_u16(),
+        401,
+        "missing auth must be rejected before run control lookup"
+    );
+    assert_admin_console_security_headers(missing_control_auth.headers())?;
 
     let unknown_run = client
         .get(&status_url)
@@ -420,6 +433,20 @@ fn admin_run_endpoints_require_token_and_report_not_found_for_unknown_run() -> R
         .send()
         .context("failed to call admin run cancel with auth")?;
     assert_eq!(unknown_cancel.status().as_u16(), 404, "unknown run cancel should return not found");
+
+    let unknown_control = client
+        .post(&control_url)
+        .header("Authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .header("x-palyra-principal", "user:ops")
+        .header("x-palyra-device-id", DEVICE_ID)
+        .json(&serde_json::json!({"command": "yield", "dry_run": true}))
+        .send()
+        .context("failed to call admin run control with auth")?;
+    assert_eq!(
+        unknown_control.status().as_u16(),
+        404,
+        "unknown run control should return not found after auth"
+    );
     Ok(())
 }
 

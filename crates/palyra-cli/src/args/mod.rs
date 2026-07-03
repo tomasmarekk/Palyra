@@ -137,7 +137,7 @@ pub use routines::{
     RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
     RoutineUpsertCommand, RoutinesCommand,
 };
-pub use run::{RunCommand, RunExportFormatArg};
+pub use run::{RunCommand, RunControlActivePhaseArg, RunControlCommandArg, RunExportFormatArg};
 pub use sandbox::{SandboxCommand, SandboxRuntimeArg};
 pub use secrets::{SecretsCommand, SecretsConfigureCommand};
 pub use security::SecurityCommand;

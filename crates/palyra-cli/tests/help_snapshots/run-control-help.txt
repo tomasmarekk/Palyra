@@ -1,15 +1,29 @@
-Wait for runs and export trajectories for audit and evals
+Apply a unified control command to a daemon run
 
-Usage: palyra run [OPTIONS] <COMMAND>
+Usage: palyra run control [OPTIONS] --command <COMMAND> <RUN_ID>
 
-Commands:
-  wait     Wait for a daemon run to finish
-  control  Apply a unified control command to a daemon run
-  export   Export a redacted run trajectory
-  replay   Replay a trajectory JSONL offline
+Arguments:
+  <RUN_ID>
 
 Options:
-  -h, --help  Print help
+      --command <COMMAND>
+          [possible values: cancel, pause, redirect, resume, steer, yield]
+      --active-phase <ACTIVE_PHASE>
+          [possible values: provider-stream, tool-execution, approval-pending, queue, background-task, idle]
+      --instruction <INSTRUCTION>
+
+      --queued-input-id <QUEUED_INPUT_ID>
+
+      --priority-lane <PRIORITY_LANE>
+
+      --reason <REASON>
+
+      --dry-run
+
+      --json
+
+  -h, --help
+          Print help
 
 Global Options:
       --profile <PROFILE>

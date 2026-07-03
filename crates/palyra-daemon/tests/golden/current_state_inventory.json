@@ -1990,6 +1990,20 @@
       },
       {
         "surface": "admin",
+        "route": "/admin/v1/runs/{run_id}/control",
+        "http_method": "POST",
+        "method_name": "admin.post.admin.v1.runs.by_run_id.control",
+        "stability": "stable",
+        "required_scope": "admin.write",
+        "request_schema_id": "admin.post.admin.v1.runs.by_run_id.control.request.method-registry.v1",
+        "request_schema_hash": "f7b78cd9cfe193280f795b1e65ae089b5a35d04d2852c21bd728c29ee2007e62",
+        "response_schema_id": "admin.post.admin.v1.runs.by_run_id.control.response.method-registry.v1",
+        "response_schema_hash": "5e203e352d64d5453f316c882db2759a9aff87916b003f203d176491f5da573a",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "admin",
         "route": "/admin/v1/runs/{run_id}/tape",
         "http_method": "GET",
         "method_name": "admin.get.admin.v1.runs.by_run_id.tape",
@@ -9051,7 +9065,7 @@
       "diagnostics_sections": 45,
       "execution_backends": 5,
       "feature_rollout_flags": 26,
-      "method_registry_methods": 491,
+      "method_registry_methods": 492,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -9077,7 +9091,7 @@
       "schema_version": 1,
       "registry_version": "method-registry.v1",
       "surface_counts": {
-        "admin": 51,
+        "admin": 52,
         "canvas": 5,
         "compat": 16,
         "console": 416,

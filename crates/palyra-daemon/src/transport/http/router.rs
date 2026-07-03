@@ -40,6 +40,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/admin/v1/runs/{run_id}", get(admin::core::admin_run_status_handler))
         .route("/admin/v1/runs/{run_id}/wait", post(admin::core::admin_run_wait_handler))
         .route("/admin/v1/runs/{run_id}/tape", get(admin::core::admin_run_tape_handler))
+        .route("/admin/v1/runs/{run_id}/control", post(admin::core::admin_run_control_handler))
         .route("/admin/v1/runs/{run_id}/cancel", post(admin::core::admin_run_cancel_handler))
         .route("/admin/v1/channels", get(admin::channels::admin_channels_list_handler))
         .route(

@@ -861,6 +861,26 @@ path = "run wait"
 file = "run-wait-help.txt"
 
 [[entries]]
+path = "run control"
+category = "nested_surface"
+status = "done"
+summary = "Apply a unified control command to a daemon run through the local admin surface."
+required_flags = [
+  "command",
+  "active-phase",
+  "instruction",
+  "queued-input-id",
+  "priority-lane",
+  "reason",
+  "dry-run",
+  "json",
+]
+
+[entries.snapshot]
+path = "run control"
+file = "run-control-help.txt"
+
+[[entries]]
 path = "run export"
 category = "nested_surface"
 status = "done"

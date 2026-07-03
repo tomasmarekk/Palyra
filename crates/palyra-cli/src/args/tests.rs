@@ -26,12 +26,12 @@ use super::{
     RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
     RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
     RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
-    RoutinesCommand, RunCommand, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg,
-    SecretsCommand, SecretsConfigureCommand, SecurityCommand, SessionsCommand,
-    SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand,
-    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg, TuiCommand,
-    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkersCommand,
-    WorkspaceRoleArg,
+    RoutinesCommand, RunCommand, RunControlActivePhaseArg, RunControlCommandArg,
+    RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
+    WizardOverridesArg, WorkersCommand, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -476,6 +476,42 @@ fn parse_run_wait_with_timeout_and_json() {
                 run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
                 timeout_ms: 1500,
                 return_on_waiting: true,
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_run_control_redirect_command() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "run",
+        "control",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB3",
+        "--command",
+        "redirect",
+        "--active-phase",
+        "approval-pending",
+        "--instruction",
+        "prefer the new operator constraint",
+        "--reason",
+        "operator_redirect",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Run {
+            command: RunCommand::Control {
+                run_id: "01ARZ3NDEKTSV4RRFFQ69G5FB3".to_owned(),
+                command: RunControlCommandArg::Redirect,
+                active_phase: Some(RunControlActivePhaseArg::ApprovalPending),
+                instruction: Some("prefer the new operator constraint".to_owned()),
+                queued_input_id: None,
+                priority_lane: None,
+                reason: Some("operator_redirect".to_owned()),
+                dry_run: true,
                 json: true,
             }
         }

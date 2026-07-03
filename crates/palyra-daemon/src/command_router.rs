@@ -251,10 +251,12 @@ async fn run_abort(
         .apply_turn_control(TurnControlRequest {
             operation: TurnControlOperation::CancelRun,
             actor_principal: context.request_context.principal.clone(),
+            active_phase: None,
             session_id: Some(run.session_id.clone()),
             run_id: Some(run.run_id.clone()),
             queued_input_id: None,
             priority_lane: None,
+            instruction: None,
             reason: Some(reason),
             dry_run: false,
         })

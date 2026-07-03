@@ -25,6 +25,27 @@ pub(crate) fn run_run(command: RunCommand) -> Result<()> {
         RunCommand::Wait { run_id, timeout_ms, return_on_waiting, json } => {
             run_wait(run_id, timeout_ms, return_on_waiting, json)
         }
+        RunCommand::Control {
+            run_id,
+            command,
+            active_phase,
+            instruction,
+            queued_input_id,
+            priority_lane,
+            reason,
+            dry_run,
+            json,
+        } => run_control(
+            run_id,
+            command,
+            active_phase,
+            instruction,
+            queued_input_id,
+            priority_lane,
+            reason,
+            dry_run,
+            json,
+        ),
         RunCommand::Export {
             run_id,
             output,
@@ -89,6 +110,86 @@ fn run_wait(
             response.get("timed_out").and_then(Value::as_bool).unwrap_or(false),
             response.get("timeout_ms").and_then(Value::as_u64).unwrap_or(timeout_ms),
             session_id
+        );
+        std::io::stdout().flush().context("stdout flush failed")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_control(
+    run_id: String,
+    command: RunControlCommandArg,
+    active_phase: Option<RunControlActivePhaseArg>,
+    instruction: Option<String>,
+    queued_input_id: Option<String>,
+    priority_lane: Option<String>,
+    reason: Option<String>,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    validate_canonical_id(run_id.as_str())
+        .context("run_id must be a canonical ULID for run control")?;
+    if command == RunControlCommandArg::Redirect
+        && instruction.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none()
+    {
+        anyhow::bail!("run control --command redirect requires --instruction");
+    }
+    if command == RunControlCommandArg::Steer {
+        if queued_input_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
+            anyhow::bail!("run control --command steer requires --queued-input-id");
+        }
+        if priority_lane.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none() {
+            anyhow::bail!("run control --command steer requires --priority-lane");
+        }
+    }
+    let connection = run_root_context()?.resolve_http_connection(
+        app::ConnectionOverrides::default(),
+        app::ConnectionDefaults::ADMIN,
+    )?;
+    let endpoint = format!(
+        "{}/admin/v1/runs/{}/control",
+        connection.base_url.trim_end_matches('/'),
+        percent_encode_component(run_id.as_str())
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build run control HTTP client")?;
+    let response: Value = apply_run_http_connection_headers(client.post(endpoint), &connection)
+        .json(&json!({
+            "command": command.as_str(),
+            "active_phase": active_phase.map(RunControlActivePhaseArg::as_str),
+            "instruction": instruction,
+            "queued_input_id": queued_input_id,
+            "priority_lane": priority_lane,
+            "reason": reason,
+            "dry_run": dry_run,
+        }))
+        .send()
+        .context("failed to call daemon run control endpoint")?
+        .error_for_status()
+        .context("daemon run control endpoint returned non-success status")?
+        .json()
+        .context("failed to parse daemon run control payload")?;
+    if output::preferred_json(json_output) {
+        output::print_json_pretty(&response, "failed to encode run control output as JSON")?;
+    } else {
+        let accepted =
+            response.pointer("/turn_control/accepted").and_then(Value::as_bool).unwrap_or(false);
+        let action =
+            response.pointer("/turn_control/action").and_then(Value::as_str).unwrap_or("unknown");
+        let reason_code = response
+            .pointer("/turn_control/reason_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        println!(
+            "run.control run_id={} command={} accepted={} action={} reason_code={}",
+            response.get("run_id").and_then(Value::as_str).unwrap_or(run_id.as_str()),
+            command.as_str(),
+            accepted,
+            action,
+            reason_code
         );
         std::io::stdout().flush().context("stdout flush failed")?;
     }

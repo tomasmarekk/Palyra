@@ -1784,14 +1784,25 @@ async fn collect_console_turn_control_diagnostics(
         "operations": [
             crate::application::turn_control::TurnControlOperation::Status.as_str(),
             crate::application::turn_control::TurnControlOperation::CancelRun.as_str(),
+            crate::application::turn_control::TurnControlOperation::RedirectRun.as_str(),
             crate::application::turn_control::TurnControlOperation::PauseQueue.as_str(),
             crate::application::turn_control::TurnControlOperation::ResumeQueue.as_str(),
             crate::application::turn_control::TurnControlOperation::PrioritizeQueuedInput.as_str(),
+            crate::application::turn_control::TurnControlOperation::YieldRun.as_str(),
+        ],
+        "commands": [
+            crate::application::turn_control::ControlCommand::Cancel.as_str(),
+            crate::application::turn_control::ControlCommand::Pause.as_str(),
+            crate::application::turn_control::ControlCommand::Redirect.as_str(),
+            crate::application::turn_control::ControlCommand::Resume.as_str(),
+            crate::application::turn_control::ControlCommand::Steer.as_str(),
+            crate::application::turn_control::ControlCommand::Yield.as_str(),
         ],
         "audit_event_types": {
-            "started": crate::application::turn_control::TURN_CONTROL_EVENT_STARTED,
-            "completed": crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
-            "failed": crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
+            "legacy_started": crate::application::turn_control::TURN_CONTROL_EVENT_STARTED,
+            "legacy_completed": crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
+            "legacy_failed": crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
+            "command_pattern": "turn_control.{command}.{started|completed|failed}",
         },
         "queue_steering": {
             "schema_version": crate::application::session_queue::QUEUE_STEERING_SCHEMA_VERSION,

@@ -710,6 +710,78 @@ async fn resolve_admin_diagnostics_run_id(
     })
 }
 
+/// Applies a unified run control command through the admin API.
+///
+/// # Errors
+/// Returns an error response when admin authorization, context extraction,
+/// run-id validation, run lookup, or the selected control effect fails.
+/// Authorization is completed before any runtime mutation is attempted.
+pub(crate) async fn admin_run_control_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(payload): Json<RunControlRequest>,
+) -> Result<Json<Value>, Response> {
+    authorize_headers(&headers, &state.auth).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    let context = request_context_from_headers(&headers).map_err(|error| {
+        state.runtime.record_denied();
+        auth_error_response(error)
+    })?;
+    validate_canonical_id(run_id.as_str()).map_err(|_| {
+        runtime_status_response(tonic::Status::invalid_argument("run_id must be a canonical ULID"))
+    })?;
+    state.runtime.record_admin_status_request();
+    let snapshot = state
+        .runtime
+        .orchestrator_run_status_snapshot(run_id.clone())
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| {
+            runtime_status_response(tonic::Status::not_found(format!(
+                "orchestrator run not found: {run_id}"
+            )))
+        })?;
+    let requested_session_id = payload.session_id.and_then(trim_to_option);
+    if let Some(session_id) = requested_session_id.as_deref() {
+        if session_id != snapshot.session_id {
+            return Err(runtime_status_response(tonic::Status::invalid_argument(format!(
+                "session_id {session_id} does not match run {run_id} session {}",
+                snapshot.session_id
+            ))));
+        }
+    }
+    let command = payload.command;
+    let outcome = state
+        .runtime
+        .apply_turn_control(crate::application::turn_control::TurnControlRequest {
+            operation: command.operation(),
+            actor_principal: context.principal,
+            active_phase: payload.active_phase,
+            session_id: requested_session_id.or_else(|| Some(snapshot.session_id.clone())),
+            run_id: Some(snapshot.run_id.clone()),
+            queued_input_id: payload.queued_input_id.and_then(trim_to_option),
+            priority_lane: payload.priority_lane.and_then(trim_to_option),
+            instruction: payload.instruction.and_then(trim_to_option),
+            reason: payload
+                .reason
+                .and_then(trim_to_option)
+                .or_else(|| Some(format!("admin_run_control:{}", command.as_str()))),
+            dry_run: payload.dry_run.unwrap_or(false),
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "run_id": snapshot.run_id,
+        "object": "run.control",
+        "command": command.as_str(),
+        "turn_control": outcome.decision,
+        "effect": outcome.effect,
+    })))
+}
+
 /// Requests cancellation of an orchestrator run from the admin API.
 ///
 /// # Errors

@@ -417,6 +417,18 @@ struct RunWaitRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RunControlRequest {
+    command: crate::application::turn_control::ControlCommand,
+    active_phase: Option<crate::application::turn_control::ControlActivePhase>,
+    session_id: Option<String>,
+    queued_input_id: Option<String>,
+    priority_lane: Option<String>,
+    instruction: Option<String>,
+    reason: Option<String>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SkillStatusRequest {
     version: String,
     reason: Option<String>,

@@ -38,12 +38,13 @@ use crate::application::{
     },
     progress_draft::project_progress_draft_tape_event,
     session_queue::{
-        decide_queue_steering, QueueSteeringAction, QueueSteeringDecision, QueueSteeringRequest,
+        decide_queue_steering, decide_session_queue_mode, pending_queue_depth, QueueSteeringAction,
+        QueueSteeringDecision, QueueSteeringRequest, SessionQueuePolicy, SessionQueueSafeBoundary,
         QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED, QUEUE_STEERING_EVENT_STARTED,
     },
     turn_control::{
-        decide_turn_control_request, TurnControlAction, TurnControlApplyOutcome,
-        TurnControlDecision, TurnControlOperation, TurnControlRequest,
+        decide_turn_control_request, ControlActivePhase, TurnControlAction,
+        TurnControlApplyOutcome, TurnControlDecision, TurnControlOperation, TurnControlRequest,
     },
 };
 use crate::journal::state_health::{
@@ -123,11 +124,12 @@ use crate::usage_governance::SmartRoutingRuntimeConfig;
 use palyra_auth::{AuthHealthReport, AuthProfileFailureKind};
 use palyra_common::replay_bundle::ReplayBundle;
 use palyra_common::runtime_contracts::{
-    ArtifactReadResponse, IdempotencyReplayDecision, RunLifecyclePhase, StableErrorEnvelope,
-    ToolResultArtifactRef,
+    ArtifactReadResponse, IdempotencyReplayDecision, QueueDecision, QueueMode, QueuedInputState,
+    RunLifecyclePhase, StableErrorEnvelope, ToolResultArtifactRef,
 };
 use palyra_common::runtime_preview::{
-    RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionPayload,
+    RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
+    RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
 };
 use palyra_workerd::{
     WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
@@ -149,6 +151,55 @@ fn sign_canvas_hmac_sha256(secret: &[u8], domain: &str, parts: &[&[u8]]) -> Stri
         context.update(part);
     }
     URL_SAFE_NO_PAD.encode(context.sign().as_ref())
+}
+
+fn session_queue_boundary_for_control(
+    active_phase: ControlActivePhase,
+) -> SessionQueueSafeBoundary {
+    match active_phase {
+        ControlActivePhase::ProviderStream => SessionQueueSafeBoundary {
+            active_run_stream: true,
+            pending_approval: false,
+            sensitive_tool_execution: false,
+            before_model_round: true,
+            after_model_round: false,
+            after_tool_result: false,
+            after_approval_wait: false,
+            after_child_merge: false,
+        },
+        ControlActivePhase::ToolExecution => SessionQueueSafeBoundary {
+            active_run_stream: true,
+            pending_approval: false,
+            sensitive_tool_execution: true,
+            before_model_round: false,
+            after_model_round: false,
+            after_tool_result: false,
+            after_approval_wait: false,
+            after_child_merge: false,
+        },
+        ControlActivePhase::ApprovalPending => SessionQueueSafeBoundary {
+            active_run_stream: true,
+            pending_approval: true,
+            sensitive_tool_execution: false,
+            before_model_round: false,
+            after_model_round: false,
+            after_tool_result: false,
+            after_approval_wait: true,
+            after_child_merge: false,
+        },
+        ControlActivePhase::Queue
+        | ControlActivePhase::BackgroundTask
+        | ControlActivePhase::Idle => SessionQueueSafeBoundary {
+            active_run_stream: false,
+            pending_approval: false,
+            sensitive_tool_execution: false,
+            before_model_round: false,
+            after_model_round: false,
+            after_tool_result: false,
+            after_approval_wait: false,
+            after_child_merge: false,
+        },
+    }
 }
 
 /// Immutable copy of the daemon configuration the gateway runtime was started with.
@@ -5674,7 +5725,7 @@ impl GatewayRuntimeState {
             self.record_turn_control_decision_event(
                 &request,
                 &decision,
-                crate::application::turn_control::TURN_CONTROL_EVENT_FAILED,
+                decision.journal_projection.terminal_event_type.as_str(),
                 "failed",
             )
             .await?;
@@ -5684,7 +5735,7 @@ impl GatewayRuntimeState {
         self.record_turn_control_decision_event(
             &request,
             &decision,
-            crate::application::turn_control::TURN_CONTROL_EVENT_STARTED,
+            decision.journal_projection.started_event_type.as_str(),
             "started",
         )
         .await?;
@@ -5696,7 +5747,7 @@ impl GatewayRuntimeState {
         self.record_turn_control_decision_event(
             &request,
             &decision,
-            crate::application::turn_control::TURN_CONTROL_EVENT_COMPLETED,
+            decision.journal_projection.terminal_event_type.as_str(),
             "completed",
         )
         .await?;
@@ -5729,6 +5780,9 @@ impl GatewayRuntimeState {
                         "failed to serialize turn control cancel effect: {error}"
                     ))
                 })
+            }
+            TurnControlAction::EnqueueRedirect => {
+                self.turn_control_redirect_effect(request, decision).await
             }
             TurnControlAction::SetQueuePaused => {
                 let session_id = decision.target_id.as_deref().ok_or_else(|| {
@@ -5802,8 +5856,164 @@ impl GatewayRuntimeState {
                     "prioritized": true,
                 }))
             }
+            TurnControlAction::Yield => Ok(json!({
+                "yielded": true,
+                "active_phase": decision.active_phase.as_str(),
+                "target_kind": decision.target_kind.as_str(),
+                "target_id": decision.target_id.as_deref(),
+            })),
             TurnControlAction::Reject => Ok(json!({"accepted": false})),
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn turn_control_redirect_effect(
+        self: &Arc<Self>,
+        request: &TurnControlRequest,
+        decision: &TurnControlDecision,
+    ) -> Result<Value, Status> {
+        let run_id = decision.target_id.as_deref().ok_or_else(|| {
+            Status::invalid_argument("turn control redirect decision missing run id")
+        })?;
+        let instruction = request
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::invalid_argument("turn control redirect missing instruction"))?;
+        let snapshot = self
+            .orchestrator_run_status_snapshot(run_id.to_owned())
+            .await?
+            .ok_or_else(|| Status::not_found(format!("orchestrator run not found: {run_id}")))?;
+        let session_id = if let Some(request_session_id) =
+            request.session_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        {
+            if request_session_id != snapshot.session_id {
+                return Err(Status::invalid_argument(format!(
+                    "turn control redirect session_id {} does not match run {} session {}",
+                    request_session_id, run_id, snapshot.session_id
+                )));
+            }
+            request_session_id.to_owned()
+        } else {
+            snapshot.session_id.clone()
+        };
+        let queued_inputs = self.list_orchestrator_queued_inputs(session_id.clone()).await?;
+        let policy = SessionQueuePolicy::from_config(
+            &self.config.session_queue_policy,
+            &session_id,
+            None,
+            None,
+        );
+        let current_depth =
+            pending_queue_depth(queued_inputs.as_slice(), Some(policy.coalescing_group.as_str()));
+        let safe_boundary = session_queue_boundary_for_control(decision.active_phase);
+        let queue_decision = decide_session_queue_mode(
+            policy,
+            Some(QueueMode::Interrupt),
+            safe_boundary,
+            current_depth,
+        );
+        let queued_input_id = Ulid::new().to_string();
+        let queued_state = if queue_decision.accepted {
+            QueuedInputState::Pending
+        } else {
+            QueuedInputState::Overflowed
+        };
+        let queued = self
+            .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
+                queued_input_id: queued_input_id.clone(),
+                run_id: run_id.to_owned(),
+                session_id: session_id.clone(),
+                state: queued_state.as_str().to_owned(),
+                text: instruction.to_owned(),
+                origin_run_id: Some(run_id.to_owned()),
+                queue_mode: queue_decision.mode.as_str().to_owned(),
+                priority_lane: queue_decision.policy.priority_lane.clone(),
+                coalescing_group: Some(queue_decision.policy.coalescing_group.clone()),
+                overflow_summary_ref: None,
+                safe_boundary_flags_json: serde_json::to_string(&queue_decision.safe_boundary)
+                    .unwrap_or_else(|_| "{}".to_owned()),
+                decision_reason: decision.reason_code.clone(),
+                accepted_at_unix_ms: queue_decision
+                    .accepted
+                    .then_some(crate::gateway::current_unix_ms()),
+                policy_snapshot_json: queue_decision.policy.snapshot_json().to_string(),
+                explain_json: queue_decision.explain_json().to_string(),
+            })
+            .await?;
+        let queue_event_type = match queue_decision.decision {
+            QueueDecision::Interrupt => RuntimeDecisionEventType::QueueInterrupt,
+            QueueDecision::Steer | QueueDecision::SteerBacklog => {
+                RuntimeDecisionEventType::QueueSteer
+            }
+            QueueDecision::Merge => RuntimeDecisionEventType::QueueMerge,
+            QueueDecision::Overflow => RuntimeDecisionEventType::QueueOverflow,
+            QueueDecision::Enqueue | QueueDecision::Defer => RuntimeDecisionEventType::QueueEnqueue,
+        };
+        let runtime_decision = RuntimeDecisionPayload::new(
+            queue_event_type,
+            RuntimeDecisionActor::new(
+                RuntimeDecisionActorKind::Operator,
+                decision.actor_principal.clone(),
+                "control-plane",
+                None,
+            ),
+            decision.reason_code.clone(),
+            queue_decision.policy.policy_id.clone(),
+            RuntimeDecisionTiming::observed(crate::gateway::current_unix_ms()),
+        )
+        .with_input(
+            RuntimeEntityRef::new("queued_input", "queued_input", queued.queued_input_id.clone())
+                .with_state(queued.state.as_str()),
+        )
+        .with_output(RuntimeEntityRef::new("run", "run", run_id.to_owned()).with_state("active"))
+        .with_resource_budget(RuntimeResourceBudget {
+            queue_depth: Some(
+                current_depth.saturating_add(usize::from(queue_decision.accepted)) as u64
+            ),
+            token_budget: None,
+            pruning_token_delta: None,
+            retrieval_branch_latency_ms: None,
+            retry_count: None,
+            suppression_count: None,
+        })
+        .with_related_entity(RuntimeEntityRef::new("session", "session", session_id.clone()))
+        .with_details(json!({
+            "control_command": decision.command.as_str(),
+            "active_phase": decision.active_phase.as_str(),
+            "safety_boundary": &decision.safety_boundary,
+            "queue_decision": queue_decision.decision.as_str(),
+            "queue_mode": queue_decision.mode.as_str(),
+            "redirect_preserves_existing_state": true,
+        }));
+        self.record_system_runtime_decision_event(
+            decision.actor_principal.as_str(),
+            "control-plane",
+            None,
+            Some(session_id.as_str()),
+            Some(run_id),
+            runtime_decision.clone(),
+        )
+        .await?;
+        let mut tape_seq = snapshot.tape_events as i64;
+        crate::application::run_stream::tape::append_runtime_decision_tape_event(
+            self,
+            run_id,
+            &mut tape_seq,
+            &runtime_decision,
+        )
+        .await?;
+        Ok(json!({
+            "redirect_queued": queue_decision.accepted,
+            "queued_input": queued,
+            "decision": queue_decision.explain_json(),
+            "preserved_state": {
+                "artifacts": "append_only",
+                "checkpoints": "unchanged",
+                "partial_evidence": "unchanged",
+            },
+        }))
     }
 
     #[allow(clippy::result_large_err)]

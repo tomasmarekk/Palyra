@@ -123,10 +123,11 @@ use cli::{
     JournalCheckpointModeArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
     MemorySourceArg, ModelsCommand, OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg,
     PatchBundleCommand, PatchCommand, PluginsCommand, PolicyCommand, ProtocolCommand, QaCommand,
-    RemoteVerificationModeArg, RunCommand, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg,
-    SecretsCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand,
-    SkillsPackageCommand, StateCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
+    RemoteVerificationModeArg, RunCommand, RunControlActivePhaseArg, RunControlCommandArg,
+    RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecurityCommand,
+    SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand, StateCommand,
+    SupportBundleCommand, SystemCommand, SystemEventCommand, SystemEventSeverityArg,
+    WebhooksCommand, WizardOverridesArg, WorkspaceRoleArg,
 };
 use cli::{PairingClientKindArg, PairingCommand, PairingMethodArg};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};

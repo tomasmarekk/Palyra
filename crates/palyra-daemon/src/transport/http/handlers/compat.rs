@@ -1131,10 +1131,12 @@ pub(crate) async fn compat_run_stop_handler(
         .apply_turn_control(crate::application::turn_control::TurnControlRequest {
             operation: crate::application::turn_control::TurnControlOperation::CancelRun,
             actor_principal: owner_principal.clone(),
+            active_phase: None,
             session_id: Some(snapshot.session_id.clone()),
             run_id: Some(snapshot.run_id.clone()),
             queued_input_id: None,
             priority_lane: None,
+            instruction: None,
             reason: Some(reason.clone()),
             dry_run: false,
         })
@@ -3934,10 +3936,12 @@ async fn handle_compat_chat_stream_disconnect(state: &AppState, context: &Compat
             .apply_turn_control(crate::application::turn_control::TurnControlRequest {
                 operation: crate::application::turn_control::TurnControlOperation::CancelRun,
                 actor_principal: context.principal.clone(),
+                active_phase: None,
                 session_id: Some(context.session_id.clone()),
                 run_id: Some(context.run_id.clone()),
                 queued_input_id: None,
                 priority_lane: None,
+                instruction: None,
                 reason: Some("compat_chat_stream_client_disconnect".to_owned()),
                 dry_run: false,
             })
