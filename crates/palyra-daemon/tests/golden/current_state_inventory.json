@@ -783,6 +783,9 @@
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
@@ -792,6 +795,7 @@
         "remote-node runner contract is not production-backed by attestation and cleanup evidence"
       ],
       "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
@@ -807,6 +811,9 @@
       "maturity": "blocked",
       "owner_component": "workerd/execution backends",
       "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
@@ -816,6 +823,7 @@
         "networked worker execution requires worker attestation and policy-bound remote tool subsets"
       ],
       "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
@@ -831,15 +839,19 @@
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
       "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
       "activation_blockers": [
         "Enable feature_rollouts.execution_backend_docker or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER after required tests and owner acceptance pass.",
-        "Docker runner isolation and patch writeback parity are still roadmap-gated"
+        "real Docker execution still needs operator-enabled runtime coverage before production promotion"
       ],
       "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
@@ -855,15 +867,19 @@
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
       "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
       "activation_blockers": [
         "Enable feature_rollouts.execution_backend_ssh_tunnel or PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL after required tests and owner acceptance pass.",
-        "SSH worker RPC envelope and transport trust chain are not complete"
+        "SSH worker RPC transport trust chain still needs live tunnel coverage before production promotion"
       ],
       "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
@@ -1103,6 +1119,9 @@
       "maturity": "blocked",
       "owner_component": "workerd/execution backends",
       "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
         "cargo test -p palyra-daemon --test current_state_inventory --locked",
         "bash scripts/test/run-critical-attack-scenarios.sh"
       ],
@@ -1112,6 +1131,7 @@
         "networked workers also require feature_rollouts.execution_backend_networked_worker"
       ],
       "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],

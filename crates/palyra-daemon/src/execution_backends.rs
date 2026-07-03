@@ -4662,9 +4662,9 @@ mod tests {
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
-        OperatorManagedSshTunnelTransport, SshWorkerBackendProfile, SshWorkerRpcFuture,
-        SshWorkerRpcRequestEnvelope, SshWorkerRpcResultEnvelope, SshWorkerRpcTransport,
-        SshWorkerRunner, StuckToolJobRecoveryAction, WorkspacePatchBundle,
+        LocalSandboxRunner, OperatorManagedSshTunnelTransport, SshWorkerBackendProfile,
+        SshWorkerRpcFuture, SshWorkerRpcRequestEnvelope, SshWorkerRpcResultEnvelope,
+        SshWorkerRpcTransport, SshWorkerRunner, StuckToolJobRecoveryAction, WorkspacePatchBundle,
         WorkspacePatchBundleBinaryFilePolicy, WorkspacePatchBundleCheckpointPair,
         WorkspacePatchBundleConflictSummary, WorkspacePatchBundleMergePreview,
         WorkspacePatchBundleRollbackPlan, WorkspacePatchBundleSourceManifest,
@@ -5082,6 +5082,106 @@ mod tests {
             resolve_execution_backend(ExecutionBackendPreference::Automatic, &inventory);
         assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
         assert!(!resolution.fallback_used);
+    }
+
+    #[test]
+    fn execution_backend_parity_matrix_covers_runner_contracts() {
+        let remote_tool_cases = [
+            ("palyra.fs.read_file", WorkerRemoteToolKind::FsRead),
+            ("palyra.fs.list_dir", WorkerRemoteToolKind::FsList),
+            ("palyra.fs.search", WorkerRemoteToolKind::FsSearch),
+            ("palyra.process.run", WorkerRemoteToolKind::ProcessRun),
+            ("palyra.fs.apply_patch", WorkerRemoteToolKind::ApplyPatch),
+            ("palyra.artifact.read", WorkerRemoteToolKind::ArtifactRead),
+            ("palyra.tool_program.run", WorkerRemoteToolKind::ToolProgramRun),
+        ];
+        for (tool_name, expected_kind) in remote_tool_cases {
+            assert_eq!(WorkerRemoteToolKind::from_tool_name(tool_name), Some(expected_kind));
+            assert_eq!(expected_kind.required_capability(), format!("tool:{tool_name}"));
+        }
+
+        let local = LocalSandboxRunner;
+        assert_runner_exposes(
+            &local,
+            &[
+                ExecutionBackendRunnerCapability::RunProcess,
+                ExecutionBackendRunnerCapability::RunToolProgram,
+                ExecutionBackendRunnerCapability::ReadArtifact,
+                ExecutionBackendRunnerCapability::CommitOrPatchBundle,
+                ExecutionBackendRunnerCapability::Cancel,
+                ExecutionBackendRunnerCapability::Cleanup,
+                ExecutionBackendRunnerCapability::AttestationManifest,
+            ],
+        );
+        assert_eq!(
+            WorkspaceStrategyDescriptor::daemon_workspace_root().writeback,
+            WorkspaceWritebackMode::PatchBundle
+        );
+
+        let (engine, _) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let docker = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        assert_runner_exposes(
+            &docker,
+            &[
+                ExecutionBackendRunnerCapability::RunProcess,
+                ExecutionBackendRunnerCapability::OpenWorkspace,
+                ExecutionBackendRunnerCapability::CommitOrPatchBundle,
+                ExecutionBackendRunnerCapability::Cancel,
+                ExecutionBackendRunnerCapability::Cleanup,
+                ExecutionBackendRunnerCapability::AttestationManifest,
+            ],
+        );
+        assert_eq!(
+            WorkspaceStrategyDescriptor::container_volume().writeback,
+            WorkspaceWritebackMode::PatchBundle
+        );
+
+        let (transport, _) = FakeSshWorkerTransport::new(serde_json::json!({"exit_code": 0}));
+        let ssh = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        assert_runner_exposes(
+            &ssh,
+            &[
+                ExecutionBackendRunnerCapability::RunProcess,
+                ExecutionBackendRunnerCapability::RunToolProgram,
+                ExecutionBackendRunnerCapability::ReadArtifact,
+                ExecutionBackendRunnerCapability::AttestationManifest,
+            ],
+        );
+        assert_eq!(
+            WorkspaceStrategyDescriptor::remote_lease_workspace().writeback,
+            WorkspaceWritebackMode::PatchBundle
+        );
+
+        let patch_bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::Docker.as_str(),
+            WorkspaceStrategyDescriptor::container_volume().attestation_digest_sha256(),
+        );
+        assert!(patch_bundle.reviewed);
+        assert!(patch_bundle.rollback_plan.restore_report_required);
+        assert_eq!(patch_bundle.checkpoint_pair.status, "required_on_apply");
+        assert_eq!(patch_bundle.source_manifest.writeback_mode, "patch_bundle");
+        assert!(!patch_bundle.source_manifest.authoritative_workspace_mutation);
+    }
+
+    fn assert_runner_exposes(
+        runner: &dyn ExecutionBackendRunner,
+        required_capabilities: &[ExecutionBackendRunnerCapability],
+    ) {
+        for capability in required_capabilities {
+            assert!(
+                runner.capabilities().contains(capability),
+                "{} should expose {}",
+                runner.runner_id(),
+                capability.as_str()
+            );
+        }
+        let manifest =
+            runner.attestation_manifest(&WorkspaceStrategyDescriptor::daemon_workspace_root());
+        assert_eq!(manifest.runner_id, runner.runner_id());
+        assert!(manifest.capabilities.iter().any(|capability| capability
+            == ExecutionBackendRunnerCapability::AttestationManifest.as_str()));
     }
 
     #[test]

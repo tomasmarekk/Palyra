@@ -1,0 +1,100 @@
+schema_version: 1
+id: execution_backends.backend_parity
+title: Execution backend parity
+area: tools
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - execution_backend_parity
+    - patch_verification
+    - process_background
+    - workspace_context
+  tools:
+    - palyra.process.run
+    - palyra.process.cancel
+    - palyra.fs.read_file
+    - palyra.fs.list_dir
+    - palyra.fs.search
+    - palyra.fs.apply_patch
+    - palyra.artifact.read
+    - palyra.tool_program.run
+  fixtures:
+    - qa/fixtures/sandbox_workspaces/repo_basic
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Run the execution backend parity pack across the local sandbox, fake Docker runner, and fake worker runner."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "execution backend parity complete"
+  events:
+    - event_type: execution_backend.parity.local_sandbox.passed
+      min_count: 1
+    - event_type: execution_backend.parity.docker.passed
+      min_count: 1
+    - event_type: execution_backend.parity.worker.passed
+      min_count: 1
+    - event_type: execution_backend.parity.cleanup_verified
+      min_count: 1
+    - event_type: execution_backend.parity.patch_bundle_reviewed
+      min_count: 1
+    - event_type: execution_backend.parity.cancellation_verified
+      min_count: 1
+    - event_type: execution_backend.parity.forbidden_fallback_checked
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: palyra.process.run
+      min_count: 1
+    - name: palyra.process.cancel
+      min_count: 1
+    - name: palyra.fs.read_file
+      min_count: 1
+    - name: palyra.fs.list_dir
+      min_count: 1
+    - name: palyra.fs.search
+      min_count: 1
+    - name: palyra.fs.apply_patch
+      min_count: 1
+    - name: palyra.artifact.read
+      min_count: 1
+    - name: palyra.tool_program.run
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - execution_backend.fallback.local_sandbox
+    - execution_backend.cleanup.incomplete
+    - execution_backend.patch_bundle.unreviewed
+  artifacts: []
+  claims:
+    - "fallback to local"
+    - "cleanup evidence missing"
+artifacts:
+  - path: qa/reports/execution_backends/backend_parity.json
+    kind: report
+    required: true
+  - path: qa/reports/execution_backends/backend_parity.evidence.json
+    kind: evidence
+    required: true
+  - path: qa/reports/execution_backends/backend_parity.trajectory.json
+    kind: trajectory
+    required: true
+maturity:
+  labels:
+    - p0
+    - nightly
+    - execution_backend_parity
+    - process
+    - mutating
+timeout:
+  run_ms: 90000
+  step_ms: 30000

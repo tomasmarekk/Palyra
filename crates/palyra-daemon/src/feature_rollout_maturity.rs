@@ -26,6 +26,9 @@ const RUNTIME_PREVIEW_TESTS: &[&str] = &[
     "cargo test -p palyra-daemon --test current_state_inventory --locked",
 ];
 const EXECUTION_BACKEND_TESTS: &[&str] = &[
+    "cargo test -p palyra-daemon execution_backend_parity --locked",
+    "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+    "palyra qa validate --path qa/scenarios/execution_backends --json",
     "cargo test -p palyra-daemon --test current_state_inventory --locked",
     "bash scripts/test/run-critical-attack-scenarios.sh",
 ];
@@ -51,6 +54,7 @@ const RUNTIME_PREVIEW_ACCEPTANCE: &[&str] = &[
     "golden inventory records the effective state",
 ];
 const EXECUTION_BACKEND_ACCEPTANCE: &[&str] = &[
+    "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
     "backend advertises degraded outcome when disabled",
     "policy, attestation, and cleanup evidence are covered before production enablement",
 ];
@@ -457,7 +461,7 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         required_tests: EXECUTION_BACKEND_TESTS,
         public_api_exposure: INTERNAL_EXPOSURE,
         activation_blockers: &[
-            "Docker runner isolation and patch writeback parity are still roadmap-gated",
+            "real Docker execution still needs operator-enabled runtime coverage before production promotion",
         ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
@@ -470,7 +474,9 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::Blocked,
         required_tests: EXECUTION_BACKEND_TESTS,
         public_api_exposure: INTERNAL_EXPOSURE,
-        activation_blockers: &["SSH worker RPC envelope and transport trust chain are not complete"],
+        activation_blockers: &[
+            "SSH worker RPC transport trust chain still needs live tunnel coverage before production promotion",
+        ],
         acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,

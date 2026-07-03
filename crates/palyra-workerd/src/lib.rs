@@ -1689,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_tool_kind_maps_m043_subset() {
+    fn remote_tool_kind_maps_backend_parity_tools() {
         let cases = [
             ("palyra.fs.read_file", WorkerRemoteToolKind::FsRead),
             ("palyra.fs.list_dir", WorkerRemoteToolKind::FsList),

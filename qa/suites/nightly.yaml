@@ -3,6 +3,7 @@ id: nightly
 mode: nightly
 scenario_roots:
   - qa/scenarios
+  - qa/scenarios/execution_backends
   - qa/scenarios/provider
 include_tags:
   - nightly
@@ -17,6 +18,7 @@ available_capabilities:
   - approvals
   - context_compaction
   - delegation
+  - execution_backend_parity
   - gateway_recovery
   - hook_policy
   - patch_verification
@@ -53,7 +55,7 @@ scorecard:
       labels: [provider, provider_compat]
     - id: execution_backends
       label: Execution backends
-      labels: [process, mutating]
+      labels: [execution_backend_parity, process, mutating]
     - id: hooks
       label: Hooks
       labels: [security]
