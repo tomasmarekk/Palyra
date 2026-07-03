@@ -272,6 +272,7 @@ pub(super) fn filtered(
     FilteredToolCatalogEntry {
         name: name.to_owned(),
         reason_code,
+        external_reason_code: None,
         repair_hint: repair_hint.to_owned(),
     }
 }

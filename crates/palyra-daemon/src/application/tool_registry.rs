@@ -21,9 +21,11 @@ mod tests;
 #[cfg(test)]
 pub(crate) use catalog::build_model_visible_tool_catalog_snapshot_with_external_tools;
 pub(crate) use catalog::{
-    build_model_visible_tool_catalog_snapshot, describe_catalog_tool, projection_policy_for_tool,
-    provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
-    snapshot_to_provider_request_value, tool_catalog_tape_payload,
+    build_model_visible_tool_catalog_snapshot,
+    build_model_visible_tool_catalog_snapshot_with_external_records, describe_catalog_tool,
+    projection_policy_for_tool, provider_tools_from_catalog_snapshot,
+    resolve_catalog_invoke_target, search_tool_catalog_index, snapshot_to_provider_request_value,
+    tool_catalog_tape_payload,
 };
 pub(crate) use hashing::{canonical_json_bytes, stable_hash_bytes, stable_hash_value};
 pub(crate) use normalization::{
@@ -32,9 +34,10 @@ pub(crate) use normalization::{
 };
 pub(crate) use schema::sanitize_schema_for_provider;
 pub(crate) use types::{
-    ModelVisibleToolCatalogSnapshot, NormalizedToolCall, ToolApprovalPosture,
-    ToolArgumentNormalizationAudit, ToolCallRejection, ToolCatalogBridgeError,
-    ToolCatalogBuildRequest, ToolCatalogPolicySnapshot, ToolExposureSurface, ToolParallelismPolicy,
-    ToolRegistryEntry, ToolResultProjectionPolicy, ToolSchemaDialect,
-    TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
+    FilteredToolCatalogEntry, ModelVisibleToolCatalogSnapshot, NormalizedToolCall,
+    ToolApprovalPosture, ToolArgumentNormalizationAudit, ToolCallRejection, ToolCatalogBridgeError,
+    ToolCatalogBuildRequest, ToolCatalogFilterReasonCode, ToolCatalogPolicySnapshot,
+    ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry, ToolResultProjectionPolicy,
+    ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME,
+    TOOL_CATALOG_SEARCH_TOOL_NAME,
 };

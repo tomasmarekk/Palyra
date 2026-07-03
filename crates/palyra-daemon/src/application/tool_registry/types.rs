@@ -268,6 +268,8 @@ pub(crate) struct AvailabilityProbeResult {
 pub(crate) struct FilteredToolCatalogEntry {
     pub(crate) name: String,
     pub(crate) reason_code: ToolCatalogFilterReasonCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_reason_code: Option<String>,
     pub(crate) repair_hint: String,
 }
 

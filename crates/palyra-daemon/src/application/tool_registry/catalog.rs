@@ -23,11 +23,12 @@ use super::schema::{
     exposure_reason, filtered, provider_tool_payload, sanitize_schema_for_provider,
 };
 use super::types::{
-    AvailabilityProbeResult, ModelVisibleTool, ModelVisibleToolCatalogSnapshot,
-    ToolCatalogBridgeError, ToolCatalogBuildRequest, ToolCatalogFilterReasonCode, ToolCatalogIndex,
-    ToolCatalogIndexEntry, ToolCatalogInvokeTarget, ToolRegistryEntry, ToolResultProjectionPolicy,
-    ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME,
-    TOOL_CATALOG_SCHEMA_VERSION, TOOL_CATALOG_SEARCH_TOOL_NAME,
+    AvailabilityProbeResult, FilteredToolCatalogEntry, ModelVisibleTool,
+    ModelVisibleToolCatalogSnapshot, ToolCatalogBridgeError, ToolCatalogBuildRequest,
+    ToolCatalogFilterReasonCode, ToolCatalogIndex, ToolCatalogIndexEntry, ToolCatalogInvokeTarget,
+    ToolRegistryEntry, ToolResultProjectionPolicy, ToolSchemaDialect,
+    TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SCHEMA_VERSION,
+    TOOL_CATALOG_SEARCH_TOOL_NAME,
 };
 
 const AVAILABILITY_PROBE_TTL_MS: u64 = 30_000;
@@ -54,8 +55,26 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_tools(
     request: ToolCatalogBuildRequest<'_>,
     external_tools: &[ToolRegistryEntry],
 ) -> ModelVisibleToolCatalogSnapshot {
+    build_model_visible_tool_catalog_snapshot_with_external_records(
+        request,
+        external_tools,
+        &[],
+        &[],
+    )
+}
+
+/// Builds a catalog snapshot with external tools plus external availability evidence.
+///
+/// `external_registered_names` prevents allowlisted but currently unavailable
+/// external tools from also being reported as unknown names.
+pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_records(
+    request: ToolCatalogBuildRequest<'_>,
+    external_tools: &[ToolRegistryEntry],
+    external_filtered_tools: &[FilteredToolCatalogEntry],
+    external_registered_names: &[String],
+) -> ModelVisibleToolCatalogSnapshot {
     let dialect = ToolSchemaDialect::from_provider_kind(request.provider_kind);
-    let mut filtered_tools = Vec::new();
+    let mut filtered_tools = external_filtered_tools.to_vec();
     let allowed_tools = normalized_configured_tools(
         request.catalog_policy.profile_expansion.effective_allowed_tools.as_slice(),
     );
@@ -68,7 +87,9 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_tools(
     let mut authorized_target_tools = Vec::new();
     let mut registry = registry_entries();
     registry.extend(external_tools.iter().cloned());
-    let registered_names = registry.iter().map(|entry| entry.name.clone()).collect::<BTreeSet<_>>();
+    let mut registered_names =
+        registry.iter().map(|entry| entry.name.clone()).collect::<BTreeSet<_>>();
+    registered_names.extend(external_registered_names.iter().cloned());
 
     for entry in registry {
         if is_catalog_bridge_tool(entry.name.as_str()) {
@@ -456,6 +477,7 @@ pub(crate) fn tool_catalog_tape_payload(snapshot: &ModelVisibleToolCatalogSnapsh
             json!({
                 "name": tool.name,
                 "reason_code": tool.reason_code.as_str(),
+                "external_reason_code": tool.external_reason_code,
                 "repair_hint": tool.repair_hint,
             })
         }).collect::<Vec<_>>(),

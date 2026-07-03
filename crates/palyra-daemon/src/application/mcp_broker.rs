@@ -27,9 +27,11 @@ use serde_json::{json, Value};
 use crate::config::{McpServerConfig, McpServerTransport, McpServersConfig};
 
 use super::tool_registry::{
-    sanitize_schema_for_provider, stable_hash_bytes, stable_hash_value, ToolApprovalPosture,
-    ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry, ToolResultProjectionPolicy,
-    ToolSchemaDialect,
+    build_model_visible_tool_catalog_snapshot_with_external_records, sanitize_schema_for_provider,
+    stable_hash_bytes, stable_hash_value, FilteredToolCatalogEntry,
+    ModelVisibleToolCatalogSnapshot, ToolApprovalPosture, ToolCatalogBuildRequest,
+    ToolCatalogFilterReasonCode, ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry,
+    ToolResultProjectionPolicy, ToolSchemaDialect,
 };
 
 const MCP_SCHEMA_VERSION: u32 = 1;
@@ -942,15 +944,21 @@ impl McpBroker {
         transport: &dyn McpTransport,
     ) -> Result<McpToolDiscoveryReport, McpBrokerError> {
         let server_id = normalize_mcp_identifier(server_name, "server_name")?;
-        let record = self.server_record(server_id.as_str())?;
-        if record.state != McpServerLifecycleState::Healthy {
+        let (manifest, state) = {
+            let record = self.server_record(server_id.as_str())?;
+            (record.manifest.clone(), record.state)
+        };
+        if state != McpServerLifecycleState::Healthy {
             return Err(McpBrokerError::new(
                 "mcp.server_not_ready",
-                format!("MCP server '{}' is {}", server_name, record.state.as_str()),
+                format!("MCP server '{}' is {}", server_name, state.as_str()),
             ));
         }
-        let tools = transport.list_tools(&record.manifest)?;
-        let report = import_discovered_tools(&record.manifest, record.state, tools);
+        let tools = transport.list_tools(&manifest)?;
+        let report = import_discovered_tools(&manifest, state, tools);
+        if report.filtered_tools.iter().any(mcp_discovery_filter_is_protocol_violation) {
+            self.record_discovery_protocol_violation(server_id.as_str())?;
+        }
         Ok(report)
     }
 
@@ -1083,12 +1091,27 @@ impl McpBroker {
         &mut self,
         server_name: &str,
     ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        self.record_protocol_violation_with_policy(server_name, true)
+    }
+
+    fn record_discovery_protocol_violation(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        self.record_protocol_violation_with_policy(server_name, false)
+    }
+
+    fn record_protocol_violation_with_policy(
+        &mut self,
+        server_name: &str,
+        degrade_before_quarantine: bool,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
         let server_id = normalize_mcp_identifier(server_name, "server_name")?;
         let record = self.server_record_mut(server_id.as_str())?;
         record.protocol_violations = record.protocol_violations.saturating_add(1);
         if record.protocol_violations >= QUARANTINE_AFTER_VIOLATIONS {
             record.state = McpServerLifecycleState::Quarantined;
-        } else if record.state == McpServerLifecycleState::Healthy {
+        } else if degrade_before_quarantine && record.state == McpServerLifecycleState::Healthy {
             record.state = McpServerLifecycleState::Degraded;
         }
         Ok(record.state)
@@ -1175,6 +1198,116 @@ pub fn namespaced_tool_id(server_name: &str, tool_name: &str) -> Result<String, 
     let server = normalize_mcp_identifier(server_name, "server_name")?;
     let tool = normalize_mcp_identifier(tool_name, "tool_name")?;
     Ok(format!("mcp.{server}.{tool}"))
+}
+
+/// Projects MCP discovery reports into the model-visible tool catalog.
+///
+/// Only reports for enabled, healthy servers in `supervisor_snapshot` supply
+/// external registry entries. Filtered tools and unhealthy server entries are
+/// still surfaced as catalog availability evidence with their MCP reason codes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "MCP discovery scheduling will call this service-layer projection entrypoint"
+    )
+)]
+pub(crate) fn build_mcp_tool_catalog_snapshot(
+    request: ToolCatalogBuildRequest<'_>,
+    supervisor_snapshot: &McpRuntimeSupervisorSnapshot,
+    discovery_reports: &[McpToolDiscoveryReport],
+) -> ModelVisibleToolCatalogSnapshot {
+    let healthy_servers = supervisor_snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled && server.state == McpServerLifecycleState::Healthy)
+        .map(|server| server.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut registry_entries = Vec::new();
+    let mut filtered_entries = Vec::new();
+    let mut external_registered_names = Vec::new();
+
+    for report in discovery_reports {
+        let server_id = normalize_mcp_identifier(report.server_name.as_str(), "server_name")
+            .unwrap_or_else(|_| report.server_name.trim().to_ascii_lowercase());
+        let server_healthy = report.state == McpServerLifecycleState::Healthy
+            && healthy_servers.contains(server_id.as_str());
+        if server_healthy {
+            registry_entries.extend(report.registry_entries.iter().cloned());
+        } else {
+            for entry in &report.registry_entries {
+                external_registered_names.push(entry.name.clone());
+                filtered_entries.push(mcp_catalog_filtered_entry(
+                    entry.name.clone(),
+                    ToolCatalogFilterReasonCode::RuntimeUnavailable,
+                    "mcp.server_not_healthy",
+                    format!(
+                        "MCP server '{}' is not enabled and healthy in the supervisor snapshot",
+                        report.server_name
+                    ),
+                ));
+            }
+        }
+        for filtered_tool in &report.filtered_tools {
+            let name = mcp_filtered_catalog_tool_name(
+                report.server_name.as_str(),
+                filtered_tool.raw_name.as_str(),
+            );
+            external_registered_names.push(name.clone());
+            filtered_entries.push(mcp_catalog_filtered_entry(
+                name,
+                ToolCatalogFilterReasonCode::ProviderSchemaIncompatible,
+                filtered_tool.reason_code.as_str(),
+                filtered_tool.message.clone(),
+            ));
+        }
+    }
+
+    registry_entries.sort_by(|left, right| left.name.cmp(&right.name));
+    registry_entries.dedup_by(|left, right| left.name == right.name);
+    filtered_entries.sort_by(|left, right| {
+        left.name.cmp(&right.name).then(
+            left.external_reason_code
+                .as_deref()
+                .unwrap_or_default()
+                .cmp(right.external_reason_code.as_deref().unwrap_or_default()),
+        )
+    });
+    filtered_entries.dedup_by(|left, right| {
+        left.name == right.name && left.external_reason_code == right.external_reason_code
+    });
+    external_registered_names.sort();
+    external_registered_names.dedup();
+
+    build_model_visible_tool_catalog_snapshot_with_external_records(
+        request,
+        registry_entries.as_slice(),
+        filtered_entries.as_slice(),
+        external_registered_names.as_slice(),
+    )
+}
+
+fn mcp_catalog_filtered_entry(
+    name: String,
+    reason_code: ToolCatalogFilterReasonCode,
+    external_reason_code: &str,
+    repair_hint: String,
+) -> FilteredToolCatalogEntry {
+    FilteredToolCatalogEntry {
+        name,
+        reason_code,
+        external_reason_code: Some(external_reason_code.to_owned()),
+        repair_hint,
+    }
+}
+
+fn mcp_filtered_catalog_tool_name(server_name: &str, raw_tool_name: &str) -> String {
+    namespaced_tool_id(server_name, raw_tool_name).unwrap_or_else(|_| {
+        let server = normalize_mcp_identifier(server_name, "server_name")
+            .unwrap_or_else(|_| "unknown".to_owned());
+        let digest = stable_hash_bytes(raw_tool_name.as_bytes());
+        format!("mcp.{server}.filtered_{}", &digest[..12])
+    })
 }
 
 fn execute_remote_jsonrpc(
@@ -1874,6 +2007,11 @@ fn import_discovered_tools(
     }
 }
 
+fn mcp_discovery_filter_is_protocol_violation(tool: &McpFilteredTool) -> bool {
+    tool.reason_code.starts_with("schema.")
+        || matches!(tool.reason_code.as_str(), "mcp.identifier_invalid" | "mcp.tool_collision")
+}
+
 fn registry_entry_from_mcp_tool(
     manifest: &McpServerManifest,
     tool: &McpDiscoveredTool,
@@ -2461,18 +2599,33 @@ mod tests {
         McpDiscoveredTool {
             name: name.to_owned(),
             description: format!("{name} test tool"),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
+            input_schema: search_tool_schema(),
             capabilities: vec!["docs".to_owned()],
             sensitivity: None,
             approval_policy: None,
         }
+    }
+
+    fn discovered_tool_with_schema(name: &str, input_schema: Value) -> McpDiscoveredTool {
+        McpDiscoveredTool {
+            name: name.to_owned(),
+            description: format!("{name} test tool"),
+            input_schema,
+            capabilities: vec!["docs".to_owned()],
+            sensitivity: None,
+            approval_policy: None,
+        }
+    }
+
+    fn search_tool_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
     }
 
     fn broker_with_ready_manifest(transport: &dyn McpTransport) -> McpBroker {
@@ -2806,6 +2959,154 @@ mod tests {
     }
 
     #[test]
+    fn mcp_catalog_projection_exposes_healthy_allowlisted_tools_with_hashes() {
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_ready_manifest(&transport);
+        let report = broker.discover_tools("docs", &transport).expect("discovery should run");
+        let supervisor = healthy_supervisor_snapshot("docs", 42);
+        let config = tool_config(&["mcp.docs.search"]);
+        let policy = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&config.allowed_tools);
+        let context = mcp_catalog_request_context();
+
+        let snapshot = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            std::slice::from_ref(&report),
+        );
+
+        let tool = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.name == "mcp.docs.search")
+            .expect("healthy allowlisted MCP tool should be model-visible");
+        assert_eq!(tool.internal_schema_hash, report.registry_entries[0].schema_hash);
+        assert!(!tool.provider_schema_hash.is_empty());
+        assert!(snapshot.catalog_hash.len() >= 16);
+    }
+
+    #[test]
+    fn mcp_catalog_projection_filters_unhealthy_servers_with_mcp_reason_code() {
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_ready_manifest(&transport);
+        let report = broker.discover_tools("docs", &transport).expect("discovery should run");
+        let supervisor = stopped_supervisor_snapshot("docs", 42);
+        let config = tool_config(&["mcp.docs.search"]);
+        let policy = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&config.allowed_tools);
+        let context = mcp_catalog_request_context();
+
+        let snapshot = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            &[report],
+        );
+
+        assert!(snapshot.tools.iter().all(|tool| tool.name != "mcp.docs.search"));
+        let filtered = filtered_catalog_entry(&snapshot, "mcp.docs.search");
+        assert_eq!(filtered.reason_code, ToolCatalogFilterReasonCode::RuntimeUnavailable);
+        assert_eq!(filtered.external_reason_code.as_deref(), Some("mcp.server_not_healthy"));
+        assert!(!snapshot.filtered_tools.iter().any(|tool| {
+            tool.name == "mcp.docs.search"
+                && tool.reason_code == ToolCatalogFilterReasonCode::UnknownTool
+        }));
+    }
+
+    #[test]
+    fn mcp_catalog_projection_preserves_filtered_discovery_reason_codes() {
+        let mut invalid = discovered_tool("write_note");
+        invalid
+            .input_schema
+            .as_object_mut()
+            .expect("schema object")
+            .insert("$ref".to_owned(), Value::String("https://attacker.example/schema".to_owned()));
+        let transport = FakeTransport { tools: vec![invalid], ..Default::default() };
+        let mut broker = broker_with_ready_manifest(&transport);
+        let report = broker.discover_tools("docs", &transport).expect("discovery should run");
+        let supervisor = healthy_supervisor_snapshot("docs", 42);
+        let config = tool_config(&["mcp.docs.write_note"]);
+        let policy = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&config.allowed_tools);
+        let context = mcp_catalog_request_context();
+
+        let snapshot = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            &[report],
+        );
+
+        let filtered = filtered_catalog_entry(&snapshot, "mcp.docs.write_note");
+        assert_eq!(filtered.reason_code, ToolCatalogFilterReasonCode::ProviderSchemaIncompatible);
+        assert_eq!(filtered.external_reason_code.as_deref(), Some("schema.unsupported_keyword"));
+    }
+
+    #[test]
+    fn mcp_catalog_projection_hash_is_deterministic_and_changes_with_schema() {
+        let first_report = discovery_report_for_tool(discovered_tool("search"));
+        let second_report = discovery_report_for_tool(discovered_tool_with_schema(
+            "search",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "integer" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ));
+        let supervisor = healthy_supervisor_snapshot("docs", 42);
+        let config = tool_config(&["mcp.docs.search"]);
+        let policy = ToolCatalogPolicySnapshot::direct_from_allowed_tools(&config.allowed_tools);
+        let context = mcp_catalog_request_context();
+
+        let first = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            std::slice::from_ref(&first_report),
+        );
+        let first_again = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            &[first_report],
+        );
+        let second = build_mcp_tool_catalog_snapshot(
+            tool_catalog_request(&config, &policy, &context, 42),
+            &supervisor,
+            &[second_report],
+        );
+
+        assert_eq!(first.catalog_hash, first_again.catalog_hash);
+        assert_ne!(first.catalog_hash, second.catalog_hash);
+        assert_ne!(first.tools[0].provider_schema_hash, second.tools[0].provider_schema_hash);
+    }
+
+    #[test]
+    fn discovery_invalid_schema_quarantines_after_repeated_protocol_violations() {
+        let mut invalid = discovered_tool("write_note");
+        invalid
+            .input_schema
+            .as_object_mut()
+            .expect("schema object")
+            .insert("$ref".to_owned(), Value::String("https://attacker.example/schema".to_owned()));
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search"), invalid], ..Default::default() };
+        let mut broker = broker_with_ready_manifest(&transport);
+
+        for attempt in 1..=QUARANTINE_AFTER_VIOLATIONS {
+            let report = broker.discover_tools("docs", &transport).expect("discovery should run");
+            assert_eq!(report.imported_count, 1);
+            let state = broker.state("docs").expect("state should be readable");
+            if attempt < QUARANTINE_AFTER_VIOLATIONS {
+                assert_eq!(state, McpServerLifecycleState::Healthy);
+            }
+        }
+
+        assert_eq!(
+            broker.state("docs").expect("server should be quarantined"),
+            McpServerLifecycleState::Quarantined
+        );
+    }
+
+    #[test]
     fn invocation_denies_policy_before_transport_call() {
         let transport = FakeTransport::default();
         let mut broker = broker_with_ready_manifest(&transport);
@@ -2904,6 +3205,75 @@ mod tests {
         let env = scrub_stdio_env(&manifest());
 
         assert_eq!(env.get("API_TOKEN"), Some(&"<redacted>".to_owned()));
+    }
+
+    fn healthy_supervisor_snapshot(
+        id: &str,
+        generated_at_unix_ms: i64,
+    ) -> McpRuntimeSupervisorSnapshot {
+        let mut supervisor =
+            McpRuntimeSupervisor::from_config(&runtime_config(vec![runtime_server(id, true)]));
+        supervisor.start_server(id, generated_at_unix_ms - 2).expect("server should start");
+        supervisor
+            .record_start_success(id, generated_at_unix_ms - 1)
+            .expect("server should become healthy");
+        supervisor.snapshot(generated_at_unix_ms)
+    }
+
+    fn stopped_supervisor_snapshot(
+        id: &str,
+        generated_at_unix_ms: i64,
+    ) -> McpRuntimeSupervisorSnapshot {
+        McpRuntimeSupervisor::from_config(&runtime_config(vec![runtime_server(id, true)]))
+            .snapshot(generated_at_unix_ms)
+    }
+
+    fn tool_catalog_request<'a>(
+        config: &'a ToolCallConfig,
+        catalog_policy: &'a ToolCatalogPolicySnapshot,
+        request_context: &'a ToolRequestContext,
+        created_at_unix_ms: i64,
+    ) -> ToolCatalogBuildRequest<'a> {
+        ToolCatalogBuildRequest {
+            config,
+            catalog_policy,
+            browser_service_enabled: false,
+            browser_service_configured: false,
+            request_context,
+            provider_kind: "openai_compatible",
+            provider_model_id: None,
+            surface: ToolExposureSurface::RunStream,
+            remaining_tool_budget: None,
+            created_at_unix_ms,
+        }
+    }
+
+    fn mcp_catalog_request_context() -> ToolRequestContext {
+        ToolRequestContext {
+            principal: "user:test".to_owned(),
+            device_id: None,
+            channel: Some("console".to_owned()),
+            session_id: None,
+            run_id: None,
+            skill_id: None,
+        }
+    }
+
+    fn filtered_catalog_entry<'a>(
+        snapshot: &'a ModelVisibleToolCatalogSnapshot,
+        name: &str,
+    ) -> &'a FilteredToolCatalogEntry {
+        snapshot
+            .filtered_tools
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("filtered catalog entry should exist")
+    }
+
+    fn discovery_report_for_tool(tool: McpDiscoveredTool) -> McpToolDiscoveryReport {
+        let transport = FakeTransport { tools: vec![tool], ..Default::default() };
+        let mut broker = broker_with_ready_manifest(&transport);
+        broker.discover_tools("docs", &transport).expect("discovery should run")
     }
 
     #[test]
