@@ -98,6 +98,57 @@ pub struct McpServerManifest {
     pub approval_policy: McpApprovalPolicy,
     #[serde(default)]
     pub sampling_enabled: bool,
+    #[serde(default)]
+    pub oauth_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_grant: Option<McpOAuthGrant>,
+    #[serde(default)]
+    pub sampling_policy: McpSamplingPolicy,
+}
+
+/// Vault-backed OAuth grant descriptor for one MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpOAuthGrant {
+    pub grant_id: String,
+    pub access_token_vault_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_vault_ref: Option<String>,
+    pub metadata_vault_ref: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_id: Option<String>,
+    pub issued_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+/// Host-owned sampling policy for one MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpSamplingPolicy {
+    pub mode: McpSamplingMode,
+    #[serde(default)]
+    pub allowed_model_capabilities: Vec<String>,
+}
+
+impl Default for McpSamplingPolicy {
+    fn default() -> Self {
+        Self { mode: McpSamplingMode::Deny, allowed_model_capabilities: Vec::new() }
+    }
+}
+
+/// Sampling decision mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSamplingMode {
+    #[default]
+    Deny,
+    Allowlist,
 }
 
 /// Transport declaration for an MCP server.
@@ -654,6 +705,8 @@ pub struct McpToolResponse {
     #[serde(default)]
     pub sampling_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_model_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_host_requested: Option<String>,
 }
 
@@ -707,9 +760,13 @@ pub struct McpInvocationAttestation {
     pub output_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_grant_id: Option<String>,
     pub transport_id: String,
     pub result_projection: String,
     pub policy_outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling_model_capability: Option<String>,
     pub executed_at_unix_ms: i64,
     pub output_truncated: bool,
     #[serde(default)]
@@ -835,6 +892,7 @@ impl McpTransport for McpRuntimeTransport {
         Ok(McpToolResponse {
             output: result,
             sampling_requested: false,
+            sampling_model_capability: None,
             egress_host_requested: None,
         })
     }
@@ -1081,6 +1139,20 @@ impl McpBroker {
                 "MCP tool input must be a JSON object",
             ));
         }
+        match evaluate_mcp_oauth_grant(&record.manifest, current_unix_ms()) {
+            Ok(grant_id) => {
+                audit_context.oauth_grant_id = grant_id;
+            }
+            Err(error) => {
+                return Ok(denied_invocation_with_hint(
+                    &request,
+                    &audit_context,
+                    error.reason_code.as_str(),
+                    error.message.as_str(),
+                    Some(error.repair_hint.as_str()),
+                ));
+            }
+        }
         match resolve_scoped_vault_grants(
             request.vault_refs_requested.as_slice(),
             record.manifest.vault_refs.as_slice(),
@@ -1112,13 +1184,22 @@ impl McpBroker {
             }
         };
         if response.sampling_requested {
-            self.record_protocol_violation(server_id.as_str())?;
-            return Ok(denied_invocation(
-                &request,
-                &audit_context,
-                "mcp.sampling_denied",
-                "MCP sampling is denied by default and cannot be requested by tools",
-            ));
+            audit_context.sampling_model_capability = response.sampling_model_capability.clone();
+            if !sampling_allowed_by_manifest(
+                &record.manifest,
+                response.sampling_model_capability.as_deref(),
+            ) {
+                self.record_protocol_violation(server_id.as_str())?;
+                return Ok(denied_invocation_with_hint(
+                    &request,
+                    &audit_context,
+                    "mcp.sampling_denied",
+                    "MCP sampling is denied unless this server allowlists the requested model capability",
+                    Some(
+                        "set mcp.servers[].sampling_policy.mode=allowlist and add the model capability",
+                    ),
+                ));
+            }
         }
         if let Some(host) = response.egress_host_requested.as_deref() {
             if !host_allowed_by_manifest(host, record.manifest.egress_allowlist.as_slice()) {
@@ -1226,16 +1307,18 @@ pub fn validate_mcp_server_manifest(
     validate_transport(&manifest.transport, policy, &mut findings);
     validate_timeouts(manifest, policy, &mut findings);
     validate_vault_refs(manifest.vault_refs.as_slice(), &mut findings);
+    validate_oauth_grant(manifest, &mut findings);
     validate_tool_filters(manifest, &mut findings);
     validate_egress_allowlist(manifest.egress_allowlist.as_slice(), &mut findings);
     if manifest.sampling_enabled {
         findings.push(finding(
             McpFindingSeverity::Error,
             "mcp.sampling_denied",
-            "MCP sampling is denied by default for external servers",
-            "remove sampling_enabled or keep it false",
+            "legacy MCP sampling toggle is denied for external servers",
+            "use sampling_policy.mode=allowlist with explicit model capabilities",
         ));
     }
+    validate_sampling_policy(&manifest.sampling_policy, &mut findings);
     let valid = !findings.iter().any(|finding| finding.severity == McpFindingSeverity::Error);
     McpManifestValidationReport {
         schema_version: MCP_SCHEMA_VERSION,
@@ -2246,6 +2329,78 @@ fn validate_vault_refs(grants: &[McpVaultRefGrant], findings: &mut Vec<McpValida
     }
 }
 
+fn validate_oauth_grant(manifest: &McpServerManifest, findings: &mut Vec<McpValidationFinding>) {
+    let Some(grant) = manifest.oauth_grant.as_ref() else {
+        if manifest.oauth_required {
+            findings.push(finding(
+                McpFindingSeverity::Error,
+                "mcp.oauth_grant_missing",
+                "OAuth is required but no MCP OAuth grant is configured",
+                "run `palyra mcp login <server>` to create vault-backed grant references",
+            ));
+        }
+        return;
+    };
+    if normalize_mcp_identifier(grant.grant_id.as_str(), "oauth_grant_id").is_err() {
+        findings.push(finding(
+            McpFindingSeverity::Error,
+            "mcp.oauth_grant_id_invalid",
+            "OAuth grant id must be a bounded identifier",
+            "regenerate the MCP OAuth grant with `palyra mcp login`",
+        ));
+    }
+    for (label, vault_ref) in [
+        ("access_token_vault_ref", Some(grant.access_token_vault_ref.as_str())),
+        ("metadata_vault_ref", Some(grant.metadata_vault_ref.as_str())),
+        ("refresh_token_vault_ref", grant.refresh_token_vault_ref.as_deref()),
+    ] {
+        let Some(vault_ref) = vault_ref else {
+            continue;
+        };
+        if !is_mcp_vault_ref_descriptor(vault_ref) {
+            findings.push(finding(
+                McpFindingSeverity::Error,
+                "mcp.oauth_vault_ref_invalid",
+                format!("OAuth {label} must be a vault reference").as_str(),
+                "store OAuth material in the vault and keep only vault refs in config",
+            ));
+        }
+    }
+    if grant.issued_at_unix_ms < 0 || grant.updated_at_unix_ms < 0 {
+        findings.push(finding(
+            McpFindingSeverity::Error,
+            "mcp.oauth_timestamp_invalid",
+            "OAuth grant timestamps must be non-negative unix milliseconds",
+            "regenerate the MCP OAuth grant metadata",
+        ));
+    }
+}
+
+fn validate_sampling_policy(policy: &McpSamplingPolicy, findings: &mut Vec<McpValidationFinding>) {
+    match policy.mode {
+        McpSamplingMode::Deny => {
+            if !policy.allowed_model_capabilities.is_empty() {
+                findings.push(finding(
+                    McpFindingSeverity::Error,
+                    "mcp.sampling_allowlist_unused",
+                    "sampling allowlist entries cannot be set while sampling mode is deny",
+                    "remove allowed_model_capabilities or set sampling_policy.mode=allowlist",
+                ));
+            }
+        }
+        McpSamplingMode::Allowlist => {
+            if policy.allowed_model_capabilities.is_empty() {
+                findings.push(finding(
+                    McpFindingSeverity::Error,
+                    "mcp.sampling_allowlist_empty",
+                    "sampling allowlist mode requires at least one model capability",
+                    "add allowed_model_capabilities for the specific model capability",
+                ));
+            }
+        }
+    }
+}
+
 fn validate_tool_filters(manifest: &McpServerManifest, findings: &mut Vec<McpValidationFinding>) {
     for tool in manifest.tool_allowlist.iter().chain(manifest.tool_denylist.iter()) {
         if normalize_mcp_identifier(tool.as_str(), "tool_filter").is_err() {
@@ -2309,6 +2464,106 @@ fn tool_allowed_by_manifest(manifest: &McpServerManifest, raw_tool_name: &str) -
             .any(|allowed| allowed == tool_name)
 }
 
+#[derive(Debug, Clone)]
+struct McpOAuthGrantEvaluationError {
+    reason_code: String,
+    message: String,
+    repair_hint: String,
+}
+
+fn evaluate_mcp_oauth_grant(
+    manifest: &McpServerManifest,
+    now_unix_ms: i64,
+) -> Result<Option<String>, McpOAuthGrantEvaluationError> {
+    if !manifest.oauth_required {
+        return Ok(None);
+    }
+    let repair_hint =
+        format!("run `palyra mcp login {}` to refresh the MCP OAuth grant", manifest.name);
+    let Some(grant) = manifest.oauth_grant.as_ref() else {
+        return Err(McpOAuthGrantEvaluationError {
+            reason_code: "mcp.oauth_grant_missing".to_owned(),
+            message: "MCP OAuth grant is missing".to_owned(),
+            repair_hint,
+        });
+    };
+    if grant.revoked_at_unix_ms.is_some() {
+        return Err(McpOAuthGrantEvaluationError {
+            reason_code: "mcp.oauth_grant_revoked".to_owned(),
+            message: "MCP OAuth grant was revoked".to_owned(),
+            repair_hint,
+        });
+    }
+    if grant.expires_at_unix_ms.is_some_and(|expires_at| expires_at <= now_unix_ms) {
+        return Err(McpOAuthGrantEvaluationError {
+            reason_code: "mcp.oauth_grant_expired".to_owned(),
+            message: "MCP OAuth grant has expired".to_owned(),
+            repair_hint,
+        });
+    }
+    Ok(Some(grant.grant_id.clone()))
+}
+
+/// Returns doctor-style findings for MCP OAuth grants that cannot authorize tools.
+#[must_use]
+pub fn mcp_oauth_grant_doctor_findings(
+    manifests: &[McpServerManifest],
+    now_unix_ms: i64,
+) -> Vec<McpValidationFinding> {
+    manifests
+        .iter()
+        .filter_map(|manifest| {
+            evaluate_mcp_oauth_grant(manifest, now_unix_ms).err().map(|error| {
+                finding(
+                    McpFindingSeverity::Error,
+                    error.reason_code.as_str(),
+                    error.message.as_str(),
+                    error.repair_hint.as_str(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn sampling_allowed_by_manifest(
+    manifest: &McpServerManifest,
+    requested_model_capability: Option<&str>,
+) -> bool {
+    if manifest.sampling_enabled {
+        return false;
+    }
+    if !matches!(manifest.sampling_policy.mode, McpSamplingMode::Allowlist) {
+        return false;
+    }
+    let Some(requested) = requested_model_capability
+        .and_then(|value| normalize_sampling_model_capability(value).ok())
+    else {
+        return false;
+    };
+    manifest
+        .sampling_policy
+        .allowed_model_capabilities
+        .iter()
+        .filter_map(|capability| normalize_sampling_model_capability(capability).ok())
+        .any(|allowed| allowed == requested)
+}
+
+fn normalize_sampling_model_capability(raw: &str) -> Result<String, McpBrokerError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 128
+        || !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
+    {
+        return Err(McpBrokerError::new(
+            "mcp.sampling_capability_invalid",
+            "sampling model capability must use bounded ASCII label syntax",
+        ));
+    }
+    Ok(normalized)
+}
+
 fn host_allowed_by_manifest(host: &str, allowlist: &[String]) -> bool {
     let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
     allowlist.iter().any(|allowed| allowed.trim().trim_end_matches('.').eq(&normalized))
@@ -2332,6 +2587,8 @@ struct McpInvocationAuditContext {
     namespaced_tool_id: String,
     transport_id: String,
     result_projection: ToolResultProjectionPolicy,
+    oauth_grant_id: Option<String>,
+    sampling_model_capability: Option<String>,
     vault_grant_ids: Vec<String>,
 }
 
@@ -2347,6 +2604,8 @@ impl McpInvocationAuditContext {
             namespaced_tool_id,
             transport_id,
             result_projection,
+            oauth_grant_id: None,
+            sampling_model_capability: None,
             vault_grant_ids: Vec::new(),
         }
     }
@@ -2529,12 +2788,25 @@ fn denied_invocation(
     reason_code: &str,
     message: &str,
 ) -> McpToolInvocationOutcome {
+    denied_invocation_with_hint(request, audit_context, reason_code, message, None)
+}
+
+fn denied_invocation_with_hint(
+    request: &McpToolCallRequest,
+    audit_context: &McpInvocationAuditContext,
+    reason_code: &str,
+    message: &str,
+    repair_hint: Option<&str>,
+) -> McpToolInvocationOutcome {
     let message = sanitize_mcp_transport_message(message);
-    let output_json = json!({
+    let mut output_json = json!({
         "success": false,
         "reason_code": reason_code,
         "message": message,
     });
+    if let Some(repair_hint) = repair_hint {
+        output_json["repair_hint"] = json!(sanitize_mcp_transport_message(repair_hint));
+    }
     McpToolInvocationOutcome {
         success: false,
         output_json: output_json.clone(),
@@ -2560,7 +2832,7 @@ fn invocation_attestation(
     let input_hash = stable_hash_value(&request.input);
     let output_hash = stable_hash_value(raw_output_json);
     let attestation_seed = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         audit_context.server_id,
         request.server_name,
         request.tool_name,
@@ -2568,8 +2840,10 @@ fn invocation_attestation(
         input_hash,
         output_hash,
         request.approval_id.as_deref().unwrap_or_default(),
+        audit_context.oauth_grant_id.as_deref().unwrap_or_default(),
         audit_context.transport_id,
         audit_context.vault_grant_ids.join(","),
+        audit_context.sampling_model_capability.as_deref().unwrap_or_default(),
         policy_outcome,
         executed_at_unix_ms
     );
@@ -2583,9 +2857,11 @@ fn invocation_attestation(
         input_hash,
         output_hash,
         approval_id: request.approval_id.clone(),
+        oauth_grant_id: audit_context.oauth_grant_id.clone(),
         transport_id: audit_context.transport_id.clone(),
         result_projection: audit_context.result_projection.as_str().to_owned(),
         policy_outcome: policy_outcome.to_owned(),
+        sampling_model_capability: audit_context.sampling_model_capability.clone(),
         executed_at_unix_ms,
         output_truncated,
         vault_grant_ids: audit_context.vault_grant_ids.clone(),
@@ -2709,6 +2985,17 @@ fn is_vault_ref(value: &str) -> bool {
     value.starts_with("vault://") || value.starts_with("vault:")
 }
 
+fn is_mcp_vault_ref_descriptor(value: &str) -> bool {
+    let value = value.trim();
+    is_vault_ref(value)
+        || value.split_once('/').is_some_and(|(scope, key)| {
+            !scope.trim().is_empty()
+                && !key.trim().is_empty()
+                && !key.contains('/')
+                && key.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        })
+}
+
 fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
@@ -2791,6 +3078,7 @@ mod tests {
             Ok(self.response.clone().unwrap_or(McpToolResponse {
                 output: json!({"ok": true}),
                 sampling_requested: false,
+                sampling_model_capability: None,
                 egress_host_requested: None,
             }))
         }
@@ -2828,6 +3116,9 @@ mod tests {
             sensitivity_default: McpToolSensitivity::Internal,
             approval_policy: McpApprovalPolicy::Safe,
             sampling_enabled: false,
+            oauth_required: false,
+            oauth_grant: None,
+            sampling_policy: McpSamplingPolicy::default(),
         }
     }
 
@@ -2919,6 +3210,9 @@ mod tests {
             approval_profile: McpServerApprovalProfile::RequireApproval,
             egress_policy: McpServerEgressPolicy::DenyAll,
             egress_allowlist: Vec::new(),
+            oauth_required: false,
+            oauth_grant: None,
+            sampling_policy: crate::config::McpServerSamplingPolicy::default(),
             tool_allowlist: Vec::new(),
             tool_denylist: Vec::new(),
         }
@@ -3462,6 +3756,7 @@ mod tests {
                     "ok": true,
                 }),
                 sampling_requested: false,
+                sampling_model_capability: None,
                 egress_host_requested: None,
             }),
             ..Default::default()
@@ -3482,12 +3777,73 @@ mod tests {
     }
 
     #[test]
+    fn invocation_blocks_expired_oauth_grant_with_repair_hint_before_transport() {
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut manifest = manifest();
+        manifest.oauth_required = true;
+        manifest.oauth_grant = Some(McpOAuthGrant {
+            grant_id: "grant.docs.oauth.01".to_owned(),
+            access_token_vault_ref: "global/mcp.docs.access".to_owned(),
+            refresh_token_vault_ref: Some("global/mcp.docs.refresh".to_owned()),
+            metadata_vault_ref: "global/mcp.docs.grant".to_owned(),
+            scopes: vec!["docs.read".to_owned()],
+            expires_at_unix_ms: Some(1),
+            rotation_id: Some("rotation-1".to_owned()),
+            issued_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            revoked_at_unix_ms: None,
+        });
+        let mut broker = McpBroker::new(policy());
+        broker.register_manifest(manifest).expect("manifest should register");
+        broker.start_server("docs", &transport).expect("server should start");
+        broker.discover_tools("docs", &transport).expect("discovery should run");
+
+        let outcome = broker
+            .invoke_tool(invocation_request(), &transport)
+            .expect("expired grant should be attested");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.policy_outcome, "mcp.oauth_grant_expired");
+        assert_eq!(
+            outcome.output_json["repair_hint"],
+            "run `palyra mcp login docs` to refresh the MCP OAuth grant"
+        );
+        assert_eq!(transport.call_count.get(), 0);
+    }
+
+    #[test]
+    fn expired_oauth_grant_produces_doctor_finding() {
+        let mut manifest = manifest();
+        manifest.oauth_required = true;
+        manifest.oauth_grant = Some(McpOAuthGrant {
+            grant_id: "grant.docs.oauth.01".to_owned(),
+            access_token_vault_ref: "global/mcp.docs.access".to_owned(),
+            refresh_token_vault_ref: None,
+            metadata_vault_ref: "global/mcp.docs.grant".to_owned(),
+            scopes: Vec::new(),
+            expires_at_unix_ms: Some(99),
+            rotation_id: None,
+            issued_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            revoked_at_unix_ms: None,
+        });
+
+        let findings = mcp_oauth_grant_doctor_findings(&[manifest], 100);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "mcp.oauth_grant_expired");
+        assert!(findings[0].fix_hint.contains("palyra mcp login docs"));
+    }
+
+    #[test]
     fn invocation_rejects_sampling_and_quarantines_after_repeated_violations() {
         let transport = FakeTransport {
             tools: vec![discovered_tool("search")],
             response: Some(McpToolResponse {
                 output: json!({"ok": true}),
                 sampling_requested: true,
+                sampling_model_capability: Some("model:gpt-5".to_owned()),
                 egress_host_requested: None,
             }),
             ..Default::default()
@@ -3513,12 +3869,47 @@ mod tests {
     }
 
     #[test]
+    fn invocation_allows_sampling_only_for_explicit_model_capability() {
+        let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
+            response: Some(McpToolResponse {
+                output: json!({"ok": true}),
+                sampling_requested: true,
+                sampling_model_capability: Some("model:gpt-5".to_owned()),
+                egress_host_requested: None,
+            }),
+            ..Default::default()
+        };
+        let mut manifest = manifest();
+        manifest.sampling_policy = McpSamplingPolicy {
+            mode: McpSamplingMode::Allowlist,
+            allowed_model_capabilities: vec!["model:gpt-5".to_owned()],
+        };
+        let mut broker = McpBroker::new(policy());
+        broker.register_manifest(manifest).expect("manifest should register");
+        broker.start_server("docs", &transport).expect("server should start");
+        broker.discover_tools("docs", &transport).expect("discovery should run");
+
+        let outcome = broker
+            .invoke_tool(invocation_request(), &transport)
+            .expect("allowlisted sampling request should be attested");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.attestation.sampling_model_capability.as_deref(), Some("model:gpt-5"));
+        assert_eq!(
+            broker.state("docs").expect("state should remain healthy"),
+            McpServerLifecycleState::Healthy
+        );
+    }
+
+    #[test]
     fn invocation_rejects_egress_outside_allowlist_and_large_output() {
         let transport = FakeTransport {
             tools: vec![discovered_tool("search")],
             response: Some(McpToolResponse {
                 output: json!({"data": "x".repeat(2048)}),
                 sampling_requested: false,
+                sampling_model_capability: None,
                 egress_host_requested: Some("evil.example".to_owned()),
             }),
             ..Default::default()
@@ -3537,6 +3928,7 @@ mod tests {
             response: Some(McpToolResponse {
                 output: json!({"data": "x".repeat(2048)}),
                 sampling_requested: false,
+                sampling_model_capability: None,
                 egress_host_requested: Some("api.example.com".to_owned()),
             }),
             ..Default::default()

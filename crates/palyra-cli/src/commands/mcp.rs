@@ -7,18 +7,22 @@
 
 use std::{
     collections::HashSet,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
-use palyra_vault::VaultRef;
+use palyra_vault::{Vault, VaultRef, VaultScope};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tonic::Request;
 
 use crate::cli::{
-    AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpEgressPolicyArg,
-    McpRegistryMutateArgs, McpRegistryToggleArgs, McpStatusArgs, McpSubcommand, McpTransportArg,
+    AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpEgressPolicyArg, McpLoginArgs,
+    McpLogoutArgs, McpRegistryMutateArgs, McpRegistryToggleArgs, McpSamplingModeArg, McpStatusArgs,
+    McpSubcommand, McpTransportArg,
 };
 use crate::*;
 
@@ -62,6 +66,8 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
         McpSubcommand::Status(args) => run_mcp_runtime_status(args),
         McpSubcommand::List { path, json } => run_mcp_registry_list(path, json),
         McpSubcommand::Show { id, path, json } => run_mcp_registry_show(path, &id, json),
+        McpSubcommand::Login(args) => run_mcp_login(args),
+        McpSubcommand::Logout(args) => run_mcp_logout(args),
         McpSubcommand::Add(args) => run_mcp_registry_add(args),
         McpSubcommand::Set(args) => run_mcp_registry_set(args),
         McpSubcommand::Enable(args) => run_mcp_registry_toggle(args, true),
@@ -178,6 +184,149 @@ fn run_mcp_registry_show(path: Option<String>, id: &str, json: bool) -> Result<(
         json_string(&server, "transport").unwrap_or("unknown")
     );
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+#[derive(Debug, Deserialize)]
+struct McpOAuthLoginTokenInput {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    expires_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    rotation_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct McpOAuthLoginOptions<'a> {
+    scopes: &'a [String],
+    expires_at_unix_ms: Option<i64>,
+    rotation_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpOAuthGrantLoginOutcome {
+    server_id: String,
+    grant_id: String,
+    access_token_vault_ref: String,
+    refresh_token_vault_ref: Option<String>,
+    metadata_vault_ref: String,
+    scopes: Vec<String>,
+    expires_at_unix_ms: Option<i64>,
+    rotation_id: Option<String>,
+    issued_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct McpOAuthGrantVaultMetadata<'a> {
+    schema_version: u32,
+    server_id: &'a str,
+    grant_id: &'a str,
+    access_token_vault_ref: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token_vault_ref: Option<&'a str>,
+    metadata_vault_ref: &'a str,
+    scopes: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation_id: Option<&'a str>,
+    issued_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+fn run_mcp_login(args: McpLoginArgs) -> Result<()> {
+    let path = resolve_config_path(args.path.clone(), true)?;
+    let path_ref = Path::new(&path);
+    let (mut document, _) = load_document_from_existing_path(path_ref)
+        .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let input = read_mcp_oauth_login_token_input(args.token_json_stdin)?;
+    let options = McpOAuthLoginOptions {
+        scopes: args.scopes.as_slice(),
+        expires_at_unix_ms: args.expires_at_unix_ms,
+        rotation_id: args.rotation_id.as_deref(),
+    };
+    let vault = Vault::open_default().context("failed to open vault for MCP OAuth grant")?;
+    let now_unix_ms = current_unix_ms()?;
+    let outcome = login_mcp_server_in_document(
+        &mut document,
+        args.id.as_str(),
+        &input,
+        &options,
+        &vault,
+        now_unix_ms,
+    )?;
+    persist_mcp_registry_document(path_ref, &document, args.backups)?;
+    let payload = json!({
+        "source": path_ref.display().to_string(),
+        "id": outcome.server_id,
+        "grant_id": outcome.grant_id,
+        "oauth_required": true,
+        "access_token_vault_ref_configured": true,
+        "refresh_token_vault_ref_configured": outcome.refresh_token_vault_ref.is_some(),
+        "metadata_vault_ref_configured": true,
+        "scopes": outcome.scopes,
+        "expires_at_unix_ms": outcome.expires_at_unix_ms,
+        "rotation_id": outcome.rotation_id,
+        "updated_at_unix_ms": outcome.updated_at_unix_ms,
+        "backups": args.backups,
+    });
+    if output::preferred_json(args.json) {
+        output::print_json_pretty(&payload, "failed to encode MCP login outcome as JSON")
+    } else {
+        println!(
+            "mcp.login id={} grant_id={} source={} expires_at_unix_ms={} backups={}",
+            payload["id"].as_str().unwrap_or("unknown"),
+            payload["grant_id"].as_str().unwrap_or("unknown"),
+            path_ref.display(),
+            payload["expires_at_unix_ms"]
+                .as_i64()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            args.backups
+        );
+        std::io::stdout().flush().context("stdout flush failed")
+    }
+}
+
+fn run_mcp_logout(args: McpLogoutArgs) -> Result<()> {
+    let path = resolve_config_path(args.path.clone(), true)?;
+    let path_ref = Path::new(&path);
+    let (mut document, _) = load_document_from_existing_path(path_ref)
+        .with_context(|| format!("failed to parse {}", path_ref.display()))?;
+    canonicalize_mcp_registry_section(&mut document)?;
+    let vault = Vault::open_default().context("failed to open vault for MCP OAuth revoke")?;
+    let now_unix_ms = current_unix_ms()?;
+    let outcome =
+        logout_mcp_server_in_document(&mut document, args.id.as_str(), &vault, now_unix_ms)?;
+    persist_mcp_registry_document(path_ref, &document, args.backups)?;
+    let payload = json!({
+        "source": path_ref.display().to_string(),
+        "id": outcome["server_id"].clone(),
+        "grant_id": outcome["grant_id"].clone(),
+        "revoked_at_unix_ms": now_unix_ms,
+        "deleted_secret_count": outcome["deleted_secret_count"].clone(),
+        "audit_event": outcome["audit_event"].clone(),
+        "backups": args.backups,
+    });
+    if output::preferred_json(args.json) {
+        output::print_json_pretty(&payload, "failed to encode MCP logout outcome as JSON")
+    } else {
+        println!(
+            "mcp.logout id={} grant_id={} revoked_at_unix_ms={} deleted_secret_count={} source={} backups={}",
+            payload["id"].as_str().unwrap_or("unknown"),
+            payload["grant_id"].as_str().unwrap_or("unknown"),
+            now_unix_ms,
+            payload["deleted_secret_count"].as_u64().unwrap_or_default(),
+            path_ref.display(),
+            args.backups
+        );
+        std::io::stdout().flush().context("stdout flush failed")
+    }
 }
 
 fn run_mcp_registry_add(args: McpRegistryMutateArgs) -> Result<()> {
@@ -368,6 +517,12 @@ fn mcp_server_table(args: &McpRegistryMutateArgs) -> Result<toml::Value> {
             string_array_toml(args.egress_allowlist.as_slice()),
         );
     }
+    if args.oauth_required {
+        table.insert("oauth_required".to_owned(), toml::Value::Boolean(true));
+    }
+    if let Some(sampling_policy) = mcp_sampling_policy_table(args)? {
+        table.insert("sampling_policy".to_owned(), sampling_policy);
+    }
     if !args.tool_allowlist.is_empty() {
         table
             .insert("tool_allowlist".to_owned(), string_array_toml(args.tool_allowlist.as_slice()));
@@ -442,6 +597,16 @@ fn validate_mcp_transport_args(args: &McpRegistryMutateArgs) -> Result<()> {
         && args.egress_allowlist.is_empty()
     {
         anyhow::bail!("--egress-host is required when --egress-policy allowlist");
+    }
+    if matches!(args.sampling_mode, McpSamplingModeArg::Allowlist)
+        && args.sampling_model_capabilities.is_empty()
+    {
+        anyhow::bail!("--sampling-model-capability is required when --sampling-mode allowlist");
+    }
+    if matches!(args.sampling_mode, McpSamplingModeArg::Deny)
+        && !args.sampling_model_capabilities.is_empty()
+    {
+        anyhow::bail!("--sampling-model-capability requires --sampling-mode allowlist");
     }
     Ok(())
 }
@@ -538,12 +703,313 @@ fn parse_env_vault_ref_tables(raw_refs: &[String]) -> Result<Vec<toml::Value>> {
         .collect()
 }
 
+fn mcp_sampling_policy_table(args: &McpRegistryMutateArgs) -> Result<Option<toml::Value>> {
+    if matches!(args.sampling_mode, McpSamplingModeArg::Deny)
+        && args.sampling_model_capabilities.is_empty()
+    {
+        return Ok(None);
+    }
+    let mut table = toml::map::Map::new();
+    table.insert("mode".to_owned(), toml::Value::String(args.sampling_mode.as_str().to_owned()));
+    if !args.sampling_model_capabilities.is_empty() {
+        let capabilities = args
+            .sampling_model_capabilities
+            .iter()
+            .map(|value| normalize_mcp_model_capability(value.as_str()))
+            .collect::<Result<Vec<_>>>()?;
+        table.insert("allowed_model_capabilities".to_owned(), string_array_toml(&capabilities));
+    }
+    Ok(Some(toml::Value::Table(table)))
+}
+
+fn read_mcp_oauth_login_token_input(token_json_stdin: bool) -> Result<McpOAuthLoginTokenInput> {
+    if !token_json_stdin {
+        anyhow::bail!(
+            "MCP OAuth login requires --token-json-stdin so tokens are not passed through argv"
+        );
+    }
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .context("failed to read MCP OAuth token JSON from stdin")?;
+    serde_json::from_str(buffer.as_str()).context("failed to parse MCP OAuth token JSON")
+}
+
+fn login_mcp_server_in_document(
+    document: &mut toml::Value,
+    id: &str,
+    input: &McpOAuthLoginTokenInput,
+    options: &McpOAuthLoginOptions<'_>,
+    vault: &Vault,
+    now_unix_ms: i64,
+) -> Result<McpOAuthGrantLoginOutcome> {
+    let server_id = normalize_mcp_config_identifier(id, "id")?;
+    let outcome = store_mcp_oauth_grant(server_id.as_str(), input, options, vault, now_unix_ms)?;
+    let server = mcp_server_entry_mut(document, server_id.as_str())?
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` is not configured"))?;
+    let table = server
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` is not a TOML table"))?;
+    table.insert("oauth_required".to_owned(), toml::Value::Boolean(true));
+    table.insert("oauth_grant".to_owned(), mcp_oauth_grant_toml(&outcome));
+    Ok(outcome)
+}
+
+fn logout_mcp_server_in_document(
+    document: &mut toml::Value,
+    id: &str,
+    vault: &Vault,
+    now_unix_ms: i64,
+) -> Result<Value> {
+    let server_id = normalize_mcp_config_identifier(id, "id")?;
+    let server = mcp_server_entry_mut(document, server_id.as_str())?
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` is not configured"))?;
+    let table = server
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` is not a TOML table"))?;
+    let grant = table
+        .get_mut("oauth_grant")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` does not have an OAuth grant"))?;
+    let grant_id = grant
+        .get("grant_id")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow!("MCP server `{server_id}` OAuth grant is missing grant_id"))?
+        .to_owned();
+    let vault_refs = [
+        grant.get("access_token_vault_ref").and_then(toml::Value::as_str),
+        grant.get("refresh_token_vault_ref").and_then(toml::Value::as_str),
+        grant.get("metadata_vault_ref").and_then(toml::Value::as_str),
+    ];
+    let mut deleted_secret_count = 0_u64;
+    for vault_ref in vault_refs.into_iter().flatten() {
+        let parsed = VaultRef::parse(vault_ref)
+            .with_context(|| format!("MCP server `{server_id}` has invalid OAuth vault ref"))?;
+        if vault
+            .delete_secret(&parsed.scope, parsed.key.as_str())
+            .with_context(|| format!("failed to delete OAuth grant secret for `{server_id}`"))?
+        {
+            deleted_secret_count = deleted_secret_count.saturating_add(1);
+        }
+    }
+    grant.insert("revoked_at_unix_ms".to_owned(), toml::Value::Integer(now_unix_ms));
+    grant.insert("updated_at_unix_ms".to_owned(), toml::Value::Integer(now_unix_ms));
+    Ok(json!({
+        "server_id": server_id,
+        "grant_id": grant_id,
+        "deleted_secret_count": deleted_secret_count,
+        "audit_event": {
+            "event_type": "mcp.oauth_grant_revoked",
+            "server_id": server_id,
+            "grant_id": grant_id,
+            "revoked_at_unix_ms": now_unix_ms,
+            "deleted_secret_count": deleted_secret_count,
+        }
+    }))
+}
+
+fn store_mcp_oauth_grant(
+    server_id: &str,
+    input: &McpOAuthLoginTokenInput,
+    options: &McpOAuthLoginOptions<'_>,
+    vault: &Vault,
+    now_unix_ms: i64,
+) -> Result<McpOAuthGrantLoginOutcome> {
+    validate_mcp_oauth_secret(input.access_token.as_str(), "access_token")?;
+    let refresh_token = input
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(refresh_token) = refresh_token.as_deref() {
+        validate_mcp_oauth_secret(refresh_token, "refresh_token")?;
+    }
+    let scopes = normalize_mcp_oauth_scopes(options.scopes, input.scopes.as_slice())?;
+    let expires_at_unix_ms = options.expires_at_unix_ms.or(input.expires_at_unix_ms);
+    if expires_at_unix_ms.is_some_and(|value| value < 0) {
+        anyhow::bail!("expires_at_unix_ms must be a non-negative unix millisecond timestamp");
+    }
+    let rotation_id = options.rotation_id.map(str::to_owned).or_else(|| input.rotation_id.clone());
+    let rotation_id = rotation_id
+        .as_deref()
+        .map(|value| normalize_mcp_config_identifier(value, "rotation_id"))
+        .transpose()?;
+    let key_prefix = mcp_oauth_vault_key_prefix(server_id);
+    let access_key = format!("{key_prefix}.access");
+    let refresh_key = format!("{key_prefix}.refresh");
+    let metadata_key = format!("{key_prefix}.grant");
+    let access_token_vault_ref = format!("global/{access_key}");
+    let refresh_token_vault_ref = refresh_token.as_ref().map(|_| format!("global/{refresh_key}"));
+    let metadata_vault_ref = format!("global/{metadata_key}");
+    let grant_id = format!("{key_prefix}.oauth");
+
+    vault
+        .put_secret(&VaultScope::Global, access_key.as_str(), input.access_token.as_bytes())
+        .context("failed to store MCP OAuth access token in vault")?;
+    if let Some(refresh_token) = refresh_token.as_deref() {
+        if let Err(error) =
+            vault.put_secret(&VaultScope::Global, refresh_key.as_str(), refresh_token.as_bytes())
+        {
+            let _ = vault.delete_secret(&VaultScope::Global, access_key.as_str());
+            return Err(error).context("failed to store MCP OAuth refresh token in vault");
+        }
+    }
+
+    let outcome = McpOAuthGrantLoginOutcome {
+        server_id: server_id.to_owned(),
+        grant_id,
+        access_token_vault_ref,
+        refresh_token_vault_ref,
+        metadata_vault_ref,
+        scopes,
+        expires_at_unix_ms,
+        rotation_id,
+        issued_at_unix_ms: now_unix_ms,
+        updated_at_unix_ms: now_unix_ms,
+    };
+    let metadata = McpOAuthGrantVaultMetadata {
+        schema_version: 1,
+        server_id: outcome.server_id.as_str(),
+        grant_id: outcome.grant_id.as_str(),
+        access_token_vault_ref: outcome.access_token_vault_ref.as_str(),
+        refresh_token_vault_ref: outcome.refresh_token_vault_ref.as_deref(),
+        metadata_vault_ref: outcome.metadata_vault_ref.as_str(),
+        scopes: outcome.scopes.as_slice(),
+        expires_at_unix_ms: outcome.expires_at_unix_ms,
+        rotation_id: outcome.rotation_id.as_deref(),
+        issued_at_unix_ms: outcome.issued_at_unix_ms,
+        updated_at_unix_ms: outcome.updated_at_unix_ms,
+    };
+    let metadata_bytes = serde_json::to_vec(&metadata)
+        .context("failed to encode MCP OAuth grant metadata for vault")?;
+    if let Err(error) =
+        vault.put_secret(&VaultScope::Global, metadata_key.as_str(), metadata_bytes.as_slice())
+    {
+        let _ = vault.delete_secret(&VaultScope::Global, access_key.as_str());
+        let _ = vault.delete_secret(&VaultScope::Global, refresh_key.as_str());
+        return Err(error).context("failed to store MCP OAuth grant metadata in vault");
+    }
+    Ok(outcome)
+}
+
+fn mcp_oauth_grant_toml(outcome: &McpOAuthGrantLoginOutcome) -> toml::Value {
+    let mut table = toml::map::Map::new();
+    table.insert("grant_id".to_owned(), toml::Value::String(outcome.grant_id.clone()));
+    table.insert(
+        "access_token_vault_ref".to_owned(),
+        toml::Value::String(outcome.access_token_vault_ref.clone()),
+    );
+    if let Some(refresh_token_vault_ref) = outcome.refresh_token_vault_ref.as_ref() {
+        table.insert(
+            "refresh_token_vault_ref".to_owned(),
+            toml::Value::String(refresh_token_vault_ref.clone()),
+        );
+    }
+    table.insert(
+        "metadata_vault_ref".to_owned(),
+        toml::Value::String(outcome.metadata_vault_ref.clone()),
+    );
+    if !outcome.scopes.is_empty() {
+        table.insert("scopes".to_owned(), string_array_toml(outcome.scopes.as_slice()));
+    }
+    if let Some(expires_at_unix_ms) = outcome.expires_at_unix_ms {
+        table.insert("expires_at_unix_ms".to_owned(), toml::Value::Integer(expires_at_unix_ms));
+    }
+    if let Some(rotation_id) = outcome.rotation_id.as_ref() {
+        table.insert("rotation_id".to_owned(), toml::Value::String(rotation_id.clone()));
+    }
+    table.insert("issued_at_unix_ms".to_owned(), toml::Value::Integer(outcome.issued_at_unix_ms));
+    table.insert("updated_at_unix_ms".to_owned(), toml::Value::Integer(outcome.updated_at_unix_ms));
+    toml::Value::Table(table)
+}
+
+fn normalize_mcp_oauth_scopes(
+    cli_scopes: &[String],
+    input_scopes: &[String],
+) -> Result<Vec<String>> {
+    let raw_scopes = if cli_scopes.is_empty() { input_scopes } else { cli_scopes };
+    let mut scopes = Vec::new();
+    for raw in raw_scopes {
+        let scope = normalize_mcp_model_capability(raw.as_str())?;
+        if !scopes.iter().any(|existing| existing == &scope) {
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
+}
+
+fn validate_mcp_oauth_secret(value: &str, field_name: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        anyhow::bail!("{field_name} cannot be empty");
+    }
+    if value.len() > 64 * 1024 {
+        anyhow::bail!("{field_name} exceeds maximum bytes");
+    }
+    Ok(())
+}
+
+fn normalize_mcp_model_capability(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        anyhow::bail!("model capability cannot be empty");
+    }
+    if value.len() > 128 {
+        anyhow::bail!("model capability exceeds maximum bytes ({} > 128)", value.len());
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
+    {
+        anyhow::bail!("model capability contains invalid identifier `{value}`");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn mcp_oauth_vault_key_prefix(server_id: &str) -> String {
+    let hash = sha256_hex(server_id.as_bytes());
+    let slug = server_id
+        .chars()
+        .map(
+            |ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                    ch
+                } else {
+                    '_'
+                }
+            },
+        )
+        .take(32)
+        .collect::<String>();
+    let slug = slug.trim_matches('_');
+    let slug = if slug.is_empty() { "server" } else { slug };
+    format!("mcp.{slug}.{}", &hash[..12])
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn current_unix_ms() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?;
+    Ok(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+}
+
 fn string_array_toml(values: &[String]) -> toml::Value {
     toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
 fn toml_server_to_json(value: &toml::Value) -> Result<Value> {
-    serde_json::to_value(value).context("failed to encode MCP registry entry as JSON")
+    let mut server =
+        serde_json::to_value(value).context("failed to encode MCP registry entry as JSON")?;
+    let now_unix_ms = current_unix_ms().unwrap_or_default();
+    let findings = mcp_server_oauth_doctor_findings(&server, now_unix_ms);
+    if !findings.is_empty() {
+        server["doctor_findings"] = Value::Array(findings);
+    }
+    Ok(server)
 }
 
 fn toml_table_string<'a>(value: &'a toml::Value, key: &str) -> Option<&'a str> {
@@ -556,6 +1022,42 @@ fn json_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn json_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key)?.as_bool()
+}
+
+fn mcp_server_oauth_doctor_findings(server: &Value, now_unix_ms: i64) -> Vec<Value> {
+    if json_bool(server, "oauth_required") != Some(true) {
+        return Vec::new();
+    }
+    let id = json_string(server, "id").unwrap_or("unknown");
+    let Some(grant) = server.get("oauth_grant").and_then(Value::as_object) else {
+        return vec![json!({
+            "severity": "error",
+            "code": "mcp.oauth_grant_missing",
+            "message": "MCP OAuth grant is missing",
+            "repair_hint": format!("run `palyra mcp login {id}`"),
+        })];
+    };
+    if grant.get("revoked_at_unix_ms").and_then(Value::as_i64).is_some() {
+        return vec![json!({
+            "severity": "error",
+            "code": "mcp.oauth_grant_revoked",
+            "message": "MCP OAuth grant was revoked",
+            "repair_hint": format!("run `palyra mcp login {id}`"),
+        })];
+    }
+    if grant
+        .get("expires_at_unix_ms")
+        .and_then(Value::as_i64)
+        .is_some_and(|expires_at| expires_at <= now_unix_ms)
+    {
+        return vec![json!({
+            "severity": "error",
+            "code": "mcp.oauth_grant_expired",
+            "message": "MCP OAuth grant has expired",
+            "repair_hint": format!("run `palyra mcp login {id}`"),
+        })];
+    }
+    Vec::new()
 }
 
 fn json_u64(value: &Value, key: &str) -> u64 {
@@ -1983,6 +2485,9 @@ mod tests {
             approval_profile: McpApprovalProfileArg::RequireApproval,
             egress_policy: McpEgressPolicyArg::DenyAll,
             egress_allowlist: Vec::new(),
+            oauth_required: false,
+            sampling_mode: McpSamplingModeArg::Deny,
+            sampling_model_capabilities: Vec::new(),
             tool_allowlist: vec!["search".to_owned()],
             tool_denylist: Vec::new(),
             enabled: false,
@@ -2049,6 +2554,75 @@ mod tests {
         let error = validate_mcp_registry_document(&document)
             .expect_err("inline env table should be rejected before persist");
         assert!(error.to_string().contains("env_vault_refs"));
+    }
+
+    #[test]
+    fn mcp_login_mock_flow_stores_tokens_in_vault_and_logout_revokes() {
+        let mut document = toml::Value::Table(toml::map::Map::new());
+        mcp_servers_array_mut(&mut document)
+            .expect("mcp section should be created")
+            .push(mcp_server_table(&stdio_registry_args()).expect("server should encode"));
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let vault = Vault::open_with_config(palyra_vault::VaultConfig {
+            root: Some(temp.path().join("vault")),
+            identity_store_root: Some(temp.path().join("identity")),
+            backend_preference: palyra_vault::BackendPreference::EncryptedFile,
+            ..palyra_vault::VaultConfig::default()
+        })
+        .expect("test vault should open");
+        let input = McpOAuthLoginTokenInput {
+            access_token: "access-token-secret".to_owned(),
+            refresh_token: Some("refresh-token-secret".to_owned()),
+            scopes: vec!["Docs.Read".to_owned()],
+            expires_at_unix_ms: Some(1_730_000_000_000),
+            rotation_id: Some("rotation-1".to_owned()),
+        };
+        let options =
+            McpOAuthLoginOptions { scopes: &[], expires_at_unix_ms: None, rotation_id: None };
+
+        let outcome = login_mcp_server_in_document(
+            &mut document,
+            "docs",
+            &input,
+            &options,
+            &vault,
+            1_720_000_000_000,
+        )
+        .expect("mock login should store a vault-backed grant");
+
+        assert_eq!(outcome.server_id, "docs");
+        assert_eq!(outcome.scopes, vec!["docs.read".to_owned()]);
+        let access_ref =
+            VaultRef::parse(outcome.access_token_vault_ref.as_str()).expect("ref should parse");
+        let access_token = vault
+            .get_secret(&access_ref.scope, access_ref.key.as_str())
+            .expect("access token should be stored");
+        assert_eq!(access_token, b"access-token-secret");
+        let metadata_ref =
+            VaultRef::parse(outcome.metadata_vault_ref.as_str()).expect("ref should parse");
+        let metadata = vault
+            .get_secret(&metadata_ref.scope, metadata_ref.key.as_str())
+            .expect("metadata should be stored");
+        let metadata_json: Value =
+            serde_json::from_slice(metadata.as_slice()).expect("metadata should be JSON");
+        assert_eq!(metadata_json["server_id"], "docs");
+        assert!(!metadata_json.to_string().contains("access-token-secret"));
+
+        let logout =
+            logout_mcp_server_in_document(&mut document, "docs", &vault, 1_720_000_001_000)
+                .expect("logout should revoke the grant");
+        assert_eq!(logout["audit_event"]["event_type"], "mcp.oauth_grant_revoked");
+        assert_eq!(logout["deleted_secret_count"], 3);
+        assert!(vault.get_secret(&access_ref.scope, access_ref.key.as_str()).is_err());
+        let server = find_mcp_server_entry(&document, "docs")
+            .expect("server lookup should succeed")
+            .expect("server should remain configured");
+        assert_eq!(
+            server.pointer("/oauth_grant/revoked_at_unix_ms").and_then(Value::as_i64),
+            Some(1_720_000_001_000)
+        );
+        let findings = mcp_server_oauth_doctor_findings(&server, 1_720_000_002_000);
+        assert_eq!(findings[0]["code"], "mcp.oauth_grant_revoked");
     }
 
     #[test]

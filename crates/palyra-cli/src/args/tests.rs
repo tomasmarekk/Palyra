@@ -16,11 +16,11 @@ use super::{
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
     DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
-    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpEgressPolicyArg,
-    McpRegistryMutateArgs, McpStatusArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg,
-    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand,
-    ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg,
-    ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
+    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpEgressPolicyArg, McpLoginArgs,
+    McpRegistryMutateArgs, McpSamplingModeArg, McpStatusArgs, McpSubcommand, McpTransportArg,
+    McpTrustLevelArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg,
+    MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
+    ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
     PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg, ProfileModeArg,
@@ -192,9 +192,47 @@ fn parse_mcp_add_registry_server() {
                     approval_profile: McpApprovalProfileArg::RequireApproval,
                     egress_policy: McpEgressPolicyArg::DenyAll,
                     egress_allowlist: Vec::new(),
+                    oauth_required: false,
+                    sampling_mode: McpSamplingModeArg::Deny,
+                    sampling_model_capabilities: Vec::new(),
                     tool_allowlist: vec!["search".to_owned()],
                     tool_denylist: Vec::new(),
                     enabled: true,
+                    backups: 5,
+                    json: true,
+                })
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_mcp_login_token_json_stdin() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "mcp",
+        "login",
+        "docs",
+        "--token-json-stdin",
+        "--scope",
+        "docs.read",
+        "--expires-at-unix-ms",
+        "1730000000000",
+        "--rotation-id",
+        "rotation-1",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Login(McpLoginArgs {
+                    id: "docs".to_owned(),
+                    path: None,
+                    token_json_stdin: true,
+                    scopes: vec!["docs.read".to_owned()],
+                    expires_at_unix_ms: Some(1_730_000_000_000),
+                    rotation_id: Some("rotation-1".to_owned()),
                     backups: 5,
                     json: true,
                 })

@@ -574,6 +574,9 @@ pub struct McpServerConfig {
     pub approval_profile: McpServerApprovalProfile,
     pub egress_policy: McpServerEgressPolicy,
     pub egress_allowlist: Vec<String>,
+    pub oauth_required: bool,
+    pub oauth_grant: Option<McpServerOAuthGrant>,
+    pub sampling_policy: McpServerSamplingPolicy,
     pub tool_allowlist: Vec<String>,
     pub tool_denylist: Vec<String>,
 }
@@ -583,6 +586,52 @@ pub struct McpServerConfig {
 pub struct McpServerEnvVaultRef {
     pub name: String,
     pub vault_ref: String,
+}
+
+/// Vault-backed OAuth grant metadata for an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerOAuthGrant {
+    pub grant_id: String,
+    pub access_token_vault_ref: String,
+    pub refresh_token_vault_ref: Option<String>,
+    pub metadata_vault_ref: String,
+    pub scopes: Vec<String>,
+    pub expires_at_unix_ms: Option<i64>,
+    pub rotation_id: Option<String>,
+    pub issued_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+/// Sampling posture for a configured MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerSamplingPolicy {
+    pub mode: McpServerSamplingMode,
+    pub allowed_model_capabilities: Vec<String>,
+}
+
+impl Default for McpServerSamplingPolicy {
+    fn default() -> Self {
+        Self { mode: McpServerSamplingMode::Deny, allowed_model_capabilities: Vec::new() }
+    }
+}
+
+/// Sampling request decision mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerSamplingMode {
+    Deny,
+    Allowlist,
+}
+
+impl McpServerSamplingMode {
+    /// Returns the canonical config value for this sampling mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allowlist => "allowlist",
+        }
+    }
 }
 
 /// Operator-assigned trust tier for an external MCP server.

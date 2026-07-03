@@ -30,9 +30,9 @@ use palyra_common::{
     },
     daemon_config_schema::{
         FileAgentHarnessConfig, FileDoctorCheckConfig, FileExecutionBackendProfileConfig,
-        FileMcpCommandValue, FileMcpEnvVaultRefConfig, FileMcpServerConfig,
-        FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
-        FileRetrievalSourceScoringProfile, RootFileConfig,
+        FileMcpCommandValue, FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig,
+        FileMcpSamplingPolicyConfig, FileMcpServerConfig, FileMemoryRetrievalConfig,
+        FileObservabilityExporterConfig, FileRetrievalSourceScoringProfile, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
@@ -2649,6 +2649,12 @@ fn parse_mcp_server_config(
         128,
         253,
     )?;
+    let oauth_grant =
+        parse_mcp_oauth_grant(entry.oauth_grant, format!("{source_name}.oauth_grant").as_str())?;
+    let sampling_policy = parse_mcp_sampling_policy(
+        entry.sampling_policy,
+        format!("{source_name}.sampling_policy").as_str(),
+    )?;
     let tool_allowlist = parse_optional_string_list(
         entry.tool_allowlist,
         format!("{source_name}.tool_allowlist").as_str(),
@@ -2691,6 +2697,11 @@ fn parse_mcp_server_config(
     if matches!(egress_policy, McpServerEgressPolicy::Allowlist) && egress_allowlist.is_empty() {
         anyhow::bail!("{source_name}.egress_allowlist is required when egress_policy=allowlist");
     }
+    if entry.oauth_required.unwrap_or(false) && oauth_grant.is_none() {
+        anyhow::bail!(
+            "{source_name}.oauth_grant is required when oauth_required=true; run `palyra mcp login {id}`"
+        );
+    }
 
     Ok(McpServerConfig {
         id,
@@ -2704,6 +2715,9 @@ fn parse_mcp_server_config(
         approval_profile,
         egress_policy,
         egress_allowlist,
+        oauth_required: entry.oauth_required.unwrap_or(false),
+        oauth_grant,
+        sampling_policy,
         tool_allowlist,
         tool_denylist,
     })
@@ -2939,6 +2953,148 @@ fn parse_mcp_vault_ref(raw: Option<&str>, source_name: &str) -> Result<String> {
         anyhow::anyhow!("{source_name} contains invalid vault ref '{}': {error}", value)
     })?;
     Ok(value)
+}
+
+fn parse_required_vault_ref(raw: Option<&str>, source_name: &str) -> Result<String> {
+    let raw = raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required"))?;
+    let value = parse_non_empty_config_text(raw, source_name)?;
+    VaultRef::parse(value.as_str()).map_err(|error| {
+        anyhow::anyhow!("{source_name} contains invalid vault ref '{}': {error}", value)
+    })?;
+    Ok(value)
+}
+
+fn parse_mcp_oauth_grant(
+    raw: Option<FileMcpOAuthGrantConfig>,
+    source_name: &str,
+) -> Result<Option<McpServerOAuthGrant>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let grant_id = parse_registry_identifier(
+        raw.grant_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("{source_name}.grant_id is required"))?,
+        format!("{source_name}.grant_id").as_str(),
+    )?;
+    let access_token_vault_ref = parse_required_vault_ref(
+        raw.access_token_vault_ref.as_deref(),
+        format!("{source_name}.access_token_vault_ref").as_str(),
+    )?;
+    let refresh_token_vault_ref = raw
+        .refresh_token_vault_ref
+        .as_deref()
+        .map(|value| {
+            parse_required_vault_ref(
+                Some(value),
+                format!("{source_name}.refresh_token_vault_ref").as_str(),
+            )
+        })
+        .transpose()?;
+    let metadata_vault_ref = parse_required_vault_ref(
+        raw.metadata_vault_ref.as_deref(),
+        format!("{source_name}.metadata_vault_ref").as_str(),
+    )?;
+    let scopes =
+        parse_optional_string_list(raw.scopes, format!("{source_name}.scopes").as_str(), 64, 128)?;
+    let rotation_id = raw
+        .rotation_id
+        .as_deref()
+        .map(|value| {
+            parse_registry_identifier(value, format!("{source_name}.rotation_id").as_str())
+        })
+        .transpose()?;
+    let issued_at_unix_ms = raw.issued_at_unix_ms.unwrap_or(0);
+    let updated_at_unix_ms = raw.updated_at_unix_ms.unwrap_or(issued_at_unix_ms);
+    validate_mcp_grant_timestamp(
+        issued_at_unix_ms,
+        format!("{source_name}.issued_at_unix_ms").as_str(),
+    )?;
+    validate_mcp_grant_timestamp(
+        updated_at_unix_ms,
+        format!("{source_name}.updated_at_unix_ms").as_str(),
+    )?;
+    if let Some(expires_at_unix_ms) = raw.expires_at_unix_ms {
+        validate_mcp_grant_timestamp(
+            expires_at_unix_ms,
+            format!("{source_name}.expires_at_unix_ms").as_str(),
+        )?;
+    }
+    if let Some(revoked_at_unix_ms) = raw.revoked_at_unix_ms {
+        validate_mcp_grant_timestamp(
+            revoked_at_unix_ms,
+            format!("{source_name}.revoked_at_unix_ms").as_str(),
+        )?;
+    }
+    Ok(Some(McpServerOAuthGrant {
+        grant_id,
+        access_token_vault_ref,
+        refresh_token_vault_ref,
+        metadata_vault_ref,
+        scopes,
+        expires_at_unix_ms: raw.expires_at_unix_ms,
+        rotation_id,
+        issued_at_unix_ms,
+        updated_at_unix_ms,
+        revoked_at_unix_ms: raw.revoked_at_unix_ms,
+    }))
+}
+
+fn validate_mcp_grant_timestamp(value: i64, source_name: &str) -> Result<()> {
+    if value < 0 {
+        anyhow::bail!("{source_name} must be a non-negative unix millisecond timestamp");
+    }
+    Ok(())
+}
+
+fn parse_mcp_sampling_policy(
+    raw: Option<FileMcpSamplingPolicyConfig>,
+    source_name: &str,
+) -> Result<McpServerSamplingPolicy> {
+    let Some(raw) = raw else {
+        return Ok(McpServerSamplingPolicy::default());
+    };
+    let mode =
+        parse_mcp_sampling_mode(raw.mode.as_deref(), format!("{source_name}.mode").as_str())?;
+    let allowed_model_capabilities = parse_optional_string_list(
+        raw.allowed_model_capabilities,
+        format!("{source_name}.allowed_model_capabilities").as_str(),
+        64,
+        128,
+    )?
+    .into_iter()
+    .map(|value| normalize_mcp_model_capability(value.as_str(), source_name))
+    .collect::<Result<Vec<_>>>()?;
+    if matches!(mode, McpServerSamplingMode::Allowlist) && allowed_model_capabilities.is_empty() {
+        anyhow::bail!(
+            "{source_name}.allowed_model_capabilities is required when sampling_policy.mode=allowlist"
+        );
+    }
+    if matches!(mode, McpServerSamplingMode::Deny) && !allowed_model_capabilities.is_empty() {
+        anyhow::bail!(
+            "{source_name}.allowed_model_capabilities must be empty when sampling_policy.mode=deny"
+        );
+    }
+    Ok(McpServerSamplingPolicy { mode, allowed_model_capabilities })
+}
+
+fn parse_mcp_sampling_mode(raw: Option<&str>, source_name: &str) -> Result<McpServerSamplingMode> {
+    match raw.unwrap_or("deny").trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "deny" => Ok(McpServerSamplingMode::Deny),
+        "allowlist" => Ok(McpServerSamplingMode::Allowlist),
+        _ => anyhow::bail!("{source_name} must be one of: deny, allowlist"),
+    }
+}
+
+fn normalize_mcp_model_capability(raw: &str, source_name: &str) -> Result<String> {
+    let value = parse_non_empty_config_text(raw, source_name)?;
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
+    {
+        anyhow::bail!("{source_name} contains invalid model capability '{value}'");
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn parse_optional_string_list(
@@ -5037,8 +5193,9 @@ mod tests {
     use palyra_common::tool_catalog::ToolCatalogExposureMode;
     use palyra_common::{
         daemon_config_schema::{
-            FileMcpCommandValue, FileMcpServerConfig, FileModelProviderRegistryEntry,
-            FileModelProviderRegistryModel, RootFileConfig,
+            FileMcpCommandValue, FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig,
+            FileMcpServerConfig, FileModelProviderRegistryEntry, FileModelProviderRegistryModel,
+            RootFileConfig,
         },
         feature_rollouts::{
             FeatureRolloutSetting, FeatureRolloutSource, DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV,
@@ -5439,6 +5596,74 @@ mod tests {
             crate::config::McpServerApprovalProfile::RequireApproval
         );
         assert_eq!(server.egress_policy, crate::config::McpServerEgressPolicy::DenyAll);
+        assert!(!server.oauth_required);
+        assert!(server.oauth_grant.is_none());
+        assert_eq!(server.sampling_policy.mode, crate::config::McpServerSamplingMode::Deny);
+    }
+
+    #[test]
+    fn valid_mcp_oauth_grant_and_sampling_policy_parse_from_vault_refs() {
+        let server = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("Docs".to_owned()),
+                enabled: Some(true),
+                transport: Some("stdio".to_owned()),
+                command: Some(FileMcpCommandValue::Command("mcp-docs".to_owned())),
+                oauth_required: Some(true),
+                oauth_grant: Some(FileMcpOAuthGrantConfig {
+                    grant_id: Some("grant.docs.oauth".to_owned()),
+                    access_token_vault_ref: Some("global/mcp.docs.oauth_access".to_owned()),
+                    refresh_token_vault_ref: Some("global/mcp.docs.oauth_refresh".to_owned()),
+                    metadata_vault_ref: Some("global/mcp.docs.oauth_grant".to_owned()),
+                    scopes: Some(vec!["docs.read".to_owned()]),
+                    expires_at_unix_ms: Some(1_730_000_000_000),
+                    rotation_id: Some("rotation-1".to_owned()),
+                    issued_at_unix_ms: Some(1_720_000_000_000),
+                    updated_at_unix_ms: Some(1_720_000_000_001),
+                    revoked_at_unix_ms: None,
+                }),
+                sampling_policy: Some(FileMcpSamplingPolicyConfig {
+                    mode: Some("allowlist".to_owned()),
+                    allowed_model_capabilities: Some(vec!["Model:GPT-5".to_owned()]),
+                }),
+                ..Default::default()
+            },
+            0,
+            "mcp",
+        )
+        .expect("valid OAuth grant and sampling policy should parse");
+
+        assert!(server.oauth_required);
+        let grant = server.oauth_grant.expect("OAuth grant should parse");
+        assert_eq!(grant.grant_id, "grant.docs.oauth");
+        assert_eq!(grant.access_token_vault_ref, "global/mcp.docs.oauth_access");
+        assert_eq!(grant.scopes, vec!["docs.read".to_owned()]);
+        assert_eq!(grant.expires_at_unix_ms, Some(1_730_000_000_000));
+        assert_eq!(server.sampling_policy.mode, crate::config::McpServerSamplingMode::Allowlist);
+        assert_eq!(
+            server.sampling_policy.allowed_model_capabilities,
+            vec!["model:gpt-5".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_required_rejects_missing_grant() {
+        let error = parse_mcp_server_config(
+            FileMcpServerConfig {
+                id: Some("docs".to_owned()),
+                transport: Some("stdio".to_owned()),
+                command: Some(FileMcpCommandValue::Command("mcp-docs".to_owned())),
+                oauth_required: Some(true),
+                ..Default::default()
+            },
+            0,
+            "mcp",
+        )
+        .expect_err("OAuth-required MCP server without grant should fail closed");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("mcp.servers[0].oauth_grant"));
+        assert!(rendered.contains("palyra mcp login docs"));
     }
 
     #[test]

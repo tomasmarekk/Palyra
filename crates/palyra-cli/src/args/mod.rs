@@ -109,8 +109,9 @@ pub use ids::RequiredCommandIdArg;
 pub use init::{InitModeArg, InitTlsScaffoldArg};
 pub use jobs::JobsCommand;
 pub use mcp::{
-    McpApprovalProfileArg, McpCommand, McpEgressPolicyArg, McpRegistryMutateArgs,
-    McpRegistryToggleArgs, McpStatusArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg,
+    McpApprovalProfileArg, McpCommand, McpEgressPolicyArg, McpLoginArgs, McpLogoutArgs,
+    McpRegistryMutateArgs, McpRegistryToggleArgs, McpSamplingModeArg, McpStatusArgs, McpSubcommand,
+    McpTransportArg, McpTrustLevelArg,
 };
 pub use memory::{
     MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MemoryWorkspaceCommand,

@@ -41,6 +41,10 @@ pub enum McpSubcommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Store an OAuth grant for one external MCP server")]
+    Login(McpLoginArgs),
+    #[command(about = "Revoke an OAuth grant for one external MCP server")]
+    Logout(McpLogoutArgs),
     #[command(about = "Add one external MCP server to local config")]
     Add(McpRegistryMutateArgs),
     #[command(about = "Update one external MCP server in local config")]
@@ -76,6 +80,36 @@ pub struct McpStatusArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpLoginArgs {
+    pub id: String,
+    #[arg(long, help = "Edit this palyra.toml path")]
+    pub path: Option<String>,
+    #[arg(long, default_value_t = false, help = "Read OAuth token JSON from stdin")]
+    pub token_json_stdin: bool,
+    #[arg(long = "scope", help = "Repeatable OAuth scope override")]
+    pub scopes: Vec<String>,
+    #[arg(long, help = "OAuth access token expiry as unix milliseconds")]
+    pub expires_at_unix_ms: Option<i64>,
+    #[arg(long, help = "Opaque provider rotation metadata")]
+    pub rotation_id: Option<String>,
+    #[arg(long, default_value_t = 5, help = "Number of backup files to retain")]
+    pub backups: usize,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpLogoutArgs {
+    pub id: String,
+    #[arg(long, help = "Edit this palyra.toml path")]
+    pub path: Option<String>,
+    #[arg(long, default_value_t = 5, help = "Number of backup files to retain")]
+    pub backups: usize,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct McpRegistryMutateArgs {
     pub id: String,
     #[arg(long, help = "Edit this palyra.toml path")]
@@ -103,6 +137,12 @@ pub struct McpRegistryMutateArgs {
     pub egress_policy: McpEgressPolicyArg,
     #[arg(long = "egress-host", help = "Repeatable egress allowlist host")]
     pub egress_allowlist: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    pub oauth_required: bool,
+    #[arg(long, value_enum, default_value_t = McpSamplingModeArg::Deny)]
+    pub sampling_mode: McpSamplingModeArg,
+    #[arg(long = "sampling-model-capability", help = "Repeatable sampling model capability")]
+    pub sampling_model_capabilities: Vec<String>,
     #[arg(long = "tool-allow", help = "Repeatable raw MCP tool allowlist entry")]
     pub tool_allowlist: Vec<String>,
     #[arg(long = "tool-deny", help = "Repeatable raw MCP tool denylist entry")]
@@ -185,6 +225,21 @@ impl McpEgressPolicyArg {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::DenyAll => "deny_all",
+            Self::Allowlist => "allowlist",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum McpSamplingModeArg {
+    Deny,
+    Allowlist,
+}
+
+impl McpSamplingModeArg {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
             Self::Allowlist => "allowlist",
         }
     }

@@ -871,8 +871,35 @@ pub struct FileMcpServerConfig {
     pub approval_profile: Option<String>,
     pub egress_policy: Option<String>,
     pub egress_allowlist: Option<Vec<String>>,
+    pub oauth_required: Option<bool>,
+    pub oauth_grant: Option<FileMcpOAuthGrantConfig>,
+    pub sampling_policy: Option<FileMcpSamplingPolicyConfig>,
     pub tool_allowlist: Option<Vec<String>>,
     pub tool_denylist: Option<Vec<String>>,
+}
+
+/// OAuth grant descriptor for one external MCP server.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMcpOAuthGrantConfig {
+    pub grant_id: Option<String>,
+    pub access_token_vault_ref: Option<String>,
+    pub refresh_token_vault_ref: Option<String>,
+    pub metadata_vault_ref: Option<String>,
+    pub scopes: Option<Vec<String>>,
+    pub expires_at_unix_ms: Option<i64>,
+    pub rotation_id: Option<String>,
+    pub issued_at_unix_ms: Option<i64>,
+    pub updated_at_unix_ms: Option<i64>,
+    pub revoked_at_unix_ms: Option<i64>,
+}
+
+/// Sampling policy for one external MCP server.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMcpSamplingPolicyConfig {
+    pub mode: Option<String>,
+    pub allowed_model_capabilities: Option<Vec<String>>,
 }
 
 /// Stdio command declaration, accepting both legacy argv arrays and canonical command strings.
@@ -1757,9 +1784,23 @@ mod tests {
             trust_level = "workspace"
             approval_profile = "require_approval"
             egress_policy = "deny_all"
+            oauth_required = true
             [[mcp.servers.env_vault_refs]]
             name = "FILESYSTEM_TOKEN"
             vault_ref = "global/mcp-filesystem-token"
+            [mcp.servers.oauth_grant]
+            grant_id = "grant.filesystem.oauth"
+            access_token_vault_ref = "global/mcp-filesystem-access"
+            refresh_token_vault_ref = "global/mcp-filesystem-refresh"
+            metadata_vault_ref = "global/mcp-filesystem-grant"
+            scopes = ["filesystem.read"]
+            expires_at_unix_ms = 1730000000000
+            rotation_id = "rotation-1"
+            issued_at_unix_ms = 1720000000000
+            updated_at_unix_ms = 1720000001000
+            [mcp.servers.sampling_policy]
+            mode = "allowlist"
+            allowed_model_capabilities = ["model:gpt-5"]
 
             [execution_backend_profiles]
             mode = "disabled"
@@ -1822,6 +1863,18 @@ mod tests {
                 .and_then(|refs| refs.first())
                 .and_then(|env_ref| env_ref.name.as_deref()),
             Some("FILESYSTEM_TOKEN")
+        );
+        assert_eq!(mcp_server.oauth_required, Some(true));
+        assert_eq!(
+            mcp_server
+                .oauth_grant
+                .as_ref()
+                .and_then(|grant| grant.access_token_vault_ref.as_deref()),
+            Some("global/mcp-filesystem-access")
+        );
+        assert_eq!(
+            mcp_server.sampling_policy.as_ref().and_then(|policy| policy.mode.as_deref()),
+            Some("allowlist")
         );
         assert_eq!(
             parsed.qa_lab.as_ref().and_then(|value| value.mode.as_deref()),
