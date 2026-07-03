@@ -5351,6 +5351,28 @@ async fn process_lifecycle_tools_reject_unregistered_run_pid() {
         input_unowned.error
     );
 
+    let keys_unowned = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "proposal-process-keys-unowned",
+        super::PROCESS_SEND_KEYS_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "pid": pid,
+            "keys": [{"key": "enter"}],
+        }))
+        .expect("process keys should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(!keys_unowned.success, "unregistered process send_keys must fail");
+    assert!(
+        keys_unowned.error.contains("not registered as a run-owned background process"),
+        "unexpected error: {}",
+        keys_unowned.error
+    );
+
     state.record_run_background_process(context.run_id, pid);
     assert!(super::process_lifecycle_pid_is_run_owned(&state, context.run_id, pid));
     assert!(
@@ -5407,6 +5429,55 @@ async fn process_input_journal_event_redacts_input_and_links_pid() {
             .expect("event should serialize")
             .contains("secret stdin text"),
         "journal payload must not contain raw stdin input: {event}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_keys_journal_event_redacts_keys_and_links_pid() {
+    let state = build_test_runtime_state(false);
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: "session-process-keys-journal",
+        run_id: "run-process-keys-journal",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    let input = br#"{"pid":1234,"keys":[{"key":"text","text":"secret tui text"},{"key":"enter"}],"allow_stdin_fallback":true}"#;
+
+    super::record_process_keys_journal_event(
+        &state,
+        context,
+        "proposal-process-keys-journal",
+        input,
+    )
+    .await;
+
+    let snapshot = state
+        .recent_journal_snapshot(10)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let event = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+            (payload.get("event_type").and_then(Value::as_str) == Some("process.keys.sent"))
+                .then_some(payload)
+        })
+        .expect("process keys journal event should be recorded");
+
+    assert_eq!(event.get("pid").and_then(Value::as_u64), Some(1234));
+    assert_eq!(event.get("keys").and_then(Value::as_str), Some("<redacted>"));
+    assert_eq!(event.get("redaction_level").and_then(Value::as_str), Some("input_redacted"));
+    assert_eq!(
+        event.get("proposal_id").and_then(Value::as_str),
+        Some("proposal-process-keys-journal")
+    );
+    assert!(
+        !serde_json::to_string(&event).expect("event should serialize").contains("secret tui text"),
+        "journal payload must not contain raw key text: {event}"
     );
 }
 

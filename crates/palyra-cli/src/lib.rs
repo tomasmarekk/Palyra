@@ -776,6 +776,7 @@ const LOCAL_DESKTOP_DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "palyra.plugin.run",
     "palyra.process.run",
     "palyra.process.input",
+    "palyra.process.send_keys",
     "palyra.process.stop",
     "palyra.process.status",
     "palyra.process.list",
@@ -14212,6 +14213,10 @@ mod init_command_tests {
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.process.input"),
             "local init should expose active background process stdin controls"
+        );
+        assert!(
+            allowed_tools.iter().any(|tool| tool == "palyra.process.send_keys"),
+            "local init should expose active background process key controls"
         );
         assert!(
             allowed_tools.iter().any(|tool| tool == "palyra.process.status"),

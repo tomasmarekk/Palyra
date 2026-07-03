@@ -20,7 +20,7 @@ use crate::{
         current_unix_ms, truncate_with_ellipsis, GatewayRuntimeState, ToolApprovalOutcome,
         ToolSkillContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, APPROVAL_DENIED_REASON,
         APPROVAL_POLICY_ID, APPROVAL_PROMPT_TIMEOUT_SECONDS, APPROVAL_REQUEST_SUMMARY_MAX_BYTES,
-        PROCESS_INPUT_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME,
+        PROCESS_INPUT_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME, PROCESS_SEND_KEYS_TOOL_NAME,
     },
     journal::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
@@ -217,6 +217,9 @@ fn approval_input_details(tool_name: &str, input_json: &[u8], config: &ToolCallC
     if tool_name == PROCESS_INPUT_TOOL_NAME {
         redact_process_input_approval_details(&mut details, input_json);
     }
+    if tool_name == PROCESS_SEND_KEYS_TOOL_NAME {
+        redact_process_send_keys_approval_details(&mut details, input_json);
+    }
     details
 }
 
@@ -226,6 +229,16 @@ fn redact_process_input_approval_details(details: &mut Value, input_json: &[u8])
         details.insert("input".to_owned(), Value::String("<redacted>".to_owned()));
         details.insert("input_bytes".to_owned(), json!(input_len));
         details.insert("input_sha256".to_owned(), json!(sha256_hex(input_json)));
+        details.insert("redaction_level".to_owned(), json!("input_redacted"));
+    }
+}
+
+fn redact_process_send_keys_approval_details(details: &mut Value, input_json: &[u8]) {
+    let key_count = details.get("keys").and_then(Value::as_array).map(Vec::len).unwrap_or_default();
+    if let Value::Object(details) = details {
+        details.insert("keys".to_owned(), Value::String("<redacted>".to_owned()));
+        details.insert("key_count".to_owned(), json!(key_count));
+        details.insert("keys_sha256".to_owned(), json!(sha256_hex(input_json)));
         details.insert("redaction_level".to_owned(), json!("input_redacted"));
     }
 }
@@ -289,6 +302,10 @@ pub(crate) fn build_tool_approval_subject_id(
         }
     }
     if tool_name == PROCESS_INPUT_TOOL_NAME {
+        subject_id.push_str("|pid:");
+        subject_id.push_str(process_input_approval_pid(input_json).as_deref().unwrap_or("unknown"));
+    }
+    if tool_name == PROCESS_SEND_KEYS_TOOL_NAME {
         subject_id.push_str("|pid:");
         subject_id.push_str(process_input_approval_pid(input_json).as_deref().unwrap_or("unknown"));
     }
@@ -1041,6 +1058,33 @@ mod tests {
             Some("super-secret-command".len() as u64)
         );
         assert_eq!(input_json.get("input_sha256").and_then(Value::as_str).map(str::len), Some(64));
+    }
+
+    #[test]
+    fn process_send_keys_approval_is_pid_scoped_and_redacted() {
+        let input = br#"{"pid":1234,"keys":[{"key":"text","text":"secret menu value"},{"key":"enter"}],"allow_stdin_fallback":true}"#;
+        let subject = build_tool_approval_subject_id(PROCESS_SEND_KEYS_TOOL_NAME, None, input);
+        let config = test_tool_call_config(PROCESS_SEND_KEYS_TOOL_NAME);
+        let pending =
+            build_pending_tool_approval(PROCESS_SEND_KEYS_TOOL_NAME, None, input, &config, None);
+
+        assert_eq!(subject, "tool:palyra.process.send_keys|pid:1234");
+        assert!(!pending.request_summary.contains("secret menu value"));
+        assert!(pending.request_summary.contains("<redacted>"));
+
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        let input_json = details_json
+            .get("input_json")
+            .expect("approval prompt should include redacted input JSON");
+        assert_eq!(input_json.get("pid").and_then(Value::as_u64), Some(1234));
+        assert_eq!(input_json.get("keys").and_then(Value::as_str), Some("<redacted>"));
+        assert_eq!(input_json.get("key_count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            input_json.get("redaction_level").and_then(Value::as_str),
+            Some("input_redacted")
+        );
+        assert_eq!(input_json.get("keys_sha256").and_then(Value::as_str).map(str::len), Some(64));
     }
 
     #[test]

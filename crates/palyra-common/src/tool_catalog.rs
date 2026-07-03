@@ -383,6 +383,7 @@ fn push_effective_tool(tool: &str, tools: &mut Vec<String>, seen: &mut BTreeSet<
     if tool == "palyra.process.run" {
         for companion in [
             "palyra.process.input",
+            "palyra.process.send_keys",
             "palyra.process.stop",
             "palyra.process.status",
             "palyra.process.list",
@@ -466,6 +467,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         }),
         "palyra.process.run"
         | "palyra.process.input"
+        | "palyra.process.send_keys"
         | "palyra.process.stop"
         | "palyra.process.status"
         | "palyra.process.list" => Some(ToolMetadata {
@@ -641,6 +643,8 @@ mod tests {
         assert_eq!(tool_policy_capability_names("palyra.process.run"), vec!["process_exec"]);
         assert!(tool_requires_approval("palyra.process.input"));
         assert_eq!(tool_policy_capability_names("palyra.process.input"), vec!["process_exec"]);
+        assert!(tool_requires_approval("palyra.process.send_keys"));
+        assert_eq!(tool_policy_capability_names("palyra.process.send_keys"), vec!["process_exec"]);
     }
 
     #[test]
@@ -684,6 +688,7 @@ mod tests {
         assert!(report.effective_allowed_tools.contains(&"palyra.fs.apply_patch".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.run".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.input".to_owned()));
+        assert!(report.effective_allowed_tools.contains(&"palyra.process.send_keys".to_owned()));
         assert!(!report.effective_allowed_tools.contains(&"palyra.process.status".to_owned()));
         assert_eq!(
             report

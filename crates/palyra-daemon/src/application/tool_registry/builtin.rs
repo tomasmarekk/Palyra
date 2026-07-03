@@ -983,6 +983,22 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         }),
                     ),
                     (
+                        "interactive",
+                        json!({"type":"boolean","description":"Compatibility flag for requesting a stdin-capable background handle. Requires background=true and never implies PTY."}),
+                    ),
+                    (
+                        "stdin",
+                        json!({"type":"boolean","description":"Request a writable stdin handle for a background process. Requires background=true. Use palyra.process.input for plain stdin text after startup."}),
+                    ),
+                    (
+                        "pty",
+                        json!({"type":"boolean","description":"Explicitly request PTY semantics for TUI/REPL workflows. PTY is never implicit; when the current platform runner cannot provide PTY, the returned process_handle reports pty=false and pty_degraded_reason='pty_backend_unavailable'. Use palyra.process.send_keys with allow_stdin_fallback=true only when known stdin key bytes are acceptable."}),
+                    ),
+                    (
+                        "port_hints",
+                        json!({"type":"array","items":{"type":"integer","minimum":1,"maximum":65535},"maxItems":16,"description":"Optional local service ports to include in the returned process handle alongside ports inferred from args/startup output."}),
+                    ),
+                    (
                         "lifetime_mode",
                         json!({
                             "type":"string",
@@ -1004,6 +1020,68 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                     (
                         "timeout_ms",
                         json!({"type":"integer","minimum":1,"description":"Foreground process timeout in milliseconds. For background=true this is the requested process lifetime, not just startup timeout; omit it for the default long-lived local-server window, or set a value of at least 120000 for browser/app verification loops. Shorter background values are raised to the safe minimum when the operator execution cap permits."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
+            "palyra.process.input",
+            "Send bounded plain stdin text to a run-owned background process that was started with stdin=true or interactive=true.",
+            object_schema(
+                &["pid", "input"],
+                vec![
+                    (
+                        "pid",
+                        json!({"type":"integer","minimum":1,"description":"PID returned by a background palyra.process.run result for this run."}),
+                    ),
+                    (
+                        "input",
+                        json!({"type":"string","minLength":1,"maxLength":8192,"description":"Plain stdin text. The value is never echoed in journal payloads or approval prompts; use append_newline=true when the target process expects a line."}),
+                    ),
+                    (
+                        "append_newline",
+                        json!({"type":"boolean","description":"Append a single LF byte after input before writing to the process stdin pipe."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
+            "palyra.process.send_keys",
+            "Send bounded allowlisted key actions to an interactive background process. Raw escape strings are not accepted; unsupported PTY returns a degraded result unless allow_stdin_fallback=true is explicitly requested.",
+            object_schema(
+                &["pid", "keys"],
+                vec![
+                    (
+                        "pid",
+                        json!({"type":"integer","minimum":1,"description":"PID returned by a background palyra.process.run result for this run."}),
+                    ),
+                    (
+                        "keys",
+                        json!({
+                            "type":"array",
+                            "minItems":1,
+                            "maxItems":32,
+                            "items":{
+                                "type":"object",
+                                "required":["key"],
+                                "additionalProperties":false,
+                                "properties":{
+                                    "key":{"type":"string","enum":["text","enter","tab","backspace","escape","ctrl_c","ctrl_d","up","down","left","right"],"description":"Allowed key action. Use key='text' with the text field for printable text; use named keys for control/navigation keys."},
+                                    "text":{"type":"string","minLength":1,"maxLength":1024,"description":"Printable text for key='text' only. Control characters and raw escape sequences are rejected."},
+                                    "repeat":{"type":"integer","minimum":1,"maximum":16,"description":"Repeat this key action a bounded number of times."}
+                                }
+                            }
+                        }),
+                    ),
+                    (
+                        "allow_stdin_fallback",
+                        json!({"type":"boolean","description":"When PTY is unavailable, allow the runtime to send the known key bytes through the stdin fallback handle. Leave false for TUI workflows that require real terminal semantics."}),
                     ),
                 ],
                 false,
@@ -1789,6 +1867,31 @@ mod tests {
         assert!(background_description.contains("startup stdout/stderr snapshots"));
         assert!(background_description.contains("selected dynamic port"));
         assert!(background_description.contains("operator-configured tool execution timeout"));
+
+        let pty_description = entry
+            .input_schema
+            .pointer("/properties/pty/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("pty description should be visible to models");
+        assert!(pty_description.contains("PTY is never implicit"));
+        assert!(pty_description.contains("pty_degraded_reason"));
+
+        let process_input =
+            registry_entry("palyra.process.input").expect("process input entry exists");
+        assert_eq!(
+            process_input.input_schema.pointer("/required/1").and_then(serde_json::Value::as_str),
+            Some("input")
+        );
+        let send_keys =
+            registry_entry("palyra.process.send_keys").expect("process send_keys entry exists");
+        assert_eq!(
+            send_keys
+                .input_schema
+                .pointer("/properties/keys/items/properties/key/enum/0")
+                .and_then(serde_json::Value::as_str),
+            Some("text")
+        );
+        assert!(send_keys.description.contains("Raw escape strings are not accepted"));
 
         let stop = registry_entry("palyra.process.stop").expect("process stop entry exists");
         assert_eq!(

@@ -109,6 +109,10 @@ const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
 const PROCESS_STDIN_INPUT_MAX_BYTES: usize = 8 * 1024;
 const PROCESS_STDIN_TOTAL_MAX_BYTES: usize = 64 * 1024;
 const PROCESS_STDIN_MAX_EVENTS: usize = 64;
+const PROCESS_SEND_KEYS_MAX_ACTIONS: usize = 32;
+const PROCESS_SEND_KEYS_MAX_REPEAT: u8 = 16;
+const PROCESS_SEND_KEYS_TEXT_MAX_BYTES: usize = 1024;
+const PROCESS_TERMINAL_FRAME_TEXT_BYTES: usize = 1024;
 const MAX_PROCESS_PORT_HINTS: usize = 16;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
 // Background lifetimes have a floor (short timeouts would kill dev servers mid-verification)
@@ -419,7 +423,7 @@ impl StreamCapture {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BackgroundOutputMonitor {
     stdout: Arc<Mutex<StreamCapture>>,
     stderr: Arc<Mutex<StreamCapture>>,
@@ -555,6 +559,7 @@ pub(crate) struct BackgroundProcessRuntimeStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackgroundProcessHandleCapabilities {
     pub(crate) stdin: bool,
+    pub(crate) pty_requested: bool,
     pub(crate) pty: bool,
     pub(crate) signals: bool,
     pub(crate) background: bool,
@@ -563,7 +568,8 @@ pub(crate) struct BackgroundProcessHandleCapabilities {
 impl BackgroundProcessHandleCapabilities {
     const fn from_input(input: &ProcessRunnerInput) -> Self {
         Self {
-            stdin: input.background && input.stdin_requested(),
+            stdin: input.background && (input.stdin_requested() || input.pty),
+            pty_requested: input.pty,
             pty: false,
             signals: true,
             background: input.background,
@@ -577,6 +583,7 @@ struct RegisteredBackgroundProcess {
     capabilities: BackgroundProcessHandleCapabilities,
     lifetime_mode: BackgroundLifetimeMode,
     stdin: Option<ChildStdin>,
+    output_monitor: Option<BackgroundOutputMonitor>,
     stdin_bytes_written: usize,
     stdin_events_written: usize,
 }
@@ -632,6 +639,7 @@ fn register_background_process_pid(
                     capabilities,
                     lifetime_mode,
                     stdin,
+                    output_monitor: None,
                     stdin_bytes_written: 0,
                     stdin_events_written: 0,
                 },
@@ -664,6 +672,28 @@ fn registered_background_process(
                         "palyra.process.run builtin '{command}' requires a pid returned by a live palyra.process.run background result; pid {pid} is not registered"
                     ),
                 })
+        }
+        Err(error) => Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!("background process registry lock poisoned for pid {pid}: {error}"),
+        }),
+    }
+}
+
+fn attach_background_output_monitor(
+    pid: u32,
+    output_monitor: BackgroundOutputMonitor,
+) -> Result<(), SandboxProcessRunError> {
+    match registered_background_processes().lock() {
+        Ok(mut processes) => {
+            let process = processes.get_mut(&pid).ok_or_else(|| SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.run failed to attach output monitor because pid {pid} is not registered"
+                ),
+            })?;
+            process.output_monitor = Some(output_monitor);
+            Ok(())
         }
         Err(error) => Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
@@ -2141,6 +2171,345 @@ fn validate_process_stdin_payload(pid: u32, payload: &[u8]) -> Result<(), Sandbo
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSendKeysToolInput {
+    pid: u32,
+    keys: Vec<ProcessSendKeyInput>,
+    #[serde(default)]
+    allow_stdin_fallback: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSendKeyInput {
+    key: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    repeat: Option<u8>,
+}
+
+/// Sends bounded, allowlisted key actions to an interactive background process.
+///
+/// # Errors
+/// Returns `InvalidInput` for malformed schemas, disallowed keys, unregistered
+/// PIDs, inactive processes, or stdin fallback attempts without a writable
+/// handle. Unsupported PTY availability is reported as a degraded JSON result
+/// unless `allow_stdin_fallback=true` permits the known-key stdin fallback.
+pub(crate) fn send_keys_to_background_process(
+    input_json: &[u8],
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let input = parse_process_send_keys_tool_input(input_json)?;
+    let payload = process_send_keys_payload(&input)?;
+    let snapshot = registered_background_process("palyra.process.send_keys", input.pid)?;
+    if !snapshot.active {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.send_keys pid {} is no longer active", input.pid),
+        });
+    }
+    let status =
+        background_process_runtime_status(input.pid).map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.send_keys failed to inspect pid {} before key send: {error}",
+                input.pid
+            ),
+        })?;
+    if !status.alive() {
+        mark_background_process_stopped(input.pid);
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.send_keys pid {} is not alive", input.pid),
+        });
+    }
+    if !snapshot.capabilities.pty && !input.allow_stdin_fallback {
+        return send_keys_degraded_output(
+            input.pid,
+            payload.len(),
+            snapshot.capabilities,
+            snapshot.lifetime_mode,
+            "pty_backend_unavailable",
+            "PTY is not available in this process runner; retry with allow_stdin_fallback=true only when ordinary stdin key bytes are acceptable for the target process.",
+        );
+    }
+    if !snapshot.capabilities.pty && !snapshot.capabilities.stdin {
+        return send_keys_degraded_output(
+            input.pid,
+            payload.len(),
+            snapshot.capabilities,
+            snapshot.lifetime_mode,
+            "stdin_fallback_unavailable",
+            "PTY is unavailable and this process was not started with a writable stdin fallback handle.",
+        );
+    }
+
+    let input_text =
+        String::from_utf8(payload.clone()).map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.send_keys generated invalid UTF-8 payload: {error}"),
+        })?;
+    let stdin_input = serde_json::to_vec(&json!({
+        "pid": input.pid,
+        "input": input_text,
+    }))
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize palyra.process.send_keys stdin fallback: {error}"),
+    })?;
+    write_background_process_stdin(stdin_input.as_slice())?;
+    let frame = background_terminal_frame_snapshot(input.pid);
+    send_keys_success_output(
+        input.pid,
+        payload.len(),
+        snapshot.capabilities,
+        snapshot.lifetime_mode,
+        !snapshot.capabilities.pty,
+        frame,
+    )
+}
+
+fn parse_process_send_keys_tool_input(
+    input_json: &[u8],
+) -> Result<ProcessSendKeysToolInput, SandboxProcessRunError> {
+    let input =
+        serde_json::from_slice::<ProcessSendKeysToolInput>(input_json).map_err(|error| {
+            SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!("palyra.process.send_keys invalid JSON: {error}"),
+            }
+        })?;
+    if input.pid == 0 {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.send_keys pid must be greater than 0".to_owned(),
+        });
+    }
+    if input.keys.is_empty() || input.keys.len() > PROCESS_SEND_KEYS_MAX_ACTIONS {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.send_keys keys must contain 1..={PROCESS_SEND_KEYS_MAX_ACTIONS} actions"
+            ),
+        });
+    }
+    Ok(input)
+}
+
+fn process_send_keys_payload(
+    input: &ProcessSendKeysToolInput,
+) -> Result<Vec<u8>, SandboxProcessRunError> {
+    let mut payload = Vec::new();
+    for action in &input.keys {
+        let repeat = action.repeat.unwrap_or(1);
+        if repeat == 0 || repeat > PROCESS_SEND_KEYS_MAX_REPEAT {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.send_keys repeat must be 1..={PROCESS_SEND_KEYS_MAX_REPEAT}"
+                ),
+            });
+        }
+        let bytes = process_send_key_bytes(action)?;
+        for _ in 0..repeat {
+            payload.extend_from_slice(bytes.as_slice());
+        }
+        if payload.len() > PROCESS_STDIN_INPUT_MAX_BYTES {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.send_keys payload exceeds {PROCESS_STDIN_INPUT_MAX_BYTES} bytes"
+                ),
+            });
+        }
+    }
+    Ok(payload)
+}
+
+fn process_send_key_bytes(action: &ProcessSendKeyInput) -> Result<Vec<u8>, SandboxProcessRunError> {
+    let key = action.key.trim().to_ascii_lowercase();
+    if key == "text" {
+        let text = action.text.as_deref().ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.send_keys key='text' requires text".to_owned(),
+        })?;
+        if text.is_empty() || text.len() > PROCESS_SEND_KEYS_TEXT_MAX_BYTES {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.send_keys text must contain 1..={PROCESS_SEND_KEYS_TEXT_MAX_BYTES} bytes"
+                ),
+            });
+        }
+        if text.chars().any(char::is_control) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: "palyra.process.send_keys text must not contain control characters"
+                    .to_owned(),
+            });
+        }
+        return Ok(text.as_bytes().to_vec());
+    }
+    if action.text.is_some() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.send_keys text is only allowed with key='text'".to_owned(),
+        });
+    }
+    let bytes = match key.as_str() {
+        "enter" => b"\n".as_slice(),
+        "tab" => b"\t".as_slice(),
+        "backspace" => b"\x08".as_slice(),
+        "escape" => b"\x1b".as_slice(),
+        "ctrl_c" => b"\x03".as_slice(),
+        "ctrl_d" => b"\x04".as_slice(),
+        "up" => b"\x1b[A".as_slice(),
+        "down" => b"\x1b[B".as_slice(),
+        "right" => b"\x1b[C".as_slice(),
+        "left" => b"\x1b[D".as_slice(),
+        _ => {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.send_keys unsupported key '{}'",
+                    action.key.trim()
+                ),
+            });
+        }
+    };
+    Ok(bytes.to_vec())
+}
+
+fn background_terminal_frame_snapshot(pid: u32) -> Value {
+    let snapshot = registered_background_processes()
+        .lock()
+        .ok()
+        .and_then(|processes| {
+            processes.get(&pid).and_then(|process| process.output_monitor.clone())
+        })
+        .map(|monitor| monitor.snapshot());
+    let Some((stdout, stderr)) = snapshot else {
+        return json!({
+            "available": false,
+            "reason_code": "terminal_frame_unavailable",
+        });
+    };
+    json!({
+        "available": true,
+        "stdout": terminal_frame_stream_snapshot("stdout", stdout),
+        "stderr": terminal_frame_stream_snapshot("stderr", stderr),
+    })
+}
+
+fn terminal_frame_stream_snapshot(stream_name: &str, capture: StreamCapture) -> Value {
+    let redacted = redacted_process_output(capture.bytes.as_slice());
+    json!({
+        "stream": stream_name,
+        "bytes": capture.bytes.len(),
+        "truncated": capture.truncated,
+        "redacted": redacted.redacted,
+        "redaction_reasons": redacted.redaction_reasons,
+        "tail": process_text_suffix(redacted.text.as_str(), PROCESS_TERMINAL_FRAME_TEXT_BYTES),
+        "read_error": capture.read_error,
+    })
+}
+
+fn send_keys_degraded_output(
+    pid: u32,
+    payload_bytes: usize,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
+    reason_code: &str,
+    note: &str,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    send_keys_output_json(
+        json!({
+            "sent": false,
+            "degraded": true,
+            "degraded_reason": reason_code,
+            "note": note,
+        }),
+        pid,
+        payload_bytes,
+        capabilities,
+        lifetime_mode,
+        false,
+        Value::Null,
+    )
+}
+
+fn send_keys_success_output(
+    pid: u32,
+    payload_bytes: usize,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
+    fallback_used: bool,
+    terminal_frame: Value,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    send_keys_output_json(
+        json!({
+            "sent": true,
+            "degraded": false,
+            "degraded_reason": Value::Null,
+            "note": Value::Null,
+        }),
+        pid,
+        payload_bytes,
+        capabilities,
+        lifetime_mode,
+        fallback_used,
+        terminal_frame,
+    )
+}
+
+fn send_keys_output_json(
+    status: Value,
+    pid: u32,
+    payload_bytes: usize,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
+    fallback_used: bool,
+    terminal_frame: Value,
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let output_json = serde_json::to_vec(&json!({
+        "exit_code": 0,
+        "stdout": if status.get("sent").and_then(Value::as_bool) == Some(true) {
+            format!("pid={pid} keys_sent=true bytes={payload_bytes}\n")
+        } else {
+            format!("pid={pid} keys_sent=false degraded_reason={}\n", status.get("degraded_reason").and_then(Value::as_str).unwrap_or("unknown"))
+        },
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_redacted": false,
+        "stderr_redacted": false,
+        "duration_ms": 0,
+        "pid": pid,
+        "keys_sent": status.get("sent").and_then(Value::as_bool).unwrap_or(false),
+        "payload_bytes": payload_bytes,
+        "keys_redacted": true,
+        "keys_redaction_level": "input_redacted",
+        "fallback_used": fallback_used,
+        "degraded": status.get("degraded").and_then(Value::as_bool).unwrap_or(false),
+        "degraded_reason": status.get("degraded_reason").cloned().unwrap_or(Value::Null),
+        "note": status.get("note").cloned().unwrap_or(Value::Null),
+        "process_handle": {
+            "kind": "pid",
+            "direct_process_pid": pid,
+            "capabilities": process_handle_capabilities_json(capabilities, &[], lifetime_mode),
+        },
+        "terminal_frame": terminal_frame,
+        "tier": "builtin",
+        "sandbox_backend": "builtin_portable",
+    }))
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize sandbox process send_keys output JSON: {error}"),
+    })?;
+    Ok(SandboxProcessRunSuccess { output_json })
+}
+
 /// Probes direct-pid and process-tree liveness for a background process.
 ///
 /// # Errors
@@ -2552,11 +2921,10 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
             message: "palyra.process.run stdin=true requires background=true".to_owned(),
         });
     }
-    if input.pty {
+    if input.pty && !input.background {
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::InvalidInput,
-            message: "palyra.process.run pty=true is not supported by this process runner"
-                .to_owned(),
+            message: "palyra.process.run pty=true requires background=true".to_owned(),
         });
     }
     if input.port_hints.len() > MAX_PROCESS_PORT_HINTS {
@@ -5360,6 +5728,10 @@ fn spawn_background_process(
                 return Err(error);
             }
         };
+    if let Err(error) = attach_background_output_monitor(pid, output_monitor.clone()) {
+        terminate_background_child(child);
+        return Err(error);
+    }
     let Some(startup_check_wait) = bounded_background_process_wait(
         startup_budget,
         started_at.elapsed(),
@@ -5677,11 +6049,17 @@ fn process_handle_capabilities_json(
 ) -> Value {
     json!({
         "stdin": capabilities.stdin,
+        "pty_requested": capabilities.pty_requested,
         "pty": capabilities.pty,
         "signals": capabilities.signals,
         "background": capabilities.background,
         "port_hints": ports,
         "lifetime_mode": lifetime_mode.as_str(),
+        "pty_degraded_reason": if capabilities.pty_requested && !capabilities.pty {
+            json!("pty_backend_unavailable")
+        } else {
+            Value::Null
+        },
     })
 }
 
@@ -11029,6 +11407,7 @@ mod tests {
 
         assert!(snapshot.active);
         assert!(snapshot.capabilities.stdin);
+        assert!(!snapshot.capabilities.pty_requested);
         assert!(!snapshot.capabilities.pty);
         assert!(snapshot.capabilities.signals);
         assert_eq!(snapshot.lifetime_mode, BackgroundLifetimeMode::UntilVerifier);
@@ -11100,6 +11479,12 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            output
+                .pointer("/process_handle/capabilities/pty_requested")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
             output.pointer("/process_handle/capabilities/pty").and_then(serde_json::Value::as_bool),
             Some(false)
         );
@@ -11152,6 +11537,188 @@ mod tests {
         let _ = super::stop_background_process_by_pid(pid);
         let _ = fs::remove_dir_all(workspace.as_path());
         assert_eq!(delivered.replace("\r\n", "\n"), "hello from stdin\n");
+    }
+
+    #[test]
+    fn process_send_keys_rejects_raw_escape_text() {
+        let input = br#"{"pid":42,"keys":[{"key":"text","text":"\u001b[31m"}],"allow_stdin_fallback":true}"#;
+
+        let error = super::send_keys_to_background_process(input)
+            .expect_err("raw escape text should be rejected before PID lookup");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("control characters"), "{}", error.message);
+    }
+
+    #[test]
+    fn terminal_frame_snapshot_is_bounded_and_redacted() {
+        let snapshot = super::terminal_frame_stream_snapshot(
+            "stdout",
+            StreamCapture {
+                bytes: format!("{}\nTOKEN=secret-value", "x".repeat(5_000)).into_bytes(),
+                truncated: true,
+                read_error: None,
+            },
+        );
+
+        let tail = snapshot
+            .get("tail")
+            .and_then(serde_json::Value::as_str)
+            .expect("terminal frame tail should be present");
+        assert!(tail.len() <= super::PROCESS_TERMINAL_FRAME_TEXT_BYTES);
+        assert!(!tail.contains("secret-value"), "{tail}");
+        assert_eq!(snapshot.get("truncated").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn process_send_keys_reports_degraded_pty_without_fallback() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-python-send-keys-degraded");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("keys_ready.py"),
+            "import time\nprint('ready', flush=True)\ntime.sleep(30)\n",
+        )
+        .expect("background keys script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["keys_ready.py"],
+            "background": true,
+            "pty": true,
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("pty-requested background process should start with degraded metadata");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let pid = output
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("background process should return pid") as u32;
+        let keys_result = super::send_keys_to_background_process(
+            serde_json::to_vec(&serde_json::json!({
+                "pid": pid,
+                "keys": [{"key": "enter"}]
+            }))
+            .expect("keys input should serialize")
+            .as_slice(),
+        )
+        .expect("unsupported PTY should return degraded output, not fail");
+        let keys_output: serde_json::Value =
+            serde_json::from_slice(&keys_result.output_json).expect("keys output should parse");
+
+        let _ = super::stop_background_process_by_pid(pid);
+        let _ = fs::remove_dir_all(workspace.as_path());
+        assert_eq!(
+            output.pointer("/process_handle/capabilities/pty").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(keys_output.get("keys_sent").and_then(serde_json::Value::as_bool), Some(false));
+        assert_eq!(
+            keys_output.get("degraded_reason").and_then(serde_json::Value::as_str),
+            Some("pty_backend_unavailable")
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn process_send_keys_uses_stdin_fallback_and_reports_frame() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-python-send-keys-fallback");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("keys_echo.py"),
+            "import pathlib, sys, time\nprint('ready', flush=True)\nline = sys.stdin.readline()\npathlib.Path('keys-result.txt').write_text(line, encoding='utf-8')\nprint('accepted', flush=True)\ntime.sleep(30)\n",
+        )
+        .expect("background keys script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["keys_echo.py"],
+            "background": true,
+            "pty": true,
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("pty-requested background process should start with stdin fallback");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let pid = output
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("background process should return pid") as u32;
+        let keys_result = super::send_keys_to_background_process(
+            serde_json::to_vec(&serde_json::json!({
+                "pid": pid,
+                "keys": [{"key": "text", "text": "hello keys"}, {"key": "enter"}],
+                "allow_stdin_fallback": true
+            }))
+            .expect("keys input should serialize")
+            .as_slice(),
+        )
+        .expect("send_keys should use stdin fallback when explicitly allowed");
+        let keys_output: serde_json::Value =
+            serde_json::from_slice(&keys_result.output_json).expect("keys output should parse");
+
+        let result_path = workspace.join("keys-result.txt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = String::new();
+        while delivered.replace("\r\n", "\n") != "hello keys\n" {
+            if Instant::now() >= deadline {
+                let _ = super::stop_background_process_by_pid(pid);
+                panic!(
+                    "send_keys stdin fallback did not write expected result; latest={delivered:?}"
+                );
+            }
+            if result_path.exists() {
+                delivered =
+                    fs::read_to_string(result_path.as_path()).unwrap_or_else(|_| String::new());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let _ = super::stop_background_process_by_pid(pid);
+        let _ = fs::remove_dir_all(workspace.as_path());
+        assert_eq!(keys_output.get("keys_sent").and_then(serde_json::Value::as_bool), Some(true));
+        assert_eq!(
+            keys_output.get("fallback_used").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            keys_output.pointer("/terminal_frame/available").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(delivered.replace("\r\n", "\n"), "hello keys\n");
     }
 
     #[test]

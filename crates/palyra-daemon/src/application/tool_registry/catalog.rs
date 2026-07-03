@@ -498,6 +498,8 @@ pub(crate) fn projection_policy_for_tool(tool_name: &str) -> ToolResultProjectio
 fn runtime_available(probes: &[AvailabilityProbeResult], tool_name: &str) -> bool {
     match tool_name {
         "palyra.process.run"
+        | "palyra.process.input"
+        | "palyra.process.send_keys"
         | "palyra.process.stop"
         | "palyra.process.status"
         | "palyra.process.list" => runtime_probe_available(probes, "process_runner"),
