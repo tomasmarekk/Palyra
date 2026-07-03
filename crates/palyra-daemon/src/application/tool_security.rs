@@ -343,6 +343,9 @@ pub(crate) fn evaluate_backend_capability_gate(
     if backend_selection.resolution.resolved != ExecutionBackendPreference::NetworkedWorker {
         return None;
     }
+    if networked_worker_supports_tool(tool_name) {
+        return None;
+    }
     let restricted_capabilities = tool_metadata(tool_name)
         .map(|metadata| {
             metadata
@@ -1031,23 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn networked_worker_backend_denies_filesystem_write_tools() {
+    fn networked_worker_backend_allows_remote_filesystem_write_tools() {
         let selection = networked_worker_selection();
-        let decision = evaluate_backend_capability_gate("palyra.fs.apply_patch", &selection)
-            .expect("filesystem write should be blocked on networked workers");
-        assert!(!decision.allowed);
-        assert!(decision.reason.contains("backend.policy.capability_denied"));
-        assert!(decision.reason.contains("filesystem_write"));
+        let decision = evaluate_backend_capability_gate("palyra.fs.apply_patch", &selection);
+        assert!(decision.is_none(), "remote apply_patch should pass backend capability gate");
     }
 
     #[test]
-    fn networked_worker_backend_denies_filesystem_read_tools() {
+    fn networked_worker_backend_allows_remote_filesystem_read_tools() {
         let selection = networked_worker_selection();
-        let decision = evaluate_backend_capability_gate("palyra.fs.read_file", &selection)
-            .expect("filesystem read should be blocked on networked workers");
+        let decision = evaluate_backend_capability_gate("palyra.fs.read_file", &selection);
+        assert!(decision.is_none(), "remote read_file should pass backend capability gate");
+    }
+
+    #[test]
+    fn networked_worker_backend_denies_filesystem_tools_outside_remote_subset() {
+        let selection = networked_worker_selection();
+        let decision = evaluate_backend_capability_gate("palyra.fs.os_file", &selection)
+            .expect("filesystem tool outside remote subset should be blocked");
         assert!(!decision.allowed);
         assert!(decision.reason.contains("backend.policy.capability_denied"));
-        assert!(decision.reason.contains("filesystem_read"));
+        assert!(decision.reason.contains("filesystem"));
     }
 
     #[test]

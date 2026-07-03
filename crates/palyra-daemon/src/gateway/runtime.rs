@@ -134,6 +134,7 @@ use palyra_common::runtime_preview::{
 use palyra_workerd::{
     WorkerAttestation, WorkerCleanupReport, WorkerFleetManager, WorkerFleetPolicy,
     WorkerFleetSnapshot, WorkerLease, WorkerLeaseRequest, WorkerLifecycleEvent,
+    WORKER_REMOTE_TOOL_CAPABILITIES,
 };
 use ring::hmac;
 use serde_json::{json, Value};
@@ -9828,10 +9829,11 @@ impl GatewayRuntimeState {
         WorkerFleetPolicy {
             max_ttl_ms: self.config.networked_workers.lease_ttl_ms,
             heartbeat_timeout_ms: 30_000,
-            trusted_capabilities: vec![
-                "tool:palyra.echo".to_owned(),
-                "tool:palyra.sleep".to_owned(),
-            ],
+            trusted_capabilities: ["tool:palyra.echo", "tool:palyra.sleep"]
+                .into_iter()
+                .chain(WORKER_REMOTE_TOOL_CAPABILITIES.iter().copied())
+                .map(str::to_owned)
+                .collect(),
             required_capability_authority_sha256: None,
             required_sdk_protocol_version: Some(1),
             required_wit_abi_version: Some("palyra-worker-abi/v1".to_owned()),
@@ -9876,6 +9878,18 @@ impl GatewayRuntimeState {
             Err(poisoned) => {
                 warn!("worker fleet lock poisoned while reading recent events");
                 poisoned.into_inner().recent_events()
+            }
+        }
+    }
+
+    /// Stored attestation for a registered networked worker.
+    #[must_use]
+    pub fn networked_worker_attestation(&self, worker_id: &str) -> Option<WorkerAttestation> {
+        match self.worker_fleet.read() {
+            Ok(manager) => manager.worker_attestation(worker_id),
+            Err(poisoned) => {
+                warn!("worker fleet lock poisoned while reading worker attestation");
+                poisoned.into_inner().worker_attestation(worker_id)
             }
         }
     }

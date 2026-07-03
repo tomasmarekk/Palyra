@@ -242,6 +242,17 @@ pub const WORKER_REMOTE_TOOL_PROTOCOL: &str = "palyra-worker-rpc/v1";
 /// [`WorkerRemoteToolResultEnvelope`].
 pub const WORKER_REMOTE_TOOL_SCHEMA_VERSION: u32 = 1;
 
+/// Capability strings trusted for the initial networked-worker remote tool subset.
+pub const WORKER_REMOTE_TOOL_CAPABILITIES: &[&str] = &[
+    "tool:palyra.fs.read_file",
+    "tool:palyra.fs.list_dir",
+    "tool:palyra.fs.search",
+    "tool:palyra.process.run",
+    "tool:palyra.fs.apply_patch",
+    "tool:palyra.artifact.read",
+    "tool:palyra.tool_program.run",
+];
+
 /// Tool families a networked worker may execute through the remote RPC envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -691,10 +702,11 @@ impl Default for WorkerFleetPolicy {
         Self {
             max_ttl_ms: 15 * 60 * 1_000,
             heartbeat_timeout_ms: 30_000,
-            trusted_capabilities: vec![
-                "tool:palyra.echo".to_owned(),
-                "tool:palyra.sleep".to_owned(),
-            ],
+            trusted_capabilities: ["tool:palyra.echo", "tool:palyra.sleep"]
+                .into_iter()
+                .chain(WORKER_REMOTE_TOOL_CAPABILITIES.iter().copied())
+                .map(str::to_owned)
+                .collect(),
             required_capability_authority_sha256: None,
             required_sdk_protocol_version: Some(DEFAULT_WORKER_SDK_PROTOCOL_VERSION),
             required_wit_abi_version: Some(DEFAULT_WORKER_WIT_ABI_VERSION.to_owned()),
@@ -839,6 +851,12 @@ impl WorkerFleetManager {
     #[must_use]
     pub fn recent_events(&self) -> Vec<WorkerLifecycleEvent> {
         self.recent_events.iter().cloned().collect()
+    }
+
+    /// Returns the stored attestation for a registered worker.
+    #[must_use]
+    pub fn worker_attestation(&self, worker_id: &str) -> Option<WorkerAttestation> {
+        self.workers.get(worker_id).map(|worker| worker.attestation.clone())
     }
 
     /// Registers a new worker after validating its attestation and compatibility.

@@ -14,8 +14,11 @@ use palyra_common::runtime_preview::{
     RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
 };
 use palyra_workerd::{
-    WorkerArtifactTransport, WorkerCleanupReport, WorkerLease, WorkerLeaseRequest, WorkerRunGrant,
-    WorkerWorkspaceScope,
+    WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
+    WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolKind,
+    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer,
+    WorkerRunGrant, WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL,
+    WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -24,26 +27,24 @@ use ulid::Ulid;
 
 use crate::{
     gateway::{current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext},
-    tool_protocol::{build_tool_execution_outcome, execute_tool_call, ToolExecutionOutcome},
+    tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
-
-const NETWORKED_WORKER_SUPPORTED_TOOLS: &[&str] = &["palyra.echo", "palyra.sleep"];
 
 /// Returns whether `tool_name` may run on the networked-worker backend.
 ///
-/// Tools outside [`NETWORKED_WORKER_SUPPORTED_TOOLS`] fail closed in
+/// Tools outside the remote worker envelope subset fail closed in
 /// [`execute_networked_worker_tool`] rather than falling back locally.
 #[must_use]
 pub(crate) fn networked_worker_supports_tool(tool_name: &str) -> bool {
-    NETWORKED_WORKER_SUPPORTED_TOOLS
-        .iter()
-        .any(|supported| supported.eq_ignore_ascii_case(tool_name))
+    WorkerRemoteToolKind::from_tool_name(tool_name).is_some()
 }
 
 /// Builds the worker capability identifier required to lease `tool_name`.
 #[must_use]
 pub(crate) fn networked_worker_tool_capability(tool_name: &str) -> String {
-    format!("tool:{}", tool_name.to_ascii_lowercase())
+    WorkerRemoteToolKind::from_tool_name(tool_name)
+        .map(WorkerRemoteToolKind::required_capability)
+        .unwrap_or_else(|| format!("tool:{}", tool_name.to_ascii_lowercase()))
 }
 
 /// Executes `tool_name` under a networked-worker lease and returns the
@@ -86,27 +87,94 @@ pub(crate) async fn execute_networked_worker_tool(
         }
     };
 
-    // The tool body still runs through the local runner; the lease exists to
-    // exercise and attest the fleet lifecycle (assign -> cleanup -> journal)
-    // for the supported tool allowlist before remote dispatch lands.
-    let local_outcome =
-        execute_tool_call(&runtime_state.config.tool_call, proposal_id, tool_name, input_json)
-            .await;
-    let output_manifest_sha256 = sha256_hex(local_outcome.output_json.as_slice());
+    let worker_attestation = match runtime_state
+        .networked_worker_attestation(lease.worker_id.as_str())
+    {
+        Some(attestation) => attestation,
+        None => {
+            if let Err(error) =
+                complete_networked_worker_lease_after_remote_failure(runtime_state, &lease).await
+            {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!("networked worker cleanup failed: {}", error.message()),
+                    "networked_worker_cleanup_failed",
+                );
+            }
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!(
+                    "networked worker {} has no stored attestation for remote dispatch",
+                    lease.worker_id
+                ),
+                "networked_worker_remote_fail_closed",
+            );
+        }
+    };
+    let remote_request = match build_worker_remote_tool_request(
+        proposal_id,
+        tool_name,
+        input_json,
+        &lease,
+        &worker_attestation,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            if let Err(cleanup_error) =
+                complete_networked_worker_lease_after_remote_failure(runtime_state, &lease).await
+            {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!("networked worker cleanup failed: {}", cleanup_error.message()),
+                    "networked_worker_cleanup_failed",
+                );
+            }
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                error,
+                "networked_worker_remote_fail_closed",
+            );
+        }
+    };
+    let remote_result = match dispatch_networked_worker_remote_tool(&remote_request) {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup_error) =
+                complete_networked_worker_lease_after_remote_failure(runtime_state, &lease).await
+            {
+                return networked_worker_failure_outcome(
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    format!("networked worker cleanup failed: {}", cleanup_error.message()),
+                    "networked_worker_cleanup_failed",
+                );
+            }
+            return networked_worker_failure_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                format!("networked worker remote dispatch failed: {error}"),
+                "networked_worker_remote_unavailable",
+            );
+        }
+    };
 
-    let cleanup_result = runtime_state
+    if let Err(error) = runtime_state
         .complete_networked_worker_lease(
             lease.worker_id.as_str(),
-            WorkerCleanupReport {
-                removed_workspace_scope: true,
-                removed_artifacts: true,
-                removed_logs: true,
-                failure_reason: None,
-            },
+            remote_result.cleanup_report.clone(),
         )
-        .await;
-
-    if let Err(error) = cleanup_result {
+        .await
+    {
         return networked_worker_failure_outcome(
             proposal_id,
             tool_name,
@@ -123,7 +191,7 @@ pub(crate) async fn execute_networked_worker_tool(
         proposal_id,
         tool_name,
         input_json,
-        output_manifest_sha256.as_str(),
+        remote_result.output_manifest_sha256.as_str(),
     )
     .await
     {
@@ -136,18 +204,110 @@ pub(crate) async fn execute_networked_worker_tool(
         );
     }
 
-    build_tool_execution_outcome(
-        proposal_id,
-        tool_name,
-        input_json,
-        local_outcome.success,
-        local_outcome.output_json,
-        local_outcome.error,
-        local_outcome.attestation.timed_out,
-        format!("networked_worker:{}", lease.worker_id),
+    networked_worker_outcome_from_remote_result(&remote_request, remote_result, current_unix_ms())
+}
+
+fn build_worker_remote_tool_request(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    lease: &WorkerLease,
+    worker_attestation: &WorkerAttestation,
+) -> Result<WorkerRemoteToolRequestEnvelope, String> {
+    let tool_kind = WorkerRemoteToolKind::from_tool_name(tool_name).ok_or_else(|| {
         format!(
-            "networked_worker;lease_id={};grant_id={};backend_reason_code={}",
-            lease.lease_id, lease.grant.grant_id, context.backend_reason_code
+            "backend policy blocked tool={tool_name}; reason_code=backend.policy.tool_unsupported; resolved_backend=networked_worker"
+        )
+    })?;
+    let input_json_text = std::str::from_utf8(input_json)
+        .map_err(|error| format!("networked worker remote input is not UTF-8 JSON: {error}"))?
+        .to_owned();
+    let workspace_manifest_sha256 = serde_json::to_vec(&lease.workspace_scope)
+        .map(|bytes| sha256_hex(bytes.as_slice()))
+        .unwrap_or_else(|_| sha256_hex(lease.workspace_scope.workspace_root.as_bytes()));
+    let request = WorkerRemoteToolRequestEnvelope {
+        protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+        schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        request_id: Ulid::new().to_string(),
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        tool_kind,
+        input_json: input_json_text,
+        input_json_sha256: sha256_hex(input_json),
+        lease: WorkerRemoteLeaseBinding::from(lease),
+        worker_identity: WorkerRemoteIdentity::from(worker_attestation),
+        workspace_transfer: WorkerRemoteWorkspaceTransfer::manifest(workspace_manifest_sha256),
+    };
+    request
+        .validate(current_unix_ms())
+        .map_err(|error| format!("networked worker remote request validation failed: {error}"))?;
+    Ok(request)
+}
+
+fn dispatch_networked_worker_remote_tool(
+    _request: &WorkerRemoteToolRequestEnvelope,
+) -> Result<WorkerRemoteToolResultEnvelope, String> {
+    Err("remote worker transport is not configured".to_owned())
+}
+
+async fn complete_networked_worker_lease_after_remote_failure(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    lease: &WorkerLease,
+) -> Result<(), tonic::Status> {
+    runtime_state
+        .complete_networked_worker_lease(
+            lease.worker_id.as_str(),
+            WorkerCleanupReport {
+                removed_workspace_scope: true,
+                removed_artifacts: true,
+                removed_logs: true,
+                failure_reason: None,
+            },
+        )
+        .await
+        .map(|_| ())
+}
+
+fn networked_worker_outcome_from_remote_result(
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: WorkerRemoteToolResultEnvelope,
+    now_unix_ms: i64,
+) -> ToolExecutionOutcome {
+    if let Err(error) = result.validate_against_request(request, now_unix_ms) {
+        return networked_worker_failure_outcome(
+            request.proposal_id.as_str(),
+            request.tool_name.as_str(),
+            request.input_json.as_bytes(),
+            format!("networked worker remote execution failed: {error}"),
+            "networked_worker_remote_fail_closed",
+        );
+    }
+    if sha256_hex(result.output_json.as_bytes()) != result.output_json_sha256 {
+        return networked_worker_failure_outcome(
+            request.proposal_id.as_str(),
+            request.tool_name.as_str(),
+            request.input_json.as_bytes(),
+            "networked worker remote execution failed: output digest mismatch".to_owned(),
+            "networked_worker_remote_digest_mismatch",
+        );
+    }
+    build_tool_execution_outcome(
+        request.proposal_id.as_str(),
+        request.tool_name.as_str(),
+        request.input_json.as_bytes(),
+        result.success,
+        result.output_json.into_bytes(),
+        result.error.unwrap_or_default(),
+        false,
+        format!("networked_worker:{}", result.worker_id),
+        format!(
+            "networked_worker_remote;lease_id={};grant_id={};worker_identity_sha256={};input_manifest_sha256={};output_manifest_sha256={};workspace_manifest_sha256={}",
+            request.lease.lease_id,
+            request.lease.grant_id,
+            request.worker_identity.artifact_digest_sha256,
+            request.lease.artifact_transport.input_manifest_sha256,
+            result.output_manifest_sha256,
+            request.workspace_transfer.workspace_manifest_sha256
         ),
     )
 }
@@ -162,6 +322,8 @@ fn build_worker_lease_request(
     let now_unix_ms = current_unix_ms();
     let ttl_ms = runtime_state.config.networked_workers.lease_ttl_ms;
     let grant_id = Ulid::new().to_string();
+    let read_only = WorkerRemoteToolKind::from_tool_name(tool_name)
+        .is_none_or(remote_tool_kind_uses_read_only_workspace);
     WorkerLeaseRequest {
         run_id: context.run_id.to_owned(),
         ttl_ms,
@@ -175,7 +337,7 @@ fn build_worker_lease_request(
                 .to_string_lossy()
                 .into_owned(),
             allowed_paths: Vec::new(),
-            read_only: true,
+            read_only,
         },
         artifact_transport: WorkerArtifactTransport {
             input_manifest_sha256: sha256_hex(input_json),
@@ -198,6 +360,16 @@ fn build_worker_lease_request(
             expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms as i64),
         },
     }
+}
+
+fn remote_tool_kind_uses_read_only_workspace(tool_kind: WorkerRemoteToolKind) -> bool {
+    matches!(
+        tool_kind,
+        WorkerRemoteToolKind::FsRead
+            | WorkerRemoteToolKind::FsList
+            | WorkerRemoteToolKind::FsSearch
+            | WorkerRemoteToolKind::ArtifactRead
+    )
 }
 
 async fn record_worker_artifact_transport_event(
@@ -297,7 +469,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{networked_worker_failure_outcome, sha256_hex};
+    use super::{
+        networked_worker_outcome_from_remote_result, networked_worker_supports_tool,
+        networked_worker_tool_capability, remote_tool_kind_uses_read_only_workspace, sha256_hex,
+    };
     use palyra_workerd::{
         WorkerArtifactTransport, WorkerCleanupReport, WorkerRemoteIdentity,
         WorkerRemoteLeaseBinding, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
@@ -410,48 +585,42 @@ mod tests {
         }
     }
 
-    fn outcome_from_remote_result(
-        request: &WorkerRemoteToolRequestEnvelope,
-        result: WorkerRemoteToolResultEnvelope,
-        now_unix_ms: i64,
-    ) -> crate::tool_protocol::ToolExecutionOutcome {
-        if let Err(error) = result.validate_against_request(request, now_unix_ms) {
-            return networked_worker_failure_outcome(
-                request.proposal_id.as_str(),
-                request.tool_name.as_str(),
-                request.input_json.as_bytes(),
-                format!("networked worker remote execution failed: {error}"),
-                "networked_worker_remote_fail_closed",
+    #[test]
+    fn networked_worker_supports_remote_tool_subset_not_echo_sleep_only() {
+        for tool_name in [
+            "palyra.fs.read_file",
+            "palyra.fs.list_dir",
+            "palyra.fs.search",
+            "palyra.process.run",
+            "palyra.fs.apply_patch",
+            "palyra.artifact.read",
+            "palyra.tool_program.run",
+        ] {
+            assert!(
+                networked_worker_supports_tool(tool_name),
+                "{tool_name} should be remote-capable"
+            );
+            assert_eq!(
+                networked_worker_tool_capability(tool_name),
+                WorkerRemoteToolKind::from_tool_name(tool_name)
+                    .expect("tool should have a remote kind")
+                    .required_capability()
             );
         }
-        if sha256_hex(result.output_json.as_bytes()) != result.output_json_sha256 {
-            return networked_worker_failure_outcome(
-                request.proposal_id.as_str(),
-                request.tool_name.as_str(),
-                request.input_json.as_bytes(),
-                "networked worker remote execution failed: output digest mismatch".to_owned(),
-                "networked_worker_remote_digest_mismatch",
-            );
-        }
-        crate::tool_protocol::build_tool_execution_outcome(
-            request.proposal_id.as_str(),
-            request.tool_name.as_str(),
-            request.input_json.as_bytes(),
-            result.success,
-            result.output_json.into_bytes(),
-            result.error.unwrap_or_default(),
-            false,
-            format!("networked_worker:{}", result.worker_id),
-            format!(
-                "networked_worker_remote;lease_id={};grant_id={};worker_identity_sha256={};input_manifest_sha256={};output_manifest_sha256={};workspace_manifest_sha256={}",
-                request.lease.lease_id,
-                request.lease.grant_id,
-                request.worker_identity.artifact_digest_sha256,
-                request.lease.artifact_transport.input_manifest_sha256,
-                result.output_manifest_sha256,
-                request.workspace_transfer.workspace_manifest_sha256
-            ),
-        )
+
+        assert!(!networked_worker_supports_tool("palyra.echo"));
+        assert!(!networked_worker_supports_tool("palyra.sleep"));
+    }
+
+    #[test]
+    fn networked_worker_workspace_scope_tracks_remote_tool_mutability() {
+        assert!(remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::FsRead));
+        assert!(remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::FsList));
+        assert!(remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::FsSearch));
+        assert!(remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ArtifactRead));
+        assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ProcessRun));
+        assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ApplyPatch));
+        assert!(!remote_tool_kind_uses_read_only_workspace(WorkerRemoteToolKind::ToolProgramRun));
     }
 
     #[test]
@@ -486,7 +655,7 @@ mod tests {
         for (tool_name, expected_output) in cases {
             let request = remote_request(tool_name);
             let result = fake.execute(&request, expected_output.clone());
-            let outcome = outcome_from_remote_result(&request, result, 2_000);
+            let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
 
             assert!(outcome.success, "remote {tool_name} should succeed");
             assert_eq!(outcome.error, "");
@@ -526,7 +695,7 @@ mod tests {
             }),
         );
 
-        let outcome = outcome_from_remote_result(&request, result, 2_000);
+        let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
 
         assert!(outcome.success);
         let output: Value = serde_json::from_slice(outcome.output_json.as_slice())
@@ -547,7 +716,7 @@ mod tests {
         request.lease.expires_at_unix_ms = 1_500;
         let result = fake.execute(&request, json!({"content": "late"}));
 
-        let outcome = outcome_from_remote_result(&request, result, 2_000);
+        let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
 
         assert!(!outcome.success);
         assert!(outcome.error.contains("expired"));
@@ -562,7 +731,7 @@ mod tests {
         fake.cleanup_report.failure_reason = Some("artifact directory not empty".to_owned());
         let result = fake.execute(&request, json!({"applied": true}));
 
-        let outcome = outcome_from_remote_result(&request, result, 2_000);
+        let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
 
         assert!(!outcome.success);
         assert!(outcome.error.contains("cleanup gap"));
@@ -575,7 +744,7 @@ mod tests {
         let fake = FakeRemoteWorker::healthy("worker-remote-02");
         let result = fake.execute(&request, json!({"artifact_id": "artifact-01"}));
 
-        let outcome = outcome_from_remote_result(&request, result, 2_000);
+        let outcome = networked_worker_outcome_from_remote_result(&request, result, 2_000);
 
         assert!(!outcome.success);
         assert!(outcome.error.contains("identity mismatch"));

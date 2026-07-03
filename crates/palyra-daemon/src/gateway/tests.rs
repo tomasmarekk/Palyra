@@ -5028,12 +5028,11 @@ async fn networked_worker_operator_actions_are_journaled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn networked_worker_runtime_executes_echo_with_artifact_transport_journal() {
+async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
     let state = build_test_runtime_state(false);
-    state
-        .register_networked_worker(test_worker_attestation("worker-runtime-01"))
-        .await
-        .expect("worker registration should succeed");
+    let mut attestation = test_worker_attestation("worker-runtime-01");
+    attestation.supported_capabilities = vec!["tool:palyra.fs.read_file".to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
 
     let outcome = super::execute_tool_with_runtime_dispatch(
         &state,
@@ -5047,63 +5046,33 @@ async fn networked_worker_runtime_executes_echo_with_artifact_transport_journal(
             backend_reason_code: "backend.available.networked_worker",
         },
         "proposal-networked-worker-runtime",
-        "palyra.echo",
-        br#"{"text":"remote worker"}"#,
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
         None,
     )
     .await;
 
-    assert!(outcome.success, "networked worker echo should succeed: {}", outcome.error);
-    assert_eq!(
-        parse_tool_output_json(&outcome).get("echo").and_then(Value::as_str),
-        Some("remote worker")
-    );
-    assert!(outcome.attestation.executor.starts_with("networked_worker:"));
-    assert!(outcome.attestation.sandbox_enforcement.contains("lease_id="));
+    assert!(!outcome.success, "networked worker must not fall back to local execution");
+    assert!(outcome.error.contains("remote dispatch failed"), "{}", outcome.error);
+    assert!(outcome.error.contains("remote worker transport is not configured"));
+    assert_eq!(outcome.attestation.executor, "networked_worker");
+    assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_unavailable");
     assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
 
     let snapshot = state
         .recent_journal_snapshot(100)
         .await
         .expect("recent journal snapshot should be returned");
-    let artifact_payload = snapshot
-        .events
-        .iter()
-        .find_map(|event| {
-            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
-            (payload.pointer("/payload/reason").and_then(Value::as_str)
-                == Some("worker.artifact_transport.attested"))
-            .then_some(payload)
-        })
-        .expect("artifact transport runtime event should be journaled");
-    assert_eq!(
-        artifact_payload.pointer("/payload/details/tool_name").and_then(Value::as_str),
-        Some("palyra.echo")
-    );
-    assert_eq!(
-        artifact_payload
-            .pointer("/payload/details/workspace_scope/read_only")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        artifact_payload
-            .pointer("/payload/details/workspace_writeback/mode")
-            .and_then(Value::as_str),
-        Some("patch_bundle")
-    );
-    assert_eq!(
-        artifact_payload
-            .pointer("/payload/details/workspace_writeback/authoritative_workspace_mutation")
-            .and_then(Value::as_bool),
-        Some(false)
-    );
     assert!(
-        artifact_payload
-            .pointer("/payload/details/artifact_transport/output_manifest_sha256")
-            .and_then(Value::as_str)
-            .is_some(),
-        "artifact transport event should attest output manifest"
+        snapshot.events.iter().any(|event| {
+            serde_json::from_str::<Value>(event.payload_json.as_str())
+                .ok()
+                .and_then(|payload| {
+                    payload.pointer("/payload/reason").and_then(Value::as_str).map(str::to_owned)
+                })
+                .is_some_and(|reason| reason == "worker.completed")
+        }),
+        "transport-missing path should still complete and journal worker cleanup"
     );
 }
 
