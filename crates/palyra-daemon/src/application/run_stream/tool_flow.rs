@@ -587,6 +587,7 @@ async fn complete_catalog_bridge_tool_call(
         execution_outcome.attestation.timed_out,
         execution_outcome.attestation.executor.as_str(),
         execution_outcome.attestation.sandbox_enforcement.as_str(),
+        execution_outcome.attestation.execution_manifest.as_deref(),
     )
     .await?;
     runtime_state.record_tool_attestation_emitted();
@@ -757,6 +758,7 @@ async fn reject_run_stream_tool_call(
         execution_outcome.attestation.timed_out,
         execution_outcome.attestation.executor.as_str(),
         execution_outcome.attestation.sandbox_enforcement.as_str(),
+        execution_outcome.attestation.execution_manifest.as_deref(),
     )
     .await?;
     runtime_state.record_tool_attestation_emitted();
@@ -1936,6 +1938,7 @@ async fn finalize_prepared_tool_execution_outcome(
         execution_outcome.attestation.timed_out,
         execution_outcome.attestation.executor.as_str(),
         execution_outcome.attestation.sandbox_enforcement.as_str(),
+        execution_outcome.attestation.execution_manifest.as_deref(),
     )
     .await?;
     runtime_state.record_tool_attestation_emitted();
@@ -2915,6 +2918,7 @@ mod tests {
                 timed_out: false,
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
+                execution_manifest: None,
             },
         };
 
@@ -2975,6 +2979,7 @@ mod tests {
                 timed_out: false,
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
+                execution_manifest: None,
             },
         };
 
@@ -3013,6 +3018,7 @@ mod tests {
                 timed_out: false,
                 executor: "test".to_owned(),
                 sandbox_enforcement: "n/a".to_owned(),
+                execution_manifest: None,
             },
         };
 
@@ -3061,6 +3067,7 @@ mod tests {
                     timed_out: false,
                     executor: "test".to_owned(),
                     sandbox_enforcement: "n/a".to_owned(),
+                    execution_manifest: None,
                 },
             };
 

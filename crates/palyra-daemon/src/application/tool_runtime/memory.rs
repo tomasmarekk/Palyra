@@ -4612,6 +4612,7 @@ fn memory_tool_execution_outcome(
             timed_out: false,
             executor: "memory_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
     }
 }

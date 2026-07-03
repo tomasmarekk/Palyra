@@ -19,10 +19,10 @@ use palyra_common::{
 };
 use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
-    WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolKind,
-    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer,
-    WorkerRunGrant, WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL,
-    WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    WorkerLeaseRequest, WorkerRemoteIdentity, WorkerRemoteLeaseBinding,
+    WorkerRemoteToolContractError, WorkerRemoteToolKind, WorkerRemoteToolRequestEnvelope,
+    WorkerRemoteToolResultEnvelope, WorkerRemoteWorkspaceTransfer, WorkerRunGrant,
+    WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -30,9 +30,14 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    execution_backends::WorkspaceStrategyDescriptor,
     gateway::{current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext},
     node_runtime::{CapabilityExecutionResult, NodeRuntimeState, RegisteredNodeRecord},
-    tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
+    tool_protocol::{
+        build_tool_execution_outcome, build_tool_execution_outcome_with_manifest,
+        ExecutionAttestationManifest, ExecutionCleanupEvidence, ExecutionCleanupResourceEvidence,
+        ToolExecutionOutcome,
+    },
 };
 
 const NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
@@ -400,12 +405,75 @@ async fn complete_networked_worker_lease_after_remote_failure(
         .map(|_| ())
 }
 
+fn networked_worker_execution_manifest(
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: &WorkerRemoteToolResultEnvelope,
+) -> ExecutionAttestationManifest {
+    ExecutionAttestationManifest {
+        schema_version: 1,
+        backend_id: "networked_worker".to_owned(),
+        runner_id: "networked_worker_remote_dispatcher".to_owned(),
+        runner_version: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+        workspace_strategy_digest: WorkspaceStrategyDescriptor::remote_lease_workspace()
+            .attestation_digest_sha256(),
+        input_manifest_sha256: request.lease.artifact_transport.input_manifest_sha256.clone(),
+        output_manifest_sha256: result.output_manifest_sha256.clone(),
+        cleanup: networked_worker_cleanup_evidence(&result.cleanup_report),
+        egress_posture: "worker_egress_proxy_attested".to_owned(),
+        policy_decision_id: Some(request.lease.grant_id.clone()),
+        approval_id: None,
+    }
+}
+
+fn networked_worker_cleanup_evidence(
+    cleanup_report: &WorkerCleanupReport,
+) -> ExecutionCleanupEvidence {
+    let success = cleanup_report.is_verified();
+    ExecutionCleanupEvidence {
+        strategy: "networked_worker_lease_cleanup".to_owned(),
+        success,
+        reason_code: cleanup_report.failure_reason.clone().unwrap_or_else(|| {
+            if success {
+                "worker.cleanup.ok".to_owned()
+            } else {
+                "worker.cleanup.incomplete".to_owned()
+            }
+        }),
+        resources: vec![
+            networked_worker_cleanup_resource(
+                "remote_workspace",
+                cleanup_report.removed_workspace_scope,
+            ),
+            networked_worker_cleanup_resource("remote_artifacts", cleanup_report.removed_artifacts),
+            networked_worker_cleanup_resource("remote_logs", cleanup_report.removed_logs),
+        ],
+    }
+}
+
+fn networked_worker_cleanup_resource(
+    kind: &str,
+    cleanup_verified: bool,
+) -> ExecutionCleanupResourceEvidence {
+    ExecutionCleanupResourceEvidence {
+        kind: kind.to_owned(),
+        status: if cleanup_verified { "removed" } else { "remove_failed" }.to_owned(),
+        cleanup_required: true,
+        cleanup_verified,
+        identifier_sha256: None,
+    }
+}
+
 fn networked_worker_outcome_from_remote_result(
     request: &WorkerRemoteToolRequestEnvelope,
     result: WorkerRemoteToolResultEnvelope,
     now_unix_ms: i64,
 ) -> ToolExecutionOutcome {
     if let Err(error) = result.validate_against_request(request, now_unix_ms) {
+        if matches!(&error, WorkerRemoteToolContractError::CleanupGap { .. })
+            && sha256_hex(result.output_json.as_bytes()) == result.output_json_sha256
+        {
+            return networked_worker_cleanup_failure_outcome(request, result, error.to_string());
+        }
         return networked_worker_failure_outcome(
             request.proposal_id.as_str(),
             request.tool_name.as_str(),
@@ -423,7 +491,8 @@ fn networked_worker_outcome_from_remote_result(
             "networked_worker_remote_digest_mismatch",
         );
     }
-    build_tool_execution_outcome(
+    let manifest = networked_worker_execution_manifest(request, &result);
+    build_tool_execution_outcome_with_manifest(
         request.proposal_id.as_str(),
         request.tool_name.as_str(),
         request.input_json.as_bytes(),
@@ -441,6 +510,28 @@ fn networked_worker_outcome_from_remote_result(
             result.output_manifest_sha256,
             request.workspace_transfer.workspace_manifest_sha256
         ),
+        manifest,
+    )
+}
+
+fn networked_worker_cleanup_failure_outcome(
+    request: &WorkerRemoteToolRequestEnvelope,
+    result: WorkerRemoteToolResultEnvelope,
+    error: String,
+) -> ToolExecutionOutcome {
+    warn!(tool_name = request.tool_name.as_str(), error = %error, "networked worker cleanup failed closed");
+    let manifest = networked_worker_execution_manifest(request, &result);
+    build_tool_execution_outcome_with_manifest(
+        request.proposal_id.as_str(),
+        request.tool_name.as_str(),
+        request.input_json.as_bytes(),
+        false,
+        result.output_json.into_bytes(),
+        format!("networked worker remote execution failed: {error}"),
+        false,
+        format!("networked_worker:{}", result.worker_id),
+        "networked_worker_remote_fail_closed".to_owned(),
+        manifest,
     )
 }
 
@@ -858,6 +949,18 @@ mod tests {
             assert_eq!(outcome.error, "");
             assert_eq!(outcome.attestation.executor, "networked_worker:worker-remote-01");
             assert!(outcome.attestation.sandbox_enforcement.contains("output_manifest_sha256="));
+            let manifest = outcome
+                .attestation
+                .execution_manifest
+                .as_ref()
+                .expect("networked worker outcome should carry an execution manifest");
+            assert_eq!(manifest.backend_id, "networked_worker");
+            assert_eq!(manifest.runner_id, "networked_worker_remote_dispatcher");
+            assert_eq!(
+                manifest.input_manifest_sha256,
+                request.lease.artifact_transport.input_manifest_sha256
+            );
+            assert!(manifest.cleanup.success);
             let output: Value = serde_json::from_slice(outcome.output_json.as_slice())
                 .expect("remote output should stay valid JSON");
             assert_eq!(output, expected_output);
@@ -933,6 +1036,14 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.error.contains("cleanup gap"));
         assert_eq!(outcome.attestation.sandbox_enforcement, "networked_worker_remote_fail_closed");
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("networked worker cleanup failure should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "networked_worker");
+        assert!(!manifest.cleanup.success);
+        assert_eq!(manifest.cleanup.reason_code, "artifact directory not empty");
     }
 
     #[test]

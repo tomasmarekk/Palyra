@@ -2,7 +2,7 @@
 
 - Scenario: `text.run.basic`
 - Verdict: `passed`
-- Checks: 6
+- Checks: 7
 - Issues: 0
 - Events: 4
 - Tool calls: 0
@@ -18,6 +18,7 @@
 | `required_tool_calls` | `passed` | 0 |
 | `forbidden_observations` | `passed` | 0 |
 | `artifacts_and_fake_progress` | `passed` | 0 |
+| `backend_attestation_manifests` | `passed` | 0 |
 
 ## Redaction
 

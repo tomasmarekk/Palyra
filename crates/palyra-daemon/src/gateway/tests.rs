@@ -1337,6 +1337,7 @@ fn cleanup_test_tool_outcome(success: bool, output: Value) -> super::ToolExecuti
             timed_out: false,
             executor: "test".to_owned(),
             sandbox_enforcement: "test".to_owned(),
+            execution_manifest: None,
         },
     }
 }

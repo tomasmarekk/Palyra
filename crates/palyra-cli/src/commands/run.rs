@@ -1488,6 +1488,21 @@ mod tests {
             let event = serde_json::from_str::<Value>(line).expect("event line should parse");
             event.get("category").and_then(Value::as_str) == Some("tool_output")
         }));
+        assert!(
+            lines.iter().skip(1).any(|line| {
+                let event = serde_json::from_str::<Value>(line).expect("event line should parse");
+                event.get("event_type").and_then(Value::as_str) == Some("tool_attestation")
+                    && (event
+                        .pointer("/payload/payload/execution_manifest/schema_version")
+                        .and_then(Value::as_u64)
+                        == Some(1)
+                        || event
+                            .pointer("/payload/attestation/execution_manifest/schema_version")
+                            .and_then(Value::as_u64)
+                            == Some(1))
+            }),
+            "trajectory JSONL should export backend execution manifests"
+        );
         assert!(!text.contains("secret-token"));
     }
 
@@ -1762,6 +1777,18 @@ mod tests {
             },
             ReplayTapeEvent {
                 seq: 12,
+                event_type: "tool_attestation".to_owned(),
+                payload: json!({
+                    "proposal_id": "proposal-1",
+                    "tool_name": tool_name,
+                    "execution_sha256": "a".repeat(64),
+                    "executor": "sandbox_tier_b",
+                    "sandbox_enforcement": "preflight",
+                    "execution_manifest": fixture_execution_manifest(),
+                }),
+            },
+            ReplayTapeEvent {
+                seq: 13,
                 event_type: "final_answer".to_owned(),
                 payload: json!({ "text": "done" }),
             },
@@ -1815,5 +1842,32 @@ mod tests {
             object.insert("proposal_id".to_owned(), Value::String(proposal_id.to_owned()));
         }
         value
+    }
+
+    fn fixture_execution_manifest() -> Value {
+        json!({
+            "schema_version": 1,
+            "manifest_sha256": "f".repeat(64),
+            "backend_id": "local_sandbox",
+            "runner_id": "local_sandbox_runner",
+            "runner_version": "v1",
+            "workspace_strategy_digest": "1".repeat(64),
+            "input_manifest_sha256": "2".repeat(64),
+            "output_manifest_sha256": "3".repeat(64),
+            "cleanup": {
+                "strategy": "local_sandbox_process_lifecycle",
+                "success": true,
+                "reason_code": "local_sandbox.cleanup.ok",
+                "resources": [
+                    {
+                        "kind": "process_tree",
+                        "status": "foreground_process_reaped",
+                        "cleanup_required": true,
+                        "cleanup_verified": true
+                    }
+                ]
+            },
+            "egress_posture": "process_runner_egress:preflight"
+        })
     }
 }

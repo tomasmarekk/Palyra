@@ -254,7 +254,8 @@ pub fn build_qa_evidence_bundle(
         })
         .collect::<Vec<_>>();
     let observed = ObservedEvidence::from_input(&input);
-    let checks = evaluate_checks(manifest, &observed);
+    let checks = evaluate_checks(manifest, &observed, &input);
+    let check_count = checks.len();
     let issue_count = checks.iter().map(|check| check.issues.len()).sum::<usize>();
     let fake_progress_detected = checks.iter().any(|check| {
         check.issues.iter().any(|issue| issue.code == "fake_progress_without_evidence")
@@ -282,7 +283,7 @@ pub fn build_qa_evidence_bundle(
         summary: QaEvidenceSummary {
             verdict,
             issue_count,
-            check_count: 6,
+            check_count,
             observed_event_count: observed.event_sequence.len(),
             observed_tool_call_count: observed.tool_calls.len(),
             artifact_count: observed.artifacts.len(),
@@ -387,6 +388,7 @@ impl ObservedEvidence {
 fn evaluate_checks(
     manifest: &QaScenarioManifest,
     observed: &ObservedEvidence,
+    input: &QaEvidenceBuildInput,
 ) -> Vec<QaEvidenceCheck> {
     vec![
         check_terminal_state(manifest, observed),
@@ -395,6 +397,7 @@ fn evaluate_checks(
         check_required_tool_calls(manifest, observed),
         check_forbidden_observations(manifest, observed),
         check_artifacts_and_fake_progress(manifest, observed),
+        check_backend_attestation_manifests(input),
     ]
 }
 
@@ -613,6 +616,205 @@ fn check_artifacts_and_fake_progress(
         }
     }
     check("artifacts_and_fake_progress", issues)
+}
+
+fn check_backend_attestation_manifests(input: &QaEvidenceBuildInput) -> QaEvidenceCheck {
+    let mut issues = Vec::new();
+    for (index, event) in input.tape_events.iter().enumerate() {
+        if event.event_type != "tool_attestation" {
+            continue;
+        }
+        let executor = event.payload.get("executor").and_then(Value::as_str).unwrap_or_default();
+        if !executor_requires_backend_manifest(executor) {
+            continue;
+        }
+        let manifest_path = format!("$.tape_events[{index}].payload.execution_manifest");
+        let Some(manifest) = event.payload.get("execution_manifest") else {
+            issues.push(QaEvidenceIssue {
+                code: "backend_attestation_manifest_missing".to_owned(),
+                path: manifest_path,
+                message: format!(
+                    "executor `{executor}` requires an execution attestation manifest"
+                ),
+                expected: Some("execution_manifest".to_owned()),
+                actual: Some("missing".to_owned()),
+            });
+            continue;
+        };
+        backend_manifest_issues(manifest, manifest_path.as_str(), &mut issues);
+    }
+    check("backend_attestation_manifests", issues)
+}
+
+fn executor_requires_backend_manifest(executor: &str) -> bool {
+    executor == "docker"
+        || executor == "ssh_tunnel"
+        || executor == "host_process"
+        || executor == "sandbox_tier_b"
+        || executor.starts_with("sandbox_tier_c")
+        || executor.starts_with("networked_worker")
+}
+
+fn backend_manifest_issues(manifest: &Value, path: &str, issues: &mut Vec<QaEvidenceIssue>) {
+    let Some(object) = manifest.as_object() else {
+        issues.push(backend_manifest_issue(
+            path,
+            "manifest must be a JSON object",
+            Some("object"),
+            Some(manifest_type_name(manifest)),
+        ));
+        return;
+    };
+    match object.get("schema_version").and_then(Value::as_u64) {
+        Some(1) => {}
+        actual => issues.push(backend_manifest_issue(
+            &format!("{path}.schema_version"),
+            "manifest schema_version must be 1",
+            Some("1"),
+            actual.map(|value| value.to_string()).as_deref(),
+        )),
+    }
+    for field in ["backend_id", "runner_id", "runner_version", "egress_posture"] {
+        require_non_empty_manifest_string(object, path, field, issues);
+    }
+    for field in ["workspace_strategy_digest", "input_manifest_sha256", "output_manifest_sha256"] {
+        require_sha256_manifest_string(object, path, field, issues);
+    }
+    if object.contains_key("manifest_sha256") {
+        require_sha256_manifest_string(object, path, "manifest_sha256", issues);
+    }
+    let cleanup_path = format!("{path}.cleanup");
+    let Some(cleanup) = object.get("cleanup").and_then(Value::as_object) else {
+        issues.push(backend_manifest_issue(
+            cleanup_path.as_str(),
+            "cleanup evidence must be an object",
+            Some("object"),
+            object.get("cleanup").map(manifest_type_name),
+        ));
+        return;
+    };
+    require_non_empty_manifest_string(cleanup, cleanup_path.as_str(), "strategy", issues);
+    require_non_empty_manifest_string(cleanup, cleanup_path.as_str(), "reason_code", issues);
+    if !matches!(cleanup.get("success"), Some(Value::Bool(_))) {
+        issues.push(backend_manifest_issue(
+            &format!("{cleanup_path}.success"),
+            "cleanup success must be a boolean",
+            Some("boolean"),
+            cleanup.get("success").map(manifest_type_name),
+        ));
+    }
+    let resources_path = format!("{cleanup_path}.resources");
+    let Some(resources) = cleanup.get("resources").and_then(Value::as_array) else {
+        issues.push(backend_manifest_issue(
+            resources_path.as_str(),
+            "cleanup resources must be a non-empty array",
+            Some("non-empty array"),
+            cleanup.get("resources").map(manifest_type_name),
+        ));
+        return;
+    };
+    if resources.is_empty() {
+        issues.push(backend_manifest_issue(
+            resources_path.as_str(),
+            "cleanup resources must not be empty",
+            Some("non-empty array"),
+            Some("empty array"),
+        ));
+    }
+    for (resource_index, resource) in resources.iter().enumerate() {
+        let resource_path = format!("{resources_path}[{resource_index}]");
+        let Some(resource_object) = resource.as_object() else {
+            issues.push(backend_manifest_issue(
+                resource_path.as_str(),
+                "cleanup resource must be an object",
+                Some("object"),
+                Some(manifest_type_name(resource)),
+            ));
+            continue;
+        };
+        require_non_empty_manifest_string(resource_object, resource_path.as_str(), "kind", issues);
+        require_non_empty_manifest_string(
+            resource_object,
+            resource_path.as_str(),
+            "status",
+            issues,
+        );
+        for field in ["cleanup_required", "cleanup_verified"] {
+            if !matches!(resource_object.get(field), Some(Value::Bool(_))) {
+                issues.push(backend_manifest_issue(
+                    &format!("{resource_path}.{field}"),
+                    "cleanup resource field must be a boolean",
+                    Some("boolean"),
+                    resource_object.get(field).map(manifest_type_name),
+                ));
+            }
+        }
+    }
+}
+
+fn require_non_empty_manifest_string(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    field: &str,
+    issues: &mut Vec<QaEvidenceIssue>,
+) {
+    let value = object.get(field).and_then(Value::as_str).unwrap_or_default();
+    if value.trim().is_empty() {
+        issues.push(backend_manifest_issue(
+            &format!("{path}.{field}"),
+            "manifest field must be a non-empty string",
+            Some("non-empty string"),
+            object.get(field).map(manifest_type_name),
+        ));
+    }
+}
+
+fn require_sha256_manifest_string(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    field: &str,
+    issues: &mut Vec<QaEvidenceIssue>,
+) {
+    let value = object.get(field).and_then(Value::as_str).unwrap_or_default();
+    if !is_sha256_hex(value) {
+        issues.push(backend_manifest_issue(
+            &format!("{path}.{field}"),
+            "manifest field must be a lowercase SHA-256 hex digest",
+            Some("64 lowercase hex characters"),
+            object.get(field).and_then(Value::as_str),
+        ));
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn backend_manifest_issue(
+    path: &str,
+    message: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) -> QaEvidenceIssue {
+    QaEvidenceIssue {
+        code: "backend_attestation_manifest_invalid".to_owned(),
+        path: path.to_owned(),
+        message: message.to_owned(),
+        expected: expected.map(ToOwned::to_owned),
+        actual: actual.map(ToOwned::to_owned),
+    }
+}
+
+fn manifest_type_name(value: &Value) -> &str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn check(name: &str, issues: Vec<QaEvidenceIssue>) -> QaEvidenceCheck {
@@ -1046,6 +1248,79 @@ timeout:
     }
 
     #[test]
+    fn backend_attestation_manifest_passes_for_execution_backend() {
+        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let mut input = passing_input();
+        input.tape_events.push(QaRunTapeEvent {
+            seq: 1,
+            event_type: "tool_attestation".to_owned(),
+            payload: json!({
+                "proposal_id": "proposal-1",
+                "tool_name": "palyra.process.run",
+                "executor": "sandbox_tier_b",
+                "execution_manifest": valid_backend_manifest(),
+            }),
+        });
+
+        let bundle = build_qa_evidence_bundle(&manifest, input);
+
+        let check = bundle
+            .checks
+            .iter()
+            .find(|check| check.name == "backend_attestation_manifests")
+            .expect("backend manifest check should be present");
+        assert_eq!(check.verdict, QaEvidenceVerdict::Passed);
+        assert_eq!(bundle.summary.check_count, 7);
+    }
+
+    #[test]
+    fn backend_attestation_manifest_reports_missing_and_invalid_fields() {
+        let manifest = parse_qa_scenario_manifest_yaml(BASIC_SCENARIO)
+            .expect("basic QA scenario should parse");
+        let mut missing = passing_input();
+        missing.tape_events.push(QaRunTapeEvent {
+            seq: 1,
+            event_type: "tool_attestation".to_owned(),
+            payload: json!({
+                "proposal_id": "proposal-1",
+                "tool_name": "palyra.process.run",
+                "executor": "docker",
+            }),
+        });
+
+        let missing_bundle = build_qa_evidence_bundle(&manifest, missing);
+
+        assert!(missing_bundle.checks.iter().any(|check| {
+            check.issues.iter().any(|issue| issue.code == "backend_attestation_manifest_missing")
+        }));
+
+        let mut invalid = passing_input();
+        let mut invalid_manifest = valid_backend_manifest();
+        invalid_manifest["output_manifest_sha256"] = json!("not-a-digest");
+        invalid_manifest["cleanup"]["resources"] = json!([]);
+        invalid.tape_events.push(QaRunTapeEvent {
+            seq: 1,
+            event_type: "tool_attestation".to_owned(),
+            payload: json!({
+                "proposal_id": "proposal-1",
+                "tool_name": "palyra.process.run",
+                "executor": "docker",
+                "execution_manifest": invalid_manifest,
+            }),
+        });
+
+        let invalid_bundle = build_qa_evidence_bundle(&manifest, invalid);
+
+        assert!(invalid_bundle.checks.iter().any(|check| {
+            check.issues.iter().any(|issue| {
+                issue.code == "backend_attestation_manifest_invalid"
+                    && issue.path.ends_with(".output_manifest_sha256")
+            })
+        }));
+    }
+
+    #[test]
     fn forbidden_claim_fails_final_answer_assertion() {
         let manifest = parse_qa_scenario_manifest_yaml(
             r#"
@@ -1154,5 +1429,32 @@ timeout:
             }],
             ..QaEvidenceBuildInput::default()
         }
+    }
+
+    fn valid_backend_manifest() -> Value {
+        json!({
+            "schema_version": 1,
+            "manifest_sha256": "f".repeat(64),
+            "backend_id": "local_sandbox",
+            "runner_id": "local_sandbox_runner",
+            "runner_version": "v1",
+            "workspace_strategy_digest": "1".repeat(64),
+            "input_manifest_sha256": "2".repeat(64),
+            "output_manifest_sha256": "3".repeat(64),
+            "cleanup": {
+                "strategy": "local_sandbox_process_lifecycle",
+                "success": true,
+                "reason_code": "local_sandbox.cleanup.ok",
+                "resources": [
+                    {
+                        "kind": "process_tree",
+                        "status": "foreground_process_reaped",
+                        "cleanup_required": true,
+                        "cleanup_verified": true
+                    }
+                ]
+            },
+            "egress_posture": "process_runner_egress:preflight"
+        })
     }
 }

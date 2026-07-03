@@ -29,6 +29,7 @@ use crate::{
         CANCELLED_REASON, MAX_MODEL_TOKEN_TAPE_EVENTS_PER_RUN,
     },
     journal::{ApprovalDecisionScope, ApprovalPromptRecord, OrchestratorTapeAppendRequest},
+    tool_protocol::ExecutionAttestationManifest,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
 
@@ -1100,6 +1101,7 @@ pub(crate) async fn send_tool_attestation_with_tape(
     timed_out: bool,
     executor: &str,
     sandbox_enforcement: &str,
+    execution_manifest: Option<&ExecutionAttestationManifest>,
 ) -> Result<(), Status> {
     let event = tool_attestation_event(
         run_id.to_owned(),
@@ -1119,7 +1121,7 @@ pub(crate) async fn send_tool_attestation_with_tape(
             run_id: run_id.to_owned(),
             seq: *tape_seq,
             event_type: "tool_attestation".to_owned(),
-            payload_json: tool_attestation_tape_payload(
+            payload_json: tool_attestation_tape_payload(ToolAttestationTapePayload {
                 proposal_id,
                 attestation_id,
                 execution_sha256,
@@ -1127,7 +1129,8 @@ pub(crate) async fn send_tool_attestation_with_tape(
                 timed_out,
                 executor,
                 sandbox_enforcement,
-            ),
+                execution_manifest,
+            }),
         })
         .await?;
     *tape_seq += 1;
@@ -1361,25 +1364,34 @@ fn tool_result_error_kind(error: &str) -> &'static str {
     }
 }
 
-fn tool_attestation_tape_payload(
-    proposal_id: &str,
-    attestation_id: &str,
-    execution_sha256: &str,
+struct ToolAttestationTapePayload<'a> {
+    proposal_id: &'a str,
+    attestation_id: &'a str,
+    execution_sha256: &'a str,
     executed_at_unix_ms: i64,
     timed_out: bool,
-    executor: &str,
-    sandbox_enforcement: &str,
-) -> String {
-    json!({
-        "proposal_id": proposal_id,
-        "attestation_id": attestation_id,
-        "execution_sha256": execution_sha256,
-        "executed_at_unix_ms": executed_at_unix_ms,
-        "timed_out": timed_out,
-        "executor": executor,
-        "sandbox_enforcement": sandbox_enforcement,
-    })
-    .to_string()
+    executor: &'a str,
+    sandbox_enforcement: &'a str,
+    execution_manifest: Option<&'a ExecutionAttestationManifest>,
+}
+
+fn tool_attestation_tape_payload(input: ToolAttestationTapePayload<'_>) -> String {
+    let mut payload = json!({
+        "proposal_id": input.proposal_id,
+        "attestation_id": input.attestation_id,
+        "execution_sha256": input.execution_sha256,
+        "executed_at_unix_ms": input.executed_at_unix_ms,
+        "timed_out": input.timed_out,
+        "executor": input.executor,
+        "sandbox_enforcement": input.sandbox_enforcement,
+    });
+    if let Some(manifest) = input.execution_manifest {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("execution_manifest".to_owned(), manifest.redacted_view());
+            object.insert("execution_manifest_audit".to_owned(), manifest.audit_view());
+        }
+    }
+    payload.to_string()
 }
 
 #[cfg(test)]

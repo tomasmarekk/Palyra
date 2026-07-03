@@ -29,7 +29,7 @@ use palyra_policy::{
     evaluate_with_context, PolicyDecision, PolicyEvaluationConfig, PolicyRequest,
     PolicyRequestContext,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -83,9 +83,9 @@ pub struct ToolRequestContext {
 /// Tamper-evidence record attached to every execution outcome.
 ///
 /// `execution_sha256` binds proposal id, tool name, input, output, error,
-/// timeout flag, executor, sandbox-enforcement label, and timestamp into one
-/// digest (see `compute_execution_hash`), so journal consumers can detect
-/// post-hoc mutation of any recorded field.
+/// timeout flag, executor, sandbox-enforcement label, timestamp, and optional
+/// backend manifest digest into one digest (see `compute_execution_hash`), so
+/// journal consumers can detect post-hoc mutation of any recorded field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolAttestation {
     pub attestation_id: String,
@@ -94,6 +94,7 @@ pub struct ToolAttestation {
     pub timed_out: bool,
     pub executor: String,
     pub sandbox_enforcement: String,
+    pub execution_manifest: Option<Box<ExecutionAttestationManifest>>,
 }
 
 /// Final attested result of a tool call: success flag, JSON output bytes,
@@ -104,6 +105,110 @@ pub struct ToolExecutionOutcome {
     pub output_json: Vec<u8>,
     pub error: String,
     pub attestation: ToolAttestation,
+}
+
+/// Backend-level manifest attached to execution outcomes that cross a runner boundary.
+///
+/// The manifest is intentionally digest-oriented: model-facing views receive
+/// comparable backend, runner, workspace, I/O, cleanup, egress, policy, and
+/// approval references without exposing raw host paths or credential material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAttestationManifest {
+    pub schema_version: u8,
+    pub backend_id: String,
+    pub runner_id: String,
+    pub runner_version: String,
+    pub workspace_strategy_digest: String,
+    pub input_manifest_sha256: String,
+    pub output_manifest_sha256: String,
+    pub cleanup: ExecutionCleanupEvidence,
+    pub egress_posture: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_decision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+}
+
+impl ExecutionAttestationManifest {
+    /// Returns a stable digest of the full audit-safe manifest payload.
+    #[must_use]
+    pub fn manifest_sha256(&self) -> String {
+        let bytes = serde_json::to_vec(self).unwrap_or_default();
+        sha256_hex(bytes.as_slice())
+    }
+
+    /// Returns the model-friendly projection used by trajectory and QA evidence.
+    #[must_use]
+    pub fn redacted_view(&self) -> Value {
+        json!({
+            "schema_version": self.schema_version,
+            "manifest_sha256": self.manifest_sha256(),
+            "backend_id": self.backend_id,
+            "runner_id": self.runner_id,
+            "runner_version": self.runner_version,
+            "workspace_strategy_digest": self.workspace_strategy_digest,
+            "input_manifest_sha256": self.input_manifest_sha256,
+            "output_manifest_sha256": self.output_manifest_sha256,
+            "cleanup": self.cleanup.redacted_view(),
+            "egress_posture": self.egress_posture,
+            "policy_decision_ref": self.policy_decision_id.as_deref().map(stable_ref_sha256),
+            "approval_ref": self.approval_id.as_deref().map(stable_ref_sha256),
+        })
+    }
+
+    /// Returns the audit-safe full view for support bundles and operator review.
+    #[must_use]
+    pub fn audit_view(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// Cleanup evidence for one execution backend run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionCleanupEvidence {
+    pub strategy: String,
+    pub success: bool,
+    pub reason_code: String,
+    #[serde(default)]
+    pub resources: Vec<ExecutionCleanupResourceEvidence>,
+}
+
+impl ExecutionCleanupEvidence {
+    /// Returns the redacted cleanup projection embedded in model-visible traces.
+    #[must_use]
+    pub fn redacted_view(&self) -> Value {
+        json!({
+            "strategy": self.strategy,
+            "success": self.success,
+            "reason_code": self.reason_code,
+            "resources": self.resources.iter().map(ExecutionCleanupResourceEvidence::redacted_view).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// One cleanup resource checked by an execution backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionCleanupResourceEvidence {
+    pub kind: String,
+    pub status: String,
+    pub cleanup_required: bool,
+    pub cleanup_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier_sha256: Option<String>,
+}
+
+impl ExecutionCleanupResourceEvidence {
+    /// Returns the redacted resource projection embedded in model-visible traces.
+    #[must_use]
+    pub fn redacted_view(&self) -> Value {
+        json!({
+            "kind": self.kind,
+            "status": self.status,
+            "cleanup_required": self.cleanup_required,
+            "cleanup_verified": self.cleanup_verified,
+            "identifier_sha256": self.identifier_sha256,
+        })
+    }
 }
 
 /// Serializable view of [`ToolCallConfig`] for console/diagnostics surfaces.
@@ -385,6 +490,7 @@ pub fn denied_execution_outcome(
             timed_out: false,
             executor: "policy".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
     )
 }
@@ -414,6 +520,37 @@ pub(crate) fn build_tool_execution_outcome(
             timed_out,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
+        },
+    )
+}
+
+/// Wraps an externally produced raw result with a backend execution manifest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tool_execution_outcome_with_manifest(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+    timed_out: bool,
+    executor: String,
+    sandbox_enforcement: String,
+    execution_manifest: ExecutionAttestationManifest,
+) -> ToolExecutionOutcome {
+    build_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        ToolExecutionRawResult {
+            success,
+            output_json,
+            error,
+            timed_out,
+            executor,
+            sandbox_enforcement,
+            execution_manifest: Some(execution_manifest),
         },
     )
 }
@@ -505,6 +642,7 @@ pub async fn execute_tool_call_with_cancellation_and_progress(
                 timed_out: true,
                 executor: tool_executor_name(config, tool_name),
                 sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
+                execution_manifest: None,
             },
         }
     };
@@ -521,6 +659,7 @@ struct ToolExecutionRawResult {
     timed_out: bool,
     executor: String,
     sandbox_enforcement: String,
+    execution_manifest: Option<ExecutionAttestationManifest>,
 }
 
 fn build_execution_outcome(
@@ -531,6 +670,8 @@ fn build_execution_outcome(
 ) -> ToolExecutionOutcome {
     let executed_at_unix_ms = current_unix_ms();
     let output_json = normalize_failure_output_json(tool_name, &raw);
+    let execution_manifest_sha256 =
+        raw.execution_manifest.as_ref().map(ExecutionAttestationManifest::manifest_sha256);
     let execution_sha256 = compute_execution_hash(
         proposal_id,
         tool_name,
@@ -542,6 +683,7 @@ fn build_execution_outcome(
         raw.executor.as_str(),
         raw.sandbox_enforcement.as_str(),
         executed_at_unix_ms,
+        execution_manifest_sha256.as_deref(),
     );
     ToolExecutionOutcome {
         success: raw.success,
@@ -554,6 +696,7 @@ fn build_execution_outcome(
             timed_out: raw.timed_out,
             executor: raw.executor,
             sandbox_enforcement: raw.sandbox_enforcement,
+            execution_manifest: raw.execution_manifest.map(Box::new),
         },
     }
 }
@@ -661,6 +804,7 @@ async fn run_allowlisted_tool_with_cancellation(
                 timed_out: false,
                 executor: "builtin".to_owned(),
                 sandbox_enforcement: "none".to_owned(),
+                execution_manifest: None,
             },
             Err(error) => ToolExecutionRawResult {
                 success: false,
@@ -669,6 +813,7 @@ async fn run_allowlisted_tool_with_cancellation(
                 timed_out: false,
                 executor: "builtin".to_owned(),
                 sandbox_enforcement: "none".to_owned(),
+                execution_manifest: None,
             },
         },
         "palyra.sleep" => match execute_sleep_tool(input_json).await {
@@ -679,6 +824,7 @@ async fn run_allowlisted_tool_with_cancellation(
                 timed_out: false,
                 executor: "builtin".to_owned(),
                 sandbox_enforcement: "none".to_owned(),
+                execution_manifest: None,
             },
             Err(error) => ToolExecutionRawResult {
                 success: false,
@@ -687,6 +833,7 @@ async fn run_allowlisted_tool_with_cancellation(
                 timed_out: false,
                 executor: "builtin".to_owned(),
                 sandbox_enforcement: "none".to_owned(),
+                execution_manifest: None,
             },
         },
         "palyra.memory.status" => ToolExecutionRawResult {
@@ -696,6 +843,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.search" => ToolExecutionRawResult {
             success: false,
@@ -704,6 +852,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.recall" => ToolExecutionRawResult {
             success: false,
@@ -712,6 +861,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.session_search" | "palyra.session_search" => ToolExecutionRawResult {
             success: false,
@@ -720,6 +870,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.retain" | "palyra.retain" => ToolExecutionRawResult {
             success: false,
@@ -728,6 +879,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.delete" => ToolExecutionRawResult {
             success: false,
@@ -736,6 +888,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.replace" => ToolExecutionRawResult {
             success: false,
@@ -744,6 +897,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.memory.reflect" => ToolExecutionRawResult {
             success: false,
@@ -752,6 +906,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.routines.query" | "palyra.routines.control" => ToolExecutionRawResult {
             success: false,
@@ -760,6 +915,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "routines_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         "palyra.delegation.query"
         | "palyra.delegation.control"
@@ -771,6 +927,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "delegation_runtime".to_owned(),
             sandbox_enforcement: "delegation_scope".to_owned(),
+            execution_manifest: None,
         },
         "palyra.artifact.read" => ToolExecutionRawResult {
             success: false,
@@ -779,6 +936,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_artifacts".to_owned(),
             sandbox_enforcement: "artifact_scope".to_owned(),
+            execution_manifest: None,
         },
         "palyra.image.observe" => ToolExecutionRawResult {
             success: false,
@@ -788,6 +946,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "image_observe".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
         },
         "palyra.http.fetch" => ToolExecutionRawResult {
             success: false,
@@ -796,6 +955,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "gateway_http_fetch".to_owned(),
             sandbox_enforcement: "ssrf_guard".to_owned(),
+            execution_manifest: None,
         },
         "palyra.process.run" => {
             execute_process_runner_tool(
@@ -816,6 +976,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: process_runner_executor_name(&config.process_runner),
             sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
+            execution_manifest: None,
         },
         "palyra.tool_program.run" => ToolExecutionRawResult {
             success: false,
@@ -825,6 +986,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "tool_program_runtime".to_owned(),
             sandbox_enforcement: "nested_tool_policy".to_owned(),
+            execution_manifest: None,
         },
         "palyra.fs.apply_patch" => ToolExecutionRawResult {
             success: false,
@@ -833,6 +995,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "workspace_patch".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
         },
         "palyra.fs.read_file" => ToolExecutionRawResult {
             success: false,
@@ -841,6 +1004,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "workspace_file".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
         },
         "palyra.fs.list_dir" => ToolExecutionRawResult {
             success: false,
@@ -849,6 +1013,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "workspace_file".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
         },
         "palyra.fs.search" => ToolExecutionRawResult {
             success: false,
@@ -857,6 +1022,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "workspace_file".to_owned(),
             sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
         },
         "palyra.fs.os_file" => ToolExecutionRawResult {
             success: false,
@@ -865,6 +1031,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "os_file".to_owned(),
             sandbox_enforcement: "approved_os_paths".to_owned(),
+            execution_manifest: None,
         },
         "palyra.browser.session.create"
         | "palyra.browser.session.close"
@@ -902,6 +1069,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "browser_broker".to_owned(),
             sandbox_enforcement: "browser_service".to_owned(),
+            execution_manifest: None,
         },
         "palyra.plugin.run" => execute_wasm_plugin_tool(config, input_json).await,
         _ => ToolExecutionRawResult {
@@ -911,6 +1079,7 @@ async fn run_allowlisted_tool_with_cancellation(
             timed_out: false,
             executor: "builtin".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
     }
 }
@@ -1177,6 +1346,7 @@ fn reject_oversized_tool_input(
         timed_out: false,
         executor: tool_executor_name(config, tool_name),
         sandbox_enforcement: sandbox_enforcement_for_tool(config, tool_name),
+        execution_manifest: None,
     })
 }
 
@@ -1218,6 +1388,7 @@ async fn execute_process_runner_tool(
             timed_out: false,
             executor: executor.clone(),
             sandbox_enforcement: sandbox_enforcement.clone(),
+            execution_manifest: None,
         },
         Ok(Err(error)) => {
             if matches!(
@@ -1233,6 +1404,7 @@ async fn execute_process_runner_tool(
                 timed_out: matches!(error.kind, SandboxProcessRunErrorKind::TimedOut),
                 executor: executor.clone(),
                 sandbox_enforcement: sandbox_enforcement.clone(),
+                execution_manifest: None,
             }
         }
         Err(join_error) => ToolExecutionRawResult {
@@ -1242,6 +1414,7 @@ async fn execute_process_runner_tool(
             timed_out: false,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
         },
     }
 }
@@ -1262,6 +1435,7 @@ async fn execute_process_lifecycle_tool(
             timed_out: false,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
         };
     }
     let pid = match process_lifecycle_pid_from_input(input_json, tool_name) {
@@ -1274,6 +1448,7 @@ async fn execute_process_lifecycle_tool(
                 timed_out: false,
                 executor,
                 sandbox_enforcement,
+                execution_manifest: None,
             };
         }
     };
@@ -1292,6 +1467,7 @@ async fn execute_process_lifecycle_tool(
             timed_out: false,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
         },
         Ok(Err(error)) => ToolExecutionRawResult {
             success: false,
@@ -1300,6 +1476,7 @@ async fn execute_process_lifecycle_tool(
             timed_out: false,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
         },
         Err(join_error) => ToolExecutionRawResult {
             success: false,
@@ -1308,6 +1485,7 @@ async fn execute_process_lifecycle_tool(
             timed_out: false,
             executor,
             sandbox_enforcement,
+            execution_manifest: None,
         },
     }
 }
@@ -1347,6 +1525,7 @@ async fn execute_wasm_plugin_tool(
             timed_out: false,
             executor: "sandbox_tier_a".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
         Ok(Err(error)) => {
             if matches!(
@@ -1365,6 +1544,7 @@ async fn execute_wasm_plugin_tool(
                 timed_out: matches!(error.kind, WasmPluginRunErrorKind::TimedOut),
                 executor: "sandbox_tier_a".to_owned(),
                 sandbox_enforcement: "none".to_owned(),
+                execution_manifest: None,
             }
         }
         Err(join_error) => ToolExecutionRawResult {
@@ -1374,6 +1554,7 @@ async fn execute_wasm_plugin_tool(
             timed_out: false,
             executor: "sandbox_tier_a".to_owned(),
             sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
         },
     }
 }
@@ -1430,6 +1611,7 @@ fn compute_execution_hash(
     executor: &str,
     sandbox_enforcement: &str,
     executed_at_unix_ms: i64,
+    execution_manifest_sha256: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"palyra.tool.attestation.v1");
@@ -1443,6 +1625,19 @@ fn compute_execution_hash(
     hash_len_prefixed_str(&mut hasher, executor);
     hash_len_prefixed_str(&mut hasher, sandbox_enforcement);
     hasher.update(executed_at_unix_ms.to_be_bytes());
+    if let Some(execution_manifest_sha256) = execution_manifest_sha256 {
+        hash_len_prefixed_str(&mut hasher, execution_manifest_sha256);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn stable_ref_sha256(value: &str) -> String {
+    format!("sha256:{}", sha256_hex(value.as_bytes()))
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
     hex::encode(hasher.finalize())
 }
 
@@ -3018,6 +3213,7 @@ mod tests {
             "builtin",
             "none",
             1_735_689_600_000,
+            None,
         );
         let hash_two = super::compute_execution_hash(
             "01ARZ3NDEKTSV4RRFFQ69G5FA4",
@@ -3030,7 +3226,22 @@ mod tests {
             "builtin",
             "none",
             1_735_689_600_000,
+            None,
+        );
+        let hash_with_manifest = super::compute_execution_hash(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+            "palyra.echo",
+            br#"{"text":"hello|world"}"#,
+            false,
+            b"A",
+            "B|C",
+            false,
+            "builtin",
+            "none",
+            1_735_689_600_000,
+            Some("1111111111111111111111111111111111111111111111111111111111111111"),
         );
         assert_ne!(hash_one, hash_two, "distinct field tuples must hash differently");
+        assert_ne!(hash_one, hash_with_manifest, "manifest digest must bind into the hash");
     }
 }

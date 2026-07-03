@@ -57,8 +57,10 @@ use crate::{
         process_runner_executor_name, ProcessProgressSink, SandboxProcessRunnerPolicy,
     },
     tool_protocol::{
-        build_tool_execution_outcome, execute_tool_call_with_cancellation_and_progress,
-        ToolCallConfig, ToolExecutionOutcome,
+        build_tool_execution_outcome, build_tool_execution_outcome_with_manifest,
+        execute_tool_call_with_cancellation_and_progress, ExecutionAttestationManifest,
+        ExecutionCleanupEvidence, ExecutionCleanupResourceEvidence, ToolCallConfig,
+        ToolExecutionOutcome,
     },
 };
 
@@ -570,6 +572,109 @@ pub(crate) struct ExecutionBackendRunnerManifest {
     pub(crate) capabilities: Vec<String>,
 }
 
+struct ExecutionAttestationManifestInput<'a> {
+    backend_id: &'a str,
+    runner_id: &'a str,
+    runner_version: &'a str,
+    workspace_strategy_digest: String,
+    input_manifest_sha256: String,
+    output_manifest_sha256: String,
+    cleanup: ExecutionCleanupEvidence,
+    egress_posture: String,
+}
+
+fn execution_attestation_manifest(
+    input: ExecutionAttestationManifestInput<'_>,
+) -> ExecutionAttestationManifest {
+    ExecutionAttestationManifest {
+        schema_version: 1,
+        backend_id: input.backend_id.to_owned(),
+        runner_id: input.runner_id.to_owned(),
+        runner_version: input.runner_version.to_owned(),
+        workspace_strategy_digest: input.workspace_strategy_digest,
+        input_manifest_sha256: input.input_manifest_sha256,
+        output_manifest_sha256: input.output_manifest_sha256,
+        cleanup: input.cleanup,
+        egress_posture: input.egress_posture,
+        policy_decision_id: None,
+        approval_id: None,
+    }
+}
+
+fn cleanup_resource(
+    kind: &str,
+    status: &str,
+    cleanup_required: bool,
+    cleanup_verified: bool,
+) -> ExecutionCleanupResourceEvidence {
+    ExecutionCleanupResourceEvidence {
+        kind: kind.to_owned(),
+        status: status.to_owned(),
+        cleanup_required,
+        cleanup_verified,
+        identifier_sha256: None,
+    }
+}
+
+fn local_sandbox_process_manifest(
+    runner: &dyn ExecutionBackendRunner,
+    policy: &SandboxProcessRunnerPolicy,
+    input_json: &[u8],
+    outcome: &ToolExecutionOutcome,
+) -> ExecutionAttestationManifest {
+    execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: runner.backend_preference().as_str(),
+        runner_id: runner.runner_id(),
+        runner_version: runner.runner_version(),
+        workspace_strategy_digest: WorkspaceStrategyDescriptor::daemon_workspace_root()
+            .attestation_digest_sha256(),
+        input_manifest_sha256: sha256_hex(input_json),
+        output_manifest_sha256: sha256_hex(outcome.output_json.as_slice()),
+        cleanup: local_sandbox_cleanup_evidence(outcome),
+        egress_posture: format!(
+            "process_runner_egress:{}",
+            policy.egress_enforcement_mode.as_str()
+        ),
+    })
+}
+
+fn local_sandbox_cleanup_evidence(outcome: &ToolExecutionOutcome) -> ExecutionCleanupEvidence {
+    let payload = serde_json::from_slice::<serde_json::Value>(outcome.output_json.as_slice()).ok();
+    let background = payload
+        .as_ref()
+        .and_then(|value| value.get("background"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let cleanup_is_null = payload
+        .as_ref()
+        .and_then(|value| value.get("cleanup"))
+        .is_some_and(serde_json::Value::is_null);
+    let process_status = if outcome.attestation.timed_out {
+        "process_timeout_terminated"
+    } else if background && cleanup_is_null {
+        "background_launcher_tree_terminated"
+    } else if background {
+        "background_lifecycle_bounded"
+    } else {
+        "foreground_process_reaped"
+    };
+    let process_cleanup_verified = !background || cleanup_is_null || outcome.attestation.timed_out;
+    ExecutionCleanupEvidence {
+        strategy: "local_sandbox_process_lifecycle".to_owned(),
+        success: process_cleanup_verified,
+        reason_code: if process_cleanup_verified {
+            "local_sandbox.cleanup.ok"
+        } else {
+            "local_sandbox.cleanup.background_lifecycle_pending"
+        }
+        .to_owned(),
+        resources: vec![
+            cleanup_resource("process_tree", process_status, true, process_cleanup_verified),
+            cleanup_resource("temporary_files", "scoped_runtime_temp_released", true, true),
+        ],
+    }
+}
+
 /// Health probe result for a concrete execution runner implementation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecutionBackendRunnerHealth {
@@ -804,7 +909,7 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
         request: ExecutionBackendProcessRunRequest<'a>,
     ) -> RunnerExecutionFuture<'a> {
         Box::pin(async move {
-            execute_tool_call_with_cancellation_and_progress(
+            let mut outcome = execute_tool_call_with_cancellation_and_progress(
                 request.config,
                 request.proposal_id,
                 request.tool_name,
@@ -812,7 +917,15 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
                 request.cancellation_requested,
                 request.process_progress_sink,
             )
-            .await
+            .await;
+            outcome.attestation.execution_manifest =
+                Some(Box::new(local_sandbox_process_manifest(
+                    self,
+                    &request.config.process_runner,
+                    request.input_json,
+                    &outcome,
+                )));
+            outcome
         })
     }
 
@@ -1573,6 +1686,7 @@ pub(crate) struct DockerRunPlan {
     pub(crate) profile_id: String,
     pub(crate) image: String,
     pub(crate) image_digest_sha256: String,
+    pub(crate) workspace_strategy_digest: String,
     pub(crate) user: String,
     pub(crate) readonly_rootfs: bool,
     pub(crate) network: ContainerNetworkPolicy,
@@ -1594,6 +1708,28 @@ pub(crate) struct DockerCleanupAttestation {
     pub(crate) volume_removed: bool,
     pub(crate) success: bool,
     pub(crate) reason_code: String,
+}
+
+fn docker_cleanup_evidence(cleanup: &DockerCleanupAttestation) -> ExecutionCleanupEvidence {
+    ExecutionCleanupEvidence {
+        strategy: cleanup.strategy.clone(),
+        success: cleanup.success,
+        reason_code: cleanup.reason_code.clone(),
+        resources: vec![
+            cleanup_resource(
+                "container",
+                if cleanup.container_removed { "removed" } else { "remove_failed" },
+                true,
+                cleanup.container_removed,
+            ),
+            cleanup_resource(
+                "workspace_volume",
+                if cleanup.volume_removed { "removed" } else { "remove_failed" },
+                true,
+                cleanup.volume_removed,
+            ),
+        ],
+    }
 }
 
 /// Container resource usage summary attached to process output.
@@ -2254,6 +2390,8 @@ fn docker_process_run_plan(
         profile_id: profile.profile_id.clone(),
         image: profile.image.clone(),
         image_digest_sha256,
+        workspace_strategy_digest: WorkspaceStrategyDescriptor::container_volume()
+            .attestation_digest_sha256(),
         user: profile.user.clone(),
         readonly_rootfs: profile.readonly_rootfs,
         network: profile.network,
@@ -2314,7 +2452,8 @@ fn docker_process_run_outcome(
     plan: &DockerRunPlan,
     report: DockerRunReport,
 ) -> ToolExecutionOutcome {
-    let cleanup_success = report.cleanup.success;
+    let cleanup = report.cleanup.clone();
+    let cleanup_success = cleanup.success;
     let success = report.exit_code == 0 && cleanup_success;
     let stdout_view = docker_stream_output_view(&report.stdout);
     let stderr_view = docker_stream_output_view(&report.stderr);
@@ -2366,7 +2505,7 @@ fn docker_process_run_outcome(
             "authoritative_workspace_mutation": false,
             "patch_bundle": report.patch_bundle,
         },
-        "cleanup": report.cleanup,
+        "cleanup": cleanup,
         "output_manifest": output_manifest,
         "output_manifest_sha256": output_manifest_sha256,
     });
@@ -2377,7 +2516,17 @@ fn docker_process_run_outcome(
     } else {
         format!("DockerRunner process exited unsuccessfully with code {}", report.exit_code)
     };
-    build_tool_execution_outcome(
+    let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: ExecutionBackendPreference::Docker.as_str(),
+        runner_id: "docker_runner",
+        runner_version: "v1",
+        workspace_strategy_digest: plan.workspace_strategy_digest.clone(),
+        input_manifest_sha256: sha256_hex(input_json),
+        output_manifest_sha256,
+        cleanup: docker_cleanup_evidence(&report.cleanup),
+        egress_posture: docker_egress_posture(plan.network).to_owned(),
+    });
+    build_tool_execution_outcome_with_manifest(
         proposal_id,
         tool_name,
         input_json,
@@ -2387,6 +2536,7 @@ fn docker_process_run_outcome(
         false,
         "docker".to_owned(),
         "container_profile".to_owned(),
+        manifest,
     )
 }
 
@@ -2404,16 +2554,37 @@ fn docker_error_outcome(
         "reason_code": reason_code,
         "repair_hint": "Configure an allowlisted non-root Docker profile with a sha256-pinned image, read-only root filesystem, workspace-scoped mount, and patch-bundle writeback.",
     });
-    build_tool_execution_outcome(
+    let output_json = serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec());
+    let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: ExecutionBackendPreference::Docker.as_str(),
+        runner_id: "docker_runner",
+        runner_version: "v1",
+        workspace_strategy_digest: WorkspaceStrategyDescriptor::container_volume()
+            .attestation_digest_sha256(),
+        input_manifest_sha256: sha256_hex(input_json),
+        output_manifest_sha256: sha256_hex(output_json.as_slice()),
+        cleanup: ExecutionCleanupEvidence {
+            strategy: "container_profile_preflight".to_owned(),
+            success: false,
+            reason_code: reason_code.to_owned(),
+            resources: vec![
+                cleanup_resource("container", "not_started", false, false),
+                cleanup_resource("workspace_volume", "not_started", false, false),
+            ],
+        },
+        egress_posture: "container_network:preflight_not_started".to_owned(),
+    });
+    build_tool_execution_outcome_with_manifest(
         proposal_id,
         tool_name,
         input_json,
         false,
-        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        output_json,
         message,
         false,
         "docker".to_owned(),
         "container_profile_preflight".to_owned(),
+        manifest,
     )
 }
 
@@ -2445,6 +2616,13 @@ fn docker_network_arg(network: ContainerNetworkPolicy) -> &'static str {
     match network {
         ContainerNetworkPolicy::None => "none",
         ContainerNetworkPolicy::EgressProxy => DOCKER_EGRESS_PROXY_NETWORK,
+    }
+}
+
+fn docker_egress_posture(network: ContainerNetworkPolicy) -> &'static str {
+    match network {
+        ContainerNetworkPolicy::None => "container_network:none",
+        ContainerNetworkPolicy::EgressProxy => "container_network:egress_proxy",
     }
 }
 
@@ -2671,6 +2849,60 @@ pub(crate) struct SshWorkerRpcResultEnvelope {
     pub(crate) error: Option<String>,
     pub(crate) output_manifest_sha256: String,
     pub(crate) cleanup_report: WorkerCleanupReport,
+}
+
+fn worker_cleanup_evidence(
+    strategy: &str,
+    cleanup_report: &WorkerCleanupReport,
+) -> ExecutionCleanupEvidence {
+    let success = cleanup_report.is_verified();
+    ExecutionCleanupEvidence {
+        strategy: strategy.to_owned(),
+        success,
+        reason_code: cleanup_report.failure_reason.clone().unwrap_or_else(|| {
+            if success {
+                "worker.cleanup.ok".to_owned()
+            } else {
+                "worker.cleanup.incomplete".to_owned()
+            }
+        }),
+        resources: vec![
+            cleanup_resource(
+                "remote_workspace",
+                if cleanup_report.removed_workspace_scope { "removed" } else { "remove_failed" },
+                true,
+                cleanup_report.removed_workspace_scope,
+            ),
+            cleanup_resource(
+                "remote_artifacts",
+                if cleanup_report.removed_artifacts { "removed" } else { "remove_failed" },
+                true,
+                cleanup_report.removed_artifacts,
+            ),
+            cleanup_resource(
+                "remote_logs",
+                if cleanup_report.removed_logs { "removed" } else { "remove_failed" },
+                true,
+                cleanup_report.removed_logs,
+            ),
+        ],
+    }
+}
+
+fn worker_not_started_cleanup_evidence(
+    strategy: &str,
+    reason_code: &str,
+) -> ExecutionCleanupEvidence {
+    ExecutionCleanupEvidence {
+        strategy: strategy.to_owned(),
+        success: false,
+        reason_code: reason_code.to_owned(),
+        resources: vec![
+            cleanup_resource("remote_workspace", "not_started", false, false),
+            cleanup_resource("remote_artifacts", "not_started", false, false),
+            cleanup_resource("remote_logs", "not_started", false, false),
+        ],
+    }
 }
 
 /// SSH worker transport failures converted to fail-closed tool outcomes.
@@ -3009,16 +3241,54 @@ fn ssh_worker_outcome_from_rpc_result(
         );
     }
     if !result.cleanup_report.is_verified() {
-        return ssh_worker_error_outcome(
+        let cleanup_report = result.cleanup_report.clone();
+        let output = json!({
+            "success": false,
+            "event": "execution_backend.ssh_worker_runner",
+            "status": "cleanup_failed",
+            "backend": ExecutionBackendPreference::SshTunnel.as_str(),
+            "profile_id": profile.profile_id,
+            "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+            "reason_code": "ssh_worker.cleanup.incomplete",
+            "cleanup_report": cleanup_report.clone(),
+        });
+        let output_json = serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec());
+        let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+            backend_id: ExecutionBackendPreference::SshTunnel.as_str(),
+            runner_id: "ssh_worker_runner",
+            runner_version: "v1",
+            workspace_strategy_digest: request.workspace_strategy_digest.clone(),
+            input_manifest_sha256: request.input_json_sha256.clone(),
+            output_manifest_sha256: result.output_manifest_sha256,
+            cleanup: worker_cleanup_evidence("ssh_worker_rpc_cleanup", &cleanup_report),
+            egress_posture: "operator_managed_ssh_tunnel_worker_rpc".to_owned(),
+        });
+        return build_tool_execution_outcome_with_manifest(
             proposal_id,
             tool_name,
             input_json,
-            "ssh_worker.cleanup.incomplete",
+            false,
+            output_json,
             "SSH worker RPC cleanup report was incomplete".to_owned(),
-            profile,
+            false,
+            "ssh_tunnel".to_owned(),
+            "ssh_worker_rpc_cleanup_failed".to_owned(),
+            manifest,
         );
     }
-    build_tool_execution_outcome(
+    let output_manifest_sha256 = result.output_manifest_sha256.clone();
+    let cleanup_report = result.cleanup_report.clone();
+    let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: ExecutionBackendPreference::SshTunnel.as_str(),
+        runner_id: "ssh_worker_runner",
+        runner_version: "v1",
+        workspace_strategy_digest: request.workspace_strategy_digest.clone(),
+        input_manifest_sha256: request.input_json_sha256.clone(),
+        output_manifest_sha256: output_manifest_sha256.clone(),
+        cleanup: worker_cleanup_evidence("ssh_worker_rpc_cleanup", &cleanup_report),
+        egress_posture: "operator_managed_ssh_tunnel_worker_rpc".to_owned(),
+    });
+    build_tool_execution_outcome_with_manifest(
         proposal_id,
         tool_name,
         input_json,
@@ -3029,8 +3299,9 @@ fn ssh_worker_outcome_from_rpc_result(
         "ssh_tunnel".to_owned(),
         format!(
             "ssh_worker_rpc;profile_id={};workspace_strategy_sha256={};output_manifest_sha256={}",
-            profile.profile_id, request.workspace_strategy_digest, result.output_manifest_sha256
+            profile.profile_id, request.workspace_strategy_digest, output_manifest_sha256
         ),
+        manifest,
     )
 }
 
@@ -3054,16 +3325,28 @@ fn ssh_worker_error_outcome(
         "repair_hint": "Attach an operator-managed palyra-worker-rpc/v1 SSH tunnel profile or select a different execution backend.",
     });
     let redacted_message = redact_diagnostic_text(message.as_str());
-    build_tool_execution_outcome(
+    let output_json = serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec());
+    let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: ExecutionBackendPreference::SshTunnel.as_str(),
+        runner_id: "ssh_worker_runner",
+        runner_version: "v1",
+        workspace_strategy_digest: profile.workspace_strategy.attestation_digest_sha256(),
+        input_manifest_sha256: sha256_hex(input_json),
+        output_manifest_sha256: sha256_hex(output_json.as_slice()),
+        cleanup: worker_not_started_cleanup_evidence("ssh_worker_rpc_preflight", reason_code),
+        egress_posture: "operator_managed_ssh_tunnel_worker_rpc".to_owned(),
+    });
+    build_tool_execution_outcome_with_manifest(
         proposal_id,
         tool_name,
         input_json,
         false,
-        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        output_json,
         redacted_message,
         false,
         "ssh_tunnel".to_owned(),
         "ssh_worker_rpc_unavailable".to_owned(),
+        manifest,
     )
 }
 
@@ -4407,6 +4690,8 @@ mod tests {
             image: profile.image,
             image_digest_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
                 .to_owned(),
+            workspace_strategy_digest: WorkspaceStrategyDescriptor::container_volume()
+                .attestation_digest_sha256(),
             user: profile.user,
             readonly_rootfs: profile.readonly_rootfs,
             network: profile.network,
@@ -4484,6 +4769,19 @@ mod tests {
             outcome.attestation.sandbox_enforcement,
             process_runner_sandbox_enforcement_label(&config.process_runner)
         );
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("local process outcome should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "local_sandbox");
+        assert_eq!(manifest.runner_id, "local_sandbox_runner");
+        assert_eq!(
+            manifest.input_manifest_sha256,
+            sha256_hex(br#"{"command":"echo","args":["runner-ok"]}"#)
+        );
+        assert_eq!(manifest.output_manifest_sha256, sha256_hex(outcome.output_json.as_slice()));
+        assert!(manifest.cleanup.success);
     }
 
     #[test]
@@ -4541,6 +4839,19 @@ mod tests {
         assert_eq!(payload["workspace_writeback"]["mode"], "patch_bundle");
         assert_eq!(payload["workspace_writeback"]["authoritative_workspace_mutation"], false);
         assert!(payload["output_manifest_sha256"].as_str().is_some_and(|hash| hash.len() == 64));
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("Docker outcome should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "docker");
+        assert_eq!(manifest.runner_id, "docker_runner");
+        assert_eq!(
+            manifest.output_manifest_sha256,
+            payload["output_manifest_sha256"].as_str().expect("manifest hash")
+        );
+        assert_eq!(manifest.cleanup.reason_code, "docker.cleanup.ok");
+        assert!(manifest.cleanup.success);
 
         let plans = plans.lock().expect("fake Docker plans");
         assert_eq!(plans.len(), 1);
@@ -4628,6 +4939,14 @@ mod tests {
             serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
         assert_eq!(payload["cleanup"]["success"], false);
         assert_eq!(payload["cleanup"]["reason_code"], "docker.cleanup.remove_failed");
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("Docker cleanup failure should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "docker");
+        assert!(!manifest.cleanup.success);
+        assert_eq!(manifest.cleanup.reason_code, "docker.cleanup.remove_failed");
     }
 
     #[tokio::test]
@@ -4662,6 +4981,15 @@ mod tests {
             serde_json::from_slice(&outcome.output_json).expect("SSH worker output should be JSON");
         assert_eq!(payload["exit_code"], 0);
         assert_eq!(payload["stdout"], "runner-ok\n");
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("SSH worker outcome should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "ssh_tunnel");
+        assert_eq!(manifest.runner_id, "ssh_worker_runner");
+        assert_eq!(manifest.cleanup.reason_code, "worker.cleanup.ok");
+        assert!(manifest.cleanup.success);
 
         let requests = requests.lock().expect("fake SSH requests");
         assert_eq!(requests.len(), 1);
@@ -4713,6 +5041,14 @@ mod tests {
             .get("tunnel_endpoint_sha256")
             .and_then(serde_json::Value::as_str)
             .is_some());
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("SSH worker unavailable outcome should carry an execution manifest");
+        assert_eq!(manifest.backend_id, "ssh_tunnel");
+        assert!(!manifest.cleanup.success);
+        assert_eq!(manifest.cleanup.reason_code, "runner.unavailable.ssh_tunnel");
     }
 
     #[tokio::test]
