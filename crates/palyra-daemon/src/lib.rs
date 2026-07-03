@@ -2371,6 +2371,7 @@ pub async fn run() -> Result<()> {
             delivery_arbitration: loaded.delivery_arbitration.clone(),
             replay_capture: loaded.replay_capture.clone(),
             networked_workers: loaded.networked_workers.clone(),
+            execution_backend_profiles: loaded.execution_backend_profiles.clone(),
             channel_router: loaded.channel_router.clone(),
             media: loaded.media.clone(),
             code_intel: loaded.tool_call.code_intel.clone(),

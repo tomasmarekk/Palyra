@@ -826,7 +826,9 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
-    } else if context.execution_backend == ExecutionBackendPreference::Docker {
+    } else if context.execution_backend == ExecutionBackendPreference::Docker
+        && tool_name != PROCESS_RUNNER_TOOL_NAME
+    {
         docker_execution_target_unavailable_outcome(proposal_id, tool_name, input_json)
     } else if let Some(outcome) =
         local_tool_runtime_runner_unavailable_outcome(context, proposal_id, tool_name, input_json)
@@ -1034,7 +1036,23 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
         let execution_input_json =
             process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
-        let runner_registry = ExecutionBackendRunnerRegistry::default();
+        let runner_registry = if context.execution_backend == ExecutionBackendPreference::Docker {
+            match ExecutionBackendRunnerRegistry::from_execution_backend_profiles(
+                &runtime_state.config.execution_backend_profiles,
+            ) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    return docker_execution_target_config_error_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        error,
+                    );
+                }
+            }
+        } else {
+            ExecutionBackendRunnerRegistry::default()
+        };
         let runner = match runner_registry
             .select_runner(context.execution_backend, ExecutionBackendRunnerCapability::RunProcess)
         {
@@ -1448,6 +1466,34 @@ fn docker_execution_target_unavailable_outcome(
         serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
         "Docker execution target is unavailable until an allowlisted container profile passes preflight"
             .to_owned(),
+        false,
+        "docker".to_owned(),
+        "container_profile_preflight".to_owned(),
+    )
+}
+
+fn docker_execution_target_config_error_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    error: String,
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "execution_target": "docker",
+        "status": "degraded",
+        "reason_code": "backend.preflight.docker_profile_invalid",
+        "repair_hint": "Fix execution_backend_profiles Docker profile invariants or select local_sandbox.",
+        "workspace_writeback": "patch_bundle_required",
+        "egress_policy": "explicit_profile_required",
+    });
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        format!("Docker execution profile is invalid: {error}"),
         false,
         "docker".to_owned(),
         "container_profile_preflight".to_owned(),

@@ -933,6 +933,49 @@ pub struct FileExecutionBackendProfileConfig {
     pub id: Option<String>,
     pub enabled: Option<bool>,
     pub kind: Option<String>,
+    pub container: Option<FileContainerExecutionProfileConfig>,
+}
+
+/// Container-specific settings for a declared execution backend profile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileContainerExecutionProfileConfig {
+    pub image: Option<String>,
+    pub user: Option<String>,
+    pub network: Option<String>,
+    pub readonly_rootfs: Option<bool>,
+    pub privileged: Option<bool>,
+    pub workspace_mount: Option<FileContainerWorkspaceMountConfig>,
+    pub resource_limits: Option<FileContainerResourceLimitsConfig>,
+    pub env: Option<Vec<FileContainerEnvBindingConfig>>,
+    pub cleanup_strategy: Option<String>,
+}
+
+/// Workspace mount declared for a container execution profile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileContainerWorkspaceMountConfig {
+    pub host_path: Option<String>,
+    pub container_path: Option<String>,
+    pub read_only: Option<bool>,
+}
+
+/// Resource limits declared for a container execution profile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileContainerResourceLimitsConfig {
+    pub cpu_time_limit_ms: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub max_output_bytes: Option<u64>,
+}
+
+/// Environment binding declared for a container execution profile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileContainerEnvBindingConfig {
+    pub name: Option<String>,
+    pub source_kind: Option<String>,
+    pub value: Option<String>,
 }
 
 /// `[observability_exporters]`: preview exporter registry.
@@ -1808,6 +1851,25 @@ mod tests {
             id = "local-docker"
             enabled = false
             kind = "docker"
+            [execution_backend_profiles.profiles.container]
+            image = "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            user = "1000:1000"
+            network = "egress_proxy"
+            readonly_rootfs = true
+            privileged = false
+            cleanup_strategy = "remove_container_and_volume"
+            [execution_backend_profiles.profiles.container.workspace_mount]
+            host_path = "workspace"
+            container_path = "/workspace"
+            read_only = true
+            [execution_backend_profiles.profiles.container.resource_limits]
+            cpu_time_limit_ms = 1000
+            memory_limit_bytes = 134217728
+            max_output_bytes = 65536
+            [[execution_backend_profiles.profiles.container.env]]
+            name = "API_TOKEN"
+            source_kind = "vault_ref"
+            value = "vault://worker/api-token"
 
             [qa_lab]
             mode = "preview_only"
@@ -1875,6 +1937,26 @@ mod tests {
         assert_eq!(
             mcp_server.sampling_policy.as_ref().and_then(|policy| policy.mode.as_deref()),
             Some("allowlist")
+        );
+        let execution_backend = parsed
+            .execution_backend_profiles
+            .as_ref()
+            .and_then(|value| value.profiles.as_ref())
+            .and_then(|profiles| profiles.first())
+            .expect("execution backend profile should parse");
+        let container =
+            execution_backend.container.as_ref().expect("container profile should parse");
+        assert_eq!(
+            container.workspace_mount.as_ref().and_then(|mount| mount.read_only),
+            Some(true)
+        );
+        assert_eq!(
+            container
+                .env
+                .as_ref()
+                .and_then(|env| env.first())
+                .and_then(|env| env.source_kind.as_deref()),
+            Some("vault_ref")
         );
         assert_eq!(
             parsed.qa_lab.as_ref().and_then(|value| value.mode.as_deref()),

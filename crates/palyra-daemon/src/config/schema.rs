@@ -675,6 +675,45 @@ pub struct ExecutionBackendProfileConfig {
     pub id: String,
     pub enabled: bool,
     pub kind: String,
+    pub container: Option<ExecutionBackendContainerProfileConfig>,
+}
+
+/// Container-specific execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendContainerProfileConfig {
+    pub image: String,
+    pub user: String,
+    pub network: String,
+    pub readonly_rootfs: bool,
+    pub privileged: bool,
+    pub workspace_mount: ExecutionBackendContainerWorkspaceMountConfig,
+    pub resource_limits: ExecutionBackendContainerResourceLimitsConfig,
+    pub env: Vec<ExecutionBackendContainerEnvBindingConfig>,
+    pub cleanup_strategy: String,
+}
+
+/// Workspace mount for a container execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendContainerWorkspaceMountConfig {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
+}
+
+/// Resource limits for a container execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendContainerResourceLimitsConfig {
+    pub cpu_time_limit_ms: u64,
+    pub memory_limit_bytes: u64,
+    pub max_output_bytes: u64,
+}
+
+/// Environment variable binding for a container execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendContainerEnvBindingConfig {
+    pub name: String,
+    pub source_kind: String,
+    pub value: String,
 }
 
 /// Observability exporter registry preview.

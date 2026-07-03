@@ -38,7 +38,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{FeatureRolloutsConfig, NetworkedWorkersConfig},
+    config::{
+        ExecutionBackendContainerEnvBindingConfig, ExecutionBackendContainerProfileConfig,
+        ExecutionBackendProfileConfig, ExecutionBackendProfilesConfig, FeatureRolloutsConfig,
+        NetworkedWorkersConfig,
+    },
     journal::{ToolJobRecord, ToolJobState},
     node_runtime::RegisteredNodeRecord,
     sandbox_runner::{
@@ -837,6 +841,46 @@ impl ExecutionBackendRunnerRegistry {
         Self { local_sandbox: LocalSandboxRunner, docker: Some(docker) }
     }
 
+    /// Builds a runner registry from validated execution backend profiles.
+    ///
+    /// # Errors
+    /// Returns an error when more than one Docker profile is enabled or when
+    /// the selected Docker profile violates container safety invariants.
+    pub(crate) fn from_execution_backend_profiles(
+        profiles: &ExecutionBackendProfilesConfig,
+    ) -> Result<Self, String> {
+        if profiles.mode == RuntimePreviewMode::Disabled {
+            return Ok(Self::default());
+        }
+        let docker_profiles = profiles
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.enabled
+                    && profile
+                        .kind
+                        .eq_ignore_ascii_case(ExecutionBackendPreference::Docker.as_str())
+            })
+            .collect::<Vec<_>>();
+        match docker_profiles.as_slice() {
+            [] => Ok(Self::default()),
+            [profile] => {
+                let container_profile = container_backend_profile_from_config(profile)?;
+                let docker =
+                    DockerRunner::new(container_profile, DockerCliEngine).map_err(|error| {
+                        format!(
+                            "failed to build Docker execution backend profile '{}': {error}",
+                            profile.id
+                        )
+                    })?;
+                Ok(Self::with_docker_runner(Box::new(docker)))
+            }
+            _ => {
+                Err("execution_backend_profiles must enable at most one Docker profile".to_owned())
+            }
+        }
+    }
+
     /// Selects a runner for the resolved backend and required operation.
     pub(crate) fn select_runner(
         &self,
@@ -1392,6 +1436,76 @@ impl ContainerBackendProfile {
     }
 }
 
+fn container_backend_profile_from_config(
+    profile: &ExecutionBackendProfileConfig,
+) -> Result<ContainerBackendProfile, String> {
+    let container = profile.container.as_ref().ok_or_else(|| {
+        format!("Docker execution backend profile '{}' requires a container block", profile.id)
+    })?;
+    Ok(ContainerBackendProfile {
+        profile_id: profile.id.clone(),
+        runtime: ContainerRuntimeKind::Docker,
+        image: container.image.clone(),
+        mounts: vec![container_workspace_mount_from_config(container)],
+        network: container_network_policy_from_config(container.network.as_str())?,
+        user: container.user.clone(),
+        readonly_rootfs: container.readonly_rootfs,
+        privileged: container.privileged,
+        limits: ContainerResourceLimits {
+            cpu_time_limit_ms: container.resource_limits.cpu_time_limit_ms,
+            memory_limit_bytes: container.resource_limits.memory_limit_bytes,
+            max_output_bytes: container.resource_limits.max_output_bytes,
+        },
+        env: container
+            .env
+            .iter()
+            .map(container_env_binding_from_config)
+            .collect::<Result<Vec<_>, _>>()?,
+        cleanup_strategy: container.cleanup_strategy.clone(),
+    })
+}
+
+fn container_workspace_mount_from_config(
+    container: &ExecutionBackendContainerProfileConfig,
+) -> ContainerMountPolicy {
+    ContainerMountPolicy {
+        host_path: container.workspace_mount.host_path.clone(),
+        container_path: container.workspace_mount.container_path.clone(),
+        read_only: container.workspace_mount.read_only,
+        workspace_scoped: true,
+    }
+}
+
+fn container_network_policy_from_config(raw: &str) -> Result<ContainerNetworkPolicy, String> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "none" => Ok(ContainerNetworkPolicy::None),
+        "egress_proxy" => Ok(ContainerNetworkPolicy::EgressProxy),
+        other => {
+            Err(format!("container backend network must be none or egress_proxy, got {other}"))
+        }
+    }
+}
+
+fn container_env_binding_from_config(
+    binding: &ExecutionBackendContainerEnvBindingConfig,
+) -> Result<ContainerEnvBinding, String> {
+    Ok(ContainerEnvBinding {
+        name: binding.name.clone(),
+        source_kind: container_env_source_kind_from_config(binding.source_kind.as_str())?,
+        value: binding.value.clone(),
+    })
+}
+
+fn container_env_source_kind_from_config(raw: &str) -> Result<ContainerEnvSourceKind, String> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "literal_safe_value" => Ok(ContainerEnvSourceKind::LiteralSafeValue),
+        "vault_ref" => Ok(ContainerEnvSourceKind::VaultRef),
+        other => Err(format!(
+            "container backend env source_kind must be literal_safe_value or vault_ref, got {other}"
+        )),
+    }
+}
+
 const DOCKER_WORKSPACE_ROOT: &str = "/workspace";
 const DOCKER_EGRESS_PROXY_NETWORK: &str = "palyra-egress-proxy";
 
@@ -1474,6 +1588,15 @@ pub(crate) struct DockerCliEngine;
 impl DockerEngine for DockerCliEngine {
     fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
         Box::pin(async move {
+            if plan.mounts.iter().any(|mount| !mount.read_only) {
+                return Err(DockerEngineError {
+                    reason_code: "docker.writeback.capture_unavailable".to_owned(),
+                    message: format!(
+                        "Docker profile {} declares a writable workspace mount; patch-bundle capture is required before host writeback is allowed",
+                        plan.profile_id
+                    ),
+                });
+            }
             let started = Instant::now();
             let mut command = tokio::process::Command::new("docker");
             command.arg("run").arg("--rm");
@@ -2804,7 +2927,12 @@ mod tests {
     use palyra_common::runtime_preview::RuntimePreviewMode;
     use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 
-    use crate::config::NetworkedWorkersConfig;
+    use crate::config::{
+        ExecutionBackendContainerEnvBindingConfig, ExecutionBackendContainerProfileConfig,
+        ExecutionBackendContainerResourceLimitsConfig,
+        ExecutionBackendContainerWorkspaceMountConfig, ExecutionBackendProfileConfig,
+        ExecutionBackendProfilesConfig, NetworkedWorkersConfig,
+    };
     use crate::journal::{ToolJobRecord, ToolJobState};
     use crate::sandbox_runner::{
         process_runner_executor_name, process_runner_sandbox_enforcement_label,
@@ -2820,9 +2948,9 @@ mod tests {
         resolve_execution_backend, resolve_execution_backend_for_request,
         validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
-        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
-        DockerEngineError, DockerEngineFuture, DockerPatchBundle, DockerResourceUsage,
-        DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
+        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerCliEngine,
+        DockerEngine, DockerEngineError, DockerEngineFuture, DockerPatchBundle,
+        DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
@@ -2899,6 +3027,40 @@ mod tests {
             },
             env: Vec::new(),
             cleanup_strategy: "remove_container_and_volume".to_owned(),
+        }
+    }
+
+    fn safe_container_profile_config(
+        id: &str,
+        workspace_mount_read_only: bool,
+    ) -> ExecutionBackendProfileConfig {
+        ExecutionBackendProfileConfig {
+            id: id.to_owned(),
+            enabled: true,
+            kind: "docker".to_owned(),
+            container: Some(ExecutionBackendContainerProfileConfig {
+                image: SAFE_DOCKER_IMAGE.to_owned(),
+                user: "1000:1000".to_owned(),
+                network: "none".to_owned(),
+                readonly_rootfs: true,
+                privileged: false,
+                workspace_mount: ExecutionBackendContainerWorkspaceMountConfig {
+                    host_path: "workspace".to_owned(),
+                    container_path: "/workspace".to_owned(),
+                    read_only: workspace_mount_read_only,
+                },
+                resource_limits: ExecutionBackendContainerResourceLimitsConfig {
+                    cpu_time_limit_ms: 1_000,
+                    memory_limit_bytes: 128 * 1024 * 1024,
+                    max_output_bytes: 64 * 1024,
+                },
+                env: vec![ExecutionBackendContainerEnvBindingConfig {
+                    name: "API_TOKEN".to_owned(),
+                    source_kind: "vault_ref".to_owned(),
+                    value: "vault://worker/api-token".to_owned(),
+                }],
+                cleanup_strategy: "remove_container_and_volume".to_owned(),
+            }),
         }
     }
 
@@ -3079,6 +3241,70 @@ mod tests {
         assert_eq!(selection.event, "execution_backend.runner_selected");
         assert_eq!(selection.resolved_backend, "docker");
         assert!(selection.capabilities.iter().any(|capability| capability == "run_process"));
+    }
+
+    #[test]
+    fn runner_registry_builds_docker_runner_from_profile_config() {
+        let profiles = ExecutionBackendProfilesConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            profiles: vec![safe_container_profile_config("docker-safe", true)],
+        };
+
+        let registry = ExecutionBackendRunnerRegistry::from_execution_backend_profiles(&profiles)
+            .expect("valid Docker profile should build a registry");
+
+        let runner = registry
+            .select_runner(
+                ExecutionBackendPreference::Docker,
+                ExecutionBackendRunnerCapability::RunProcess,
+            )
+            .expect("configured Docker runner should be selectable");
+        assert_eq!(runner.runner_id(), "docker_runner");
+    }
+
+    #[test]
+    fn runner_registry_rejects_multiple_enabled_docker_profiles() {
+        let profiles = ExecutionBackendProfilesConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            profiles: vec![
+                safe_container_profile_config("docker-a", true),
+                safe_container_profile_config("docker-b", true),
+            ],
+        };
+
+        let error = ExecutionBackendRunnerRegistry::from_execution_backend_profiles(&profiles)
+            .expect_err("multiple enabled Docker profiles must fail closed");
+
+        assert!(error.contains("at most one Docker profile"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn docker_cli_engine_rejects_writable_mount_without_patch_capture() {
+        let profile = safe_container_profile();
+        let plan = DockerRunPlan {
+            profile_id: profile.profile_id,
+            image: profile.image,
+            image_digest_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_owned(),
+            user: profile.user,
+            readonly_rootfs: profile.readonly_rootfs,
+            network: profile.network,
+            mounts: profile.mounts,
+            env: profile.env,
+            command: "echo".to_owned(),
+            args: vec!["runner-ok".to_owned()],
+            working_dir: "/workspace".to_owned(),
+            limits: profile.limits,
+            workspace_writeback: WorkspaceWritebackMode::PatchBundle,
+            cleanup_strategy: profile.cleanup_strategy,
+        };
+
+        let error = DockerCliEngine
+            .run(plan)
+            .await
+            .expect_err("writable workspace mounts require patch capture before Docker CLI launch");
+
+        assert_eq!(error.reason_code, "docker.writeback.capture_unavailable");
     }
 
     #[tokio::test]

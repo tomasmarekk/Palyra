@@ -29,10 +29,12 @@ use palyra_common::{
         parse_document_with_migration, serialize_document_pretty, ConfigMigrationInfo,
     },
     daemon_config_schema::{
-        FileAgentHarnessConfig, FileDoctorCheckConfig, FileExecutionBackendProfileConfig,
-        FileMcpCommandValue, FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig,
-        FileMcpSamplingPolicyConfig, FileMcpServerConfig, FileMemoryRetrievalConfig,
-        FileObservabilityExporterConfig, FileRetrievalSourceScoringProfile, RootFileConfig,
+        FileAgentHarnessConfig, FileContainerEnvBindingConfig, FileContainerExecutionProfileConfig,
+        FileContainerResourceLimitsConfig, FileContainerWorkspaceMountConfig,
+        FileDoctorCheckConfig, FileExecutionBackendProfileConfig, FileMcpCommandValue,
+        FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig,
+        FileMcpServerConfig, FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
+        FileRetrievalSourceScoringProfile, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
@@ -2728,11 +2730,131 @@ fn parse_execution_backend_profile_config(
     index: usize,
 ) -> Result<ExecutionBackendProfileConfig> {
     let source_name = format!("execution_backend_profiles.profiles[{index}]");
+    let container = entry
+        .container
+        .map(|container| {
+            parse_execution_backend_container_profile_config(
+                container,
+                format!("{source_name}.container").as_str(),
+            )
+        })
+        .transpose()?;
     Ok(ExecutionBackendProfileConfig {
         id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
         enabled: entry.enabled.unwrap_or(false),
         kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
+        container,
     })
+}
+
+fn parse_execution_backend_container_profile_config(
+    entry: FileContainerExecutionProfileConfig,
+    source_name: &str,
+) -> Result<ExecutionBackendContainerProfileConfig> {
+    let workspace_mount = parse_container_workspace_mount_config(
+        required_nested_config(entry.workspace_mount, format!("{source_name}.workspace_mount"))?,
+        format!("{source_name}.workspace_mount").as_str(),
+    )?;
+    let resource_limits = parse_container_resource_limits_config(
+        required_nested_config(entry.resource_limits, format!("{source_name}.resource_limits"))?,
+        format!("{source_name}.resource_limits").as_str(),
+    )?;
+    let env = entry
+        .env
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, env)| {
+            parse_container_env_binding_config(env, format!("{source_name}.env[{index}]").as_str())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ExecutionBackendContainerProfileConfig {
+        image: parse_required_config_text(entry.image, format!("{source_name}.image").as_str())?,
+        user: parse_required_config_text(entry.user, format!("{source_name}.user").as_str())?,
+        network: parse_required_registry_kind(
+            entry.network,
+            format!("{source_name}.network").as_str(),
+        )?,
+        readonly_rootfs: entry.readonly_rootfs.ok_or_else(|| {
+            anyhow::anyhow!("{source_name}.readonly_rootfs is required for container profiles")
+        })?,
+        privileged: entry.privileged.ok_or_else(|| {
+            anyhow::anyhow!("{source_name}.privileged is required for container profiles")
+        })?,
+        workspace_mount,
+        resource_limits,
+        env,
+        cleanup_strategy: parse_required_registry_kind(
+            entry.cleanup_strategy,
+            format!("{source_name}.cleanup_strategy").as_str(),
+        )?,
+    })
+}
+
+fn parse_container_workspace_mount_config(
+    entry: FileContainerWorkspaceMountConfig,
+    source_name: &str,
+) -> Result<ExecutionBackendContainerWorkspaceMountConfig> {
+    Ok(ExecutionBackendContainerWorkspaceMountConfig {
+        host_path: parse_required_config_text(
+            entry.host_path,
+            format!("{source_name}.host_path").as_str(),
+        )?,
+        container_path: parse_required_config_text(
+            entry.container_path,
+            format!("{source_name}.container_path").as_str(),
+        )?,
+        read_only: entry.read_only.ok_or_else(|| {
+            anyhow::anyhow!("{source_name}.read_only is required for container workspace mounts")
+        })?,
+    })
+}
+
+fn parse_container_resource_limits_config(
+    entry: FileContainerResourceLimitsConfig,
+    source_name: &str,
+) -> Result<ExecutionBackendContainerResourceLimitsConfig> {
+    Ok(ExecutionBackendContainerResourceLimitsConfig {
+        cpu_time_limit_ms: parse_positive_u64(
+            required_u64(entry.cpu_time_limit_ms, format!("{source_name}.cpu_time_limit_ms"))?,
+            format!("{source_name}.cpu_time_limit_ms").as_str(),
+        )?,
+        memory_limit_bytes: parse_positive_u64(
+            required_u64(entry.memory_limit_bytes, format!("{source_name}.memory_limit_bytes"))?,
+            format!("{source_name}.memory_limit_bytes").as_str(),
+        )?,
+        max_output_bytes: parse_positive_u64(
+            required_u64(entry.max_output_bytes, format!("{source_name}.max_output_bytes"))?,
+            format!("{source_name}.max_output_bytes").as_str(),
+        )?,
+    })
+}
+
+fn parse_container_env_binding_config(
+    entry: FileContainerEnvBindingConfig,
+    source_name: &str,
+) -> Result<ExecutionBackendContainerEnvBindingConfig> {
+    Ok(ExecutionBackendContainerEnvBindingConfig {
+        name: parse_required_config_text(entry.name, format!("{source_name}.name").as_str())?,
+        source_kind: parse_required_registry_kind(
+            entry.source_kind,
+            format!("{source_name}.source_kind").as_str(),
+        )?,
+        value: parse_required_config_text(entry.value, format!("{source_name}.value").as_str())?,
+    })
+}
+
+fn parse_required_config_text(raw: Option<String>, source_name: &str) -> Result<String> {
+    let raw = raw.ok_or_else(|| anyhow::anyhow!("{source_name} is required"))?;
+    parse_non_empty_config_text(raw.as_str(), source_name)
+}
+
+fn required_nested_config<T>(value: Option<T>, source_name: String) -> Result<T> {
+    value.ok_or_else(|| anyhow::anyhow!("{source_name} is required for container profiles"))
+}
+
+fn required_u64(value: Option<u64>, source_name: String) -> Result<u64> {
+    value.ok_or_else(|| anyhow::anyhow!("{source_name} is required"))
 }
 
 fn parse_observability_exporter_config(
@@ -6534,6 +6656,77 @@ qa_mock_fixture_path = "qa/fixtures/provider_basic.yaml"
             loaded.model_provider.qa_mock_fixture_path.as_deref(),
             Some(Path::new("qa/fixtures/provider_basic.yaml"))
         );
+    }
+
+    #[test]
+    fn load_config_accepts_container_execution_backend_profile() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[execution_backend_profiles]
+mode = "preview_only"
+
+[[execution_backend_profiles.profiles]]
+id = "docker-safe"
+enabled = true
+kind = "docker"
+
+[execution_backend_profiles.profiles.container]
+image = "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+user = "1000:1000"
+network = "egress_proxy"
+readonly_rootfs = true
+privileged = false
+cleanup_strategy = "remove_container_and_volume"
+
+[execution_backend_profiles.profiles.container.workspace_mount]
+host_path = "workspace"
+container_path = "/workspace"
+read_only = true
+
+[execution_backend_profiles.profiles.container.resource_limits]
+cpu_time_limit_ms = 1000
+memory_limit_bytes = 134217728
+max_output_bytes = 65536
+
+[[execution_backend_profiles.profiles.container.env]]
+name = "API_TOKEN"
+source_kind = "vault_ref"
+value = "vault://worker/api-token"
+"#,
+        )
+        .expect("execution backend profile config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _profiles_mode = ScopedEnvVar::unset("PALYRA_EXECUTION_BACKEND_PROFILES_MODE");
+
+        let loaded = super::load_config().expect("container backend profile should load");
+
+        assert_eq!(loaded.execution_backend_profiles.mode, RuntimePreviewMode::PreviewOnly);
+        let profile = loaded
+            .execution_backend_profiles
+            .profiles
+            .first()
+            .expect("one execution backend profile should load");
+        assert_eq!(profile.id, "docker-safe");
+        assert!(profile.enabled);
+        assert_eq!(profile.kind, "docker");
+        let container = profile.container.as_ref().expect("container profile should load");
+        assert_eq!(container.network, "egress_proxy");
+        assert!(container.readonly_rootfs);
+        assert!(!container.privileged);
+        assert_eq!(container.workspace_mount.container_path, "/workspace");
+        assert!(container.workspace_mount.read_only);
+        assert_eq!(container.resource_limits.max_output_bytes, 65_536);
+        assert_eq!(container.env[0].source_kind, "vault_ref");
     }
 
     #[test]
