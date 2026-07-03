@@ -761,14 +761,16 @@ async fn run_allowlisted_tool_with_cancellation(
             executor: "routines_runtime".to_owned(),
             sandbox_enforcement: "none".to_owned(),
         },
-        "palyra.delegation.query" | "palyra.delegation.control" => ToolExecutionRawResult {
-            success: false,
-            output_json: b"{}".to_vec(),
-            error: format!("{tool_name} requires gateway delegation runtime context"),
-            timed_out: false,
-            executor: "delegation_runtime".to_owned(),
-            sandbox_enforcement: "delegation_scope".to_owned(),
-        },
+        "palyra.delegation.query" | "palyra.delegation.control" | "sessions_spawn" => {
+            ToolExecutionRawResult {
+                success: false,
+                output_json: b"{}".to_vec(),
+                error: format!("{tool_name} requires gateway delegation runtime context"),
+                timed_out: false,
+                executor: "delegation_runtime".to_owned(),
+                sandbox_enforcement: "delegation_scope".to_owned(),
+            }
+        }
         "palyra.artifact.read" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -934,6 +936,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.routines.control"
             | "palyra.delegation.query"
             | "palyra.delegation.control"
+            | "sessions_spawn"
             | "palyra.artifact.read"
             | "palyra.image.observe"
             | "palyra.http.fetch"
@@ -1023,7 +1026,10 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "gateway_runtime".to_owned()
     } else if matches!(tool_name, "palyra.routines.query" | "palyra.routines.control") {
         "routines_runtime".to_owned()
-    } else if matches!(tool_name, "palyra.delegation.query" | "palyra.delegation.control") {
+    } else if matches!(
+        tool_name,
+        "palyra.delegation.query" | "palyra.delegation.control" | "sessions_spawn"
+    ) {
         "delegation_runtime".to_owned()
     } else if tool_name == "palyra.artifact.read" {
         "gateway_artifacts".to_owned()
@@ -1054,7 +1060,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.routines.query" => MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES,
         "palyra.routines.control" => MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES,
         "palyra.delegation.query" => MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES,
-        "palyra.delegation.control" => MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES,
+        "palyra.delegation.control" | "sessions_spawn" => MAX_DELEGATION_CONTROL_TOOL_INPUT_BYTES,
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
@@ -1130,7 +1136,10 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
         "browser_service".to_owned()
     } else if tool_name == "palyra.artifact.read" {
         "artifact_scope".to_owned()
-    } else if matches!(tool_name, "palyra.delegation.query" | "palyra.delegation.control") {
+    } else if matches!(
+        tool_name,
+        "palyra.delegation.query" | "palyra.delegation.control" | "sessions_spawn"
+    ) {
         "delegation_scope".to_owned()
     } else {
         "none".to_owned()
@@ -2393,6 +2402,33 @@ mod tests {
             outcome.error
         );
         assert_eq!(outcome.attestation.executor, "routines_runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_tool_call_sessions_spawn_requires_gateway_runtime_context() {
+        let config = ToolCallConfig {
+            allowed_tools: vec!["sessions_spawn".to_owned()],
+            max_calls_per_run: 1,
+            execution_timeout_ms: 250,
+            process_runner: default_process_runner_policy(),
+            wasm_runtime: default_wasm_runtime_policy(),
+        };
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAC",
+            "sessions_spawn",
+            br#"{"task":"summarize the current investigation"}"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "generic tool executor should not spawn delegated sessions");
+        assert!(
+            outcome.error.contains("requires gateway delegation runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "delegation_runtime");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "delegation_scope");
     }
 
     #[tokio::test(flavor = "multi_thread")]

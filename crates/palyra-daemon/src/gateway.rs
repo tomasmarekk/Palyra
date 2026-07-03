@@ -222,6 +222,7 @@ pub(crate) const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 pub(crate) const ARTIFACT_READ_TOOL_NAME: &str = "palyra.artifact.read";
 pub(crate) const DELEGATION_QUERY_TOOL_NAME: &str = "palyra.delegation.query";
 pub(crate) const DELEGATION_CONTROL_TOOL_NAME: &str = "palyra.delegation.control";
+pub(crate) const SESSIONS_SPAWN_TOOL_NAME: &str = "sessions_spawn";
 pub(crate) const PLAN_MANAGE_TOOL_NAME: &str = "palyra.plan.manage";
 pub(crate) const WORKSPACE_READ_FILE_TOOL_NAME: &str = "palyra.fs.read_file";
 pub(crate) const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "palyra.fs.list_dir";
@@ -916,7 +917,10 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
-    } else if matches!(tool_name, DELEGATION_QUERY_TOOL_NAME | DELEGATION_CONTROL_TOOL_NAME) {
+    } else if matches!(
+        tool_name,
+        DELEGATION_QUERY_TOOL_NAME | DELEGATION_CONTROL_TOOL_NAME | SESSIONS_SPAWN_TOOL_NAME
+    ) {
         crate::application::tool_runtime::delegation::execute_delegation_tool(
             runtime_state,
             context,

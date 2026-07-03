@@ -461,7 +461,7 @@ async fn dispatch_background_task(
         return Ok(());
     }
 
-    let run_id = Ulid::new().to_string();
+    let run_id = task.target_run_id.clone().unwrap_or_else(|| Ulid::new().to_string());
     runtime
         .update_orchestrator_background_task(build_background_task_running_update(
             task.task_id.as_str(),

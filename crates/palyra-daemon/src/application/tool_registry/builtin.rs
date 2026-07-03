@@ -774,6 +774,61 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
         ),
         entry(
+            "sessions_spawn",
+            "Start a bounded Palyra child run for a delegated task and return child run identifiers immediately.",
+            object_schema(
+                &["task"],
+                vec![
+                    (
+                        "task",
+                        json!({"type":"string","maxLength":8192,"description":"Objective and instructions for the child run. The task is persisted in the child scope, but the tool result returns only ids and redacted metadata."}),
+                    ),
+                    (
+                        "label",
+                        json!({"type":"string","maxLength":128,"description":"Optional short label for audit and UI grouping."}),
+                    ),
+                    (
+                        "context_mode",
+                        json!({"type":"string","enum":["none","parent_session","parent_session_and_workspace","workspace_only"],"description":"Delegated memory/context scope. Defaults to the selected delegation profile when omitted."}),
+                    ),
+                    (
+                        "priority",
+                        json!({"type":"integer","minimum":-10,"maximum":10,"description":"Queue priority for the child task. Defaults to 0."}),
+                    ),
+                    (
+                        "return_mode",
+                        json!({"type":"string","enum":["ids_only","status_ref","ack"],"description":"Controls how much non-sensitive spawn metadata is returned. The child run still continues asynchronously."}),
+                    ),
+                    (
+                        "allowed_tools",
+                        json!({"type":"array","items":{"type":"string","maxLength":256},"maxItems":64,"description":"Optional child tool allowlist. Omit to use the delegation profile defaults; pass an empty array to grant the child no tools."}),
+                    ),
+                    (
+                        "budget",
+                        json!({
+                            "type":"object",
+                            "additionalProperties":false,
+                            "properties":{
+                                "tokens":{"type":"integer","minimum":1},
+                                "max_attempts":{"type":"integer","minimum":1,"maximum":16},
+                                "max_concurrent_children":{"type":"integer","minimum":1},
+                                "max_children_per_parent":{"type":"integer","minimum":1},
+                                "max_total_children":{"type":"integer","minimum":1},
+                                "max_parallel_groups":{"type":"integer","minimum":1},
+                                "max_depth":{"type":"integer","minimum":1},
+                                "max_budget_share_bps":{"type":"integer","minimum":1,"maximum":10000},
+                                "child_timeout_ms":{"type":"integer","minimum":1000}
+                            },
+                            "description":"Optional child budget and fan-out limits enforced by the delegation resolver."
+                        }),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.http.fetch",
             "Fetch an HTTP(S) URL through Palyra SSRF, header and content-type guardrails.",
             object_schema(
@@ -1495,7 +1550,36 @@ fn browser_tool_schema(tool_name: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::registry_entry;
+    use super::{registry_entry, ToolApprovalPosture, ToolParallelismPolicy};
+
+    #[test]
+    fn sessions_spawn_registry_schema_exposes_spawn_contract() {
+        let entry = registry_entry("sessions_spawn").expect("sessions_spawn entry exists");
+
+        assert_eq!(entry.approval_posture, ToolApprovalPosture::ApprovalRequired);
+        assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
+        assert!(entry.description.contains("child run"));
+        assert_eq!(
+            entry.input_schema.pointer("/required/0").and_then(serde_json::Value::as_str),
+            Some("task")
+        );
+        assert!(entry.input_schema.pointer("/properties/task").is_some());
+        assert!(entry.input_schema.pointer("/properties/allowed_tools").is_some());
+        assert!(entry.input_schema.pointer("/properties/budget/properties/tokens").is_some());
+        assert_eq!(
+            entry
+                .input_schema
+                .pointer("/properties/return_mode/enum/1")
+                .and_then(serde_json::Value::as_str),
+            Some("status_ref")
+        );
+        let allowed_tools_description = entry
+            .input_schema
+            .pointer("/properties/allowed_tools/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("allowed_tools description should be visible to models");
+        assert!(allowed_tools_description.contains("empty array"));
+    }
 
     #[test]
     fn browser_tabs_switch_registry_exposes_required_tab_id() {

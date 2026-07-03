@@ -69,7 +69,7 @@ use crate::{
         tool_cancellation_requires_execution_drain, GatewayRuntimeState,
         RunStreamToolExecutionOutcome, SharedToolBudget, ToolApprovalOutcome,
         ToolRuntimeDispatchControls, ToolRuntimeExecutionContext, PROCESS_RUNNER_TOOL_NAME,
-        TOOL_APPROVAL_RESPONSE_TIMEOUT,
+        SESSIONS_SPAWN_TOOL_NAME, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     },
     journal::{
         ApprovalCreateRequest, ApprovalResolveRequest, OrchestratorTapeAppendRequest,
@@ -1903,6 +1903,15 @@ async fn finalize_prepared_tool_execution_outcome(
     }
     let execution_outcome = projected.outcome;
 
+    append_sessions_spawn_tape_event_if_needed(
+        runtime_state,
+        run_id,
+        tape_seq,
+        prepared,
+        &execution_outcome,
+    )
+    .await?;
+
     send_tool_result_with_tape(
         sender,
         runtime_state,
@@ -2089,6 +2098,61 @@ async fn append_tool_result_projection_audit_tape_event(
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_sessions_spawn_tape_event_if_needed(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    prepared: &RunStreamPreparedToolExecution,
+    execution_outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    if prepared.tool_name != SESSIONS_SPAWN_TOOL_NAME || !execution_outcome.success {
+        return Ok(());
+    }
+    let Ok(output) = serde_json::from_slice::<Value>(execution_outcome.output_json.as_slice())
+    else {
+        return Ok(());
+    };
+    let Some(payload) = sessions_spawn_tape_payload(
+        prepared.proposal_id.as_str(),
+        prepared.tool_name.as_str(),
+        run_id,
+        &output,
+    ) else {
+        return Ok(());
+    };
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: "subagent.spawned".to_owned(),
+            payload_json: payload.to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+fn sessions_spawn_tape_payload(
+    proposal_id: &str,
+    tool_name: &str,
+    parent_run_id: &str,
+    output: &Value,
+) -> Option<Value> {
+    let child_run_id = output.get("child_run_id").and_then(Value::as_str)?;
+    Some(json!({
+        "schema_version": 1,
+        "proposal_id": proposal_id,
+        "tool_name": tool_name,
+        "parent_run_id": parent_run_id,
+        "task_id": output.get("task_id").and_then(Value::as_str),
+        "child_run_id": child_run_id,
+        "child_session_id": output.get("child_session_id").and_then(Value::as_str),
+        "state": output.get("state").and_then(Value::as_str).unwrap_or("queued"),
+        "transcript_ref": output.get("transcript_ref").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn projection_policy_contract(
@@ -2423,7 +2487,7 @@ mod tests {
     use super::{
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
         drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
-        process_progress_status_message, projection_policy_contract,
+        process_progress_status_message, projection_policy_contract, sessions_spawn_tape_payload,
         ParallelToolExecutionTaskOutcome, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
     };
     use crate::application::tool_registry::ToolResultProjectionPolicy;
@@ -2484,6 +2548,38 @@ mod tests {
             classify_tool_parallelism("palyra.fs.apply_patch", br#"{"patch":"..."}"#),
             ToolParallelism::Never
         );
+    }
+
+    #[test]
+    fn sessions_spawn_tape_payload_projects_child_refs_only() {
+        let output = json!({
+            "task_id": "task-1",
+            "child_run_id": "child-run",
+            "child_session_id": "session-1",
+            "state": "queued",
+            "task": "read https://example.com/callback?access_token=secret",
+            "transcript_ref": {
+                "kind": "orchestrator_run_tape",
+                "status": "pending",
+                "run_id": "child-run",
+                "session_id": "session-1"
+            }
+        });
+
+        let payload =
+            sessions_spawn_tape_payload("proposal-1", "sessions_spawn", "parent-run", &output)
+                .expect("spawn output with child_run_id should produce tape payload");
+        let payload_text = payload.to_string();
+
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["proposal_id"], "proposal-1");
+        assert_eq!(payload["tool_name"], "sessions_spawn");
+        assert_eq!(payload["parent_run_id"], "parent-run");
+        assert_eq!(payload["child_run_id"], "child-run");
+        assert_eq!(payload["child_session_id"], "session-1");
+        assert_eq!(payload["transcript_ref"]["run_id"], "child-run");
+        assert!(!payload_text.contains("access_token"));
+        assert!(!payload_text.contains("secret"));
     }
 
     #[test]

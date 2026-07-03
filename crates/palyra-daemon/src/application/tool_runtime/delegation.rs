@@ -25,7 +25,7 @@ use crate::{
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext,
-        DELEGATION_CONTROL_TOOL_NAME, DELEGATION_QUERY_TOOL_NAME,
+        DELEGATION_CONTROL_TOOL_NAME, DELEGATION_QUERY_TOOL_NAME, SESSIONS_SPAWN_TOOL_NAME,
     },
     journal::{
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
@@ -98,6 +98,92 @@ struct DelegationToolInput {
     include_completed: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SessionsSpawnInput {
+    task: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    context_mode: Option<DelegationMemoryScopeKind>,
+    #[serde(default)]
+    priority: Option<i64>,
+    #[serde(default)]
+    return_mode: Option<SessionsSpawnReturnMode>,
+    #[serde(default)]
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    budget: Option<SessionsSpawnBudgetInput>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionsSpawnReturnMode {
+    IdsOnly,
+    #[default]
+    StatusRef,
+    Ack,
+}
+
+impl SessionsSpawnReturnMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdsOnly => "ids_only",
+            Self::StatusRef => "status_ref",
+            Self::Ack => "ack",
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SessionsSpawnBudgetInput {
+    #[serde(default)]
+    tokens: Option<u64>,
+    #[serde(default)]
+    max_attempts: Option<u64>,
+    #[serde(default)]
+    max_concurrent_children: Option<u64>,
+    #[serde(default)]
+    max_children_per_parent: Option<u64>,
+    #[serde(default)]
+    max_total_children: Option<u64>,
+    #[serde(default)]
+    max_parallel_groups: Option<u64>,
+    #[serde(default)]
+    max_depth: Option<u64>,
+    #[serde(default)]
+    max_budget_share_bps: Option<u64>,
+    #[serde(default)]
+    child_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DelegationSpawnRequest {
+    objective: String,
+    profile_id: Option<String>,
+    template_id: Option<String>,
+    group_id: Option<String>,
+    execution_mode: Option<DelegationExecutionMode>,
+    display_name: Option<String>,
+    model_profile: Option<String>,
+    memory_scope: Option<DelegationMemoryScopeKind>,
+    tool_allowlist: Vec<String>,
+    explicit_empty_tool_allowlist: bool,
+    skill_allowlist: Vec<String>,
+    approval_required: Option<bool>,
+    budget_tokens: Option<u64>,
+    max_attempts: Option<u64>,
+    max_concurrent_children: Option<u64>,
+    max_children_per_parent: Option<u64>,
+    max_total_children: Option<u64>,
+    max_parallel_groups: Option<u64>,
+    max_depth: Option<u64>,
+    max_budget_share_bps: Option<u64>,
+    child_timeout_ms: Option<u64>,
+    priority: i64,
+    preallocated_child_run_id: Option<String>,
+    payload_json: Option<String>,
+}
+
 /// Executes one `palyra.delegation.query` or `palyra.delegation.control` call.
 ///
 /// Never fails at the call boundary: invalid input and runtime errors are
@@ -132,6 +218,13 @@ async fn execute_delegation_tool_inner(
     tool_name: &str,
     input_json: &[u8],
 ) -> Result<Value, Status> {
+    if tool_name == SESSIONS_SPAWN_TOOL_NAME {
+        let input = serde_json::from_slice::<SessionsSpawnInput>(input_json).map_err(|error| {
+            Status::invalid_argument(format!("sessions_spawn input is invalid JSON: {error}"))
+        })?;
+        return create_sessions_spawn(runtime, context, &input).await;
+    }
+
     let input = serde_json::from_slice::<DelegationToolInput>(input_json).map_err(|error| {
         Status::invalid_argument(format!("delegation tool input is invalid JSON: {error}"))
     })?;
@@ -162,38 +255,24 @@ async fn create_delegation(
     input: &DelegationToolInput,
 ) -> Result<Value, Status> {
     let objective = normalize_required(input.objective.as_deref(), "objective")?;
-    let parent_run_id = context.run_id.to_owned();
-    // The delegation resolver enforces per-child budget-share limits against
-    // the parent budget, but tool input does not carry the real parent
-    // budget. Synthesize one: double the requested child budget (keeps the
-    // child's share at 50%), falling back to the objective's estimated token
-    // count when no budget was requested.
-    let parent_budget_tokens = input
-        .budget_tokens
-        .map(|budget| budget.saturating_mul(2).max(1))
-        .or_else(|| Some(crate::orchestrator::estimate_token_count(objective.as_str()).max(1)));
-    let resolved_agent = runtime
-        .resolve_agent_for_context(AgentResolveRequest {
-            principal: context.principal.to_owned(),
-            channel: context.channel.map(ToOwned::to_owned),
-            session_id: Some(context.session_id.to_owned()),
-            preferred_agent_id: None,
-            persist_session_binding: false,
-        })
-        .await?;
-    let request = DelegationRequestInput {
-        profile_id: normalize_optional(input.profile_id.as_deref()),
-        template_id: normalize_optional(input.template_id.as_deref()),
-        group_id: normalize_optional(input.group_id.as_deref()),
-        execution_mode: input.execution_mode,
-        manifest: Some(DelegationManifestInput {
+    let task = create_delegation_background_task(
+        runtime,
+        context,
+        DelegationSpawnRequest {
+            objective,
+            profile_id: normalize_optional(input.profile_id.as_deref()),
+            template_id: normalize_optional(input.template_id.as_deref()),
+            group_id: normalize_optional(input.group_id.as_deref()),
+            execution_mode: input.execution_mode,
+            display_name: None,
             model_profile: normalize_optional(input.model_profile.as_deref()),
-            tool_allowlist: input.tool_allowlist.clone(),
-            skill_allowlist: input.skill_allowlist.clone(),
             memory_scope: input.memory_scope,
+            tool_allowlist: input.tool_allowlist.clone(),
+            explicit_empty_tool_allowlist: false,
+            skill_allowlist: input.skill_allowlist.clone(),
+            approval_required: input.approval_required,
             budget_tokens: input.budget_tokens,
             max_attempts: input.max_attempts,
-            approval_required: input.approval_required,
             max_concurrent_children: input.max_concurrent_children,
             max_children_per_parent: input.max_children_per_parent,
             max_total_children: input.max_total_children,
@@ -201,45 +280,12 @@ async fn create_delegation(
             max_depth: input.max_depth,
             max_budget_share_bps: input.max_budget_share_bps,
             child_timeout_ms: input.child_timeout_ms,
-            ..Default::default()
-        }),
-    };
-    let delegation = resolve_delegation_request(
-        &request,
-        &DelegationParentContext {
-            parent_run_id: Some(parent_run_id.clone()),
-            agent_id: Some(resolved_agent.agent.agent_id.clone()),
-            parent_model_profile: normalize_optional(Some(
-                resolved_agent.agent.default_model_profile.as_str(),
-            )),
-            parent_tool_allowlist: resolved_agent.agent.default_tool_allowlist.clone(),
-            parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist.clone(),
-            parent_budget_tokens,
-        },
-    )?;
-    let task = runtime
-        .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
-            task_id: Ulid::new().to_string(),
-            task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
-            session_id: context.session_id.to_owned(),
-            parent_run_id: Some(parent_run_id),
-            target_run_id: None,
-            queued_input_id: None,
-            owner_principal: context.principal.to_owned(),
-            device_id: context.device_id.to_owned(),
-            channel: context.channel.map(ToOwned::to_owned),
-            state: AuxiliaryTaskState::Queued.as_str().to_owned(),
             priority: input.priority.unwrap_or(0).clamp(-10, 10),
-            max_attempts: delegation.max_attempts,
-            budget_tokens: delegation.budget_tokens,
-            delegation: Some(delegation),
-            not_before_unix_ms: None,
-            expires_at_unix_ms: None,
-            notification_target_json: None,
-            input_text: Some(objective),
+            preallocated_child_run_id: None,
             payload_json: None,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     Ok(json!({
         "schema_version": 1,
@@ -253,6 +299,194 @@ async fn create_delegation(
             "state": task.state,
         },
     }))
+}
+
+async fn create_sessions_spawn(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    input: &SessionsSpawnInput,
+) -> Result<Value, Status> {
+    let child_run_id = Ulid::new().to_string();
+    let return_mode = input.return_mode.unwrap_or_default();
+    let request = sessions_spawn_delegation_spawn_request(input, child_run_id.clone())?;
+    let task = create_delegation_background_task(runtime, context, request).await?;
+    Ok(sessions_spawn_response(&task, return_mode, child_run_id.as_str()))
+}
+
+fn sessions_spawn_delegation_spawn_request(
+    input: &SessionsSpawnInput,
+    child_run_id: String,
+) -> Result<DelegationSpawnRequest, Status> {
+    let objective = normalize_required(Some(input.task.as_str()), "task")?;
+    let allowed_tools =
+        input.allowed_tools.as_ref().map(|values| normalize_tool_list(values)).unwrap_or_default();
+    let explicit_empty_tool_allowlist =
+        input.allowed_tools.as_ref().is_some_and(|_| allowed_tools.is_empty());
+    let budget = input.budget.as_ref();
+
+    Ok(DelegationSpawnRequest {
+        objective,
+        profile_id: None,
+        template_id: None,
+        group_id: None,
+        execution_mode: None,
+        display_name: normalize_optional(input.label.as_deref()),
+        model_profile: None,
+        memory_scope: input.context_mode,
+        tool_allowlist: allowed_tools,
+        explicit_empty_tool_allowlist,
+        skill_allowlist: Vec::new(),
+        approval_required: None,
+        budget_tokens: budget.and_then(|value| value.tokens),
+        max_attempts: budget.and_then(|value| value.max_attempts),
+        max_concurrent_children: budget.and_then(|value| value.max_concurrent_children),
+        max_children_per_parent: budget.and_then(|value| value.max_children_per_parent),
+        max_total_children: budget.and_then(|value| value.max_total_children),
+        max_parallel_groups: budget.and_then(|value| value.max_parallel_groups),
+        max_depth: budget.and_then(|value| value.max_depth),
+        max_budget_share_bps: budget.and_then(|value| value.max_budget_share_bps),
+        child_timeout_ms: budget.and_then(|value| value.child_timeout_ms),
+        priority: input.priority.unwrap_or(0).clamp(-10, 10),
+        preallocated_child_run_id: Some(child_run_id),
+        payload_json: Some(json!({"source_tool":"sessions_spawn"}).to_string()),
+    })
+}
+
+async fn create_delegation_background_task(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    request: DelegationSpawnRequest,
+) -> Result<OrchestratorBackgroundTaskRecord, Status> {
+    let parent_run_id = context.run_id.to_owned();
+    // The delegation resolver enforces per-child budget-share limits against
+    // the parent budget, but tool input does not carry the real parent
+    // budget. Synthesize one: double the requested child budget (keeps the
+    // child's share at 50%), falling back to the objective's estimated token
+    // count when no budget was requested.
+    let parent_budget_tokens =
+        request.budget_tokens.map(|budget| budget.saturating_mul(2).max(1)).or_else(|| {
+            Some(crate::orchestrator::estimate_token_count(request.objective.as_str()).max(1))
+        });
+    let resolved_agent = runtime
+        .resolve_agent_for_context(AgentResolveRequest {
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(ToOwned::to_owned),
+            session_id: Some(context.session_id.to_owned()),
+            preferred_agent_id: None,
+            persist_session_binding: false,
+        })
+        .await?;
+    let delegation_request = delegation_request_for_spawn(&request);
+    let mut delegation = resolve_delegation_request(
+        &delegation_request,
+        &DelegationParentContext {
+            parent_run_id: Some(parent_run_id.clone()),
+            agent_id: Some(resolved_agent.agent.agent_id.clone()),
+            parent_model_profile: normalize_optional(Some(
+                resolved_agent.agent.default_model_profile.as_str(),
+            )),
+            parent_tool_allowlist: parent_tool_allowlist_for_spawn_resolution(
+                &request,
+                resolved_agent.agent.default_tool_allowlist.as_slice(),
+            ),
+            parent_skill_allowlist: resolved_agent.agent.default_skill_allowlist.clone(),
+            parent_budget_tokens,
+        },
+    )?;
+    if request.explicit_empty_tool_allowlist {
+        delegation.tool_allowlist.clear();
+    }
+
+    runtime
+        .create_orchestrator_background_task(OrchestratorBackgroundTaskCreateRequest {
+            task_id: Ulid::new().to_string(),
+            task_kind: AuxiliaryTaskKind::DelegationPrompt.as_str().to_owned(),
+            session_id: context.session_id.to_owned(),
+            parent_run_id: Some(parent_run_id),
+            target_run_id: request.preallocated_child_run_id,
+            queued_input_id: None,
+            owner_principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(ToOwned::to_owned),
+            state: AuxiliaryTaskState::Queued.as_str().to_owned(),
+            priority: request.priority,
+            max_attempts: delegation.max_attempts,
+            budget_tokens: delegation.budget_tokens,
+            delegation: Some(delegation),
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some(request.objective),
+            payload_json: request.payload_json,
+        })
+        .await
+}
+
+fn delegation_request_for_spawn(request: &DelegationSpawnRequest) -> DelegationRequestInput {
+    DelegationRequestInput {
+        profile_id: request.profile_id.clone(),
+        template_id: request.template_id.clone(),
+        group_id: request.group_id.clone(),
+        execution_mode: request.execution_mode,
+        manifest: Some(DelegationManifestInput {
+            display_name: request.display_name.clone(),
+            model_profile: request.model_profile.clone(),
+            tool_allowlist: request.tool_allowlist.clone(),
+            skill_allowlist: request.skill_allowlist.clone(),
+            memory_scope: request.memory_scope,
+            budget_tokens: request.budget_tokens,
+            max_attempts: request.max_attempts,
+            approval_required: request.approval_required,
+            max_concurrent_children: request.max_concurrent_children,
+            max_children_per_parent: request.max_children_per_parent,
+            max_total_children: request.max_total_children,
+            max_parallel_groups: request.max_parallel_groups,
+            max_depth: request.max_depth,
+            max_budget_share_bps: request.max_budget_share_bps,
+            child_timeout_ms: request.child_timeout_ms,
+            ..Default::default()
+        }),
+    }
+}
+
+fn parent_tool_allowlist_for_spawn_resolution(
+    request: &DelegationSpawnRequest,
+    parent_tool_allowlist: &[String],
+) -> Vec<String> {
+    if request.explicit_empty_tool_allowlist {
+        return Vec::new();
+    }
+    parent_tool_allowlist.to_vec()
+}
+
+fn sessions_spawn_response(
+    task: &OrchestratorBackgroundTaskRecord,
+    return_mode: SessionsSpawnReturnMode,
+    child_run_id: &str,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "operation": "sessions_spawn",
+        "spawned": true,
+        "task_id": task.task_id,
+        "parent_run_id": task.parent_run_id,
+        "child_run_id": child_run_id,
+        "child_session_id": task.session_id,
+        "state": task.state,
+        "return_mode": return_mode.as_str(),
+        "transcript_ref": {
+            "kind": "orchestrator_run_tape",
+            "status": "pending",
+            "run_id": child_run_id,
+            "session_id": task.session_id,
+        },
+        "progress_ref": {
+            "task_id": task.task_id,
+            "parent_run_id": task.parent_run_id,
+            "child_run_id": child_run_id,
+            "state": task.state,
+        },
+    })
 }
 
 async fn list_delegations(
@@ -541,6 +775,19 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
     value.map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned)
 }
 
+fn normalize_tool_list(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .filter_map(|value| {
+            let value = normalize_optional(Some(value.as_str()))?;
+            Some(value.to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 /// Applies the model-visible redaction chain to free-form text.
 fn safe_text(value: &str) -> String {
     redact_url_segments_in_text(&redact_auth_error(value))
@@ -570,11 +817,16 @@ fn build_outcome(
 
 #[cfg(test)]
 mod tests {
-    use super::{task_merge_preview, task_safe_json};
+    use super::{
+        delegation_request_for_spawn, parent_tool_allowlist_for_spawn_resolution,
+        sessions_spawn_delegation_spawn_request, sessions_spawn_response, task_merge_preview,
+        task_safe_json, SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
+    };
     use crate::{
         delegation::{
-            DelegationExecutionMode, DelegationMemoryScopeKind, DelegationMergeContract,
-            DelegationMergeStrategy, DelegationRole, DelegationRuntimeLimits, DelegationSnapshot,
+            resolve_delegation_request, DelegationExecutionMode, DelegationMemoryScopeKind,
+            DelegationMergeContract, DelegationMergeStrategy, DelegationParentContext,
+            DelegationRole, DelegationRuntimeLimits, DelegationSnapshot,
         },
         journal::OrchestratorBackgroundTaskRecord,
     };
@@ -617,6 +869,112 @@ mod tests {
             .as_str()
             .expect("summary should be present")
             .contains("secret"));
+    }
+
+    #[test]
+    fn sessions_spawn_request_preserves_explicit_empty_allowed_tools() {
+        let input = SessionsSpawnInput {
+            task: "Inspect the pending handoff".to_owned(),
+            label: None,
+            context_mode: Some(DelegationMemoryScopeKind::ParentSession),
+            priority: Some(4),
+            return_mode: None,
+            allowed_tools: Some(Vec::new()),
+            budget: None,
+        };
+
+        let request = sessions_spawn_delegation_spawn_request(&input, "child-run".to_owned())
+            .expect("sessions_spawn request should normalize");
+        assert!(request.explicit_empty_tool_allowlist);
+        assert!(request.tool_allowlist.is_empty());
+        assert_eq!(request.priority, 4);
+        assert_eq!(request.preallocated_child_run_id.as_deref(), Some("child-run"));
+
+        let mut snapshot = resolve_delegation_request(
+            &delegation_request_for_spawn(&request),
+            &test_parent_context(Some(2_000)),
+        )
+        .expect("base delegation should resolve");
+        assert!(
+            !snapshot.tool_allowlist.is_empty(),
+            "the profile default would grant tools unless the explicit empty list is applied"
+        );
+        if request.explicit_empty_tool_allowlist {
+            snapshot.tool_allowlist.clear();
+        }
+        assert!(snapshot.tool_allowlist.is_empty());
+
+        let parent_resolution_allowlist = parent_tool_allowlist_for_spawn_resolution(
+            &request,
+            &["sessions_spawn".to_owned(), "palyra.echo".to_owned()],
+        );
+        assert!(
+            parent_resolution_allowlist.is_empty(),
+            "explicit child no-tools requests must not fail on profile default tools"
+        );
+    }
+
+    #[test]
+    fn sessions_spawn_budget_share_is_denied_by_delegation_resolver() {
+        let input = SessionsSpawnInput {
+            task: "Summarize the large report".to_owned(),
+            label: None,
+            context_mode: None,
+            priority: None,
+            return_mode: None,
+            allowed_tools: None,
+            budget: Some(SessionsSpawnBudgetInput {
+                tokens: Some(1_300),
+                max_budget_share_bps: Some(5_000),
+                ..Default::default()
+            }),
+        };
+
+        let request = sessions_spawn_delegation_spawn_request(&input, "child-run".to_owned())
+            .expect("sessions_spawn request should normalize");
+        let error = resolve_delegation_request(
+            &delegation_request_for_spawn(&request),
+            &test_parent_context(Some(2_000)),
+        )
+        .expect_err("child budget above parent share should be denied");
+
+        assert!(error.message().contains("configured parent budget share"));
+    }
+
+    #[test]
+    fn sessions_spawn_response_does_not_echo_task_text() {
+        let mut task = sample_task();
+        task.input_text =
+            Some("Read https://example.com/callback?access_token=secret and summarize".to_owned());
+
+        let response =
+            sessions_spawn_response(&task, SessionsSpawnReturnMode::StatusRef, "child-run");
+        let response_text = response.to_string();
+
+        assert_eq!(response["operation"], "sessions_spawn");
+        assert_eq!(response["child_run_id"], "child-run");
+        assert_eq!(response["child_session_id"], "session-1");
+        assert!(!response_text.contains("access_token"));
+        assert!(!response_text.contains("secret"));
+        assert!(!response_text.contains("Read https://example.com"));
+    }
+
+    #[test]
+    fn sessions_spawn_return_modes_use_stable_wire_labels() {
+        assert_eq!(SessionsSpawnReturnMode::IdsOnly.as_str(), "ids_only");
+        assert_eq!(SessionsSpawnReturnMode::StatusRef.as_str(), "status_ref");
+        assert_eq!(SessionsSpawnReturnMode::Ack.as_str(), "ack");
+    }
+
+    fn test_parent_context(parent_budget_tokens: Option<u64>) -> DelegationParentContext {
+        DelegationParentContext {
+            parent_run_id: Some("parent-run".to_owned()),
+            agent_id: Some("main".to_owned()),
+            parent_model_profile: Some("deterministic".to_owned()),
+            parent_tool_allowlist: Vec::new(),
+            parent_skill_allowlist: Vec::new(),
+            parent_budget_tokens,
+        }
     }
 
     fn sample_task() -> OrchestratorBackgroundTaskRecord {

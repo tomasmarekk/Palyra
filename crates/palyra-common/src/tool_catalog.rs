@@ -214,6 +214,7 @@ const AUTOMATION_PROFILE_TOOLS: &[&str] = &[
     "palyra.routines.control",
     "palyra.delegation.query",
     "palyra.delegation.control",
+    "sessions_spawn",
     "palyra.http.fetch",
     "palyra.browser.session.create",
     "palyra.browser.session.close",
@@ -438,6 +439,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.delegation.control" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
+        "sessions_spawn" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
+        }
         "palyra.plan.manage" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
@@ -643,6 +647,12 @@ mod tests {
     }
 
     #[test]
+    fn sessions_spawn_is_sensitive_without_extra_policy_capabilities() {
+        assert!(tool_requires_approval("sessions_spawn"));
+        assert!(tool_policy_capability_names("sessions_spawn").is_empty());
+    }
+
+    #[test]
     fn memory_status_is_read_only_without_approval() {
         assert!(!tool_requires_approval("palyra.memory.status"));
         assert!(tool_policy_capability_names("palyra.memory.status").is_empty());
@@ -670,6 +680,14 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn automation_profile_exposes_sessions_spawn() {
+        let report = expand_toolset_profiles(&[String::from("automation")], &[], &[], &[])
+            .expect("automation profile should be valid");
+
+        assert!(report.effective_allowed_tools.contains(&"sessions_spawn".to_owned()));
     }
 
     #[test]
