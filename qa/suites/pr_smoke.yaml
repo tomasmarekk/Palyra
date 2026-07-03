@@ -3,6 +3,7 @@ id: pr_smoke
 mode: pr
 scenario_roots:
   - qa/scenarios
+  - qa/scenarios/mcp
 include_tags:
   - release_smoke
 allow_provider_modes:
@@ -11,6 +12,7 @@ available_capabilities:
   - agent_run
   - qa_lab
   - approvals
+  - mcp
   - provider_recovery
   - redaction
   - workspace_context

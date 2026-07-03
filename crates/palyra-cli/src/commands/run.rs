@@ -625,6 +625,9 @@ fn project_tape_payload(event_type: &str, payload: &Value) -> Value {
             }
         }
     }
+    if event_type.contains("mcp") {
+        return project_mcp_public_payload(payload);
+    }
     payload.clone()
 }
 
@@ -688,6 +691,7 @@ struct RunReplaySummary {
     event_count: usize,
     event_categories: BTreeMap<String, usize>,
     public_events: Vec<RunReplayPublicEvent>,
+    mcp_imports: Vec<RunReplayMcpImport>,
     tool_proposals: Vec<RunReplayToolProposal>,
     tool_outputs: Vec<String>,
     final_answer_sha256: Option<String>,
@@ -707,6 +711,17 @@ struct RunReplayToolProposal {
     tool_name: String,
     mutation_class: String,
     recorded_output: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RunReplayMcpImport {
+    event_type: String,
+    server_name: Option<String>,
+    catalog_generation: Option<u64>,
+    imported_tools: Vec<String>,
+    tool_count: usize,
+    status: Option<String>,
+    reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -800,6 +815,7 @@ fn replay_trajectory_document(
 fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummary {
     let mut event_categories = BTreeMap::<String, usize>::new();
     let mut public_events = Vec::with_capacity(document.events.len());
+    let mut mcp_imports = Vec::new();
     let mut tool_proposals = BTreeMap::<String, RunReplayToolProposal>::new();
     let mut tool_outputs = BTreeSet::<String>::new();
     let mut final_answer_sha256 = None;
@@ -810,7 +826,13 @@ fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummar
         let category = row.get("category").and_then(Value::as_str).unwrap_or("unknown");
         let event_type = row.get("event_type").and_then(Value::as_str).unwrap_or("unknown");
         *event_categories.entry(category.to_owned()).or_insert(0) += 1;
-        public_events.push(public_event_for_row(row, event_type, category));
+        let public_event = public_event_for_row(row, event_type, category);
+        if category == "mcp_import" {
+            if let Some(import) = mcp_import_from_public_event(&public_event) {
+                mcp_imports.push(import);
+            }
+        }
+        public_events.push(public_event);
         match event_type {
             "tool_proposal" => {
                 if let Some(payload) = row.get("payload") {
@@ -854,6 +876,7 @@ fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummar
         event_count: document.events.len(),
         event_categories,
         public_events,
+        mcp_imports,
         tool_proposals: proposals,
         tool_outputs: tool_outputs.into_iter().collect(),
         final_answer_sha256,
@@ -883,6 +906,7 @@ fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunRep
             "completion_tokens": payload.get("completion_tokens").and_then(Value::as_i64),
             "total_tokens": payload.get("total_tokens").and_then(Value::as_i64),
         }),
+        value if value.contains("mcp") => project_mcp_public_payload(payload),
         _ => json!({}),
     };
     RunReplayPublicEvent {
@@ -892,10 +916,101 @@ fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunRep
     }
 }
 
+fn project_mcp_public_payload(payload: &Value) -> Value {
+    let imported_tools = collect_mcp_tool_names(payload);
+    let tool_count = payload_u64(payload, "tool_count")
+        .or_else(|| payload_u64(payload, "imported_tool_count"))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(imported_tools.len());
+    json!({
+        "server_name": payload_str(payload, "server_name")
+            .or_else(|| payload_str(payload, "server_id"))
+            .or_else(|| payload_str(payload, "namespace")),
+        "catalog_generation": payload_u64(payload, "catalog_generation"),
+        "imported_tools": imported_tools,
+        "tool_count": tool_count,
+        "status": payload_str(payload, "status")
+            .or_else(|| payload_str(payload, "state")),
+        "reason_code": payload_str(payload, "reason_code")
+            .or_else(|| payload_str(payload, "code")),
+    })
+}
+
+fn mcp_import_from_public_event(event: &RunReplayPublicEvent) -> Option<RunReplayMcpImport> {
+    if !matches!(event.event_type.as_str(), "mcp.discovery.snapshot" | "mcp.tool_import.snapshot") {
+        return None;
+    }
+    let payload = &event.stable_payload;
+    let imported_tools = payload
+        .get("imported_tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tool_count = payload
+        .get("tool_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(imported_tools.len());
+    Some(RunReplayMcpImport {
+        event_type: event.event_type.clone(),
+        server_name: payload.get("server_name").and_then(Value::as_str).map(ToOwned::to_owned),
+        catalog_generation: payload.get("catalog_generation").and_then(Value::as_u64),
+        imported_tools,
+        tool_count,
+        status: payload.get("status").and_then(Value::as_str).map(ToOwned::to_owned),
+        reason_code: payload.get("reason_code").and_then(Value::as_str).map(ToOwned::to_owned),
+    })
+}
+
 fn payload_str<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str).or_else(|| {
         payload.get("payload").and_then(|nested| nested.get(key)).and_then(Value::as_str)
     })
+}
+
+fn payload_u64(payload: &Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(Value::as_u64).or_else(|| {
+        payload.get("payload").and_then(|nested| nested.get(key)).and_then(Value::as_u64)
+    })
+}
+
+fn collect_mcp_tool_names(payload: &Value) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for pointer in [
+        "/tools",
+        "/imported_tools",
+        "/tool_imports",
+        "/registry_entries",
+        "/catalog/tools",
+        "/snapshot/tools",
+        "/payload/tools",
+        "/payload/imported_tools",
+        "/payload/tool_imports",
+        "/payload/registry_entries",
+        "/payload/catalog/tools",
+        "/payload/snapshot/tools",
+    ] {
+        if let Some(value) = payload.pointer(pointer) {
+            collect_mcp_tool_names_from_value(value, &mut names);
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn collect_mcp_tool_names_from_value(value: &Value, names: &mut BTreeSet<String>) {
+    if let Some(array) = value.as_array() {
+        for item in array {
+            if let Some(name) = item
+                .as_str()
+                .or_else(|| payload_str(item, "name"))
+                .or_else(|| payload_str(item, "tool_name"))
+            {
+                names.insert(name.to_owned());
+            }
+        }
+    }
 }
 
 fn mutation_class_for_tool(tool_name: &str, payload: &Value) -> String {
@@ -976,12 +1091,56 @@ fn compare_trajectory_summary_to_golden(
             });
         }
     }
+    if let Some(expected_imports) = expected.get("mcp_imports").and_then(Value::as_array) {
+        diffs.extend(compare_mcp_imports_to_golden(&summary.mcp_imports, expected_imports)?);
+    }
     if let Some(expected_events) =
         expected.get("events").or_else(|| expected.get("public_events")).and_then(Value::as_array)
     {
         diffs.extend(compare_public_events_to_golden(&summary.public_events, expected_events)?);
     }
     Ok(diffs)
+}
+
+fn compare_mcp_imports_to_golden(
+    actual_imports: &[RunReplayMcpImport],
+    expected_imports: &[Value],
+) -> Result<Vec<RunReplayDiff>> {
+    if expected_imports.len() != actual_imports.len() {
+        return Ok(vec![RunReplayDiff {
+            path: "$.expected.mcp_imports".to_owned(),
+            expected: format!("{} MCP import event(s)", expected_imports.len()),
+            actual: format!("{} MCP import event(s)", actual_imports.len()),
+            context: "MCP import snapshot stream changed".to_owned(),
+        }]);
+    }
+    for (index, (actual, expected)) in actual_imports.iter().zip(expected_imports).enumerate() {
+        if !mcp_import_matches_expected(actual, expected)? {
+            let actual = serde_json::to_string(actual)
+                .context("failed to encode actual MCP import replay event")?;
+            return Ok(vec![RunReplayDiff {
+                path: format!("$.expected.mcp_imports[{index}]"),
+                expected: expected.to_string(),
+                actual,
+                context: "MCP import snapshot changed".to_owned(),
+            }]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn mcp_import_matches_expected(actual: &RunReplayMcpImport, expected: &Value) -> Result<bool> {
+    if let Some(event_type) = expected.as_str() {
+        return Ok(actual.event_type == event_type);
+    }
+    let Some(expected_object) = expected.as_object() else {
+        return Ok(false);
+    };
+    let actual_value =
+        serde_json::to_value(actual).context("failed to encode actual MCP import replay event")?;
+    Ok(expected_object
+        .iter()
+        .all(|(key, expected_value)| actual_value.get(key) == Some(expected_value)))
 }
 
 fn compare_public_events_to_golden(
@@ -1401,6 +1560,52 @@ mod tests {
     }
 
     #[test]
+    fn replay_mcp_trajectory_uses_recorded_outputs_and_import_snapshots() {
+        let bundle = fixture_mcp_bundle();
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let text = String::from_utf8(bytes.clone()).expect("trajectory should be UTF-8");
+        let document = parse_run_trajectory_jsonl(bytes.as_slice()).unwrap();
+
+        let report = replay_trajectory_document(
+            &document,
+            Some(&json!({
+                "expected": {
+                    "mcp_imports": [
+                        {
+                            "event_type": "mcp.discovery.snapshot",
+                            "server_name": "docs",
+                            "tool_count": 2,
+                            "imported_tools": ["mcp.docs.search", "mcp.docs.write_note"]
+                        },
+                        {
+                            "event_type": "mcp.tool_import.snapshot",
+                            "server_name": "docs",
+                            "catalog_generation": 7,
+                            "status": "available"
+                        }
+                    ]
+                }
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "passed");
+        assert_eq!(report.summary.mcp_imports.len(), 2);
+        assert!(report.summary.event_categories.contains_key("mcp_import"));
+        assert!(report.summary.tool_proposals.iter().any(|proposal| {
+            proposal.tool_name == "mcp.docs.write_note"
+                && proposal.mutation_class == "non_idempotent"
+                && proposal.recorded_output
+        }));
+        assert!(report.unsafe_mutations.is_empty());
+        assert!(text.contains("mcp.discovery.snapshot"));
+        assert!(text.contains("mcp.tool_import.snapshot"));
+        assert!(text.contains("mcp.docs.search"));
+        assert!(!text.contains("mcp-secret-token"));
+    }
+
+    #[test]
     fn replay_golden_compare_accepts_stable_public_event_stream() {
         let bundle = fixture_bundle();
         let (bytes, _) =
@@ -1490,6 +1695,77 @@ mod tests {
     }
 
     fn fixture_bundle_with_tool_output(tool_output: Value) -> ReplayBundle {
+        fixture_bundle_with_named_tool("palyra.shell", tool_output, Vec::new())
+    }
+
+    fn fixture_mcp_bundle() -> ReplayBundle {
+        fixture_bundle_with_named_tool(
+            "mcp.docs.write_note",
+            json!({
+                "proposal_id": "proposal-1",
+                "success": true,
+                "output_json": {
+                    "artifact": "trajectory://mcp/docs/write-note",
+                    "status": "written"
+                },
+                "error": "tool completed after token=mcp-secret-token was redacted",
+                "attestation": { "execution_sha256": "c".repeat(64) },
+            }),
+            vec![
+                ReplayTapeEvent {
+                    seq: 1,
+                    event_type: "mcp.discovery.snapshot".to_owned(),
+                    payload: json!({
+                        "server_name": "docs",
+                        "catalog_generation": 7,
+                        "status": "healthy",
+                        "tools": [
+                            { "name": "mcp.docs.search", "input_schema_sha256": "d".repeat(64) },
+                            { "name": "mcp.docs.write_note", "input_schema_sha256": "e".repeat(64) }
+                        ],
+                        "diagnostic": "probe succeeded with token=mcp-secret-token"
+                    }),
+                },
+                ReplayTapeEvent {
+                    seq: 2,
+                    event_type: "mcp.tool_import.snapshot".to_owned(),
+                    payload: json!({
+                        "server_name": "docs",
+                        "catalog_generation": 7,
+                        "status": "available",
+                        "imported_tools": ["mcp.docs.search", "mcp.docs.write_note"]
+                    }),
+                },
+            ],
+        )
+    }
+
+    fn fixture_bundle_with_named_tool(
+        tool_name: &str,
+        tool_output: Value,
+        mut extra_tape_events: Vec<ReplayTapeEvent>,
+    ) -> ReplayBundle {
+        extra_tape_events.extend([
+            ReplayTapeEvent {
+                seq: 10,
+                event_type: "tool_proposal".to_owned(),
+                payload: json!({
+                    "proposal_id": "proposal-1",
+                    "tool_name": tool_name,
+                    "input": { "token": "secret-token" },
+                }),
+            },
+            ReplayTapeEvent {
+                seq: 11,
+                event_type: "tool_result".to_owned(),
+                payload: with_proposal_id(tool_output, "proposal-1"),
+            },
+            ReplayTapeEvent {
+                seq: 12,
+                event_type: "final_answer".to_owned(),
+                payload: json!({ "text": "done" }),
+            },
+        ]);
         build_replay_bundle(ReplayBundleBuildInput {
             generated_at_unix_ms: 1_700_000_000_000,
             source: ReplaySource {
@@ -1524,29 +1800,9 @@ mod tests {
             },
             config_snapshot: json!({
                 "contract": { "format": "palyra incident replay bundle" },
-                "tool_catalog": ["palyra.shell"],
+                "tool_catalog": [tool_name],
             }),
-            tape_events: vec![
-                ReplayTapeEvent {
-                    seq: 1,
-                    event_type: "tool_proposal".to_owned(),
-                    payload: json!({
-                        "proposal_id": "proposal-1",
-                        "tool_name": "palyra.shell",
-                        "input": { "token": "secret-token" },
-                    }),
-                },
-                ReplayTapeEvent {
-                    seq: 2,
-                    event_type: "tool_result".to_owned(),
-                    payload: with_proposal_id(tool_output, "proposal-1"),
-                },
-                ReplayTapeEvent {
-                    seq: 3,
-                    event_type: "final_answer".to_owned(),
-                    payload: json!({ "text": "done" }),
-                },
-            ],
+            tape_events: extra_tape_events,
             lifecycle_transitions: Vec::new(),
             idempotency_records: Vec::new(),
             artifact_refs: Vec::new(),

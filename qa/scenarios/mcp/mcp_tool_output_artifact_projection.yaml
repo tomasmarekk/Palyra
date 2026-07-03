@@ -1,0 +1,60 @@
+schema_version: 1
+id: mcp.tool_output_artifact_projection
+title: MCP tool output artifact projection
+area: replay
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - mcp
+  tools:
+    - mcp.artifacts.read_large
+  fixtures:
+    - qa/fixtures/mcp/http_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Project a large MCP tool output into a trajectory artifact reference."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp tool output projected"
+  events:
+    - event_type: mcp.tool_import.snapshot
+      min_count: 1
+    - event_type: mcp.tool_output.artifact_projected
+      min_count: 1
+    - event_type: run.replay.trajectory_exported
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: mcp.artifacts.read_large
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - mcp.tool_output.inline_oversize
+  artifacts: []
+  claims:
+    - "oversize output inlined"
+artifacts:
+  - path: qa/reports/mcp_tool_output_artifact_projection.trajectory.jsonl
+    kind: trajectory
+    required: true
+  - path: qa/reports/mcp_tool_output_artifact_projection.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+timeout:
+  run_ms: 30000
+  step_ms: 10000

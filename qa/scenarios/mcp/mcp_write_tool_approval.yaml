@@ -1,0 +1,66 @@
+schema_version: 1
+id: mcp.write_tool_approval
+title: MCP write tool approval
+area: approvals
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - approvals
+    - mcp
+  tools:
+    - mcp.docs.write_note
+  fixtures:
+    - qa/fixtures/mcp/stdio_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Call the docs MCP write tool and require approval before execution."
+  - id: approve
+    action: approval_decision
+    decision: approve_once
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp write approval enforced"
+  events:
+    - event_type: mcp.tool_import.snapshot
+      min_count: 1
+    - event_type: approval.requested
+      min_count: 1
+    - event_type: approval.approved
+      min_count: 1
+    - event_type: tool.call.completed
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls:
+    - name: mcp.docs.write_note
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events:
+    - mcp.write_without_approval
+  artifacts: []
+  claims:
+    - "approval bypassed"
+artifacts:
+  - path: qa/reports/mcp_write_tool_approval.json
+    kind: report
+    required: true
+  - path: qa/reports/mcp_write_tool_approval.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+timeout:
+  run_ms: 30000
+  step_ms: 10000

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "transport": "http",
+  "server_name": "artifacts",
+  "catalog_generation": 3,
+  "endpoint": "http://127.0.0.1:0/mcp",
+  "tools": [
+    {
+      "name": "mcp.artifacts.read_large",
+      "title": "Read large artifact",
+      "input_schema_sha256": "ea342f2514bcd9a473101d127265a6e38c6fa61299f566cf764cc5619e95d410",
+      "output_fixture": {
+        "success": true,
+        "artifact_ref": "trajectory://mcp/artifacts/read-large"
+      }
+    }
+  ],
+  "transport_events": [
+    "mcp.transport.disconnected",
+    "mcp.transport.reconnected"
+  ]
+}

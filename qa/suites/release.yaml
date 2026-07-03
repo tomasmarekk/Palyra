@@ -4,6 +4,7 @@ mode: release
 scenario_roots:
   - qa/scenarios
   - qa/scenarios/provider
+  - qa/scenarios/mcp
 include_tags:
   - p0
 allow_provider_modes:
@@ -17,6 +18,7 @@ available_capabilities:
   - delegation
   - gateway_recovery
   - hook_policy
+  - mcp
   - patch_verification
   - process_background
   - provider_compat

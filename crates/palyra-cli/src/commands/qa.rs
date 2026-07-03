@@ -90,6 +90,8 @@ struct QaPackScenarioReport {
     provider_mode: String,
     evidence_verdict: String,
     issue_codes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<String>,
     artifact_count: usize,
     sandbox_fixture: bool,
     sandbox_cleanup_verified: bool,
@@ -872,16 +874,17 @@ fn render_gate_markdown(report: &QaGateReport) -> String {
         }
     }
     markdown.push_str("\n## Scenario Results\n\n");
-    markdown.push_str("| Scenario | Status | Area | Labels | Reason |\n");
-    markdown.push_str("| --- | --- | --- | --- | --- |\n");
+    markdown.push_str("| Scenario | Status | Area | Labels | Failure class | Reason |\n");
+    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
     for scenario in &report.scenarios {
         markdown.push_str(
             format!(
-                "| `{}` | `{}` | `{}` | {} | {} |\n",
+                "| `{}` | `{}` | `{}` | {} | `{}` | {} |\n",
                 markdown_escape(scenario.id.as_str()),
                 scenario.status.as_str(),
                 markdown_escape(scenario.area.as_str()),
                 markdown_escape(scenario.labels.join(", ").as_str()),
+                markdown_escape(scenario.failure_class.as_deref().unwrap_or("-")),
                 markdown_escape(scenario.reason.as_deref().unwrap_or("-"))
             )
             .as_str(),
@@ -1038,6 +1041,7 @@ fn pack_failure(path: &Path, id: &str, issue_code: &str, reason: String) -> QaPa
         provider_mode: "unknown".to_owned(),
         evidence_verdict: "failed".to_owned(),
         issue_codes: vec![issue_code.to_owned()],
+        failure_class: None,
         artifact_count: 0,
         sandbox_fixture: false,
         sandbox_cleanup_verified: false,
@@ -1054,6 +1058,7 @@ fn pack_manifest_report(
     reason: Option<String>,
 ) -> QaPackScenarioReport {
     let sandbox_fixture = manifest_requires_sandbox_fixture(manifest);
+    let failure_class = classify_manifest_failure(manifest, status, issue_codes.as_slice());
     QaPackScenarioReport {
         id: manifest.id.clone(),
         path: display_path_slash(path),
@@ -1063,6 +1068,7 @@ fn pack_manifest_report(
         provider_mode: manifest.mode.provider.as_str().to_owned(),
         evidence_verdict: evidence_verdict.to_owned(),
         issue_codes,
+        failure_class,
         artifact_count: manifest.artifacts.len(),
         sandbox_fixture,
         sandbox_cleanup_verified: !sandbox_fixture || status == QaPackScenarioStatus::Pass,
@@ -1165,6 +1171,40 @@ fn matches_excluded_tags(manifest: &QaScenarioManifest, excluded_tags: &[String]
 
 fn manifest_requires_sandbox_fixture(manifest: &QaScenarioManifest) -> bool {
     manifest.requires.fixtures.iter().any(|fixture| fixture.contains("sandbox_workspaces"))
+}
+
+fn classify_manifest_failure(
+    manifest: &QaScenarioManifest,
+    status: QaPackScenarioStatus,
+    issue_codes: &[String],
+) -> Option<String> {
+    if !manifest_exercises_mcp(manifest) {
+        return None;
+    }
+    match status {
+        QaPackScenarioStatus::Unsupported => Some("server_unavailable".to_owned()),
+        QaPackScenarioStatus::Fail
+            if issue_codes.iter().any(|code| is_mcp_availability_issue(code)) =>
+        {
+            Some("server_unavailable".to_owned())
+        }
+        QaPackScenarioStatus::Fail => Some("runtime_regression".to_owned()),
+        QaPackScenarioStatus::Pass | QaPackScenarioStatus::Skipped => None,
+    }
+}
+
+fn manifest_exercises_mcp(manifest: &QaScenarioManifest) -> bool {
+    manifest.maturity.labels.iter().any(|label| label == "mcp")
+        || manifest.requires.capabilities.iter().any(|capability| capability == "mcp")
+        || manifest.requires.tools.iter().any(|tool| tool.starts_with("mcp."))
+        || manifest.requires.fixtures.iter().any(|fixture| fixture.contains("/mcp/"))
+}
+
+fn is_mcp_availability_issue(code: &str) -> bool {
+    code.starts_with("missing_fixture:qa/fixtures/mcp/")
+        || code.starts_with("invalid_mcp_fixture:")
+        || code.contains("mcp.server_unavailable")
+        || code.contains("mcp.transport_reconnect_failed")
 }
 
 fn validate_pack_fixtures(manifest: &QaScenarioManifest) -> Vec<String> {
@@ -1343,4 +1383,93 @@ fn is_yaml_path(path: &Path) -> bool {
     path.extension()
         .and_then(OsStr::to_str)
         .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_fixture_failure_reports_server_unavailable() {
+        let manifest = mcp_manifest();
+
+        let report = pack_manifest_report(
+            Path::new("qa/scenarios/mcp/mcp_server_import_read_tool.yaml"),
+            &manifest,
+            QaPackScenarioStatus::Fail,
+            "failed",
+            vec!["missing_fixture:qa/fixtures/mcp/stdio_server.json".to_owned()],
+            Some("required QA fixture validation failed".to_owned()),
+        );
+
+        assert_eq!(report.failure_class.as_deref(), Some("server_unavailable"));
+    }
+
+    #[test]
+    fn mcp_evidence_failure_reports_runtime_regression() {
+        let manifest = mcp_manifest();
+
+        let report = pack_manifest_report(
+            Path::new("qa/scenarios/mcp/mcp_server_import_read_tool.yaml"),
+            &manifest,
+            QaPackScenarioStatus::Fail,
+            "failed",
+            vec!["missing_event:mcp.tool_import.snapshot".to_owned()],
+            None,
+        );
+
+        assert_eq!(report.failure_class.as_deref(), Some("runtime_regression"));
+    }
+
+    fn mcp_manifest() -> QaScenarioManifest {
+        parse_qa_scenario_manifest_yaml(
+            r#"
+schema_version: 1
+id: mcp.test
+area: tools
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - mcp
+  tools:
+    - mcp.docs.search
+  fixtures:
+    - qa/fixtures/mcp/stdio_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Import the MCP read tool."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp imported"
+  events:
+    - event_type: mcp.tool_import.snapshot
+      min_count: 1
+  tool_calls:
+    - name: mcp.docs.search
+      min_count: 1
+forbidden:
+  tool_calls: []
+  events: []
+  artifacts: []
+  claims: []
+artifacts: []
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+timeout:
+  run_ms: 30000
+"#,
+        )
+        .expect("fixture manifest should parse")
+    }
 }

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "transport": "stdio",
+  "server_name": "broken-schema",
+  "catalog_generation": 1,
+  "failure": {
+    "reason_code": "mcp.invalid_schema",
+    "quarantine_reason": "tool input schema is not an object",
+    "catalog_available": false
+  },
+  "tools": [
+    {
+      "name": "mcp.broken_schema.search",
+      "input_schema": "invalid"
+    }
+  ]
+}

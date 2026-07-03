@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "transport": "stdio",
+  "server_name": "docs",
+  "catalog_generation": 7,
+  "tools": [
+    {
+      "name": "mcp.docs.search",
+      "title": "Search docs",
+      "input_schema_sha256": "4d7f5e21a8a9d9fb6d0b19c722f0c91334e196f7ff3a1fd5c10b132b8ab1e101",
+      "output_fixture": {
+        "success": true,
+        "text": "fixture docs search result"
+      }
+    },
+    {
+      "name": "mcp.docs.write_note",
+      "title": "Write docs note",
+      "approval_required": true,
+      "input_schema_sha256": "71fb311dc33df2667e1cfd6d0522a1a5bb40194d3650302d8f46de65c2d59bd7",
+      "output_fixture": {
+        "success": true,
+        "text": "fixture write accepted after approval"
+      }
+    }
+  ]
+}

@@ -187,6 +187,11 @@ fn replay_config_snapshot(
             "offline_replay_requires_live_network": false,
             "offline_replay_requires_live_provider": false,
         },
+        "mcp": {
+            "offline_replay_requires_live_server": false,
+            "capture_discovery_snapshots": true,
+            "capture_tool_import_snapshots": true,
+        },
     })
 }
 
@@ -328,6 +333,14 @@ mod tests {
         let encoded = serde_json::to_string(&bundle).expect("bundle should serialize");
         assert!(!encoded.contains("access_token=raw"));
         assert!(!encoded.contains("Bearer raw"));
+        assert_eq!(
+            bundle.config_snapshot.pointer("/mcp/offline_replay_requires_live_server"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            bundle.config_snapshot.pointer("/mcp/capture_tool_import_snapshots"),
+            Some(&json!(true))
+        );
         assert_eq!(replay_bundle_offline(&bundle).status, ReplayRunStatus::Passed);
     }
 }

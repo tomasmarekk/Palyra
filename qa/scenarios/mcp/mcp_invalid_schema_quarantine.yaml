@@ -1,0 +1,60 @@
+schema_version: 1
+id: mcp.invalid_schema_quarantine
+title: MCP invalid schema quarantine
+area: security
+mode:
+  provider: mock
+  deterministic: true
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - mcp
+  tools:
+    - mcp.broken_schema.search
+  fixtures:
+    - qa/fixtures/mcp/invalid_schema_server.json
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Import the invalid MCP server and verify it is quarantined."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - "mcp invalid schema quarantined"
+  events:
+    - event_type: mcp.discovery.snapshot
+      min_count: 1
+    - event_type: mcp.invalid_schema
+      min_count: 1
+    - event_type: mcp.server_quarantined
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - mcp.broken_schema.search
+  events:
+    - mcp.tool_import.snapshot
+  artifacts: []
+  claims:
+    - "invalid schema accepted"
+artifacts:
+  - path: qa/reports/mcp_invalid_schema_quarantine.json
+    kind: report
+    required: true
+  - path: qa/reports/mcp_invalid_schema_quarantine.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - p0
+    - release_smoke
+    - mcp
+    - security
+timeout:
+  run_ms: 30000
+  step_ms: 10000
