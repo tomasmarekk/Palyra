@@ -78,6 +78,9 @@ const MEMORY_EMBEDDING_JOB_INDEX_TARGET: &str = "memory_vectors";
 const MEMORY_EMBEDDING_JOB_CLAIM_OWNER: &str = "memory_embeddings_backfill";
 const MEMORY_EMBEDDING_JOB_CLAIM_TIMEOUT_MS: i64 = 15 * 60 * 1000;
 const MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS: i64 = 60_000;
+const SESSION_WRITE_LEASE_TTL_MS: i64 = 30_000;
+const SESSION_WRITE_LEASE_OWNER_LABEL: &str = "journal.session_writer";
+const SESSION_WRITE_LEASE_MAX_TEXT_LEN: usize = 128;
 const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
     "secret",
     "token",
@@ -1676,6 +1679,39 @@ pub struct OrchestratorSessionCleanupOutcome {
     pub newly_archived: bool,
     pub previous_session_key: String,
     pub run_count: u64,
+}
+
+/// Request to acquire the exclusive writer lease for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWriteLeaseAcquireRequest {
+    pub session_id: String,
+    pub owner_process_id: u32,
+    pub owner_label: String,
+    pub reason: String,
+    pub ttl_ms: i64,
+    pub allow_reentrant: bool,
+}
+
+/// Request to release a previously acquired session writer lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWriteLeaseReleaseRequest {
+    pub session_id: String,
+    pub lease_id: String,
+    pub owner_process_id: u32,
+    pub owner_label: String,
+}
+
+/// Active session writer lease exposed to operator diagnostics.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionWriteLeaseRecord {
+    pub session_id: String,
+    pub lease_id: String,
+    pub owner_process_id: u32,
+    pub owner_label: String,
+    pub reason: String,
+    pub acquired_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub reentrant_depth: u32,
 }
 
 /// Parameters for registering a new orchestrator run.
@@ -4453,6 +4489,15 @@ pub enum JournalError {
     SessionIdentityMismatch { session_id: String },
     #[error("orchestrator session not found for selector: {selector}")]
     SessionNotFound { selector: String },
+    #[error("orchestrator session write lease timed out for session {session_id}; held by {owner_label} (pid {owner_process_id}) until {expires_at_unix_ms} while acquiring {requested_reason}")]
+    SessionWriteLeaseTimeout {
+        session_id: String,
+        lease_id: String,
+        owner_process_id: u32,
+        owner_label: String,
+        expires_at_unix_ms: i64,
+        requested_reason: String,
+    },
     #[error("{checkpoint_kind} checkpoint not found: {checkpoint_id}")]
     CheckpointNotFound { checkpoint_kind: &'static str, checkpoint_id: String },
     #[error("invalid orchestrator session selector: {reason}")]
@@ -6501,6 +6546,51 @@ const MIGRATIONS: &[Migration] = &[
             END;
         "#,
     },
+    Migration {
+        version: 41,
+        name: "session_write_leases",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS orchestrator_session_write_leases (
+                session_ulid TEXT PRIMARY KEY,
+                lease_ulid TEXT NOT NULL UNIQUE,
+                owner_process_id INTEGER NOT NULL,
+                owner_label TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                acquired_at_unix_ms INTEGER NOT NULL,
+                expires_at_unix_ms INTEGER NOT NULL,
+                reentrant_depth INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_session_write_leases_expires
+                ON orchestrator_session_write_leases(expires_at_unix_ms);
+
+            CREATE TABLE IF NOT EXISTS orchestrator_session_write_lease_events (
+                event_ulid TEXT PRIMARY KEY,
+                session_ulid TEXT NOT NULL,
+                lease_ulid TEXT,
+                event_type TEXT NOT NULL,
+                owner_process_id INTEGER NOT NULL,
+                owner_label TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                reentrant_depth INTEGER NOT NULL,
+                observed_holder_json TEXT,
+                created_at_unix_ms INTEGER NOT NULL,
+                FOREIGN KEY(session_ulid) REFERENCES orchestrator_sessions(session_ulid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestrator_session_write_lease_events_session
+                ON orchestrator_session_write_lease_events(session_ulid, created_at_unix_ms DESC);
+            CREATE TRIGGER IF NOT EXISTS trg_orchestrator_session_write_lease_events_prevent_update
+            BEFORE UPDATE ON orchestrator_session_write_lease_events
+            BEGIN
+                SELECT RAISE(ABORT, 'orchestrator_session_write_lease_events is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_orchestrator_session_write_lease_events_prevent_delete
+            BEFORE DELETE ON orchestrator_session_write_lease_events
+            BEGIN
+                SELECT RAISE(ABORT, 'orchestrator_session_write_lease_events is append-only');
+            END;
+        "#,
+    },
 ];
 
 // Shared serialization, lifecycle, and row-hydration helpers used by the
@@ -6555,6 +6645,431 @@ fn parse_optional_json_column<T: DeserializeOwned>(
             Box::new(std::io::Error::other(format!("failed to decode {field}: {error}"))),
         )
     })
+}
+
+fn normalize_session_write_lease_text(
+    value: &str,
+    field: &'static str,
+) -> Result<String, JournalError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(JournalError::InvalidArgument(format!(
+            "session write lease {field} must not be empty"
+        )));
+    }
+    if trimmed.len() > SESSION_WRITE_LEASE_MAX_TEXT_LEN {
+        return Err(JournalError::InvalidArgument(format!(
+            "session write lease {field} exceeds {SESSION_WRITE_LEASE_MAX_TEXT_LEN} bytes"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_session_write_lease_request(
+    request: &SessionWriteLeaseAcquireRequest,
+) -> Result<(String, String, String), JournalError> {
+    let session_id = normalize_session_write_lease_text(&request.session_id, "session_id")?;
+    let owner_label = normalize_session_write_lease_text(&request.owner_label, "owner_label")?;
+    let reason = normalize_session_write_lease_text(&request.reason, "reason")?;
+    if request.ttl_ms <= 0 {
+        return Err(JournalError::InvalidArgument(
+            "session write lease ttl_ms must be greater than 0".to_owned(),
+        ));
+    }
+    Ok((session_id, owner_label, reason))
+}
+
+fn internal_session_write_lease_request(
+    session_id: &str,
+    reason: &'static str,
+    allow_reentrant: bool,
+) -> SessionWriteLeaseAcquireRequest {
+    SessionWriteLeaseAcquireRequest {
+        session_id: session_id.to_owned(),
+        owner_process_id: std::process::id(),
+        owner_label: SESSION_WRITE_LEASE_OWNER_LABEL.to_owned(),
+        reason: reason.to_owned(),
+        ttl_ms: SESSION_WRITE_LEASE_TTL_MS,
+        allow_reentrant,
+    }
+}
+
+fn hydrate_session_write_lease(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionWriteLeaseRecord> {
+    let owner_process_id = row.get::<_, i64>(2)?.clamp(0, i64::from(u32::MAX)) as u32;
+    let reentrant_depth = row.get::<_, i64>(7)?.clamp(1, i64::from(u32::MAX)) as u32;
+    Ok(SessionWriteLeaseRecord {
+        session_id: row.get(0)?,
+        lease_id: row.get(1)?,
+        owner_process_id,
+        owner_label: row.get(3)?,
+        reason: row.get(4)?,
+        acquired_at_unix_ms: row.get(5)?,
+        expires_at_unix_ms: row.get(6)?,
+        reentrant_depth,
+    })
+}
+
+fn active_session_write_lease_tx(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionWriteLeaseRecord>, JournalError> {
+    connection
+        .query_row(
+            r#"
+                SELECT
+                    session_ulid,
+                    lease_ulid,
+                    owner_process_id,
+                    owner_label,
+                    reason,
+                    acquired_at_unix_ms,
+                    expires_at_unix_ms,
+                    reentrant_depth
+                FROM orchestrator_session_write_leases
+                WHERE session_ulid = ?1
+            "#,
+            params![session_id],
+            hydrate_session_write_lease,
+        )
+        .optional()
+        .map_err(JournalError::from)
+}
+
+fn orchestrator_session_exists_tx(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<bool, JournalError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM orchestrator_sessions WHERE session_ulid = ?1 LIMIT 1",
+            params![session_id],
+            |_row| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(JournalError::from)
+}
+
+fn append_session_write_lease_event_tx(
+    connection: &Connection,
+    event_type: &'static str,
+    lease: Option<&SessionWriteLeaseRecord>,
+    request: &SessionWriteLeaseAcquireRequest,
+    observed_holder: Option<&SessionWriteLeaseRecord>,
+    now: i64,
+) -> Result<(), JournalError> {
+    let observed_holder_json =
+        observed_holder.map(serde_json::to_string).transpose().map_err(JournalError::from)?;
+    connection.execute(
+        r#"
+            INSERT INTO orchestrator_session_write_lease_events (
+                event_ulid,
+                session_ulid,
+                lease_ulid,
+                event_type,
+                owner_process_id,
+                owner_label,
+                reason,
+                reentrant_depth,
+                observed_holder_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+        params![
+            Ulid::new().to_string(),
+            lease.map(|record| record.session_id.as_str()).unwrap_or(request.session_id.as_str()),
+            lease.map(|record| record.lease_id.as_str()),
+            event_type,
+            i64::from(request.owner_process_id),
+            request.owner_label.as_str(),
+            request.reason.as_str(),
+            lease.map(|record| i64::from(record.reentrant_depth)).unwrap_or(0_i64),
+            observed_holder_json,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_session_write_lease_release_event_tx(
+    connection: &Connection,
+    event_type: &'static str,
+    lease: &SessionWriteLeaseRecord,
+    now: i64,
+) -> Result<(), JournalError> {
+    connection.execute(
+        r#"
+            INSERT INTO orchestrator_session_write_lease_events (
+                event_ulid,
+                session_ulid,
+                lease_ulid,
+                event_type,
+                owner_process_id,
+                owner_label,
+                reason,
+                reentrant_depth,
+                observed_holder_json,
+                created_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
+        "#,
+        params![
+            Ulid::new().to_string(),
+            lease.session_id.as_str(),
+            lease.lease_id.as_str(),
+            event_type,
+            i64::from(lease.owner_process_id),
+            lease.owner_label.as_str(),
+            lease.reason.as_str(),
+            i64::from(lease.reentrant_depth),
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn reap_expired_session_write_leases_tx(
+    connection: &Connection,
+    now: i64,
+) -> Result<Vec<SessionWriteLeaseRecord>, JournalError> {
+    let expired = {
+        let mut statement = connection.prepare(
+            r#"
+                SELECT
+                    session_ulid,
+                    lease_ulid,
+                    owner_process_id,
+                    owner_label,
+                    reason,
+                    acquired_at_unix_ms,
+                    expires_at_unix_ms,
+                    reentrant_depth
+                FROM orchestrator_session_write_leases
+                WHERE expires_at_unix_ms <= ?1
+                ORDER BY expires_at_unix_ms ASC
+            "#,
+        )?;
+        let rows = statement.query_map(params![now], hydrate_session_write_lease)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for lease in &expired {
+        connection.execute(
+            "DELETE FROM orchestrator_session_write_leases WHERE session_ulid = ?1 AND lease_ulid = ?2",
+            params![lease.session_id.as_str(), lease.lease_id.as_str()],
+        )?;
+        append_session_write_lease_release_event_tx(connection, "expired_reaped", lease, now)?;
+    }
+    Ok(expired)
+}
+
+fn session_write_lease_timeout(
+    holder: &SessionWriteLeaseRecord,
+    requested_reason: &str,
+) -> JournalError {
+    JournalError::SessionWriteLeaseTimeout {
+        session_id: holder.session_id.clone(),
+        lease_id: holder.lease_id.clone(),
+        owner_process_id: holder.owner_process_id,
+        owner_label: holder.owner_label.clone(),
+        expires_at_unix_ms: holder.expires_at_unix_ms,
+        requested_reason: requested_reason.to_owned(),
+    }
+}
+
+fn acquire_session_write_lease_tx(
+    connection: &Connection,
+    request: &SessionWriteLeaseAcquireRequest,
+    now: i64,
+) -> Result<SessionWriteLeaseRecord, JournalError> {
+    let (session_id, owner_label, reason) = validate_session_write_lease_request(request)?;
+    reap_expired_session_write_leases_tx(connection, now)?;
+    if !orchestrator_session_exists_tx(connection, session_id.as_str())? {
+        return Err(JournalError::SessionNotFound { selector: session_id });
+    }
+    if let Some(holder) = active_session_write_lease_tx(connection, session_id.as_str())? {
+        if request.allow_reentrant
+            && holder.owner_process_id == request.owner_process_id
+            && holder.owner_label == owner_label
+        {
+            let reentrant_depth = holder.reentrant_depth.saturating_add(1);
+            let expires_at_unix_ms = now.saturating_add(request.ttl_ms);
+            connection.execute(
+                r#"
+                    UPDATE orchestrator_session_write_leases
+                    SET
+                        reason = ?2,
+                        expires_at_unix_ms = ?3,
+                        reentrant_depth = ?4
+                    WHERE session_ulid = ?1 AND lease_ulid = ?5
+                "#,
+                params![
+                    session_id.as_str(),
+                    reason.as_str(),
+                    expires_at_unix_ms,
+                    i64::from(reentrant_depth),
+                    holder.lease_id.as_str(),
+                ],
+            )?;
+            let lease = SessionWriteLeaseRecord {
+                session_id,
+                lease_id: holder.lease_id.clone(),
+                owner_process_id: request.owner_process_id,
+                owner_label,
+                reason,
+                acquired_at_unix_ms: holder.acquired_at_unix_ms,
+                expires_at_unix_ms,
+                reentrant_depth,
+            };
+            append_session_write_lease_event_tx(
+                connection,
+                "reentrant_acquired",
+                Some(&lease),
+                request,
+                Some(&holder),
+                now,
+            )?;
+            return Ok(lease);
+        }
+        append_session_write_lease_event_tx(
+            connection,
+            "timeout",
+            None,
+            request,
+            Some(&holder),
+            now,
+        )?;
+        return Err(session_write_lease_timeout(&holder, reason.as_str()));
+    }
+
+    let lease = SessionWriteLeaseRecord {
+        session_id,
+        lease_id: Ulid::new().to_string(),
+        owner_process_id: request.owner_process_id,
+        owner_label,
+        reason,
+        acquired_at_unix_ms: now,
+        expires_at_unix_ms: now.saturating_add(request.ttl_ms),
+        reentrant_depth: 1,
+    };
+    match connection.execute(
+        r#"
+            INSERT INTO orchestrator_session_write_leases (
+                session_ulid,
+                lease_ulid,
+                owner_process_id,
+                owner_label,
+                reason,
+                acquired_at_unix_ms,
+                expires_at_unix_ms,
+                reentrant_depth
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![
+            lease.session_id.as_str(),
+            lease.lease_id.as_str(),
+            i64::from(lease.owner_process_id),
+            lease.owner_label.as_str(),
+            lease.reason.as_str(),
+            lease.acquired_at_unix_ms,
+            lease.expires_at_unix_ms,
+            i64::from(lease.reentrant_depth),
+        ],
+    ) {
+        Ok(_) => {
+            append_session_write_lease_event_tx(
+                connection,
+                "acquired",
+                Some(&lease),
+                request,
+                None,
+                now,
+            )?;
+            Ok(lease)
+        }
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == ErrorCode::ConstraintViolation =>
+        {
+            if let Some(holder) =
+                active_session_write_lease_tx(connection, lease.session_id.as_str())?
+            {
+                append_session_write_lease_event_tx(
+                    connection,
+                    "timeout",
+                    None,
+                    request,
+                    Some(&holder),
+                    now,
+                )?;
+                Err(session_write_lease_timeout(&holder, lease.reason.as_str()))
+            } else {
+                Err(JournalError::Sqlite(rusqlite::Error::SqliteFailure(error, None)))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn release_session_write_lease_tx(
+    connection: &Connection,
+    request: &SessionWriteLeaseReleaseRequest,
+    now: i64,
+) -> Result<bool, JournalError> {
+    let Some(mut lease) = active_session_write_lease_tx(connection, request.session_id.as_str())?
+    else {
+        return Ok(false);
+    };
+    if lease.lease_id != request.lease_id {
+        return Ok(false);
+    }
+    if lease.owner_process_id != request.owner_process_id
+        || lease.owner_label != request.owner_label
+    {
+        return Err(JournalError::InvalidArgument(format!(
+            "session write lease {} for session {} is owned by a different writer",
+            request.lease_id, request.session_id
+        )));
+    }
+    if lease.reentrant_depth > 1 {
+        lease.reentrant_depth = lease.reentrant_depth.saturating_sub(1);
+        connection.execute(
+            r#"
+                UPDATE orchestrator_session_write_leases
+                SET reentrant_depth = ?3
+                WHERE session_ulid = ?1 AND lease_ulid = ?2
+            "#,
+            params![
+                lease.session_id.as_str(),
+                lease.lease_id.as_str(),
+                i64::from(lease.reentrant_depth),
+            ],
+        )?;
+        append_session_write_lease_release_event_tx(connection, "reentrant_released", &lease, now)?;
+        return Ok(true);
+    }
+    connection.execute(
+        "DELETE FROM orchestrator_session_write_leases WHERE session_ulid = ?1 AND lease_ulid = ?2",
+        params![lease.session_id.as_str(), lease.lease_id.as_str()],
+    )?;
+    append_session_write_lease_release_event_tx(connection, "released", &lease, now)?;
+    Ok(true)
+}
+
+fn release_session_write_lease_record_tx(
+    connection: &Connection,
+    lease: &SessionWriteLeaseRecord,
+    now: i64,
+) -> Result<bool, JournalError> {
+    release_session_write_lease_tx(
+        connection,
+        &SessionWriteLeaseReleaseRequest {
+            session_id: lease.session_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            owner_process_id: lease.owner_process_id,
+            owner_label: lease.owner_label.clone(),
+        },
+        now,
+    )
 }
 
 /// Maps legacy run states onto the canonical lifecycle phases.
@@ -7691,6 +8206,57 @@ impl JournalStore {
         }
     }
 
+    fn with_session_write_lease<T, F>(
+        &self,
+        session_id: &str,
+        reason: &'static str,
+        allow_reentrant: bool,
+        write: F,
+    ) -> Result<T, JournalError>
+    where
+        F: FnOnce(&Connection, i64) -> Result<T, JournalError>,
+    {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let request = internal_session_write_lease_request(session_id, reason, allow_reentrant);
+        let lease = acquire_session_write_lease_tx(&guard, &request, now)?;
+        let write_result = write(&guard, now);
+        let release_now = current_unix_ms().unwrap_or(now);
+        let release_result = release_session_write_lease_record_tx(&guard, &lease, release_now);
+        match (write_result, release_result) {
+            (Ok(value), Ok(_)) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    /// Lists active session writer leases after pruning expired records.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] when storage fails.
+    pub fn list_session_write_leases(&self) -> Result<Vec<SessionWriteLeaseRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        reap_expired_session_write_leases_tx(&guard, now)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    session_ulid,
+                    lease_ulid,
+                    owner_process_id,
+                    owner_label,
+                    reason,
+                    acquired_at_unix_ms,
+                    expires_at_unix_ms,
+                    reentrant_depth
+                FROM orchestrator_session_write_leases
+                ORDER BY expires_at_unix_ms ASC, session_ulid ASC
+            "#,
+        )?;
+        let rows = statement.query_map([], hydrate_session_write_lease)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
     /// Appends one event to the audit journal, sanitizing and redacting the payload
     /// and extending the hash chain when enabled.
     ///
@@ -8043,6 +8609,16 @@ impl JournalStore {
                 });
             }
 
+            let reset_lease = if request.reset_session {
+                let lease_request = internal_session_write_lease_request(
+                    session.session_id.as_str(),
+                    "resolve_orchestrator_session_reset",
+                    false,
+                );
+                Some(acquire_session_write_lease_tx(&guard, &lease_request, now)?)
+            } else {
+                None
+            };
             guard.execute(
                 r#"
                     UPDATE orchestrator_sessions
@@ -8090,11 +8666,19 @@ impl JournalStore {
             if request.reset_session {
                 session.last_run_id = None;
             }
-            return Ok(OrchestratorSessionResolveOutcome {
+            let outcome = OrchestratorSessionResolveOutcome {
                 session: hydrate_orchestrator_session(&guard, session, None)?,
                 created: false,
                 reset_applied: request.reset_session,
-            });
+            };
+            if let Some(lease) = reset_lease {
+                release_session_write_lease_record_tx(
+                    &guard,
+                    &lease,
+                    current_unix_ms().unwrap_or(now),
+                )?;
+            }
+            return Ok(outcome);
         }
 
         if request.require_existing {
@@ -8998,6 +9582,12 @@ impl JournalStore {
             });
         }
 
+        let lease_request = internal_session_write_lease_request(
+            session.session_id.as_str(),
+            "cleanup_orchestrator_session",
+            false,
+        );
+        let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
         let archived_session_key = archived_session_key(session.session_id.as_str(), now);
         guard.execute(
             r#"
@@ -9017,13 +9607,15 @@ impl JournalStore {
         session.last_run_id = None;
         session.archived_at_unix_ms = Some(now);
 
-        Ok(OrchestratorSessionCleanupOutcome {
+        let outcome = OrchestratorSessionCleanupOutcome {
             session: hydrate_orchestrator_session(&guard, session, None)?,
             cleaned: true,
             newly_archived: true,
             previous_session_key,
             run_count,
-        })
+        };
+        release_session_write_lease_record_tx(&guard, &lease, current_unix_ms().unwrap_or(now))?;
+        Ok(outcome)
     }
 
     /// Registers a new run for a session and appends the initial lifecycle event.
@@ -9035,116 +9627,121 @@ impl JournalStore {
         &self,
         request: &OrchestratorRunStartRequest,
     ) -> Result<(), JournalError> {
-        let now = current_unix_ms()?;
-        let updates_session_last_run =
-            origin_kind_updates_session_last_run(request.origin_kind.as_str());
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        if updates_session_last_run {
-            if let Some(active_run_id) =
-                active_session_last_run(&guard, request.session_id.as_str())?
-                    .filter(|active_run_id| active_run_id != &request.run_id)
-            {
-                return Err(JournalError::SessionRunAlreadyActive {
-                    session_id: request.session_id.clone(),
-                    active_run_id,
-                    requested_run_id: request.run_id.clone(),
-                });
-            }
-        }
-        match guard.execute(
-            r#"
-                INSERT INTO orchestrator_runs (
-                    run_ulid,
-                    session_ulid,
-                    state,
-                    cancel_requested,
-                    cancel_reason,
-                    created_at_unix_ms,
-                    started_at_unix_ms,
-                    completed_at_unix_ms,
-                    updated_at_unix_ms,
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    last_error,
-                    origin_kind,
-                    origin_run_ulid,
-                    parent_run_ulid,
-                    triggered_by_principal,
-                    parameter_delta_json
-                ) VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4, NULL, ?4, 0, 0, 0, NULL, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            params![
-                request.run_id,
-                request.session_id,
-                RunLifecycleState::Accepted.as_str(),
-                now,
-                request.origin_kind,
-                request.origin_run_id,
-                request.origin_run_id,
-                request.triggered_by_principal,
-                request.parameter_delta_json,
-            ],
-        ) {
-            Ok(_) => {
-                guard.execute(
+        self.with_session_write_lease(
+            request.session_id.as_str(),
+            "start_orchestrator_run",
+            false,
+            |guard, now| {
+                let updates_session_last_run =
+                    origin_kind_updates_session_last_run(request.origin_kind.as_str());
+                if updates_session_last_run {
+                    if let Some(active_run_id) =
+                        active_session_last_run(guard, request.session_id.as_str())?
+                            .filter(|active_run_id| active_run_id != &request.run_id)
+                    {
+                        return Err(JournalError::SessionRunAlreadyActive {
+                            session_id: request.session_id.clone(),
+                            active_run_id,
+                            requested_run_id: request.run_id.clone(),
+                        });
+                    }
+                }
+                match guard.execute(
                     r#"
-                        UPDATE orchestrator_sessions
-                        SET
-                            updated_at_unix_ms = ?2,
-                            last_run_ulid = CASE
-                                WHEN ?4 = 1 THEN ?3
-                                ELSE last_run_ulid
-                            END
-                        WHERE session_ulid = ?1
+                        INSERT INTO orchestrator_runs (
+                            run_ulid,
+                            session_ulid,
+                            state,
+                            cancel_requested,
+                            cancel_reason,
+                            created_at_unix_ms,
+                            started_at_unix_ms,
+                            completed_at_unix_ms,
+                            updated_at_unix_ms,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            last_error,
+                            origin_kind,
+                            origin_run_ulid,
+                            parent_run_ulid,
+                            triggered_by_principal,
+                            parameter_delta_json
+                        ) VALUES (?1, ?2, ?3, 0, NULL, ?4, ?4, NULL, ?4, 0, 0, 0, NULL, ?5, ?6, ?7, ?8, ?9)
                     "#,
                     params![
-                        request.session_id,
-                        now,
                         request.run_id,
-                        if updates_session_last_run { 1_i64 } else { 0_i64 },
+                        request.session_id,
+                        RunLifecycleState::Accepted.as_str(),
+                        now,
+                        request.origin_kind,
+                        request.origin_run_id,
+                        request.origin_run_id,
+                        request.triggered_by_principal,
+                        request.parameter_delta_json,
                     ],
-                )?;
-                append_run_lifecycle_event_tx(
-                    &guard,
-                    &RunLifecycleEventAppendRequest {
-                        event_id: Ulid::new().to_string(),
-                        run_id: request.run_id.clone(),
-                        session_id: request.session_id.clone(),
-                        from_state: None,
-                        to_state: RunLifecyclePhase::Queued,
-                        actor: RuntimeActorRef {
-                            kind: request
-                                .triggered_by_principal
-                                .as_ref()
-                                .map_or(RuntimeActorKind::System, |_| RuntimeActorKind::Principal),
-                            id: request
-                                .triggered_by_principal
-                                .clone()
-                                .unwrap_or_else(|| "system".to_owned()),
-                        },
-                        correlation_id: request.run_id.clone(),
-                        parent_run_id: request.origin_run_id.clone(),
-                        idempotency_key: Some(format!("run:start:{}", request.run_id)),
-                        reason: "run.accepted".to_owned(),
-                        payload_json: "{}".to_owned(),
-                    },
-                    now,
-                )?;
-                Ok(())
+                ) {
+                    Ok(_) => {
+                        guard.execute(
+                            r#"
+                                UPDATE orchestrator_sessions
+                                SET
+                                    updated_at_unix_ms = ?2,
+                                    last_run_ulid = CASE
+                                        WHEN ?4 = 1 THEN ?3
+                                        ELSE last_run_ulid
+                                    END
+                                WHERE session_ulid = ?1
+                            "#,
+                            params![
+                                request.session_id,
+                                now,
+                                request.run_id,
+                                if updates_session_last_run { 1_i64 } else { 0_i64 },
+                            ],
+                        )?;
+                        append_run_lifecycle_event_tx(
+                            guard,
+                            &RunLifecycleEventAppendRequest {
+                                event_id: Ulid::new().to_string(),
+                                run_id: request.run_id.clone(),
+                                session_id: request.session_id.clone(),
+                                from_state: None,
+                                to_state: RunLifecyclePhase::Queued,
+                                actor: RuntimeActorRef {
+                                    kind: request.triggered_by_principal.as_ref().map_or(
+                                        RuntimeActorKind::System,
+                                        |_| RuntimeActorKind::Principal,
+                                    ),
+                                    id: request
+                                        .triggered_by_principal
+                                        .clone()
+                                        .unwrap_or_else(|| "system".to_owned()),
+                                },
+                                correlation_id: request.run_id.clone(),
+                                parent_run_id: request.origin_run_id.clone(),
+                                idempotency_key: Some(format!("run:start:{}", request.run_id)),
+                                reason: "run.accepted".to_owned(),
+                                payload_json: "{}".to_owned(),
+                            },
+                            now,
+                        )?;
+                        Ok(())
+                    }
+                    Err(rusqlite::Error::SqliteFailure(error, message))
+                        if error.code == ErrorCode::ConstraintViolation
+                            && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                                || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                                || message.as_deref().is_some_and(|value| {
+                                    value.contains("orchestrator_runs.run_ulid")
+                                })) =>
+                    {
+                        Err(JournalError::DuplicateRunId { run_id: request.run_id.clone() })
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
-            Err(rusqlite::Error::SqliteFailure(error, message))
-                if error.code == ErrorCode::ConstraintViolation
-                    && (error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
-                        || error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                        || message
-                            .as_deref()
-                            .is_some_and(|value| value.contains("orchestrator_runs.run_ulid"))) =>
-            {
-                Err(JournalError::DuplicateRunId { run_id: request.run_id.clone() })
-            }
-            Err(error) => Err(error.into()),
-        }
+        )
     }
 
     /// Updates run lineage and delegation metadata; `Some(None)` clears a field.
@@ -9488,7 +10085,29 @@ impl JournalStore {
     ) -> Result<(), JournalError> {
         let now = current_unix_ms()?;
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        append_orchestrator_tape_event_tx(&guard, self.config.max_payload_bytes, request, now)
+        let session_id = guard
+            .query_row(
+                "SELECT session_ulid FROM orchestrator_runs WHERE run_ulid = ?1",
+                params![request.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::RunNotFound { run_id: request.run_id.clone() })?;
+        let lease_request = internal_session_write_lease_request(
+            session_id.as_str(),
+            "append_orchestrator_tape",
+            false,
+        );
+        let lease = acquire_session_write_lease_tx(&guard, &lease_request, now)?;
+        let append_result =
+            append_orchestrator_tape_event_tx(&guard, self.config.max_payload_bytes, request, now);
+        let release_now = current_unix_ms().unwrap_or(now);
+        let release_result = release_session_write_lease_record_tx(&guard, &lease, release_now);
+        match (append_result, release_result) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
     }
 
     /// Marks a run cancelled (unless already terminal) and appends a lifecycle
@@ -11250,53 +11869,60 @@ impl JournalStore {
         &self,
         request: &OrchestratorSessionLineageUpdateRequest,
     ) -> Result<(), JournalError> {
-        let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let updated = guard.execute(
-            r#"
-                UPDATE orchestrator_sessions
-                SET
-                    branch_state = ?2,
-                    parent_session_ulid = ?3,
-                    branch_origin_run_ulid = ?4,
-                    auto_title = CASE
-                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?5
-                        ELSE auto_title
-                    END,
-                    auto_title_source = CASE
-                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN 'title_family'
-                        ELSE auto_title_source
-                    END,
-                    auto_title_generator_version = CASE
-                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?6
-                        ELSE auto_title_generator_version
-                    END,
-                    auto_title_updated_at_unix_ms = CASE
-                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?7
-                        ELSE auto_title_updated_at_unix_ms
-                    END,
-                    title_generation_state = CASE
-                        WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?8
-                        ELSE title_generation_state
-                    END,
-                    updated_at_unix_ms = ?7
-                WHERE session_ulid = ?1
-            "#,
-            params![
-                request.session_id,
-                request.branch_state,
-                request.parent_session_id,
-                request.branch_origin_run_id,
-                request.suggested_auto_title,
-                ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION,
-                now,
-                ORCHESTRATOR_TITLE_GENERATION_STATE_READY,
-            ],
-        )?;
-        if updated == 0 {
-            return Err(JournalError::SessionNotFound { selector: request.session_id.clone() });
-        }
-        Ok(())
+        self.with_session_write_lease(
+            request.session_id.as_str(),
+            "update_orchestrator_session_lineage",
+            false,
+            |guard, now| {
+                let updated = guard.execute(
+                    r#"
+                        UPDATE orchestrator_sessions
+                        SET
+                            branch_state = ?2,
+                            parent_session_ulid = ?3,
+                            branch_origin_run_ulid = ?4,
+                            auto_title = CASE
+                                WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?5
+                                ELSE auto_title
+                            END,
+                            auto_title_source = CASE
+                                WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN 'title_family'
+                                ELSE auto_title_source
+                            END,
+                            auto_title_generator_version = CASE
+                                WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?6
+                                ELSE auto_title_generator_version
+                            END,
+                            auto_title_updated_at_unix_ms = CASE
+                                WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?7
+                                ELSE auto_title_updated_at_unix_ms
+                            END,
+                            title_generation_state = CASE
+                                WHEN ?5 IS NOT NULL AND manual_title_locked = 0 THEN ?8
+                                ELSE title_generation_state
+                            END,
+                            updated_at_unix_ms = ?7
+                        WHERE session_ulid = ?1
+                    "#,
+                    params![
+                        request.session_id,
+                        request.branch_state,
+                        request.parent_session_id,
+                        request.branch_origin_run_id,
+                        request.suggested_auto_title,
+                        ORCHESTRATOR_AUTO_TITLE_GENERATOR_VERSION,
+                        now,
+                        ORCHESTRATOR_TITLE_GENERATION_STATE_READY,
+                    ],
+                )?;
+                if updated == 0 {
+                    return Err(JournalError::SessionNotFound {
+                        selector: request.session_id.clone(),
+                    });
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Lists tape events across all of a session's runs as one transcript.
@@ -11948,7 +12574,6 @@ impl JournalStore {
         &self,
         request: &OrchestratorCompactionArtifactCreateRequest,
     ) -> Result<OrchestratorCompactionArtifactRecord, JournalError> {
-        let now = current_unix_ms()?;
         let source_event_count = u64_to_sqlite(request.source_event_count, "source_event_count")?;
         let protected_event_count =
             u64_to_sqlite(request.protected_event_count, "protected_event_count")?;
@@ -11960,82 +12585,88 @@ impl JournalStore {
             u64_to_sqlite(request.estimated_input_tokens, "estimated_input_tokens")?;
         let estimated_output_tokens =
             u64_to_sqlite(request.estimated_output_tokens, "estimated_output_tokens")?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
-            r#"
-                INSERT INTO orchestrator_compaction_artifacts (
-                    artifact_ulid,
-                    session_ulid,
-                    run_ulid,
-                    mode,
-                    strategy,
-                    compressor_version,
-                    trigger_reason,
-                    trigger_policy,
-                    trigger_inputs_json,
-                    summary_text,
-                    summary_preview,
-                    source_event_count,
-                    protected_event_count,
-                    condensed_event_count,
-                    omitted_event_count,
-                    estimated_input_tokens,
-                    estimated_output_tokens,
-                    source_records_json,
-                    summary_json,
-                    created_by_principal,
-                    created_at_unix_ms
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
-                )
-            "#,
-            params![
-                request.artifact_id,
-                request.session_id,
-                request.run_id,
-                request.mode,
-                request.strategy,
-                request.compressor_version,
-                request.trigger_reason,
-                request.trigger_policy,
-                request.trigger_inputs_json,
-                request.summary_text,
-                request.summary_preview,
-                source_event_count,
-                protected_event_count,
-                condensed_event_count,
-                omitted_event_count,
-                estimated_input_tokens,
-                estimated_output_tokens,
-                request.source_records_json,
-                request.summary_json,
-                request.created_by_principal,
-                now,
-            ],
-        )?;
-        Ok(OrchestratorCompactionArtifactRecord {
-            artifact_id: request.artifact_id.clone(),
-            session_id: request.session_id.clone(),
-            run_id: request.run_id.clone(),
-            mode: request.mode.clone(),
-            strategy: request.strategy.clone(),
-            compressor_version: request.compressor_version.clone(),
-            trigger_reason: request.trigger_reason.clone(),
-            trigger_policy: request.trigger_policy.clone(),
-            trigger_inputs_json: request.trigger_inputs_json.clone(),
-            summary_text: request.summary_text.clone(),
-            summary_preview: request.summary_preview.clone(),
-            source_event_count: request.source_event_count,
-            protected_event_count: request.protected_event_count,
-            condensed_event_count: request.condensed_event_count,
-            omitted_event_count: request.omitted_event_count,
-            estimated_input_tokens: request.estimated_input_tokens,
-            estimated_output_tokens: request.estimated_output_tokens,
-            source_records_json: request.source_records_json.clone(),
-            summary_json: request.summary_json.clone(),
-            created_by_principal: request.created_by_principal.clone(),
-            created_at_unix_ms: now,
-        })
+        self.with_session_write_lease(
+            request.session_id.as_str(),
+            "create_orchestrator_compaction_artifact",
+            false,
+            |guard, now| {
+                guard.execute(
+                    r#"
+                        INSERT INTO orchestrator_compaction_artifacts (
+                            artifact_ulid,
+                            session_ulid,
+                            run_ulid,
+                            mode,
+                            strategy,
+                            compressor_version,
+                            trigger_reason,
+                            trigger_policy,
+                            trigger_inputs_json,
+                            summary_text,
+                            summary_preview,
+                            source_event_count,
+                            protected_event_count,
+                            condensed_event_count,
+                            omitted_event_count,
+                            estimated_input_tokens,
+                            estimated_output_tokens,
+                            source_records_json,
+                            summary_json,
+                            created_by_principal,
+                            created_at_unix_ms
+                        ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                        )
+                    "#,
+                    params![
+                        request.artifact_id,
+                        request.session_id,
+                        request.run_id,
+                        request.mode,
+                        request.strategy,
+                        request.compressor_version,
+                        request.trigger_reason,
+                        request.trigger_policy,
+                        request.trigger_inputs_json,
+                        request.summary_text,
+                        request.summary_preview,
+                        source_event_count,
+                        protected_event_count,
+                        condensed_event_count,
+                        omitted_event_count,
+                        estimated_input_tokens,
+                        estimated_output_tokens,
+                        request.source_records_json,
+                        request.summary_json,
+                        request.created_by_principal,
+                        now,
+                    ],
+                )?;
+                Ok(OrchestratorCompactionArtifactRecord {
+                    artifact_id: request.artifact_id.clone(),
+                    session_id: request.session_id.clone(),
+                    run_id: request.run_id.clone(),
+                    mode: request.mode.clone(),
+                    strategy: request.strategy.clone(),
+                    compressor_version: request.compressor_version.clone(),
+                    trigger_reason: request.trigger_reason.clone(),
+                    trigger_policy: request.trigger_policy.clone(),
+                    trigger_inputs_json: request.trigger_inputs_json.clone(),
+                    summary_text: request.summary_text.clone(),
+                    summary_preview: request.summary_preview.clone(),
+                    source_event_count: request.source_event_count,
+                    protected_event_count: request.protected_event_count,
+                    condensed_event_count: request.condensed_event_count,
+                    omitted_event_count: request.omitted_event_count,
+                    estimated_input_tokens: request.estimated_input_tokens,
+                    estimated_output_tokens: request.estimated_output_tokens,
+                    source_records_json: request.source_records_json.clone(),
+                    summary_json: request.summary_json.clone(),
+                    created_by_principal: request.created_by_principal.clone(),
+                    created_at_unix_ms: now,
+                })
+            },
+        )
     }
 
     /// Lists compaction artifacts for a session.
@@ -12182,58 +12813,63 @@ impl JournalStore {
         &self,
         request: &OrchestratorCheckpointCreateRequest,
     ) -> Result<OrchestratorCheckpointRecord, JournalError> {
-        let now = current_unix_ms()?;
-        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        guard.execute(
-            r#"
-                INSERT INTO orchestrator_checkpoints (
-                    checkpoint_ulid,
-                    session_ulid,
-                    run_ulid,
-                    name,
-                    tags_json,
-                    note,
-                    branch_state,
-                    parent_session_ulid,
-                    referenced_compaction_ids_json,
-                    workspace_paths_json,
-                    created_by_principal,
-                    created_at_unix_ms,
-                    restore_count,
-                    last_restored_at_unix_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, NULL)
-            "#,
-            params![
-                request.checkpoint_id,
-                request.session_id,
-                request.run_id,
-                request.name,
-                request.tags_json,
-                request.note,
-                request.branch_state,
-                request.parent_session_id,
-                request.referenced_compaction_ids_json,
-                request.workspace_paths_json,
-                request.created_by_principal,
-                now,
-            ],
-        )?;
-        Ok(OrchestratorCheckpointRecord {
-            checkpoint_id: request.checkpoint_id.clone(),
-            session_id: request.session_id.clone(),
-            run_id: request.run_id.clone(),
-            name: request.name.clone(),
-            tags_json: request.tags_json.clone(),
-            note: request.note.clone(),
-            branch_state: request.branch_state.clone(),
-            parent_session_id: request.parent_session_id.clone(),
-            referenced_compaction_ids_json: request.referenced_compaction_ids_json.clone(),
-            workspace_paths_json: request.workspace_paths_json.clone(),
-            created_by_principal: request.created_by_principal.clone(),
-            created_at_unix_ms: now,
-            restore_count: 0,
-            last_restored_at_unix_ms: None,
-        })
+        self.with_session_write_lease(
+            request.session_id.as_str(),
+            "create_orchestrator_checkpoint",
+            false,
+            |guard, now| {
+                guard.execute(
+                    r#"
+                        INSERT INTO orchestrator_checkpoints (
+                            checkpoint_ulid,
+                            session_ulid,
+                            run_ulid,
+                            name,
+                            tags_json,
+                            note,
+                            branch_state,
+                            parent_session_ulid,
+                            referenced_compaction_ids_json,
+                            workspace_paths_json,
+                            created_by_principal,
+                            created_at_unix_ms,
+                            restore_count,
+                            last_restored_at_unix_ms
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, NULL)
+                    "#,
+                    params![
+                        request.checkpoint_id,
+                        request.session_id,
+                        request.run_id,
+                        request.name,
+                        request.tags_json,
+                        request.note,
+                        request.branch_state,
+                        request.parent_session_id,
+                        request.referenced_compaction_ids_json,
+                        request.workspace_paths_json,
+                        request.created_by_principal,
+                        now,
+                    ],
+                )?;
+                Ok(OrchestratorCheckpointRecord {
+                    checkpoint_id: request.checkpoint_id.clone(),
+                    session_id: request.session_id.clone(),
+                    run_id: request.run_id.clone(),
+                    name: request.name.clone(),
+                    tags_json: request.tags_json.clone(),
+                    note: request.note.clone(),
+                    branch_state: request.branch_state.clone(),
+                    parent_session_id: request.parent_session_id.clone(),
+                    referenced_compaction_ids_json: request.referenced_compaction_ids_json.clone(),
+                    workspace_paths_json: request.workspace_paths_json.clone(),
+                    created_by_principal: request.created_by_principal.clone(),
+                    created_at_unix_ms: now,
+                    restore_count: 0,
+                    last_restored_at_unix_ms: None,
+                })
+            },
+        )
     }
 
     /// Lists conversation checkpoints for a session.
@@ -27091,28 +27727,30 @@ mod tests {
     };
 
     use super::{
-        build_fts_query, build_memory_fts_queries, current_unix_ms, encode_vector_blob,
-        memory_query_embedding_cache_scope, query_embedding_cache_key,
-        session_search_source_refs_projection, session_search_window_source_ref, sha256_hex,
-        workspace_query_embedding_cache_scope, AgentPlanCreateRequest, AgentPlanListFilter,
-        AgentPlanUpdateRequest, ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope,
-        ApprovalPolicySnapshot, ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest,
-        ApprovalRiskLevel, ApprovalSubjectType, ApprovalsListFilter, CanvasStateTransitionRequest,
-        CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter,
-        CommitmentUpdateRequest, CompatResponseUpsertRequest, CronConcurrencyPolicy,
-        CronJobCreateRequest, CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy,
-        CronRunFinalizeRequest, CronRunStartRequest, CronRunStatus, CronRunsListFilter,
-        CronScheduleType, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
-        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
-        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
-        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
-        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
+        acquire_session_write_lease_tx, build_fts_query, build_memory_fts_queries, current_unix_ms,
+        encode_vector_blob, memory_query_embedding_cache_scope, query_embedding_cache_key,
+        release_session_write_lease_tx, session_search_source_refs_projection,
+        session_search_window_source_ref, sha256_hex, workspace_query_embedding_cache_scope,
+        AgentPlanCreateRequest, AgentPlanListFilter, AgentPlanUpdateRequest, ApprovalCreateRequest,
+        ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
+        ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel, ApprovalSubjectType,
+        ApprovalsListFilter, CanvasStateTransitionRequest, CommitmentCreateRequest,
+        CommitmentDeliveryAttemptCreateRequest, CommitmentListFilter, CommitmentUpdateRequest,
+        CompatResponseUpsertRequest, CronConcurrencyPolicy, CronJobCreateRequest,
+        CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
+        CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
+        HashMemoryEmbeddingProvider, IdempotencyBeginRequest, IdempotencyCompleteRequest,
+        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryEmbeddingProvider,
+        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
+        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
+        OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
         OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
         OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, ProgressDraftListFilter,
         ProgressDraftTapeEventRequest, RecallArtifactCreateRequest, RecallArtifactListFilter,
         SessionProjectContextStateUpsertRequest, SessionSearchRequest,
         SessionSearchUxSourceRefsProjection, SessionSearchUxSourceRefsReasonCode,
+        SessionWriteLeaseAcquireRequest, SessionWriteLeaseRecord, SessionWriteLeaseReleaseRequest,
         SkillExecutionStatus, SkillStatusUpsertRequest, ToolJobAttachRequest, ToolJobCreateRequest,
         ToolJobRetentionPolicy, ToolJobRetryPolicy, ToolJobRetryRequest, ToolJobState,
         ToolJobTailAppendRequest, ToolJobTailReadRequest, ToolJobTailStream,
@@ -27259,6 +27897,42 @@ mod tests {
                 payload_json: "{}".to_owned(),
             })
             .expect("orchestrator tape event should be appended");
+    }
+
+    fn session_write_lease_request(
+        session_id: &str,
+        owner_process_id: u32,
+        owner_label: &str,
+        reason: &str,
+        ttl_ms: i64,
+        allow_reentrant: bool,
+    ) -> SessionWriteLeaseAcquireRequest {
+        SessionWriteLeaseAcquireRequest {
+            session_id: session_id.to_owned(),
+            owner_process_id,
+            owner_label: owner_label.to_owned(),
+            reason: reason.to_owned(),
+            ttl_ms,
+            allow_reentrant,
+        }
+    }
+
+    fn acquire_test_session_write_lease(
+        store: &JournalStore,
+        request: &SessionWriteLeaseAcquireRequest,
+    ) -> Result<SessionWriteLeaseRecord, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = store.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        acquire_session_write_lease_tx(&guard, request, now)
+    }
+
+    fn release_test_session_write_lease(
+        store: &JournalStore,
+        request: &SessionWriteLeaseReleaseRequest,
+    ) -> Result<bool, JournalError> {
+        let now = current_unix_ms()?;
+        let guard = store.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        release_session_write_lease_tx(&guard, request, now)
     }
 
     fn progress_draft_request(
@@ -27593,6 +28267,214 @@ mod tests {
             .expect("queue steering events should list from audit ledger");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, event.event_id);
+    }
+
+    #[test]
+    fn session_write_lease_blocks_cross_store_session_mutation() {
+        let db_path = temp_db_path();
+        let store_a = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("first journal store should open");
+        let store_b = JournalStore::open(test_journal_config(db_path, false))
+            .expect("second journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5WL1";
+        let run_id = "01ARZ3NDEKTSV4RRFFQ69G5WL2";
+        upsert_orchestrator_session(&store_a, session_id);
+
+        let lease = acquire_test_session_write_lease(
+            &store_a,
+            &session_write_lease_request(
+                session_id,
+                10_001,
+                "lease-test-a",
+                "hold_for_cross_store_test",
+                60_000,
+                false,
+            ),
+        )
+        .expect("first writer should acquire session lease");
+
+        let error = store_b
+            .start_orchestrator_run(&OrchestratorRunStartRequest {
+                run_id: run_id.to_owned(),
+                session_id: session_id.to_owned(),
+                origin_kind: String::new(),
+                origin_run_id: None,
+                triggered_by_principal: None,
+                parameter_delta_json: None,
+            })
+            .expect_err("second writer must not mutate a leased session");
+        match error {
+            JournalError::SessionWriteLeaseTimeout {
+                session_id: conflict_session_id,
+                owner_label,
+                requested_reason,
+                ..
+            } => {
+                assert_eq!(conflict_session_id, session_id);
+                assert_eq!(owner_label, "lease-test-a");
+                assert_eq!(requested_reason, "start_orchestrator_run");
+            }
+            other => panic!("expected session write lease timeout, got {other:?}"),
+        }
+
+        release_test_session_write_lease(
+            &store_a,
+            &SessionWriteLeaseReleaseRequest {
+                session_id: session_id.to_owned(),
+                lease_id: lease.lease_id.clone(),
+                owner_process_id: lease.owner_process_id,
+                owner_label: lease.owner_label.clone(),
+            },
+        )
+        .expect("lease release should succeed");
+        start_orchestrator_run(&store_b, session_id, run_id);
+    }
+
+    #[test]
+    fn session_write_lease_requires_explicit_reentrant_mode_and_audits_it() {
+        let db_path = temp_db_path();
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should open");
+        let session_id = "01ARZ3NDEKTSV4RRFFQ69G5WL3";
+        upsert_orchestrator_session(&store, session_id);
+
+        let first = acquire_test_session_write_lease(
+            &store,
+            &session_write_lease_request(
+                session_id,
+                20_001,
+                "lease-test-reentrant",
+                "outer_write",
+                60_000,
+                false,
+            ),
+        )
+        .expect("outer lease should acquire");
+        let default_error = acquire_test_session_write_lease(
+            &store,
+            &session_write_lease_request(
+                session_id,
+                20_001,
+                "lease-test-reentrant",
+                "implicit_nested_write",
+                60_000,
+                false,
+            ),
+        )
+        .expect_err("reentrant acquisition must not be implicit");
+        assert!(matches!(default_error, JournalError::SessionWriteLeaseTimeout { .. }));
+
+        let nested = acquire_test_session_write_lease(
+            &store,
+            &session_write_lease_request(
+                session_id,
+                20_001,
+                "lease-test-reentrant",
+                "explicit_nested_write",
+                60_000,
+                true,
+            ),
+        )
+        .expect("explicit reentrant lease should acquire");
+        assert_eq!(nested.lease_id, first.lease_id);
+        assert_eq!(nested.reentrant_depth, 2);
+
+        let active = store.list_session_write_leases().expect("active leases should list");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].reentrant_depth, 2);
+
+        let reentrant_events = {
+            let guard = store.connection.lock().expect("connection lock should not be poisoned");
+            guard
+                .query_row(
+                    r#"
+                        SELECT COUNT(*)
+                        FROM orchestrator_session_write_lease_events
+                        WHERE session_ulid = ?1 AND event_type = 'reentrant_acquired'
+                    "#,
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("lease audit events should be queryable")
+        };
+        assert_eq!(reentrant_events, 1);
+
+        release_test_session_write_lease(
+            &store,
+            &SessionWriteLeaseReleaseRequest {
+                session_id: session_id.to_owned(),
+                lease_id: nested.lease_id.clone(),
+                owner_process_id: nested.owner_process_id,
+                owner_label: nested.owner_label.clone(),
+            },
+        )
+        .expect("nested release should decrement depth");
+        let active = store
+            .list_session_write_leases()
+            .expect("active leases should list after nested release");
+        assert_eq!(active[0].reentrant_depth, 1);
+        release_test_session_write_lease(
+            &store,
+            &SessionWriteLeaseReleaseRequest {
+                session_id: session_id.to_owned(),
+                lease_id: nested.lease_id,
+                owner_process_id: nested.owner_process_id,
+                owner_label: nested.owner_label,
+            },
+        )
+        .expect("outer release should clear lease");
+        assert!(store
+            .list_session_write_leases()
+            .expect("active leases should list after release")
+            .is_empty());
+    }
+
+    #[test]
+    fn expired_session_write_lease_is_reaped_after_restart_like_reopen() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let session_id = "01ARZ3NDEKTSV4RRFFQ69G5WL4";
+            upsert_orchestrator_session(&store, session_id);
+            acquire_test_session_write_lease(
+                &store,
+                &session_write_lease_request(
+                    session_id,
+                    30_001,
+                    "lease-test-crash",
+                    "simulate_crashed_writer",
+                    1,
+                    false,
+                ),
+            )
+            .expect("short lease should acquire");
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        assert!(
+            reopened
+                .list_session_write_leases()
+                .expect("expired lease should be reaped during list")
+                .is_empty(),
+            "expired session write lease must not deadlock a restarted daemon"
+        );
+
+        let lease = acquire_test_session_write_lease(
+            &reopened,
+            &session_write_lease_request(
+                "01ARZ3NDEKTSV4RRFFQ69G5WL4",
+                30_002,
+                "lease-test-recovery",
+                "post_recovery_write",
+                60_000,
+                false,
+            ),
+        )
+        .expect("new writer should acquire after expired lease is reaped");
+        assert_eq!(lease.owner_label, "lease-test-recovery");
     }
 
     #[test]

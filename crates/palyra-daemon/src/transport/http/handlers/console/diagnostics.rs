@@ -180,6 +180,10 @@ pub(crate) async fn console_diagnostics_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let session_write_leases =
+        state.runtime.list_session_write_leases().await.map_err(runtime_status_response)?;
+    let session_write_leases_payload =
+        build_session_write_leases_diagnostics(session_write_leases.as_slice());
     let generated_at_unix_ms = unix_ms_now().map_err(|error| {
         runtime_status_response(tonic::Status::internal(format!(
             "failed to read system clock: {error}"
@@ -290,6 +294,7 @@ pub(crate) async fn console_diagnostics_handler(
         "routine_capability_profile": routine_capability_profile_payload,
         "cron_routine_preview_audit": cron_routine_preview_audit_payload,
         "turn_control": turn_control_payload,
+        "session_write_leases": session_write_leases_payload,
         "delegation": delegation_payload,
         "access": {
             "feature_flags": access_snapshot.feature_flags,
@@ -338,6 +343,60 @@ pub(crate) async fn console_diagnostics_handler(
             }
         },
     })))
+}
+
+fn build_session_write_leases_diagnostics(
+    leases: &[crate::journal::SessionWriteLeaseRecord],
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "active_count": leases.len(),
+        "active": leases.iter().map(|lease| {
+            json!({
+                "session_id": lease.session_id.as_str(),
+                "lease_id": lease.lease_id.as_str(),
+                "owner_process_id": lease.owner_process_id,
+                "owner_label": lease.owner_label.as_str(),
+                "reason": lease.reason.as_str(),
+                "acquired_at_unix_ms": lease.acquired_at_unix_ms,
+                "expires_at_unix_ms": lease.expires_at_unix_ms,
+                "reentrant_depth": lease.reentrant_depth,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod session_write_lease_diagnostics_tests {
+    use super::build_session_write_leases_diagnostics;
+    use crate::journal::SessionWriteLeaseRecord;
+    use serde_json::Value;
+
+    #[test]
+    fn diagnostics_snapshot_exposes_active_session_write_leases() {
+        let payload = build_session_write_leases_diagnostics(&[SessionWriteLeaseRecord {
+            session_id: "session-1".to_owned(),
+            lease_id: "lease-1".to_owned(),
+            owner_process_id: 42,
+            owner_label: "journal.session_writer".to_owned(),
+            reason: "start_orchestrator_run".to_owned(),
+            acquired_at_unix_ms: 1_730_000_000_000,
+            expires_at_unix_ms: 1_730_000_030_000,
+            reentrant_depth: 1,
+        }]);
+
+        assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(1));
+        assert_eq!(payload.pointer("/active_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            payload.pointer("/active/0/session_id").and_then(Value::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            payload.pointer("/active/0/reason").and_then(Value::as_str),
+            Some("start_orchestrator_run")
+        );
+        assert_eq!(payload.pointer("/active/0/reentrant_depth").and_then(Value::as_u64), Some(1));
+    }
 }
 
 // Networked-worker fleet actions. Every handler requires a CSRF-validated

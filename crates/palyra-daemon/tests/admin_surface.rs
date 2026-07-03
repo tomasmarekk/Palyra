@@ -3331,6 +3331,11 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
         "diagnostics should publish runtime capability entries"
     );
     assert_eq!(
+        diagnostics_response.pointer("/session_write_leases/active_count").and_then(Value::as_u64),
+        Some(0),
+        "diagnostics should expose active session write lease count"
+    );
+    assert_eq!(
         diagnostics_response
             .pointer("/feature_rollouts/session_queue_policy/config_path")
             .and_then(Value::as_str),

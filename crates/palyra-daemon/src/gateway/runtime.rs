@@ -80,9 +80,9 @@ use crate::journal::{
     RecallArtifactCreateRequest, RecallArtifactListFilter, RecallArtifactRecord,
     RetrievalBranchDiagnostics, SessionProjectContextStateCopyRequest,
     SessionProjectContextStateRecord, SessionProjectContextStateUpsertRequest,
-    SessionSearchOutcome, SessionSearchRequest, ToolJobAttachRequest, ToolJobCreateRequest,
-    ToolJobRecord, ToolJobRetryRequest, ToolJobTailAppendRequest, ToolJobTailPage,
-    ToolJobTailReadRequest, ToolJobTransitionRequest, ToolJobsListFilter,
+    SessionSearchOutcome, SessionSearchRequest, SessionWriteLeaseRecord, ToolJobAttachRequest,
+    ToolJobCreateRequest, ToolJobRecord, ToolJobRetryRequest, ToolJobTailAppendRequest,
+    ToolJobTailPage, ToolJobTailReadRequest, ToolJobTransitionRequest, ToolJobsListFilter,
     ToolResultArtifactCreateRequest, ToolResultArtifactReadRequest,
     TurnControlAuditEventAppendRequest, TurnControlAuditEventListFilter,
     TurnControlAuditEventRecord, WorkItemCreateRequest, WorkItemEventRecord, WorkItemListFilter,
@@ -6548,6 +6548,27 @@ impl GatewayRuntimeState {
     // search, recall artifacts, queued inputs, queue controls, pins,
     // compaction artifacts, checkpoints, workspace checkpoints/restore
     // reports, flows, background tasks, and learning records.
+
+    #[allow(clippy::result_large_err)]
+    fn list_session_write_leases_blocking(&self) -> Result<Vec<SessionWriteLeaseRecord>, Status> {
+        self.journal_store
+            .list_session_write_leases()
+            .map_err(|error| map_orchestrator_store_error("list session write leases", error))
+    }
+
+    /// Lists active session write leases for operator diagnostics.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_session_write_leases(
+        self: &Arc<Self>,
+    ) -> Result<Vec<SessionWriteLeaseRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_session_write_leases_blocking())
+            .await
+            .map_err(|_| Status::internal("session write lease list worker panicked"))?
+    }
 
     #[allow(clippy::result_large_err)]
     fn list_orchestrator_session_runs_blocking(

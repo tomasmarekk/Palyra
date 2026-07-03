@@ -40,6 +40,16 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         JournalError::SessionNotFound { selector } => {
             Status::not_found(format!("orchestrator session not found for selector: {selector}"))
         }
+        JournalError::SessionWriteLeaseTimeout {
+            session_id,
+            lease_id,
+            owner_process_id,
+            owner_label,
+            expires_at_unix_ms,
+            requested_reason,
+        } => Status::aborted(format!(
+            "orchestrator session {session_id} write lease timed out while acquiring {requested_reason}; active lease {lease_id} is held by {owner_label} (pid {owner_process_id}) until {expires_at_unix_ms}"
+        )),
         JournalError::CheckpointNotFound { checkpoint_kind, checkpoint_id } => {
             Status::not_found(format!("{checkpoint_kind} checkpoint not found: {checkpoint_id}"))
         }
@@ -327,6 +337,26 @@ mod tests {
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert!(status.message().contains("active run run-active"));
         assert!(status.message().contains("run-next"));
+    }
+
+    #[test]
+    fn map_orchestrator_store_error_maps_session_write_lease_timeout_to_aborted() {
+        let status = map_orchestrator_store_error(
+            "start orchestrator run",
+            JournalError::SessionWriteLeaseTimeout {
+                session_id: "session-1".to_owned(),
+                lease_id: "lease-1".to_owned(),
+                owner_process_id: 42,
+                owner_label: "journal.session_writer".to_owned(),
+                expires_at_unix_ms: 1_730_000_030_000,
+                requested_reason: "start_orchestrator_run".to_owned(),
+            },
+        );
+
+        assert_eq!(status.code(), Code::Aborted);
+        assert!(status.message().contains("session-1"));
+        assert!(status.message().contains("lease-1"));
+        assert!(status.message().contains("start_orchestrator_run"));
     }
 
     #[test]
