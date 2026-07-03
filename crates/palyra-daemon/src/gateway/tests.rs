@@ -3,7 +3,7 @@
 //! runtime-state behavior. Pins error strings and journal/wire payloads.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
@@ -124,6 +124,7 @@ use crate::application::{
         },
         os_file::execute_os_file_tool,
         routines::execute_routines_tool,
+        tool_rpc::{process_tool_rpc_file_transport_once, ToolRpcFileTransportConfig},
         workspace_file::execute_workspace_list_dir_tool,
         workspace_patch::{
             execute_workspace_patch_tool, extend_patch_string_defaults,
@@ -6425,6 +6426,263 @@ async fn tool_program_python_rpc_script_spills_large_child_output() {
         .expect("spilled artifact should be listed");
     assert_eq!(artifacts.len(), 1);
     assert_eq!(artifacts[0].tool_name, "palyra.echo");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_python_rpc_script_advertises_docker_file_transport() {
+    let state = build_test_runtime_state(false);
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FD1";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FD2";
+    start_tool_program_test_run(&state, session_id, run_id).await;
+    let input = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "program_id": "script-docker-transport",
+        "program_kind": "python_rpc_script",
+        "granted_tools": ["palyra.echo"],
+        "script": {
+            "source": "from palyra_tools import call_palyra_echo\ncall_palyra_echo({'text': 'docker'})\n",
+            "calls": [
+                {
+                    "call_id": "echo-docker",
+                    "tool_name": "palyra.echo",
+                    "arguments": {"text": "docker transport"}
+                }
+            ]
+        }
+    }))
+    .expect("tool program input should serialize");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id,
+            run_id,
+            execution_backend: ExecutionBackendPreference::Docker,
+            backend_reason_code: "backend.available.docker",
+        },
+        "proposal-tool-program-docker-transport",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(
+        outcome.success,
+        "Docker tool-program script should run through runtime: {}",
+        outcome.error
+    );
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(
+        output.pointer("/python_bridge/transports/0/kind").and_then(Value::as_str),
+        Some("file_jsonl")
+    );
+    assert!(
+        output
+            .pointer("/python_bridge/transports/0/request_dir")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.starts_with("/workspace/.palyra/tool-rpc/")),
+        "Docker bridge should advertise a scoped request dir: {output}"
+    );
+    assert_eq!(
+        output
+            .pointer("/python_bridge/environment/PALYRA_TOOL_RPC_TRANSPORT")
+            .and_then(Value::as_str),
+        Some("file-jsonl")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_rpc_file_transport_executes_fake_remote_worker_request() {
+    let state = build_test_runtime_state(false);
+    let tempdir = gateway_tempdir("gateway-");
+    let request_dir = tempdir.path().join("rpc-requests");
+    let response_dir = tempdir.path().join("rpc-responses");
+    fs::create_dir_all(request_dir.as_path()).expect("request dir should exist");
+    fs::create_dir_all(response_dir.as_path()).expect("response dir should exist");
+    fs::write(
+        request_dir.join("remote_echo.request.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "call_id": "remote_echo",
+            "tool_name": "palyra.echo",
+            "arguments": {"text": "remote ok"}
+        }))
+        .expect("request should serialize"),
+    )
+    .expect("request file should be written");
+    start_tool_program_test_run(&state, "01ARZ3NDEKTSV4RRFFQ69G5FE1", "01ARZ3NDEKTSV4RRFFQ69G5FE2")
+        .await;
+
+    let sweep = process_tool_rpc_file_transport_once(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FE1",
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FE2",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-rpc-file-transport",
+        &BTreeSet::from(["palyra.echo".to_owned()]),
+        None,
+        &ToolRpcFileTransportConfig {
+            request_dir: request_dir.clone(),
+            response_dir: response_dir.clone(),
+            orphan_timeout: Duration::from_secs(30),
+        },
+    )
+    .await
+    .expect("file transport sweep should succeed");
+
+    assert_eq!(sweep.processed, 1);
+    assert_eq!(sweep.denied, 0);
+    assert_eq!(sweep.failed, 0);
+    assert_eq!(sweep.responses[0].correlation_id, "remote_echo");
+    let response_path = response_dir.join("remote_echo.response.json");
+    let envelope: Value = serde_json::from_slice(
+        fs::read(response_path.as_path()).expect("response file should exist").as_slice(),
+    )
+    .expect("response envelope should parse");
+    assert_eq!(envelope.get("correlation_id").and_then(Value::as_str), Some("remote_echo"));
+    assert_eq!(
+        envelope.pointer("/response/output/echo").and_then(Value::as_str),
+        Some("remote ok")
+    );
+    assert!(
+        request_dir.join("remote_echo.processed.json").exists(),
+        "processed request should be renamed for idempotency"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_rpc_file_transport_denies_grant_escalation() {
+    let state = build_test_runtime_state(false);
+    let tempdir = gateway_tempdir("gateway-");
+    let request_dir = tempdir.path().join("rpc-requests");
+    let response_dir = tempdir.path().join("rpc-responses");
+    fs::create_dir_all(request_dir.as_path()).expect("request dir should exist");
+    fs::create_dir_all(response_dir.as_path()).expect("response dir should exist");
+    fs::write(
+        request_dir.join("escalate.request.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "call_id": "escalate",
+            "tool_name": super::PROCESS_RUNNER_TOOL_NAME,
+            "arguments": {"command": "echo", "args": ["blocked"]}
+        }))
+        .expect("request should serialize"),
+    )
+    .expect("request file should be written");
+    start_tool_program_test_run(&state, "01ARZ3NDEKTSV4RRFFQ69G5FF1", "01ARZ3NDEKTSV4RRFFQ69G5FF2")
+        .await;
+
+    let sweep = process_tool_rpc_file_transport_once(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FF1",
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FF2",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-rpc-file-escalation",
+        &BTreeSet::from(["palyra.echo".to_owned()]),
+        None,
+        &ToolRpcFileTransportConfig {
+            request_dir: request_dir.clone(),
+            response_dir: response_dir.clone(),
+            orphan_timeout: Duration::from_secs(30),
+        },
+    )
+    .await
+    .expect("file transport sweep should succeed");
+
+    assert_eq!(sweep.processed, 1);
+    assert_eq!(sweep.denied, 1);
+    let envelope: Value = serde_json::from_slice(
+        fs::read(response_dir.join("escalate.response.json"))
+            .expect("response file should exist")
+            .as_slice(),
+    )
+    .expect("response envelope should parse");
+    assert_eq!(envelope.get("status").and_then(Value::as_str), Some("denied"));
+    assert!(
+        envelope
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("grant set")),
+        "grant escalation denial should be explicit: {envelope}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_rpc_file_transport_cleans_orphaned_request() {
+    let state = build_test_runtime_state(false);
+    let tempdir = gateway_tempdir("gateway-");
+    let request_dir = tempdir.path().join("rpc-requests");
+    let response_dir = tempdir.path().join("rpc-responses");
+    fs::create_dir_all(request_dir.as_path()).expect("request dir should exist");
+    fs::create_dir_all(response_dir.as_path()).expect("response dir should exist");
+    fs::write(
+        request_dir.join("orphan.request.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "call_id": "orphan",
+            "tool_name": "palyra.echo",
+            "arguments": {"text": "too late"}
+        }))
+        .expect("request should serialize"),
+    )
+    .expect("request file should be written");
+    start_tool_program_test_run(&state, "01ARZ3NDEKTSV4RRFFQ69G5FG1", "01ARZ3NDEKTSV4RRFFQ69G5FG2")
+        .await;
+
+    let sweep = process_tool_rpc_file_transport_once(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FG1",
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FG2",
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-rpc-file-orphan",
+        &BTreeSet::from(["palyra.echo".to_owned()]),
+        None,
+        &ToolRpcFileTransportConfig {
+            request_dir: request_dir.clone(),
+            response_dir: response_dir.clone(),
+            orphan_timeout: Duration::from_millis(0),
+        },
+    )
+    .await
+    .expect("file transport sweep should succeed");
+
+    assert_eq!(sweep.processed, 0);
+    assert_eq!(sweep.orphaned, 1);
+    let envelope: Value = serde_json::from_slice(
+        fs::read(response_dir.join("orphan.response.json"))
+            .expect("response file should exist")
+            .as_slice(),
+    )
+    .expect("response envelope should parse");
+    assert_eq!(envelope.get("status").and_then(Value::as_str), Some("timed_out"));
+    assert!(envelope.get("response").is_none_or(Value::is_null));
+    assert!(
+        request_dir.join("orphan.orphaned.json").exists(),
+        "orphaned request should be renamed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

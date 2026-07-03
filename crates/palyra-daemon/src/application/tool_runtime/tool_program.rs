@@ -28,6 +28,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::{
+    execution_backends::ExecutionBackendPreference,
     gateway::{
         current_unix_ms, GatewayRuntimeState, SharedToolBudget, ToolRuntimeExecutionContext,
         TOOL_PROGRAM_RUN_TOOL_NAME,
@@ -53,10 +54,10 @@ use super::process_registry::{
     ExecutionEnvironmentResourceKind,
 };
 use super::tool_rpc::{
-    build_python_tool_rpc_bridge_context, execute_granted_tool_rpc_call,
+    build_python_tool_rpc_bridge_context_with_transports, execute_granted_tool_rpc_call,
     python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers, PythonToolRpcBridgeContext,
-    ToolRpcAttestation, ToolRpcRequest, ToolRpcResponse, ToolRpcResultProjection, ToolRpcScope,
-    ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION,
+    PythonToolRpcTransportDescriptor, ToolRpcAttestation, ToolRpcRequest, ToolRpcResponse,
+    ToolRpcResultProjection, ToolRpcScope, ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION,
 };
 
 const TOOL_PROGRAM_SCHEMA_VERSION: u32 = 1;
@@ -435,8 +436,12 @@ async fn execute_validated_program(
     let mut child_attestations = Vec::new();
     let grants = granted_tool_set(&request)?;
     let program_kind = request.program_kind;
-    let python_bridge =
-        build_python_tool_rpc_bridge_context(proposal_id, request.program_id.as_str(), &grants);
+    let python_bridge = build_python_tool_rpc_bridge_context_with_transports(
+        proposal_id,
+        request.program_id.as_str(),
+        &grants,
+        tool_rpc_transports_for_context(context, proposal_id),
+    );
     let python_sdk_source = python_tool_rpc_sdk_source_for_tools(&grants);
     let python_sdk = PythonToolRpcSdkManifest {
         module_name: "palyra_tools.py".to_owned(),
@@ -781,6 +786,28 @@ async fn record_execution_environment_health_journal_projection(
             status_message = %error.message(),
             "execution environment health journal write failed"
         );
+    }
+}
+
+fn tool_rpc_transports_for_context(
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+) -> Vec<PythonToolRpcTransportDescriptor> {
+    let proposal_digest = sha256_hex(proposal_id.as_bytes());
+    let bridge_id = &proposal_digest[..16];
+    match context.execution_backend {
+        ExecutionBackendPreference::Docker => vec![PythonToolRpcTransportDescriptor::file_jsonl(
+            format!("/workspace/.palyra/tool-rpc/{bridge_id}/requests"),
+            format!("/workspace/.palyra/tool-rpc/{bridge_id}/responses"),
+            30_000,
+        )],
+        ExecutionBackendPreference::NetworkedWorker | ExecutionBackendPreference::SshTunnel => {
+            vec![PythonToolRpcTransportDescriptor::artifact_jsonl(
+                format!("tool-rpc:{bridge_id}"),
+                30_000,
+            )]
+        }
+        _ => vec![PythonToolRpcTransportDescriptor::stdio_jsonl(30_000)],
     }
 }
 

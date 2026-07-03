@@ -828,6 +828,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         .await
     } else if context.execution_backend == ExecutionBackendPreference::Docker
         && tool_name != PROCESS_RUNNER_TOOL_NAME
+        && tool_name != TOOL_PROGRAM_RUN_TOOL_NAME
     {
         docker_execution_target_unavailable_outcome(proposal_id, tool_name, input_json)
     } else if let Some(outcome) =
@@ -1535,6 +1536,9 @@ fn local_tool_runtime_runner_unavailable_outcome(
     tool_name: &str,
     input_json: &[u8],
 ) -> Option<ToolExecutionOutcome> {
+    if tool_name == TOOL_PROGRAM_RUN_TOOL_NAME {
+        return None;
+    }
     let runner_registry = ExecutionBackendRunnerRegistry::default();
     runner_registry
         .select_runner(context.execution_backend, ExecutionBackendRunnerCapability::OpenWorkspace)

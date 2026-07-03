@@ -6,7 +6,14 @@
 //! Also ships the stdio-JSONL Python SDK source and the bridge context handed
 //! to sandboxed program code.
 
-use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use palyra_common::redaction::{redact_auth_error, redact_url_segments_in_text};
 use serde::{Deserialize, Serialize};
@@ -79,6 +86,18 @@ pub(crate) enum ToolRpcStatus {
     TimedOut,
 }
 
+impl ToolRpcStatus {
+    #[allow(dead_code)]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
 /// Result envelope returned to the program for one tool RPC call; denials and
 /// failures are encoded in `status`/`error` rather than as transport errors.
 #[derive(Debug, Clone, Serialize)]
@@ -128,8 +147,124 @@ pub(crate) struct PythonToolRpcBridgeContext {
     pub job_id: String,
     pub program_id: String,
     pub ipc: String,
+    pub transports: Vec<PythonToolRpcTransportDescriptor>,
     pub allowed_tools: Vec<String>,
     pub environment: BTreeMap<String, String>,
+}
+
+/// One supported IPC transport for script-mode tool RPC.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PythonToolRpcTransportDescriptor {
+    pub kind: ToolRpcTransportKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_channel: Option<String>,
+    pub orphan_timeout_ms: u64,
+}
+
+impl PythonToolRpcTransportDescriptor {
+    pub(crate) fn stdio_jsonl(orphan_timeout_ms: u64) -> Self {
+        Self {
+            kind: ToolRpcTransportKind::Stdio,
+            request_dir: None,
+            response_dir: None,
+            artifact_channel: None,
+            orphan_timeout_ms,
+        }
+    }
+
+    pub(crate) fn file_jsonl(
+        request_dir: impl Into<String>,
+        response_dir: impl Into<String>,
+        orphan_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            kind: ToolRpcTransportKind::File,
+            request_dir: Some(request_dir.into()),
+            response_dir: Some(response_dir.into()),
+            artifact_channel: None,
+            orphan_timeout_ms,
+        }
+    }
+
+    pub(crate) fn artifact_jsonl(
+        artifact_channel: impl Into<String>,
+        orphan_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            kind: ToolRpcTransportKind::Artifact,
+            request_dir: None,
+            response_dir: None,
+            artifact_channel: Some(artifact_channel.into()),
+            orphan_timeout_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolRpcTransportKind {
+    #[serde(rename = "stdio_jsonl")]
+    Stdio,
+    #[serde(rename = "file_jsonl")]
+    File,
+    #[serde(rename = "artifact_jsonl")]
+    Artifact,
+}
+
+impl ToolRpcTransportKind {
+    const fn env_value(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio-jsonl",
+            Self::File => "file-jsonl",
+            Self::Artifact => "artifact-jsonl",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct ToolRpcFileTransportConfig {
+    pub request_dir: PathBuf,
+    pub response_dir: PathBuf,
+    pub orphan_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
+pub(crate) struct ToolRpcFileTransportSweep {
+    pub transport: ToolRpcTransportKind,
+    pub processed: usize,
+    pub denied: usize,
+    pub failed: usize,
+    pub orphaned: usize,
+    pub responses: Vec<ToolRpcFileTransportAudit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
+pub(crate) struct ToolRpcFileTransportAudit {
+    pub correlation_id: String,
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub status: String,
+    pub success: bool,
+    pub response_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+struct ToolRpcFileResponseEnvelope {
+    schema_version: u32,
+    correlation_id: String,
+    status: String,
+    success: bool,
+    error: String,
+    response: Option<ToolRpcResponse>,
 }
 
 /// Executes one grant-checked child tool call on behalf of a tool program.
@@ -348,6 +483,119 @@ pub(crate) async fn execute_granted_tool_rpc_call(
     )
 }
 
+/// Processes one batch of file-backed RPC requests for remote script runtimes.
+///
+/// Each `*.request.json` file is correlation-bound to a `*.response.json`
+/// envelope. Normal requests still execute through
+/// [`execute_granted_tool_rpc_call`], so remote file transport cannot expand
+/// the parent grant set or bypass nested approval policy.
+#[allow(dead_code)]
+pub(crate) async fn process_tool_rpc_file_transport_once(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    parent_proposal_id: &str,
+    grants: &BTreeSet<String>,
+    remaining_tool_budget: Option<SharedToolBudget>,
+    config: &ToolRpcFileTransportConfig,
+) -> Result<ToolRpcFileTransportSweep, String> {
+    let request_dir = canonicalize_rpc_dir(config.request_dir.as_path(), "request_dir")?;
+    fs::create_dir_all(config.response_dir.as_path())
+        .map_err(|error| format!("failed to create tool rpc response_dir: {error}"))?;
+    let response_dir = canonicalize_rpc_dir(config.response_dir.as_path(), "response_dir")?;
+    let mut sweep = ToolRpcFileTransportSweep {
+        transport: ToolRpcTransportKind::File,
+        processed: 0,
+        denied: 0,
+        failed: 0,
+        orphaned: 0,
+        responses: Vec::new(),
+    };
+
+    for entry in fs::read_dir(request_dir.as_path())
+        .map_err(|error| format!("failed to read tool rpc request_dir: {error}"))?
+    {
+        let entry =
+            entry.map_err(|error| format!("failed to read tool rpc request entry: {error}"))?;
+        let request_path = entry.path();
+        let Some(correlation_id) = tool_rpc_file_correlation_id(request_path.as_path()) else {
+            continue;
+        };
+        let response_path = response_dir.join(format!("{correlation_id}.response.json"));
+        if rpc_request_is_orphaned(request_path.as_path(), config.orphan_timeout) {
+            write_orphaned_file_rpc_response(
+                request_path.as_path(),
+                response_path.as_path(),
+                correlation_id,
+                &mut sweep,
+            )?;
+            continue;
+        }
+
+        let input_json = fs::read(request_path.as_path()).map_err(|error| {
+            format!("failed to read tool rpc request file {}: {error}", request_path.display())
+        })?;
+        let request = match serde_json::from_slice::<ToolRpcRequest>(input_json.as_slice()) {
+            Ok(request) => request,
+            Err(error) => {
+                write_failed_file_rpc_response(
+                    request_path.as_path(),
+                    response_path.as_path(),
+                    correlation_id,
+                    format!("tool rpc request file is not valid JSON RPC: {error}"),
+                    &mut sweep,
+                )?;
+                continue;
+            }
+        };
+        let call_id = request.call_id.clone();
+        let tool_name = request.tool_name.clone();
+        let (response, _consumed) = execute_granted_tool_rpc_call(
+            runtime_state,
+            context,
+            parent_proposal_id,
+            grants,
+            remaining_tool_budget.clone(),
+            request,
+        )
+        .await;
+        let status = response.status;
+        let success = response.success;
+        let reason = if response.error.is_empty() {
+            response.decision_reason.clone()
+        } else {
+            response.error.clone()
+        };
+        write_file_rpc_response(
+            response_path.as_path(),
+            &ToolRpcFileResponseEnvelope {
+                schema_version: TOOL_RPC_SCHEMA_VERSION,
+                correlation_id: correlation_id.clone(),
+                status: status.as_str().to_owned(),
+                success,
+                error: if success { String::new() } else { reason.clone() },
+                response: Some(response),
+            },
+        )?;
+        mark_rpc_request_processed(request_path.as_path(), correlation_id.as_str(), "processed")?;
+        sweep.processed += 1;
+        if status == ToolRpcStatus::Denied {
+            sweep.denied += 1;
+        } else if !success {
+            sweep.failed += 1;
+        }
+        sweep.responses.push(ToolRpcFileTransportAudit {
+            correlation_id,
+            call_id: Some(call_id),
+            tool_name: Some(tool_name),
+            status: status.as_str().to_owned(),
+            success,
+            response_path: response_path.display().to_string(),
+            reason,
+        });
+    }
+    Ok(sweep)
+}
+
 /// Runs `resolve` against the shared legacy budget counter, or against a
 /// local fallback counter when the caller did not thread one.
 ///
@@ -403,7 +651,10 @@ impl ToolRpcBudgetDebit {
 pub(crate) fn python_tool_rpc_sdk_source() -> &'static str {
     r#"import itertools
 import json
+import os
+from pathlib import Path
 import sys
+import time
 
 
 _CALL_COUNTER = itertools.count(1)
@@ -423,9 +674,12 @@ class ToolRpcError(RuntimeError):
 
 
 class ToolRpcClient:
-    def __init__(self, stdin=None, stdout=None):
+    def __init__(self, stdin=None, stdout=None, request_dir=None, response_dir=None):
         self._stdin = stdin or sys.stdin
         self._stdout = stdout or sys.stdout
+        self._transport = os.environ.get("PALYRA_TOOL_RPC_TRANSPORT", "stdio-jsonl")
+        self._request_dir = Path(request_dir or os.environ.get("PALYRA_TOOL_RPC_REQUEST_DIR", ""))
+        self._response_dir = Path(response_dir or os.environ.get("PALYRA_TOOL_RPC_RESPONSE_DIR", ""))
 
     def call(
         self,
@@ -448,6 +702,11 @@ class ToolRpcClient:
             request["scope"] = scope
         if result_projection is not None:
             request["result_projection"] = result_projection
+        if self._transport == "file-jsonl":
+            return self._call_file_jsonl(request, timeout_ms)
+        return self._call_stdio_jsonl(request)
+
+    def _call_stdio_jsonl(self, request):
         self._stdout.write(json.dumps(request, separators=(",", ":")) + "\n")
         self._stdout.flush()
         line = self._stdin.readline()
@@ -457,6 +716,24 @@ class ToolRpcClient:
         if not response.get("success", False):
             raise ToolRpcError(response.get("error", "tool rpc call failed"), response)
         return response.get("output")
+
+    def _call_file_jsonl(self, request, timeout_ms):
+        if not self._request_dir or not self._response_dir:
+            raise ToolRpcError("tool rpc file transport directories are not configured")
+        call_id = request["call_id"]
+        request_path = self._request_dir / (call_id + ".request.json")
+        response_path = self._response_dir / (call_id + ".response.json")
+        request_path.write_text(json.dumps(request, separators=(",", ":")), encoding="utf-8")
+        deadline = time.monotonic() + ((timeout_ms or 30000) / 1000.0)
+        while time.monotonic() <= deadline:
+            if response_path.exists():
+                envelope = json.loads(response_path.read_text(encoding="utf-8"))
+                response = envelope.get("response") or {}
+                if not envelope.get("success", False):
+                    raise ToolRpcError(envelope.get("error", "tool rpc call failed"), response)
+                return response.get("output")
+            time.sleep(0.025)
+        raise ToolRpcError("tool rpc file transport timed out")
 "#
 }
 
@@ -522,22 +799,40 @@ fn python_tool_rpc_wrapper_name(tool_name: &str) -> String {
 
 /// Builds the non-secret bridge context (IPC shape, scoped grant list, and
 /// bridge environment variables) surfaced to sandboxed Python program code.
-pub(crate) fn build_python_tool_rpc_bridge_context(
+pub(crate) fn build_python_tool_rpc_bridge_context_with_transports(
     job_id: &str,
     program_id: &str,
     grants: &BTreeSet<String>,
+    transports: Vec<PythonToolRpcTransportDescriptor>,
 ) -> PythonToolRpcBridgeContext {
-    let environment = BTreeMap::from([
+    let mut environment = BTreeMap::from([
         ("PALYRA_TOOL_RPC_SCHEMA_VERSION".to_owned(), TOOL_RPC_SCHEMA_VERSION.to_string()),
         ("PALYRA_TOOL_RPC_IPC".to_owned(), "stdio-jsonl".to_owned()),
         ("PALYRA_TOOL_RPC_JOB_ID".to_owned(), job_id.to_owned()),
         ("PALYRA_TOOL_RPC_PROGRAM_ID".to_owned(), program_id.to_owned()),
     ]);
+    if let Some(primary_transport) = transports.first() {
+        environment.insert(
+            "PALYRA_TOOL_RPC_TRANSPORT".to_owned(),
+            primary_transport.kind.env_value().to_owned(),
+        );
+        if let Some(request_dir) = &primary_transport.request_dir {
+            environment.insert("PALYRA_TOOL_RPC_REQUEST_DIR".to_owned(), request_dir.clone());
+        }
+        if let Some(response_dir) = &primary_transport.response_dir {
+            environment.insert("PALYRA_TOOL_RPC_RESPONSE_DIR".to_owned(), response_dir.clone());
+        }
+        if let Some(artifact_channel) = &primary_transport.artifact_channel {
+            environment
+                .insert("PALYRA_TOOL_RPC_ARTIFACT_CHANNEL".to_owned(), artifact_channel.clone());
+        }
+    }
     PythonToolRpcBridgeContext {
         schema_version: TOOL_RPC_SCHEMA_VERSION,
         job_id: job_id.to_owned(),
         program_id: program_id.to_owned(),
         ipc: "stdio-jsonl".to_owned(),
+        transports,
         allowed_tools: grants.iter().cloned().collect(),
         environment,
     }
@@ -547,6 +842,120 @@ fn nested_approval_denial_reason(tool_name: &str, original_reason: &str) -> Stri
     format!(
         "tool program cannot self-approve approval-required child tool; tool={tool_name}; original_reason={original_reason}"
     )
+}
+
+fn canonicalize_rpc_dir(path: &Path, field_name: &str) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("tool rpc {field_name} must exist and canonicalize: {error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("tool rpc {field_name} must be a directory"));
+    }
+    Ok(canonical)
+}
+
+fn tool_rpc_file_correlation_id(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let correlation_id = file_name.strip_suffix(".request.json")?;
+    is_safe_rpc_file_id(correlation_id).then(|| correlation_id.to_owned())
+}
+
+fn is_safe_rpc_file_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn rpc_request_is_orphaned(path: &Path, orphan_timeout: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified.elapsed().is_ok_and(|age| age >= orphan_timeout)
+}
+
+fn write_orphaned_file_rpc_response(
+    request_path: &Path,
+    response_path: &Path,
+    correlation_id: String,
+    sweep: &mut ToolRpcFileTransportSweep,
+) -> Result<(), String> {
+    let reason = "tool rpc request orphaned before execution".to_owned();
+    write_file_rpc_response(
+        response_path,
+        &ToolRpcFileResponseEnvelope {
+            schema_version: TOOL_RPC_SCHEMA_VERSION,
+            correlation_id: correlation_id.clone(),
+            status: ToolRpcStatus::TimedOut.as_str().to_owned(),
+            success: false,
+            error: reason.clone(),
+            response: None,
+        },
+    )?;
+    mark_rpc_request_processed(request_path, correlation_id.as_str(), "orphaned")?;
+    sweep.orphaned += 1;
+    sweep.responses.push(ToolRpcFileTransportAudit {
+        correlation_id,
+        call_id: None,
+        tool_name: None,
+        status: ToolRpcStatus::TimedOut.as_str().to_owned(),
+        success: false,
+        response_path: response_path.display().to_string(),
+        reason,
+    });
+    Ok(())
+}
+
+fn write_failed_file_rpc_response(
+    request_path: &Path,
+    response_path: &Path,
+    correlation_id: String,
+    reason: String,
+    sweep: &mut ToolRpcFileTransportSweep,
+) -> Result<(), String> {
+    write_file_rpc_response(
+        response_path,
+        &ToolRpcFileResponseEnvelope {
+            schema_version: TOOL_RPC_SCHEMA_VERSION,
+            correlation_id: correlation_id.clone(),
+            status: ToolRpcStatus::Failed.as_str().to_owned(),
+            success: false,
+            error: reason.clone(),
+            response: None,
+        },
+    )?;
+    mark_rpc_request_processed(request_path, correlation_id.as_str(), "processed")?;
+    sweep.failed += 1;
+    sweep.responses.push(ToolRpcFileTransportAudit {
+        correlation_id,
+        call_id: None,
+        tool_name: None,
+        status: ToolRpcStatus::Failed.as_str().to_owned(),
+        success: false,
+        response_path: response_path.display().to_string(),
+        reason,
+    });
+    Ok(())
+}
+
+fn write_file_rpc_response(
+    response_path: &Path,
+    envelope: &ToolRpcFileResponseEnvelope,
+) -> Result<(), String> {
+    let response_json = serde_json::to_vec_pretty(envelope)
+        .map_err(|error| format!("failed to serialize tool rpc file response: {error}"))?;
+    fs::write(response_path, response_json)
+        .map_err(|error| format!("failed to write tool rpc file response: {error}"))
+}
+
+fn mark_rpc_request_processed(
+    request_path: &Path,
+    correlation_id: &str,
+    suffix: &str,
+) -> Result<(), String> {
+    let processed_path = request_path.with_file_name(format!("{correlation_id}.{suffix}.json"));
+    fs::rename(request_path, processed_path)
+        .map_err(|error| format!("failed to mark tool rpc request {suffix}: {error}"))
 }
 
 fn child_tool_may_inherit_parent_approval(
@@ -658,21 +1067,54 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        build_python_tool_rpc_bridge_context, child_tool_may_inherit_parent_approval,
-        python_tool_rpc_sdk_source, python_tool_rpc_sdk_source_for_tools,
-        python_tool_rpc_sdk_wrappers, TOOL_RPC_SCHEMA_VERSION,
+        build_python_tool_rpc_bridge_context_with_transports,
+        child_tool_may_inherit_parent_approval, python_tool_rpc_sdk_source,
+        python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers,
+        PythonToolRpcTransportDescriptor, ToolRpcTransportKind, TOOL_RPC_SCHEMA_VERSION,
     };
 
     #[test]
     fn python_bridge_context_exports_only_scoped_handles() {
         let grants = BTreeSet::from(["palyra.echo".to_owned(), "palyra.http.fetch".to_owned()]);
-        let context = build_python_tool_rpc_bridge_context("job-1", "program-1", &grants);
+        let context = build_python_tool_rpc_bridge_context_with_transports(
+            "job-1",
+            "program-1",
+            &grants,
+            vec![PythonToolRpcTransportDescriptor::stdio_jsonl(30_000)],
+        );
         assert_eq!(context.schema_version, TOOL_RPC_SCHEMA_VERSION);
         assert_eq!(context.environment["PALYRA_TOOL_RPC_IPC"], "stdio-jsonl");
+        assert_eq!(context.transports[0].kind, ToolRpcTransportKind::Stdio);
         let serialized = serde_json::to_string(&context).expect("context should serialize");
         assert!(!serialized.to_ascii_lowercase().contains("secret"));
         assert!(!serialized.to_ascii_lowercase().contains("token"));
         assert!(serialized.contains("palyra.echo"));
+    }
+
+    #[test]
+    fn python_bridge_context_exports_file_transport_bootstrap() {
+        let grants = BTreeSet::from(["palyra.echo".to_owned()]);
+        let context = build_python_tool_rpc_bridge_context_with_transports(
+            "job-1",
+            "program-1",
+            &grants,
+            vec![PythonToolRpcTransportDescriptor::file_jsonl(
+                "/workspace/.palyra/rpc/requests",
+                "/workspace/.palyra/rpc/responses",
+                30_000,
+            )],
+        );
+
+        assert_eq!(context.transports[0].kind, ToolRpcTransportKind::File);
+        assert_eq!(context.environment["PALYRA_TOOL_RPC_TRANSPORT"], "file-jsonl");
+        assert_eq!(
+            context.environment["PALYRA_TOOL_RPC_REQUEST_DIR"],
+            "/workspace/.palyra/rpc/requests"
+        );
+        assert_eq!(
+            context.environment["PALYRA_TOOL_RPC_RESPONSE_DIR"],
+            "/workspace/.palyra/rpc/responses"
+        );
     }
 
     #[test]
@@ -681,6 +1123,7 @@ mod tests {
         assert!(source.contains("ToolRpcClient"));
         assert!(source.contains("json.dumps"));
         assert!(source.contains("\"call_id\""));
+        assert!(source.contains("_call_file_jsonl"));
         assert!(!source.contains("API_KEY"));
         assert!(!source.contains("TOKEN"));
     }
