@@ -56,7 +56,7 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Free Cargo build artifacts before workspace tests
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         run: cargo clean
 
       - name: Cargo test
