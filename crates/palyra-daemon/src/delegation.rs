@@ -410,6 +410,253 @@ pub struct DelegatedRunGraphSnapshot {
     pub terminal_child_count: u64,
 }
 
+/// Availability of the durable child transcript reference attached to a
+/// subagent record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentTranscriptStatus {
+    Pending,
+    Available,
+    Stale,
+}
+
+/// Health of the task-to-child-run link and its repairability.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentLinkStatus {
+    Healthy,
+    Pending,
+    Stale,
+}
+
+/// Redacted reference to a scope, memory, or artifact item shared with a
+/// subagent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentReferenceRecord {
+    pub ref_id: String,
+    pub reason: String,
+    pub sensitivity: String,
+}
+
+impl From<&DelegatedRunReference> for SubagentReferenceRecord {
+    fn from(value: &DelegatedRunReference) -> Self {
+        Self {
+            ref_id: safe_text(value.ref_id.as_str()),
+            reason: safe_text(value.reason.as_str()),
+            sensitivity: safe_text(value.sensitivity.as_str()),
+        }
+    }
+}
+
+/// Redacted scope projection for a persistent subagent record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentScopeRecord {
+    pub memory_scope: DelegationMemoryScopeKind,
+    pub tool_allowlist: Vec<String>,
+    pub skill_allowlist: Vec<String>,
+    pub context_refs: Vec<SubagentReferenceRecord>,
+    pub memory_refs: Vec<SubagentReferenceRecord>,
+    pub artifact_refs: Vec<SubagentReferenceRecord>,
+}
+
+impl From<&DelegatedRunScope> for SubagentScopeRecord {
+    fn from(value: &DelegatedRunScope) -> Self {
+        Self {
+            memory_scope: value.memory_scope,
+            tool_allowlist: value.tool_allowlist.clone(),
+            skill_allowlist: value.skill_allowlist.clone(),
+            context_refs: value.context_refs.iter().map(SubagentReferenceRecord::from).collect(),
+            memory_refs: value.memory_refs.iter().map(SubagentReferenceRecord::from).collect(),
+            artifact_refs: value.artifact_refs.iter().map(SubagentReferenceRecord::from).collect(),
+        }
+    }
+}
+
+/// Stable pointer to the child run tape that contains the subagent transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentTranscriptRef {
+    pub kind: String,
+    pub status: SubagentTranscriptStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub session_id: String,
+}
+
+/// One operator-reviewable action for repairing a stale task-to-run link.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentLinkRepairAction {
+    pub action: String,
+    pub target: String,
+    pub reason: String,
+    pub automatic_apply: bool,
+    pub policy_gate: String,
+}
+
+/// Non-mutating repair plan for the link between a subagent task and child run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubagentLinkRepairPlan {
+    pub status: SubagentLinkStatus,
+    pub reason: String,
+    pub automatic_apply: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<SubagentLinkRepairAction>,
+}
+
+/// Persistent, redacted operator view of one delegated child run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubagentSessionRecord {
+    pub schema_version: u32,
+    pub record_id: String,
+    pub task_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_run_id: Option<String>,
+    pub child_session_id: String,
+    pub role: DelegationRole,
+    pub scope: SubagentScopeRecord,
+    pub budget: DelegatedRunBudgets,
+    pub status: String,
+    pub transcript_ref: SubagentTranscriptRef,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<Value>,
+    pub verification_state: String,
+    pub stale_link_repair: SubagentLinkRepairPlan,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Parameters for [`build_subagent_session_record`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentSessionRecordBuildRequest {
+    pub task_id: String,
+    pub parent_run_id: Option<String>,
+    pub child_run_id: Option<String>,
+    pub child_session_id: String,
+    pub scope: DelegatedRunScope,
+    pub delegation: DelegationSnapshot,
+    pub status: String,
+    pub child_run_exists: bool,
+    pub task_terminal: bool,
+    pub artifacts: Vec<Value>,
+    pub evidence_refs: Vec<Value>,
+    pub verification_state: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Builds the redacted persistent subagent record exposed by session snapshot,
+/// CLI, and trajectory export surfaces.
+#[must_use]
+pub fn build_subagent_session_record(
+    request: SubagentSessionRecordBuildRequest,
+) -> SubagentSessionRecord {
+    let transcript_status = subagent_transcript_status(
+        request.child_run_id.as_deref(),
+        request.child_run_exists,
+        request.task_terminal,
+    );
+    let stale_link_repair = build_subagent_link_repair_plan(
+        request.task_id.as_str(),
+        request.child_run_id.as_deref(),
+        transcript_status,
+    );
+    let record_id = request
+        .parent_run_id
+        .as_deref()
+        .map(|parent_run_id| {
+            stable_delegated_run_id(
+                parent_run_id,
+                request.child_run_id.as_deref(),
+                Some(request.task_id.as_str()),
+            )
+        })
+        .unwrap_or_else(|| format!("subagent_{}", request.task_id));
+
+    SubagentSessionRecord {
+        schema_version: 1,
+        record_id,
+        task_id: request.task_id,
+        parent_run_id: request.parent_run_id,
+        child_run_id: request.child_run_id.clone(),
+        child_session_id: request.child_session_id.clone(),
+        role: request.delegation.role,
+        scope: SubagentScopeRecord::from(&request.scope),
+        budget: DelegatedRunBudgets::from(&request.delegation),
+        status: safe_text(request.status.as_str()),
+        transcript_ref: SubagentTranscriptRef {
+            kind: "orchestrator_run_tape".to_owned(),
+            status: transcript_status,
+            run_id: request.child_run_id,
+            session_id: request.child_session_id,
+        },
+        artifacts: request.artifacts,
+        evidence_refs: request.evidence_refs,
+        verification_state: safe_text(request.verification_state.as_str()),
+        stale_link_repair,
+        created_at_unix_ms: request.created_at_unix_ms,
+        updated_at_unix_ms: request.updated_at_unix_ms,
+    }
+}
+
+const fn subagent_transcript_status(
+    child_run_id: Option<&str>,
+    child_run_exists: bool,
+    task_terminal: bool,
+) -> SubagentTranscriptStatus {
+    match (child_run_id.is_some(), child_run_exists, task_terminal) {
+        (true, true, _) => SubagentTranscriptStatus::Available,
+        (true, false, true) => SubagentTranscriptStatus::Stale,
+        _ => SubagentTranscriptStatus::Pending,
+    }
+}
+
+fn build_subagent_link_repair_plan(
+    task_id: &str,
+    child_run_id: Option<&str>,
+    transcript_status: SubagentTranscriptStatus,
+) -> SubagentLinkRepairPlan {
+    match (child_run_id, transcript_status) {
+        (Some(_), SubagentTranscriptStatus::Available) => SubagentLinkRepairPlan {
+            status: SubagentLinkStatus::Healthy,
+            reason: "child run tape is available".to_owned(),
+            automatic_apply: false,
+            actions: Vec::new(),
+        },
+        (Some(child_run_id), SubagentTranscriptStatus::Stale) => SubagentLinkRepairPlan {
+            status: SubagentLinkStatus::Stale,
+            reason: "subagent task points at a child run tape that is no longer present".to_owned(),
+            automatic_apply: false,
+            actions: vec![
+                SubagentLinkRepairAction {
+                    action: "inspect_child_run".to_owned(),
+                    target: format!("run:{child_run_id}"),
+                    reason: "confirm whether the run tape was pruned or never committed".to_owned(),
+                    automatic_apply: false,
+                    policy_gate: "subagent.link.repair".to_owned(),
+                },
+                SubagentLinkRepairAction {
+                    action: "retry_or_clear_task_target".to_owned(),
+                    target: format!("task:{task_id}"),
+                    reason:
+                        "retry the delegated task or clear the stale target after operator review"
+                            .to_owned(),
+                    automatic_apply: false,
+                    policy_gate: "subagent.link.repair".to_owned(),
+                },
+            ],
+        },
+        _ => SubagentLinkRepairPlan {
+            status: SubagentLinkStatus::Pending,
+            reason: "child run tape has not been attached yet".to_owned(),
+            automatic_apply: false,
+            actions: Vec::new(),
+        },
+    }
+}
+
 impl DelegatedRunGraphSnapshot {
     /// Returns the graph with each child rendered through
     /// [`DelegatedRunRecord::explain_json`].
@@ -1500,11 +1747,12 @@ pub fn resolve_delegation_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_delegated_run_record, build_delegated_scope, built_in_delegation_catalog,
-        resolve_delegation_request, DelegatedReferenceInput, DelegatedRunRecordBuildRequest,
-        DelegatedRunState, DelegatedScopeBuildRequest, DelegationExecutionMode,
-        DelegationManifestInput, DelegationMemoryScopeKind, DelegationMergeStatus,
-        DelegationParentContext, DelegationRequestInput, DelegationRole,
+        build_delegated_run_record, build_delegated_scope, build_subagent_session_record,
+        built_in_delegation_catalog, resolve_delegation_request, DelegatedReferenceInput,
+        DelegatedRunRecordBuildRequest, DelegatedRunState, DelegatedScopeBuildRequest,
+        DelegationExecutionMode, DelegationManifestInput, DelegationMemoryScopeKind,
+        DelegationMergeStatus, DelegationParentContext, DelegationRequestInput, DelegationRole,
+        SubagentLinkStatus, SubagentSessionRecordBuildRequest, SubagentTranscriptStatus,
     };
 
     fn parent_context() -> DelegationParentContext {
@@ -1876,5 +2124,64 @@ mod tests {
             "dr_01ARZ3NDEKTSV4RRFFQ69G5FAV_01ARZ3NDEKTSV4RRFFQ69G5FAW"
         );
         assert_eq!(record.explain_json()["state"], "running");
+    }
+
+    #[test]
+    fn subagent_session_record_serializes_transcript_ref_and_stale_repair_plan() {
+        let delegation = resolve_delegation_request(
+            &DelegationRequestInput {
+                manifest: Some(DelegationManifestInput {
+                    budget_tokens: Some(1_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &parent_context(),
+        )
+        .expect("delegation should resolve");
+        let scope = build_delegated_scope(DelegatedScopeBuildRequest {
+            objective: "Summarize child output with token=secret".to_owned(),
+            delegation: delegation.clone(),
+            parent_tool_allowlist: vec!["palyra.http.fetch".to_owned()],
+            parent_skill_allowlist: vec!["repo.read".to_owned()],
+            context_refs: Vec::new(),
+            memory_refs: Vec::new(),
+            artifact_refs: vec![DelegatedReferenceInput {
+                ref_id: "artifact-1".to_owned(),
+                reason: "merge evidence".to_owned(),
+                sensitivity: "internal".to_owned(),
+            }],
+        })
+        .expect("scope should build");
+
+        let record = build_subagent_session_record(SubagentSessionRecordBuildRequest {
+            task_id: "task-1".to_owned(),
+            parent_run_id: Some("parent-run".to_owned()),
+            child_run_id: Some("child-run".to_owned()),
+            child_session_id: "session-1".to_owned(),
+            scope,
+            delegation,
+            status: "succeeded".to_owned(),
+            child_run_exists: false,
+            task_terminal: true,
+            artifacts: vec![serde_json::json!({
+                "artifact_id": "artifact-1",
+                "artifact_kind": "patch",
+            })],
+            evidence_refs: Vec::new(),
+            verification_state: "verified".to_owned(),
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+        });
+
+        assert_eq!(record.record_id, "dr_parent-run_child-run");
+        assert_eq!(record.transcript_ref.status, SubagentTranscriptStatus::Stale);
+        assert_eq!(record.stale_link_repair.status, SubagentLinkStatus::Stale);
+        assert_eq!(record.stale_link_repair.actions.len(), 2);
+
+        let encoded = serde_json::to_string(&record).expect("subagent record should serialize");
+        assert!(encoded.contains("\"transcript_ref\""), "{encoded}");
+        assert!(encoded.contains("\"retry_or_clear_task_target\""), "{encoded}");
+        assert!(!encoded.contains("token=secret"), "{encoded}");
     }
 }

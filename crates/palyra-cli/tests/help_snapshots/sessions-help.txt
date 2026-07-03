@@ -22,6 +22,7 @@ Commands:
   branch                 Branch a session into a new label
   transcript-search      Search within a session transcript
   export                 Export a session transcript
+  subagents              List subagent records for a session
   compact-preview        Preview session compaction candidates
   compact-apply          Apply session compaction decisions
   compaction-show        Show a compaction artifact

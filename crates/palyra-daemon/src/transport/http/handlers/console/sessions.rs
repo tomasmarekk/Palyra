@@ -327,6 +327,10 @@ struct SessionSnapshotSubagents {
     child_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     child_session_ids: Vec<String>,
+    subagent_count: usize,
+    stale_link_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    records: Vec<crate::delegation::SubagentSessionRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -773,6 +777,7 @@ pub(crate) async fn console_session_snapshot_handler(
             .await?;
     let snapshot = build_session_public_snapshot(
         &state,
+        &console_session.context,
         &base_sessions,
         &catalog_context,
         &detail_context,
@@ -1461,6 +1466,7 @@ fn default_public_session_queue_control(
 
 async fn build_session_public_snapshot(
     state: &AppState,
+    context: &gateway::RequestContext,
     base_sessions: &[journal::OrchestratorSessionRecord],
     catalog_context: &SessionCatalogContext,
     detail_context: &SessionDetailContext,
@@ -1526,7 +1532,7 @@ async fn build_session_public_snapshot(
         can_repair_binding: record.quick_controls.reset_to_default_available
             || record.quick_controls.agent.value.is_none(),
     });
-    let subagents = build_session_snapshot_subagents(record, base_sessions);
+    let subagents = build_session_snapshot_subagents(state, context, record, base_sessions).await?;
     let last_error = active_run_snapshot
         .as_ref()
         .and_then(|run| run.last_error.as_deref())
@@ -1801,10 +1807,12 @@ fn derive_session_safe_operations(
     }
 }
 
-fn build_session_snapshot_subagents(
+async fn build_session_snapshot_subagents(
+    state: &AppState,
+    context: &gateway::RequestContext,
     record: &SessionCatalogRecord,
     base_sessions: &[journal::OrchestratorSessionRecord],
-) -> SessionSnapshotSubagents {
+) -> Result<SessionSnapshotSubagents, Response> {
     let mut child_session_ids = base_sessions
         .iter()
         .filter(|candidate| {
@@ -1813,11 +1821,210 @@ fn build_session_snapshot_subagents(
         .map(|candidate| candidate.session_id.clone())
         .collect::<Vec<_>>();
     child_session_ids.sort();
-    SessionSnapshotSubagents {
+    let records = load_session_subagent_records(state, context, record.session_id.as_str()).await?;
+    let stale_link_count = records
+        .iter()
+        .filter(|subagent| {
+            subagent.stale_link_repair.status == crate::delegation::SubagentLinkStatus::Stale
+        })
+        .count();
+    Ok(SessionSnapshotSubagents {
         parent_session_id: record.parent_session_id.clone(),
         child_count: child_session_ids.len(),
         child_session_ids,
+        subagent_count: records.len(),
+        stale_link_count,
+        records,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn load_session_subagent_records(
+    state: &AppState,
+    context: &gateway::RequestContext,
+    session_id: &str,
+) -> Result<Vec<crate::delegation::SubagentSessionRecord>, Response> {
+    let tasks = state
+        .runtime
+        .list_orchestrator_background_tasks(journal::OrchestratorBackgroundTaskListFilter {
+            owner_principal: Some(context.principal.clone()),
+            device_id: Some(context.device_id.clone()),
+            channel: context.channel.clone(),
+            session_id: Some(session_id.to_owned()),
+            include_completed: true,
+            limit: 64,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let mut records = Vec::new();
+    for task in tasks.into_iter().filter(|task| task.delegation.is_some()) {
+        let run = if let Some(run_id) = task.target_run_id.as_ref() {
+            state
+                .runtime
+                .orchestrator_run_status_snapshot(run_id.clone())
+                .await
+                .map_err(runtime_status_response)?
+        } else {
+            None
+        };
+        records.push(build_subagent_session_record_from_task(&task, run.as_ref())?);
     }
+    records.sort_by(|left, right| {
+        right
+            .created_at_unix_ms
+            .cmp(&left.created_at_unix_ms)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    Ok(records)
+}
+
+#[allow(clippy::result_large_err)]
+fn build_subagent_session_record_from_task(
+    task: &journal::OrchestratorBackgroundTaskRecord,
+    run: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> Result<crate::delegation::SubagentSessionRecord, Response> {
+    let delegation = task.delegation.clone().ok_or_else(|| {
+        runtime_status_response(tonic::Status::failed_precondition(
+            "subagent record requires delegation metadata",
+        ))
+    })?;
+    let scope = build_subagent_task_scope(task, &delegation)?;
+    let child_state = run.map(|snapshot| snapshot.state.as_str()).unwrap_or(task.state.as_str());
+    let terminal = subagent_task_terminal(task, run);
+    let merge_preview = subagent_merge_preview_json(task, run);
+    Ok(crate::delegation::build_subagent_session_record(
+        crate::delegation::SubagentSessionRecordBuildRequest {
+            task_id: task.task_id.clone(),
+            parent_run_id: task.parent_run_id.clone(),
+            child_run_id: task.target_run_id.clone(),
+            child_session_id: task.session_id.clone(),
+            scope,
+            delegation,
+            status: child_state.to_owned(),
+            child_run_exists: run.is_some(),
+            task_terminal: terminal,
+            artifacts: merge_preview
+                .get("changed_artifacts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            evidence_refs: merge_preview
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            verification_state: subagent_verification_state(child_state, terminal, &merge_preview),
+            created_at_unix_ms: task.created_at_unix_ms,
+            updated_at_unix_ms: task.updated_at_unix_ms,
+        },
+    ))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_subagent_task_scope(
+    task: &journal::OrchestratorBackgroundTaskRecord,
+    delegation: &crate::delegation::DelegationSnapshot,
+) -> Result<crate::delegation::DelegatedRunScope, Response> {
+    let mut context_refs = Vec::new();
+    if let Some(parent_run_id) = task.parent_run_id.as_deref() {
+        context_refs.push(crate::delegation::DelegatedReferenceInput {
+            ref_id: parent_run_id.to_owned(),
+            reason: "parent run summary and progress refs".to_owned(),
+            sensitivity: "internal".to_owned(),
+        });
+    }
+    let memory_refs =
+        if delegation.memory_scope == crate::delegation::DelegationMemoryScopeKind::None {
+            Vec::new()
+        } else {
+            vec![crate::delegation::DelegatedReferenceInput {
+                ref_id: task.session_id.clone(),
+                reason: "delegated memory recall scope".to_owned(),
+                sensitivity: "internal".to_owned(),
+            }]
+        };
+    crate::delegation::build_delegated_scope(crate::delegation::DelegatedScopeBuildRequest {
+        objective: subagent_task_objective(task),
+        delegation: delegation.clone(),
+        parent_tool_allowlist: delegation.tool_allowlist.clone(),
+        parent_skill_allowlist: delegation.skill_allowlist.clone(),
+        context_refs,
+        memory_refs,
+        artifact_refs: Vec::new(),
+    })
+    .map_err(runtime_status_response)
+}
+
+fn subagent_task_objective(task: &journal::OrchestratorBackgroundTaskRecord) -> String {
+    task.input_text
+        .as_deref()
+        .and_then(|value| normalize_catalog_text(value, 512))
+        .unwrap_or_else(|| format!("Delegated task {} ({})", task.task_id, task.task_kind))
+}
+
+fn subagent_task_terminal(
+    task: &journal::OrchestratorBackgroundTaskRecord,
+    run: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> bool {
+    palyra_common::runtime_contracts::AuxiliaryTaskState::from_str(task.state.as_str())
+        .is_some_and(palyra_common::runtime_contracts::AuxiliaryTaskState::is_terminal)
+        || run.is_some_and(|snapshot| subagent_run_state_terminal(snapshot.state.as_str()))
+}
+
+fn subagent_run_state_terminal(state: &str) -> bool {
+    matches!(state, "done" | "failed" | "cancelled" | "canceled" | "timed_out" | "rejected")
+}
+
+fn subagent_merge_preview_json(
+    task: &journal::OrchestratorBackgroundTaskRecord,
+    run: Option<&journal::OrchestratorRunStatusSnapshot>,
+) -> Value {
+    let result_json = task.result_json.as_deref().and_then(parse_json_object);
+    let merge_result = run
+        .and_then(|snapshot| snapshot.merge_result.as_ref())
+        .and_then(|merge| serde_json::to_value(merge).ok())
+        .or_else(|| result_json.as_ref().and_then(|value| value.get("merge_result").cloned()));
+    let Some(merge_result) = merge_result else {
+        return json!({
+            "ready": false,
+            "reason": "merge preview is not available until the child run reaches a merge checkpoint",
+        });
+    };
+    json!({
+        "ready": true,
+        "summary": merge_result
+            .get("summary_text")
+            .and_then(Value::as_str)
+            .and_then(|value| normalize_catalog_text(value, SESSION_CATALOG_PREVIEW_LEN))
+            .unwrap_or_else(|| "no summary".to_owned()),
+        "evidence_refs": merge_result.get("provenance").cloned().unwrap_or_else(|| json!([])),
+        "changed_artifacts": merge_result
+            .get("artifact_references")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "approval_required": merge_result
+            .get("approval_required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "warnings": merge_result.get("warnings").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+fn subagent_verification_state(child_state: &str, terminal: bool, merge_preview: &Value) -> String {
+    if merge_preview.get("ready").and_then(Value::as_bool).unwrap_or(false)
+        && terminal
+        && !matches!(child_state, "failed" | "cancelled" | "canceled" | "timed_out" | "rejected")
+    {
+        "verified".to_owned()
+    } else if terminal {
+        "terminal_without_verified_merge".to_owned()
+    } else {
+        "pending".to_owned()
+    }
+}
+
+fn parse_json_object(value: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(value).ok().filter(Value::is_object)
 }
 
 fn run_state_is_active(state: &str) -> bool {
@@ -2806,6 +3013,73 @@ mod tests {
         assert!(queued.can_compact);
         assert!(queued.can_repair_binding);
         assert!(queued.blocking_reasons.iter().any(|reason| reason == "queued_inputs_pending"));
+    }
+
+    #[test]
+    fn subagent_record_marks_terminal_missing_child_run_as_stale() {
+        let task = journal::OrchestratorBackgroundTaskRecord {
+            task_id: "task-1".to_owned(),
+            task_kind: palyra_common::runtime_contracts::AuxiliaryTaskKind::DelegationPrompt
+                .as_str()
+                .to_owned(),
+            session_id: "session-1".to_owned(),
+            parent_run_id: Some("parent-run".to_owned()),
+            target_run_id: Some("child-run".to_owned()),
+            queued_input_id: None,
+            owner_principal: "user:test".to_owned(),
+            device_id: "device-test".to_owned(),
+            channel: Some("cli".to_owned()),
+            state: palyra_common::runtime_contracts::AuxiliaryTaskState::Succeeded
+                .as_str()
+                .to_owned(),
+            priority: 0,
+            attempt_count: 1,
+            max_attempts: 3,
+            budget_tokens: 1_000,
+            delegation: Some(crate::delegation::DelegationSnapshot {
+                profile_id: "research".to_owned(),
+                display_name: "Research".to_owned(),
+                description: None,
+                template_id: None,
+                role: crate::delegation::DelegationRole::Research,
+                execution_mode: crate::delegation::DelegationExecutionMode::Parallel,
+                group_id: "default".to_owned(),
+                model_profile: "deterministic".to_owned(),
+                tool_allowlist: vec!["palyra.http.fetch".to_owned()],
+                skill_allowlist: Vec::new(),
+                memory_scope: crate::delegation::DelegationMemoryScopeKind::ParentSession,
+                budget_tokens: 1_000,
+                max_attempts: 3,
+                merge_contract: crate::delegation::DelegationMergeContract {
+                    strategy: crate::delegation::DelegationMergeStrategy::Summarize,
+                    approval_required: false,
+                },
+                runtime_limits: crate::delegation::DelegationRuntimeLimits::default(),
+                agent_id: Some("agent-default".to_owned()),
+            }),
+            not_before_unix_ms: None,
+            expires_at_unix_ms: None,
+            notification_target_json: None,
+            input_text: Some("Fetch docs and summarize".to_owned()),
+            payload_json: None,
+            last_error: None,
+            result_json: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 2,
+            started_at_unix_ms: Some(1),
+            completed_at_unix_ms: Some(2),
+        };
+
+        let record = build_subagent_session_record_from_task(&task, None)
+            .expect("subagent projection should build");
+
+        assert_eq!(record.child_session_id, "session-1");
+        assert_eq!(
+            record.transcript_ref.status,
+            crate::delegation::SubagentTranscriptStatus::Stale
+        );
+        assert_eq!(record.stale_link_repair.status, crate::delegation::SubagentLinkStatus::Stale);
+        assert!(!record.stale_link_repair.actions.is_empty());
     }
 
     #[test]

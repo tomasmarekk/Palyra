@@ -9005,9 +9005,10 @@
         "status": "preview",
         "evidence": [
           "runtime_controls.auxiliary_executor",
-          "cli families: agent, agents, sessions"
+          "cli: sessions subagents",
+          "session snapshot subagent_records"
         ],
-        "reason": "delegated work surfaces exist behind preview controls before durable subagent records land"
+        "reason": "delegated work and durable subagent record projections exist behind preview controls"
       },
       {
         "area": "execution_backends",

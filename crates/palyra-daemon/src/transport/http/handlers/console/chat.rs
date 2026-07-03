@@ -4092,6 +4092,12 @@ pub(crate) async fn console_chat_transcript_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let subagent_records = super::sessions::load_session_subagent_records(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+    )
+    .await?;
     let runs = state
         .runtime
         .list_orchestrator_session_runs(session_record.session_id.clone())
@@ -4129,6 +4135,7 @@ pub(crate) async fn console_chat_transcript_handler(
         "queued_inputs": queued_inputs,
         "runs": runs,
         "background_tasks": background_tasks,
+        "subagent_records": subagent_records,
         "contract": contract_descriptor(),
     })))
 }
@@ -4427,6 +4434,12 @@ pub(crate) async fn console_chat_export_handler(
         })
         .await
         .map_err(runtime_status_response)?;
+    let subagent_records = super::sessions::load_session_subagent_records(
+        &state,
+        &session.context,
+        session_record.session_id.as_str(),
+    )
+    .await?;
     Ok(Json(json!({
         "format": "json",
         "content": {
@@ -4436,6 +4449,7 @@ pub(crate) async fn console_chat_export_handler(
             "compactions": compactions,
             "checkpoints": checkpoints,
             "background_tasks": background_tasks,
+            "subagent_records": subagent_records,
         },
         "contract": contract_descriptor(),
     })))

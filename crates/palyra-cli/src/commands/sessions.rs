@@ -54,6 +54,7 @@ pub(crate) async fn run_sessions_async(
         | SessionsCommand::Branch { json, .. }
         | SessionsCommand::TranscriptSearch { json, .. }
         | SessionsCommand::Export { json, .. }
+        | SessionsCommand::Subagents { json, .. }
         | SessionsCommand::CompactPreview { json, .. }
         | SessionsCommand::CompactApply { json, .. }
         | SessionsCommand::CompactionShow { json, .. }
@@ -636,6 +637,17 @@ pub(crate) async fn run_sessions_async(
                     payload.pointer("/content").context("json export content is missing")?;
                 println!("{}", serde_json::to_string_pretty(content)?);
             }
+        }
+        SessionsCommand::Subagents { session_id, json: _ } => {
+            let context = connect_sessions_admin_console(&connection).await?;
+            let payload = context
+                .client
+                .get_json_value(format!(
+                    "console/v1/sessions/{}/snapshot",
+                    percent_encode_component(session_id.as_str())
+                ))
+                .await?;
+            print_session_subagents_payload(&payload, json)?;
         }
         SessionsCommand::CompactPreview {
             session_id,
@@ -1433,6 +1445,49 @@ fn print_session_status_payload(payload: &Value, json_output: bool) -> Result<()
         safe_operations.pointer("/can_compact").and_then(Value::as_bool).unwrap_or(false),
         usage.pointer("/total").and_then(Value::as_u64).map(|value| value.to_string()).unwrap_or_else(|| "none".to_owned())
     );
+    Ok(())
+}
+
+fn print_session_subagents_payload(payload: &Value, json_output: bool) -> Result<()> {
+    let subagents = payload
+        .pointer("/snapshot/subagents")
+        .or_else(|| payload.pointer("/subagents"))
+        .context("session snapshot is missing subagents")?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "subagents": subagents,
+                "contract": payload.pointer("/contract").cloned().unwrap_or(Value::Null),
+            }))?
+        );
+        return Ok(());
+    }
+    let records =
+        subagents.pointer("/records").and_then(Value::as_array).cloned().unwrap_or_default();
+    println!(
+        "sessions.subagents count={} stale_links={} child_sessions={}",
+        subagents
+            .pointer("/subagent_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(records.len() as u64),
+        subagents.pointer("/stale_link_count").and_then(Value::as_u64).unwrap_or_default(),
+        subagents.pointer("/child_count").and_then(Value::as_u64).unwrap_or_default()
+    );
+    for record in records {
+        println!(
+            "subagent task_id={} child_run_id={} status={} transcript={} link={} role={} budget_tokens={}",
+            redacted_optional_identifier_for_output(record.pointer("/task_id").and_then(Value::as_str)),
+            redacted_optional_identifier_for_output(record.pointer("/child_run_id").and_then(Value::as_str)),
+            json_optional_string_in(&record, "/status").unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_in(&record, "/transcript_ref/status")
+                .unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_in(&record, "/stale_link_repair/status")
+                .unwrap_or_else(|| "unknown".to_owned()),
+            json_optional_string_in(&record, "/role").unwrap_or_else(|| "unknown".to_owned()),
+            record.pointer("/budget/budget_tokens").and_then(Value::as_u64).unwrap_or_default()
+        );
+    }
     Ok(())
 }
 

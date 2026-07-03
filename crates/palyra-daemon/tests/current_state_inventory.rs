@@ -439,8 +439,8 @@ fn roadmap_area_map() -> Vec<Value> {
         json!({
             "area": "subagents",
             "status": "preview",
-            "evidence": ["runtime_controls.auxiliary_executor", "cli families: agent, agents, sessions"],
-            "reason": "delegated work surfaces exist behind preview controls before durable subagent records land"
+            "evidence": ["runtime_controls.auxiliary_executor", "cli: sessions subagents", "session snapshot subagent_records"],
+            "reason": "delegated work and durable subagent record projections exist behind preview controls"
         }),
         json!({
             "area": "execution_backends",

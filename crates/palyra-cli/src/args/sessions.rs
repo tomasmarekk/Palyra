@@ -190,6 +190,12 @@ pub enum SessionsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "List subagent records for a session")]
+    Subagents {
+        session_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     #[command(about = "Preview session compaction candidates")]
     CompactPreview {
         #[arg(value_name = "SESSION_ID", required_unless_present = "session_key")]

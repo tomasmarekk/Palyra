@@ -1797,6 +1797,18 @@ fn parse_sessions_retry_branch_search_and_export() {
             }
         }
     );
+
+    let subagents =
+        Cli::parse_from(["palyra", "sessions", "subagents", "01ARZ3NDEKTSV4RRFFQ69G5FB6"]);
+    assert_eq!(
+        subagents.command,
+        Command::Sessions {
+            command: SessionsCommand::Subagents {
+                session_id: "01ARZ3NDEKTSV4RRFFQ69G5FB6".to_owned(),
+                json: false,
+            }
+        }
+    );
 }
 
 #[test]

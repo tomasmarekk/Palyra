@@ -52,7 +52,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 | --- | --- | --- | --- |
 | `api` | `production` | `/console/v1/control-plane/capabilities`, `/v1/models`, `/v1/chat/completions`, `/v1/responses` | console and compat routes are registered in the live daemon harness |
 | `mcp` | `scaffold` | `cli family: mcp`, `roadmap phase 5` | MCP serve is discoverable, while external MCP import/supervision remains roadmap work |
-| `subagents` | `preview` | `runtime_controls.auxiliary_executor`, `cli families: agent, agents, sessions` | delegated work surfaces exist behind preview controls before durable subagent records land |
+| `subagents` | `preview` | `runtime_controls.auxiliary_executor`, `cli: sessions subagents`, `session snapshot subagent_records` | delegated work and durable subagent record projections exist behind preview controls |
 | `execution_backends` | `preview` | `execution_backends`, `runtime_controls.networked_workers` | local sandbox is available, while remote backends and workers remain gated or disabled |
 | `qa_lab` | `scaffold` | `runtime_roadmap.phase0_harness`, `fixtures/golden/release_eval_inventory.json` | regression fixtures exist before the dedicated QA Lab manifest and runner |
 | `hooks` | `preview` | `capability: hooks`, `cli family: hooks` | basic hook operability is exposed before the full agent hook taxonomy |
