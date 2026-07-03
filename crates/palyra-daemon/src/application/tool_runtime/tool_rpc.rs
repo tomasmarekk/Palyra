@@ -401,8 +401,19 @@ impl ToolRpcBudgetDebit {
 /// Returns the embedded Python SDK source for the stdio-JSONL tool RPC
 /// bridge, shipped verbatim into sandboxed program workspaces.
 pub(crate) fn python_tool_rpc_sdk_source() -> &'static str {
-    r#"import json
+    r#"import itertools
+import json
 import sys
+
+
+_CALL_COUNTER = itertools.count(1)
+
+
+def _next_call_id(tool_name):
+    safe_name = "".join(ch if ch.isalnum() else "_" for ch in tool_name).strip("_")
+    if not safe_name:
+        safe_name = "tool"
+    return "{}_{}".format(safe_name, next(_CALL_COUNTER))
 
 
 class ToolRpcError(RuntimeError):
@@ -416,14 +427,27 @@ class ToolRpcClient:
         self._stdin = stdin or sys.stdin
         self._stdout = stdout or sys.stdout
 
-    def call(self, tool_name, arguments=None, timeout_ms=None):
+    def call(
+        self,
+        tool_name,
+        arguments=None,
+        timeout_ms=None,
+        call_id=None,
+        scope=None,
+        result_projection=None,
+    ):
         request = {
             "schema_version": 1,
+            "call_id": call_id or _next_call_id(tool_name),
             "tool_name": tool_name,
             "arguments": arguments or {},
         }
         if timeout_ms is not None:
             request["timeout_ms"] = int(timeout_ms)
+        if scope is not None:
+            request["scope"] = scope
+        if result_projection is not None:
+            request["result_projection"] = result_projection
         self._stdout.write(json.dumps(request, separators=(",", ":")) + "\n")
         self._stdout.flush()
         line = self._stdin.readline()
@@ -434,6 +458,66 @@ class ToolRpcClient:
             raise ToolRpcError(response.get("error", "tool rpc call failed"), response)
         return response.get("output")
 "#
+}
+
+/// Builds the generated `palyra_tools.py` module for a concrete grant set.
+pub(crate) fn python_tool_rpc_sdk_source_for_tools(grants: &BTreeSet<String>) -> String {
+    let mut source = python_tool_rpc_sdk_source().to_owned();
+    source.push_str("\n\nDEFAULT_CLIENT = ToolRpcClient()\n\n");
+    for (tool_name, wrapper_name) in python_tool_rpc_sdk_wrappers(grants) {
+        source.push_str(&format!(
+            r#"
+def {wrapper_name}(arguments=None, timeout_ms=None, call_id=None, scope=None, result_projection=None):
+    return DEFAULT_CLIENT.call(
+        "{tool_name}",
+        arguments,
+        timeout_ms=timeout_ms,
+        call_id=call_id,
+        scope=scope,
+        result_projection=result_projection,
+    )
+"#,
+        ));
+    }
+    source
+}
+
+/// Returns the tool-name to Python-wrapper map used by `palyra_tools.py`.
+pub(crate) fn python_tool_rpc_sdk_wrappers(grants: &BTreeSet<String>) -> BTreeMap<String, String> {
+    let mut wrappers = BTreeMap::new();
+    let mut used_names = BTreeSet::new();
+    for tool_name in grants {
+        let base_name = python_tool_rpc_wrapper_name(tool_name);
+        let mut wrapper_name = base_name.clone();
+        let mut suffix = 2_u32;
+        while !used_names.insert(wrapper_name.clone()) {
+            wrapper_name = format!("{base_name}_{suffix}");
+            suffix = suffix.saturating_add(1);
+        }
+        wrappers.insert(tool_name.clone(), wrapper_name);
+    }
+    wrappers
+}
+
+fn python_tool_rpc_wrapper_name(tool_name: &str) -> String {
+    let mut normalized = String::from("call_");
+    let mut previous_separator = false;
+    for character in tool_name.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+            previous_separator = false;
+        } else if !previous_separator {
+            normalized.push('_');
+            previous_separator = true;
+        }
+    }
+    while normalized.ends_with('_') {
+        normalized.pop();
+    }
+    if normalized == "call" {
+        return "call_tool".to_owned();
+    }
+    normalized
 }
 
 /// Builds the non-secret bridge context (IPC shape, scoped grant list, and
@@ -575,7 +659,8 @@ mod tests {
 
     use super::{
         build_python_tool_rpc_bridge_context, child_tool_may_inherit_parent_approval,
-        python_tool_rpc_sdk_source, TOOL_RPC_SCHEMA_VERSION,
+        python_tool_rpc_sdk_source, python_tool_rpc_sdk_source_for_tools,
+        python_tool_rpc_sdk_wrappers, TOOL_RPC_SCHEMA_VERSION,
     };
 
     #[test]
@@ -595,8 +680,29 @@ mod tests {
         let source = python_tool_rpc_sdk_source();
         assert!(source.contains("ToolRpcClient"));
         assert!(source.contains("json.dumps"));
+        assert!(source.contains("\"call_id\""));
         assert!(!source.contains("API_KEY"));
         assert!(!source.contains("TOKEN"));
+    }
+
+    #[test]
+    fn python_sdk_generates_strong_wrappers_for_granted_tools() {
+        let grants = BTreeSet::from([
+            "palyra.echo".to_owned(),
+            "palyra.fs.read_file".to_owned(),
+            "palyra.fs.search".to_owned(),
+        ]);
+        let wrappers = python_tool_rpc_sdk_wrappers(&grants);
+
+        assert_eq!(wrappers["palyra.echo"], "call_palyra_echo");
+        assert_eq!(wrappers["palyra.fs.read_file"], "call_palyra_fs_read_file");
+        assert_eq!(wrappers["palyra.fs.search"], "call_palyra_fs_search");
+
+        let source = python_tool_rpc_sdk_source_for_tools(&grants);
+        assert!(source.contains("def call_palyra_echo("));
+        assert!(source.contains("def call_palyra_fs_read_file("));
+        assert!(source.contains("\"palyra.fs.search\""));
+        assert!(!source.contains("palyra.process.run"));
     }
 
     #[test]

@@ -45,7 +45,8 @@ use crate::journal::{
     OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
     OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
     OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
-    SessionProjectContextStateUpsertRequest, WorkspaceDocumentWriteRequest,
+    SessionProjectContextStateUpsertRequest, ToolJobTailReadRequest, ToolJobsListFilter,
+    WorkspaceDocumentWriteRequest,
 };
 use crate::objectives::{
     ObjectiveAutomationBinding, ObjectiveBudget, ObjectiveKind, ObjectivePriority, ObjectiveRecord,
@@ -6119,6 +6120,311 @@ async fn tool_program_runtime_executes_echo_and_emits_child_attestation() {
             .is_some_and(|digest| !digest.is_empty()),
         "child attestation must include execution digest"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_python_rpc_script_reads_and_searches_workspace() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![
+        super::WORKSPACE_READ_FILE_TOOL_NAME.to_owned(),
+        super::WORKSPACE_SEARCH_TOOL_NAME.to_owned(),
+    ];
+    let state = build_test_runtime_state_with_tool_call_config(false, tool_call);
+    let tempdir = gateway_tempdir("gateway-");
+    let workspace = tempdir.path().join("script-workspace");
+    fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+    fs::write(
+        workspace.join("notes.md"),
+        "Palyra script mode marker: search-needle\nSecond line\n",
+    )
+    .expect("fixture file should be written");
+    let workspace =
+        fs::canonicalize(workspace.as_path()).expect("workspace root should canonicalize");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: "tool-program-python-rpc-workspace".to_owned(),
+            display_name: "Tool Program Python RPC Workspace".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("agent should be created");
+
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FC1";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FC2";
+    start_tool_program_test_run(&state, session_id, run_id).await;
+    let input = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "program_id": "program-python-rpc",
+        "program_kind": "python_rpc_script",
+        "granted_tools": [
+            super::WORKSPACE_READ_FILE_TOOL_NAME,
+            super::WORKSPACE_SEARCH_TOOL_NAME
+        ],
+        "budgets": {
+            "max_steps": 2,
+            "max_child_runs": 2,
+            "max_runtime_ms": 5_000,
+            "max_step_output_bytes": 64_000,
+            "max_total_output_bytes": 128_000
+        },
+        "script": {
+            "source": concat!(
+                "from palyra_tools import call_palyra_fs_read_file, call_palyra_fs_search\n",
+                "read = call_palyra_fs_read_file({'path': 'notes.md'})\n",
+                "hits = call_palyra_fs_search({'query': 'search-needle', 'path': '.'})\n",
+            ),
+            "calls": [
+                {
+                    "call_id": "read",
+                    "tool_name": super::WORKSPACE_READ_FILE_TOOL_NAME,
+                    "arguments": {"path": "notes.md", "max_bytes": 2048}
+                },
+                {
+                    "call_id": "search",
+                    "tool_name": super::WORKSPACE_SEARCH_TOOL_NAME,
+                    "arguments": {"query": "search-needle", "path": "."},
+                    "depends_on": ["read"]
+                }
+            ]
+        }
+    }))
+    .expect("tool program input should serialize");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id,
+            run_id,
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-python-rpc",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(outcome.success, "script program should succeed: {}", outcome.error);
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("program_kind").and_then(Value::as_str), Some("python_rpc_script"));
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert!(output.pointer("/steps/0/output/text").and_then(Value::as_str).is_some());
+    assert_eq!(
+        output.pointer("/steps/1/output/matches/0/path").and_then(Value::as_str),
+        Some("notes.md")
+    );
+    assert_eq!(output.pointer("/budget_debit/child_runs_used").and_then(Value::as_u64), Some(2));
+    assert_eq!(
+        output.pointer("/child_call_transcript/0/tool_name").and_then(Value::as_str),
+        Some(super::WORKSPACE_READ_FILE_TOOL_NAME)
+    );
+    assert_eq!(
+        output.pointer("/attestation_summary/child_call_count").and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        output.pointer("/attestation_summary/attested_child_call_count").and_then(Value::as_u64),
+        Some(2)
+    );
+    let sdk_source = output
+        .pointer("/python_sdk/source")
+        .and_then(Value::as_str)
+        .expect("SDK source should be returned");
+    assert!(sdk_source.contains("def call_palyra_fs_read_file("));
+    assert!(sdk_source.contains("def call_palyra_fs_search("));
+    assert!(!sdk_source.contains("palyra.process.run"));
+
+    let jobs = state
+        .list_tool_jobs(ToolJobsListFilter {
+            run_id: Some(run_id.to_owned()),
+            include_terminal: true,
+            limit: 10,
+            ..ToolJobsListFilter::default()
+        })
+        .await
+        .expect("tool jobs should list");
+    let job = jobs
+        .iter()
+        .find(|job| job.tool_name == super::TOOL_PROGRAM_RUN_TOOL_NAME)
+        .expect("tool program job should be recorded");
+    let tail = state
+        .tail_tool_job(ToolJobTailReadRequest {
+            job_id: job.job_id.clone(),
+            owner_principal: Some("user:ops".to_owned()),
+            offset: 0,
+            limit: 10,
+            max_bytes: 4096,
+        })
+        .await
+        .expect("tool job tail should load");
+    let tail_text = tail
+        .entries
+        .iter()
+        .map(|entry| entry.chunk_redacted.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(tail_text.contains("step=read"), "journal tail should show read step: {tail_text}");
+    assert!(tail_text.contains("step=search"), "journal tail should show search step: {tail_text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_python_rpc_script_inherits_http_fetch_approval() {
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools =
+        vec![super::TOOL_PROGRAM_RUN_TOOL_NAME.to_owned(), super::HTTP_FETCH_TOOL_NAME.to_owned()];
+    let state = build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        false,
+        true,
+        crate::config::FeatureRolloutsConfig::default(),
+        tool_call,
+    );
+    let session_id = "session-tool-program-script-http";
+    let run_id = "run-tool-program-script-http";
+    start_tool_program_test_run(&state, session_id, run_id).await;
+    let (url, handle) = spawn_static_http_server_with_content_type(
+        r#"{"scenario":"script-http"}"#,
+        "application/json",
+    );
+    let input = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "program_id": "script-http-fetch",
+        "program_kind": "python_rpc_script",
+        "granted_tools": [super::HTTP_FETCH_TOOL_NAME],
+        "budgets": {
+            "max_steps": 1,
+            "max_child_runs": 1,
+            "max_runtime_ms": 5_000,
+            "max_step_output_bytes": 64_000,
+            "max_total_output_bytes": 128_000
+        },
+        "script": {
+            "source": "from palyra_tools import call_palyra_http_fetch\nfetch = call_palyra_http_fetch({'url': url})\n",
+            "calls": [
+                {
+                    "call_id": "fetch",
+                    "tool_name": super::HTTP_FETCH_TOOL_NAME,
+                    "arguments": {
+                        "url": url.as_str(),
+                        "allowed_content_types": ["application/json"]
+                    }
+                }
+            ]
+        }
+    }))
+    .expect("tool program input should serialize");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id,
+            run_id,
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-script-http",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(outcome.success, "script HTTP fetch should inherit parent approval: {}", outcome.error);
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(
+        output.pointer("/steps/0/output/body_text").and_then(Value::as_str),
+        Some(r#"{"scenario":"script-http"}"#)
+    );
+    assert_eq!(output.pointer("/budget/nested_approval_requests").and_then(Value::as_u64), Some(0));
+    assert!(
+        output
+            .pointer("/child_call_transcript/0/decision_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("parent tool program approval inherited")),
+        "transcript should preserve inherited approval reason: {output}"
+    );
+    handle.join().expect("static server should receive one request");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_program_python_rpc_script_spills_large_child_output() {
+    let state = build_test_runtime_state(false);
+    let session_id = "session-tool-program-script-spill";
+    let run_id = "run-tool-program-script-spill";
+    start_tool_program_test_run(&state, session_id, run_id).await;
+    let input = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "program_id": "script-spill",
+        "program_kind": "python_rpc_script",
+        "granted_tools": ["palyra.echo"],
+        "budgets": {
+            "max_steps": 1,
+            "max_child_runs": 1,
+            "max_runtime_ms": 5_000,
+            "max_step_output_bytes": 32,
+            "max_total_output_bytes": 64
+        },
+        "script": {
+            "source": "from palyra_tools import call_palyra_echo\ncall_palyra_echo({'text': 'large'})\n",
+            "calls": [
+                {
+                    "call_id": "echo-large",
+                    "tool_name": "palyra.echo",
+                    "arguments": {"text": "x".repeat(512)},
+                    "max_output_bytes": 32
+                }
+            ]
+        }
+    }))
+    .expect("tool program input should serialize");
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id,
+            run_id,
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        "proposal-tool-program-script-spill",
+        super::TOOL_PROGRAM_RUN_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(outcome.success, "spilled script output should keep program successful");
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("status").and_then(Value::as_str), Some("completed"));
+    assert_eq!(output.pointer("/steps/0/status").and_then(Value::as_str), Some("spilled"));
+    assert_eq!(output.pointer("/budget/spilled_artifacts").and_then(Value::as_u64), Some(1));
+    assert!(
+        output.pointer("/child_call_transcript/0/artifact_id").and_then(Value::as_str).is_some(),
+        "transcript should include spilled artifact id: {output}"
+    );
+    let artifacts = state
+        .journal_store
+        .list_tool_result_artifacts_for_run(run_id)
+        .expect("spilled artifact should be listed");
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].tool_name, "palyra.echo");
 }
 
 #[tokio::test(flavor = "multi_thread")]

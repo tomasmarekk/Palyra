@@ -54,28 +54,78 @@ use super::process_registry::{
 };
 use super::tool_rpc::{
     build_python_tool_rpc_bridge_context, execute_granted_tool_rpc_call,
-    python_tool_rpc_sdk_source, PythonToolRpcBridgeContext, ToolRpcAttestation, ToolRpcRequest,
-    ToolRpcResponse, ToolRpcScope, ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION,
+    python_tool_rpc_sdk_source_for_tools, python_tool_rpc_sdk_wrappers, PythonToolRpcBridgeContext,
+    ToolRpcAttestation, ToolRpcRequest, ToolRpcResponse, ToolRpcResultProjection, ToolRpcScope,
+    ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION,
 };
 
 const TOOL_PROGRAM_SCHEMA_VERSION: u32 = 1;
 const MAX_PROGRAM_ID_BYTES: usize = 128;
 const MAX_STEP_ID_BYTES: usize = 128;
 const MAX_TOOL_PROGRAM_STEPS: usize = 32;
+const MAX_PYTHON_RPC_SCRIPT_BYTES: usize = 64 * 1024;
 
 /// Top-level `palyra.tool_program.run` input: grants, budgets, safety
-/// switches, and the declarative step list.
+/// switches, and either a declarative step list or a Python RPC script plan.
 #[derive(Debug, Clone, Deserialize)]
 struct ToolProgramRunRequest {
     schema_version: u32,
     program_id: String,
+    #[serde(default)]
+    program_kind: ToolProgramKind,
     #[serde(default)]
     budgets: ToolProgramBudgets,
     #[serde(default)]
     safety_policy: ToolProgramSafetyPolicy,
     #[serde(default)]
     granted_tools: Vec<String>,
+    #[serde(default)]
+    script: Option<ToolProgramScriptSpec>,
+    #[serde(default)]
     steps: Vec<ToolProgramStep>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ToolProgramKind {
+    #[default]
+    Declarative,
+    PythonRpcScript,
+}
+
+/// Auditable script body plus its typed RPC calls. The daemon executes the
+/// call plan through the normal tool RPC bridge instead of interpreting Python
+/// in-process.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ToolProgramScriptSpec {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    calls: Vec<ToolProgramScriptCall>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolProgramScriptCall {
+    call_id: String,
+    tool_name: String,
+    #[serde(default)]
+    arguments: Value,
+    #[serde(default)]
+    scope: ToolRpcScope,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+    #[serde(default)]
+    result_projection: ToolRpcResultProjection,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    parallelism: ToolParallelism,
+    #[serde(default)]
+    path_scope: Vec<String>,
+    #[serde(default)]
+    retry_policy: ToolProgramStepRetryPolicy,
 }
 
 /// One declarative step: a granted tool call plus its dependency, budget,
@@ -92,6 +142,8 @@ struct ToolProgramStep {
     budget: ToolProgramStepBudget,
     #[serde(default)]
     allowed_artifact_refs: Vec<String>,
+    #[serde(default)]
+    result_projection: ToolRpcResultProjection,
     #[serde(default)]
     depends_on: Vec<String>,
     #[serde(default)]
@@ -195,11 +247,16 @@ impl Default for ToolProgramSafetyPolicy {
 struct ToolProgramRunResponse {
     schema_version: u32,
     program_id: String,
+    program_kind: ToolProgramKind,
     status: ToolProgramStatus,
     steps: Vec<ToolProgramStepResult>,
+    child_call_transcript: Vec<ToolProgramChildCallTranscript>,
     child_attestations: Vec<ChildToolAttestation>,
     budget: ToolProgramBudgetReport,
+    budget_debit: ToolProgramBudgetReport,
+    attestation_summary: ToolProgramAttestationSummary,
     python_bridge: PythonToolRpcBridgeContext,
+    python_sdk: PythonToolRpcSdkManifest,
     python_sdk_bytes: usize,
     process_diagnostics: Vec<RuntimeProcessDiagnostic>,
     background_task_diagnostics: Vec<RuntimeProcessDiagnostic>,
@@ -236,6 +293,19 @@ struct ToolProgramStepResult {
     artifact: Option<ToolResultArtifactRef>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ToolProgramChildCallTranscript {
+    call_id: String,
+    tool_name: String,
+    status: ToolProgramStepStatus,
+    success: bool,
+    decision_reason: String,
+    approval_required: bool,
+    artifact_id: Option<String>,
+    output_preview: String,
+    attestation_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ToolProgramStepStatus {
@@ -257,6 +327,23 @@ struct ChildToolAttestation {
     executor: String,
     sandbox_enforcement: String,
     timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolProgramAttestationSummary {
+    child_call_count: usize,
+    attested_child_call_count: usize,
+    executors: Vec<String>,
+    execution_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PythonToolRpcSdkManifest {
+    module_name: String,
+    bytes: usize,
+    source_sha256: String,
+    source: String,
+    wrappers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -347,9 +434,18 @@ async fn execute_validated_program(
     let mut results = Vec::new();
     let mut child_attestations = Vec::new();
     let grants = granted_tool_set(&request)?;
+    let program_kind = request.program_kind;
     let python_bridge =
         build_python_tool_rpc_bridge_context(proposal_id, request.program_id.as_str(), &grants);
-    let python_sdk_bytes = python_tool_rpc_sdk_source().len();
+    let python_sdk_source = python_tool_rpc_sdk_source_for_tools(&grants);
+    let python_sdk = PythonToolRpcSdkManifest {
+        module_name: "palyra_tools.py".to_owned(),
+        bytes: python_sdk_source.len(),
+        source_sha256: sha256_hex(python_sdk_source.as_bytes()),
+        source: python_sdk_source,
+        wrappers: python_tool_rpc_sdk_wrappers(&grants),
+    };
+    let python_sdk_bytes = python_sdk.bytes;
     let job_id = Ulid::new().to_string();
     runtime_state
         .create_tool_job(ToolJobCreateRequest {
@@ -592,15 +688,25 @@ async fn execute_validated_program(
         let process_diagnostics = process_registry.diagnostics(current_unix_ms());
         let _shutdown = process_registry.shutdown(elapsed_millis(started_at));
         let _ = background_registry.complete(background_task_id.as_str());
+        let child_call_transcript =
+            child_call_transcript_from_results(&results, &child_attestations);
+        let attestation_summary =
+            tool_program_attestation_summary(results.len(), &child_attestations);
+        let budget_debit = budget.clone();
         Ok(ToolProgramExecution {
             response: ToolProgramRunResponse {
                 schema_version: TOOL_PROGRAM_SCHEMA_VERSION,
                 program_id: request.program_id,
+                program_kind,
                 status: final_status,
                 steps: results,
+                child_call_transcript,
                 child_attestations,
                 budget,
+                budget_debit,
+                attestation_summary,
                 python_bridge,
+                python_sdk,
                 python_sdk_bytes,
                 process_diagnostics,
                 background_task_diagnostics: background_registry.diagnostics(current_unix_ms()),
@@ -812,7 +918,7 @@ async fn execute_program_step(
             allowed_artifact_refs: step.allowed_artifact_refs.clone(),
         },
         timeout_ms: step.budget.timeout_ms,
-        result_projection: Default::default(),
+        result_projection: step.result_projection.clone(),
     };
     let (rpc_response, child_runs_consumed) = execute_tool_rpc_with_retries(
         runtime_state,
@@ -1024,6 +1130,62 @@ fn child_attestation_from_rpc_response(
     })
 }
 
+fn child_call_transcript_from_results(
+    results: &[ToolProgramStepResult],
+    child_attestations: &[ChildToolAttestation],
+) -> Vec<ToolProgramChildCallTranscript> {
+    let attestation_by_step = child_attestations
+        .iter()
+        .map(|attestation| (attestation.step_id.as_str(), attestation.attestation_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    results
+        .iter()
+        .map(|result| ToolProgramChildCallTranscript {
+            call_id: result.step_id.clone(),
+            tool_name: result.tool.clone(),
+            status: result.status,
+            success: result.success,
+            decision_reason: result.decision_reason.clone(),
+            approval_required: result.approval_required,
+            artifact_id: result.artifact.as_ref().map(|artifact| artifact.artifact_id.clone()),
+            output_preview: transcript_output_preview(&result.output),
+            attestation_id: attestation_by_step
+                .get(result.step_id.as_str())
+                .map(|attestation_id| (*attestation_id).to_owned()),
+        })
+        .collect()
+}
+
+fn transcript_output_preview(output: &Value) -> String {
+    let output_json = serde_json::to_vec(output).unwrap_or_else(|_| b"{}".to_vec());
+    summarize_output(output_json.as_slice(), 1024)
+}
+
+fn tool_program_attestation_summary(
+    child_call_count: usize,
+    child_attestations: &[ChildToolAttestation],
+) -> ToolProgramAttestationSummary {
+    let executors = child_attestations
+        .iter()
+        .map(|attestation| attestation.executor.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    for attestation in child_attestations {
+        hasher.update(attestation.step_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(attestation.execution_sha256.as_bytes());
+        hasher.update([0]);
+    }
+    ToolProgramAttestationSummary {
+        child_call_count,
+        attested_child_call_count: child_attestations.len(),
+        executors,
+        execution_sha256: hex::encode(hasher.finalize()),
+    }
+}
+
 fn granted_tool_set(request: &ToolProgramRunRequest) -> Result<BTreeSet<String>, String> {
     let grants = request
         .granted_tools
@@ -1152,10 +1314,73 @@ fn apply_budget_delta(budget: &mut ToolProgramBudgetReport, delta: &ToolProgramB
 }
 
 fn parse_and_validate_request(input_json: &[u8]) -> Result<ToolProgramRunRequest, String> {
-    let request = serde_json::from_slice::<ToolProgramRunRequest>(input_json)
+    let mut request = serde_json::from_slice::<ToolProgramRunRequest>(input_json)
         .map_err(|error| format!("palyra.tool_program.run input must be valid JSON: {error}"))?;
+    materialize_python_rpc_script_steps(&mut request)?;
     validate_request(&request)?;
     Ok(request)
+}
+
+fn materialize_python_rpc_script_steps(request: &mut ToolProgramRunRequest) -> Result<(), String> {
+    match request.program_kind {
+        ToolProgramKind::Declarative => {
+            if request.script.is_some() {
+                return Err(
+                    "palyra.tool_program.run script requires program_kind=python_rpc_script"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        ToolProgramKind::PythonRpcScript => {
+            if !request.steps.is_empty() {
+                return Err(
+                    "palyra.tool_program.run python_rpc_script uses script.calls instead of steps"
+                        .to_owned(),
+                );
+            }
+            let script = request.script.as_ref().ok_or_else(|| {
+                "palyra.tool_program.run python_rpc_script requires script".to_owned()
+            })?;
+            if script.source.trim().is_empty() {
+                return Err(
+                    "palyra.tool_program.run python_rpc_script requires non-empty script.source"
+                        .to_owned(),
+                );
+            }
+            if script.source.len() > MAX_PYTHON_RPC_SCRIPT_BYTES {
+                return Err("palyra.tool_program.run python_rpc_script source exceeds 65536 bytes"
+                    .to_owned());
+            }
+            if script.calls.is_empty() {
+                return Err(
+                    "palyra.tool_program.run python_rpc_script requires at least one script call"
+                        .to_owned(),
+                );
+            }
+            request.steps = script.calls.iter().map(tool_program_step_from_script_call).collect();
+            Ok(())
+        }
+    }
+}
+
+fn tool_program_step_from_script_call(call: &ToolProgramScriptCall) -> ToolProgramStep {
+    ToolProgramStep {
+        step_id: call.call_id.clone(),
+        tool: call.tool_name.clone(),
+        input: call.arguments.clone(),
+        scopes: call.scope.scopes.clone(),
+        budget: ToolProgramStepBudget {
+            max_output_bytes: call.max_output_bytes,
+            timeout_ms: call.timeout_ms,
+        },
+        allowed_artifact_refs: call.scope.allowed_artifact_refs.clone(),
+        result_projection: call.result_projection.clone(),
+        depends_on: call.depends_on.clone(),
+        parallelism: call.parallelism,
+        path_scope: call.path_scope.clone(),
+        retry_policy: call.retry_policy.clone(),
+    }
 }
 
 fn validate_request(request: &ToolProgramRunRequest) -> Result<(), String> {
@@ -1414,8 +1639,8 @@ mod tests {
     use super::super::tool_rpc::{ToolRpcResponse, ToolRpcStatus, TOOL_RPC_SCHEMA_VERSION};
     use super::{
         build_execution_plan, parse_and_validate_request, should_retry_tool_rpc_response,
-        tool_program_job_completion, tool_program_job_completion_for_status, ToolProgramStatus,
-        ToolProgramStepRetryPolicy,
+        tool_program_job_completion, tool_program_job_completion_for_status, ToolProgramKind,
+        ToolProgramStatus, ToolProgramStepRetryPolicy,
     };
     use crate::journal::ToolJobState;
 
@@ -1434,7 +1659,70 @@ mod tests {
         .expect("program should validate");
 
         assert_eq!(request.program_id, "program-a");
+        assert_eq!(request.program_kind, ToolProgramKind::Declarative);
         assert_eq!(request.steps.len(), 1);
+    }
+
+    #[test]
+    fn validates_python_rpc_script_call_plan() {
+        let request = parse_and_validate_request(
+            br#"{
+                "schema_version": 1,
+                "program_id": "program-script",
+                "program_kind": "python_rpc_script",
+                "granted_tools": ["palyra.fs.read_file", "palyra.fs.search"],
+                "script": {
+                    "source": "from palyra_tools import call_palyra_fs_read_file, call_palyra_fs_search\n",
+                    "calls": [
+                        {
+                            "call_id": "read",
+                            "tool_name": "palyra.fs.read_file",
+                            "arguments": {"path": "README.md", "max_bytes": 1024},
+                            "result_projection": "summary_only"
+                        },
+                        {
+                            "call_id": "search",
+                            "tool_name": "palyra.fs.search",
+                            "arguments": {"query": "Palyra", "path": "."},
+                            "depends_on": ["read"]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("script program should validate");
+
+        assert_eq!(request.program_kind, ToolProgramKind::PythonRpcScript);
+        assert_eq!(request.steps.len(), 2);
+        assert_eq!(request.steps[0].step_id, "read");
+        assert_eq!(request.steps[0].tool, "palyra.fs.read_file");
+        assert_eq!(request.steps[1].depends_on, vec!["read"]);
+        let plan = build_execution_plan(&request).expect("script plan should build");
+        assert_eq!(plan, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn rejects_ambiguous_python_rpc_script_shape() {
+        let error = parse_and_validate_request(
+            br#"{
+                "schema_version": 1,
+                "program_id": "program-script",
+                "program_kind": "python_rpc_script",
+                "granted_tools": ["palyra.echo"],
+                "script": {
+                    "source": "from palyra_tools import call_palyra_echo\n",
+                    "calls": [
+                        {"call_id": "echo", "tool_name": "palyra.echo"}
+                    ]
+                },
+                "steps": [
+                    {"step_id": "echo", "tool": "palyra.echo"}
+                ]
+            }"#,
+        )
+        .expect_err("script mode must not accept a second step source");
+
+        assert!(error.contains("script.calls instead of steps"));
     }
 
     #[test]
