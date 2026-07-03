@@ -8,11 +8,19 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    env, fmt,
+    future::Future,
+    io::Read,
+    net::IpAddr,
+    process::Stdio,
+    sync::mpsc,
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use palyra_common::{redaction::redact_diagnostic_text, runtime_preview::RuntimePreviewMode};
+use palyra_egress_proxy::{EgressProxyPolicyService, EgressProxyRequest};
+use reqwest::{blocking::Response, redirect::Policy, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -35,6 +43,12 @@ const DEFAULT_SUPERVISOR_MAX_RETRIES: u32 = 3;
 const DEFAULT_SUPERVISOR_BASE_BACKOFF_MS: i64 = 1_000;
 const DEFAULT_SUPERVISOR_MAX_BACKOFF_MS: i64 = 30_000;
 const DEFAULT_SUPERVISOR_STDERR_TAIL_BYTES: usize = 4 * 1024;
+const MCP_JSONRPC_VERSION: &str = "2.0";
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_STDIO_MAX_HEADER_BYTES: usize = 8 * 1024;
+const MCP_STDIO_STDERR_TAIL_BYTES: usize = 4 * 1024;
+const MCP_STDIO_INHERITED_ENV_ALLOWLIST: &[&str] =
+    &["PATH", "Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "TMP", "TEMP"];
 
 /// Broker-wide policy that is not trusted from server-authored manifests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -708,6 +722,103 @@ pub trait McpTransport {
     ) -> Result<McpToolResponse, McpBrokerError>;
 }
 
+/// Normalized transport failure with redacted operator-facing detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpTransportError {
+    pub reason_code: String,
+    pub message: String,
+}
+
+impl McpTransportError {
+    /// Builds a transport error and strips credentials from the message.
+    #[must_use]
+    pub fn new(reason_code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            reason_code: reason_code.into(),
+            message: sanitize_mcp_transport_message(message.into().as_str()),
+        }
+    }
+}
+
+impl fmt::Display for McpTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.reason_code, self.message)
+    }
+}
+
+impl std::error::Error for McpTransportError {}
+
+impl From<McpTransportError> for McpBrokerError {
+    fn from(error: McpTransportError) -> Self {
+        Self::new(error.reason_code, error.message)
+    }
+}
+
+/// Default real MCP transport implementation for stdio, HTTP, streamable HTTP, and SSE.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct McpRuntimeTransport;
+
+impl McpTransport for McpRuntimeTransport {
+    fn start(&self, manifest: &McpServerManifest) -> Result<(), McpBrokerError> {
+        match &manifest.transport {
+            McpTransportManifest::Stdio { .. } => {
+                execute_stdio_jsonrpc(manifest, None, manifest.start_timeout_ms).map(|_| ())
+            }
+            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
+                execute_remote_jsonrpc(
+                    manifest,
+                    "initialize",
+                    mcp_initialize_params(),
+                    manifest.start_timeout_ms,
+                )
+                .map(|_| ())
+            }
+        }
+        .map_err(Into::into)
+    }
+
+    fn list_tools(
+        &self,
+        manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredTool>, McpBrokerError> {
+        let result = match &manifest.transport {
+            McpTransportManifest::Stdio { .. } => execute_stdio_jsonrpc(
+                manifest,
+                Some(("tools/list", json!({}))),
+                manifest.timeout_ms,
+            ),
+            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
+                execute_remote_jsonrpc(manifest, "tools/list", json!({}), manifest.timeout_ms)
+            }
+        }?;
+        tools_from_mcp_result(&result).map_err(Into::into)
+    }
+
+    fn call_tool(
+        &self,
+        manifest: &McpServerManifest,
+        request: &McpToolCallRequest,
+    ) -> Result<McpToolResponse, McpBrokerError> {
+        let params = json!({
+            "name": request.tool_name,
+            "arguments": request.input,
+        });
+        let result = match &manifest.transport {
+            McpTransportManifest::Stdio { .. } => {
+                execute_stdio_jsonrpc(manifest, Some(("tools/call", params)), manifest.timeout_ms)
+            }
+            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
+                execute_remote_jsonrpc(manifest, "tools/call", params, manifest.timeout_ms)
+            }
+        }?;
+        Ok(McpToolResponse {
+            output: result,
+            sampling_requested: false,
+            egress_host_requested: None,
+        })
+    }
+}
+
 /// Fail-closed broker error with safe operator-facing context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpBrokerError {
@@ -1064,6 +1175,643 @@ pub fn namespaced_tool_id(server_name: &str, tool_name: &str) -> Result<String, 
     let server = normalize_mcp_identifier(server_name, "server_name")?;
     let tool = normalize_mcp_identifier(tool_name, "tool_name")?;
     Ok(format!("mcp.{server}.{tool}"))
+}
+
+fn execute_remote_jsonrpc(
+    manifest: &McpServerManifest,
+    method: &str,
+    params: Value,
+    timeout_ms: u64,
+) -> Result<Value, McpTransportError> {
+    let (url, expects_sse) = match &manifest.transport {
+        McpTransportManifest::Http { url } => (url.as_str(), false),
+        McpTransportManifest::Sse { url } => (url.as_str(), true),
+        McpTransportManifest::Stdio { .. } => {
+            return Err(McpTransportError::new(
+                "mcp.transport_mismatch",
+                "remote transport requested for stdio manifest",
+            ));
+        }
+    };
+    let url = Url::parse(url).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_invalid_url",
+            format!("MCP remote transport URL is invalid: {error}"),
+        )
+    })?;
+    let egress_verdict = evaluate_mcp_remote_egress(manifest, &url)?;
+    let response = send_mcp_remote_jsonrpc_request(
+        &url,
+        &egress_verdict.resolved_addresses,
+        mcp_jsonrpc_request(1, method, params),
+        timeout_ms,
+    )?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if !response.status().is_success() {
+        return Err(McpTransportError::new(
+            "mcp.transport_http_status",
+            format!("MCP remote transport returned HTTP {}", response.status().as_u16()),
+        ));
+    }
+    let body = read_bounded_remote_body(response, manifest.max_response_bytes)?;
+    let payload = parse_mcp_remote_body(body.as_slice(), content_type.as_str(), expects_sse)?;
+    mcp_jsonrpc_result(payload)
+}
+
+fn evaluate_mcp_remote_egress(
+    manifest: &McpServerManifest,
+    url: &Url,
+) -> Result<palyra_egress_proxy::EgressPolicyVerdict, McpTransportError> {
+    if manifest.egress_allowlist.is_empty() {
+        return Err(McpTransportError::new(
+            "mcp.egress_allowlist_missing",
+            "MCP remote transport requires a non-empty egress allowlist",
+        ));
+    }
+    EgressProxyPolicyService
+        .evaluate_request(&EgressProxyRequest {
+            method: "POST",
+            url: url.as_str(),
+            allow_private_targets: mcp_remote_url_targets_loopback(url),
+            allowed_hosts: manifest.egress_allowlist.as_slice(),
+            allowed_dns_suffixes: &[],
+            max_response_bytes: manifest.max_response_bytes,
+            credential_bindings: &[],
+        })
+        .map_err(|error| {
+            McpTransportError::new(
+                "mcp.egress_denied",
+                format!("MCP remote transport target blocked by egress policy: {error}"),
+            )
+        })
+}
+
+fn send_mcp_remote_jsonrpc_request(
+    url: &Url,
+    resolved_addresses: &[std::net::SocketAddr],
+    payload: Value,
+    timeout_ms: u64,
+) -> Result<Response, McpTransportError> {
+    let host = url.host_str().unwrap_or_default();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let mut client_builder = reqwest::blocking::Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(timeout)
+        .timeout(timeout);
+    if !host.is_empty() && host.parse::<IpAddr>().is_err() {
+        for address in resolved_addresses {
+            client_builder = client_builder.resolve(host, *address);
+        }
+    }
+    let client = client_builder.build().map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_client_build_failed",
+            format!("MCP remote transport client build failed: {error}"),
+        )
+    })?;
+    let request_body = serde_json::to_vec(&payload).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_request_encode_failed",
+            format!("MCP JSON-RPC request serialization failed: {error}"),
+        )
+    })?;
+    client
+        .post(url.clone())
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .send()
+        .map_err(|error| {
+            McpTransportError::new(
+                "mcp.transport_http_failed",
+                format!("MCP remote transport request failed: {error}"),
+            )
+        })
+}
+
+fn read_bounded_remote_body(
+    mut response: Response,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, McpTransportError> {
+    let mut body = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = response.read(&mut buffer).map_err(|error| {
+            McpTransportError::new(
+                "mcp.transport_read_failed",
+                format!("MCP remote transport response read failed: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        if body.len().saturating_add(read) > max_response_bytes {
+            return Err(McpTransportError::new(
+                "mcp.transport_response_too_large",
+                format!("MCP remote transport response exceeded {max_response_bytes} bytes"),
+            ));
+        }
+        body.extend_from_slice(&buffer[..read]);
+    }
+    Ok(body)
+}
+
+fn parse_mcp_remote_body(
+    body: &[u8],
+    content_type: &str,
+    expects_sse: bool,
+) -> Result<Value, McpTransportError> {
+    let content_type =
+        content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    if expects_sse || content_type == "text/event-stream" {
+        let body = std::str::from_utf8(body).map_err(|error| {
+            McpTransportError::new(
+                "mcp.transport_invalid_response",
+                format!("MCP SSE response was not UTF-8: {error}"),
+            )
+        })?;
+        return parse_mcp_sse_response(body);
+    }
+    serde_json::from_slice::<Value>(body).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_invalid_response",
+            format!("MCP JSON-RPC response was not valid JSON: {error}"),
+        )
+    })
+}
+
+fn parse_mcp_sse_response(body: &str) -> Result<Value, McpTransportError> {
+    let mut event_data = String::new();
+    for line in body.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            if let Some(value) = parse_mcp_sse_event(event_data.as_str())? {
+                return Ok(value);
+            }
+            event_data.clear();
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            if !event_data.is_empty() {
+                event_data.push('\n');
+            }
+            event_data.push_str(data.trim_start());
+        }
+    }
+    if let Some(value) = parse_mcp_sse_event(event_data.as_str())? {
+        return Ok(value);
+    }
+    Err(McpTransportError::new(
+        "mcp.transport_invalid_response",
+        "MCP SSE response did not contain a JSON data event",
+    ))
+}
+
+fn parse_mcp_sse_event(data: &str) -> Result<Option<Value>, McpTransportError> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+    serde_json::from_str::<Value>(data).map(Some).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_invalid_response",
+            format!("MCP SSE data event was not valid JSON: {error}"),
+        )
+    })
+}
+
+fn execute_stdio_jsonrpc(
+    manifest: &McpServerManifest,
+    operation: Option<(&'static str, Value)>,
+    timeout_ms: u64,
+) -> Result<Value, McpTransportError> {
+    let McpTransportManifest::Stdio { command, env } = &manifest.transport else {
+        return Err(McpTransportError::new(
+            "mcp.transport_mismatch",
+            "stdio transport requested for remote manifest",
+        ));
+    };
+    let command = command.clone();
+    let env = env.clone();
+    let max_response_bytes = manifest.max_response_bytes;
+    run_transport_future(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            execute_stdio_session(command, env, operation, max_response_bytes),
+        )
+        .await
+        .map_err(|_| {
+            McpTransportError::new(
+                "mcp.transport_timeout",
+                format!("MCP stdio transport timed out after {timeout_ms} ms"),
+            )
+        })?
+    })
+}
+
+async fn execute_stdio_session(
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    operation: Option<(&'static str, Value)>,
+    max_response_bytes: usize,
+) -> Result<Value, McpTransportError> {
+    let (program, args) = command.split_first().ok_or_else(|| {
+        McpTransportError::new("mcp.stdio_command_empty", "MCP stdio command is empty")
+    })?;
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    apply_stdio_environment(&mut command, &env)?;
+    let mut child = command.spawn().map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_spawn_failed",
+            format!("MCP stdio transport failed to spawn process: {error}"),
+        )
+    })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        McpTransportError::new("mcp.transport_pipe_missing", "MCP stdio stdin pipe is missing")
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        McpTransportError::new("mcp.transport_pipe_missing", "MCP stdio stdout pipe is missing")
+    })?;
+    let stderr = child.stderr.take();
+    let stderr_task = stderr
+        .map(|stderr| tokio::spawn(read_stdio_stderr_tail(stderr, MCP_STDIO_STDERR_TAIL_BYTES)));
+
+    let result = async {
+        write_mcp_stdio_message(
+            &mut stdin,
+            &mcp_jsonrpc_request(1, "initialize", mcp_initialize_params()),
+        )
+        .await?;
+        let initialized = read_mcp_stdio_message(&mut stdout, max_response_bytes).await?;
+        let initialized = mcp_jsonrpc_result(initialized)?;
+        write_mcp_stdio_message(&mut stdin, &mcp_initialized_notification()).await?;
+        if let Some((method, params)) = operation {
+            write_mcp_stdio_message(&mut stdin, &mcp_jsonrpc_request(2, method, params)).await?;
+            let response = read_mcp_stdio_message(&mut stdout, max_response_bytes).await?;
+            mcp_jsonrpc_result(response)
+        } else {
+            Ok(initialized)
+        }
+    }
+    .await;
+
+    drop(stdin);
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    if let Some(stderr_task) = stderr_task {
+        let stderr_tail = stderr_task.await.ok().unwrap_or_default();
+        if result.is_err() && !stderr_tail.trim().is_empty() {
+            return result.map_err(|error| {
+                McpTransportError::new(
+                    error.reason_code,
+                    format!("{}; stderr: {}", error.message, stderr_tail.trim()),
+                )
+            });
+        }
+    }
+    result
+}
+
+fn apply_stdio_environment(
+    command: &mut tokio::process::Command,
+    env_values: &BTreeMap<String, String>,
+) -> Result<(), McpTransportError> {
+    command.env_clear();
+    for key in MCP_STDIO_INHERITED_ENV_ALLOWLIST {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env_values {
+        if is_vault_ref(value.as_str()) {
+            return Err(McpTransportError::new(
+                "mcp.vault_ref_unresolved",
+                format!("MCP stdio environment variable '{key}' requires vault resolution"),
+            ));
+        }
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+async fn write_mcp_stdio_message<W>(
+    writer: &mut W,
+    message: &Value,
+) -> Result<(), McpTransportError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let body = serde_json::to_vec(message).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_request_encode_failed",
+            format!("MCP stdio JSON-RPC request serialization failed: {error}"),
+        )
+    })?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    tokio::io::AsyncWriteExt::write_all(writer, header.as_bytes()).await.map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_write_failed",
+            format!("MCP stdio header write failed: {error}"),
+        )
+    })?;
+    tokio::io::AsyncWriteExt::write_all(writer, body.as_slice()).await.map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_write_failed",
+            format!("MCP stdio body write failed: {error}"),
+        )
+    })?;
+    tokio::io::AsyncWriteExt::flush(writer).await.map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_write_failed",
+            format!("MCP stdio flush failed: {error}"),
+        )
+    })
+}
+
+async fn read_mcp_stdio_message<R>(
+    reader: &mut R,
+    max_response_bytes: usize,
+) -> Result<Value, McpTransportError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut header = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(reader, &mut byte).await.map_err(|error| {
+            McpTransportError::new(
+                "mcp.transport_read_failed",
+                format!("MCP stdio header read failed: {error}"),
+            )
+        })?;
+        if read == 0 {
+            return Err(McpTransportError::new(
+                "mcp.transport_eof",
+                "MCP stdio server closed stdout before a complete response header",
+            ));
+        }
+        header.push(byte[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if header.len() > MCP_STDIO_MAX_HEADER_BYTES {
+            return Err(McpTransportError::new(
+                "mcp.transport_header_too_large",
+                format!("MCP stdio response header exceeded {MCP_STDIO_MAX_HEADER_BYTES} bytes"),
+            ));
+        }
+    }
+    let content_length = mcp_stdio_content_length(header.as_slice())?;
+    if content_length > max_response_bytes {
+        return Err(McpTransportError::new(
+            "mcp.transport_response_too_large",
+            format!("MCP stdio response exceeded {max_response_bytes} bytes"),
+        ));
+    }
+    let mut body = vec![0_u8; content_length];
+    let mut offset = 0_usize;
+    while offset < content_length {
+        let read =
+            tokio::io::AsyncReadExt::read(reader, &mut body[offset..]).await.map_err(|error| {
+                McpTransportError::new(
+                    "mcp.transport_read_failed",
+                    format!("MCP stdio body read failed: {error}"),
+                )
+            })?;
+        if read == 0 {
+            return Err(McpTransportError::new(
+                "mcp.transport_eof",
+                "MCP stdio server closed stdout before a complete response body",
+            ));
+        }
+        offset = offset.saturating_add(read);
+    }
+    serde_json::from_slice::<Value>(body.as_slice()).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_invalid_response",
+            format!("MCP stdio response was not valid JSON: {error}"),
+        )
+    })
+}
+
+async fn read_stdio_stderr_tail<R>(mut reader: R, max_bytes: usize) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while let Ok(read) = tokio::io::AsyncReadExt::read(&mut reader, &mut buffer).await {
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&buffer[..read]);
+        if output.len() > max_bytes {
+            let keep_from = output.len().saturating_sub(max_bytes);
+            output.drain(..keep_from);
+        }
+    }
+    sanitize_mcp_transport_message(String::from_utf8_lossy(output.as_slice()).as_ref())
+}
+
+fn mcp_stdio_content_length(header: &[u8]) -> Result<usize, McpTransportError> {
+    let header = std::str::from_utf8(header).map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_invalid_response",
+            format!("MCP stdio response header was not UTF-8: {error}"),
+        )
+    })?;
+    for line in header.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().map_err(|error| {
+                McpTransportError::new(
+                    "mcp.transport_invalid_response",
+                    format!("MCP stdio content-length was invalid: {error}"),
+                )
+            });
+        }
+    }
+    Err(McpTransportError::new(
+        "mcp.transport_invalid_response",
+        "MCP stdio response header did not include content-length",
+    ))
+}
+
+fn run_transport_future<F, T>(future: F) -> Result<T, McpTransportError>
+where
+    F: Future<Output = Result<T, McpTransportError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| {
+                McpTransportError::new(
+                    "mcp.transport_runtime_failed",
+                    format!("MCP stdio runtime initialization failed: {error}"),
+                )
+            })
+            .and_then(|runtime| runtime.block_on(future));
+        let _ = sender.send(result);
+    });
+    receiver.recv().map_err(|error| {
+        McpTransportError::new(
+            "mcp.transport_runtime_failed",
+            format!("MCP stdio runtime worker failed: {error}"),
+        )
+    })?
+}
+
+fn mcp_jsonrpc_request(id: u64, method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": MCP_JSONRPC_VERSION,
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+fn mcp_initialized_notification() -> Value {
+    json!({
+        "jsonrpc": MCP_JSONRPC_VERSION,
+        "method": "notifications/initialized",
+        "params": {},
+    })
+}
+
+fn mcp_initialize_params() -> Value {
+    json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {
+            "name": "palyra",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
+}
+
+fn mcp_jsonrpc_result(response: Value) -> Result<Value, McpTransportError> {
+    if response.get("jsonrpc").and_then(Value::as_str) != Some(MCP_JSONRPC_VERSION) {
+        return Err(McpTransportError::new(
+            "mcp.transport_invalid_response",
+            "MCP response missing JSON-RPC version",
+        ));
+    }
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("MCP server returned a JSON-RPC error");
+        return Err(McpTransportError::new(
+            "mcp.transport_rpc_error",
+            format!("MCP server returned JSON-RPC error {code}: {message}"),
+        ));
+    }
+    response.get("result").cloned().ok_or_else(|| {
+        McpTransportError::new("mcp.transport_invalid_response", "MCP response missing result")
+    })
+}
+
+fn tools_from_mcp_result(result: &Value) -> Result<Vec<McpDiscoveredTool>, McpTransportError> {
+    let tools = result.get("tools").and_then(Value::as_array).ok_or_else(|| {
+        McpTransportError::new(
+            "mcp.transport_invalid_response",
+            "MCP tools/list result missing tools array",
+        )
+    })?;
+    let mut discovered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = tool.get("name").and_then(Value::as_str).ok_or_else(|| {
+            McpTransportError::new(
+                "mcp.transport_invalid_response",
+                "MCP discovered tool missing string name",
+            )
+        })?;
+        let description =
+            tool.get("description").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let input_schema = tool
+            .get("inputSchema")
+            .or_else(|| tool.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"}));
+        discovered.push(McpDiscoveredTool {
+            name: name.to_owned(),
+            description,
+            input_schema,
+            capabilities: Vec::new(),
+            sensitivity: None,
+            approval_policy: None,
+        });
+    }
+    Ok(discovered)
+}
+
+fn mcp_remote_url_targets_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+    })
+}
+
+fn sanitize_mcp_transport_message(message: &str) -> String {
+    redact_vault_refs(redact_diagnostic_text(message).as_str())
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
+fn redact_vault_refs(message: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut cursor = 0_usize;
+    while cursor < message.len() {
+        let rest = &message[cursor..];
+        let marker_len = if rest.starts_with("vault://") {
+            Some("vault://".len())
+        } else if rest.starts_with("vault:") {
+            Some("vault:".len())
+        } else {
+            None
+        };
+        let Some(marker_len) = marker_len else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            output.push(ch);
+            cursor = cursor.saturating_add(ch.len_utf8());
+            continue;
+        };
+        output.push_str("<redacted-vault-ref>");
+        cursor = cursor.saturating_add(marker_len);
+        while cursor < message.len() {
+            let Some(ch) = message[cursor..].chars().next() else {
+                break;
+            };
+            if ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ')' | ']' | '}' | '<' | '>') {
+                break;
+            }
+            cursor = cursor.saturating_add(ch.len_utf8());
+        }
+    }
+    output
 }
 
 fn import_discovered_tools(
@@ -1600,7 +2348,14 @@ fn current_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{
+        cell::Cell,
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        path::Path,
+        process::Command,
+        time::Duration,
+    };
 
     use palyra_common::tool_catalog::ToolCatalogExposureMode;
 
@@ -1692,6 +2447,14 @@ mod tests {
             approval_policy: McpApprovalPolicy::Safe,
             sampling_enabled: false,
         }
+    }
+
+    fn remote_manifest(transport: McpTransportManifest) -> McpServerManifest {
+        let mut manifest = manifest();
+        manifest.transport = transport;
+        manifest.egress_allowlist = vec!["127.0.0.1".to_owned()];
+        manifest.max_response_bytes = 4 * 1024;
+        manifest
     }
 
     fn discovered_tool(name: &str) -> McpDiscoveredTool {
@@ -2143,6 +2906,103 @@ mod tests {
         assert_eq!(env.get("API_TOKEN"), Some(&"<redacted>".to_owned()));
     }
 
+    #[test]
+    fn runtime_transport_http_lists_tools_via_egress_policy() {
+        let body = jsonrpc_response(json!({
+            "tools": [{
+                "name": "search",
+                "description": "Search docs",
+                "inputSchema": {"type": "object"}
+            }]
+        }));
+        let url = spawn_fake_mcp_http_server("application/json", body);
+        let manifest = remote_manifest(McpTransportManifest::Http { url });
+
+        let tools =
+            McpRuntimeTransport.list_tools(&manifest).expect("HTTP tools/list should succeed");
+
+        assert_eq!(tools, vec![discovered_tool_without_capabilities("search", "Search docs")]);
+    }
+
+    #[test]
+    fn runtime_transport_sse_reads_json_data_event() {
+        let data = jsonrpc_response(json!({
+            "tools": [{
+                "name": "search",
+                "description": "Search docs",
+                "inputSchema": {"type": "object"}
+            }]
+        }));
+        let url = spawn_fake_mcp_http_server(
+            "text/event-stream",
+            format!("event: message\ndata: {data}\n\n"),
+        );
+        let manifest = remote_manifest(McpTransportManifest::Sse { url });
+
+        let tools =
+            McpRuntimeTransport.list_tools(&manifest).expect("SSE tools/list should succeed");
+
+        assert_eq!(tools, vec![discovered_tool_without_capabilities("search", "Search docs")]);
+    }
+
+    #[test]
+    fn runtime_transport_remote_egress_denies_hosts_outside_manifest_allowlist() {
+        let mut manifest = manifest();
+        manifest.transport =
+            McpTransportManifest::Http { url: "https://blocked.example/mcp".to_owned() };
+        manifest.egress_allowlist = vec!["allowed.example".to_owned()];
+
+        let error = McpRuntimeTransport
+            .start(&manifest)
+            .expect_err("host outside manifest allowlist must fail closed");
+
+        assert_eq!(error.reason_code, "mcp.egress_denied");
+        assert!(!error.message.contains("blocked.example/mcp"));
+    }
+
+    #[test]
+    fn runtime_transport_strips_credentials_from_rpc_errors() {
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "Authorization: Bearer sk-secret-value token=plain-secret vault://global/api_key"
+            }
+        }))
+        .expect("JSON-RPC error fixture should serialize");
+        let url = spawn_fake_mcp_http_server("application/json", body);
+        let manifest = remote_manifest(McpTransportManifest::Http { url });
+
+        let error = McpRuntimeTransport
+            .list_tools(&manifest)
+            .expect_err("JSON-RPC error should fail transport call");
+
+        assert_eq!(error.reason_code, "mcp.transport_rpc_error");
+        assert!(!error.message.contains("sk-secret-value"));
+        assert!(!error.message.contains("plain-secret"));
+        assert!(!error.message.contains("vault://global/api_key"));
+    }
+
+    #[test]
+    fn runtime_transport_stdio_lists_tools_from_fake_server() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be available");
+        let script_path = tempdir.path().join("fake_mcp_stdio.py");
+        std::fs::write(&script_path, fake_stdio_server_script())
+            .expect("fake MCP stdio script should be written");
+        let mut manifest = manifest();
+        manifest.transport = McpTransportManifest::Stdio {
+            command: python_command_for_script(&script_path),
+            env: BTreeMap::new(),
+        };
+        manifest.max_response_bytes = 4 * 1024;
+
+        let tools =
+            McpRuntimeTransport.list_tools(&manifest).expect("stdio tools/list should succeed");
+
+        assert_eq!(tools, vec![discovered_tool_without_capabilities("search", "Search docs")]);
+    }
+
     fn tool_config(allowed_tools: &[&str]) -> ToolCallConfig {
         ToolCallConfig {
             allowed_tools: allowed_tools.iter().map(|tool| (*tool).to_owned()).collect(),
@@ -2176,5 +3036,148 @@ mod tests {
                 allowed_channels: Vec::new(),
             },
         }
+    }
+
+    fn discovered_tool_without_capabilities(name: &str, description: &str) -> McpDiscoveredTool {
+        McpDiscoveredTool {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: json!({"type": "object"}),
+            capabilities: Vec::new(),
+            sensitivity: None,
+            approval_policy: None,
+        }
+    }
+
+    fn jsonrpc_response(result: Value) -> String {
+        serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": result,
+        }))
+        .expect("JSON-RPC fixture should serialize")
+    }
+
+    fn spawn_fake_mcp_http_server(content_type: &str, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server should bind");
+        let address = listener.local_addr().expect("fake server should expose address");
+        let content_type = content_type.to_owned();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("fake server should accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout should be configurable");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("fake server request read should work");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("fake server response write should work");
+        });
+        format!("http://{address}/mcp")
+    }
+
+    fn python_command_for_script(script_path: &Path) -> Vec<String> {
+        let script = script_path.display().to_string();
+        if command_succeeds("python3", &["--version"]) {
+            return vec!["python3".to_owned(), script];
+        }
+        if command_succeeds("python", &["--version"]) {
+            return vec!["python".to_owned(), script];
+        }
+        if command_succeeds("py", &["-3", "--version"]) {
+            return vec!["py".to_owned(), "-3".to_owned(), script];
+        }
+        panic!("python interpreter is required for fake MCP stdio integration test");
+    }
+
+    fn command_succeeds(program: &str, args: &[&str]) -> bool {
+        Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn fake_stdio_server_script() -> &'static str {
+        r#"
+import json
+import sys
+
+def read_message():
+    header = b""
+    while not header.endswith(b"\r\n\r\n"):
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            sys.exit(2)
+        header += chunk
+    length = None
+    for line in header.decode("utf-8").split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+            break
+    if length is None:
+        sys.exit(3)
+    return json.loads(sys.stdin.buffer.read(length))
+
+def write_message(payload):
+    body = json.dumps(payload).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_message()
+    method = message.get("method")
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {},
+                "serverInfo": {"name": "fake-stdio", "version": "1.0.0"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "tools": [{
+                    "name": "search",
+                    "description": "Search docs",
+                    "inputSchema": {"type": "object"},
+                }]
+            },
+        })
+        break
+    elif method == "tools/call":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {"ok": True, "echo": message["params"]["arguments"]},
+        })
+        break
+    else:
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32601, "message": "unknown method"},
+        })
+        break
+"#
     }
 }
