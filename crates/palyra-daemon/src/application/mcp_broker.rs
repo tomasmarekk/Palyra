@@ -4412,6 +4412,10 @@ mod tests {
             env: BTreeMap::new(),
         };
         manifest.max_response_bytes = 4 * 1024;
+        // Windows CI can spend several seconds spawning Python from a cold runner;
+        // this test asserts stdio protocol behavior, not timeout policy.
+        manifest.timeout_ms = 10_000;
+        manifest.start_timeout_ms = 5_000;
 
         let tools =
             McpRuntimeTransport.list_tools(&manifest).expect("stdio tools/list should succeed");
