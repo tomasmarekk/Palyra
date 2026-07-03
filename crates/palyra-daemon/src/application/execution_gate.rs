@@ -1122,9 +1122,9 @@ mod tests {
     #[test]
     fn pipeline_requires_networked_backend_approval_for_supported_tool() {
         let outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
-            tool_call_config: &tool_call_config(&["palyra.echo"]),
+            tool_call_config: &tool_call_config(&["palyra.fs.read_file"]),
             request_context: &request_context(),
-            tool_name: "palyra.echo",
+            tool_name: "palyra.fs.read_file",
             skill_context: None,
             skill_gate_decision: None,
             proposal_approval_required: true,
