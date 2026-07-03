@@ -1036,13 +1036,17 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
         let execution_input_json =
             process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
-        let runner_registry = if context.execution_backend == ExecutionBackendPreference::Docker {
+        let runner_registry = if matches!(
+            context.execution_backend,
+            ExecutionBackendPreference::Docker | ExecutionBackendPreference::SshTunnel
+        ) {
             match ExecutionBackendRunnerRegistry::from_execution_backend_profiles(
                 &runtime_state.config.execution_backend_profiles,
             ) {
                 Ok(registry) => registry,
                 Err(error) => {
-                    return docker_execution_target_config_error_outcome(
+                    return execution_backend_target_config_error_outcome(
+                        context.execution_backend,
                         proposal_id,
                         tool_name,
                         input_json,
@@ -1472,20 +1476,45 @@ fn docker_execution_target_unavailable_outcome(
     )
 }
 
-fn docker_execution_target_config_error_outcome(
+fn execution_backend_target_config_error_outcome(
+    backend: ExecutionBackendPreference,
     proposal_id: &str,
     tool_name: &str,
     input_json: &[u8],
     error: String,
 ) -> ToolExecutionOutcome {
+    let (reason_code, repair_hint, workspace_writeback, egress_policy, sandbox_enforcement) =
+        match backend {
+            ExecutionBackendPreference::Docker => (
+                "backend.preflight.docker_profile_invalid",
+                "Fix execution_backend_profiles Docker profile invariants or select local_sandbox.",
+                "patch_bundle_required",
+                "explicit_profile_required",
+                "container_profile_preflight",
+            ),
+            ExecutionBackendPreference::SshTunnel => (
+                "backend.preflight.ssh_worker_profile_invalid",
+                "Fix execution_backend_profiles SSH worker profile invariants or select local_sandbox.",
+                "worker_rpc_patch_bundle_required",
+                "vault_identity_required",
+                "ssh_worker_rpc_preflight",
+            ),
+            _ => (
+                "backend.preflight.profile_invalid",
+                "Fix execution_backend_profiles invariants or select local_sandbox.",
+                "profile_required",
+                "profile_required",
+                "execution_backend_profile_preflight",
+            ),
+        };
     let output = json!({
         "success": false,
-        "execution_target": "docker",
+        "execution_target": backend.as_str(),
         "status": "degraded",
-        "reason_code": "backend.preflight.docker_profile_invalid",
-        "repair_hint": "Fix execution_backend_profiles Docker profile invariants or select local_sandbox.",
-        "workspace_writeback": "patch_bundle_required",
-        "egress_policy": "explicit_profile_required",
+        "reason_code": reason_code,
+        "repair_hint": repair_hint,
+        "workspace_writeback": workspace_writeback,
+        "egress_policy": egress_policy,
     });
     build_tool_execution_outcome(
         proposal_id,
@@ -1493,10 +1522,10 @@ fn docker_execution_target_config_error_outcome(
         input_json,
         false,
         serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
-        format!("Docker execution profile is invalid: {error}"),
+        format!("{} execution profile is invalid: {error}", backend.label()),
         false,
-        "docker".to_owned(),
-        "container_profile_preflight".to_owned(),
+        backend.as_str().to_owned(),
+        sandbox_enforcement.to_owned(),
     )
 }
 

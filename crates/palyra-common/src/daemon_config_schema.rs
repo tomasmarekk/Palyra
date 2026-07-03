@@ -35,6 +35,10 @@ pub const SECRET_CONFIG_PATHS: &[&str] = &[
     "tool_call.browser_service.auth_token_secret_ref",
     "tool_call.browser_service.state_key_secret_ref",
     "tool_call.browser_service.state_key_vault_ref",
+    "execution_backend_profiles.profiles.ssh_worker.host_handle",
+    "execution_backend_profiles.profiles.ssh_worker.user_handle",
+    "execution_backend_profiles.profiles.ssh_worker.identity_handle",
+    "execution_backend_profiles.profiles.ssh_worker.host_trust_handle",
 ];
 
 /// Typed metadata for operator-facing config diagnostics.
@@ -386,6 +390,28 @@ pub const CONFIG_SCHEMA_ENTRIES: &[ConfigSchemaEntry] = &[
         description: "Execution backend profile declarations; env overrides intentionally do not replace structured registry data.",
     },
     ConfigSchemaEntry {
+        path: "execution_backend_profiles.profiles.ssh_worker",
+        value_type: "table",
+        default_value: None,
+        env_vars: &[],
+        secret: false,
+        deprecated: false,
+        restart_required: true,
+        category: "execution_backend_profiles",
+        description: "Operator-managed SSH worker RPC tunnel profile using vault or identity handles.",
+    },
+    ConfigSchemaEntry {
+        path: "execution_backend_profiles.profiles.ssh_worker.identity_handle",
+        value_type: "vault_ref",
+        default_value: None,
+        env_vars: &[],
+        secret: true,
+        deprecated: false,
+        restart_required: true,
+        category: "execution_backend_profiles",
+        description: "Vault or identity handle for SSH worker identity material; plaintext keys are rejected.",
+    },
+    ConfigSchemaEntry {
         path: "qa_lab.mode",
         value_type: "enum(disabled|preview_only)",
         default_value: Some("disabled"),
@@ -563,6 +589,7 @@ pub fn redact_secret_config_values(document: &mut Value) {
         redact_config_path(document, secret_path);
     }
     redact_provider_registry_secrets(document);
+    redact_execution_backend_profile_secrets(document);
 }
 
 fn redact_config_path(document: &mut Value, path: &str) {
@@ -629,6 +656,40 @@ fn redact_provider_registry_secrets(document: &mut Value) {
         ] {
             if provider_table.contains_key(secret_field) {
                 provider_table.insert(
+                    secret_field.to_owned(),
+                    Value::String(REDACTED_CONFIG_VALUE.to_owned()),
+                );
+            }
+        }
+    }
+}
+
+fn redact_execution_backend_profile_secrets(document: &mut Value) {
+    let Some(execution_backend_profiles) = document.get_mut("execution_backend_profiles") else {
+        return;
+    };
+    let Some(execution_backend_profiles_table) = execution_backend_profiles.as_table_mut() else {
+        return;
+    };
+    let Some(profiles) = execution_backend_profiles_table.get_mut("profiles") else {
+        return;
+    };
+    let Some(array) = profiles.as_array_mut() else {
+        return;
+    };
+    for entry in array {
+        let Some(profile_table) = entry.as_table_mut() else {
+            continue;
+        };
+        let Some(ssh_worker) = profile_table.get_mut("ssh_worker") else {
+            continue;
+        };
+        let Some(ssh_worker_table) = ssh_worker.as_table_mut() else {
+            continue;
+        };
+        for secret_field in ["host_handle", "user_handle", "identity_handle", "host_trust_handle"] {
+            if ssh_worker_table.contains_key(secret_field) {
+                ssh_worker_table.insert(
                     secret_field.to_owned(),
                     Value::String(REDACTED_CONFIG_VALUE.to_owned()),
                 );
@@ -934,6 +995,7 @@ pub struct FileExecutionBackendProfileConfig {
     pub enabled: Option<bool>,
     pub kind: Option<String>,
     pub container: Option<FileContainerExecutionProfileConfig>,
+    pub ssh_worker: Option<FileSshWorkerExecutionProfileConfig>,
 }
 
 /// Container-specific settings for a declared execution backend profile.
@@ -976,6 +1038,20 @@ pub struct FileContainerEnvBindingConfig {
     pub name: Option<String>,
     pub source_kind: Option<String>,
     pub value: Option<String>,
+}
+
+/// SSH worker RPC settings for a declared execution backend profile.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSshWorkerExecutionProfileConfig {
+    pub tunnel_endpoint: Option<String>,
+    pub host_handle: Option<String>,
+    pub user_handle: Option<String>,
+    pub identity_handle: Option<String>,
+    pub host_trust_handle: Option<String>,
+    pub worker_protocol: Option<String>,
+    pub health_probe: Option<String>,
+    pub capabilities: Option<Vec<String>>,
 }
 
 /// `[observability_exporters]`: preview exporter registry.
@@ -1469,6 +1545,9 @@ mod tests {
         assert!(is_secret_config_path("admin.auth_token_secret_ref"));
         assert!(is_secret_config_path("admin.connector_token"));
         assert!(is_secret_config_path("admin.connector_token_secret_ref"));
+        assert!(is_secret_config_path(
+            "execution_backend_profiles.profiles.ssh_worker.identity_handle"
+        ));
         assert!(!is_secret_config_path("daemon.port"));
     }
 
@@ -1502,6 +1581,21 @@ mod tests {
             kind = "file"
             path = "secrets/browserd.key"
             trusted_dirs = ["secrets"]
+            [execution_backend_profiles]
+            mode = "preview_only"
+            [[execution_backend_profiles.profiles]]
+            id = "ssh-worker"
+            enabled = true
+            kind = "ssh_tunnel"
+            [execution_backend_profiles.profiles.ssh_worker]
+            tunnel_endpoint = "127.0.0.1:7142"
+            host_handle = "vault://ssh/host"
+            user_handle = "identity://ssh/user"
+            identity_handle = "vault://ssh/key"
+            host_trust_handle = "vault://ssh/known-host"
+            worker_protocol = "palyra-worker-rpc/v1"
+            health_probe = "ssh_worker_rpc_health"
+            capabilities = ["tool:palyra.process.run"]
             "#,
         )
         .expect("config document should parse");
@@ -1588,6 +1682,24 @@ mod tests {
                 .and_then(|browser_service| browser_service.get("state_key_vault_ref"))
                 .and_then(toml::Value::as_str),
             Some("<redacted>")
+        );
+        let ssh_worker = document
+            .get("execution_backend_profiles")
+            .and_then(|profiles| profiles.get("profiles"))
+            .and_then(toml::Value::as_array)
+            .and_then(|profiles| profiles.first())
+            .and_then(|profile| profile.get("ssh_worker"))
+            .expect("ssh worker profile should remain present");
+        for field in ["host_handle", "user_handle", "identity_handle", "host_trust_handle"] {
+            assert_eq!(
+                ssh_worker.get(field).and_then(toml::Value::as_str),
+                Some("<redacted>"),
+                "ssh worker {field} should be redacted"
+            );
+        }
+        assert_eq!(
+            ssh_worker.get("tunnel_endpoint").and_then(toml::Value::as_str),
+            Some("127.0.0.1:7142")
         );
     }
 
@@ -1871,6 +1983,20 @@ mod tests {
             source_kind = "vault_ref"
             value = "vault://worker/api-token"
 
+            [[execution_backend_profiles.profiles]]
+            id = "ssh-worker"
+            enabled = false
+            kind = "ssh_tunnel"
+            [execution_backend_profiles.profiles.ssh_worker]
+            tunnel_endpoint = "127.0.0.1:7142"
+            host_handle = "vault://ssh/host"
+            user_handle = "identity://ssh/user"
+            identity_handle = "vault://ssh/key"
+            host_trust_handle = "vault://ssh/known-host"
+            worker_protocol = "palyra-worker-rpc/v1"
+            health_probe = "ssh_worker_rpc_health"
+            capabilities = ["tool:palyra.process.run"]
+
             [qa_lab]
             mode = "preview_only"
 
@@ -1957,6 +2083,22 @@ mod tests {
                 .and_then(|env| env.first())
                 .and_then(|env| env.source_kind.as_deref()),
             Some("vault_ref")
+        );
+        let ssh_worker = parsed
+            .execution_backend_profiles
+            .as_ref()
+            .and_then(|value| value.profiles.as_ref())
+            .and_then(|profiles| profiles.get(1))
+            .and_then(|profile| profile.ssh_worker.as_ref())
+            .expect("ssh worker profile should parse");
+        assert_eq!(ssh_worker.worker_protocol.as_deref(), Some("palyra-worker-rpc/v1"));
+        assert_eq!(
+            ssh_worker
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.first())
+                .map(String::as_str),
+            Some("tool:palyra.process.run")
         );
         assert_eq!(
             parsed.qa_lab.as_ref().and_then(|value| value.mode.as_deref()),
@@ -2080,6 +2222,26 @@ mod tests {
                     "default_value": "[]",
                     "env_vars": [],
                     "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "execution_backend_profiles"
+                },
+                {
+                    "path": "execution_backend_profiles.profiles.ssh_worker",
+                    "value_type": "table",
+                    "default_value": null,
+                    "env_vars": [],
+                    "secret": false,
+                    "deprecated": false,
+                    "restart_required": true,
+                    "category": "execution_backend_profiles"
+                },
+                {
+                    "path": "execution_backend_profiles.profiles.ssh_worker.identity_handle",
+                    "value_type": "vault_ref",
+                    "default_value": null,
+                    "env_vars": [],
+                    "secret": true,
                     "deprecated": false,
                     "restart_required": true,
                     "category": "execution_backend_profiles"

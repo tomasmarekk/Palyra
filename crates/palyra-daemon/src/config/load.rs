@@ -34,7 +34,7 @@ use palyra_common::{
         FileDoctorCheckConfig, FileExecutionBackendProfileConfig, FileMcpCommandValue,
         FileMcpEnvVaultRefConfig, FileMcpOAuthGrantConfig, FileMcpSamplingPolicyConfig,
         FileMcpServerConfig, FileMemoryRetrievalConfig, FileObservabilityExporterConfig,
-        FileRetrievalSourceScoringProfile, RootFileConfig,
+        FileRetrievalSourceScoringProfile, FileSshWorkerExecutionProfileConfig, RootFileConfig,
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
@@ -2739,11 +2739,21 @@ fn parse_execution_backend_profile_config(
             )
         })
         .transpose()?;
+    let ssh_worker = entry
+        .ssh_worker
+        .map(|ssh_worker| {
+            parse_execution_backend_ssh_worker_profile_config(
+                ssh_worker,
+                format!("{source_name}.ssh_worker").as_str(),
+            )
+        })
+        .transpose()?;
     Ok(ExecutionBackendProfileConfig {
         id: parse_required_registry_id(entry.id, format!("{source_name}.id").as_str())?,
         enabled: entry.enabled.unwrap_or(false),
         kind: parse_required_registry_kind(entry.kind, format!("{source_name}.kind").as_str())?,
         container,
+        ssh_worker,
     })
 }
 
@@ -2841,6 +2851,52 @@ fn parse_container_env_binding_config(
             format!("{source_name}.source_kind").as_str(),
         )?,
         value: parse_required_config_text(entry.value, format!("{source_name}.value").as_str())?,
+    })
+}
+
+fn parse_execution_backend_ssh_worker_profile_config(
+    entry: FileSshWorkerExecutionProfileConfig,
+    source_name: &str,
+) -> Result<ExecutionBackendSshWorkerProfileConfig> {
+    let capabilities = parse_optional_string_list(
+        entry.capabilities,
+        format!("{source_name}.capabilities").as_str(),
+        64,
+        128,
+    )?;
+    if capabilities.is_empty() {
+        anyhow::bail!("{source_name}.capabilities requires at least one worker RPC capability");
+    }
+    Ok(ExecutionBackendSshWorkerProfileConfig {
+        tunnel_endpoint: parse_required_config_text(
+            entry.tunnel_endpoint,
+            format!("{source_name}.tunnel_endpoint").as_str(),
+        )?,
+        host_handle: parse_required_config_text(
+            entry.host_handle,
+            format!("{source_name}.host_handle").as_str(),
+        )?,
+        user_handle: parse_required_config_text(
+            entry.user_handle,
+            format!("{source_name}.user_handle").as_str(),
+        )?,
+        identity_handle: parse_required_config_text(
+            entry.identity_handle,
+            format!("{source_name}.identity_handle").as_str(),
+        )?,
+        host_trust_handle: parse_required_config_text(
+            entry.host_trust_handle,
+            format!("{source_name}.host_trust_handle").as_str(),
+        )?,
+        worker_protocol: parse_required_config_text(
+            entry.worker_protocol,
+            format!("{source_name}.worker_protocol").as_str(),
+        )?,
+        health_probe: parse_required_config_text(
+            entry.health_probe,
+            format!("{source_name}.health_probe").as_str(),
+        )?,
+        capabilities,
     })
 }
 
@@ -6727,6 +6783,61 @@ value = "vault://worker/api-token"
         assert!(container.workspace_mount.read_only);
         assert_eq!(container.resource_limits.max_output_bytes, 65_536);
         assert_eq!(container.env[0].source_kind, "vault_ref");
+    }
+
+    #[test]
+    fn load_config_accepts_ssh_worker_execution_backend_profile() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let tempdir = tempfile::tempdir().expect("temporary directory should be created");
+        let config_path = tempdir.path().join("palyra.toml");
+        std::fs::write(
+            config_path.as_path(),
+            r#"
+version = 1
+
+[execution_backend_profiles]
+mode = "preview_only"
+
+[[execution_backend_profiles.profiles]]
+id = "ssh-worker"
+enabled = true
+kind = "ssh_tunnel"
+
+[execution_backend_profiles.profiles.ssh_worker]
+tunnel_endpoint = "127.0.0.1:7142"
+host_handle = "vault://ssh/host"
+user_handle = "identity://ssh/user"
+identity_handle = "vault://ssh/key"
+host_trust_handle = "vault://ssh/known-host"
+worker_protocol = "palyra-worker-rpc/v1"
+health_probe = "ssh_worker_rpc_health"
+capabilities = ["tool:palyra.process.run", "tool:palyra.artifact.read"]
+"#,
+        )
+        .expect("ssh worker backend profile config should be written");
+
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _profiles_mode = ScopedEnvVar::unset("PALYRA_EXECUTION_BACKEND_PROFILES_MODE");
+
+        let loaded = super::load_config().expect("ssh worker backend profile should load");
+
+        assert_eq!(loaded.execution_backend_profiles.mode, RuntimePreviewMode::PreviewOnly);
+        let profile = loaded
+            .execution_backend_profiles
+            .profiles
+            .first()
+            .expect("one execution backend profile should load");
+        assert_eq!(profile.kind, "ssh_tunnel");
+        let ssh_worker = profile.ssh_worker.as_ref().expect("ssh worker profile should load");
+        assert_eq!(ssh_worker.worker_protocol, "palyra-worker-rpc/v1");
+        assert_eq!(ssh_worker.tunnel_endpoint, "127.0.0.1:7142");
+        assert_eq!(
+            ssh_worker.capabilities,
+            vec!["tool:palyra.process.run", "tool:palyra.artifact.read"]
+        );
     }
 
     #[test]

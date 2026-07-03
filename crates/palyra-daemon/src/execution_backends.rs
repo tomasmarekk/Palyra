@@ -36,10 +36,14 @@ use palyra_common::{
     },
 };
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
-use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
+use palyra_workerd::{
+    WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
+    WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use crate::{
     config::{
@@ -827,6 +831,7 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
 pub(crate) struct ExecutionBackendRunnerRegistry {
     local_sandbox: LocalSandboxRunner,
     docker: Option<Box<dyn ExecutionBackendRunner>>,
+    ssh_worker: Option<Box<dyn ExecutionBackendRunner>>,
 }
 
 impl std::fmt::Debug for ExecutionBackendRunnerRegistry {
@@ -835,6 +840,7 @@ impl std::fmt::Debug for ExecutionBackendRunnerRegistry {
             .debug_struct("ExecutionBackendRunnerRegistry")
             .field("local_sandbox", &self.local_sandbox.runner_id())
             .field("docker", &self.docker.as_ref().map(|runner| runner.runner_id()))
+            .field("ssh_worker", &self.ssh_worker.as_ref().map(|runner| runner.runner_id()))
             .finish()
     }
 }
@@ -842,7 +848,12 @@ impl std::fmt::Debug for ExecutionBackendRunnerRegistry {
 impl ExecutionBackendRunnerRegistry {
     /// Builds a registry with an explicitly configured Docker runner.
     pub(crate) fn with_docker_runner(docker: Box<dyn ExecutionBackendRunner>) -> Self {
-        Self { local_sandbox: LocalSandboxRunner, docker: Some(docker) }
+        Self { local_sandbox: LocalSandboxRunner, docker: Some(docker), ssh_worker: None }
+    }
+
+    /// Builds a registry with an explicitly configured SSH worker runner.
+    pub(crate) fn with_ssh_worker_runner(ssh_worker: Box<dyn ExecutionBackendRunner>) -> Self {
+        Self { local_sandbox: LocalSandboxRunner, docker: None, ssh_worker: Some(ssh_worker) }
     }
 
     /// Builds a runner registry from validated execution backend profiles.
@@ -856,18 +867,23 @@ impl ExecutionBackendRunnerRegistry {
         if profiles.mode == RuntimePreviewMode::Disabled {
             return Ok(Self::default());
         }
-        let docker_profiles = profiles
-            .profiles
-            .iter()
-            .filter(|profile| {
-                profile.enabled
-                    && profile
-                        .kind
-                        .eq_ignore_ascii_case(ExecutionBackendPreference::Docker.as_str())
-            })
-            .collect::<Vec<_>>();
-        match docker_profiles.as_slice() {
-            [] => Ok(Self::default()),
+        let docker_profiles =
+            enabled_profiles_for_backend(profiles, ExecutionBackendPreference::Docker);
+        let ssh_profiles =
+            enabled_profiles_for_backend(profiles, ExecutionBackendPreference::SshTunnel);
+        if docker_profiles.len() > 1 {
+            return Err(
+                "execution_backend_profiles must enable at most one Docker profile".to_owned()
+            );
+        }
+        if ssh_profiles.len() > 1 {
+            return Err(
+                "execution_backend_profiles must enable at most one SSH worker profile".to_owned()
+            );
+        }
+
+        let docker = match docker_profiles.as_slice() {
+            [] => None,
             [profile] => {
                 let container_profile = container_backend_profile_from_config(profile)?;
                 let docker =
@@ -877,12 +893,28 @@ impl ExecutionBackendRunnerRegistry {
                             profile.id
                         )
                     })?;
-                Ok(Self::with_docker_runner(Box::new(docker)))
+                Some(Box::new(docker) as Box<dyn ExecutionBackendRunner>)
             }
-            _ => {
-                Err("execution_backend_profiles must enable at most one Docker profile".to_owned())
+            _ => unreachable!("multiple Docker profiles were rejected above"),
+        };
+
+        let ssh_worker = match ssh_profiles.as_slice() {
+            [] => None,
+            [profile] => {
+                let ssh_profile = ssh_worker_backend_profile_from_config(profile)?;
+                let runner = SshWorkerRunner::new(ssh_profile, OperatorManagedSshTunnelTransport)
+                    .map_err(|error| {
+                    format!(
+                        "failed to build SSH worker execution backend profile '{}': {error}",
+                        profile.id
+                    )
+                })?;
+                Some(Box::new(runner) as Box<dyn ExecutionBackendRunner>)
             }
-        }
+            _ => unreachable!("multiple SSH worker profiles were rejected above"),
+        };
+
+        Ok(Self { local_sandbox: LocalSandboxRunner, docker, ssh_worker })
     }
 
     /// Selects a runner for the resolved backend and required operation.
@@ -916,9 +948,20 @@ impl ExecutionBackendRunnerRegistry {
                     required_capability,
                 )),
             },
+            ExecutionBackendPreference::SshTunnel => match self.ssh_worker.as_deref() {
+                Some(runner) if runner.capabilities().contains(&required_capability) => Ok(runner),
+                Some(runner) => Err(ExecutionBackendRunnerSelectionError::missing_capability(
+                    backend,
+                    runner.runner_id(),
+                    required_capability,
+                )),
+                None => Err(ExecutionBackendRunnerSelectionError::unavailable_backend(
+                    backend,
+                    required_capability,
+                )),
+            },
             ExecutionBackendPreference::DesktopNode
-            | ExecutionBackendPreference::NetworkedWorker
-            | ExecutionBackendPreference::SshTunnel => {
+            | ExecutionBackendPreference::NetworkedWorker => {
                 Err(ExecutionBackendRunnerSelectionError::unavailable_backend(
                     backend,
                     required_capability,
@@ -947,6 +990,17 @@ impl ExecutionBackendRunnerRegistry {
             Err(error) => error.selection_event(requested_backend),
         }
     }
+}
+
+fn enabled_profiles_for_backend(
+    profiles: &ExecutionBackendProfilesConfig,
+    backend: ExecutionBackendPreference,
+) -> Vec<&ExecutionBackendProfileConfig> {
+    profiles
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled && profile.kind.eq_ignore_ascii_case(backend.as_str()))
+        .collect()
 }
 
 /// Fail-closed runner selection failure.
@@ -2470,11 +2524,14 @@ fn sha256_hex(input: &[u8]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SshWorkerBackendProfile {
     pub(crate) profile_id: String,
+    pub(crate) tunnel_endpoint: String,
     pub(crate) host_handle: String,
     pub(crate) user_handle: String,
     pub(crate) identity_handle: String,
     pub(crate) host_trust_handle: String,
     pub(crate) worker_protocol: String,
+    pub(crate) health_probe: String,
+    pub(crate) capabilities: Vec<String>,
     pub(crate) workspace_strategy: WorkspaceStrategyDescriptor,
 }
 
@@ -2489,13 +2546,19 @@ impl SshWorkerBackendProfile {
         if self.profile_id.trim().is_empty() {
             return Err("ssh worker profile_id must not be empty".to_owned());
         }
+        if !ssh_worker_tunnel_endpoint_is_safe(self.tunnel_endpoint.as_str()) {
+            return Err(
+                "ssh worker tunnel_endpoint must be a non-empty endpoint label, not a shell command"
+                    .to_owned(),
+            );
+        }
         for (field_name, value) in [
             ("host_handle", self.host_handle.as_str()),
             ("user_handle", self.user_handle.as_str()),
             ("identity_handle", self.identity_handle.as_str()),
             ("host_trust_handle", self.host_trust_handle.as_str()),
         ] {
-            if !(value.starts_with("vault://") || value.starts_with("identity://")) {
+            if !ssh_worker_handle_is_reference(value) {
                 return Err(format!(
                     "ssh worker {field_name} must be a Vault or identity handle, not plaintext"
                 ));
@@ -2507,8 +2570,501 @@ impl SshWorkerBackendProfile {
         if !matches!(self.workspace_strategy.kind, WorkspaceStrategyKind::RemoteLeaseWorkspace) {
             return Err("ssh worker backend requires a remote lease workspace strategy".to_owned());
         }
+        if self.health_probe.trim().is_empty() {
+            return Err("ssh worker health_probe must not be empty".to_owned());
+        }
+        if self.capabilities.is_empty() {
+            return Err("ssh worker backend requires negotiated worker RPC capabilities".to_owned());
+        }
+        for capability in &self.capabilities {
+            if !ssh_worker_capability_is_safe(capability) {
+                return Err(format!(
+                    "ssh worker capability {capability:?} must be a worker RPC capability, not raw shell"
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn ssh_worker_backend_profile_from_config(
+    profile: &ExecutionBackendProfileConfig,
+) -> Result<SshWorkerBackendProfile, String> {
+    let ssh_worker = profile.ssh_worker.as_ref().ok_or_else(|| {
+        format!("SSH execution backend profile '{}' requires an ssh_worker block", profile.id)
+    })?;
+    let backend_profile = SshWorkerBackendProfile {
+        profile_id: profile.id.clone(),
+        tunnel_endpoint: ssh_worker.tunnel_endpoint.clone(),
+        host_handle: ssh_worker.host_handle.clone(),
+        user_handle: ssh_worker.user_handle.clone(),
+        identity_handle: ssh_worker.identity_handle.clone(),
+        host_trust_handle: ssh_worker.host_trust_handle.clone(),
+        worker_protocol: ssh_worker.worker_protocol.clone(),
+        health_probe: ssh_worker.health_probe.clone(),
+        capabilities: ssh_worker.capabilities.clone(),
+        workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
+    };
+    backend_profile.validate()?;
+    Ok(backend_profile)
+}
+
+fn ssh_worker_handle_is_reference(value: &str) -> bool {
+    let value = value.trim();
+    (value.starts_with("vault://") || value.starts_with("identity://"))
+        && !value.contains(char::is_whitespace)
+}
+
+fn ssh_worker_tunnel_endpoint_is_safe(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.contains(['\0', '\n', '\r'])
+        && !value.contains("&&")
+        && !value.contains("||")
+        && !value.contains(';')
+        && !value.contains('|')
+        && !value.contains('`')
+        && !value.contains("$(")
+}
+
+fn ssh_worker_capability_is_safe(capability: &str) -> bool {
+    let capability = capability.trim();
+    !capability.is_empty()
+        && capability
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-' | '/'))
+        && !matches!(
+            capability.to_ascii_lowercase().as_str(),
+            "shell" | "raw_shell" | "ssh.shell" | "ssh.raw_shell" | "tool:shell"
+        )
+}
+
+/// SSH worker RPC request sent through an operator-managed tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SshWorkerRpcRequestEnvelope {
+    pub(crate) protocol: String,
+    pub(crate) schema_version: u32,
+    pub(crate) request_id: String,
+    pub(crate) profile_id: String,
+    pub(crate) tunnel_endpoint_sha256: String,
+    pub(crate) tool_name: String,
+    pub(crate) tool_kind: WorkerRemoteToolKind,
+    pub(crate) input_json: String,
+    pub(crate) input_json_sha256: String,
+    pub(crate) worker_protocol: String,
+    pub(crate) health_probe: String,
+    pub(crate) negotiated_capabilities: Vec<String>,
+    pub(crate) workspace_strategy_digest: String,
+    pub(crate) artifact_transport: String,
+    pub(crate) writeback_mode: String,
+}
+
+/// SSH worker RPC result returned by the remote worker envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SshWorkerRpcResultEnvelope {
+    pub(crate) protocol: String,
+    pub(crate) schema_version: u32,
+    pub(crate) request_id: String,
+    pub(crate) success: bool,
+    pub(crate) output_json: String,
+    pub(crate) output_json_sha256: String,
+    pub(crate) error: Option<String>,
+    pub(crate) output_manifest_sha256: String,
+    pub(crate) cleanup_report: WorkerCleanupReport,
+}
+
+/// SSH worker transport failures converted to fail-closed tool outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshWorkerTransportError {
+    pub(crate) reason_code: String,
+    pub(crate) message: String,
+}
+
+type SshWorkerRpcFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<SshWorkerRpcResultEnvelope, SshWorkerTransportError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Narrow transport seam for SSH worker RPC envelopes.
+pub(crate) trait SshWorkerRpcTransport: Send + Sync + std::fmt::Debug {
+    fn health_probe(&self, profile: &SshWorkerBackendProfile) -> ExecutionBackendRunnerHealth;
+
+    fn execute<'a>(
+        &'a self,
+        profile: &'a SshWorkerBackendProfile,
+        request: SshWorkerRpcRequestEnvelope,
+    ) -> SshWorkerRpcFuture<'a>;
+}
+
+/// Production placeholder for operator-managed SSH tunnels.
+///
+/// The daemon never opens a raw SSH shell here. Until a tunnel transport is
+/// explicitly attached, every dispatch fails closed with a repair hint.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct OperatorManagedSshTunnelTransport;
+
+impl SshWorkerRpcTransport for OperatorManagedSshTunnelTransport {
+    fn health_probe(&self, profile: &SshWorkerBackendProfile) -> ExecutionBackendRunnerHealth {
+        ExecutionBackendRunnerHealth {
+            backend_id: ExecutionBackendPreference::SshTunnel.as_str().to_owned(),
+            status: ExecutionBackendHealthStatus::Unavailable,
+            reason_code: "runner.health.ssh_worker.tunnel_unavailable".to_owned(),
+            summary: format!(
+                "SSH worker profile {} is valid but no operator-managed RPC tunnel is attached",
+                profile.profile_id
+            ),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        profile: &'a SshWorkerBackendProfile,
+        _request: SshWorkerRpcRequestEnvelope,
+    ) -> SshWorkerRpcFuture<'a> {
+        Box::pin(async move {
+            Err(SshWorkerTransportError {
+                reason_code: "runner.unavailable.ssh_tunnel".to_owned(),
+                message: format!(
+                    "SSH worker profile {} has no active palyra-worker-rpc/v1 tunnel; local fallback is denied",
+                    profile.profile_id
+                ),
+            })
+        })
+    }
+}
+
+const SSH_WORKER_RUNNER_CAPABILITIES: &[ExecutionBackendRunnerCapability] = &[
+    ExecutionBackendRunnerCapability::RunProcess,
+    ExecutionBackendRunnerCapability::RunToolProgram,
+    ExecutionBackendRunnerCapability::ReadArtifact,
+    ExecutionBackendRunnerCapability::HealthProbe,
+    ExecutionBackendRunnerCapability::AttestationManifest,
+];
+
+/// Runner for worker RPC over an operator-managed SSH tunnel.
+#[derive(Debug)]
+pub(crate) struct SshWorkerRunner<T: SshWorkerRpcTransport> {
+    profile: SshWorkerBackendProfile,
+    transport: T,
+}
+
+impl<T: SshWorkerRpcTransport> SshWorkerRunner<T> {
+    /// Builds an SSH worker runner from an already parsed profile.
+    ///
+    /// # Errors
+    /// Returns the first profile invariant violation.
+    pub(crate) fn new(profile: SshWorkerBackendProfile, transport: T) -> Result<Self, String> {
+        profile.validate()?;
+        Ok(Self { profile, transport })
+    }
+
+    fn dispatch_remote_tool<'a>(
+        &'a self,
+        proposal_id: &'a str,
+        tool_name: &'a str,
+        input_json: &'a [u8],
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            let request = match build_ssh_worker_rpc_request(&self.profile, tool_name, input_json) {
+                Ok(request) => request,
+                Err(error) => {
+                    return ssh_worker_error_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        error.reason_code.as_str(),
+                        error.message,
+                        &self.profile,
+                    );
+                }
+            };
+            let result = match self.transport.execute(&self.profile, request.clone()).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return ssh_worker_error_outcome(
+                        proposal_id,
+                        tool_name,
+                        input_json,
+                        error.reason_code.as_str(),
+                        error.message,
+                        &self.profile,
+                    );
+                }
+            };
+            ssh_worker_outcome_from_rpc_result(
+                proposal_id,
+                tool_name,
+                input_json,
+                &self.profile,
+                &request,
+                result,
+            )
+        })
+    }
+}
+
+impl<T: SshWorkerRpcTransport> ExecutionBackendRunner for SshWorkerRunner<T> {
+    fn backend_preference(&self) -> ExecutionBackendPreference {
+        ExecutionBackendPreference::SshTunnel
+    }
+
+    fn runner_id(&self) -> &'static str {
+        "ssh_worker_runner"
+    }
+
+    fn runner_version(&self) -> &'static str {
+        "v1"
+    }
+
+    fn capabilities(&self) -> &'static [ExecutionBackendRunnerCapability] {
+        SSH_WORKER_RUNNER_CAPABILITIES
+    }
+
+    fn run_process<'a>(
+        &'a self,
+        request: ExecutionBackendProcessRunRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        if let Err(error) = validate_ssh_worker_process_input(request.config, request.input_json) {
+            return Box::pin(async move {
+                ssh_worker_error_outcome(
+                    request.proposal_id,
+                    request.tool_name,
+                    request.input_json,
+                    error.reason_code.as_str(),
+                    error.message,
+                    &self.profile,
+                )
+            });
+        }
+        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+    }
+
+    fn run_tool_program<'a>(
+        &'a self,
+        request: ExecutionBackendToolProgramRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+    }
+
+    fn read_artifact<'a>(
+        &'a self,
+        request: ExecutionBackendArtifactRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        self.dispatch_remote_tool(request.proposal_id, request.tool_name, request.input_json)
+    }
+
+    fn health_probe(&self) -> ExecutionBackendRunnerHealth {
+        self.transport.health_probe(&self.profile)
+    }
+}
+
+fn build_ssh_worker_rpc_request(
+    profile: &SshWorkerBackendProfile,
+    tool_name: &str,
+    input_json: &[u8],
+) -> Result<SshWorkerRpcRequestEnvelope, SshWorkerTransportError> {
+    let tool_kind =
+        WorkerRemoteToolKind::from_tool_name(tool_name).ok_or_else(|| SshWorkerTransportError {
+            reason_code: "ssh_worker.tool_unsupported".to_owned(),
+            message: format!("SSH worker RPC does not support tool {tool_name}"),
+        })?;
+    let input_json = std::str::from_utf8(input_json).map_err(|error| SshWorkerTransportError {
+        reason_code: "ssh_worker.input.not_utf8".to_owned(),
+        message: format!("SSH worker RPC input must be UTF-8 JSON: {error}"),
+    })?;
+    let required_capability = tool_kind.required_capability();
+    if !profile.capabilities.iter().any(|capability| capability == required_capability.as_str()) {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.capability_missing".to_owned(),
+            message: format!(
+                "SSH worker profile {} does not advertise {required_capability}",
+                profile.profile_id
+            ),
+        });
+    }
+    Ok(SshWorkerRpcRequestEnvelope {
+        protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+        schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+        request_id: Ulid::new().to_string(),
+        profile_id: profile.profile_id.clone(),
+        tunnel_endpoint_sha256: sha256_hex(profile.tunnel_endpoint.as_bytes()),
+        tool_name: tool_name.to_owned(),
+        tool_kind,
+        input_json: input_json.to_owned(),
+        input_json_sha256: sha256_hex(input_json.as_bytes()),
+        worker_protocol: profile.worker_protocol.clone(),
+        health_probe: profile.health_probe.clone(),
+        negotiated_capabilities: profile.capabilities.clone(),
+        workspace_strategy_digest: profile.workspace_strategy.attestation_digest_sha256(),
+        artifact_transport: "ssh_worker_rpc_manifest_bundle_transfer".to_owned(),
+        writeback_mode: profile.workspace_strategy.writeback.as_str().to_owned(),
+    })
+}
+
+fn validate_ssh_worker_process_input(
+    config: &ToolCallConfig,
+    input_json: &[u8],
+) -> Result<(), SshWorkerTransportError> {
+    let input =
+        parse_process_runner_tool_input(input_json).map_err(|error| SshWorkerTransportError {
+            reason_code: "ssh_worker.process.invalid_input".to_owned(),
+            message: format!("SshWorkerRunner rejected process input: {error}"),
+        })?;
+    if input.background || input.keep_running_after_run {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.background_unsupported".to_owned(),
+            message: "SshWorkerRunner does not support background process handles yet".to_owned(),
+        });
+    }
+    if !input.prepend_path.is_empty() {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.prepend_path_unsupported".to_owned(),
+            message: "SshWorkerRunner does not accept host PATH injection".to_owned(),
+        });
+    }
+    if input.env.keys().any(|name| is_sensitive_key(name.as_str())) {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.secret_env_denied".to_owned(),
+            message: "SshWorkerRunner rejects sensitive env names in tool input".to_owned(),
+        });
+    }
+    let command = input.command.trim();
+    if command.is_empty() || command.chars().any(char::is_whitespace) {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.invalid_command".to_owned(),
+            message: "SshWorkerRunner requires a single executable token in command".to_owned(),
+        });
+    }
+    if ssh_worker_command_is_raw_shell(command) {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.raw_shell_denied".to_owned(),
+            message: "SshWorkerRunner uses worker RPC envelopes and refuses raw shell dispatch"
+                .to_owned(),
+        });
+    }
+    if !config
+        .process_runner
+        .allowed_executables
+        .iter()
+        .any(|entry| docker_command_allowlist_matches(entry, command))
+    {
+        return Err(SshWorkerTransportError {
+            reason_code: "ssh_worker.process.executable_denied".to_owned(),
+            message: format!("SshWorkerRunner command {command:?} is not in the process allowlist"),
+        });
+    }
+    Ok(())
+}
+
+fn ssh_worker_command_is_raw_shell(command: &str) -> bool {
+    let command_name =
+        Path::new(command).file_name().and_then(|name| name.to_str()).unwrap_or(command);
+    matches!(
+        command_name.to_ascii_lowercase().as_str(),
+        "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "cmd.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "pwsh"
+            | "pwsh.exe"
+    )
+}
+
+fn ssh_worker_outcome_from_rpc_result(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    profile: &SshWorkerBackendProfile,
+    request: &SshWorkerRpcRequestEnvelope,
+    result: SshWorkerRpcResultEnvelope,
+) -> ToolExecutionOutcome {
+    if result.protocol != WORKER_REMOTE_TOOL_PROTOCOL
+        || result.schema_version != WORKER_REMOTE_TOOL_SCHEMA_VERSION
+        || result.request_id != request.request_id
+    {
+        return ssh_worker_error_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            "ssh_worker.result.binding_mismatch",
+            "SSH worker RPC result did not match the request envelope".to_owned(),
+            profile,
+        );
+    }
+    if sha256_hex(result.output_json.as_bytes()) != result.output_json_sha256 {
+        return ssh_worker_error_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            "ssh_worker.result.digest_mismatch",
+            "SSH worker RPC output digest mismatch".to_owned(),
+            profile,
+        );
+    }
+    if !result.cleanup_report.is_verified() {
+        return ssh_worker_error_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            "ssh_worker.cleanup.incomplete",
+            "SSH worker RPC cleanup report was incomplete".to_owned(),
+            profile,
+        );
+    }
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        result.success,
+        result.output_json.into_bytes(),
+        result.error.unwrap_or_default(),
+        false,
+        "ssh_tunnel".to_owned(),
+        format!(
+            "ssh_worker_rpc;profile_id={};workspace_strategy_sha256={};output_manifest_sha256={}",
+            profile.profile_id, request.workspace_strategy_digest, result.output_manifest_sha256
+        ),
+    )
+}
+
+fn ssh_worker_error_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    reason_code: &str,
+    message: String,
+    profile: &SshWorkerBackendProfile,
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "event": "execution_backend.ssh_worker_runner",
+        "status": "unavailable",
+        "backend": ExecutionBackendPreference::SshTunnel.as_str(),
+        "profile_id": profile.profile_id,
+        "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+        "tunnel_endpoint_sha256": sha256_hex(profile.tunnel_endpoint.as_bytes()),
+        "reason_code": reason_code,
+        "repair_hint": "Attach an operator-managed palyra-worker-rpc/v1 SSH tunnel profile or select a different execution backend.",
+    });
+    let redacted_message = redact_diagnostic_text(message.as_str());
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        redacted_message,
+        false,
+        "ssh_tunnel".to_owned(),
+        "ssh_worker_rpc_unavailable".to_owned(),
+    )
 }
 
 /// Parses an operator-supplied backend preference, accepting short aliases
@@ -3279,11 +3835,11 @@ fn ssh_tunnel_inventory_record(rollout: FeatureRolloutSetting) -> ExecutionBacke
         selected_by_default: false,
         description: ExecutionBackendPreference::SshTunnel.description().to_owned(),
         operator_summary: if rollout.enabled {
-            "Preview backend is enabled. Operators must still establish an explicit SSH forward before relying on remote control-plane flows."
+            "Preview backend is enabled. Operators must configure an SSH worker RPC profile and attach the tunnel before remote dispatch can run."
                 .to_owned()
         } else {
             format!(
-                "Preview backend is disabled. Set {}=1 before advertising SSH tunnel workflows.",
+                "Preview backend is disabled. Set {}=1 before advertising SSH worker RPC workflows.",
                 EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV
             )
         },
@@ -3292,24 +3848,28 @@ fn ssh_tunnel_inventory_record(rollout: FeatureRolloutSetting) -> ExecutionBacke
         rollout_source: Some(rollout.source),
         rollout_enabled: rollout.enabled,
         capabilities: vec![
-            "verified_remote_dashboard_access".to_owned(),
-            "operator_handoff".to_owned(),
+            "ssh_worker_rpc_envelope".to_owned(),
+            "worker_capability_negotiation".to_owned(),
+            "vault_scoped_secret_delivery".to_owned(),
+            "manifest_attested_artifact_transport".to_owned(),
+            "patch_bundle_writeback".to_owned(),
         ],
         tradeoffs: vec![
-            "Useful for explicit remote operator access and controlled handoff".to_owned(),
-            "Requires manual tunnel setup and does not replace sandbox or node trust boundaries"
+            "Uses only the palyra-worker-rpc/v1 envelope over an operator-managed tunnel"
+                .to_owned(),
+            "Requires vault-backed SSH identity handles and explicit tunnel health negotiation"
                 .to_owned(),
         ],
-        requires_attestation: false,
+        requires_attestation: true,
         requires_egress_proxy: false,
         attestation_mode: BackendAttestationMode::VaultIdentity,
-        workspace_strategy: WorkspaceStrategyDescriptor::operator_managed_remote(),
-        workspace_scope_mode: "operator_managed_remote_scope".to_owned(),
-        artifact_transport: "out_of_band_operator_tunnel".to_owned(),
-        cleanup_strategy: "operator_managed_tunnel_teardown".to_owned(),
-        supports_cancellation: false,
-        supports_cleanup: false,
-        health_probe: "operator_tunnel_connectivity_check".to_owned(),
+        workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
+        workspace_scope_mode: "ssh_worker_remote_lease_scope".to_owned(),
+        artifact_transport: "ssh_worker_rpc_manifest_bundle_transfer".to_owned(),
+        cleanup_strategy: "worker_rpc_cleanup_attestation".to_owned(),
+        supports_cancellation: true,
+        supports_cleanup: true,
+        health_probe: "ssh_worker_rpc_health_and_capability_negotiation".to_owned(),
         active_node_count: 0,
         total_node_count: 0,
     }
@@ -3343,13 +3903,17 @@ mod tests {
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
     use palyra_common::runtime_preview::RuntimePreviewMode;
-    use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
+    use palyra_workerd::{
+        WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
+        WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+    };
 
     use crate::config::{
         ExecutionBackendContainerEnvBindingConfig, ExecutionBackendContainerProfileConfig,
         ExecutionBackendContainerResourceLimitsConfig,
         ExecutionBackendContainerWorkspaceMountConfig, ExecutionBackendProfileConfig,
-        ExecutionBackendProfilesConfig, NetworkedWorkersConfig,
+        ExecutionBackendProfilesConfig, ExecutionBackendSshWorkerProfileConfig,
+        NetworkedWorkersConfig,
     };
     use crate::journal::{ToolJobRecord, ToolJobState};
     use crate::sandbox_runner::{
@@ -3363,7 +3927,7 @@ mod tests {
         apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
         parse_execution_backend_preference, plan_stuck_tool_job_recovery, prepare_docker_run_plan,
-        resolve_execution_backend, resolve_execution_backend_for_request,
+        resolve_execution_backend, resolve_execution_backend_for_request, sha256_hex,
         validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
         ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
@@ -3371,10 +3935,12 @@ mod tests {
         DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
-        ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
-        ExecutionBackendState, FeatureRolloutSetting, SshWorkerBackendProfile,
-        StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor, WorkspaceStrategyKind,
-        WorkspaceWritebackMode,
+        ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
+        ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
+        OperatorManagedSshTunnelTransport, SshWorkerBackendProfile, SshWorkerRpcFuture,
+        SshWorkerRpcRequestEnvelope, SshWorkerRpcResultEnvelope, SshWorkerRpcTransport,
+        SshWorkerRunner, StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor,
+        WorkspaceStrategyKind, WorkspaceWritebackMode,
     };
 
     const SAFE_DOCKER_IMAGE: &str =
@@ -3479,6 +4045,44 @@ mod tests {
                 }],
                 cleanup_strategy: "remove_container_and_volume".to_owned(),
             }),
+            ssh_worker: None,
+        }
+    }
+
+    fn safe_ssh_worker_profile() -> SshWorkerBackendProfile {
+        SshWorkerBackendProfile {
+            profile_id: "ssh-worker".to_owned(),
+            tunnel_endpoint: "127.0.0.1:7142".to_owned(),
+            host_handle: "vault://ssh/host".to_owned(),
+            user_handle: "identity://ssh/user".to_owned(),
+            identity_handle: "vault://ssh/key".to_owned(),
+            host_trust_handle: "vault://ssh/known-host".to_owned(),
+            worker_protocol: "palyra-worker-rpc/v1".to_owned(),
+            health_probe: "ssh_worker_rpc_health".to_owned(),
+            capabilities: vec![
+                "tool:palyra.process.run".to_owned(),
+                "tool:palyra.artifact.read".to_owned(),
+            ],
+            workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
+        }
+    }
+
+    fn safe_ssh_worker_profile_config(id: &str, enabled: bool) -> ExecutionBackendProfileConfig {
+        ExecutionBackendProfileConfig {
+            id: id.to_owned(),
+            enabled,
+            kind: "ssh_tunnel".to_owned(),
+            container: None,
+            ssh_worker: Some(ExecutionBackendSshWorkerProfileConfig {
+                tunnel_endpoint: "127.0.0.1:7142".to_owned(),
+                host_handle: "vault://ssh/host".to_owned(),
+                user_handle: "identity://ssh/user".to_owned(),
+                identity_handle: "vault://ssh/key".to_owned(),
+                host_trust_handle: "vault://ssh/known-host".to_owned(),
+                worker_protocol: "palyra-worker-rpc/v1".to_owned(),
+                health_probe: "ssh_worker_rpc_health".to_owned(),
+                capabilities: vec!["tool:palyra.process.run".to_owned()],
+            }),
         }
     }
 
@@ -3525,6 +4129,62 @@ mod tests {
             Box::pin(async move {
                 plans.lock().expect("fake docker plan lock").push(plan);
                 result
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeSshWorkerTransport {
+        requests: Arc<Mutex<Vec<SshWorkerRpcRequestEnvelope>>>,
+        result_json: serde_json::Value,
+    }
+
+    impl FakeSshWorkerTransport {
+        fn new(
+            result_json: serde_json::Value,
+        ) -> (Self, Arc<Mutex<Vec<SshWorkerRpcRequestEnvelope>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (Self { requests: Arc::clone(&requests), result_json }, requests)
+        }
+    }
+
+    impl SshWorkerRpcTransport for FakeSshWorkerTransport {
+        fn health_probe(&self, _profile: &SshWorkerBackendProfile) -> ExecutionBackendRunnerHealth {
+            ExecutionBackendRunnerHealth {
+                backend_id: ExecutionBackendPreference::SshTunnel.as_str().to_owned(),
+                status: ExecutionBackendHealthStatus::Healthy,
+                reason_code: "runner.health.ssh_worker.fake_ready".to_owned(),
+                summary: "fake SSH worker transport is ready".to_owned(),
+            }
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _profile: &'a SshWorkerBackendProfile,
+            request: SshWorkerRpcRequestEnvelope,
+        ) -> SshWorkerRpcFuture<'a> {
+            let requests = Arc::clone(&self.requests);
+            let result_json = self.result_json.clone();
+            Box::pin(async move {
+                requests.lock().expect("fake ssh requests").push(request.clone());
+                let output_json =
+                    serde_json::to_string(&result_json).expect("fake ssh output should serialize");
+                Ok(SshWorkerRpcResultEnvelope {
+                    protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+                    schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    success: true,
+                    output_json: output_json.clone(),
+                    output_json_sha256: sha256_hex(output_json.as_bytes()),
+                    error: None,
+                    output_manifest_sha256: sha256_hex(b"ssh-worker-output-manifest"),
+                    cleanup_report: WorkerCleanupReport {
+                        removed_workspace_scope: true,
+                        removed_artifacts: true,
+                        removed_logs: true,
+                        failure_reason: None,
+                    },
+                })
             })
         }
     }
@@ -3694,6 +4354,44 @@ mod tests {
             .expect_err("multiple enabled Docker profiles must fail closed");
 
         assert!(error.contains("at most one Docker profile"), "{error}");
+    }
+
+    #[test]
+    fn runner_registry_builds_ssh_worker_runner_from_profile_config() {
+        let profiles = ExecutionBackendProfilesConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            profiles: vec![safe_ssh_worker_profile_config("ssh-worker", true)],
+        };
+
+        let registry = ExecutionBackendRunnerRegistry::from_execution_backend_profiles(&profiles)
+            .expect("valid SSH worker profile should build a registry");
+
+        let runner = registry
+            .select_runner(
+                ExecutionBackendPreference::SshTunnel,
+                ExecutionBackendRunnerCapability::RunProcess,
+            )
+            .expect("configured SSH worker runner should be selectable");
+        assert_eq!(runner.runner_id(), "ssh_worker_runner");
+        let health = runner.health_probe();
+        assert_eq!(health.status, ExecutionBackendHealthStatus::Unavailable);
+        assert_eq!(health.reason_code, "runner.health.ssh_worker.tunnel_unavailable");
+    }
+
+    #[test]
+    fn runner_registry_rejects_multiple_enabled_ssh_worker_profiles() {
+        let profiles = ExecutionBackendProfilesConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            profiles: vec![
+                safe_ssh_worker_profile_config("ssh-a", true),
+                safe_ssh_worker_profile_config("ssh-b", true),
+            ],
+        };
+
+        let error = ExecutionBackendRunnerRegistry::from_execution_backend_profiles(&profiles)
+            .expect_err("multiple enabled SSH worker profiles must fail closed");
+
+        assert!(error.contains("at most one SSH worker profile"), "{error}");
     }
 
     #[test]
@@ -3930,6 +4628,120 @@ mod tests {
             serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
         assert_eq!(payload["cleanup"]["success"], false);
         assert_eq!(payload["cleanup"]["reason_code"], "docker.cleanup.remove_failed");
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_fake_process_run_uses_worker_rpc_envelope() {
+        let (transport, requests) = FakeSshWorkerTransport::new(
+            serde_json::json!({"exit_code": 0, "stdout": "runner-ok\n"}),
+        );
+        let runner = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-process",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        assert_eq!(outcome.attestation.executor, "ssh_tunnel");
+        assert!(outcome
+            .attestation
+            .sandbox_enforcement
+            .contains("ssh_worker_rpc;profile_id=ssh-worker"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("SSH worker output should be JSON");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["stdout"], "runner-ok\n");
+
+        let requests = requests.lock().expect("fake SSH requests");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.protocol, WORKER_REMOTE_TOOL_PROTOCOL);
+        assert_eq!(request.schema_version, WORKER_REMOTE_TOOL_SCHEMA_VERSION);
+        assert_eq!(request.tool_name, "palyra.process.run");
+        assert_eq!(request.tool_kind, WorkerRemoteToolKind::ProcessRun);
+        assert_eq!(request.worker_protocol, "palyra-worker-rpc/v1");
+        assert!(request
+            .negotiated_capabilities
+            .iter()
+            .any(|capability| capability == "tool:palyra.process.run"));
+        assert!(!serde_json::to_string(request)
+            .expect("request should serialize")
+            .contains("vault://ssh/key"));
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_unavailable_tunnel_fails_closed_without_shell() {
+        let runner =
+            SshWorkerRunner::new(safe_ssh_worker_profile(), OperatorManagedSshTunnelTransport)
+                .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-unavailable",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("local fallback is denied"));
+        assert!(!outcome.error.contains("vault://ssh/key"));
+        assert_eq!(outcome.attestation.executor, "ssh_tunnel");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "ssh_worker_rpc_unavailable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("SSH worker error should be JSON");
+        assert_eq!(payload["reason_code"], "runner.unavailable.ssh_tunnel");
+        assert_eq!(payload["protocol"], WORKER_REMOTE_TOOL_PROTOCOL);
+        assert!(payload
+            .get("tunnel_endpoint_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_rejects_raw_shell_process_input() {
+        let (transport, requests) =
+            FakeSshWorkerTransport::new(serde_json::json!({"exit_code": 0}));
+        let runner = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["bash".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-shell",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"bash","args":["-lc","echo unsafe"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("refuses raw shell dispatch"));
+        assert!(requests.lock().expect("fake SSH requests").is_empty());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("SSH worker error should be JSON");
+        assert_eq!(payload["reason_code"], "ssh_worker.process.raw_shell_denied");
     }
 
     #[test]
@@ -4445,20 +5257,22 @@ mod tests {
     fn ssh_worker_profile_requires_vault_identity_handles_and_worker_rpc() {
         let mut profile = SshWorkerBackendProfile {
             profile_id: "ssh-worker".to_owned(),
+            tunnel_endpoint: "127.0.0.1:7142".to_owned(),
             host_handle: "vault://ssh/host".to_owned(),
             user_handle: "identity://ssh/user".to_owned(),
             identity_handle: "vault://ssh/key".to_owned(),
             host_trust_handle: "vault://ssh/known-host".to_owned(),
             worker_protocol: "palyra-worker-rpc/v1".to_owned(),
+            health_probe: "ssh_worker_rpc_health".to_owned(),
+            capabilities: vec!["tool:palyra.process.run".to_owned()],
             workspace_strategy: WorkspaceStrategyDescriptor::remote_lease_workspace(),
         };
         assert!(profile.validate().is_ok());
 
         profile.identity_handle = "-----BEGIN PRIVATE KEY-----".to_owned();
-        assert!(profile
-            .validate()
-            .expect_err("plaintext identity material must fail closed")
-            .contains("identity_handle"));
+        let error = profile.validate().expect_err("plaintext identity material must fail closed");
+        assert!(error.contains("identity_handle"));
+        assert!(!error.contains("BEGIN PRIVATE KEY"));
         profile.identity_handle = "vault://ssh/key".to_owned();
         profile.worker_protocol = "raw-shell".to_owned();
         assert!(profile

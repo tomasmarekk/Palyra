@@ -8790,14 +8790,14 @@
       "rollout_flag": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
       "rollout_enabled": false,
       "tradeoffs": [
-        "Useful for explicit remote operator access and controlled handoff",
-        "Requires manual tunnel setup and does not replace sandbox or node trust boundaries"
+        "Uses only the palyra-worker-rpc/v1 envelope over an operator-managed tunnel",
+        "Requires vault-backed SSH identity handles and explicit tunnel health negotiation"
       ],
-      "requires_attestation": false,
+      "requires_attestation": true,
       "requires_egress_proxy": false,
-      "workspace_scope_mode": "operator_managed_remote_scope",
-      "artifact_transport": "out_of_band_operator_tunnel",
-      "cleanup_strategy": "operator_managed_tunnel_teardown"
+      "workspace_scope_mode": "ssh_worker_remote_lease_scope",
+      "artifact_transport": "ssh_worker_rpc_manifest_bundle_transfer",
+      "cleanup_strategy": "worker_rpc_cleanup_attestation"
     }
   ],
   "compat_routes": [

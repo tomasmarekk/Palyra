@@ -676,6 +676,7 @@ pub struct ExecutionBackendProfileConfig {
     pub enabled: bool,
     pub kind: String,
     pub container: Option<ExecutionBackendContainerProfileConfig>,
+    pub ssh_worker: Option<ExecutionBackendSshWorkerProfileConfig>,
 }
 
 /// Container-specific execution backend profile.
@@ -714,6 +715,19 @@ pub struct ExecutionBackendContainerEnvBindingConfig {
     pub name: String,
     pub source_kind: String,
     pub value: String,
+}
+
+/// SSH worker RPC execution backend profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionBackendSshWorkerProfileConfig {
+    pub tunnel_endpoint: String,
+    pub host_handle: String,
+    pub user_handle: String,
+    pub identity_handle: String,
+    pub host_trust_handle: String,
+    pub worker_protocol: String,
+    pub health_probe: String,
+    pub capabilities: Vec<String>,
 }
 
 /// Observability exporter registry preview.
