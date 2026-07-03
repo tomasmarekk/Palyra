@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::{
+    execution_backends::ExecutionBackendRunnerRegistry,
     gateway::{
         ToolApprovalOutcome, ToolSkillContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON,
         APPROVAL_DENIED_REASON, SKILL_EXECUTION_DENY_REASON_PREFIX,
@@ -588,6 +589,10 @@ fn backend_gate_step(
     backend_selection: &ToolProposalBackendSelection,
     capability_gate_decision: Option<&ToolDecision>,
 ) -> ExecutionGateStep {
+    let runner_selection = ExecutionBackendRunnerRegistry::default().selection_event(
+        backend_selection.requested_preference,
+        backend_selection.resolution.resolved,
+    );
     if let Some(capability_gate_decision) = capability_gate_decision {
         return ExecutionGateStep {
             gate_id: "backend_selection".to_owned(),
@@ -605,6 +610,7 @@ fn backend_gate_step(
                 "backend_reason_code": backend_selection.resolution.reason_code,
                 "backend_reason": backend_selection.resolution.reason,
                 "agent_id": backend_selection.agent_id,
+                "runner_selection": runner_selection,
             }),
         };
     }
@@ -633,6 +639,7 @@ fn backend_gate_step(
             "approval_required": backend_selection.resolution.approval_required,
             "reason": backend_selection.resolution.reason,
             "agent_id": backend_selection.agent_id,
+            "runner_selection": runner_selection,
         }),
     }
 }
@@ -1247,5 +1254,24 @@ mod tests {
             .iter()
             .any(|step| step["gate_id"] == json!("audit.finalization")
                 && step["reason_code"] == json!("audit.finalized")));
+        let backend_step = value["steps"]
+            .as_array()
+            .expect("steps should be an array")
+            .iter()
+            .find(|step| step["gate_id"] == json!("backend_selection"))
+            .expect("backend selection step should be present");
+        assert_eq!(
+            backend_step["metadata"]["runner_selection"]["event"],
+            json!("execution_backend.runner_selected")
+        );
+        assert_eq!(
+            backend_step["metadata"]["runner_selection"]["runner_id"],
+            json!("local_sandbox_runner")
+        );
+        assert!(backend_step["metadata"]["runner_selection"]["capabilities"]
+            .as_array()
+            .expect("runner capabilities should be an array")
+            .iter()
+            .any(|capability| capability == &json!("run_process")));
     }
 }

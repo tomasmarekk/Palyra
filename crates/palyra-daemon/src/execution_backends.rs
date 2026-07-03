@@ -10,7 +10,13 @@
 
 #![allow(dead_code)]
 
-use std::{collections::BTreeSet, env};
+use std::{
+    collections::BTreeSet,
+    env,
+    future::Future,
+    pin::Pin,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use palyra_common::feature_rollouts::{
     FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
@@ -27,7 +33,13 @@ use crate::{
     config::{FeatureRolloutsConfig, NetworkedWorkersConfig},
     journal::{ToolJobRecord, ToolJobState},
     node_runtime::RegisteredNodeRecord,
-    sandbox_runner::{process_runner_executor_name, SandboxProcessRunnerPolicy},
+    sandbox_runner::{
+        process_runner_executor_name, ProcessProgressSink, SandboxProcessRunnerPolicy,
+    },
+    tool_protocol::{
+        build_tool_execution_outcome, execute_tool_call_with_cancellation_and_progress,
+        ToolCallConfig, ToolExecutionOutcome,
+    },
 };
 
 /// A desktop node counts as healthy only when seen within this window.
@@ -466,6 +478,490 @@ impl ExecutionBackend for ExecutionBackendInventoryRecord {
     fn health_probe(&self) -> &str {
         self.health_probe.as_str()
     }
+}
+
+/// Discrete runtime operations a backend runner may implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionBackendRunnerCapability {
+    RunProcess,
+    RunToolProgram,
+    ReadArtifact,
+    WriteArtifact,
+    OpenWorkspace,
+    CommitOrPatchBundle,
+    Cancel,
+    Cleanup,
+    HealthProbe,
+    AttestationManifest,
+}
+
+impl ExecutionBackendRunnerCapability {
+    /// Stable snake_case identifier used in selection diagnostics.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunProcess => "run_process",
+            Self::RunToolProgram => "run_tool_program",
+            Self::ReadArtifact => "read_artifact",
+            Self::WriteArtifact => "write_artifact",
+            Self::OpenWorkspace => "open_workspace",
+            Self::CommitOrPatchBundle => "commit_or_patch_bundle",
+            Self::Cancel => "cancel",
+            Self::Cleanup => "cleanup",
+            Self::HealthProbe => "health_probe",
+            Self::AttestationManifest => "attestation_manifest",
+        }
+    }
+}
+
+/// Registry selection record suitable for journal and trajectory metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendRunnerSelection {
+    pub(crate) event: String,
+    pub(crate) requested_backend: String,
+    pub(crate) resolved_backend: String,
+    pub(crate) runner_id: String,
+    pub(crate) runner_version: String,
+    pub(crate) reason_code: String,
+    pub(crate) capabilities: Vec<String>,
+}
+
+/// Minimal runner manifest used before the full backend attestation milestone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendRunnerManifest {
+    pub(crate) backend_id: String,
+    pub(crate) runner_id: String,
+    pub(crate) runner_version: String,
+    pub(crate) workspace_strategy_digest: String,
+    pub(crate) capabilities: Vec<String>,
+}
+
+/// Health probe result for a concrete execution runner implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendRunnerHealth {
+    pub(crate) backend_id: String,
+    pub(crate) status: ExecutionBackendHealthStatus,
+    pub(crate) reason_code: String,
+    pub(crate) summary: String,
+}
+
+/// Process-run dispatch request passed from gateway runtime into a runner.
+pub(crate) struct ExecutionBackendProcessRunRequest<'a> {
+    pub(crate) config: &'a ToolCallConfig,
+    pub(crate) proposal_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) input_json: &'a [u8],
+    pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
+    pub(crate) process_progress_sink: Option<ProcessProgressSink>,
+}
+
+/// Tool-program dispatch placeholder for runner implementations.
+pub(crate) struct ExecutionBackendToolProgramRequest<'a> {
+    pub(crate) proposal_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) input_json: &'a [u8],
+}
+
+/// Artifact dispatch placeholder for runner implementations.
+pub(crate) struct ExecutionBackendArtifactRequest<'a> {
+    pub(crate) proposal_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) input_json: &'a [u8],
+}
+
+/// Workspace dispatch placeholder for runner implementations.
+pub(crate) struct ExecutionBackendWorkspaceRequest<'a> {
+    pub(crate) proposal_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) input_json: &'a [u8],
+}
+
+/// Cancellation/cleanup dispatch placeholder for runner implementations.
+pub(crate) struct ExecutionBackendLifecycleRequest<'a> {
+    pub(crate) proposal_id: &'a str,
+    pub(crate) tool_name: &'a str,
+    pub(crate) input_json: &'a [u8],
+}
+
+type RunnerExecutionFuture<'a> = Pin<Box<dyn Future<Output = ToolExecutionOutcome> + Send + 'a>>;
+
+/// Executable backend contract used by the gateway runtime dispatcher.
+///
+/// Inventory still describes what a backend could do; this trait is the
+/// execution boundary that actually owns dispatch. Unsupported operations
+/// return explicit unavailable outcomes, so a selected backend can never
+/// silently fall back to host-local execution.
+pub(crate) trait ExecutionBackendRunner: Send + Sync {
+    fn backend_preference(&self) -> ExecutionBackendPreference;
+    fn runner_id(&self) -> &'static str;
+    fn runner_version(&self) -> &'static str;
+    fn capabilities(&self) -> &'static [ExecutionBackendRunnerCapability];
+
+    fn run_process<'a>(
+        &'a self,
+        request: ExecutionBackendProcessRunRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::RunProcess,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn run_tool_program<'a>(
+        &'a self,
+        request: ExecutionBackendToolProgramRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::RunToolProgram,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn read_artifact<'a>(
+        &'a self,
+        request: ExecutionBackendArtifactRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::ReadArtifact,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn write_artifact<'a>(
+        &'a self,
+        request: ExecutionBackendArtifactRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::WriteArtifact,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn open_workspace<'a>(
+        &'a self,
+        request: ExecutionBackendWorkspaceRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::OpenWorkspace,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn commit_or_patch_bundle<'a>(
+        &'a self,
+        request: ExecutionBackendWorkspaceRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::CommitOrPatchBundle,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        request: ExecutionBackendLifecycleRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::Cancel,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        request: ExecutionBackendLifecycleRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            unavailable_runner_operation_outcome(
+                self,
+                ExecutionBackendRunnerCapability::Cleanup,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+            )
+        })
+    }
+
+    fn health_probe(&self) -> ExecutionBackendRunnerHealth;
+
+    fn attestation_manifest(
+        &self,
+        workspace_strategy: &WorkspaceStrategyDescriptor,
+    ) -> ExecutionBackendRunnerManifest {
+        ExecutionBackendRunnerManifest {
+            backend_id: self.backend_preference().as_str().to_owned(),
+            runner_id: self.runner_id().to_owned(),
+            runner_version: self.runner_version().to_owned(),
+            workspace_strategy_digest: workspace_strategy.attestation_digest_sha256(),
+            capabilities: runner_capability_strings(self.capabilities()),
+        }
+    }
+}
+
+/// Adapter from the new runner contract to the existing local sandbox runtime.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocalSandboxRunner;
+
+impl ExecutionBackendRunner for LocalSandboxRunner {
+    fn backend_preference(&self) -> ExecutionBackendPreference {
+        ExecutionBackendPreference::LocalSandbox
+    }
+
+    fn runner_id(&self) -> &'static str {
+        "local_sandbox_runner"
+    }
+
+    fn runner_version(&self) -> &'static str {
+        "v1"
+    }
+
+    fn capabilities(&self) -> &'static [ExecutionBackendRunnerCapability] {
+        &[
+            ExecutionBackendRunnerCapability::RunProcess,
+            ExecutionBackendRunnerCapability::RunToolProgram,
+            ExecutionBackendRunnerCapability::ReadArtifact,
+            ExecutionBackendRunnerCapability::WriteArtifact,
+            ExecutionBackendRunnerCapability::OpenWorkspace,
+            ExecutionBackendRunnerCapability::CommitOrPatchBundle,
+            ExecutionBackendRunnerCapability::Cancel,
+            ExecutionBackendRunnerCapability::Cleanup,
+            ExecutionBackendRunnerCapability::HealthProbe,
+            ExecutionBackendRunnerCapability::AttestationManifest,
+        ]
+    }
+
+    fn run_process<'a>(
+        &'a self,
+        request: ExecutionBackendProcessRunRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            execute_tool_call_with_cancellation_and_progress(
+                request.config,
+                request.proposal_id,
+                request.tool_name,
+                request.input_json,
+                request.cancellation_requested,
+                request.process_progress_sink,
+            )
+            .await
+        })
+    }
+
+    fn health_probe(&self) -> ExecutionBackendRunnerHealth {
+        ExecutionBackendRunnerHealth {
+            backend_id: ExecutionBackendPreference::LocalSandbox.as_str().to_owned(),
+            status: ExecutionBackendHealthStatus::Healthy,
+            reason_code: "runner.health.local_sandbox.ready".to_owned(),
+            summary: "local sandbox runner is available in-process".to_owned(),
+        }
+    }
+}
+
+/// Registry of concrete runners available to the daemon process.
+#[derive(Debug, Default)]
+pub(crate) struct ExecutionBackendRunnerRegistry {
+    local_sandbox: LocalSandboxRunner,
+}
+
+impl ExecutionBackendRunnerRegistry {
+    /// Selects a runner for the resolved backend and required operation.
+    pub(crate) fn select_runner(
+        &self,
+        backend: ExecutionBackendPreference,
+        required_capability: ExecutionBackendRunnerCapability,
+    ) -> Result<&dyn ExecutionBackendRunner, ExecutionBackendRunnerSelectionError> {
+        match backend {
+            ExecutionBackendPreference::Automatic | ExecutionBackendPreference::LocalSandbox => {
+                let runner = &self.local_sandbox;
+                if runner.capabilities().contains(&required_capability) {
+                    Ok(runner)
+                } else {
+                    Err(ExecutionBackendRunnerSelectionError::missing_capability(
+                        backend,
+                        runner.runner_id(),
+                        required_capability,
+                    ))
+                }
+            }
+            ExecutionBackendPreference::DesktopNode
+            | ExecutionBackendPreference::Docker
+            | ExecutionBackendPreference::NetworkedWorker
+            | ExecutionBackendPreference::SshTunnel => {
+                Err(ExecutionBackendRunnerSelectionError::unavailable_backend(
+                    backend,
+                    required_capability,
+                ))
+            }
+        }
+    }
+
+    /// Returns the runner metadata emitted into backend selection reports.
+    pub(crate) fn selection_event(
+        &self,
+        requested_backend: ExecutionBackendPreference,
+        resolved_backend: ExecutionBackendPreference,
+    ) -> ExecutionBackendRunnerSelection {
+        match self.select_runner(resolved_backend, ExecutionBackendRunnerCapability::OpenWorkspace)
+        {
+            Ok(runner) => ExecutionBackendRunnerSelection {
+                event: "execution_backend.runner_selected".to_owned(),
+                requested_backend: requested_backend.as_str().to_owned(),
+                resolved_backend: resolved_backend.as_str().to_owned(),
+                runner_id: runner.runner_id().to_owned(),
+                runner_version: runner.runner_version().to_owned(),
+                reason_code: format!("runner.selected.{}", runner.runner_id()),
+                capabilities: runner_capability_strings(runner.capabilities()),
+            },
+            Err(error) => error.selection_event(requested_backend),
+        }
+    }
+}
+
+/// Fail-closed runner selection failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecutionBackendRunnerSelectionError {
+    backend: ExecutionBackendPreference,
+    runner_id: Option<String>,
+    required_capability: ExecutionBackendRunnerCapability,
+    reason_code: String,
+    message: String,
+}
+
+impl ExecutionBackendRunnerSelectionError {
+    fn unavailable_backend(
+        backend: ExecutionBackendPreference,
+        required_capability: ExecutionBackendRunnerCapability,
+    ) -> Self {
+        Self {
+            backend,
+            runner_id: None,
+            required_capability,
+            reason_code: format!("runner.unavailable.{}", backend.as_str()),
+            message: format!(
+                "execution backend {} has no registered runner for {}; local fallback is denied",
+                backend.as_str(),
+                required_capability.as_str()
+            ),
+        }
+    }
+
+    fn missing_capability(
+        backend: ExecutionBackendPreference,
+        runner_id: &str,
+        required_capability: ExecutionBackendRunnerCapability,
+    ) -> Self {
+        Self {
+            backend,
+            runner_id: Some(runner_id.to_owned()),
+            required_capability,
+            reason_code: format!("runner.capability_missing.{}", backend.as_str()),
+            message: format!(
+                "execution backend {} runner {} does not support {}; local fallback is denied",
+                backend.as_str(),
+                runner_id,
+                required_capability.as_str()
+            ),
+        }
+    }
+
+    pub(crate) fn to_tool_execution_outcome(
+        &self,
+        proposal_id: &str,
+        tool_name: &str,
+        input_json: &[u8],
+    ) -> ToolExecutionOutcome {
+        let output = serde_json::json!({
+            "success": false,
+            "event": "execution_backend.runner_selection",
+            "status": "unavailable",
+            "backend": self.backend.as_str(),
+            "runner_id": self.runner_id.as_deref(),
+            "required_capability": self.required_capability.as_str(),
+            "reason_code": self.reason_code.as_str(),
+            "repair_hint": "Enable a runner for the selected backend or switch the agent backend preference to automatic/local_sandbox.",
+        });
+        build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+            self.message.clone(),
+            false,
+            self.backend.as_str().to_owned(),
+            "runner_selection".to_owned(),
+        )
+    }
+
+    fn selection_event(
+        &self,
+        requested_backend: ExecutionBackendPreference,
+    ) -> ExecutionBackendRunnerSelection {
+        ExecutionBackendRunnerSelection {
+            event: "execution_backend.runner_unavailable".to_owned(),
+            requested_backend: requested_backend.as_str().to_owned(),
+            resolved_backend: self.backend.as_str().to_owned(),
+            runner_id: self.runner_id.clone().unwrap_or_else(|| "unregistered".to_owned()),
+            runner_version: "unavailable".to_owned(),
+            reason_code: self.reason_code.clone(),
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+fn unavailable_runner_operation_outcome<R: ExecutionBackendRunner + ?Sized>(
+    runner: &R,
+    required_capability: ExecutionBackendRunnerCapability,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    ExecutionBackendRunnerSelectionError::missing_capability(
+        runner.backend_preference(),
+        runner.runner_id(),
+        required_capability,
+    )
+    .to_tool_execution_outcome(proposal_id, tool_name, input_json)
+}
+
+fn runner_capability_strings(capabilities: &[ExecutionBackendRunnerCapability]) -> Vec<String> {
+    capabilities.iter().map(|capability| capability.as_str().to_owned()).collect()
 }
 
 /// Default preflight: checks declared capabilities and workspace strategy
@@ -1703,8 +2199,11 @@ mod tests {
     use crate::config::NetworkedWorkersConfig;
     use crate::journal::{ToolJobRecord, ToolJobState};
     use crate::sandbox_runner::{
+        process_runner_executor_name, process_runner_sandbox_enforcement_label,
         EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
     };
+    use crate::tool_protocol::ToolCallConfig;
+    use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
     use super::{
         apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
@@ -1715,9 +2214,10 @@ mod tests {
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
         ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
-        ExecutionBackendResolutionRequest, ExecutionBackendState, FeatureRolloutSetting,
-        SshWorkerBackendProfile, StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor,
-        WorkspaceStrategyKind, WorkspaceWritebackMode,
+        ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
+        ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry, ExecutionBackendState,
+        FeatureRolloutSetting, SshWorkerBackendProfile, StuckToolJobRecoveryAction,
+        WorkspaceStrategyDescriptor, WorkspaceStrategyKind, WorkspaceWritebackMode,
     };
 
     fn test_policy() -> SandboxProcessRunnerPolicy {
@@ -1734,6 +2234,32 @@ mod tests {
             cpu_time_limit_ms: 1_000,
             memory_limit_bytes: 1_048_576,
             max_output_bytes: 1_048_576,
+        }
+    }
+
+    fn test_wasm_policy() -> WasmPluginRunnerPolicy {
+        WasmPluginRunnerPolicy {
+            enabled: false,
+            allow_inline_modules: false,
+            max_module_size_bytes: 256 * 1024,
+            fuel_budget: 10_000_000,
+            max_memory_bytes: 64 * 1024 * 1024,
+            max_table_elements: 100_000,
+            max_instances: 256,
+            allowed_http_hosts: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_storage_prefixes: Vec::new(),
+            allowed_channels: Vec::new(),
+        }
+    }
+
+    fn test_tool_call_config(process_runner: SandboxProcessRunnerPolicy) -> ToolCallConfig {
+        ToolCallConfig {
+            allowed_tools: vec!["palyra.process.run".to_owned()],
+            max_calls_per_run: 10,
+            execution_timeout_ms: 1_000,
+            process_runner,
+            wasm_runtime: test_wasm_policy(),
         }
     }
 
@@ -1794,6 +2320,95 @@ mod tests {
             resolve_execution_backend(ExecutionBackendPreference::Automatic, &inventory);
         assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
         assert!(!resolution.fallback_used);
+    }
+
+    #[test]
+    fn runner_registry_selects_local_sandbox_runner() {
+        let registry = ExecutionBackendRunnerRegistry::default();
+
+        let runner = registry
+            .select_runner(
+                ExecutionBackendPreference::LocalSandbox,
+                ExecutionBackendRunnerCapability::RunProcess,
+            )
+            .expect("local sandbox runner should implement process runs");
+        assert_eq!(runner.runner_id(), "local_sandbox_runner");
+        assert!(runner.capabilities().contains(&ExecutionBackendRunnerCapability::RunProcess));
+
+        let selection = registry.selection_event(
+            ExecutionBackendPreference::Automatic,
+            ExecutionBackendPreference::LocalSandbox,
+        );
+        assert_eq!(selection.event, "execution_backend.runner_selected");
+        assert_eq!(selection.requested_backend, "automatic");
+        assert_eq!(selection.resolved_backend, "local_sandbox");
+        assert!(selection.capabilities.iter().any(|capability| capability == "run_process"));
+    }
+
+    #[test]
+    fn runner_registry_denies_unregistered_backend_without_local_fallback() {
+        let registry = ExecutionBackendRunnerRegistry::default();
+        let error = match registry.select_runner(
+            ExecutionBackendPreference::SshTunnel,
+            ExecutionBackendRunnerCapability::OpenWorkspace,
+        ) {
+            Ok(_) => panic!("ssh tunnel must not fall back to local execution"),
+            Err(error) => error,
+        };
+
+        let outcome = error.to_tool_execution_outcome("proposal-ssh", "palyra.fs.read_file", b"{}");
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("local fallback is denied"));
+        assert_eq!(outcome.attestation.executor, "ssh_tunnel");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "runner_selection");
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("selection payload is valid JSON");
+        assert_eq!(payload["event"], "execution_backend.runner_selection");
+        assert_eq!(payload["status"], "unavailable");
+        assert_eq!(payload["backend"], "ssh_tunnel");
+        assert_eq!(payload["required_capability"], "open_workspace");
+        assert_eq!(payload["reason_code"], "runner.unavailable.ssh_tunnel");
+    }
+
+    #[tokio::test]
+    async fn local_sandbox_runner_preserves_process_run_schema() {
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+        let registry = ExecutionBackendRunnerRegistry::default();
+        let runner = registry
+            .select_runner(
+                ExecutionBackendPreference::LocalSandbox,
+                ExecutionBackendRunnerCapability::RunProcess,
+            )
+            .expect("local sandbox runner should implement process runs");
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-local-process",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("process output is valid JSON");
+        assert_eq!(payload["schema_version"], 2);
+        assert_eq!(payload["exit_code"], 0);
+        assert!(payload["stdout"].as_str().unwrap_or_default().contains("runner-ok"));
+        assert_eq!(
+            outcome.attestation.executor,
+            process_runner_executor_name(&config.process_runner)
+        );
+        assert_eq!(
+            outcome.attestation.sandbox_enforcement,
+            process_runner_sandbox_enforcement_label(&config.process_runner)
+        );
     }
 
     #[test]

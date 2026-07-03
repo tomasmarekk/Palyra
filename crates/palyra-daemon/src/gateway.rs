@@ -82,7 +82,10 @@ use crate::{
         PairingConsumeOutcome, RoutePreview as ChannelRoutePreview,
     },
     cron::schedule_to_proto,
-    execution_backends::ExecutionBackendPreference,
+    execution_backends::{
+        ExecutionBackendPreference, ExecutionBackendProcessRunRequest,
+        ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
+    },
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
@@ -107,8 +110,7 @@ use crate::{
     orchestrator::{RunLifecycleState, RunStateMachine, RunTransition},
     sandbox_runner::ProcessProgressSink,
     tool_protocol::{
-        build_tool_execution_outcome, execute_tool_call,
-        execute_tool_call_with_cancellation_and_progress, tool_policy_snapshot, ToolCallConfig,
+        build_tool_execution_outcome, execute_tool_call, tool_policy_snapshot, ToolCallConfig,
         ToolCallPolicySnapshot, ToolExecutionOutcome,
     },
 };
@@ -826,6 +828,10 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         .await
     } else if context.execution_backend == ExecutionBackendPreference::Docker {
         docker_execution_target_unavailable_outcome(proposal_id, tool_name, input_json)
+    } else if let Some(outcome) =
+        local_tool_runtime_runner_unavailable_outcome(context, proposal_id, tool_name, input_json)
+    {
+        outcome
     } else if tool_name == TOOL_PROGRAM_RUN_TOOL_NAME {
         let fallback_budget;
         let remaining_tool_budget = match controls.remaining_tool_budget {
@@ -1028,15 +1034,25 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
         let execution_input_json =
             process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
-        let outcome = execute_tool_call_with_cancellation_and_progress(
-            &config,
-            proposal_id,
-            tool_name,
-            execution_input_json.as_slice(),
-            controls.cancellation_requested,
-            controls.process_progress_sink,
-        )
-        .await;
+        let runner_registry = ExecutionBackendRunnerRegistry::default();
+        let runner = match runner_registry
+            .select_runner(context.execution_backend, ExecutionBackendRunnerCapability::RunProcess)
+        {
+            Ok(runner) => runner,
+            Err(error) => {
+                return error.to_tool_execution_outcome(proposal_id, tool_name, input_json);
+            }
+        };
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id,
+                tool_name,
+                input_json: execution_input_json.as_slice(),
+                cancellation_requested: controls.cancellation_requested,
+                process_progress_sink: controls.process_progress_sink,
+            })
+            .await;
         record_run_cleanup_resource_from_tool_outcome(
             runtime_state,
             context,
@@ -1436,6 +1452,19 @@ fn docker_execution_target_unavailable_outcome(
         "docker".to_owned(),
         "container_profile_preflight".to_owned(),
     )
+}
+
+fn local_tool_runtime_runner_unavailable_outcome(
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> Option<ToolExecutionOutcome> {
+    let runner_registry = ExecutionBackendRunnerRegistry::default();
+    runner_registry
+        .select_runner(context.execution_backend, ExecutionBackendRunnerCapability::OpenWorkspace)
+        .err()
+        .map(|error| error.to_tool_execution_outcome(proposal_id, tool_name, input_json))
 }
 
 fn execute_process_list_tool(
