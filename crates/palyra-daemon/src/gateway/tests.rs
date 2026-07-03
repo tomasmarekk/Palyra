@@ -78,6 +78,7 @@ use super::{
 use crate::application::run_stream::orchestration::{
     finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome,
 };
+use crate::application::tool_runtime::networked_worker::NodeRuntimeNetworkedWorkerDispatcher;
 use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
 use crate::application::tool_security::ToolProposalBackendSelection;
 use crate::application::{
@@ -133,6 +134,9 @@ use crate::execution_backends::{ExecutionBackendPreference, ExecutionBackendReso
 use crate::flows::{self, FlowCoordinator, FlowCreateDescriptor, FlowLineage, FlowMode};
 use crate::media::MediaRuntimeConfig;
 use crate::model_provider::ProviderImageInput;
+use crate::node_runtime::{
+    CapabilityExecutionResult, CapabilityRequestState, DeviceCapabilityView, NodeRuntimeState,
+};
 use crate::orchestrator::{RunLifecycleState, RunStateMachine, RunTransition};
 use crate::sandbox_runner::{
     EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
@@ -143,7 +147,8 @@ use crate::transport::grpc::auth::{
 use crate::transport::grpc::services::gateway::GatewayServiceImpl;
 use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLeaseRequest,
-    WorkerRunGrant, WorkerWorkspaceScope,
+    WorkerRemoteToolRequestEnvelope, WorkerRemoteToolResultEnvelope, WorkerRunGrant,
+    WorkerWorkspaceScope, WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
 };
 
 static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5073,6 +5078,150 @@ async fn networked_worker_runtime_fails_closed_when_remote_transport_missing() {
                 .is_some_and(|reason| reason == "worker.completed")
         }),
         "transport-missing path should still complete and journal worker cleanup"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn networked_worker_runtime_dispatches_remote_tool_through_node_runtime() {
+    let state = build_test_runtime_state(false);
+    let worker_id = "worker-runtime-01";
+    let required_capability = "tool:palyra.fs.read_file";
+    let mut attestation = test_worker_attestation(worker_id);
+    attestation.supported_capabilities = vec![required_capability.to_owned()];
+    state.register_networked_worker(attestation).await.expect("worker registration should succeed");
+
+    let node_runtime_root = unique_temp_test_root("palyra-networked-worker-node");
+    let node_runtime = std::sync::Arc::new(
+        NodeRuntimeState::load(node_runtime_root.as_path())
+            .expect("node runtime should initialize"),
+    );
+    node_runtime
+        .register_node(
+            worker_id,
+            "test-worker",
+            vec![DeviceCapabilityView { name: required_capability.to_owned(), available: true }],
+        )
+        .expect("worker node should register");
+    state.configure_networked_worker_remote_dispatcher(std::sync::Arc::new(
+        NodeRuntimeNetworkedWorkerDispatcher::new(std::sync::Arc::clone(&node_runtime)),
+    ));
+
+    let worker_node_runtime = std::sync::Arc::clone(&node_runtime);
+    let worker_id_for_task = worker_id.to_owned();
+    let remote_worker = tokio::spawn(async move {
+        for _ in 0..100 {
+            if let Some(dispatch) = worker_node_runtime
+                .next_capability_dispatch(worker_id_for_task.as_str())
+                .expect("dispatch poll should succeed")
+            {
+                assert_eq!(dispatch.capability, required_capability);
+                let request: WorkerRemoteToolRequestEnvelope =
+                    serde_json::from_slice(dispatch.input_json.as_slice())
+                        .expect("remote request envelope should deserialize");
+                request
+                    .validate(super::current_unix_ms())
+                    .expect("remote request envelope should validate");
+                assert_eq!(request.tool_name, "palyra.fs.read_file");
+                assert_eq!(request.lease.worker_id, worker_id_for_task);
+
+                let output_json = serde_json::to_string(&json!({
+                    "content": "remote content",
+                    "path": "src/lib.rs"
+                }))
+                .expect("remote output should serialize");
+                let result = WorkerRemoteToolResultEnvelope {
+                    protocol: WORKER_REMOTE_TOOL_PROTOCOL.to_owned(),
+                    schema_version: WORKER_REMOTE_TOOL_SCHEMA_VERSION,
+                    request_id: request.request_id.clone(),
+                    proposal_id: request.proposal_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    tool_kind: request.tool_kind,
+                    worker_id: request.lease.worker_id.clone(),
+                    lease_id: request.lease.lease_id.clone(),
+                    success: true,
+                    output_json: output_json.clone(),
+                    output_json_sha256: super::sha256_hex(output_json.as_bytes()),
+                    error: None,
+                    output_manifest_sha256: super::sha256_hex(b"remote-output-manifest"),
+                    cleanup_report: WorkerCleanupReport {
+                        removed_workspace_scope: true,
+                        removed_artifacts: true,
+                        removed_logs: true,
+                        failure_reason: None,
+                    },
+                    worker_identity: request.worker_identity.clone(),
+                    completed_at_unix_ms: super::current_unix_ms(),
+                };
+                worker_node_runtime
+                    .complete_capability_request(
+                        dispatch.request_id.as_str(),
+                        CapabilityExecutionResult {
+                            success: true,
+                            output_json: serde_json::to_vec(&result)
+                                .expect("remote result envelope should serialize"),
+                            error: String::new(),
+                        },
+                    )
+                    .expect("capability completion should succeed");
+                return dispatch.request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("remote worker did not receive node dispatch");
+    });
+
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: "session-networked-worker-runtime",
+            run_id: "run-networked-worker-runtime",
+            execution_backend: ExecutionBackendPreference::NetworkedWorker,
+            backend_reason_code: "backend.available.networked_worker",
+        },
+        "proposal-networked-worker-runtime",
+        "palyra.fs.read_file",
+        br#"{"path":"src/lib.rs"}"#,
+        None,
+    )
+    .await;
+    let capability_request_id = remote_worker.await.expect("remote worker task should complete");
+
+    assert!(outcome.success, "remote dispatch should succeed: {}", outcome.error);
+    assert_eq!(outcome.attestation.executor, "networked_worker:worker-runtime-01");
+    assert!(outcome.attestation.sandbox_enforcement.contains("networked_worker_remote;lease_id="));
+    let output = parse_tool_output_json(&outcome);
+    assert_eq!(output.get("content").and_then(Value::as_str), Some("remote content"));
+    assert_eq!(output.get("path").and_then(Value::as_str), Some("src/lib.rs"));
+    assert_eq!(state.worker_fleet_snapshot().active_leases, 0);
+
+    let capability_requests = node_runtime
+        .capability_requests(Some(worker_id))
+        .expect("capability request ledger should be readable");
+    assert!(capability_requests.iter().any(|request| {
+        request.request_id == capability_request_id
+            && request.capability == required_capability
+            && matches!(request.state, CapabilityRequestState::Succeeded)
+    }));
+
+    let snapshot = state
+        .recent_journal_snapshot(100)
+        .await
+        .expect("recent journal snapshot should be returned");
+    assert!(
+        snapshot.events.iter().any(|event| {
+            serde_json::from_str::<Value>(event.payload_json.as_str()).ok().is_some_and(|payload| {
+                payload.get("event").and_then(Value::as_str)
+                    == Some("runtime.worker_lease.lifecycle")
+                    && payload.pointer("/payload/reason").and_then(Value::as_str)
+                        == Some("worker.artifact_transport.attested")
+                    && payload.pointer("/payload/policy_id").and_then(Value::as_str)
+                        == Some("networked_workers.artifact_transport.daemon")
+            })
+        }),
+        "successful remote execution should journal attested artifact transport"
     );
 }
 

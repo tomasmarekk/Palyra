@@ -2503,6 +2503,11 @@ pub async fn run() -> Result<()> {
         },
     )
     .context("failed to initialize gateway runtime state")?;
+    runtime.configure_networked_worker_remote_dispatcher(Arc::new(
+        application::tool_runtime::networked_worker::NodeRuntimeNetworkedWorkerDispatcher::new(
+            Arc::clone(&node_runtime),
+        ),
+    ));
     runtime.configure_memory(MemoryRuntimeConfig {
         max_item_bytes: loaded.memory.max_item_bytes,
         max_item_tokens: loaded.memory.max_item_tokens,

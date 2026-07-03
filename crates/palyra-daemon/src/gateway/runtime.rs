@@ -29,6 +29,7 @@ use crate::agents::{
     AgentRecord, AgentResolveOutcome, AgentResolveRequest, AgentSetDefaultOutcome,
     AgentUnbindOutcome, AgentUnbindRequest, SessionAgentBinding,
 };
+use crate::application::tool_runtime::networked_worker::NetworkedWorkerRemoteDispatcher;
 use crate::application::{
     auth::map_auth_profile_error,
     code_intel_runtime::{
@@ -818,6 +819,7 @@ pub struct GatewayRuntimeState {
     run_detached_resources: Mutex<HashMap<String, RunDetachedResources>>,
     closed_browser_sessions: Mutex<ClosedBrowserSessionLedger>,
     worker_fleet: RwLock<WorkerFleetManager>,
+    networked_worker_remote_dispatcher: RwLock<Option<Arc<dyn NetworkedWorkerRemoteDispatcher>>>,
     pub(crate) provider_leases: ProviderLeaseManager,
     pub(crate) retrieval_backend: Arc<dyn RetrievalBackend>,
     pub(crate) external_retrieval_index: Arc<ExternalRetrievalRuntime>,
@@ -1856,6 +1858,7 @@ impl GatewayRuntimeState {
             run_detached_resources: Mutex::new(HashMap::new()),
             closed_browser_sessions: Mutex::new(ClosedBrowserSessionLedger::default()),
             worker_fleet: RwLock::new(WorkerFleetManager::default()),
+            networked_worker_remote_dispatcher: RwLock::new(None),
             provider_leases: ProviderLeaseManager::default(),
             retrieval_backend,
             external_retrieval_index,
@@ -9821,6 +9824,36 @@ impl GatewayRuntimeState {
     // Networked worker fleet. The fleet manager lives behind an RwLock; each
     // mutation journals its lifecycle event afterwards, and cleanup paths
     // fail closed when a worker's cleanup report shows leftover scoped data.
+
+    /// Installs the remote dispatcher used by leased networked-worker tools.
+    pub(crate) fn configure_networked_worker_remote_dispatcher(
+        &self,
+        dispatcher: Arc<dyn NetworkedWorkerRemoteDispatcher>,
+    ) {
+        match self.networked_worker_remote_dispatcher.write() {
+            Ok(mut configured) => {
+                *configured = Some(dispatcher);
+            }
+            Err(poisoned) => {
+                warn!("networked worker remote dispatcher lock poisoned while configuring");
+                *poisoned.into_inner() = Some(dispatcher);
+            }
+        }
+    }
+
+    /// Configured remote dispatcher for leased networked-worker tools.
+    #[must_use]
+    pub(crate) fn networked_worker_remote_dispatcher(
+        &self,
+    ) -> Option<Arc<dyn NetworkedWorkerRemoteDispatcher>> {
+        match self.networked_worker_remote_dispatcher.read() {
+            Ok(configured) => configured.clone(),
+            Err(poisoned) => {
+                warn!("networked worker remote dispatcher lock poisoned while reading");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
 
     /// Builds the fleet admission policy from networked-worker config. The
     /// trusted capability list is currently a fixed built-in allowlist.

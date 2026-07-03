@@ -7,11 +7,15 @@
 //! denial, cleanup failure, journal failure) fails closed with a reason-coded
 //! [`ToolExecutionOutcome`] instead of falling back to another backend.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use palyra_common::runtime_preview::{
-    RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
-    RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
+use palyra_common::{
+    redaction::{redact_auth_error, redact_url_segments_in_text},
+    runtime_contracts::REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS,
+    runtime_preview::{
+        RuntimeDecisionActor, RuntimeDecisionActorKind, RuntimeDecisionEventType,
+        RuntimeDecisionPayload, RuntimeDecisionTiming, RuntimeEntityRef, RuntimeResourceBudget,
+    },
 };
 use palyra_workerd::{
     WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerLease,
@@ -27,8 +31,129 @@ use ulid::Ulid;
 
 use crate::{
     gateway::{current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext},
+    node_runtime::{CapabilityExecutionResult, NodeRuntimeState, RegisteredNodeRecord},
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
+
+const NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS: u64 = 30_000;
+const NETWORKED_WORKER_NODE_CAPABILITY_MAX_PAYLOAD_BYTES: u64 = 512 * 1024;
+
+/// Dispatches a validated remote worker tool envelope to an actual worker transport.
+#[async_trait::async_trait]
+pub(crate) trait NetworkedWorkerRemoteDispatcher: Send + Sync {
+    /// Executes `request` remotely and returns the worker result envelope.
+    ///
+    /// # Errors
+    /// Returns a reason-coded dispatch error when the worker transport is not
+    /// configured, the selected worker is unavailable, the request cannot be
+    /// queued, or the worker returns a malformed result envelope.
+    async fn dispatch_remote_tool(
+        &self,
+        request: WorkerRemoteToolRequestEnvelope,
+    ) -> Result<WorkerRemoteToolResultEnvelope, NetworkedWorkerRemoteDispatchError>;
+}
+
+/// Remote dispatch failures surfaced as fail-closed tool outcomes.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NetworkedWorkerRemoteDispatchError {
+    #[error("remote worker transport is not configured")]
+    Unconfigured,
+    #[error("remote worker transport unavailable: {0}")]
+    WorkerUnavailable(String),
+    #[error("remote worker request was rejected: {0}")]
+    RequestRejected(String),
+    #[error("remote worker dispatch timed out for request_id={request_id}")]
+    Timeout { request_id: String },
+    #[error("remote worker result channel closed")]
+    ResultChannelClosed,
+    #[error("remote worker returned malformed result: {0}")]
+    MalformedResult(String),
+    #[error("remote worker transport failed: {0}")]
+    TransportFailed(String),
+}
+
+/// Networked-worker dispatcher backed by the existing node capability queue.
+#[derive(Debug)]
+pub(crate) struct NodeRuntimeNetworkedWorkerDispatcher {
+    node_runtime: Arc<NodeRuntimeState>,
+    dispatch_timeout_ms: u64,
+    max_payload_bytes: u64,
+}
+
+impl NodeRuntimeNetworkedWorkerDispatcher {
+    /// Builds a dispatcher over the daemon's paired-node runtime.
+    #[must_use]
+    pub(crate) fn new(node_runtime: Arc<NodeRuntimeState>) -> Self {
+        Self {
+            node_runtime,
+            dispatch_timeout_ms: NETWORKED_WORKER_NODE_CAPABILITY_TIMEOUT_MS,
+            max_payload_bytes: NETWORKED_WORKER_NODE_CAPABILITY_MAX_PAYLOAD_BYTES,
+        }
+    }
+
+    fn required_capability(request: &WorkerRemoteToolRequestEnvelope) -> String {
+        request.tool_kind.required_capability()
+    }
+}
+
+#[async_trait::async_trait]
+impl NetworkedWorkerRemoteDispatcher for NodeRuntimeNetworkedWorkerDispatcher {
+    async fn dispatch_remote_tool(
+        &self,
+        request: WorkerRemoteToolRequestEnvelope,
+    ) -> Result<WorkerRemoteToolResultEnvelope, NetworkedWorkerRemoteDispatchError> {
+        let worker_id = request.lease.worker_id.as_str();
+        let node = self
+            .node_runtime
+            .node(worker_id)
+            .map_err(|error| {
+                NetworkedWorkerRemoteDispatchError::WorkerUnavailable(error.to_string())
+            })?
+            .ok_or_else(|| {
+                NetworkedWorkerRemoteDispatchError::WorkerUnavailable(format!(
+                    "node runtime has no registered worker node for worker_id={worker_id}"
+                ))
+            })?;
+        ensure_node_is_ready_for_remote_worker(&node, &request)?;
+
+        let payload = serde_json::to_vec(&request).map_err(|error| {
+            NetworkedWorkerRemoteDispatchError::MalformedResult(format!(
+                "failed to encode remote request envelope: {error}"
+            ))
+        })?;
+        if payload.len() > usize::try_from(self.max_payload_bytes).unwrap_or(usize::MAX) {
+            return Err(NetworkedWorkerRemoteDispatchError::RequestRejected(format!(
+                "remote request envelope exceeds node payload limit ({} bytes > {} bytes)",
+                payload.len(),
+                self.max_payload_bytes
+            )));
+        }
+
+        let capability = Self::required_capability(&request);
+        let timeout_ms = bounded_dispatch_timeout_ms(self.dispatch_timeout_ms, &request);
+        let (request_id, receiver) = self
+            .node_runtime
+            .enqueue_capability_request(
+                worker_id,
+                capability.as_str(),
+                payload,
+                self.max_payload_bytes,
+                Some(timeout_ms),
+            )
+            .map_err(|error| {
+                NetworkedWorkerRemoteDispatchError::RequestRejected(error.to_string())
+            })?;
+
+        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), receiver)
+            .await
+            .map_err(|_| {
+                let _ = self.node_runtime.mark_capability_timeout(request_id.as_str());
+                NetworkedWorkerRemoteDispatchError::Timeout { request_id: request_id.clone() }
+            })?
+            .map_err(|_| NetworkedWorkerRemoteDispatchError::ResultChannelClosed)?;
+        remote_result_from_node_capability_result(result)
+    }
+}
 
 /// Returns whether `tool_name` may run on the networked-worker backend.
 ///
@@ -144,7 +269,9 @@ pub(crate) async fn execute_networked_worker_tool(
             );
         }
     };
-    let remote_result = match dispatch_networked_worker_remote_tool(&remote_request) {
+    let remote_result = match dispatch_networked_worker_remote_tool(runtime_state, &remote_request)
+        .await
+    {
         Ok(result) => result,
         Err(error) => {
             if let Err(cleanup_error) =
@@ -244,10 +371,15 @@ fn build_worker_remote_tool_request(
     Ok(request)
 }
 
-fn dispatch_networked_worker_remote_tool(
-    _request: &WorkerRemoteToolRequestEnvelope,
+async fn dispatch_networked_worker_remote_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request: &WorkerRemoteToolRequestEnvelope,
 ) -> Result<WorkerRemoteToolResultEnvelope, String> {
-    Err("remote worker transport is not configured".to_owned())
+    let dispatcher = runtime_state
+        .networked_worker_remote_dispatcher()
+        .ok_or(NetworkedWorkerRemoteDispatchError::Unconfigured)
+        .map_err(|error| error.to_string())?;
+    dispatcher.dispatch_remote_tool(request.clone()).await.map_err(|error| error.to_string())
 }
 
 async fn complete_networked_worker_lease_after_remote_failure(
@@ -370,6 +502,71 @@ fn remote_tool_kind_uses_read_only_workspace(tool_kind: WorkerRemoteToolKind) ->
             | WorkerRemoteToolKind::FsSearch
             | WorkerRemoteToolKind::ArtifactRead
     )
+}
+
+fn ensure_node_is_ready_for_remote_worker(
+    node: &RegisteredNodeRecord,
+    request: &WorkerRemoteToolRequestEnvelope,
+) -> Result<(), NetworkedWorkerRemoteDispatchError> {
+    let now = current_unix_ms();
+    let node_age_ms = now.saturating_sub(node.last_seen_at_unix_ms);
+    let freshness_ttl_ms =
+        i64::try_from(REALTIME_DEFAULT_HEARTBEAT_INTERVAL_MS.saturating_mul(4)).unwrap_or(i64::MAX);
+    if node_age_ms > freshness_ttl_ms {
+        return Err(NetworkedWorkerRemoteDispatchError::WorkerUnavailable(format!(
+            "worker node {} is stale (last_seen_age_ms={node_age_ms}, ttl_ms={freshness_ttl_ms})",
+            node.device_id
+        )));
+    }
+
+    let required_capability = request.tool_kind.required_capability();
+    if !node
+        .capabilities
+        .iter()
+        .any(|capability| capability.available && capability.name == required_capability)
+    {
+        return Err(NetworkedWorkerRemoteDispatchError::WorkerUnavailable(format!(
+            "worker node {} does not advertise required capability {required_capability}",
+            node.device_id
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_dispatch_timeout_ms(
+    configured_timeout_ms: u64,
+    request: &WorkerRemoteToolRequestEnvelope,
+) -> u64 {
+    let remaining_lease_ms = request.lease.expires_at_unix_ms.saturating_sub(current_unix_ms());
+    let remaining_lease_ms = u64::try_from(remaining_lease_ms).unwrap_or(1).max(1);
+    configured_timeout_ms.min(remaining_lease_ms).max(1)
+}
+
+fn remote_result_from_node_capability_result(
+    result: CapabilityExecutionResult,
+) -> Result<WorkerRemoteToolResultEnvelope, NetworkedWorkerRemoteDispatchError> {
+    if !result.success {
+        return Err(NetworkedWorkerRemoteDispatchError::TransportFailed(
+            sanitize_remote_dispatch_error(result.error.as_str()),
+        ));
+    }
+    serde_json::from_slice::<WorkerRemoteToolResultEnvelope>(result.output_json.as_slice()).map_err(
+        |error| {
+            NetworkedWorkerRemoteDispatchError::MalformedResult(format!(
+                "node capability output was not a remote worker result envelope: {error}"
+            ))
+        },
+    )
+}
+
+fn sanitize_remote_dispatch_error(error: &str) -> String {
+    let redacted = redact_url_segments_in_text(&redact_auth_error(error));
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        "remote worker reported a transport failure".to_owned()
+    } else {
+        trimmed.chars().take(512).collect()
+    }
 }
 
 async fn record_worker_artifact_transport_event(
