@@ -666,6 +666,14 @@ pub struct McpInvocationPolicyDecision {
     pub reason: String,
 }
 
+/// Scoped, host-issued grant for one logical MCP vault reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpVaultScopedGrant {
+    pub name: String,
+    pub grant_id: String,
+}
+
 /// Broker input for one MCP tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -677,8 +685,12 @@ pub struct McpToolCallRequest {
     pub policy: McpInvocationPolicyDecision,
     #[serde(default)]
     pub approval_granted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
     #[serde(default)]
     pub vault_refs_requested: Vec<String>,
+    #[serde(default)]
+    pub vault_scoped_grants: Vec<McpVaultScopedGrant>,
 }
 
 /// Hash-anchored audit record for an MCP invocation.
@@ -686,15 +698,22 @@ pub struct McpToolCallRequest {
 #[serde(deny_unknown_fields)]
 pub struct McpInvocationAttestation {
     pub attestation_id: String,
+    pub server_id: String,
     pub server_name: String,
     pub tool_name: String,
     pub namespaced_tool_id: String,
     pub schema_hash: String,
     pub input_hash: String,
     pub output_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    pub transport_id: String,
+    pub result_projection: String,
     pub policy_outcome: String,
     pub executed_at_unix_ms: i64,
     pub output_truncated: bool,
+    #[serde(default)]
+    pub vault_grant_ids: Vec<String>,
 }
 
 /// Final broker outcome for an MCP tool call.
@@ -847,6 +866,7 @@ struct McpServerRecord {
     manifest: McpServerManifest,
     state: McpServerLifecycleState,
     protocol_violations: u32,
+    imported_tools: BTreeMap<String, ToolRegistryEntry>,
 }
 
 /// In-process MCP broker state.
@@ -891,6 +911,7 @@ impl McpBroker {
                 manifest,
                 state: McpServerLifecycleState::Stopped,
                 protocol_violations: 0,
+                imported_tools: BTreeMap::new(),
             },
         );
         Ok(report)
@@ -956,7 +977,15 @@ impl McpBroker {
         }
         let tools = transport.list_tools(&manifest)?;
         let report = import_discovered_tools(&manifest, state, tools);
-        if report.filtered_tools.iter().any(mcp_discovery_filter_is_protocol_violation) {
+        let has_protocol_violation =
+            report.filtered_tools.iter().any(mcp_discovery_filter_is_protocol_violation);
+        self.server_record_mut(server_id.as_str())?.imported_tools = report
+            .registry_entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.name.clone(), entry))
+            .collect();
+        if has_protocol_violation {
             self.record_discovery_protocol_violation(server_id.as_str())?;
         }
         Ok(report)
@@ -976,10 +1005,17 @@ impl McpBroker {
         let namespaced_tool_id =
             namespaced_tool_id(request.server_name.as_str(), request.tool_name.as_str())?;
         let record = self.server_record(server_id.as_str())?.clone();
+        let transport_id = transport_id_for_manifest(&record.manifest);
+        let mut audit_context = McpInvocationAuditContext::new(
+            server_id.clone(),
+            namespaced_tool_id,
+            transport_id,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        );
         if record.state != McpServerLifecycleState::Healthy {
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.server_not_ready",
                 format!("MCP server is {}", record.state.as_str()).as_str(),
             ));
@@ -987,45 +1023,80 @@ impl McpBroker {
         if !tool_allowed_by_manifest(&record.manifest, request.tool_name.as_str()) {
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.tool_not_allowed",
                 "tool is not allowed by the MCP server manifest",
+            ));
+        }
+        let Some(registry_entry) =
+            record.imported_tools.get(audit_context.namespaced_tool_id.as_str())
+        else {
+            return Ok(denied_invocation(
+                &request,
+                &audit_context,
+                "mcp.tool_not_discovered",
+                "tool must be discovered and cataloged before invocation",
+            ));
+        };
+        audit_context.result_projection = registry_entry.projection_policy;
+        if request.schema_hash != registry_entry.schema_hash {
+            return Ok(denied_invocation(
+                &request,
+                &audit_context,
+                "mcp.schema_hash_mismatch",
+                "request schema_hash does not match the discovered MCP tool schema",
             ));
         }
         if !request.policy.allowed {
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.policy_denied",
                 request.policy.reason.as_str(),
             ));
         }
-        if request.policy.approval_required && !request.approval_granted {
+        let approval_required = request.policy.approval_required
+            || mcp_registry_entry_requires_approval(registry_entry);
+        if approval_required && !request.approval_granted {
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.approval_required",
                 "operator approval is required before this MCP tool may execute",
+            ));
+        }
+        if approval_required && !valid_optional_invocation_id(request.approval_id.as_deref()) {
+            return Ok(denied_invocation(
+                &request,
+                &audit_context,
+                "mcp.approval_id_required",
+                "operator approval must include a bounded approval id",
             ));
         }
         if !request.input.is_object() {
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.input_not_object",
                 "MCP tool input must be a JSON object",
             ));
         }
-        if let Some(denied) = first_ungranted_vault_ref(
+        match resolve_scoped_vault_grants(
             request.vault_refs_requested.as_slice(),
             record.manifest.vault_refs.as_slice(),
+            request.vault_scoped_grants.as_slice(),
         ) {
-            return Ok(denied_invocation(
-                &request,
-                namespaced_tool_id,
-                "mcp.vault_ref_not_granted",
-                format!("vault reference '{denied}' is not granted by the MCP manifest").as_str(),
-            ));
+            Ok(vault_grant_ids) => {
+                audit_context.vault_grant_ids = vault_grant_ids;
+            }
+            Err(error) => {
+                return Ok(denied_invocation(
+                    &request,
+                    &audit_context,
+                    error.reason_code.as_str(),
+                    error.message.as_str(),
+                ));
+            }
         }
 
         let response = match transport.call_tool(&record.manifest, &request) {
@@ -1034,7 +1105,7 @@ impl McpBroker {
                 self.record_protocol_violation(server_id.as_str())?;
                 return Ok(denied_invocation(
                     &request,
-                    namespaced_tool_id,
+                    &audit_context,
                     error.reason_code.as_str(),
                     error.message.as_str(),
                 ));
@@ -1044,7 +1115,7 @@ impl McpBroker {
             self.record_protocol_violation(server_id.as_str())?;
             return Ok(denied_invocation(
                 &request,
-                namespaced_tool_id,
+                &audit_context,
                 "mcp.sampling_denied",
                 "MCP sampling is denied by default and cannot be requested by tools",
             ));
@@ -1054,34 +1125,27 @@ impl McpBroker {
                 self.record_protocol_violation(server_id.as_str())?;
                 return Ok(denied_invocation(
                     &request,
-                    namespaced_tool_id,
+                    &audit_context,
                     "mcp.egress_denied",
                     "MCP tool attempted egress outside its manifest allowlist",
                 ));
             }
         }
-        let output_json = match bounded_output(
+        let projected_output = project_mcp_output(
             &response.output,
             record.manifest.max_response_bytes,
-            &request,
-            namespaced_tool_id.as_str(),
-        ) {
-            Ok(output_json) => output_json,
-            Err(outcome) => {
-                self.record_protocol_violation(server_id.as_str())?;
-                return Ok(*outcome);
-            }
-        };
+            audit_context.result_projection,
+        );
         Ok(McpToolInvocationOutcome {
             success: true,
-            output_json: output_json.clone(),
+            output_json: projected_output.output_json.clone(),
             error: None,
             attestation: invocation_attestation(
                 &request,
-                namespaced_tool_id,
-                output_json,
+                &audit_context,
+                &response.output,
                 "allowed",
-                false,
+                projected_output.output_truncated,
             ),
         })
     }
@@ -2262,40 +2326,210 @@ fn first_ungranted_vault_ref<'a>(
         .find(|requested| !granted.contains(&requested.trim().to_ascii_lowercase()))
 }
 
-fn bounded_output(
+#[derive(Debug, Clone)]
+struct McpInvocationAuditContext {
+    server_id: String,
+    namespaced_tool_id: String,
+    transport_id: String,
+    result_projection: ToolResultProjectionPolicy,
+    vault_grant_ids: Vec<String>,
+}
+
+impl McpInvocationAuditContext {
+    fn new(
+        server_id: String,
+        namespaced_tool_id: String,
+        transport_id: String,
+        result_projection: ToolResultProjectionPolicy,
+    ) -> Self {
+        Self {
+            server_id,
+            namespaced_tool_id,
+            transport_id,
+            result_projection,
+            vault_grant_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpVaultGrantResolutionError {
+    reason_code: String,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedMcpOutput {
+    output_json: Value,
+    output_truncated: bool,
+}
+
+fn resolve_scoped_vault_grants(
+    requested: &[String],
+    manifest_grants: &[McpVaultRefGrant],
+    scoped_grants: &[McpVaultScopedGrant],
+) -> Result<Vec<String>, McpVaultGrantResolutionError> {
+    if let Some(denied) = first_ungranted_vault_ref(requested, manifest_grants) {
+        return Err(McpVaultGrantResolutionError {
+            reason_code: "mcp.vault_ref_not_granted".to_owned(),
+            message: format!("vault reference '{denied}' is not granted by the MCP manifest"),
+        });
+    }
+
+    let scoped_by_name = scoped_grants
+        .iter()
+        .map(|grant| (grant.name.trim().to_ascii_lowercase(), grant.grant_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut grant_ids = Vec::new();
+    for requested_ref in requested {
+        let name = requested_ref.trim().to_ascii_lowercase();
+        let Some(grant_id) = scoped_by_name.get(name.as_str()) else {
+            return Err(McpVaultGrantResolutionError {
+                reason_code: "mcp.vault_scoped_grant_missing".to_owned(),
+                message: format!("vault reference '{requested_ref}' requires a scoped grant id"),
+            });
+        };
+        let grant_id = *grant_id;
+        if !valid_optional_invocation_id(Some(grant_id)) || is_vault_ref(grant_id) {
+            return Err(McpVaultGrantResolutionError {
+                reason_code: "mcp.vault_scoped_grant_invalid".to_owned(),
+                message: format!(
+                    "vault reference '{requested_ref}' has an invalid scoped grant id"
+                ),
+            });
+        }
+        if sanitize_mcp_transport_message(grant_id) != grant_id {
+            return Err(McpVaultGrantResolutionError {
+                reason_code: "mcp.vault_scoped_grant_invalid".to_owned(),
+                message: format!("vault reference '{requested_ref}' has an unsafe scoped grant id"),
+            });
+        }
+        grant_ids.push(grant_id.to_owned());
+    }
+    grant_ids.sort();
+    grant_ids.dedup();
+    Ok(grant_ids)
+}
+
+fn mcp_registry_entry_requires_approval(entry: &ToolRegistryEntry) -> bool {
+    entry.approval_posture == ToolApprovalPosture::ApprovalRequired
+        || entry.capabilities.iter().any(|capability| {
+            matches!(
+                capability.trim().to_ascii_lowercase().as_str(),
+                "approval:require_approval"
+                    | "sensitivity:sensitive"
+                    | "sensitivity:secret"
+                    | "filesystem_write"
+                    | "secrets_read"
+                    | "process_exec"
+                    | "network"
+                    | "egress"
+                    | "external_side_effect"
+                    | "write"
+                    | "delete"
+                    | "mutation"
+                    | "mutating"
+            )
+        })
+}
+
+fn valid_optional_invocation_id(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim) else {
+        return false;
+    };
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
+}
+
+fn project_mcp_output(
     output: &Value,
     max_response_bytes: usize,
-    request: &McpToolCallRequest,
-    namespaced_tool_id: &str,
-) -> Result<Value, Box<McpToolInvocationOutcome>> {
+    projection_policy: ToolResultProjectionPolicy,
+) -> ProjectedMcpOutput {
     let bytes = serde_json::to_vec(output).unwrap_or_else(|_| b"null".to_vec());
-    if bytes.len() <= max_response_bytes {
-        return Ok(output.clone());
+    let output_truncated = bytes.len() > max_response_bytes;
+    let redacted_preview =
+        redacted_json_preview(output, max_response_bytes.min(DEFAULT_MAX_RESPONSE_BYTES));
+    let output_sha256 = stable_hash_value(output);
+    let output_json = match projection_policy {
+        ToolResultProjectionPolicy::InlineUnlessLarge if !output_truncated => {
+            redact_value_for_model(output)
+        }
+        ToolResultProjectionPolicy::InlineUnlessLarge => json!({
+            "artifact_required": true,
+            "redacted_preview": redacted_preview,
+            "raw_output_sha256": output_sha256,
+        }),
+        ToolResultProjectionPolicy::SummarizeAndArtifact => json!({
+            "artifact_required": output_truncated,
+            "summary": redacted_preview,
+            "raw_output_sha256": output_sha256,
+        }),
+        ToolResultProjectionPolicy::RedactedPreviewAndArtifact => json!({
+            "artifact_required": output_truncated,
+            "redacted_preview": redacted_preview,
+            "raw_output_sha256": output_sha256,
+        }),
+    };
+    ProjectedMcpOutput { output_json, output_truncated }
+}
+
+fn redact_value_for_model(output: &Value) -> Value {
+    let serialized = serde_json::to_string(output).unwrap_or_else(|_| "null".to_owned());
+    let redacted = sanitize_mcp_transport_message(serialized.as_str());
+    serde_json::from_str(redacted.as_str())
+        .unwrap_or_else(|_| json!({ "redacted_preview": redacted }))
+}
+
+fn redacted_json_preview(output: &Value, max_bytes: usize) -> String {
+    let serialized = serde_json::to_string(output).unwrap_or_else(|_| "null".to_owned());
+    let redacted = sanitize_mcp_transport_message(serialized.as_str());
+    truncate_at_char_boundary(redacted.as_str(), max_bytes)
+}
+
+fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
     }
-    Err(Box::new(McpToolInvocationOutcome {
-        success: false,
-        output_json: json!({}),
-        error: Some(format!(
-            "MCP tool response exceeded max_response_bytes ({} > {})",
-            bytes.len(),
-            max_response_bytes
-        )),
-        attestation: invocation_attestation(
-            request,
-            namespaced_tool_id.to_owned(),
-            json!({}),
-            "output_too_large",
-            true,
-        ),
-    }))
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = value[..end].to_owned();
+    truncated.push_str("...");
+    truncated
+}
+
+fn transport_id_for_manifest(manifest: &McpServerManifest) -> String {
+    let payload = match &manifest.transport {
+        McpTransportManifest::Stdio { command, .. } => json!({
+            "kind": "stdio",
+            "command": command,
+            "env": scrub_stdio_env(manifest),
+        }),
+        McpTransportManifest::Http { url } => json!({
+            "kind": "http",
+            "url": sanitize_mcp_transport_message(url),
+        }),
+        McpTransportManifest::Sse { url } => json!({
+            "kind": "sse",
+            "url": sanitize_mcp_transport_message(url),
+        }),
+    };
+    let transport_hash = stable_hash_value(&payload);
+    format!("mcp.transport.{}", &transport_hash[..16])
 }
 
 fn denied_invocation(
     request: &McpToolCallRequest,
-    namespaced_tool_id: String,
+    audit_context: &McpInvocationAuditContext,
     reason_code: &str,
     message: &str,
 ) -> McpToolInvocationOutcome {
+    let message = sanitize_mcp_transport_message(message);
     let output_json = json!({
         "success": false,
         "reason_code": reason_code,
@@ -2307,8 +2541,8 @@ fn denied_invocation(
         error: Some(message.to_owned()),
         attestation: invocation_attestation(
             request,
-            namespaced_tool_id,
-            output_json,
+            audit_context,
+            &output_json,
             reason_code,
             false,
         ),
@@ -2317,34 +2551,44 @@ fn denied_invocation(
 
 fn invocation_attestation(
     request: &McpToolCallRequest,
-    namespaced_tool_id: String,
-    output_json: Value,
+    audit_context: &McpInvocationAuditContext,
+    raw_output_json: &Value,
     policy_outcome: &str,
     output_truncated: bool,
 ) -> McpInvocationAttestation {
     let executed_at_unix_ms = current_unix_ms();
     let input_hash = stable_hash_value(&request.input);
-    let output_hash = stable_hash_value(&output_json);
+    let output_hash = stable_hash_value(raw_output_json);
     let attestation_seed = format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        audit_context.server_id,
         request.server_name,
         request.tool_name,
         request.schema_hash,
         input_hash,
         output_hash,
+        request.approval_id.as_deref().unwrap_or_default(),
+        audit_context.transport_id,
+        audit_context.vault_grant_ids.join(","),
+        policy_outcome,
         executed_at_unix_ms
     );
     McpInvocationAttestation {
         attestation_id: format!("mcpatt_{}", &stable_hash_bytes(attestation_seed.as_bytes())[..16]),
+        server_id: audit_context.server_id.clone(),
         server_name: request.server_name.clone(),
         tool_name: request.tool_name.clone(),
-        namespaced_tool_id,
+        namespaced_tool_id: audit_context.namespaced_tool_id.clone(),
         schema_hash: request.schema_hash.clone(),
         input_hash,
         output_hash,
+        approval_id: request.approval_id.clone(),
+        transport_id: audit_context.transport_id.clone(),
+        result_projection: audit_context.result_projection.as_str().to_owned(),
         policy_outcome: policy_outcome.to_owned(),
         executed_at_unix_ms,
         output_truncated,
+        vault_grant_ids: audit_context.vault_grant_ids.clone(),
     }
 }
 
@@ -2635,19 +2879,30 @@ mod tests {
         broker
     }
 
+    fn broker_with_discovered_manifest(transport: &dyn McpTransport) -> McpBroker {
+        let mut broker = broker_with_ready_manifest(transport);
+        broker.discover_tools("docs", transport).expect("tool discovery should run");
+        broker
+    }
+
     fn invocation_request() -> McpToolCallRequest {
         McpToolCallRequest {
             server_name: "docs".to_owned(),
             tool_name: "search".to_owned(),
             input: json!({"query": "rust"}),
-            schema_hash: "schema_hash".to_owned(),
+            schema_hash: stable_hash_value(&search_tool_schema()),
             policy: McpInvocationPolicyDecision {
                 allowed: true,
                 approval_required: false,
                 reason: "allowlisted".to_owned(),
             },
             approval_granted: false,
+            approval_id: None,
             vault_refs_requested: vec!["api_token".to_owned()],
+            vault_scoped_grants: vec![McpVaultScopedGrant {
+                name: "api_token".to_owned(),
+                grant_id: "grant.docs.api_token.01".to_owned(),
+            }],
         }
     }
 
@@ -3108,8 +3363,9 @@ mod tests {
 
     #[test]
     fn invocation_denies_policy_before_transport_call() {
-        let transport = FakeTransport::default();
-        let mut broker = broker_with_ready_manifest(&transport);
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&transport);
         let mut request = invocation_request();
         request.policy.allowed = false;
         request.policy.reason = "deny by policy".to_owned();
@@ -3123,8 +3379,9 @@ mod tests {
 
     #[test]
     fn invocation_requires_approval_when_policy_says_so() {
-        let transport = FakeTransport::default();
-        let mut broker = broker_with_ready_manifest(&transport);
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&transport);
         let mut request = invocation_request();
         request.policy.approval_required = true;
 
@@ -3136,8 +3393,98 @@ mod tests {
     }
 
     #[test]
+    fn invocation_requires_discovered_schema_match_before_transport_call() {
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&transport);
+        let mut request = invocation_request();
+        request.schema_hash = "stale_schema_hash".to_owned();
+
+        let outcome = broker.invoke_tool(request, &transport).expect("denial should be attested");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.policy_outcome, "mcp.schema_hash_mismatch");
+        assert_eq!(transport.call_count.get(), 0);
+    }
+
+    #[test]
+    fn invocation_requires_sensitive_discovered_tools_to_have_approval_id() {
+        let mut sensitive_tool = discovered_tool("search");
+        sensitive_tool.sensitivity = Some(McpToolSensitivity::Sensitive);
+        let transport = FakeTransport { tools: vec![sensitive_tool], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&transport);
+
+        let outcome = broker
+            .invoke_tool(invocation_request(), &transport)
+            .expect("approval denial should be attested");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.policy_outcome, "mcp.approval_required");
+        assert_eq!(transport.call_count.get(), 0);
+
+        let mut approved = invocation_request();
+        approved.approval_granted = true;
+        approved.approval_id = Some("approval.docs.search.01".to_owned());
+        let outcome = broker
+            .invoke_tool(approved, &transport)
+            .expect("approved sensitive call should execute");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.attestation.approval_id.as_deref(), Some("approval.docs.search.01"));
+        assert_eq!(transport.call_count.get(), 1);
+    }
+
+    #[test]
+    fn invocation_requires_scoped_vault_grants_without_leaking_vault_refs() {
+        let transport =
+            FakeTransport { tools: vec![discovered_tool("search")], ..Default::default() };
+        let mut broker = broker_with_discovered_manifest(&transport);
+        let mut request = invocation_request();
+        request.vault_scoped_grants.clear();
+
+        let outcome = broker.invoke_tool(request, &transport).expect("denial should be attested");
+        let serialized = serde_json::to_string(&outcome).expect("outcome should serialize");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.attestation.policy_outcome, "mcp.vault_scoped_grant_missing");
+        assert!(!serialized.contains("vault://global/docs_api_token"));
+        assert_eq!(transport.call_count.get(), 0);
+    }
+
+    #[test]
+    fn invocation_redacts_model_visible_output_and_attests_transport() {
+        let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
+            response: Some(McpToolResponse {
+                output: json!({
+                    "authorization": "Bearer sk-secret-value",
+                    "vault_ref": "vault://global/docs_api_token",
+                    "ok": true,
+                }),
+                sampling_requested: false,
+                egress_host_requested: None,
+            }),
+            ..Default::default()
+        };
+        let mut broker = broker_with_discovered_manifest(&transport);
+
+        let outcome = broker
+            .invoke_tool(invocation_request(), &transport)
+            .expect("invocation should be attested");
+        let serialized = serde_json::to_string(&outcome).expect("outcome should serialize");
+
+        assert!(outcome.success);
+        assert!(outcome.attestation.transport_id.starts_with("mcp.transport."));
+        assert_eq!(outcome.attestation.vault_grant_ids, vec!["grant.docs.api_token.01".to_owned()]);
+        assert!(!serialized.contains("sk-secret-value"));
+        assert!(!serialized.contains("vault://global/docs_api_token"));
+        assert_eq!(transport.call_count.get(), 1);
+    }
+
+    #[test]
     fn invocation_rejects_sampling_and_quarantines_after_repeated_violations() {
         let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
             response: Some(McpToolResponse {
                 output: json!({"ok": true}),
                 sampling_requested: true,
@@ -3145,7 +3492,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut broker = broker_with_ready_manifest(&transport);
+        let mut broker = broker_with_discovered_manifest(&transport);
 
         for _ in 0..QUARANTINE_AFTER_VIOLATIONS {
             let outcome = broker
@@ -3168,6 +3515,7 @@ mod tests {
     #[test]
     fn invocation_rejects_egress_outside_allowlist_and_large_output() {
         let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
             response: Some(McpToolResponse {
                 output: json!({"data": "x".repeat(2048)}),
                 sampling_requested: false,
@@ -3175,7 +3523,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut broker = broker_with_ready_manifest(&transport);
+        let mut broker = broker_with_discovered_manifest(&transport);
 
         let outcome = broker
             .invoke_tool(invocation_request(), &transport)
@@ -3185,6 +3533,7 @@ mod tests {
         assert_eq!(outcome.attestation.policy_outcome, "mcp.egress_denied");
 
         let transport = FakeTransport {
+            tools: vec![discovered_tool("search")],
             response: Some(McpToolResponse {
                 output: json!({"data": "x".repeat(2048)}),
                 sampling_requested: false,
@@ -3196,8 +3545,9 @@ mod tests {
         let outcome = broker
             .invoke_tool(invocation_request(), &transport)
             .expect("large output should be attested");
-        assert!(!outcome.success);
+        assert!(outcome.success);
         assert!(outcome.attestation.output_truncated);
+        assert_eq!(outcome.output_json["artifact_required"], true);
     }
 
     #[test]
