@@ -14,19 +14,27 @@ use std::{
     collections::BTreeSet,
     env,
     future::Future,
+    path::Path,
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
-use palyra_common::feature_rollouts::{
-    FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
-    EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
-    EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
-};
 use palyra_common::runtime_preview::RuntimePreviewMode;
+use palyra_common::{
+    feature_rollouts::{
+        FeatureRolloutSetting, FeatureRolloutSource, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
+        EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
+        EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV,
+    },
+    process_risk::{classify_process_run, ProcessRiskContext},
+    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
+    redaction::{is_sensitive_key, redact_diagnostic_text},
+};
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
 use palyra_workerd::{WorkerFleetPolicy, WorkerFleetSnapshot};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -215,6 +223,19 @@ pub(crate) enum WorkspaceWritebackMode {
     PatchBundle,
     GitCommit,
     LeaseCommit,
+}
+
+impl WorkspaceWritebackMode {
+    /// Stable snake_case identifier matching the serde representation.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PatchBundle => "patch_bundle",
+            Self::GitCommit => "git_commit",
+            Self::LeaseCommit => "lease_commit",
+        }
+    }
 }
 
 /// Full workspace contract of a backend: lifecycle, isolation, cleanup,
@@ -794,12 +815,28 @@ impl ExecutionBackendRunner for LocalSandboxRunner {
 }
 
 /// Registry of concrete runners available to the daemon process.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct ExecutionBackendRunnerRegistry {
     local_sandbox: LocalSandboxRunner,
+    docker: Option<Box<dyn ExecutionBackendRunner>>,
+}
+
+impl std::fmt::Debug for ExecutionBackendRunnerRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionBackendRunnerRegistry")
+            .field("local_sandbox", &self.local_sandbox.runner_id())
+            .field("docker", &self.docker.as_ref().map(|runner| runner.runner_id()))
+            .finish()
+    }
 }
 
 impl ExecutionBackendRunnerRegistry {
+    /// Builds a registry with an explicitly configured Docker runner.
+    pub(crate) fn with_docker_runner(docker: Box<dyn ExecutionBackendRunner>) -> Self {
+        Self { local_sandbox: LocalSandboxRunner, docker: Some(docker) }
+    }
+
     /// Selects a runner for the resolved backend and required operation.
     pub(crate) fn select_runner(
         &self,
@@ -819,8 +856,19 @@ impl ExecutionBackendRunnerRegistry {
                     ))
                 }
             }
+            ExecutionBackendPreference::Docker => match self.docker.as_deref() {
+                Some(runner) if runner.capabilities().contains(&required_capability) => Ok(runner),
+                Some(runner) => Err(ExecutionBackendRunnerSelectionError::missing_capability(
+                    backend,
+                    runner.runner_id(),
+                    required_capability,
+                )),
+                None => Err(ExecutionBackendRunnerSelectionError::unavailable_backend(
+                    backend,
+                    required_capability,
+                )),
+            },
             ExecutionBackendPreference::DesktopNode
-            | ExecutionBackendPreference::Docker
             | ExecutionBackendPreference::NetworkedWorker
             | ExecutionBackendPreference::SshTunnel => {
                 Err(ExecutionBackendRunnerSelectionError::unavailable_backend(
@@ -1263,6 +1311,7 @@ pub(crate) struct ContainerBackendProfile {
     pub(crate) mounts: Vec<ContainerMountPolicy>,
     pub(crate) network: ContainerNetworkPolicy,
     pub(crate) user: String,
+    pub(crate) readonly_rootfs: bool,
     pub(crate) privileged: bool,
     pub(crate) limits: ContainerResourceLimits,
     pub(crate) env: Vec<ContainerEnvBinding>,
@@ -1284,13 +1333,19 @@ impl ContainerBackendProfile {
         if self.image.trim().is_empty() {
             return Err("container backend image must not be empty".to_owned());
         }
+        if docker_image_digest_sha256(self.image.as_str()).is_none() {
+            return Err("container backend image must be pinned by sha256 digest".to_owned());
+        }
         if self.privileged {
             return Err(
                 "container backend profiles are fail-closed for privileged containers".to_owned()
             );
         }
-        if self.user.trim().is_empty() || self.user.eq_ignore_ascii_case("root") {
+        if container_user_is_root(self.user.as_str()) {
             return Err("container backend user must be an explicit non-root user".to_owned());
+        }
+        if !self.readonly_rootfs {
+            return Err("container backend root filesystem must be read-only".to_owned());
         }
         if self.limits.cpu_time_limit_ms == 0
             || self.limits.memory_limit_bytes == 0
@@ -1298,8 +1353,21 @@ impl ContainerBackendProfile {
         {
             return Err("container backend limits must be positive".to_owned());
         }
+        if self.mounts.is_empty() {
+            return Err("container backend requires a workspace-scoped mount".to_owned());
+        }
         if self.mounts.iter().any(|mount| !mount.workspace_scoped) {
             return Err("container backend mounts must be workspace-scoped".to_owned());
+        }
+        if self.mounts.iter().any(|mount| {
+            mount.host_path.trim().is_empty()
+                || mount.container_path.trim().is_empty()
+                || !mount.container_path.starts_with('/')
+        }) {
+            return Err(
+                "container backend mounts require non-empty host paths and absolute container paths"
+                    .to_owned(),
+            );
         }
         // A literal value under a sensitive-looking env name is treated as a
         // leaked secret regardless of its content: secret material may only
@@ -1318,6 +1386,543 @@ impl ContainerBackendProfile {
         }
         Ok(())
     }
+
+    fn primary_workspace_mount(&self) -> Option<&ContainerMountPolicy> {
+        self.mounts.iter().find(|mount| mount.workspace_scoped)
+    }
+}
+
+const DOCKER_WORKSPACE_ROOT: &str = "/workspace";
+const DOCKER_EGRESS_PROXY_NETWORK: &str = "palyra-egress-proxy";
+
+/// Runtime plan passed to a Docker engine implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerRunPlan {
+    pub(crate) profile_id: String,
+    pub(crate) image: String,
+    pub(crate) image_digest_sha256: String,
+    pub(crate) user: String,
+    pub(crate) readonly_rootfs: bool,
+    pub(crate) network: ContainerNetworkPolicy,
+    pub(crate) mounts: Vec<ContainerMountPolicy>,
+    pub(crate) env: Vec<ContainerEnvBinding>,
+    pub(crate) command: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) working_dir: String,
+    pub(crate) limits: ContainerResourceLimits,
+    pub(crate) workspace_writeback: WorkspaceWritebackMode,
+    pub(crate) cleanup_strategy: String,
+}
+
+/// Container cleanup evidence emitted by a Docker engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DockerCleanupAttestation {
+    pub(crate) strategy: String,
+    pub(crate) container_removed: bool,
+    pub(crate) volume_removed: bool,
+    pub(crate) success: bool,
+    pub(crate) reason_code: String,
+}
+
+/// Container resource usage summary attached to process output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DockerResourceUsage {
+    pub(crate) duration_ms: u64,
+    pub(crate) memory_limit_bytes: u64,
+    pub(crate) cpu_time_limit_ms: u64,
+}
+
+/// Reviewed patch-bundle writeback produced from container workspace changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DockerPatchBundle {
+    pub(crate) schema_version: u8,
+    pub(crate) reviewed: bool,
+    pub(crate) patch_sha256: String,
+    pub(crate) file_count: usize,
+}
+
+/// Result returned by a Docker engine after running a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerRunReport {
+    pub(crate) exit_code: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) resource_usage: DockerResourceUsage,
+    pub(crate) cleanup: DockerCleanupAttestation,
+    pub(crate) patch_bundle: Option<DockerPatchBundle>,
+}
+
+/// Classified Docker engine failure before a container result exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerEngineError {
+    pub(crate) reason_code: String,
+    pub(crate) message: String,
+}
+
+type DockerEngineFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DockerRunReport, DockerEngineError>> + Send + 'a>>;
+
+/// Narrow execution boundary for Docker backends.
+pub(crate) trait DockerEngine: Send + Sync {
+    fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a>;
+}
+
+/// Docker CLI implementation used outside tests when an explicit profile is configured.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DockerCliEngine;
+
+impl DockerEngine for DockerCliEngine {
+    fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
+        Box::pin(async move {
+            let started = Instant::now();
+            let mut command = tokio::process::Command::new("docker");
+            command.arg("run").arg("--rm");
+            if plan.readonly_rootfs {
+                command.arg("--read-only");
+            }
+            command.arg("--user").arg(plan.user.as_str());
+            command.arg("--network").arg(docker_network_arg(plan.network));
+            command.arg("--workdir").arg(plan.working_dir.as_str());
+            command.arg("--memory").arg(format!("{}b", plan.limits.memory_limit_bytes));
+            for mount in &plan.mounts {
+                command.arg("--mount").arg(docker_mount_arg(mount));
+            }
+            for binding in &plan.env {
+                match binding.source_kind {
+                    ContainerEnvSourceKind::LiteralSafeValue => {
+                        command.arg("--env").arg(format!("{}={}", binding.name, binding.value));
+                    }
+                    ContainerEnvSourceKind::VaultRef => {
+                        return Err(DockerEngineError {
+                            reason_code: "docker.env.vault_resolution_unavailable".to_owned(),
+                            message: format!(
+                                "Docker profile {} declares Vault env binding {}; vault resolution is not wired into DockerRunner yet",
+                                plan.profile_id, binding.name
+                            ),
+                        });
+                    }
+                }
+            }
+            command.arg(plan.image.as_str());
+            command.arg(plan.command.as_str());
+            command.args(plan.args.iter().map(String::as_str));
+            let output = command.output().await.map_err(|error| DockerEngineError {
+                reason_code: "docker.spawn_failed".to_owned(),
+                message: format!(
+                    "failed to launch Docker CLI for profile {}: {error}",
+                    plan.profile_id
+                ),
+            })?;
+            Ok(DockerRunReport {
+                exit_code: output.status.code().unwrap_or(1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+                resource_usage: DockerResourceUsage {
+                    duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    memory_limit_bytes: plan.limits.memory_limit_bytes,
+                    cpu_time_limit_ms: plan.limits.cpu_time_limit_ms,
+                },
+                cleanup: DockerCleanupAttestation {
+                    strategy: plan.cleanup_strategy,
+                    container_removed: true,
+                    volume_removed: true,
+                    success: true,
+                    reason_code: "docker.cleanup.run_rm".to_owned(),
+                },
+                patch_bundle: None,
+            })
+        })
+    }
+}
+
+/// Docker runner adapter. Profile validation happens before any engine call.
+#[derive(Debug)]
+pub(crate) struct DockerRunner<E: DockerEngine> {
+    profile: ContainerBackendProfile,
+    engine: E,
+}
+
+impl<E: DockerEngine> DockerRunner<E> {
+    /// Builds a Docker runner from an already parsed container profile.
+    ///
+    /// # Errors
+    /// Returns the first profile invariant violation.
+    pub(crate) fn new(profile: ContainerBackendProfile, engine: E) -> Result<Self, String> {
+        profile.validate()?;
+        if !matches!(profile.runtime, ContainerRuntimeKind::Docker) {
+            return Err("DockerRunner requires a docker container profile".to_owned());
+        }
+        Ok(Self { profile, engine })
+    }
+}
+
+impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
+    fn backend_preference(&self) -> ExecutionBackendPreference {
+        ExecutionBackendPreference::Docker
+    }
+
+    fn runner_id(&self) -> &'static str {
+        "docker_runner"
+    }
+
+    fn runner_version(&self) -> &'static str {
+        "v1"
+    }
+
+    fn capabilities(&self) -> &'static [ExecutionBackendRunnerCapability] {
+        &[
+            ExecutionBackendRunnerCapability::RunProcess,
+            ExecutionBackendRunnerCapability::OpenWorkspace,
+            ExecutionBackendRunnerCapability::CommitOrPatchBundle,
+            ExecutionBackendRunnerCapability::Cancel,
+            ExecutionBackendRunnerCapability::Cleanup,
+            ExecutionBackendRunnerCapability::HealthProbe,
+            ExecutionBackendRunnerCapability::AttestationManifest,
+        ]
+    }
+
+    fn run_process<'a>(
+        &'a self,
+        request: ExecutionBackendProcessRunRequest<'a>,
+    ) -> RunnerExecutionFuture<'a> {
+        Box::pin(async move {
+            let plan =
+                match docker_process_run_plan(&self.profile, request.config, request.input_json) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        return docker_error_outcome(
+                            request.proposal_id,
+                            request.tool_name,
+                            request.input_json,
+                            error.reason_code.as_str(),
+                            error.message,
+                        );
+                    }
+                };
+            match self.engine.run(plan.clone()).await {
+                Ok(report) => docker_process_run_outcome(
+                    request.proposal_id,
+                    request.tool_name,
+                    request.input_json,
+                    &plan,
+                    report,
+                ),
+                Err(error) => docker_error_outcome(
+                    request.proposal_id,
+                    request.tool_name,
+                    request.input_json,
+                    error.reason_code.as_str(),
+                    error.message,
+                ),
+            }
+        })
+    }
+
+    fn health_probe(&self) -> ExecutionBackendRunnerHealth {
+        ExecutionBackendRunnerHealth {
+            backend_id: ExecutionBackendPreference::Docker.as_str().to_owned(),
+            status: ExecutionBackendHealthStatus::Healthy,
+            reason_code: "runner.health.docker.profile_valid".to_owned(),
+            summary: format!(
+                "Docker profile {} passed fail-closed validation",
+                self.profile.profile_id
+            ),
+        }
+    }
+}
+
+fn docker_process_run_plan(
+    profile: &ContainerBackendProfile,
+    config: &ToolCallConfig,
+    input_json: &[u8],
+) -> Result<DockerRunPlan, DockerEngineError> {
+    profile.validate().map_err(|message| DockerEngineError {
+        reason_code: "docker.profile.invalid".to_owned(),
+        message,
+    })?;
+    let input = parse_process_runner_tool_input(input_json).map_err(|error| DockerEngineError {
+        reason_code: "docker.process.invalid_input".to_owned(),
+        message: format!("DockerRunner rejected process input: {error}"),
+    })?;
+    validate_docker_process_input(config, &input)?;
+    let image_digest_sha256 =
+        docker_image_digest_sha256(profile.image.as_str()).ok_or_else(|| DockerEngineError {
+            reason_code: "docker.profile.image_digest_missing".to_owned(),
+            message: "DockerRunner requires image references pinned by sha256 digest".to_owned(),
+        })?;
+    let Some(workspace_mount) = profile.primary_workspace_mount() else {
+        return Err(DockerEngineError {
+            reason_code: "docker.profile.workspace_mount_missing".to_owned(),
+            message: "DockerRunner requires a workspace-scoped mount".to_owned(),
+        });
+    };
+    Ok(DockerRunPlan {
+        profile_id: profile.profile_id.clone(),
+        image: profile.image.clone(),
+        image_digest_sha256,
+        user: profile.user.clone(),
+        readonly_rootfs: profile.readonly_rootfs,
+        network: profile.network,
+        mounts: vec![workspace_mount.clone()],
+        env: profile.env.clone(),
+        command: input.command,
+        args: input.args,
+        working_dir: docker_container_working_dir(input.cwd.as_deref())?,
+        limits: profile.limits.clone(),
+        workspace_writeback: WorkspaceWritebackMode::PatchBundle,
+        cleanup_strategy: profile.cleanup_strategy.clone(),
+    })
+}
+
+fn validate_docker_process_input(
+    config: &ToolCallConfig,
+    input: &ProcessRunnerToolInput,
+) -> Result<(), DockerEngineError> {
+    if input.background || input.keep_running_after_run {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.background_unsupported".to_owned(),
+            message: "DockerRunner does not support background process handles yet".to_owned(),
+        });
+    }
+    if !input.prepend_path.is_empty() {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.prepend_path_unsupported".to_owned(),
+            message: "DockerRunner does not accept host PATH injection".to_owned(),
+        });
+    }
+    if input.env.keys().any(|name| is_sensitive_key(name.as_str())) {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.secret_env_denied".to_owned(),
+            message: "DockerRunner rejects sensitive env names in tool input".to_owned(),
+        });
+    }
+    let command = input.command.trim();
+    if command.is_empty() || command.chars().any(char::is_whitespace) {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.invalid_command".to_owned(),
+            message: "DockerRunner requires a single executable token in command".to_owned(),
+        });
+    }
+    let allowed = &config.process_runner.allowed_executables;
+    if !allowed.iter().any(|entry| docker_command_allowlist_matches(entry, command)) {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.executable_denied".to_owned(),
+            message: format!("DockerRunner command {command:?} is not in the process allowlist"),
+        });
+    }
+    Ok(())
+}
+
+fn docker_process_run_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    plan: &DockerRunPlan,
+    report: DockerRunReport,
+) -> ToolExecutionOutcome {
+    let cleanup_success = report.cleanup.success;
+    let success = report.exit_code == 0 && cleanup_success;
+    let stdout_view = docker_stream_output_view(&report.stdout);
+    let stderr_view = docker_stream_output_view(&report.stderr);
+    let process_risk = parse_process_runner_tool_input(input_json)
+        .map(|input| {
+            classify_process_run(
+                &input,
+                ProcessRiskContext {
+                    workspace_root: Some(Path::new(plan.mounts[0].host_path.as_str())),
+                    resolved_cwd: None,
+                },
+            )
+        })
+        .ok();
+    let output_manifest = json!({
+        "schema_version": 1,
+        "profile_id": plan.profile_id,
+        "image_digest_sha256": plan.image_digest_sha256,
+        "stdout_sha256": sha256_hex(report.stdout.as_slice()),
+        "stderr_sha256": sha256_hex(report.stderr.as_slice()),
+        "workspace_writeback": plan.workspace_writeback.as_str(),
+        "cleanup_success": cleanup_success,
+        "patch_bundle_sha256": report.patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
+    });
+    let output_manifest_sha256 =
+        sha256_hex(serde_json::to_vec(&output_manifest).unwrap_or_default().as_slice());
+    let output = json!({
+        "schema_version": 2,
+        "exit_code": report.exit_code,
+        "stdout": stdout_view.model_text,
+        "stderr": stderr_view.model_text,
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_redacted": stdout_view.redacted,
+        "stderr_redacted": stderr_view.redacted,
+        "stdout_bytes": report.stdout.len(),
+        "stderr_bytes": report.stderr.len(),
+        "duration_ms": report.resource_usage.duration_ms,
+        "tier": "container_profile",
+        "sandbox_backend": "docker",
+        "process_risk": process_risk,
+        "streams": {
+            "stdout": stdout_view.metadata,
+            "stderr": stderr_view.metadata,
+        },
+        "resource_usage": report.resource_usage,
+        "workspace_writeback": {
+            "mode": plan.workspace_writeback.as_str(),
+            "authoritative_workspace_mutation": false,
+            "patch_bundle": report.patch_bundle,
+        },
+        "cleanup": report.cleanup,
+        "output_manifest": output_manifest,
+        "output_manifest_sha256": output_manifest_sha256,
+    });
+    let error = if success {
+        String::new()
+    } else if !cleanup_success {
+        "DockerRunner cleanup failed after container execution".to_owned()
+    } else {
+        format!("DockerRunner process exited unsuccessfully with code {}", report.exit_code)
+    };
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        success,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        error,
+        false,
+        "docker".to_owned(),
+        "container_profile".to_owned(),
+    )
+}
+
+fn docker_error_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    reason_code: &str,
+    message: String,
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "event": "execution_backend.docker_runner",
+        "status": "unavailable",
+        "reason_code": reason_code,
+        "repair_hint": "Configure an allowlisted non-root Docker profile with a sha256-pinned image, read-only root filesystem, workspace-scoped mount, and patch-bundle writeback.",
+    });
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+        message,
+        false,
+        "docker".to_owned(),
+        "container_profile_preflight".to_owned(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerStreamOutputView {
+    model_text: String,
+    redacted: bool,
+    metadata: serde_json::Value,
+}
+
+fn docker_stream_output_view(output: &[u8]) -> DockerStreamOutputView {
+    let raw = String::from_utf8_lossy(output).into_owned();
+    let model_text = redact_diagnostic_text(raw.as_str());
+    DockerStreamOutputView {
+        redacted: model_text != raw,
+        metadata: json!({
+            "size_bytes": output.len(),
+            "captured_bytes": output.len(),
+            "truncated": false,
+            "binary": false,
+            "encoding": "utf-8-lossy",
+            "sha256": sha256_hex(output),
+        }),
+        model_text,
+    }
+}
+
+fn docker_network_arg(network: ContainerNetworkPolicy) -> &'static str {
+    match network {
+        ContainerNetworkPolicy::None => "none",
+        ContainerNetworkPolicy::EgressProxy => DOCKER_EGRESS_PROXY_NETWORK,
+    }
+}
+
+fn docker_mount_arg(mount: &ContainerMountPolicy) -> String {
+    let mut value = format!(
+        "type=bind,src={},dst={}",
+        mount.host_path.replace(',', "\\,"),
+        mount.container_path.replace(',', "\\,")
+    );
+    if mount.read_only {
+        value.push_str(",readonly");
+    }
+    value
+}
+
+fn docker_container_working_dir(cwd: Option<&str>) -> Result<String, DockerEngineError> {
+    let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+        return Ok(DOCKER_WORKSPACE_ROOT.to_owned());
+    };
+    let normalized = cwd.replace('\\', "/");
+    if normalized == "/workspace" || normalized == "workspace" {
+        return Ok(DOCKER_WORKSPACE_ROOT.to_owned());
+    }
+    let relative = normalized
+        .strip_prefix("/workspace/")
+        .or_else(|| normalized.strip_prefix("workspace/"))
+        .unwrap_or(normalized.as_str());
+    if relative.starts_with('/') || relative.split('/').any(|part| part == "..") {
+        return Err(DockerEngineError {
+            reason_code: "docker.process.cwd_denied".to_owned(),
+            message: "DockerRunner cwd must stay inside /workspace".to_owned(),
+        });
+    }
+    Ok(if relative == "." {
+        DOCKER_WORKSPACE_ROOT.to_owned()
+    } else {
+        format!("{DOCKER_WORKSPACE_ROOT}/{relative}")
+    })
+}
+
+fn docker_command_allowlist_matches(allowed: &str, command: &str) -> bool {
+    let allowed = allowed.trim();
+    if allowed == "*" {
+        return true;
+    }
+    let command_name =
+        Path::new(command).file_name().and_then(|name| name.to_str()).unwrap_or(command);
+    allowed.eq_ignore_ascii_case(command) || allowed.eq_ignore_ascii_case(command_name)
+}
+
+fn docker_image_digest_sha256(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    let digest = digest.trim();
+    (digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
+fn container_user_is_root(user: &str) -> bool {
+    let user = user.trim();
+    if user.is_empty() || user.eq_ignore_ascii_case("root") {
+        return true;
+    }
+    let Some(first) = user.split(':').next() else {
+        return true;
+    };
+    first == "0"
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hex::encode(hasher.finalize())
 }
 
 /// Declarative SSH worker profile. All connection material is referenced via
@@ -2190,7 +2795,10 @@ fn aggregate_node_capabilities(nodes: &[&RegisteredNodeRecord]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
     use palyra_common::runtime_preview::RuntimePreviewMode;
@@ -2212,13 +2820,19 @@ mod tests {
         resolve_execution_backend, resolve_execution_backend_for_request,
         validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
-        ContainerResourceLimits, ContainerRuntimeKind, ExecutionBackend,
+        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
+        DockerEngineError, DockerEngineFuture, DockerPatchBundle, DockerResourceUsage,
+        DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
         ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
-        ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry, ExecutionBackendState,
-        FeatureRolloutSetting, SshWorkerBackendProfile, StuckToolJobRecoveryAction,
-        WorkspaceStrategyDescriptor, WorkspaceStrategyKind, WorkspaceWritebackMode,
+        ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
+        ExecutionBackendState, FeatureRolloutSetting, SshWorkerBackendProfile,
+        StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor, WorkspaceStrategyKind,
+        WorkspaceWritebackMode,
     };
+
+    const SAFE_DOCKER_IMAGE: &str =
+        "ghcr.io/palyra/worker@sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
     fn test_policy() -> SandboxProcessRunnerPolicy {
         SandboxProcessRunnerPolicy {
@@ -2260,6 +2874,78 @@ mod tests {
             execution_timeout_ms: 1_000,
             process_runner,
             wasm_runtime: test_wasm_policy(),
+        }
+    }
+
+    fn safe_container_profile() -> ContainerBackendProfile {
+        ContainerBackendProfile {
+            profile_id: "docker-safe".to_owned(),
+            runtime: ContainerRuntimeKind::Docker,
+            image: SAFE_DOCKER_IMAGE.to_owned(),
+            mounts: vec![ContainerMountPolicy {
+                host_path: "workspace".to_owned(),
+                container_path: "/workspace".to_owned(),
+                read_only: false,
+                workspace_scoped: true,
+            }],
+            network: ContainerNetworkPolicy::None,
+            user: "1000:1000".to_owned(),
+            readonly_rootfs: true,
+            privileged: false,
+            limits: ContainerResourceLimits {
+                cpu_time_limit_ms: 1_000,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                max_output_bytes: 64 * 1024,
+            },
+            env: Vec::new(),
+            cleanup_strategy: "remove_container_and_volume".to_owned(),
+        }
+    }
+
+    fn docker_report_success() -> DockerRunReport {
+        DockerRunReport {
+            exit_code: 0,
+            stdout: b"runner-ok\n".to_vec(),
+            stderr: Vec::new(),
+            resource_usage: DockerResourceUsage {
+                duration_ms: 42,
+                memory_limit_bytes: 128 * 1024 * 1024,
+                cpu_time_limit_ms: 1_000,
+            },
+            cleanup: DockerCleanupAttestation {
+                strategy: "remove_container_and_volume".to_owned(),
+                container_removed: true,
+                volume_removed: true,
+                success: true,
+                reason_code: "docker.cleanup.ok".to_owned(),
+            },
+            patch_bundle: None,
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeDockerEngine {
+        result: Result<DockerRunReport, DockerEngineError>,
+        plans: Arc<Mutex<Vec<DockerRunPlan>>>,
+    }
+
+    impl FakeDockerEngine {
+        fn new(
+            result: Result<DockerRunReport, DockerEngineError>,
+        ) -> (Self, Arc<Mutex<Vec<DockerRunPlan>>>) {
+            let plans = Arc::new(Mutex::new(Vec::new()));
+            (Self { result, plans: Arc::clone(&plans) }, plans)
+        }
+    }
+
+    impl DockerEngine for FakeDockerEngine {
+        fn run<'a>(&'a self, plan: DockerRunPlan) -> DockerEngineFuture<'a> {
+            let result = self.result.clone();
+            let plans = Arc::clone(&self.plans);
+            Box::pin(async move {
+                plans.lock().expect("fake docker plan lock").push(plan);
+                result
+            })
         }
     }
 
@@ -2371,6 +3057,30 @@ mod tests {
         assert_eq!(payload["reason_code"], "runner.unavailable.ssh_tunnel");
     }
 
+    #[test]
+    fn runner_registry_selects_configured_docker_runner() {
+        let (engine, _) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let docker = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let registry = ExecutionBackendRunnerRegistry::with_docker_runner(Box::new(docker));
+
+        let runner = registry
+            .select_runner(
+                ExecutionBackendPreference::Docker,
+                ExecutionBackendRunnerCapability::RunProcess,
+            )
+            .expect("configured Docker runner should be selectable");
+        assert_eq!(runner.runner_id(), "docker_runner");
+
+        let selection = registry.selection_event(
+            ExecutionBackendPreference::Docker,
+            ExecutionBackendPreference::Docker,
+        );
+        assert_eq!(selection.event, "execution_backend.runner_selected");
+        assert_eq!(selection.resolved_backend, "docker");
+        assert!(selection.capabilities.iter().any(|capability| capability == "run_process"));
+    }
+
     #[tokio::test]
     async fn local_sandbox_runner_preserves_process_run_schema() {
         let mut policy = test_policy();
@@ -2409,6 +3119,148 @@ mod tests {
             outcome.attestation.sandbox_enforcement,
             process_runner_sandbox_enforcement_label(&config.process_runner)
         );
+    }
+
+    #[test]
+    fn docker_profile_requires_digest_non_root_and_readonly_rootfs() {
+        let profile = safe_container_profile();
+        assert!(profile.validate().is_ok());
+
+        let mut missing_digest = safe_container_profile();
+        missing_digest.image = "ubuntu:latest".to_owned();
+        assert!(missing_digest
+            .validate()
+            .expect_err("Docker image tags without digests must fail")
+            .contains("sha256 digest"));
+
+        let mut root_user = safe_container_profile();
+        root_user.user = "0:0".to_owned();
+        assert!(root_user.validate().expect_err("root user must fail").contains("non-root user"));
+
+        let mut writable_root = safe_container_profile();
+        writable_root.readonly_rootfs = false;
+        assert!(writable_root
+            .validate()
+            .expect_err("writable rootfs must fail")
+            .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn docker_runner_fake_process_run_matches_local_output_schema() {
+        let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-process",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"],"cwd":"workspace/subdir"}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        assert_eq!(outcome.attestation.executor, "docker");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "container_profile");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(payload["schema_version"], 2);
+        assert_eq!(payload["exit_code"], 0);
+        assert!(payload["stdout"].as_str().unwrap_or_default().contains("runner-ok"));
+        assert_eq!(payload["workspace_writeback"]["mode"], "patch_bundle");
+        assert_eq!(payload["workspace_writeback"]["authoritative_workspace_mutation"], false);
+        assert!(payload["output_manifest_sha256"].as_str().is_some_and(|hash| hash.len() == 64));
+
+        let plans = plans.lock().expect("fake Docker plans");
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+        assert_eq!(plan.command, "echo");
+        assert_eq!(plan.args, vec!["runner-ok"]);
+        assert_eq!(plan.working_dir, "/workspace/subdir");
+        assert!(plan.readonly_rootfs);
+        assert_eq!(plan.network, ContainerNetworkPolicy::None);
+        assert_eq!(plan.workspace_writeback, WorkspaceWritebackMode::PatchBundle);
+        assert_eq!(
+            plan.image_digest_sha256,
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_runner_output_carries_reviewed_patch_bundle_writeback() {
+        let mut report = docker_report_success();
+        report.patch_bundle = Some(DockerPatchBundle {
+            schema_version: 1,
+            reviewed: true,
+            patch_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_owned(),
+            file_count: 2,
+        });
+        let (engine, _) = FakeDockerEngine::new(Ok(report));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-patch",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["patch_sha256"],
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        assert_eq!(payload["workspace_writeback"]["patch_bundle"]["reviewed"], true);
+        assert_eq!(payload["workspace_writeback"]["patch_bundle"]["file_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn docker_runner_cleanup_failure_is_fail_closed() {
+        let mut report = docker_report_success();
+        report.cleanup.success = false;
+        report.cleanup.reason_code = "docker.cleanup.remove_failed".to_owned();
+        report.cleanup.container_removed = false;
+        let (engine, _) = FakeDockerEngine::new(Ok(report));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-cleanup",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("cleanup failed"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(payload["cleanup"]["success"], false);
+        assert_eq!(payload["cleanup"]["reason_code"], "docker.cleanup.remove_failed");
     }
 
     #[test]
@@ -2900,31 +3752,13 @@ mod tests {
 
     #[test]
     fn container_backend_profile_rejects_privileged_and_plaintext_secret_env() {
-        let mut profile = ContainerBackendProfile {
-            profile_id: "docker-safe".to_owned(),
-            runtime: ContainerRuntimeKind::Docker,
-            image: "ghcr.io/palyra/worker:sha256-deadbeef".to_owned(),
-            mounts: vec![ContainerMountPolicy {
-                host_path: "workspace".to_owned(),
-                container_path: "/workspace".to_owned(),
-                read_only: false,
-                workspace_scoped: true,
-            }],
-            network: ContainerNetworkPolicy::EgressProxy,
-            user: "1000:1000".to_owned(),
-            privileged: false,
-            limits: ContainerResourceLimits {
-                cpu_time_limit_ms: 1_000,
-                memory_limit_bytes: 128 * 1024 * 1024,
-                max_output_bytes: 64 * 1024,
-            },
-            env: vec![ContainerEnvBinding {
-                name: "API_TOKEN".to_owned(),
-                source_kind: ContainerEnvSourceKind::VaultRef,
-                value: "vault://worker/api-token".to_owned(),
-            }],
-            cleanup_strategy: "remove_container_and_volume".to_owned(),
-        };
+        let mut profile = safe_container_profile();
+        profile.network = ContainerNetworkPolicy::EgressProxy;
+        profile.env = vec![ContainerEnvBinding {
+            name: "API_TOKEN".to_owned(),
+            source_kind: ContainerEnvSourceKind::VaultRef,
+            value: "vault://worker/api-token".to_owned(),
+        }];
         assert!(profile.validate().is_ok());
 
         profile.privileged = true;
