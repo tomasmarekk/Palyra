@@ -20,6 +20,7 @@ use crate::gateway::proto::palyra::common::v1 as common_v1;
 use crate::{
     access_control::AccessRegistry,
     acp::AcpRuntime,
+    application::mcp_broker::McpRuntimeSupervisor,
     channels,
     config::LoadedConfig,
     cron::CronTimezoneMode,
@@ -73,6 +74,7 @@ pub(crate) struct AppState {
     pub(crate) console_memory_index_active: Arc<AtomicBool>,
     pub(crate) maintenance_registry: Arc<MaintenanceRegistry>,
     pub(crate) observability: Arc<ObservabilityState>,
+    pub(crate) mcp_supervisor: Arc<Mutex<McpRuntimeSupervisor>>,
     pub(crate) configured_secrets: Arc<Mutex<ConfiguredSecretsState>>,
     pub(crate) reload_state: Arc<Mutex<ReloadOperationsState>>,
     pub(crate) realtime_events: Arc<Mutex<RealtimeEventRouter>>,

@@ -369,6 +369,7 @@ pub(crate) fn build_runtime_health_snapshot(
     networked_workers_payload: &Value,
     support_bundle_payload: &Value,
     runtime_preview_payload: &Value,
+    mcp_payload: &Value,
     tool_jobs: &[ToolJobRecord],
 ) -> RuntimeHealthSnapshot {
     let mut components = vec![
@@ -383,6 +384,7 @@ pub(crate) fn build_runtime_health_snapshot(
         storage_health_component(status),
         networked_workers_health_component(networked_workers_payload),
         support_bundle_health_component(support_bundle_payload),
+        mcp_health_component(mcp_payload),
     ];
     components.sort_by(|left, right| left.component.cmp(&right.component));
     let overall = components
@@ -1370,6 +1372,47 @@ fn support_bundle_health_component(payload: &Value) -> RuntimeHealthComponentSna
     )
 }
 
+fn mcp_health_component(payload: &Value) -> RuntimeHealthComponentSnapshot {
+    let degraded_servers = read_u64(payload, "/degraded_servers");
+    let backoff_servers = read_u64(payload, "/backoff_servers");
+    let quarantined_servers = read_u64(payload, "/quarantined_servers");
+    let mut degraded = Vec::new();
+    let mut unavailable = Vec::new();
+    if payload.get("error").is_some()
+        || payload.pointer("/status").and_then(Value::as_str) == Some("unavailable")
+    {
+        unavailable.push("mcp.supervisor_snapshot_unavailable".to_owned());
+    }
+    if degraded_servers > 0 {
+        degraded.push("mcp.servers_degraded".to_owned());
+    }
+    if backoff_servers > 0 {
+        degraded.push("mcp.servers_in_backoff".to_owned());
+    }
+    if quarantined_servers > 0 {
+        degraded.push("mcp.servers_quarantined".to_owned());
+    }
+    component(
+        "mcp",
+        status_from_reason_count(degraded.len(), unavailable.len()),
+        merged_reasons(degraded, unavailable),
+        metrics(&[
+            ("total_servers", read_u64(payload, "/total_servers")),
+            ("enabled_servers", read_u64(payload, "/enabled_servers")),
+            ("healthy_servers", read_u64(payload, "/healthy_servers")),
+            ("degraded_servers", degraded_servers),
+            ("backoff_servers", backoff_servers),
+            ("quarantined_servers", quarantined_servers),
+            ("disabled_servers", read_u64(payload, "/disabled_servers")),
+        ]),
+        vec![
+            "palyra_mcp_status".to_owned(),
+            "inspect_mcp_stderr_tail".to_owned(),
+            "restart_or_disable_mcp_server".to_owned(),
+        ],
+    )
+}
+
 fn provider_metrics_json(metrics: &ProviderRuntimeMetricsSnapshot) -> Value {
     json!({
         "requests_total": metrics.request_count,
@@ -1682,6 +1725,41 @@ mod tests {
         assert_eq!(component.status, RuntimeHealthStatus::Healthy);
         assert!(!component.reason_codes.contains(&"memory.embeddings_degraded".to_owned()));
         assert_eq!(component.metrics.get("embeddings_degraded"), Some(&0_u64));
+    }
+
+    #[test]
+    fn mcp_health_component_reports_supervisor_degradation() {
+        let component = mcp_health_component(&json!({
+            "schema_version": 1,
+            "mode": "preview_only",
+            "total_servers": 3,
+            "enabled_servers": 2,
+            "healthy_servers": 1,
+            "degraded_servers": 1,
+            "backoff_servers": 1,
+            "quarantined_servers": 0,
+            "disabled_servers": 1,
+            "servers": [],
+        }));
+
+        assert_eq!(component.component, "mcp");
+        assert_eq!(component.status, RuntimeHealthStatus::Degraded);
+        assert!(component.reason_codes.contains(&"mcp.servers_degraded".to_owned()));
+        assert!(component.reason_codes.contains(&"mcp.servers_in_backoff".to_owned()));
+        assert_eq!(component.metrics.get("enabled_servers"), Some(&2_u64));
+        assert_eq!(component.metrics.get("disabled_servers"), Some(&1_u64));
+    }
+
+    #[test]
+    fn mcp_health_component_marks_snapshot_errors_unavailable() {
+        let component = mcp_health_component(&json!({
+            "schema_version": 1,
+            "status": "unavailable",
+            "error": "mcp supervisor lock poisoned",
+        }));
+
+        assert_eq!(component.status, RuntimeHealthStatus::Unavailable);
+        assert!(component.reason_codes.contains(&"mcp.supervisor_snapshot_unavailable".to_owned()));
     }
 
     #[test]

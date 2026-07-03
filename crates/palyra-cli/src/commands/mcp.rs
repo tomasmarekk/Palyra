@@ -18,7 +18,7 @@ use tonic::Request;
 
 use crate::cli::{
     AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpEgressPolicyArg,
-    McpRegistryMutateArgs, McpRegistryToggleArgs, McpSubcommand, McpTransportArg,
+    McpRegistryMutateArgs, McpRegistryToggleArgs, McpStatusArgs, McpSubcommand, McpTransportArg,
 };
 use crate::*;
 
@@ -59,6 +59,7 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
         McpSubcommand::Serve { connection, session_defaults, read_only, allow_sensitive_tools } => {
             run_mcp_serve(connection, session_defaults, read_only, allow_sensitive_tools)
         }
+        McpSubcommand::Status(args) => run_mcp_runtime_status(args),
         McpSubcommand::List { path, json } => run_mcp_registry_list(path, json),
         McpSubcommand::Show { id, path, json } => run_mcp_registry_show(path, &id, json),
         McpSubcommand::Add(args) => run_mcp_registry_add(args),
@@ -67,6 +68,61 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
         McpSubcommand::Disable(args) => run_mcp_registry_toggle(args, false),
         McpSubcommand::Remove(args) => run_mcp_registry_remove(args),
     }
+}
+
+fn run_mcp_runtime_status(args: McpStatusArgs) -> Result<()> {
+    let overrides = app::ConnectionOverrides {
+        daemon_url: args.url,
+        grpc_url: None,
+        token: args.token,
+        principal: args.principal,
+        device_id: args.device_id,
+        channel: args.channel,
+    };
+    let runtime = build_runtime()?;
+    let mcp_payload = runtime.block_on(async {
+        let context = client::control_plane::connect_admin_console(overrides).await?;
+        let diagnostics = context.client.get_diagnostics().await?;
+        diagnostics
+            .get("mcp")
+            .cloned()
+            .ok_or_else(|| anyhow!("daemon diagnostics did not include MCP runtime status"))
+    })?;
+
+    if output::preferred_json(args.json) {
+        return output::print_json_pretty(
+            &mcp_payload,
+            "failed to encode MCP runtime status as JSON",
+        );
+    }
+    println!(
+        "mcp.status mode={} total={} enabled={} healthy={} degraded={} backoff={} quarantined={} disabled={}",
+        json_string(&mcp_payload, "mode").unwrap_or("unknown"),
+        json_u64(&mcp_payload, "total_servers"),
+        json_u64(&mcp_payload, "enabled_servers"),
+        json_u64(&mcp_payload, "healthy_servers"),
+        json_u64(&mcp_payload, "degraded_servers"),
+        json_u64(&mcp_payload, "backoff_servers"),
+        json_u64(&mcp_payload, "quarantined_servers"),
+        json_u64(&mcp_payload, "disabled_servers")
+    );
+    for server in mcp_payload.get("servers").and_then(Value::as_array).into_iter().flatten() {
+        println!(
+            "mcp.server id={} namespace={} transport={} enabled={} state={} failures={} restarts={} next_retry_at_unix_ms={} last_error_code={}",
+            json_string(server, "id").unwrap_or("unknown"),
+            json_string(server, "namespace").unwrap_or("unknown"),
+            json_string(server, "transport").unwrap_or("unknown"),
+            json_bool(server, "enabled").unwrap_or(false),
+            json_string(server, "state").unwrap_or("unknown"),
+            json_u64(server, "total_failures"),
+            json_u64(server, "restart_count"),
+            json_i64(server, "next_retry_at_unix_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            json_string(server, "last_error_code").unwrap_or("-"),
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
 }
 
 fn run_mcp_registry_list(path: Option<String>, json: bool) -> Result<()> {
@@ -500,6 +556,14 @@ fn json_string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn json_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key)?.as_bool()
+}
+
+fn json_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or_default()
+}
+
+fn json_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key)?.as_i64()
 }
 
 fn normalize_mcp_config_identifier(raw: &str, field_name: &str) -> Result<String> {

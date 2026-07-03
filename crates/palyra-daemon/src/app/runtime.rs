@@ -17,6 +17,7 @@ use super::state::{
 use crate::{
     access_control::AccessRegistry,
     acp::AcpRuntime,
+    application::mcp_broker::McpRuntimeSupervisor,
     channels,
     config::{BrowserServiceConfig, LoadedConfig},
     gateway::{self, GatewayAuthConfig, GatewayRuntimeState},
@@ -100,6 +101,9 @@ pub(crate) fn build_app_state(
         console_memory_index_active: Arc::new(AtomicBool::new(false)),
         maintenance_registry: Arc::new(MaintenanceRegistry::default()),
         observability,
+        mcp_supervisor: Arc::new(Mutex::new(McpRuntimeSupervisor::from_config(
+            &loaded.mcp_servers,
+        ))),
         configured_secrets: Arc::new(Mutex::new(configured_secrets)),
         reload_state: Arc::new(Mutex::new(ReloadOperationsState::default())),
         realtime_events: Arc::new(Mutex::new(RealtimeEventRouter::default())),

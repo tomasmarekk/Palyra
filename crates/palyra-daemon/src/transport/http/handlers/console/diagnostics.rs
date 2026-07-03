@@ -219,6 +219,7 @@ pub(crate) async fn console_diagnostics_handler(
         observability_payload.pointer("/support_bundle").unwrap_or(&null_payload);
     let self_healing_payload =
         observability_payload.pointer("/self_healing").unwrap_or(&null_payload);
+    let mcp_payload = collect_console_mcp_diagnostics(&state, generated_at_unix_ms);
     let runtime_health = crate::runtime_diagnostics::build_runtime_health_snapshot(
         generated_at_unix_ms,
         &status_snapshot,
@@ -229,6 +230,7 @@ pub(crate) async fn console_diagnostics_handler(
         &networked_workers_payload,
         support_bundle_payload,
         runtime_preview_payload,
+        &mcp_payload,
         &tool_jobs,
     );
     let runtime_metrics = crate::runtime_diagnostics::build_agent_runtime_metrics_snapshot(
@@ -316,6 +318,7 @@ pub(crate) async fn console_diagnostics_handler(
         "canvas_experiments": canvas_experiments_payload,
         "observability": observability_payload,
         "memory": memory_payload,
+        "mcp": mcp_payload,
         "learning": {
             "enabled": learning_runtime_config.enabled,
             "sampling_percent": learning_runtime_config.sampling_percent,
@@ -1996,6 +1999,32 @@ pub(crate) async fn collect_console_skills_diagnostics(state: &AppState) -> Valu
                 .map(|index| index.entries.iter().filter(|entry| entry.source_kind == "prompt").count())
                 .unwrap_or(0),
         },
+    })
+}
+
+/// Returns the redacted MCP runtime supervisor snapshot for diagnostics.
+pub(crate) fn collect_console_mcp_diagnostics(
+    state: &AppState,
+    generated_at_unix_ms: i64,
+) -> Value {
+    let supervisor = match state.mcp_supervisor.lock() {
+        Ok(supervisor) => supervisor,
+        Err(_) => {
+            return json!({
+                "schema_version": 1,
+                "generated_at_unix_ms": generated_at_unix_ms,
+                "status": "unavailable",
+                "error": "mcp supervisor lock poisoned",
+            });
+        }
+    };
+    serde_json::to_value(supervisor.snapshot(generated_at_unix_ms)).unwrap_or_else(|error| {
+        json!({
+            "schema_version": 1,
+            "generated_at_unix_ms": generated_at_unix_ms,
+            "status": "unavailable",
+            "error": format!("failed to serialize MCP supervisor snapshot: {error}"),
+        })
     })
 }
 

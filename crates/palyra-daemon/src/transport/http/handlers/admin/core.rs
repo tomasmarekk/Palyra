@@ -84,6 +84,7 @@ pub(crate) async fn admin_status_handler(
         observability_payload.pointer("/runtime_preview").unwrap_or(&null_payload);
     let support_bundle_payload =
         observability_payload.pointer("/support_bundle").unwrap_or(&null_payload);
+    let mcp_payload = collect_console_mcp_diagnostics(&state, generated_at_unix_ms);
     let runtime_health = crate::runtime_diagnostics::build_runtime_health_snapshot(
         generated_at_unix_ms,
         &snapshot,
@@ -94,6 +95,7 @@ pub(crate) async fn admin_status_handler(
         &networked_workers_payload,
         support_bundle_payload,
         runtime_preview_payload,
+        &mcp_payload,
         &tool_jobs,
     );
     let runtime_metrics = crate::runtime_diagnostics::build_agent_runtime_metrics_snapshot(
@@ -104,6 +106,7 @@ pub(crate) async fn admin_status_handler(
     );
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
+        map.insert("mcp".to_owned(), mcp_payload);
         map.insert("media".to_owned(), media_payload);
         map.insert("observability".to_owned(), observability_payload);
         map.insert(

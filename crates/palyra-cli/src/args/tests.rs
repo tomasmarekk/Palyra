@@ -17,23 +17,23 @@ use super::{
     DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
     JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpEgressPolicyArg,
-    McpRegistryMutateArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg, MemoryCommand,
-    MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand, ModelsCommand,
-    NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg, ObjectiveScheduleTypeArg,
-    ObjectiveUpsertCommandArgs, ObjectivesCommand, OnboardingAuthMethodArg, OnboardingCommand,
-    OnboardingFlowArg, PairingClientKindArg, PairingCommand, PairingMethodArg, PairingStateArg,
-    PatchBundleCommand, PatchCommand, PluginsCommand, PolicyCommand, ProfileCommand,
-    ProfileExportModeArg, ProfileModeArg, ProfileRiskLevelArg, ProtocolCommand, QaCommand,
-    RemoteVerificationModeArg, RequiredCommandIdArg, ResetCommand, ResetScopeArg,
-    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
-    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
-    RoutineUpsertCommand, RoutinesCommand, RunCommand, RunControlActivePhaseArg,
-    RunControlCommandArg, RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand,
-    SecretsConfigureCommand, SecurityCommand, SessionsCommand, SetupWizardOverridesArg,
-    SkillsCommand, SkillsPackageCommand, SkillsProcedureCommand, SupportBundleCommand,
-    SystemCommand, SystemEventCommand, SystemEventSeverityArg, TasksCommand, TuiCommand,
-    UninstallCommand, UpdateCommand, WebhooksCommand, WizardOverridesArg, WorkboardCommand,
-    WorkersCommand, WorkspaceRoleArg,
+    McpRegistryMutateArgs, McpStatusArgs, McpSubcommand, McpTransportArg, McpTrustLevelArg,
+    MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg, MessageCommand,
+    ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg, ObjectivePriorityArg,
+    ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
+    OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
+    PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
+    PluginsCommand, PolicyCommand, ProfileCommand, ProfileExportModeArg, ProfileModeArg,
+    ProfileRiskLevelArg, ProtocolCommand, QaCommand, RemoteVerificationModeArg,
+    RequiredCommandIdArg, ResetCommand, ResetScopeArg, RoutineApprovalModeArg,
+    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutineUpsertCommand,
+    RoutinesCommand, RunCommand, RunControlActivePhaseArg, RunControlCommandArg,
+    RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
+    SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
+    SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
+    SystemEventSeverityArg, TasksCommand, TuiCommand, UninstallCommand, UpdateCommand,
+    WebhooksCommand, WizardOverridesArg, WorkboardCommand, WorkersCommand, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -196,6 +196,41 @@ fn parse_mcp_add_registry_server() {
                     tool_denylist: Vec::new(),
                     enabled: true,
                     backups: 5,
+                    json: true,
+                })
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_mcp_status_with_connection_overrides() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "mcp",
+        "status",
+        "--url",
+        "http://127.0.0.1:7777",
+        "--token",
+        "admin-token",
+        "--principal",
+        "admin:test",
+        "--device-id",
+        "device:test",
+        "--channel",
+        "ops",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Status(McpStatusArgs {
+                    url: Some("http://127.0.0.1:7777".to_owned()),
+                    token: Some("admin-token".to_owned()),
+                    principal: Some("admin:test".to_owned()),
+                    device_id: Some("device:test".to_owned()),
+                    channel: Some("ops".to_owned()),
                     json: true,
                 })
             }

@@ -24,6 +24,8 @@ pub enum McpSubcommand {
         #[arg(long, default_value_t = false)]
         allow_sensitive_tools: bool,
     },
+    #[command(about = "Show external MCP runtime supervisor status")]
+    Status(McpStatusArgs),
     #[command(about = "List configured external MCP servers")]
     List {
         #[arg(long, help = "Read this palyra.toml path")]
@@ -55,6 +57,22 @@ pub enum McpSubcommand {
 pub struct McpCommand {
     #[command(subcommand)]
     pub subcommand: McpSubcommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpStatusArgs {
+    #[arg(long, help = "Admin HTTP base URL")]
+    pub url: Option<String>,
+    #[arg(long, help = "Admin token override")]
+    pub token: Option<String>,
+    #[arg(long, help = "Console principal for the diagnostics session")]
+    pub principal: Option<String>,
+    #[arg(long, help = "Console device id for the diagnostics session")]
+    pub device_id: Option<String>,
+    #[arg(long, help = "Console channel for the diagnostics session")]
+    pub channel: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]

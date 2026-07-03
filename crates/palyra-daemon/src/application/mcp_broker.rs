@@ -12,8 +12,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use palyra_common::{redaction::redact_diagnostic_text, runtime_preview::RuntimePreviewMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::config::{McpServerConfig, McpServerTransport, McpServersConfig};
 
 use super::tool_registry::{
     sanitize_schema_for_provider, stable_hash_bytes, stable_hash_value, ToolApprovalPosture,
@@ -22,11 +25,16 @@ use super::tool_registry::{
 };
 
 const MCP_SCHEMA_VERSION: u32 = 1;
+const MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_START_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_IDENTIFIER_LEN: usize = 64;
 const QUARANTINE_AFTER_VIOLATIONS: u32 = 3;
+const DEFAULT_SUPERVISOR_MAX_RETRIES: u32 = 3;
+const DEFAULT_SUPERVISOR_BASE_BACKOFF_MS: i64 = 1_000;
+const DEFAULT_SUPERVISOR_MAX_BACKOFF_MS: i64 = 30_000;
+const DEFAULT_SUPERVISOR_STDERR_TAIL_BYTES: usize = 4 * 1024;
 
 /// Broker-wide policy that is not trusted from server-authored manifests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,25 +153,415 @@ impl McpApprovalPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum McpServerLifecycleState {
-    Configured,
+    Stopped,
     Starting,
-    Ready,
+    Healthy,
     Degraded,
-    Reconnecting,
+    Backoff,
     Disabled,
     Quarantined,
 }
 
 impl McpServerLifecycleState {
-    const fn as_str(self) -> &'static str {
+    /// Returns the canonical snake_case wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Configured => "configured",
+            Self::Stopped => "stopped",
             Self::Starting => "starting",
-            Self::Ready => "ready",
+            Self::Healthy => "healthy",
             Self::Degraded => "degraded",
-            Self::Reconnecting => "reconnecting",
+            Self::Backoff => "backoff",
             Self::Disabled => "disabled",
             Self::Quarantined => "quarantined",
+        }
+    }
+}
+
+/// Host-owned lifecycle policy for supervised MCP runtime entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRuntimeSupervisorPolicy {
+    pub max_retries: u32,
+    pub base_backoff_ms: i64,
+    pub max_backoff_ms: i64,
+    pub stderr_tail_bytes: usize,
+}
+
+impl Default for McpRuntimeSupervisorPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_SUPERVISOR_MAX_RETRIES,
+            base_backoff_ms: DEFAULT_SUPERVISOR_BASE_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_SUPERVISOR_MAX_BACKOFF_MS,
+            stderr_tail_bytes: DEFAULT_SUPERVISOR_STDERR_TAIL_BYTES,
+        }
+    }
+}
+
+/// Redacted lifecycle snapshot for every configured MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpRuntimeSupervisorSnapshot {
+    pub schema_version: u32,
+    pub generated_at_unix_ms: i64,
+    pub mode: String,
+    pub total_servers: usize,
+    pub enabled_servers: usize,
+    pub healthy_servers: usize,
+    pub degraded_servers: usize,
+    pub backoff_servers: usize,
+    pub quarantined_servers: usize,
+    pub disabled_servers: usize,
+    pub servers: Vec<McpRuntimeServerSnapshot>,
+}
+
+/// Redacted lifecycle snapshot for one configured MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpRuntimeServerSnapshot {
+    pub id: String,
+    pub namespace: String,
+    pub transport: String,
+    pub enabled: bool,
+    pub state: McpServerLifecycleState,
+    pub consecutive_failures: u32,
+    pub total_failures: u64,
+    pub restart_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail_redacted: Option<String>,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct McpRuntimeServerRecord {
+    id: String,
+    namespace: String,
+    transport: McpServerTransport,
+    enabled: bool,
+    state: McpServerLifecycleState,
+    consecutive_failures: u32,
+    total_failures: u64,
+    restart_count: u64,
+    next_retry_at_unix_ms: Option<i64>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    stderr_tail_redacted: Option<String>,
+    updated_at_unix_ms: i64,
+}
+
+/// In-memory supervisor for configured MCP server runtime state.
+#[derive(Debug, Clone)]
+pub struct McpRuntimeSupervisor {
+    mode: RuntimePreviewMode,
+    policy: McpRuntimeSupervisorPolicy,
+    servers: BTreeMap<String, McpRuntimeServerRecord>,
+}
+
+impl McpRuntimeSupervisor {
+    /// Builds a supervisor from the validated daemon MCP configuration.
+    #[must_use]
+    pub fn from_config(config: &McpServersConfig) -> Self {
+        Self::from_config_with_policy(config, McpRuntimeSupervisorPolicy::default())
+    }
+
+    /// Builds a supervisor from config and explicit host-owned lifecycle policy.
+    #[must_use]
+    pub fn from_config_with_policy(
+        config: &McpServersConfig,
+        policy: McpRuntimeSupervisorPolicy,
+    ) -> Self {
+        let servers = config
+            .servers
+            .iter()
+            .map(|server| {
+                let record = McpRuntimeServerRecord::from_config(
+                    server,
+                    config.mode != RuntimePreviewMode::Disabled,
+                );
+                (record.id.clone(), record)
+            })
+            .collect();
+        Self { mode: config.mode, policy, servers }
+    }
+
+    /// Returns a deterministic redacted supervisor snapshot.
+    #[must_use]
+    pub fn snapshot(&self, generated_at_unix_ms: i64) -> McpRuntimeSupervisorSnapshot {
+        let servers =
+            self.servers.values().map(McpRuntimeServerRecord::snapshot).collect::<Vec<_>>();
+        McpRuntimeSupervisorSnapshot {
+            schema_version: MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION,
+            generated_at_unix_ms,
+            mode: self.mode.as_str().to_owned(),
+            total_servers: servers.len(),
+            enabled_servers: servers.iter().filter(|server| server.enabled).count(),
+            healthy_servers: servers
+                .iter()
+                .filter(|server| server.state == McpServerLifecycleState::Healthy)
+                .count(),
+            degraded_servers: servers
+                .iter()
+                .filter(|server| server.state == McpServerLifecycleState::Degraded)
+                .count(),
+            backoff_servers: servers
+                .iter()
+                .filter(|server| server.state == McpServerLifecycleState::Backoff)
+                .count(),
+            quarantined_servers: servers
+                .iter()
+                .filter(|server| server.state == McpServerLifecycleState::Quarantined)
+                .count(),
+            disabled_servers: servers
+                .iter()
+                .filter(|server| server.state == McpServerLifecycleState::Disabled)
+                .count(),
+            servers,
+        }
+    }
+
+    /// Marks a server as starting if its lifecycle policy allows a start attempt.
+    ///
+    /// # Errors
+    /// Returns an error when the server is unknown, disabled, quarantined, or
+    /// still inside its retry backoff window.
+    pub fn start_server(
+        &mut self,
+        server_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let record = self.server_record_mut(server_id)?;
+        match record.state {
+            McpServerLifecycleState::Disabled => {
+                return Err(McpBrokerError::new(
+                    "mcp.server_disabled",
+                    format!("MCP server '{}' is disabled by configuration", record.id),
+                ));
+            }
+            McpServerLifecycleState::Quarantined => {
+                return Err(McpBrokerError::new(
+                    "mcp.server_quarantined",
+                    format!("MCP server '{}' is quarantined", record.id),
+                ));
+            }
+            McpServerLifecycleState::Backoff => {
+                if record.next_retry_at_unix_ms.is_some_and(|retry_at| retry_at > now_unix_ms) {
+                    return Err(McpBrokerError::new(
+                        "mcp.server_backoff",
+                        format!("MCP server '{}' is waiting for retry backoff", record.id),
+                    ));
+                }
+            }
+            McpServerLifecycleState::Stopped
+            | McpServerLifecycleState::Starting
+            | McpServerLifecycleState::Healthy
+            | McpServerLifecycleState::Degraded => {}
+        }
+        record.state = McpServerLifecycleState::Starting;
+        record.updated_at_unix_ms = now_unix_ms;
+        Ok(record.state)
+    }
+
+    /// Records a successful start or reconnect attempt.
+    ///
+    /// # Errors
+    /// Returns an error when `server_id` is not registered.
+    pub fn record_start_success(
+        &mut self,
+        server_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let record = self.server_record_mut(server_id)?;
+        record.state = McpServerLifecycleState::Healthy;
+        record.consecutive_failures = 0;
+        record.next_retry_at_unix_ms = None;
+        record.last_error_code = None;
+        record.last_error_message = None;
+        record.updated_at_unix_ms = now_unix_ms;
+        Ok(record.state)
+    }
+
+    /// Records a failed start, reconnect, health check, or process exit.
+    ///
+    /// # Errors
+    /// Returns an error when `server_id` is not registered.
+    pub fn record_failure(
+        &mut self,
+        server_id: &str,
+        reason_code: &str,
+        message: &str,
+        stderr: Option<&str>,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let max_retries = self.policy.max_retries;
+        let backoff_ms = self.next_backoff_ms(server_id)?;
+        let stderr_tail_bytes = self.policy.stderr_tail_bytes;
+        let record = self.server_record_mut(server_id)?;
+        append_redacted_stderr(record, stderr, stderr_tail_bytes);
+        record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        record.total_failures = record.total_failures.saturating_add(1);
+        record.last_error_code = Some(reason_code.trim().to_owned());
+        record.last_error_message = Some(redact_diagnostic_text(message));
+        record.updated_at_unix_ms = now_unix_ms;
+        if record.consecutive_failures >= max_retries {
+            record.state = McpServerLifecycleState::Quarantined;
+            record.next_retry_at_unix_ms = None;
+        } else {
+            record.state = McpServerLifecycleState::Backoff;
+            record.next_retry_at_unix_ms = Some(now_unix_ms.saturating_add(backoff_ms));
+        }
+        Ok(record.state)
+    }
+
+    /// Records a non-terminal health degradation without scheduling a restart.
+    ///
+    /// # Errors
+    /// Returns an error when `server_id` is not registered.
+    pub fn record_degraded(
+        &mut self,
+        server_id: &str,
+        reason_code: &str,
+        message: &str,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let record = self.server_record_mut(server_id)?;
+        if !matches!(
+            record.state,
+            McpServerLifecycleState::Disabled | McpServerLifecycleState::Quarantined
+        ) {
+            record.state = McpServerLifecycleState::Degraded;
+        }
+        record.last_error_code = Some(reason_code.trim().to_owned());
+        record.last_error_message = Some(redact_diagnostic_text(message));
+        record.updated_at_unix_ms = now_unix_ms;
+        Ok(record.state)
+    }
+
+    /// Appends stderr to the bounded redacted per-server tail.
+    ///
+    /// # Errors
+    /// Returns an error when `server_id` is not registered.
+    pub fn record_stderr(
+        &mut self,
+        server_id: &str,
+        stderr: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), McpBrokerError> {
+        let stderr_tail_bytes = self.policy.stderr_tail_bytes;
+        let record = self.server_record_mut(server_id)?;
+        append_redacted_stderr(record, Some(stderr), stderr_tail_bytes);
+        record.updated_at_unix_ms = now_unix_ms;
+        Ok(())
+    }
+
+    /// Stops a server without clearing its failure evidence.
+    ///
+    /// # Errors
+    /// Returns an error when `server_id` is not registered.
+    pub fn stop_server(
+        &mut self,
+        server_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let record = self.server_record_mut(server_id)?;
+        if !matches!(
+            record.state,
+            McpServerLifecycleState::Disabled | McpServerLifecycleState::Quarantined
+        ) {
+            record.state = McpServerLifecycleState::Stopped;
+            record.next_retry_at_unix_ms = None;
+        }
+        record.updated_at_unix_ms = now_unix_ms;
+        Ok(record.state)
+    }
+
+    /// Starts a new lifecycle attempt and increments restart evidence.
+    ///
+    /// # Errors
+    /// Returns an error when [`Self::start_server`] rejects the attempt.
+    pub fn restart_server(
+        &mut self,
+        server_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<McpServerLifecycleState, McpBrokerError> {
+        let state = self.start_server(server_id, now_unix_ms)?;
+        let record = self.server_record_mut(server_id)?;
+        record.restart_count = record.restart_count.saturating_add(1);
+        Ok(state)
+    }
+
+    fn server_record_mut(
+        &mut self,
+        server_id: &str,
+    ) -> Result<&mut McpRuntimeServerRecord, McpBrokerError> {
+        let normalized = normalize_mcp_identifier(server_id, "server_name")?;
+        self.servers.get_mut(normalized.as_str()).ok_or_else(|| {
+            McpBrokerError::new(
+                "mcp.server_unknown",
+                format!("MCP server '{normalized}' is not registered"),
+            )
+        })
+    }
+
+    fn next_backoff_ms(&self, server_id: &str) -> Result<i64, McpBrokerError> {
+        let normalized = normalize_mcp_identifier(server_id, "server_name")?;
+        let record = self.servers.get(normalized.as_str()).ok_or_else(|| {
+            McpBrokerError::new(
+                "mcp.server_unknown",
+                format!("MCP server '{normalized}' is not registered"),
+            )
+        })?;
+        let exponent = record.consecutive_failures.min(20);
+        let exponential = self.policy.base_backoff_ms.saturating_mul(1_i64 << exponent);
+        let capped = exponential.min(self.policy.max_backoff_ms).max(1);
+        Ok(capped.saturating_add(deterministic_backoff_jitter_ms(record.id.as_str(), exponent)))
+    }
+}
+
+impl McpRuntimeServerRecord {
+    fn from_config(config: &McpServerConfig, global_enabled: bool) -> Self {
+        let enabled = global_enabled && config.enabled;
+        Self {
+            id: config.id.clone(),
+            namespace: config.namespace.clone(),
+            transport: config.transport,
+            enabled,
+            state: if enabled {
+                McpServerLifecycleState::Stopped
+            } else {
+                McpServerLifecycleState::Disabled
+            },
+            consecutive_failures: 0,
+            total_failures: 0,
+            restart_count: 0,
+            next_retry_at_unix_ms: None,
+            last_error_code: None,
+            last_error_message: None,
+            stderr_tail_redacted: None,
+            updated_at_unix_ms: 0,
+        }
+    }
+
+    fn snapshot(&self) -> McpRuntimeServerSnapshot {
+        McpRuntimeServerSnapshot {
+            id: self.id.clone(),
+            namespace: self.namespace.clone(),
+            transport: self.transport.as_str().to_owned(),
+            enabled: self.enabled,
+            state: self.state,
+            consecutive_failures: self.consecutive_failures,
+            total_failures: self.total_failures,
+            restart_count: self.restart_count,
+            next_retry_at_unix_ms: self.next_retry_at_unix_ms,
+            last_error_code: self.last_error_code.clone(),
+            last_error_message: self.last_error_message.clone(),
+            stderr_tail_redacted: self.stderr_tail_redacted.clone(),
+            updated_at_unix_ms: self.updated_at_unix_ms,
         }
     }
 }
@@ -378,7 +776,7 @@ impl McpBroker {
             server_id,
             McpServerRecord {
                 manifest,
-                state: McpServerLifecycleState::Configured,
+                state: McpServerLifecycleState::Stopped,
                 protocol_violations: 0,
             },
         );
@@ -399,7 +797,9 @@ impl McpBroker {
         let record = self.server_record_mut(server_id.as_str())?;
         if matches!(
             record.state,
-            McpServerLifecycleState::Disabled | McpServerLifecycleState::Quarantined
+            McpServerLifecycleState::Backoff
+                | McpServerLifecycleState::Disabled
+                | McpServerLifecycleState::Quarantined
         ) {
             return Err(McpBrokerError::new(
                 "mcp.server_unavailable",
@@ -409,7 +809,7 @@ impl McpBroker {
         record.state = McpServerLifecycleState::Starting;
         match transport.start(&record.manifest) {
             Ok(()) => {
-                record.state = McpServerLifecycleState::Ready;
+                record.state = McpServerLifecycleState::Healthy;
                 Ok(record.state)
             }
             Err(error) => {
@@ -432,7 +832,7 @@ impl McpBroker {
     ) -> Result<McpToolDiscoveryReport, McpBrokerError> {
         let server_id = normalize_mcp_identifier(server_name, "server_name")?;
         let record = self.server_record(server_id.as_str())?;
-        if record.state != McpServerLifecycleState::Ready {
+        if record.state != McpServerLifecycleState::Healthy {
             return Err(McpBrokerError::new(
                 "mcp.server_not_ready",
                 format!("MCP server '{}' is {}", server_name, record.state.as_str()),
@@ -457,7 +857,7 @@ impl McpBroker {
         let namespaced_tool_id =
             namespaced_tool_id(request.server_name.as_str(), request.tool_name.as_str())?;
         let record = self.server_record(server_id.as_str())?.clone();
-        if record.state != McpServerLifecycleState::Ready {
+        if record.state != McpServerLifecycleState::Healthy {
             return Ok(denied_invocation(
                 &request,
                 namespaced_tool_id,
@@ -577,7 +977,7 @@ impl McpBroker {
         record.protocol_violations = record.protocol_violations.saturating_add(1);
         if record.protocol_violations >= QUARANTINE_AFTER_VIOLATIONS {
             record.state = McpServerLifecycleState::Quarantined;
-        } else if record.state == McpServerLifecycleState::Ready {
+        } else if record.state == McpServerLifecycleState::Healthy {
             record.state = McpServerLifecycleState::Degraded;
         }
         Ok(record.state)
@@ -1067,18 +1467,58 @@ fn normalize_mcp_identifier(raw: &str, field_name: &str) -> Result<String, McpBr
     if normalized.is_empty()
         || normalized.len() > MAX_IDENTIFIER_LEN
         || normalized.starts_with('.')
+        || normalized.starts_with(':')
         || normalized.ends_with('.')
+        || normalized.ends_with(':')
         || normalized.contains("..")
+        || normalized.contains("::")
         || !normalized.chars().all(|ch| {
-            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-' | ':')
         })
     {
         return Err(McpBrokerError::new(
             "mcp.identifier_invalid",
-            format!("{field_name} must use non-empty [a-z0-9._-] segments"),
+            format!("{field_name} must use non-empty [a-z0-9._:-] segments"),
         ));
     }
     Ok(normalized)
+}
+
+fn append_redacted_stderr(
+    record: &mut McpRuntimeServerRecord,
+    stderr: Option<&str>,
+    max_tail_bytes: usize,
+) {
+    let Some(stderr) = stderr else {
+        return;
+    };
+    let redacted = redact_diagnostic_text(stderr).replace("\r\n", "\n").replace('\r', "\n");
+    if redacted.trim().is_empty() || max_tail_bytes == 0 {
+        return;
+    }
+    let combined = match record.stderr_tail_redacted.as_deref() {
+        Some(previous) if !previous.is_empty() => format!("{previous}\n{redacted}"),
+        _ => redacted,
+    };
+    record.stderr_tail_redacted = Some(tail_on_char_boundary(combined.as_str(), max_tail_bytes));
+}
+
+fn tail_on_char_boundary(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    format!("...{}", &value[start..])
+}
+
+fn deterministic_backoff_jitter_ms(server_id: &str, attempt_index: u32) -> i64 {
+    let seed = server_id.bytes().fold(u64::from(attempt_index), |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(byte))
+    });
+    i64::try_from(seed % 250).unwrap_or(0)
 }
 
 fn finding(
@@ -1169,6 +1609,10 @@ mod tests {
         application::tool_registry::{
             build_model_visible_tool_catalog_snapshot_with_external_tools,
             ToolCatalogPolicySnapshot,
+        },
+        config::{
+            McpServerApprovalProfile, McpServerEgressPolicy, McpServerEnvVaultRef,
+            McpServerTrustLevel,
         },
         sandbox_runner::{
             EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy,
@@ -1289,6 +1733,192 @@ mod tests {
             approval_granted: false,
             vault_refs_requested: vec!["api_token".to_owned()],
         }
+    }
+
+    fn runtime_server(id: &str, enabled: bool) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_owned(),
+            enabled,
+            namespace: id.replace(':', "_"),
+            transport: McpServerTransport::Stdio,
+            command: Some(vec!["node".to_owned(), "server.js".to_owned()]),
+            url: None,
+            env_vault_refs: Vec::<McpServerEnvVaultRef>::new(),
+            trust_level: McpServerTrustLevel::Workspace,
+            approval_profile: McpServerApprovalProfile::RequireApproval,
+            egress_policy: McpServerEgressPolicy::DenyAll,
+            egress_allowlist: Vec::new(),
+            tool_allowlist: Vec::new(),
+            tool_denylist: Vec::new(),
+        }
+    }
+
+    fn runtime_config(servers: Vec<McpServerConfig>) -> McpServersConfig {
+        McpServersConfig { mode: RuntimePreviewMode::PreviewOnly, servers }
+    }
+
+    fn runtime_server_snapshot<'a>(
+        snapshot: &'a McpRuntimeSupervisorSnapshot,
+        id: &str,
+    ) -> &'a McpRuntimeServerSnapshot {
+        snapshot
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .expect("server snapshot should exist")
+    }
+
+    #[test]
+    fn runtime_supervisor_initializes_configured_servers() {
+        let supervisor = McpRuntimeSupervisor::from_config(&runtime_config(vec![
+            runtime_server("docs", true),
+            runtime_server("ops:search", false),
+        ]));
+
+        let snapshot = supervisor.snapshot(42);
+
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.generated_at_unix_ms, 42);
+        assert_eq!(snapshot.mode, "preview_only");
+        assert_eq!(snapshot.total_servers, 2);
+        assert_eq!(snapshot.enabled_servers, 1);
+        assert_eq!(snapshot.disabled_servers, 1);
+        assert_eq!(
+            runtime_server_snapshot(&snapshot, "docs").state,
+            McpServerLifecycleState::Stopped
+        );
+        assert_eq!(
+            runtime_server_snapshot(&snapshot, "ops:search").state,
+            McpServerLifecycleState::Disabled
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_backoff_blocks_retry_and_quarantines_after_repeated_failures() {
+        let policy = McpRuntimeSupervisorPolicy {
+            max_retries: 3,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            stderr_tail_bytes: 256,
+        };
+        let mut supervisor = McpRuntimeSupervisor::from_config_with_policy(
+            &runtime_config(vec![runtime_server("docs", true)]),
+            policy,
+        );
+
+        assert_eq!(
+            supervisor.start_server("docs", 1_000).expect("server should start"),
+            McpServerLifecycleState::Starting
+        );
+        assert_eq!(
+            supervisor
+                .record_failure("docs", "mcp.process_exit", "process exited", None, 1_100)
+                .expect("failure should enter backoff"),
+            McpServerLifecycleState::Backoff
+        );
+        let retry_at = runtime_server_snapshot(&supervisor.snapshot(1_100), "docs")
+            .next_retry_at_unix_ms
+            .expect("backoff should set retry time");
+        let retry_error = supervisor
+            .start_server("docs", retry_at.saturating_sub(1))
+            .expect_err("backoff should block early retry");
+        assert_eq!(retry_error.reason_code, "mcp.server_backoff");
+
+        supervisor.start_server("docs", retry_at).expect("retry should be allowed after backoff");
+        supervisor
+            .record_failure("docs", "mcp.process_exit", "process exited", None, retry_at + 1)
+            .expect("second failure should enter backoff");
+        let retry_at = runtime_server_snapshot(&supervisor.snapshot(retry_at + 1), "docs")
+            .next_retry_at_unix_ms
+            .expect("second backoff should set retry time");
+        supervisor
+            .start_server("docs", retry_at)
+            .expect("second retry should be allowed after backoff");
+        assert_eq!(
+            supervisor
+                .record_failure("docs", "mcp.process_exit", "process exited", None, retry_at + 1)
+                .expect("third failure should quarantine"),
+            McpServerLifecycleState::Quarantined
+        );
+
+        let snapshot = supervisor.snapshot(retry_at + 1);
+        let server = runtime_server_snapshot(&snapshot, "docs");
+        assert_eq!(server.state, McpServerLifecycleState::Quarantined);
+        assert_eq!(server.consecutive_failures, 3);
+        assert_eq!(server.total_failures, 3);
+        assert!(server.next_retry_at_unix_ms.is_none());
+        assert_eq!(
+            supervisor
+                .start_server("docs", retry_at + 2)
+                .expect_err("quarantine blocks starts")
+                .reason_code,
+            "mcp.server_quarantined"
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_restart_and_stop_update_lifecycle_evidence() {
+        let mut supervisor =
+            McpRuntimeSupervisor::from_config(&runtime_config(vec![runtime_server("docs", true)]));
+
+        assert_eq!(
+            supervisor.restart_server("docs", 100).expect("restart should start server"),
+            McpServerLifecycleState::Starting
+        );
+        assert_eq!(
+            supervisor
+                .record_start_success("docs", 110)
+                .expect("start success should mark healthy"),
+            McpServerLifecycleState::Healthy
+        );
+        assert_eq!(
+            supervisor.stop_server("docs", 120).expect("stop should mark stopped"),
+            McpServerLifecycleState::Stopped
+        );
+
+        let snapshot = supervisor.snapshot(120);
+        let server = runtime_server_snapshot(&snapshot, "docs");
+        assert_eq!(server.restart_count, 1);
+        assert_eq!(server.state, McpServerLifecycleState::Stopped);
+        assert_eq!(server.updated_at_unix_ms, 120);
+    }
+
+    #[test]
+    fn runtime_supervisor_stderr_tail_is_redacted_and_bounded() {
+        let policy = McpRuntimeSupervisorPolicy {
+            max_retries: 5,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            stderr_tail_bytes: 48,
+        };
+        let mut supervisor = McpRuntimeSupervisor::from_config_with_policy(
+            &runtime_config(vec![runtime_server("docs", true)]),
+            policy,
+        );
+        let stderr = format!("{}\napi_key=super-secret-value", "prefix".repeat(24));
+
+        supervisor
+            .record_stderr("docs", stderr.as_str(), 1_000)
+            .expect("stderr should be recorded");
+
+        let snapshot = supervisor.snapshot(1_000);
+        let tail = runtime_server_snapshot(&snapshot, "docs")
+            .stderr_tail_redacted
+            .as_ref()
+            .expect("stderr tail should be present");
+        assert!(tail.len() <= 51, "tail should stay within max plus ellipsis: {tail}");
+        assert!(tail.starts_with("..."));
+        assert!(!tail.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn mcp_identifier_normalizer_accepts_registry_style_colon_ids() {
+        assert_eq!(
+            normalize_mcp_identifier("Ops:Search", "server_name")
+                .expect("colon id should normalize"),
+            "ops:search"
+        );
+        assert!(normalize_mcp_identifier("ops::search", "server_name").is_err());
     }
 
     #[test]
