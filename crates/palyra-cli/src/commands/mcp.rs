@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use palyra_control_plane as control_plane;
 use palyra_vault::{Vault, VaultRef, VaultScope};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -20,9 +21,10 @@ use sha2::{Digest, Sha256};
 use tonic::Request;
 
 use crate::cli::{
-    AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpEgressPolicyArg, McpLoginArgs,
-    McpLogoutArgs, McpRegistryMutateArgs, McpRegistryToggleArgs, McpSamplingModeArg, McpStatusArgs,
-    McpSubcommand, McpTransportArg,
+    AcpConnectionArgs, AcpSessionDefaultsArgs, McpCommand, McpDoctorArgs, McpEgressPolicyArg,
+    McpLoginArgs, McpLogoutArgs, McpProbeArgs, McpRegistryMutateArgs, McpRegistryToggleArgs,
+    McpReloadArgs, McpRuntimeConnectionArgs, McpSamplingModeArg, McpStatusArgs, McpSubcommand,
+    McpToolsArgs, McpTransportArg,
 };
 use crate::*;
 
@@ -64,6 +66,10 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
             run_mcp_serve(connection, session_defaults, read_only, allow_sensitive_tools)
         }
         McpSubcommand::Status(args) => run_mcp_runtime_status(args),
+        McpSubcommand::Doctor(args) => run_mcp_runtime_doctor(args),
+        McpSubcommand::Probe(args) => run_mcp_runtime_probe(args),
+        McpSubcommand::Tools(args) => run_mcp_runtime_tools(args),
+        McpSubcommand::Reload(args) => run_mcp_runtime_reload(args),
         McpSubcommand::List { path, json } => run_mcp_registry_list(path, json),
         McpSubcommand::Show { id, path, json } => run_mcp_registry_show(path, &id, json),
         McpSubcommand::Login(args) => run_mcp_login(args),
@@ -77,23 +83,7 @@ pub(crate) fn run_mcp(command: McpCommand) -> Result<()> {
 }
 
 fn run_mcp_runtime_status(args: McpStatusArgs) -> Result<()> {
-    let overrides = app::ConnectionOverrides {
-        daemon_url: args.url,
-        grpc_url: None,
-        token: args.token,
-        principal: args.principal,
-        device_id: args.device_id,
-        channel: args.channel,
-    };
-    let runtime = build_runtime()?;
-    let mcp_payload = runtime.block_on(async {
-        let context = client::control_plane::connect_admin_console(overrides).await?;
-        let diagnostics = context.client.get_diagnostics().await?;
-        diagnostics
-            .get("mcp")
-            .cloned()
-            .ok_or_else(|| anyhow!("daemon diagnostics did not include MCP runtime status"))
-    })?;
+    let mcp_payload = fetch_mcp_runtime_payload(args.connection)?;
 
     if output::preferred_json(args.json) {
         return output::print_json_pretty(
@@ -129,6 +119,284 @@ fn run_mcp_runtime_status(args: McpStatusArgs) -> Result<()> {
         );
     }
     std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_runtime_doctor(args: McpDoctorArgs) -> Result<()> {
+    let mcp_payload = fetch_mcp_runtime_payload(args.connection)?;
+    let doctor = build_mcp_doctor_payload(&mcp_payload, args.id.as_deref())?;
+    if output::preferred_json(args.json) {
+        return output::print_json_pretty(&doctor, "failed to encode MCP doctor output as JSON");
+    }
+    println!(
+        "mcp.doctor status={} checks={} catalog_generation={}",
+        json_string(&doctor, "status").unwrap_or("unknown"),
+        doctor.get("checks").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+        json_u64(&doctor, "catalog_generation"),
+    );
+    for check in doctor.get("checks").and_then(Value::as_array).into_iter().flatten() {
+        println!(
+            "mcp.doctor.check server_id={} state={} severity={} last_error_class={} last_successful_probe_at_unix_ms={} repair_hint=\"{}\"",
+            json_string(check, "server_id").unwrap_or("unknown"),
+            json_string(check, "state").unwrap_or("unknown"),
+            json_string(check, "severity").unwrap_or("unknown"),
+            json_string(check, "last_error_class").unwrap_or("-"),
+            json_i64(check, "last_successful_probe_at_unix_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            json_string(check, "repair_hint").unwrap_or("inspect MCP diagnostics").replace('"', "'"),
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_runtime_probe(args: McpProbeArgs) -> Result<()> {
+    let mcp_payload = fetch_mcp_runtime_payload(args.connection)?;
+    let probes = build_mcp_probe_payload(&mcp_payload, args.id.as_deref())?;
+    if output::preferred_json(args.json) {
+        return output::print_json_pretty(&probes, "failed to encode MCP probe output as JSON");
+    }
+    println!(
+        "mcp.probe status={} probes={} generated_at_unix_ms={}",
+        json_string(&probes, "status").unwrap_or("unknown"),
+        probes.get("probes").and_then(Value::as_array).map(Vec::len).unwrap_or_default(),
+        json_i64(&probes, "generated_at_unix_ms")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_owned()),
+    );
+    for probe in probes.get("probes").and_then(Value::as_array).into_iter().flatten() {
+        println!(
+            "mcp.probe.server id={} state={} catalog_available={} last_error_class={} last_successful_probe_at_unix_ms={} repair_hint=\"{}\"",
+            json_string(probe, "server_id").unwrap_or("unknown"),
+            json_string(probe, "state").unwrap_or("unknown"),
+            json_bool(probe, "catalog_available").unwrap_or(false),
+            json_string(probe, "last_error_class").unwrap_or("-"),
+            json_i64(probe, "last_successful_probe_at_unix_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            json_string(probe, "repair_hint").unwrap_or("inspect MCP diagnostics").replace('"', "'"),
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_runtime_tools(args: McpToolsArgs) -> Result<()> {
+    let mcp_payload = fetch_mcp_runtime_payload(args.connection)?;
+    let tools = build_mcp_tools_payload(&mcp_payload, args.id.as_deref())?;
+    if output::preferred_json(args.json) {
+        return output::print_json_pretty(&tools, "failed to encode MCP tools output as JSON");
+    }
+    println!(
+        "mcp.tools catalog_generation={} available_servers={} hidden_servers={}",
+        json_u64(&tools, "catalog_generation"),
+        json_u64(&tools, "available_servers"),
+        json_u64(&tools, "hidden_servers"),
+    );
+    for server in tools.get("servers").and_then(Value::as_array).into_iter().flatten() {
+        println!(
+            "mcp.tools.server id={} namespace={} state={} catalog_available={} hidden_reason={} repair_hint=\"{}\"",
+            json_string(server, "server_id").unwrap_or("unknown"),
+            json_string(server, "namespace").unwrap_or("unknown"),
+            json_string(server, "state").unwrap_or("unknown"),
+            json_bool(server, "catalog_available").unwrap_or(false),
+            json_string(server, "catalog_hidden_reason").unwrap_or("-"),
+            json_string(server, "repair_hint").unwrap_or("inspect MCP diagnostics").replace('"', "'"),
+        );
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn run_mcp_runtime_reload(args: McpReloadArgs) -> Result<()> {
+    let overrides = mcp_connection_overrides(args.connection);
+    let runtime = build_runtime()?;
+    let envelope = runtime.block_on(async {
+        let context = client::control_plane::connect_admin_console(overrides).await?;
+        let envelope = context
+            .client
+            .apply_config_reload(&control_plane::ConfigReloadApplyRequest {
+                path: args.path,
+                plan_id: None,
+                idempotency_key: None,
+                dry_run: args.dry_run,
+                force: args.force,
+            })
+            .await?;
+        Ok::<_, anyhow::Error>(envelope)
+    })?;
+    if output::preferred_json(args.json) {
+        return output::print_json_pretty(&envelope, "failed to encode MCP reload output as JSON");
+    }
+    println!(
+        "mcp.reload state={} active_runs={} applied_steps={} skipped_steps={} requires_restart={} dry_run={} message=\"{}\"",
+        envelope.outcome,
+        envelope.plan.active_runs,
+        envelope.applied_steps.len(),
+        envelope.skipped_steps.len(),
+        envelope.plan.requires_restart,
+        args.dry_run,
+        envelope.message.replace('"', "'"),
+    );
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn fetch_mcp_runtime_payload(connection: McpRuntimeConnectionArgs) -> Result<Value> {
+    let overrides = mcp_connection_overrides(connection);
+    let runtime = build_runtime()?;
+    runtime.block_on(async {
+        let context = client::control_plane::connect_admin_console(overrides).await?;
+        let diagnostics = context.client.get_diagnostics().await?;
+        diagnostics
+            .get("mcp")
+            .cloned()
+            .ok_or_else(|| anyhow!("daemon diagnostics did not include MCP runtime status"))
+    })
+}
+
+fn mcp_connection_overrides(connection: McpRuntimeConnectionArgs) -> app::ConnectionOverrides {
+    app::ConnectionOverrides {
+        daemon_url: connection.url,
+        grpc_url: None,
+        token: connection.token,
+        principal: connection.principal,
+        device_id: connection.device_id,
+        channel: connection.channel,
+    }
+}
+
+fn build_mcp_doctor_payload(mcp_payload: &Value, server_filter: Option<&str>) -> Result<Value> {
+    let checks = filtered_mcp_servers(mcp_payload, server_filter)?
+        .into_iter()
+        .map(mcp_server_doctor_check)
+        .collect::<Vec<_>>();
+    let status = if mcp_payload.pointer("/status").and_then(Value::as_str) == Some("unavailable") {
+        "unavailable"
+    } else if checks
+        .iter()
+        .any(|check| check.get("severity").and_then(Value::as_str) == Some("error"))
+    {
+        "degraded"
+    } else {
+        "ok"
+    };
+    Ok(json!({
+        "schema_version": 1,
+        "generated_at_unix_ms": mcp_payload.get("generated_at_unix_ms").cloned().unwrap_or(Value::Null),
+        "catalog_generation": json_u64(mcp_payload, "catalog_generation"),
+        "status": status,
+        "checks": checks,
+    }))
+}
+
+fn build_mcp_probe_payload(mcp_payload: &Value, server_filter: Option<&str>) -> Result<Value> {
+    let probes = filtered_mcp_servers(mcp_payload, server_filter)?
+        .into_iter()
+        .map(|server| {
+            json!({
+                "server_id": json_string(&server, "id").unwrap_or("unknown"),
+                "state": json_string(&server, "state").unwrap_or("unknown"),
+                "transport": json_string(&server, "transport").unwrap_or("unknown"),
+                "catalog_available": json_bool(&server, "catalog_available").unwrap_or(false),
+                "last_error_class": server.get("last_error_class").cloned().unwrap_or(Value::Null),
+                "last_error_code": server.get("last_error_code").cloned().unwrap_or(Value::Null),
+                "last_successful_probe_at_unix_ms": server
+                    .get("last_successful_probe_at_unix_ms")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                "next_retry_at_unix_ms": server.get("next_retry_at_unix_ms").cloned().unwrap_or(Value::Null),
+                "repair_hint": json_string(&server, "repair_hint")
+                    .unwrap_or("inspect MCP diagnostics")
+                    .to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": 1,
+        "generated_at_unix_ms": mcp_payload.get("generated_at_unix_ms").cloned().unwrap_or(Value::Null),
+        "status": if mcp_payload.pointer("/status").and_then(Value::as_str) == Some("unavailable") {
+            "unavailable"
+        } else {
+            "ok"
+        },
+        "probes": probes,
+    }))
+}
+
+fn build_mcp_tools_payload(mcp_payload: &Value, server_filter: Option<&str>) -> Result<Value> {
+    let servers = filtered_mcp_servers(mcp_payload, server_filter)?
+        .into_iter()
+        .map(|server| {
+            json!({
+                "server_id": json_string(&server, "id").unwrap_or("unknown"),
+                "namespace": json_string(&server, "namespace").unwrap_or("unknown"),
+                "state": json_string(&server, "state").unwrap_or("unknown"),
+                "catalog_available": json_bool(&server, "catalog_available").unwrap_or(false),
+                "catalog_hidden_reason": server.get("catalog_hidden_reason").cloned().unwrap_or(Value::Null),
+                "repair_hint": json_string(&server, "repair_hint")
+                    .unwrap_or("inspect MCP diagnostics")
+                    .to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let available = servers
+        .iter()
+        .filter(|server| json_bool(server, "catalog_available") == Some(true))
+        .count();
+    Ok(json!({
+        "schema_version": 1,
+        "catalog_generation": json_u64(mcp_payload, "catalog_generation"),
+        "available_servers": available,
+        "hidden_servers": servers.len().saturating_sub(available),
+        "servers": servers,
+    }))
+}
+
+fn filtered_mcp_servers(mcp_payload: &Value, server_filter: Option<&str>) -> Result<Vec<Value>> {
+    if mcp_payload.pointer("/status").and_then(Value::as_str) == Some("unavailable") {
+        return Ok(Vec::new());
+    }
+    let servers = mcp_payload
+        .get("servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("daemon diagnostics did not include MCP server snapshots"))?;
+    let Some(filter) = server_filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(servers.clone());
+    };
+    let normalized = normalize_mcp_config_identifier(filter, "server_id")?;
+    let filtered = servers
+        .iter()
+        .filter(|server| json_string(server, "id") == Some(normalized.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        anyhow::bail!("MCP server `{normalized}` was not found in daemon diagnostics");
+    }
+    Ok(filtered)
+}
+
+fn mcp_server_doctor_check(server: Value) -> Value {
+    let state = json_string(&server, "state").unwrap_or("unknown");
+    let severity = match state {
+        "healthy" => "info",
+        "degraded" | "backoff" | "starting" | "stopped" => "warning",
+        "quarantined" | "disabled" => "error",
+        _ => "warning",
+    };
+    json!({
+        "server_id": json_string(&server, "id").unwrap_or("unknown"),
+        "state": state,
+        "severity": severity,
+        "last_error_class": server.get("last_error_class").cloned().unwrap_or(Value::Null),
+        "last_error_code": server.get("last_error_code").cloned().unwrap_or(Value::Null),
+        "last_successful_probe_at_unix_ms": server
+            .get("last_successful_probe_at_unix_ms")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "quarantine_reason": server.get("quarantine_reason").cloned().unwrap_or(Value::Null),
+        "catalog_available": json_bool(&server, "catalog_available").unwrap_or(false),
+        "catalog_hidden_reason": server.get("catalog_hidden_reason").cloned().unwrap_or(Value::Null),
+        "repair_hint": json_string(&server, "repair_hint")
+            .unwrap_or("inspect MCP diagnostics")
+            .to_owned(),
+    })
 }
 
 fn run_mcp_registry_list(path: Option<String>, json: bool) -> Result<()> {
@@ -2623,6 +2891,65 @@ mod tests {
         );
         let findings = mcp_server_oauth_doctor_findings(&server, 1_720_000_002_000);
         assert_eq!(findings[0]["code"], "mcp.oauth_grant_revoked");
+    }
+
+    #[test]
+    fn mcp_doctor_probe_and_tools_payloads_report_quarantined_server() {
+        let payload = json!({
+            "schema_version": 2,
+            "generated_at_unix_ms": 1_720_000_000_000_i64,
+            "catalog_generation": 3,
+            "mode": "preview_only",
+            "total_servers": 1,
+            "enabled_servers": 1,
+            "healthy_servers": 0,
+            "degraded_servers": 0,
+            "backoff_servers": 0,
+            "quarantined_servers": 1,
+            "disabled_servers": 0,
+            "servers": [{
+                "id": "docs",
+                "namespace": "docs",
+                "transport": "stdio",
+                "enabled": true,
+                "state": "quarantined",
+                "consecutive_failures": 3,
+                "total_failures": 3,
+                "restart_count": 1,
+                "last_successful_probe_at_unix_ms": 1_719_999_999_000_i64,
+                "last_error_class": "auth_failure",
+                "last_error_code": "mcp.auth_failure",
+                "quarantine_reason": "auth_failure",
+                "catalog_available": false,
+                "catalog_hidden_reason": "mcp.server_quarantined",
+                "repair_hint": "run `palyra mcp login docs` or fix MCP auth vault refs",
+                "updated_at_unix_ms": 1_720_000_000_000_i64
+            }]
+        });
+
+        let doctor =
+            build_mcp_doctor_payload(&payload, Some("docs")).expect("doctor payload should build");
+        assert_eq!(doctor["status"], "degraded");
+        assert_eq!(doctor["catalog_generation"], 3);
+        assert_eq!(doctor["checks"][0]["server_id"], "docs");
+        assert_eq!(doctor["checks"][0]["last_error_class"], "auth_failure");
+        assert_eq!(doctor["checks"][0]["last_successful_probe_at_unix_ms"], 1_719_999_999_000_i64);
+        assert_eq!(
+            doctor["checks"][0]["repair_hint"],
+            "run `palyra mcp login docs` or fix MCP auth vault refs"
+        );
+
+        let probes =
+            build_mcp_probe_payload(&payload, Some("docs")).expect("probe payload should build");
+        assert_eq!(probes["probes"][0]["state"], "quarantined");
+        assert_eq!(probes["probes"][0]["catalog_available"], false);
+
+        let tools =
+            build_mcp_tools_payload(&payload, Some("docs")).expect("tools payload should build");
+        assert_eq!(tools["catalog_generation"], 3);
+        assert_eq!(tools["available_servers"], 0);
+        assert_eq!(tools["hidden_servers"], 1);
+        assert_eq!(tools["servers"][0]["catalog_hidden_reason"], "mcp.server_quarantined");
     }
 
     #[test]

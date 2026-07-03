@@ -526,8 +526,8 @@ impl Default for RoadmapPreviewSectionConfig {
     }
 }
 
-/// MCP server registry preview. Entries are declarative only until the MCP
-/// supervisor milestones wire them into the tool catalog.
+/// MCP server registry preview consumed by the runtime supervisor and catalog
+/// projection when MCP import is enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServersConfig {
     pub mode: RuntimePreviewMode,

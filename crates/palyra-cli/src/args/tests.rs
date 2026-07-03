@@ -16,8 +16,9 @@ use super::{
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
     DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
     GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
-    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpEgressPolicyArg, McpLoginArgs,
-    McpRegistryMutateArgs, McpSamplingModeArg, McpStatusArgs, McpSubcommand, McpTransportArg,
+    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpDoctorArgs, McpEgressPolicyArg,
+    McpLoginArgs, McpProbeArgs, McpRegistryMutateArgs, McpReloadArgs, McpRuntimeConnectionArgs,
+    McpSamplingModeArg, McpStatusArgs, McpSubcommand, McpToolsArgs, McpTransportArg,
     McpTrustLevelArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg,
     MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
     ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
@@ -264,11 +265,107 @@ fn parse_mcp_status_with_connection_overrides() {
         Command::Mcp {
             command: McpCommand {
                 subcommand: McpSubcommand::Status(McpStatusArgs {
-                    url: Some("http://127.0.0.1:7777".to_owned()),
-                    token: Some("admin-token".to_owned()),
-                    principal: Some("admin:test".to_owned()),
-                    device_id: Some("device:test".to_owned()),
-                    channel: Some("ops".to_owned()),
+                    connection: McpRuntimeConnectionArgs {
+                        url: Some("http://127.0.0.1:7777".to_owned()),
+                        token: Some("admin-token".to_owned()),
+                        principal: Some("admin:test".to_owned()),
+                        device_id: Some("device:test".to_owned()),
+                        channel: Some("ops".to_owned()),
+                    },
+                    json: true,
+                })
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_mcp_doctor_probe_tools_and_reload() {
+    let doctor = Cli::parse_from(["palyra", "mcp", "doctor", "docs", "--json"]);
+    assert_eq!(
+        doctor.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Doctor(McpDoctorArgs {
+                    id: Some("docs".to_owned()),
+                    connection: McpRuntimeConnectionArgs {
+                        url: None,
+                        token: None,
+                        principal: None,
+                        device_id: None,
+                        channel: None,
+                    },
+                    json: true,
+                })
+            }
+        }
+    );
+
+    let probe = Cli::parse_from(["palyra", "mcp", "probe", "--url", "http://127.0.0.1:7777"]);
+    assert_eq!(
+        probe.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Probe(McpProbeArgs {
+                    id: None,
+                    connection: McpRuntimeConnectionArgs {
+                        url: Some("http://127.0.0.1:7777".to_owned()),
+                        token: None,
+                        principal: None,
+                        device_id: None,
+                        channel: None,
+                    },
+                    json: false,
+                })
+            }
+        }
+    );
+
+    let tools = Cli::parse_from(["palyra", "mcp", "tools", "docs", "--json"]);
+    assert_eq!(
+        tools.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Tools(McpToolsArgs {
+                    id: Some("docs".to_owned()),
+                    connection: McpRuntimeConnectionArgs {
+                        url: None,
+                        token: None,
+                        principal: None,
+                        device_id: None,
+                        channel: None,
+                    },
+                    json: true,
+                })
+            }
+        }
+    );
+
+    let reload = Cli::parse_from([
+        "palyra",
+        "mcp",
+        "reload",
+        "--path",
+        "palyra.toml",
+        "--dry-run",
+        "--force",
+        "--json",
+    ]);
+    assert_eq!(
+        reload.command,
+        Command::Mcp {
+            command: McpCommand {
+                subcommand: McpSubcommand::Reload(McpReloadArgs {
+                    path: Some("palyra.toml".to_owned()),
+                    connection: McpRuntimeConnectionArgs {
+                        url: None,
+                        token: None,
+                        principal: None,
+                        device_id: None,
+                        channel: None,
+                    },
+                    dry_run: true,
+                    force: true,
                     json: true,
                 })
             }

@@ -2011,7 +2011,7 @@ pub(crate) fn collect_console_mcp_diagnostics(
         Ok(supervisor) => supervisor,
         Err(_) => {
             return json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "generated_at_unix_ms": generated_at_unix_ms,
                 "status": "unavailable",
                 "error": "mcp supervisor lock poisoned",
@@ -2020,7 +2020,7 @@ pub(crate) fn collect_console_mcp_diagnostics(
     };
     serde_json::to_value(supervisor.snapshot(generated_at_unix_ms)).unwrap_or_else(|error| {
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at_unix_ms": generated_at_unix_ms,
             "status": "unavailable",
             "error": format!("failed to serialize MCP supervisor snapshot: {error}"),

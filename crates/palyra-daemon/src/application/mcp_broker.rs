@@ -35,7 +35,7 @@ use super::tool_registry::{
 };
 
 const MCP_SCHEMA_VERSION: u32 = 1;
-const MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION: u32 = 1;
+const MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_START_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -229,6 +229,35 @@ pub enum McpServerLifecycleState {
     Quarantined,
 }
 
+/// Stable operational class for the last MCP runtime failure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpRuntimeErrorClass {
+    ProtocolViolation,
+    InvalidSchema,
+    AuthFailure,
+    OutputLimitAbuse,
+    TransportFlapping,
+    PolicyViolation,
+    Unknown,
+}
+
+impl McpRuntimeErrorClass {
+    /// Returns the canonical snake_case wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtocolViolation => "protocol_violation",
+            Self::InvalidSchema => "invalid_schema",
+            Self::AuthFailure => "auth_failure",
+            Self::OutputLimitAbuse => "output_limit_abuse",
+            Self::TransportFlapping => "transport_flapping",
+            Self::PolicyViolation => "policy_violation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl McpServerLifecycleState {
     /// Returns the canonical snake_case wire label.
     #[must_use]
@@ -271,6 +300,7 @@ impl Default for McpRuntimeSupervisorPolicy {
 pub struct McpRuntimeSupervisorSnapshot {
     pub schema_version: u32,
     pub generated_at_unix_ms: i64,
+    pub catalog_generation: u64,
     pub mode: String,
     pub total_servers: usize,
     pub enabled_servers: usize,
@@ -295,13 +325,23 @@ pub struct McpRuntimeServerSnapshot {
     pub total_failures: u64,
     pub restart_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_probe_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_class: Option<McpRuntimeErrorClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr_tail_redacted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    pub catalog_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_hidden_reason: Option<String>,
+    pub repair_hint: String,
     pub updated_at_unix_ms: i64,
 }
 
@@ -315,10 +355,13 @@ struct McpRuntimeServerRecord {
     consecutive_failures: u32,
     total_failures: u64,
     restart_count: u64,
+    last_successful_probe_at_unix_ms: Option<i64>,
     next_retry_at_unix_ms: Option<i64>,
+    last_error_class: Option<McpRuntimeErrorClass>,
     last_error_code: Option<String>,
     last_error_message: Option<String>,
     stderr_tail_redacted: Option<String>,
+    quarantine_reason: Option<String>,
     updated_at_unix_ms: i64,
 }
 
@@ -327,6 +370,7 @@ struct McpRuntimeServerRecord {
 pub struct McpRuntimeSupervisor {
     mode: RuntimePreviewMode,
     policy: McpRuntimeSupervisorPolicy,
+    catalog_generation: u64,
     servers: BTreeMap<String, McpRuntimeServerRecord>,
 }
 
@@ -354,7 +398,7 @@ impl McpRuntimeSupervisor {
                 (record.id.clone(), record)
             })
             .collect();
-        Self { mode: config.mode, policy, servers }
+        Self { mode: config.mode, policy, catalog_generation: 0, servers }
     }
 
     /// Returns a deterministic redacted supervisor snapshot.
@@ -365,6 +409,7 @@ impl McpRuntimeSupervisor {
         McpRuntimeSupervisorSnapshot {
             schema_version: MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION,
             generated_at_unix_ms,
+            catalog_generation: self.catalog_generation,
             mode: self.mode.as_str().to_owned(),
             total_servers: servers.len(),
             enabled_servers: servers.iter().filter(|server| server.enabled).count(),
@@ -390,6 +435,30 @@ impl McpRuntimeSupervisor {
                 .count(),
             servers,
         }
+    }
+
+    /// Replaces the configured MCP registry and invalidates future catalog snapshots.
+    ///
+    /// Existing records keep health evidence when the server id and transport are
+    /// unchanged. New runs will observe the incremented catalog generation, while
+    /// already-started runs keep their previously recorded catalog snapshot.
+    pub fn reload_from_config(&mut self, config: &McpServersConfig, now_unix_ms: i64) {
+        let global_enabled = config.mode != RuntimePreviewMode::Disabled;
+        let previous = std::mem::take(&mut self.servers);
+        self.mode = config.mode;
+        self.catalog_generation = self.catalog_generation.saturating_add(1);
+        self.servers = config
+            .servers
+            .iter()
+            .map(|server| {
+                let mut next = McpRuntimeServerRecord::from_config(server, global_enabled);
+                if let Some(existing) = previous.get(next.id.as_str()) {
+                    next.apply_reload_evidence(existing, now_unix_ms);
+                }
+                next.updated_at_unix_ms = now_unix_ms;
+                (next.id.clone(), next)
+            })
+            .collect();
     }
 
     /// Marks a server as starting if its lifecycle policy allows a start attempt.
@@ -447,8 +516,11 @@ impl McpRuntimeSupervisor {
         record.state = McpServerLifecycleState::Healthy;
         record.consecutive_failures = 0;
         record.next_retry_at_unix_ms = None;
+        record.last_successful_probe_at_unix_ms = Some(now_unix_ms);
+        record.last_error_class = None;
         record.last_error_code = None;
         record.last_error_message = None;
+        record.quarantine_reason = None;
         record.updated_at_unix_ms = now_unix_ms;
         Ok(record.state)
     }
@@ -469,15 +541,18 @@ impl McpRuntimeSupervisor {
         let backoff_ms = self.next_backoff_ms(server_id)?;
         let stderr_tail_bytes = self.policy.stderr_tail_bytes;
         let record = self.server_record_mut(server_id)?;
+        let error_class = classify_mcp_runtime_error(reason_code);
         append_redacted_stderr(record, stderr, stderr_tail_bytes);
         record.consecutive_failures = record.consecutive_failures.saturating_add(1);
         record.total_failures = record.total_failures.saturating_add(1);
+        record.last_error_class = Some(error_class);
         record.last_error_code = Some(reason_code.trim().to_owned());
         record.last_error_message = Some(redact_diagnostic_text(message));
         record.updated_at_unix_ms = now_unix_ms;
         if record.consecutive_failures >= max_retries {
             record.state = McpServerLifecycleState::Quarantined;
             record.next_retry_at_unix_ms = None;
+            record.quarantine_reason = Some(error_class.as_str().to_owned());
         } else {
             record.state = McpServerLifecycleState::Backoff;
             record.next_retry_at_unix_ms = Some(now_unix_ms.saturating_add(backoff_ms));
@@ -497,6 +572,7 @@ impl McpRuntimeSupervisor {
         now_unix_ms: i64,
     ) -> Result<McpServerLifecycleState, McpBrokerError> {
         let record = self.server_record_mut(server_id)?;
+        record.last_error_class = Some(classify_mcp_runtime_error(reason_code));
         if !matches!(
             record.state,
             McpServerLifecycleState::Disabled | McpServerLifecycleState::Quarantined
@@ -606,15 +682,44 @@ impl McpRuntimeServerRecord {
             consecutive_failures: 0,
             total_failures: 0,
             restart_count: 0,
+            last_successful_probe_at_unix_ms: None,
             next_retry_at_unix_ms: None,
+            last_error_class: None,
             last_error_code: None,
             last_error_message: None,
             stderr_tail_redacted: None,
+            quarantine_reason: None,
             updated_at_unix_ms: 0,
         }
     }
 
+    fn apply_reload_evidence(&mut self, existing: &Self, now_unix_ms: i64) {
+        if !(self.enabled && existing.enabled && self.transport == existing.transport) {
+            return;
+        }
+        if existing.state == McpServerLifecycleState::Quarantined {
+            self.state = McpServerLifecycleState::Stopped;
+            self.consecutive_failures = 0;
+            self.next_retry_at_unix_ms = None;
+            self.quarantine_reason = None;
+        } else {
+            self.state = existing.state;
+            self.consecutive_failures = existing.consecutive_failures;
+            self.next_retry_at_unix_ms = existing.next_retry_at_unix_ms;
+            self.quarantine_reason.clone_from(&existing.quarantine_reason);
+        }
+        self.total_failures = existing.total_failures;
+        self.restart_count = existing.restart_count;
+        self.last_successful_probe_at_unix_ms = existing.last_successful_probe_at_unix_ms;
+        self.last_error_class = existing.last_error_class;
+        self.last_error_code.clone_from(&existing.last_error_code);
+        self.last_error_message.clone_from(&existing.last_error_message);
+        self.stderr_tail_redacted.clone_from(&existing.stderr_tail_redacted);
+        self.updated_at_unix_ms = now_unix_ms;
+    }
+
     fn snapshot(&self) -> McpRuntimeServerSnapshot {
+        let catalog_available = self.enabled && self.state == McpServerLifecycleState::Healthy;
         McpRuntimeServerSnapshot {
             id: self.id.clone(),
             namespace: self.namespace.clone(),
@@ -624,11 +729,117 @@ impl McpRuntimeServerRecord {
             consecutive_failures: self.consecutive_failures,
             total_failures: self.total_failures,
             restart_count: self.restart_count,
+            last_successful_probe_at_unix_ms: self.last_successful_probe_at_unix_ms,
             next_retry_at_unix_ms: self.next_retry_at_unix_ms,
+            last_error_class: self.last_error_class,
             last_error_code: self.last_error_code.clone(),
             last_error_message: self.last_error_message.clone(),
             stderr_tail_redacted: self.stderr_tail_redacted.clone(),
+            quarantine_reason: self.quarantine_reason.clone(),
+            catalog_available,
+            catalog_hidden_reason: mcp_catalog_hidden_reason(self),
+            repair_hint: mcp_runtime_repair_hint(self),
             updated_at_unix_ms: self.updated_at_unix_ms,
+        }
+    }
+}
+
+fn classify_mcp_runtime_error(reason_code: &str) -> McpRuntimeErrorClass {
+    let code = reason_code.trim().to_ascii_lowercase();
+    if code.contains("protocol") || code.contains("jsonrpc") || code.contains("handshake") {
+        McpRuntimeErrorClass::ProtocolViolation
+    } else if code.contains("schema") {
+        McpRuntimeErrorClass::InvalidSchema
+    } else if code.contains("auth")
+        || code.contains("oauth")
+        || code.contains("unauthorized")
+        || code.contains("forbidden")
+        || code.contains("permission")
+    {
+        McpRuntimeErrorClass::AuthFailure
+    } else if code.contains("output") || code.contains("limit") || code.contains("too_large") {
+        McpRuntimeErrorClass::OutputLimitAbuse
+    } else if code.contains("policy")
+        || code.contains("approval")
+        || code.contains("egress")
+        || code.contains("vault")
+        || code.contains("capability_denied")
+    {
+        McpRuntimeErrorClass::PolicyViolation
+    } else if code.contains("transport")
+        || code.contains("process")
+        || code.contains("exit")
+        || code.contains("timeout")
+        || code.contains("connection")
+    {
+        McpRuntimeErrorClass::TransportFlapping
+    } else {
+        McpRuntimeErrorClass::Unknown
+    }
+}
+
+fn mcp_catalog_hidden_reason(record: &McpRuntimeServerRecord) -> Option<String> {
+    if record.enabled && record.state == McpServerLifecycleState::Healthy {
+        return None;
+    }
+    let reason = if !record.enabled {
+        "mcp.server_disabled"
+    } else if record.state == McpServerLifecycleState::Quarantined {
+        "mcp.server_quarantined"
+    } else {
+        "mcp.server_not_healthy"
+    };
+    Some(reason.to_owned())
+}
+
+fn mcp_runtime_repair_hint(record: &McpRuntimeServerRecord) -> String {
+    if !record.enabled {
+        return format!("run `palyra mcp enable {}` and then `palyra mcp reload`", record.id);
+    }
+    match record.state {
+        McpServerLifecycleState::Healthy => "no action required".to_owned(),
+        McpServerLifecycleState::Starting => {
+            format!(
+                "wait for MCP server `{}` startup to finish or run `palyra mcp probe {}`",
+                record.id, record.id
+            )
+        }
+        McpServerLifecycleState::Stopped => {
+            format!("run `palyra mcp probe {}` to start a health check", record.id)
+        }
+        McpServerLifecycleState::Backoff => {
+            format!(
+                "wait for retry backoff or run `palyra mcp reload` after fixing `{}`",
+                record.id
+            )
+        }
+        McpServerLifecycleState::Degraded | McpServerLifecycleState::Quarantined => {
+            match record.last_error_class.unwrap_or(McpRuntimeErrorClass::Unknown) {
+                McpRuntimeErrorClass::ProtocolViolation => {
+                    "upgrade or fix the MCP server protocol implementation, then run `palyra mcp reload`".to_owned()
+                }
+                McpRuntimeErrorClass::InvalidSchema => {
+                    "fix the MCP tool schema, then run `palyra mcp reload`".to_owned()
+                }
+                McpRuntimeErrorClass::AuthFailure => {
+                    format!("run `palyra mcp login {}` or fix MCP auth vault refs", record.id)
+                }
+                McpRuntimeErrorClass::OutputLimitAbuse => {
+                    "reduce MCP response size or adjust output limits before reloading".to_owned()
+                }
+                McpRuntimeErrorClass::TransportFlapping => {
+                    "inspect the MCP transport command or URL and stderr tail, then run `palyra mcp reload`".to_owned()
+                }
+                McpRuntimeErrorClass::PolicyViolation => {
+                    "review MCP policy, approval, egress, and vault grant configuration".to_owned()
+                }
+                McpRuntimeErrorClass::Unknown => {
+                    format!("inspect `palyra mcp doctor {}` and reload after fixing the server", record.id)
+                }
+            }
+        }
+        McpServerLifecycleState::Disabled => {
+            format!("run `palyra mcp enable {}` and then `palyra mcp reload`", record.id)
         }
     }
 }
@@ -3242,8 +3453,9 @@ mod tests {
 
         let snapshot = supervisor.snapshot(42);
 
-        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.schema_version, 2);
         assert_eq!(snapshot.generated_at_unix_ms, 42);
+        assert_eq!(snapshot.catalog_generation, 0);
         assert_eq!(snapshot.mode, "preview_only");
         assert_eq!(snapshot.total_servers, 2);
         assert_eq!(snapshot.enabled_servers, 1);
@@ -3312,12 +3524,103 @@ mod tests {
         assert_eq!(server.consecutive_failures, 3);
         assert_eq!(server.total_failures, 3);
         assert!(server.next_retry_at_unix_ms.is_none());
+        assert_eq!(server.last_error_class, Some(McpRuntimeErrorClass::TransportFlapping));
+        assert_eq!(server.quarantine_reason.as_deref(), Some("transport_flapping"));
+        assert!(!server.catalog_available);
+        assert_eq!(server.catalog_hidden_reason.as_deref(), Some("mcp.server_quarantined"));
+        assert!(server.repair_hint.contains("transport command or URL"));
         assert_eq!(
             supervisor
                 .start_server("docs", retry_at + 2)
                 .expect_err("quarantine blocks starts")
                 .reason_code,
             "mcp.server_quarantined"
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_classifies_quarantine_reasons_for_operator_doctor() {
+        let policy = McpRuntimeSupervisorPolicy {
+            max_retries: 1,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            stderr_tail_bytes: 256,
+        };
+        let cases = [
+            ("mcp.protocol_violation", McpRuntimeErrorClass::ProtocolViolation),
+            ("mcp.invalid_schema", McpRuntimeErrorClass::InvalidSchema),
+            ("mcp.auth_failure", McpRuntimeErrorClass::AuthFailure),
+            ("mcp.output_limit_abuse", McpRuntimeErrorClass::OutputLimitAbuse),
+            ("mcp.transport_flapping", McpRuntimeErrorClass::TransportFlapping),
+            ("mcp.policy_violation", McpRuntimeErrorClass::PolicyViolation),
+        ];
+
+        for (reason_code, expected_class) in cases {
+            let mut supervisor = McpRuntimeSupervisor::from_config_with_policy(
+                &runtime_config(vec![runtime_server("docs", true)]),
+                policy.clone(),
+            );
+            supervisor.start_server("docs", 1_000).expect("server should start");
+            supervisor
+                .record_failure("docs", reason_code, "runtime failure", None, 1_001)
+                .expect("failure should quarantine");
+
+            let snapshot = supervisor.snapshot(1_001);
+            let server = runtime_server_snapshot(&snapshot, "docs");
+            assert_eq!(server.state, McpServerLifecycleState::Quarantined);
+            assert_eq!(server.last_error_class, Some(expected_class));
+            assert_eq!(server.quarantine_reason.as_deref(), Some(expected_class.as_str()));
+        }
+    }
+
+    #[test]
+    fn runtime_supervisor_reload_invalidates_catalog_generation_for_future_runs() {
+        let mut supervisor =
+            McpRuntimeSupervisor::from_config(&runtime_config(vec![runtime_server("docs", true)]));
+        supervisor.start_server("docs", 100).expect("server should start");
+        supervisor.record_start_success("docs", 110).expect("server should become healthy");
+
+        let mut next_server = runtime_server("wiki", true);
+        next_server.namespace = "wiki".to_owned();
+        supervisor.reload_from_config(&runtime_config(vec![next_server]), 200);
+
+        let snapshot = supervisor.snapshot(200);
+        assert_eq!(snapshot.catalog_generation, 1);
+        assert_eq!(snapshot.total_servers, 1);
+        assert!(snapshot.servers.iter().all(|server| server.id != "docs"));
+        let wiki = runtime_server_snapshot(&snapshot, "wiki");
+        assert_eq!(wiki.state, McpServerLifecycleState::Stopped);
+        assert_eq!(wiki.catalog_hidden_reason.as_deref(), Some("mcp.server_not_healthy"));
+    }
+
+    #[test]
+    fn runtime_supervisor_reload_reopens_quarantined_server_for_probe() {
+        let policy = McpRuntimeSupervisorPolicy {
+            max_retries: 1,
+            base_backoff_ms: 100,
+            max_backoff_ms: 1_000,
+            stderr_tail_bytes: 256,
+        };
+        let config = runtime_config(vec![runtime_server("docs", true)]);
+        let mut supervisor = McpRuntimeSupervisor::from_config_with_policy(&config, policy);
+        supervisor.start_server("docs", 100).expect("server should start");
+        supervisor
+            .record_failure("docs", "mcp.auth_failure", "auth failed", None, 101)
+            .expect("failure should quarantine");
+
+        supervisor.reload_from_config(&config, 200);
+
+        let snapshot = supervisor.snapshot(200);
+        let server = runtime_server_snapshot(&snapshot, "docs");
+        assert_eq!(snapshot.catalog_generation, 1);
+        assert_eq!(server.state, McpServerLifecycleState::Stopped);
+        assert_eq!(server.last_error_class, Some(McpRuntimeErrorClass::AuthFailure));
+        assert_eq!(server.consecutive_failures, 0);
+        assert!(server.quarantine_reason.is_none());
+        assert_eq!(server.catalog_hidden_reason.as_deref(), Some("mcp.server_not_healthy"));
+        assert_eq!(
+            supervisor.start_server("docs", 201).expect("reload should reopen probe"),
+            McpServerLifecycleState::Starting
         );
     }
 
@@ -3345,6 +3648,7 @@ mod tests {
         let server = runtime_server_snapshot(&snapshot, "docs");
         assert_eq!(server.restart_count, 1);
         assert_eq!(server.state, McpServerLifecycleState::Stopped);
+        assert_eq!(server.last_successful_probe_at_unix_ms, Some(110));
         assert_eq!(server.updated_at_unix_ms, 120);
     }
 

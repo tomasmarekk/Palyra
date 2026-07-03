@@ -26,6 +26,14 @@ pub enum McpSubcommand {
     },
     #[command(about = "Show external MCP runtime supervisor status")]
     Status(McpStatusArgs),
+    #[command(about = "Run external MCP runtime doctor checks")]
+    Doctor(McpDoctorArgs),
+    #[command(about = "Show external MCP runtime probe status")]
+    Probe(McpProbeArgs),
+    #[command(about = "Show external MCP tool catalog availability")]
+    Tools(McpToolsArgs),
+    #[command(about = "Reload external MCP runtime configuration")]
+    Reload(McpReloadArgs),
     #[command(about = "List configured external MCP servers")]
     List {
         #[arg(long, help = "Read this palyra.toml path")]
@@ -64,7 +72,7 @@ pub struct McpCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
-pub struct McpStatusArgs {
+pub struct McpRuntimeConnectionArgs {
     #[arg(long, help = "Admin HTTP base URL")]
     pub url: Option<String>,
     #[arg(long, help = "Admin token override")]
@@ -75,6 +83,56 @@ pub struct McpStatusArgs {
     pub device_id: Option<String>,
     #[arg(long, help = "Console channel for the diagnostics session")]
     pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpStatusArgs {
+    #[command(flatten)]
+    pub connection: McpRuntimeConnectionArgs,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpDoctorArgs {
+    #[arg(help = "Limit doctor output to one external MCP server")]
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub connection: McpRuntimeConnectionArgs,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpProbeArgs {
+    #[arg(help = "Limit probe output to one external MCP server")]
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub connection: McpRuntimeConnectionArgs,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpToolsArgs {
+    #[arg(help = "Limit tool availability output to one external MCP server")]
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub connection: McpRuntimeConnectionArgs,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct McpReloadArgs {
+    #[arg(long, help = "Reload this palyra.toml path; defaults to the active daemon config")]
+    pub path: Option<String>,
+    #[command(flatten)]
+    pub connection: McpRuntimeConnectionArgs,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }

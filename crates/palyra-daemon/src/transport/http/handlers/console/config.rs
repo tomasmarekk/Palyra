@@ -373,6 +373,9 @@ pub(crate) async fn apply_config_reload_for_context(
                 applied_steps.push(step.clone());
             }
         }
+        if current.mcp_servers != candidate.mcp_servers {
+            next_loaded.mcp_servers = candidate.mcp_servers.clone();
+        }
         let next_generation = state
             .configured_secrets
             .lock()
@@ -400,6 +403,17 @@ pub(crate) async fn apply_config_reload_for_context(
         }
         if current.memory != candidate.memory {
             state.runtime.configure_memory(memory_runtime_config_from_loaded(&next_loaded));
+        }
+        if current.mcp_servers != candidate.mcp_servers {
+            let reload_at_unix_ms = unix_ms_now().unwrap_or(0);
+            state
+                .mcp_supervisor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .reload_from_config(&next_loaded.mcp_servers, reload_at_unix_ms);
+            if let Some(step) = plan.steps.iter().find(|step| step.config_path == "mcp_servers") {
+                applied_steps.push(step.clone());
+            }
         }
         {
             let mut loaded_guard =
@@ -603,6 +617,20 @@ fn build_reload_plan(
             "model provider config changed; credential values and URLs are redacted",
         ));
     }
+    if current.mcp_servers != candidate.mcp_servers {
+        steps.push(reload_plan_step(
+            "mcp_runtime",
+            "mcp_servers",
+            "hot_safe",
+            "MCP registry changes invalidate future tool catalogs without mutating active run snapshots",
+            "MCP import disabled until configured",
+            "MCP registry validation plus vault-ref-only secret binding",
+            "secret_refs_redacted",
+            "hot_safe",
+            "new runs use a refreshed MCP supervisor and catalog generation",
+            "MCP server registry changed; command args, URLs, and vault refs are summarized without secret values",
+        ));
+    }
     if current.tool_call.browser_service != candidate.tool_call.browser_service {
         steps.push(reload_plan_step(
             "browser_service",
@@ -764,8 +792,12 @@ fn memory_runtime_config_from_loaded(loaded: &crate::config::LoadedConfig) -> Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LoadedConfig;
+    use crate::config::{
+        LoadedConfig, McpServerApprovalProfile, McpServerConfig, McpServerEgressPolicy,
+        McpServerTransport, McpServerTrustLevel, McpServersConfig,
+    };
     use crate::model_provider::{ModelProviderConfig, ModelProviderKind};
+    use palyra_common::runtime_preview::RuntimePreviewMode;
 
     fn loaded_with_model_provider(model_provider: ModelProviderConfig) -> LoadedConfig {
         LoadedConfig {
@@ -815,6 +847,30 @@ mod tests {
         }
     }
 
+    fn test_mcp_servers_config() -> McpServersConfig {
+        McpServersConfig {
+            mode: RuntimePreviewMode::PreviewOnly,
+            servers: vec![McpServerConfig {
+                id: "docs".to_owned(),
+                enabled: true,
+                namespace: "docs".to_owned(),
+                transport: McpServerTransport::Stdio,
+                command: Some(vec!["mcp-docs".to_owned()]),
+                url: None,
+                env_vault_refs: Vec::new(),
+                trust_level: McpServerTrustLevel::Workspace,
+                approval_profile: McpServerApprovalProfile::RequireApproval,
+                egress_policy: McpServerEgressPolicy::DenyAll,
+                egress_allowlist: Vec::new(),
+                oauth_required: false,
+                oauth_grant: None,
+                sampling_policy: Default::default(),
+                tool_allowlist: Vec::new(),
+                tool_denylist: Vec::new(),
+            }],
+        }
+    }
+
     #[test]
     fn model_provider_reload_is_hot_safe_when_no_runs_are_active() {
         let current = loaded_with_model_provider(ModelProviderConfig::default());
@@ -833,6 +889,27 @@ mod tests {
             .expect("model-provider reload step should be present");
         assert_eq!(step.category, "hot_safe");
         assert_eq!(step.reloadability, "hot_safe");
+    }
+
+    #[test]
+    fn mcp_server_reload_is_hot_safe_and_catalog_scoped() {
+        let current = loaded_with_model_provider(ModelProviderConfig::default());
+        let mut candidate = current.clone();
+        candidate.mcp_servers = test_mcp_servers_config();
+
+        let plan = build_reload_plan(&current, &candidate, "test-palyra.toml".to_owned(), 3);
+
+        assert!(!plan.requires_restart);
+        assert!(plan.hot_safe_applicable);
+        assert_eq!(plan.summary.hot_safe, 1);
+        let step = plan
+            .steps
+            .iter()
+            .find(|step| step.config_path == "mcp_servers")
+            .expect("MCP reload step should be present");
+        assert_eq!(step.category, "hot_safe");
+        assert_eq!(step.component, "mcp_runtime");
+        assert!(step.reason.contains("active run snapshots"));
     }
 
     #[test]

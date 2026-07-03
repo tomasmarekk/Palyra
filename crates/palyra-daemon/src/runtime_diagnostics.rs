@@ -1404,11 +1404,12 @@ fn mcp_health_component(payload: &Value) -> RuntimeHealthComponentSnapshot {
             ("backoff_servers", backoff_servers),
             ("quarantined_servers", quarantined_servers),
             ("disabled_servers", read_u64(payload, "/disabled_servers")),
+            ("catalog_generation", read_u64(payload, "/catalog_generation")),
         ]),
         vec![
-            "palyra_mcp_status".to_owned(),
-            "inspect_mcp_stderr_tail".to_owned(),
-            "restart_or_disable_mcp_server".to_owned(),
+            "palyra_mcp_doctor".to_owned(),
+            "palyra_mcp_probe".to_owned(),
+            "palyra_mcp_reload_after_fix".to_owned(),
         ],
     )
 }
@@ -1731,6 +1732,7 @@ mod tests {
     fn mcp_health_component_reports_supervisor_degradation() {
         let component = mcp_health_component(&json!({
             "schema_version": 1,
+            "catalog_generation": 7,
             "mode": "preview_only",
             "total_servers": 3,
             "enabled_servers": 2,
@@ -1748,6 +1750,9 @@ mod tests {
         assert!(component.reason_codes.contains(&"mcp.servers_in_backoff".to_owned()));
         assert_eq!(component.metrics.get("enabled_servers"), Some(&2_u64));
         assert_eq!(component.metrics.get("disabled_servers"), Some(&1_u64));
+        assert_eq!(component.metrics.get("catalog_generation"), Some(&7_u64));
+        assert!(component.repair_hints.contains(&"palyra_mcp_doctor".to_owned()));
+        assert!(component.repair_hints.contains(&"palyra_mcp_reload_after_fix".to_owned()));
     }
 
     #[test]
