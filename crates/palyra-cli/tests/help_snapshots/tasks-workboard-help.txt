@@ -3,6 +3,10 @@ Usage: palyra tasks workboard [OPTIONS] <COMMAND>
 Commands:
   list
   create
+  show
+  update
+  block
+  link-artifact
   claim
   heartbeat
   complete

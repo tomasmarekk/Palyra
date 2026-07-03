@@ -633,6 +633,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::tasks::console_workboard_create_handler),
         )
         .route(
+            "/console/v1/workboard/items/{item_id}",
+            get(console::tasks::console_workboard_get_handler)
+                .post(console::tasks::console_workboard_update_handler),
+        )
+        .route(
             "/console/v1/workboard/items/{item_id}/claim",
             post(console::tasks::console_workboard_claim_handler),
         )
@@ -643,6 +648,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/workboard/items/{item_id}/complete",
             post(console::tasks::console_workboard_complete_handler),
+        )
+        .route(
+            "/console/v1/workboard/items/{item_id}/block",
+            post(console::tasks::console_workboard_block_handler),
+        )
+        .route(
+            "/console/v1/workboard/items/{item_id}/artifacts",
+            post(console::tasks::console_workboard_link_artifact_handler),
         )
         .route(
             "/console/v1/networked-workers/reap-expired",

@@ -21,7 +21,7 @@ use crate::{
     gateway::current_unix_ms,
     journal::{
         CommitmentUpdateRequest, FlowTransitionRequest, OrchestratorBackgroundTaskUpdateRequest,
-        WorkItemCreateRequest, WorkItemListFilter, WorkItemUpdateRequest,
+        WorkItemCreateRequest, WorkItemListFilter, WorkItemRecord, WorkItemUpdateRequest,
     },
     runtime_status_response,
     task_runtime::{TaskAccessPolicy, TaskRuntime, TaskRuntimeFilter},
@@ -39,6 +39,22 @@ pub(crate) struct ConsoleTasksQuery {
     state: Option<String>,
     #[serde(default)]
     include_terminal: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConsoleWorkboardQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    include_terminal: Option<bool>,
+    #[serde(default)]
+    parent_work_item_id: Option<String>,
+    #[serde(default)]
+    objective_id: Option<String>,
+    #[serde(default)]
+    routine_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +77,8 @@ pub(crate) struct ConsoleWorkItemCreateRequest {
     #[serde(default)]
     run_id: Option<String>,
     #[serde(default)]
+    parent_work_item_id: Option<String>,
+    #[serde(default)]
     objective_id: Option<String>,
     #[serde(default)]
     routine_id: Option<String>,
@@ -69,9 +87,13 @@ pub(crate) struct ConsoleWorkItemCreateRequest {
     #[serde(default)]
     dependencies: Option<Value>,
     #[serde(default)]
+    evidence_refs: Option<Value>,
+    #[serde(default)]
     artifact_refs: Option<Value>,
     #[serde(default)]
     blocker: Option<Value>,
+    #[serde(default)]
+    verification_state: Option<String>,
     #[serde(default)]
     metadata: Option<Value>,
 }
@@ -83,6 +105,69 @@ pub(crate) struct ConsoleWorkItemClaimRequest {
     worker: Option<String>,
     #[serde(default)]
     lease_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWorkItemUpdateRequest {
+    #[serde(default)]
+    parent_work_item_id: Option<Option<String>>,
+    #[serde(default)]
+    objective_id: Option<Option<String>>,
+    #[serde(default)]
+    routine_id: Option<Option<String>>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+    #[serde(default)]
+    assigned_worker: Option<Option<String>>,
+    #[serde(default)]
+    dependencies: Option<Value>,
+    #[serde(default)]
+    evidence_refs: Option<Value>,
+    #[serde(default)]
+    artifact_refs: Option<Value>,
+    #[serde(default)]
+    blocker: Option<Value>,
+    #[serde(default)]
+    verification_state: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWorkItemBlockRequest {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    blocker: Option<Value>,
+    #[serde(default)]
+    evidence_refs: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWorkItemCompleteRequest {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    evidence_refs: Option<Value>,
+    #[serde(default)]
+    artifact_refs: Option<Value>,
+    #[serde(default)]
+    verification_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWorkItemArtifactLinkRequest {
+    artifact_ref: Value,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Lists normalized tasks for the caller.
@@ -203,7 +288,7 @@ pub(crate) async fn console_task_retry_handler(
 pub(crate) async fn console_workboard_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<ConsoleTasksQuery>,
+    Query(query): Query<ConsoleWorkboardQuery>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, false)?;
     let limit = query.limit.unwrap_or(DEFAULT_TASK_LIMIT).clamp(1, MAX_TASK_LIMIT);
@@ -213,6 +298,9 @@ pub(crate) async fn console_workboard_list_handler(
             owner_principal: Some(session.context.principal.clone()),
             device_id: Some(session.context.device_id.clone()),
             channel: session.context.channel.clone(),
+            parent_work_item_id: query.parent_work_item_id,
+            objective_id: query.objective_id,
+            routine_id: query.routine_id,
             state: query.state,
             include_terminal: query.include_terminal.unwrap_or(false),
             limit,
@@ -247,6 +335,7 @@ pub(crate) async fn console_workboard_create_handler(
             channel: session.context.channel.clone(),
             session_id: body.session_id,
             run_id: body.run_id,
+            parent_work_item_id: body.parent_work_item_id,
             objective_id: body.objective_id,
             routine_id: body.routine_id,
             title: body.title,
@@ -255,10 +344,78 @@ pub(crate) async fn console_workboard_create_handler(
             priority: body.priority.unwrap_or(0),
             assigned_worker: body.assigned_worker,
             dependencies_json: body.dependencies.unwrap_or_else(|| json!([])).to_string(),
+            evidence_refs_json: body.evidence_refs.unwrap_or_else(|| json!([])).to_string(),
             artifact_refs_json: body.artifact_refs.unwrap_or_else(|| json!([])).to_string(),
             blocker_json: body.blocker.unwrap_or_else(|| json!({})).to_string(),
+            verification_state: body.verification_state.unwrap_or_else(default_verification_state),
             metadata_json: body.metadata.unwrap_or_else(|| json!({})).to_string(),
             actor_principal: session.context.principal,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "contract": workboard_contract_descriptor(), "item": item })))
+}
+
+/// Returns a WorkBoard item and its audit events.
+///
+/// # Errors
+/// Returns not-found, permission denied, or a mapped runtime error.
+pub(crate) async fn console_workboard_get_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let item = load_authorized_work_item(&state, &session, item_id.as_str()).await?;
+    let events =
+        state.runtime.list_work_item_events(item_id, 100).await.map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "contract": workboard_contract_descriptor(),
+        "item": item,
+        "events": events,
+    })))
+}
+
+/// Updates graph metadata, refs, state, or assignment for a WorkBoard item.
+///
+/// # Errors
+/// Returns not-found, permission denied, invalid arguments, or a mapped runtime error.
+pub(crate) async fn console_workboard_update_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Json(body): Json<ConsoleWorkItemUpdateRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    authorize_work_item(&state, &session, item_id.as_str()).await?;
+    let completed_at = if body.state.as_deref().is_some_and(is_terminal_work_item_state_name) {
+        Some(Some(current_unix_ms()))
+    } else {
+        None
+    };
+    let summary = action_reason(body.reason, "work item updated");
+    let item = state
+        .runtime
+        .update_work_item(WorkItemUpdateRequest {
+            work_item_id: item_id,
+            parent_work_item_id: body.parent_work_item_id,
+            objective_id: body.objective_id,
+            routine_id: body.routine_id,
+            state: body.state,
+            priority: body.priority,
+            assigned_worker: body.assigned_worker,
+            dependencies_json: body.dependencies.map(|value| value.to_string()),
+            evidence_refs_json: body.evidence_refs.map(|value| value.to_string()),
+            artifact_refs_json: body.artifact_refs.map(|value| value.to_string()),
+            blocker_json: body.blocker.map(|value| value.to_string()),
+            verification_state: body.verification_state,
+            metadata_json: body.metadata.map(|value| value.to_string()),
+            completed_at_unix_ms: completed_at,
+            actor_principal: session.context.principal,
+            event_type: "work_item.updated".to_owned(),
+            summary: summary.clone(),
+            payload_json: json!({ "reason": summary }).to_string(),
+            ..WorkItemUpdateRequest::default()
         })
         .await
         .map_err(runtime_status_response)?;
@@ -333,6 +490,38 @@ pub(crate) async fn console_workboard_heartbeat_handler(
     Ok(Json(json!({ "contract": workboard_contract_descriptor(), "item": item })))
 }
 
+/// Blocks a WorkBoard item with structured blocker metadata.
+///
+/// # Errors
+/// Returns not-found, permission denied, invalid arguments, or a mapped runtime error.
+pub(crate) async fn console_workboard_block_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Json(body): Json<ConsoleWorkItemBlockRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    authorize_work_item(&state, &session, item_id.as_str()).await?;
+    let summary = action_reason(body.reason, "work item blocked");
+    let blocker = body.blocker.unwrap_or_else(|| json!({ "reason": summary }));
+    let item = state
+        .runtime
+        .update_work_item(WorkItemUpdateRequest {
+            work_item_id: item_id,
+            state: Some("blocked".to_owned()),
+            blocker_json: Some(blocker.to_string()),
+            evidence_refs_json: body.evidence_refs.map(|value| value.to_string()),
+            actor_principal: session.context.principal,
+            event_type: "work_item.blocked".to_owned(),
+            summary: summary.clone(),
+            payload_json: json!({ "reason": summary }).to_string(),
+            ..WorkItemUpdateRequest::default()
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "contract": workboard_contract_descriptor(), "item": item })))
+}
+
 /// Completes a WorkBoard item.
 ///
 /// # Errors
@@ -341,11 +530,12 @@ pub(crate) async fn console_workboard_complete_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    Json(body): Json<ConsoleTaskActionRequest>,
+    Json(body): Json<ConsoleWorkItemCompleteRequest>,
 ) -> Result<Json<Value>, Response> {
     let session = authorize_console_session(&state, &headers, true)?;
     authorize_work_item(&state, &session, item_id.as_str()).await?;
     let now = current_unix_ms();
+    let summary = action_reason(body.reason, "work item completed");
     let item = state
         .runtime
         .update_work_item(WorkItemUpdateRequest {
@@ -353,11 +543,48 @@ pub(crate) async fn console_workboard_complete_handler(
             state: Some("succeeded".to_owned()),
             claim_owner: Some(None),
             claim_expires_at_unix_ms: Some(None),
+            evidence_refs_json: body.evidence_refs.map(|value| value.to_string()),
+            artifact_refs_json: body.artifact_refs.map(|value| value.to_string()),
+            verification_state: Some(
+                body.verification_state.unwrap_or_else(|| "verified".to_owned()),
+            ),
             completed_at_unix_ms: Some(Some(now)),
             actor_principal: session.context.principal,
             event_type: "work_item.completed".to_owned(),
-            summary: action_reason(body.reason, "work item completed"),
+            summary: summary.clone(),
             payload_json: json!({ "completed_at_unix_ms": now }).to_string(),
+            ..WorkItemUpdateRequest::default()
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({ "contract": workboard_contract_descriptor(), "item": item })))
+}
+
+/// Appends one artifact reference to a WorkBoard item.
+///
+/// # Errors
+/// Returns not-found, permission denied, invalid arguments, or a mapped runtime error.
+pub(crate) async fn console_workboard_link_artifact_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Json(body): Json<ConsoleWorkItemArtifactLinkRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let item = load_authorized_work_item(&state, &session, item_id.as_str()).await?;
+    let artifact_refs =
+        append_json_array_ref(item.artifact_refs_json.as_str(), body.artifact_ref, "artifact_refs")
+            .map_err(runtime_status_response)?;
+    let summary = action_reason(body.reason, "work item artifact linked");
+    let item = state
+        .runtime
+        .update_work_item(WorkItemUpdateRequest {
+            work_item_id: item_id,
+            artifact_refs_json: Some(artifact_refs.to_string()),
+            actor_principal: session.context.principal,
+            event_type: "work_item.artifact_linked".to_owned(),
+            summary: summary.clone(),
+            payload_json: json!({ "reason": summary }).to_string(),
             ..WorkItemUpdateRequest::default()
         })
         .await
@@ -524,6 +751,15 @@ async fn authorize_work_item(
     session: &ConsoleSession,
     item_id: &str,
 ) -> Result<(), Response> {
+    load_authorized_work_item(state, session, item_id).await?;
+    Ok(())
+}
+
+async fn load_authorized_work_item(
+    state: &AppState,
+    session: &ConsoleSession,
+    item_id: &str,
+) -> Result<WorkItemRecord, Response> {
     let Some(item) =
         state.runtime.get_work_item(item_id.to_owned()).await.map_err(runtime_status_response)?
     else {
@@ -537,7 +773,7 @@ async fn authorize_work_item(
             "work item belongs to a different console scope",
         )));
     }
-    Ok(())
+    Ok(item)
 }
 
 fn task_access(session: &ConsoleSession) -> TaskAccessPolicy {
@@ -555,6 +791,25 @@ fn action_reason(reason: Option<String>, default_reason: &str) -> String {
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         })
         .unwrap_or_else(|| default_reason.to_owned())
+}
+
+fn default_verification_state() -> String {
+    "unverified".to_owned()
+}
+
+fn is_terminal_work_item_state_name(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}
+
+fn append_json_array_ref(current_json: &str, next: Value, field: &str) -> Result<Value, Status> {
+    let mut refs = serde_json::from_str::<Value>(current_json).map_err(|error| {
+        Status::failed_precondition(format!("{field} is not valid JSON: {error}"))
+    })?;
+    let Some(values) = refs.as_array_mut() else {
+        return Err(Status::failed_precondition(format!("{field} must be a JSON array")));
+    };
+    values.push(next);
+    Ok(refs)
 }
 
 fn task_contract_descriptor() -> Value {
@@ -592,5 +847,8 @@ fn workboard_contract_descriptor() -> Value {
     json!({
         "schema": "palyra.console.workboard.v1",
         "states": ["queued", "running", "paused", "blocked", "waiting", "succeeded", "failed", "cancel_requested", "cancelled"],
+        "verification_states": ["unverified", "pending", "verified", "failed", "waived"],
+        "graph_fields": ["parent_work_item_id", "dependencies_json", "evidence_refs_json", "artifact_refs_json", "objective_id", "routine_id"],
+        "operations": ["list", "get", "create", "update", "block", "complete", "link_artifact", "claim", "heartbeat"],
     })
 }

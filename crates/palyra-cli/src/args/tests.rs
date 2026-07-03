@@ -30,8 +30,8 @@ use super::{
     RunExportFormatArg, SandboxCommand, SandboxRuntimeArg, SecretsCommand, SecretsConfigureCommand,
     SecurityCommand, SessionsCommand, SetupWizardOverridesArg, SkillsCommand, SkillsPackageCommand,
     SkillsProcedureCommand, SupportBundleCommand, SystemCommand, SystemEventCommand,
-    SystemEventSeverityArg, TuiCommand, UninstallCommand, UpdateCommand, WebhooksCommand,
-    WizardOverridesArg, WorkersCommand, WorkspaceRoleArg,
+    SystemEventSeverityArg, TasksCommand, TuiCommand, UninstallCommand, UpdateCommand,
+    WebhooksCommand, WizardOverridesArg, WorkboardCommand, WorkersCommand, WorkspaceRoleArg,
 };
 
 mod parser_stability_plugin_tests;
@@ -351,6 +351,58 @@ fn parse_health_with_explicit_endpoints() {
             url: Some("http://127.0.0.1:7142".to_owned()),
             grpc_url: Some("http://127.0.0.1:7443".to_owned()),
             json: false,
+        }
+    );
+}
+
+#[test]
+fn parse_tasks_workboard_graph_controls() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "tasks",
+        "workboard",
+        "update",
+        "--id",
+        "work-item-1",
+        "--state",
+        "blocked",
+        "--clear-parent-work-item",
+        "--objective-id",
+        "objective-1",
+        "--evidence-refs-json",
+        r#"[{"kind":"run","id":"run-1"}]"#,
+        "--verification-state",
+        "pending",
+        "--reason",
+        "waiting on operator",
+        "--json",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Tasks {
+            command: TasksCommand::Workboard {
+                command: WorkboardCommand::Update {
+                    id: "work-item-1".to_owned(),
+                    state: Some("blocked".to_owned()),
+                    priority: None,
+                    assigned_worker: None,
+                    clear_assigned_worker: false,
+                    parent_work_item_id: None,
+                    clear_parent_work_item: true,
+                    objective_id: Some("objective-1".to_owned()),
+                    clear_objective: false,
+                    routine_id: None,
+                    clear_routine: false,
+                    verification_state: Some("pending".to_owned()),
+                    dependencies_json: None,
+                    evidence_refs_json: Some(r#"[{"kind":"run","id":"run-1"}]"#.to_owned()),
+                    artifact_refs_json: None,
+                    blocker_json: None,
+                    metadata_json: None,
+                    reason: Some("waiting on operator".to_owned()),
+                    json: true,
+                }
+            }
         }
     );
 }

@@ -57,24 +57,148 @@ async fn run_workboard_async(
     command: WorkboardCommand,
 ) -> Result<()> {
     match command {
-        WorkboardCommand::List { limit, state, include_terminal, json } => {
-            let payload = list_workboard_value(client, limit, state, include_terminal).await?;
+        WorkboardCommand::List {
+            limit,
+            state,
+            parent_work_item_id,
+            objective_id,
+            routine_id,
+            include_terminal,
+            json,
+        } => {
+            let payload = list_workboard_value(
+                client,
+                limit,
+                state,
+                parent_work_item_id,
+                objective_id,
+                routine_id,
+                include_terminal,
+            )
+            .await?;
             emit_workboard_list(&payload, output::preferred_json(json))
         }
-        WorkboardCommand::Create { title, summary, priority, session_id, run_id, json } => {
+        WorkboardCommand::Create {
+            title,
+            summary,
+            priority,
+            session_id,
+            run_id,
+            parent_work_item_id,
+            objective_id,
+            routine_id,
+            verification_state,
+            dependencies_json,
+            evidence_refs_json,
+            artifact_refs_json,
+            blocker_json,
+            metadata_json,
+            json,
+        } => {
+            let body = build_workboard_create_payload(WorkboardCreatePayloadInput {
+                title,
+                summary,
+                priority,
+                session_id,
+                run_id,
+                parent_work_item_id,
+                objective_id,
+                routine_id,
+                verification_state,
+                dependencies_json,
+                evidence_refs_json,
+                artifact_refs_json,
+                blocker_json,
+                metadata_json,
+            })?;
+            let payload =
+                client.post_json_value("console/v1/workboard/items".to_owned(), &body).await?;
+            emit_workboard_item("tasks.workboard.create", &payload, output::preferred_json(json))
+        }
+        WorkboardCommand::Show { id, json } => {
+            let payload = get_workboard_item_value(client, id.as_str()).await?;
+            emit_workboard_item("tasks.workboard.show", &payload, output::preferred_json(json))
+        }
+        WorkboardCommand::Update {
+            id,
+            state,
+            priority,
+            assigned_worker,
+            clear_assigned_worker,
+            parent_work_item_id,
+            clear_parent_work_item,
+            objective_id,
+            clear_objective,
+            routine_id,
+            clear_routine,
+            verification_state,
+            dependencies_json,
+            evidence_refs_json,
+            artifact_refs_json,
+            blocker_json,
+            metadata_json,
+            reason,
+            json,
+        } => {
+            let body = build_workboard_update_payload(WorkboardUpdatePayloadInput {
+                state,
+                priority,
+                assigned_worker,
+                clear_assigned_worker,
+                parent_work_item_id,
+                clear_parent_work_item,
+                objective_id,
+                clear_objective,
+                routine_id,
+                clear_routine,
+                verification_state,
+                dependencies_json,
+                evidence_refs_json,
+                artifact_refs_json,
+                blocker_json,
+                metadata_json,
+                reason,
+            })?;
             let payload = client
                 .post_json_value(
-                    "console/v1/workboard/items".to_owned(),
-                    &json!({
-                        "title": title,
-                        "summary": summary,
-                        "priority": priority,
-                        "session_id": session_id,
-                        "run_id": run_id,
-                    }),
+                    format!("console/v1/workboard/items/{}", percent_encode_component(id.as_str())),
+                    &body,
                 )
                 .await?;
-            emit_workboard_item("tasks.workboard.create", &payload, output::preferred_json(json))
+            emit_workboard_item("tasks.workboard.update", &payload, output::preferred_json(json))
+        }
+        WorkboardCommand::Block { id, reason, blocker_json, evidence_refs_json, json } => {
+            let body = build_workboard_block_payload(reason, blocker_json, evidence_refs_json)?;
+            let payload = client
+                .post_json_value(
+                    format!(
+                        "console/v1/workboard/items/{}/block",
+                        percent_encode_component(id.as_str())
+                    ),
+                    &body,
+                )
+                .await?;
+            emit_workboard_item("tasks.workboard.block", &payload, output::preferred_json(json))
+        }
+        WorkboardCommand::LinkArtifact { id, artifact_ref_json, reason, json } => {
+            let body = json!({
+                "artifact_ref": parse_json_arg("--artifact-ref-json", artifact_ref_json.as_str())?,
+                "reason": reason,
+            });
+            let payload = client
+                .post_json_value(
+                    format!(
+                        "console/v1/workboard/items/{}/artifacts",
+                        percent_encode_component(id.as_str())
+                    ),
+                    &body,
+                )
+                .await?;
+            emit_workboard_item(
+                "tasks.workboard.link-artifact",
+                &payload,
+                output::preferred_json(json),
+            )
         }
         WorkboardCommand::Claim { id, worker, lease_ms, json } => {
             let payload = client
@@ -100,14 +224,27 @@ async fn run_workboard_async(
                 .await?;
             emit_workboard_item("tasks.workboard.heartbeat", &payload, output::preferred_json(json))
         }
-        WorkboardCommand::Complete { id, reason, json } => {
+        WorkboardCommand::Complete {
+            id,
+            reason,
+            evidence_refs_json,
+            artifact_refs_json,
+            verification_state,
+            json,
+        } => {
+            let body = build_workboard_complete_payload(
+                reason,
+                evidence_refs_json,
+                artifact_refs_json,
+                verification_state,
+            )?;
             let payload = client
                 .post_json_value(
                     format!(
                         "console/v1/workboard/items/{}/complete",
                         percent_encode_component(id.as_str())
                     ),
-                    &reason_payload(reason),
+                    &body,
                 )
                 .await?;
             emit_workboard_item("tasks.workboard.complete", &payload, output::preferred_json(json))
@@ -175,6 +312,9 @@ async fn list_workboard_value(
     client: &control_plane::ControlPlaneClient,
     limit: Option<u32>,
     state: Option<String>,
+    parent_work_item_id: Option<String>,
+    objective_id: Option<String>,
+    routine_id: Option<String>,
     include_terminal: bool,
 ) -> Result<Value> {
     let path = build_query_path(
@@ -182,10 +322,181 @@ async fn list_workboard_value(
         vec![
             ("limit", limit.map(|value| value.to_string())),
             ("state", state),
+            ("parent_work_item_id", parent_work_item_id),
+            ("objective_id", objective_id),
+            ("routine_id", routine_id),
             ("include_terminal", Some(include_terminal.to_string())),
         ],
     );
     client.get_json_value(path).await.map_err(Into::into)
+}
+
+async fn get_workboard_item_value(
+    client: &control_plane::ControlPlaneClient,
+    item_id: &str,
+) -> Result<Value> {
+    client
+        .get_json_value(format!("console/v1/workboard/items/{}", percent_encode_component(item_id)))
+        .await
+        .map_err(Into::into)
+}
+
+struct WorkboardCreatePayloadInput {
+    title: String,
+    summary: Option<String>,
+    priority: Option<i64>,
+    session_id: Option<String>,
+    run_id: Option<String>,
+    parent_work_item_id: Option<String>,
+    objective_id: Option<String>,
+    routine_id: Option<String>,
+    verification_state: Option<String>,
+    dependencies_json: Option<String>,
+    evidence_refs_json: Option<String>,
+    artifact_refs_json: Option<String>,
+    blocker_json: Option<String>,
+    metadata_json: Option<String>,
+}
+
+fn build_workboard_create_payload(input: WorkboardCreatePayloadInput) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("title".to_owned(), Value::String(input.title));
+    insert_optional_string(&mut body, "summary", input.summary);
+    insert_optional_i64(&mut body, "priority", input.priority);
+    insert_optional_string(&mut body, "session_id", input.session_id);
+    insert_optional_string(&mut body, "run_id", input.run_id);
+    insert_optional_string(&mut body, "parent_work_item_id", input.parent_work_item_id);
+    insert_optional_string(&mut body, "objective_id", input.objective_id);
+    insert_optional_string(&mut body, "routine_id", input.routine_id);
+    insert_optional_string(&mut body, "verification_state", input.verification_state);
+    insert_optional_json(
+        &mut body,
+        "dependencies",
+        "--dependencies-json",
+        input.dependencies_json,
+    )?;
+    insert_optional_json(
+        &mut body,
+        "evidence_refs",
+        "--evidence-refs-json",
+        input.evidence_refs_json,
+    )?;
+    insert_optional_json(
+        &mut body,
+        "artifact_refs",
+        "--artifact-refs-json",
+        input.artifact_refs_json,
+    )?;
+    insert_optional_json(&mut body, "blocker", "--blocker-json", input.blocker_json)?;
+    insert_optional_json(&mut body, "metadata", "--metadata-json", input.metadata_json)?;
+    Ok(Value::Object(body))
+}
+
+struct WorkboardUpdatePayloadInput {
+    state: Option<String>,
+    priority: Option<i64>,
+    assigned_worker: Option<String>,
+    clear_assigned_worker: bool,
+    parent_work_item_id: Option<String>,
+    clear_parent_work_item: bool,
+    objective_id: Option<String>,
+    clear_objective: bool,
+    routine_id: Option<String>,
+    clear_routine: bool,
+    verification_state: Option<String>,
+    dependencies_json: Option<String>,
+    evidence_refs_json: Option<String>,
+    artifact_refs_json: Option<String>,
+    blocker_json: Option<String>,
+    metadata_json: Option<String>,
+    reason: Option<String>,
+}
+
+fn build_workboard_update_payload(input: WorkboardUpdatePayloadInput) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    insert_optional_string(&mut body, "state", input.state);
+    insert_optional_i64(&mut body, "priority", input.priority);
+    insert_nullable_string(
+        &mut body,
+        "assigned_worker",
+        "--assigned-worker",
+        "--clear-assigned-worker",
+        input.assigned_worker,
+        input.clear_assigned_worker,
+    )?;
+    insert_nullable_string(
+        &mut body,
+        "parent_work_item_id",
+        "--parent-work-item-id",
+        "--clear-parent-work-item",
+        input.parent_work_item_id,
+        input.clear_parent_work_item,
+    )?;
+    insert_nullable_string(
+        &mut body,
+        "objective_id",
+        "--objective-id",
+        "--clear-objective",
+        input.objective_id,
+        input.clear_objective,
+    )?;
+    insert_nullable_string(
+        &mut body,
+        "routine_id",
+        "--routine-id",
+        "--clear-routine",
+        input.routine_id,
+        input.clear_routine,
+    )?;
+    insert_optional_string(&mut body, "verification_state", input.verification_state);
+    insert_optional_json(
+        &mut body,
+        "dependencies",
+        "--dependencies-json",
+        input.dependencies_json,
+    )?;
+    insert_optional_json(
+        &mut body,
+        "evidence_refs",
+        "--evidence-refs-json",
+        input.evidence_refs_json,
+    )?;
+    insert_optional_json(
+        &mut body,
+        "artifact_refs",
+        "--artifact-refs-json",
+        input.artifact_refs_json,
+    )?;
+    insert_optional_json(&mut body, "blocker", "--blocker-json", input.blocker_json)?;
+    insert_optional_json(&mut body, "metadata", "--metadata-json", input.metadata_json)?;
+    insert_optional_string(&mut body, "reason", input.reason);
+    Ok(Value::Object(body))
+}
+
+fn build_workboard_block_payload(
+    reason: Option<String>,
+    blocker_json: Option<String>,
+    evidence_refs_json: Option<String>,
+) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    insert_optional_string(&mut body, "reason", reason);
+    insert_optional_json(&mut body, "blocker", "--blocker-json", blocker_json)?;
+    insert_optional_json(&mut body, "evidence_refs", "--evidence-refs-json", evidence_refs_json)?;
+    Ok(Value::Object(body))
+}
+
+fn build_workboard_complete_payload(
+    reason: Option<String>,
+    evidence_refs_json: Option<String>,
+    artifact_refs_json: Option<String>,
+    verification_state: Option<String>,
+) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    insert_optional_string(&mut body, "reason", reason);
+    insert_optional_json(&mut body, "evidence_refs", "--evidence-refs-json", evidence_refs_json)?;
+    insert_optional_json(&mut body, "artifact_refs", "--artifact-refs-json", artifact_refs_json)?;
+    insert_optional_string(&mut body, "verification_state", verification_state);
+    Ok(Value::Object(body))
 }
 
 fn emit_tasks_list(payload: &Value, json: bool) -> Result<()> {
@@ -291,6 +602,62 @@ fn reason_payload(reason: Option<String>) -> Value {
         Some(reason) => json!({ "reason": reason }),
         None => json!({}),
     }
+}
+
+fn insert_optional_string(
+    body: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        body.insert(key.to_owned(), Value::String(value));
+    }
+}
+
+fn insert_optional_i64(
+    body: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    value: Option<i64>,
+) {
+    if let Some(value) = value {
+        body.insert(key.to_owned(), Value::Number(value.into()));
+    }
+}
+
+fn insert_nullable_string(
+    body: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    set_arg_name: &'static str,
+    clear_arg_name: &'static str,
+    value: Option<String>,
+    clear: bool,
+) -> Result<()> {
+    if clear && value.is_some() {
+        anyhow::bail!("cannot combine {set_arg_name} with {clear_arg_name}");
+    }
+    if clear {
+        body.insert(key.to_owned(), Value::Null);
+    } else {
+        insert_optional_string(body, key, value);
+    }
+    Ok(())
+}
+
+fn insert_optional_json(
+    body: &mut serde_json::Map<String, Value>,
+    key: &'static str,
+    arg_name: &'static str,
+    value: Option<String>,
+) -> Result<()> {
+    if let Some(value) = value {
+        body.insert(key.to_owned(), parse_json_arg(arg_name, value.as_str())?);
+    }
+    Ok(())
+}
+
+fn parse_json_arg(arg_name: &'static str, raw: &str) -> Result<Value> {
+    serde_json::from_str::<Value>(raw)
+        .map_err(|error| anyhow::anyhow!("{arg_name} must be valid JSON: {error}"))
 }
 
 fn json_array_at<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {

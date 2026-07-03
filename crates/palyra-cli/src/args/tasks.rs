@@ -4,6 +4,7 @@
 use clap::Subcommand;
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum TasksCommand {
     List {
         #[arg(long)]
@@ -64,6 +65,12 @@ pub enum WorkboardCommand {
         limit: Option<u32>,
         #[arg(long)]
         state: Option<String>,
+        #[arg(long)]
+        parent_work_item_id: Option<String>,
+        #[arg(long)]
+        objective_id: Option<String>,
+        #[arg(long)]
+        routine_id: Option<String>,
         #[arg(long, default_value_t = false)]
         include_terminal: bool,
         #[arg(long, default_value_t = false)]
@@ -80,6 +87,92 @@ pub enum WorkboardCommand {
         session_id: Option<String>,
         #[arg(long)]
         run_id: Option<String>,
+        #[arg(long)]
+        parent_work_item_id: Option<String>,
+        #[arg(long)]
+        objective_id: Option<String>,
+        #[arg(long)]
+        routine_id: Option<String>,
+        #[arg(long)]
+        verification_state: Option<String>,
+        #[arg(long)]
+        dependencies_json: Option<String>,
+        #[arg(long)]
+        evidence_refs_json: Option<String>,
+        #[arg(long)]
+        artifact_refs_json: Option<String>,
+        #[arg(long)]
+        blocker_json: Option<String>,
+        #[arg(long)]
+        metadata_json: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        priority: Option<i64>,
+        #[arg(long)]
+        assigned_worker: Option<String>,
+        #[arg(long, default_value_t = false)]
+        clear_assigned_worker: bool,
+        #[arg(long)]
+        parent_work_item_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        clear_parent_work_item: bool,
+        #[arg(long)]
+        objective_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        clear_objective: bool,
+        #[arg(long)]
+        routine_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        clear_routine: bool,
+        #[arg(long)]
+        verification_state: Option<String>,
+        #[arg(long)]
+        dependencies_json: Option<String>,
+        #[arg(long)]
+        evidence_refs_json: Option<String>,
+        #[arg(long)]
+        artifact_refs_json: Option<String>,
+        #[arg(long)]
+        blocker_json: Option<String>,
+        #[arg(long)]
+        metadata_json: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Block {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        blocker_json: Option<String>,
+        #[arg(long)]
+        evidence_refs_json: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    LinkArtifact {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        artifact_ref_json: String,
+        #[arg(long)]
+        reason: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -104,6 +197,12 @@ pub enum WorkboardCommand {
         id: String,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long)]
+        evidence_refs_json: Option<String>,
+        #[arg(long)]
+        artifact_refs_json: Option<String>,
+        #[arg(long)]
+        verification_state: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

@@ -2932,6 +2932,8 @@ pub struct WorkItemRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_work_item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub objective_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routine_id: Option<String>,
@@ -2948,8 +2950,10 @@ pub struct WorkItemRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat_at_unix_ms: Option<i64>,
     pub dependencies_json: String,
+    pub evidence_refs_json: String,
     pub artifact_refs_json: String,
     pub blocker_json: String,
+    pub verification_state: String,
     pub metadata_json: String,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
@@ -2982,6 +2986,7 @@ pub struct WorkItemCreateRequest {
     pub channel: Option<String>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    pub parent_work_item_id: Option<String>,
     pub objective_id: Option<String>,
     pub routine_id: Option<String>,
     pub title: String,
@@ -2990,8 +2995,10 @@ pub struct WorkItemCreateRequest {
     pub priority: i64,
     pub assigned_worker: Option<String>,
     pub dependencies_json: String,
+    pub evidence_refs_json: String,
     pub artifact_refs_json: String,
     pub blocker_json: String,
+    pub verification_state: String,
     pub metadata_json: String,
     pub actor_principal: String,
 }
@@ -3001,14 +3008,20 @@ pub struct WorkItemCreateRequest {
 pub struct WorkItemUpdateRequest {
     pub work_item_id: String,
     pub expected_state: Option<String>,
+    pub parent_work_item_id: Option<Option<String>>,
+    pub objective_id: Option<Option<String>>,
+    pub routine_id: Option<Option<String>>,
     pub state: Option<String>,
     pub priority: Option<i64>,
     pub assigned_worker: Option<Option<String>>,
     pub claim_owner: Option<Option<String>>,
     pub claim_expires_at_unix_ms: Option<Option<i64>>,
     pub heartbeat_at_unix_ms: Option<Option<i64>>,
+    pub dependencies_json: Option<String>,
+    pub evidence_refs_json: Option<String>,
     pub blocker_json: Option<String>,
     pub artifact_refs_json: Option<String>,
+    pub verification_state: Option<String>,
     pub metadata_json: Option<String>,
     pub completed_at_unix_ms: Option<Option<i64>>,
     pub actor_principal: String,
@@ -3023,6 +3036,9 @@ pub struct WorkItemListFilter {
     pub owner_principal: Option<String>,
     pub device_id: Option<String>,
     pub channel: Option<String>,
+    pub parent_work_item_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub routine_id: Option<String>,
     pub state: Option<String>,
     pub include_terminal: bool,
     pub limit: usize,
@@ -6589,6 +6605,19 @@ const MIGRATIONS: &[Migration] = &[
             BEGIN
                 SELECT RAISE(ABORT, 'orchestrator_session_write_lease_events is append-only');
             END;
+        "#,
+    },
+    Migration {
+        version: 42,
+        name: "work_item_graph_metadata",
+        sql: r#"
+            ALTER TABLE work_items ADD COLUMN parent_work_item_ulid TEXT;
+            ALTER TABLE work_items ADD COLUMN evidence_refs_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE work_items ADD COLUMN verification_state TEXT NOT NULL DEFAULT 'unverified';
+            CREATE INDEX IF NOT EXISTS idx_work_items_parent
+                ON work_items(parent_work_item_ulid, updated_at_unix_ms DESC, work_item_ulid DESC);
+            CREATE INDEX IF NOT EXISTS idx_work_items_objective_routine
+                ON work_items(objective_id, routine_id, updated_at_unix_ms DESC, work_item_ulid DESC);
         "#,
     },
 ];
@@ -14980,8 +15009,14 @@ impl JournalStore {
         ensure_nonempty_field(request.owner_principal.as_str(), "owner_principal")?;
         ensure_nonempty_field(request.device_id.as_str(), "device_id")?;
         ensure_nonempty_field(request.title.as_str(), "title")?;
+        ensure_work_item_parent_not_self(
+            request.work_item_id.as_str(),
+            request.parent_work_item_id.as_deref(),
+        )?;
         ensure_valid_work_item_state(request.state.as_str())?;
+        ensure_valid_work_item_verification_state(request.verification_state.as_str())?;
         ensure_json_field(request.dependencies_json.as_str(), "dependencies_json")?;
+        ensure_json_field(request.evidence_refs_json.as_str(), "evidence_refs_json")?;
         ensure_json_field(request.artifact_refs_json.as_str(), "artifact_refs_json")?;
         ensure_json_field(request.blocker_json.as_str(), "blocker_json")?;
         ensure_json_field(request.metadata_json.as_str(), "metadata_json")?;
@@ -14998,6 +15033,7 @@ impl JournalStore {
                     channel,
                     session_ulid,
                     run_ulid,
+                    parent_work_item_ulid,
                     objective_id,
                     routine_id,
                     title,
@@ -15009,14 +15045,17 @@ impl JournalStore {
                     claim_expires_at_unix_ms,
                     heartbeat_at_unix_ms,
                     dependencies_json,
+                    evidence_refs_json,
                     artifact_refs_json,
                     blocker_json,
+                    verification_state,
                     metadata_json,
                     created_at_unix_ms,
                     updated_at_unix_ms,
                     completed_at_unix_ms
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, NULL, ?14, ?15, ?16, ?17, ?18, ?18, NULL
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    NULL, NULL, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, NULL
                 )
             "#,
             params![
@@ -15026,6 +15065,7 @@ impl JournalStore {
                 request.channel,
                 request.session_id,
                 request.run_id,
+                request.parent_work_item_id,
                 request.objective_id,
                 request.routine_id,
                 request.title,
@@ -15034,8 +15074,10 @@ impl JournalStore {
                 request.priority,
                 request.assigned_worker,
                 request.dependencies_json,
+                request.evidence_refs_json,
                 request.artifact_refs_json,
                 request.blocker_json,
+                request.verification_state,
                 request.metadata_json,
                 now,
             ],
@@ -15089,8 +15131,17 @@ impl JournalStore {
         if let Some(blocker_json) = request.blocker_json.as_deref() {
             ensure_json_field(blocker_json, "blocker_json")?;
         }
+        if let Some(dependencies_json) = request.dependencies_json.as_deref() {
+            ensure_json_field(dependencies_json, "dependencies_json")?;
+        }
+        if let Some(evidence_refs_json) = request.evidence_refs_json.as_deref() {
+            ensure_json_field(evidence_refs_json, "evidence_refs_json")?;
+        }
         if let Some(artifact_refs_json) = request.artifact_refs_json.as_deref() {
             ensure_json_field(artifact_refs_json, "artifact_refs_json")?;
+        }
+        if let Some(verification_state) = request.verification_state.as_deref() {
+            ensure_valid_work_item_verification_state(verification_state)?;
         }
         if let Some(metadata_json) = request.metadata_json.as_deref() {
             ensure_json_field(metadata_json, "metadata_json")?;
@@ -15106,6 +15157,11 @@ impl JournalStore {
             .ok_or_else(|| JournalError::WorkItemNotFound {
                 work_item_id: request.work_item_id.clone(),
             })?;
+        let parent_work_item_id = request.parent_work_item_id.clone().flatten();
+        ensure_work_item_parent_not_self(
+            request.work_item_id.as_str(),
+            parent_work_item_id.as_deref(),
+        )?;
         if let Some(expected) = request.expected_state.as_deref() {
             if existing.state != expected {
                 return Err(JournalError::InvalidWorkItemTransition {
@@ -15123,6 +15179,12 @@ impl JournalStore {
         )?;
 
         let assigned_worker = request.assigned_worker.clone().flatten();
+        let clear_parent_work_item =
+            request.parent_work_item_id.is_some() && parent_work_item_id.is_none();
+        let objective_id = request.objective_id.clone().flatten();
+        let clear_objective = request.objective_id.is_some() && objective_id.is_none();
+        let routine_id = request.routine_id.clone().flatten();
+        let clear_routine = request.routine_id.is_some() && routine_id.is_none();
         let clear_assigned_worker = request.assigned_worker.is_some() && assigned_worker.is_none();
         let claim_owner = request.claim_owner.clone().flatten();
         let clear_claim_owner = request.claim_owner.is_some() && claim_owner.is_none();
@@ -15137,36 +15199,57 @@ impl JournalStore {
             r#"
                 UPDATE work_items
                 SET
-                    state = COALESCE(?2, state),
-                    priority = COALESCE(?3, priority),
-                    assigned_worker = CASE
+                    parent_work_item_ulid = CASE
+                        WHEN ?2 = 1 THEN NULL
+                        ELSE COALESCE(?3, parent_work_item_ulid)
+                    END,
+                    objective_id = CASE
                         WHEN ?4 = 1 THEN NULL
-                        ELSE COALESCE(?5, assigned_worker)
+                        ELSE COALESCE(?5, objective_id)
+                    END,
+                    routine_id = CASE
+                        WHEN ?6 = 1 THEN NULL
+                        ELSE COALESCE(?7, routine_id)
+                    END,
+                    state = COALESCE(?8, state),
+                    priority = COALESCE(?9, priority),
+                    assigned_worker = CASE
+                        WHEN ?10 = 1 THEN NULL
+                        ELSE COALESCE(?11, assigned_worker)
                     END,
                     claim_owner = CASE
-                        WHEN ?6 = 1 THEN NULL
-                        ELSE COALESCE(?7, claim_owner)
+                        WHEN ?12 = 1 THEN NULL
+                        ELSE COALESCE(?13, claim_owner)
                     END,
                     claim_expires_at_unix_ms = CASE
-                        WHEN ?8 = 1 THEN NULL
-                        ELSE COALESCE(?9, claim_expires_at_unix_ms)
+                        WHEN ?14 = 1 THEN NULL
+                        ELSE COALESCE(?15, claim_expires_at_unix_ms)
                     END,
                     heartbeat_at_unix_ms = CASE
-                        WHEN ?10 = 1 THEN NULL
-                        ELSE COALESCE(?11, heartbeat_at_unix_ms)
+                        WHEN ?16 = 1 THEN NULL
+                        ELSE COALESCE(?17, heartbeat_at_unix_ms)
                     END,
-                    blocker_json = COALESCE(?12, blocker_json),
-                    artifact_refs_json = COALESCE(?13, artifact_refs_json),
-                    metadata_json = COALESCE(?14, metadata_json),
+                    dependencies_json = COALESCE(?18, dependencies_json),
+                    evidence_refs_json = COALESCE(?19, evidence_refs_json),
+                    blocker_json = COALESCE(?20, blocker_json),
+                    artifact_refs_json = COALESCE(?21, artifact_refs_json),
+                    verification_state = COALESCE(?22, verification_state),
+                    metadata_json = COALESCE(?23, metadata_json),
                     completed_at_unix_ms = CASE
-                        WHEN ?15 = 1 THEN NULL
-                        ELSE COALESCE(?16, completed_at_unix_ms)
+                        WHEN ?24 = 1 THEN NULL
+                        ELSE COALESCE(?25, completed_at_unix_ms)
                     END,
-                    updated_at_unix_ms = ?17
+                    updated_at_unix_ms = ?26
                 WHERE work_item_ulid = ?1
             "#,
             params![
                 request.work_item_id,
+                if clear_parent_work_item { 1_i64 } else { 0_i64 },
+                parent_work_item_id,
+                if clear_objective { 1_i64 } else { 0_i64 },
+                objective_id,
+                if clear_routine { 1_i64 } else { 0_i64 },
+                routine_id,
                 request.state,
                 request.priority,
                 if clear_assigned_worker { 1_i64 } else { 0_i64 },
@@ -15177,8 +15260,11 @@ impl JournalStore {
                 claim_expires_at,
                 if clear_heartbeat { 1_i64 } else { 0_i64 },
                 heartbeat_at,
+                request.dependencies_json,
+                request.evidence_refs_json,
                 request.blocker_json,
                 request.artifact_refs_json,
+                request.verification_state,
                 request.metadata_json,
                 if clear_completed { 1_i64 } else { 0_i64 },
                 completed_at,
@@ -15225,6 +15311,7 @@ impl JournalStore {
                     channel,
                     session_ulid,
                     run_ulid,
+                    parent_work_item_ulid,
                     objective_id,
                     routine_id,
                     title,
@@ -15236,8 +15323,10 @@ impl JournalStore {
                     claim_expires_at_unix_ms,
                     heartbeat_at_unix_ms,
                     dependencies_json,
+                    evidence_refs_json,
                     artifact_refs_json,
                     blocker_json,
+                    verification_state,
                     metadata_json,
                     created_at_unix_ms,
                     updated_at_unix_ms,
@@ -15246,8 +15335,11 @@ impl JournalStore {
                 WHERE (?1 IS NULL OR owner_principal = ?1)
                   AND (?2 IS NULL OR device_id = ?2)
                   AND (?3 IS NULL OR COALESCE(channel, '') = COALESCE(?3, ''))
-                  AND (?4 IS NULL OR state = ?4)
-                  AND (?5 = 1 OR state NOT IN ('succeeded', 'failed', 'cancelled'))
+                  AND (?4 IS NULL OR parent_work_item_ulid = ?4)
+                  AND (?5 IS NULL OR objective_id = ?5)
+                  AND (?6 IS NULL OR routine_id = ?6)
+                  AND (?7 IS NULL OR state = ?7)
+                  AND (?8 = 1 OR state NOT IN ('succeeded', 'failed', 'cancelled'))
                 ORDER BY
                     CASE state
                         WHEN 'running' THEN 0
@@ -15260,7 +15352,7 @@ impl JournalStore {
                     priority DESC,
                     updated_at_unix_ms DESC,
                     work_item_ulid DESC
-                LIMIT ?6
+                LIMIT ?9
             "#,
         )?;
         let rows = statement.query_map(
@@ -15268,6 +15360,9 @@ impl JournalStore {
                 filter.owner_principal,
                 filter.device_id,
                 filter.channel,
+                filter.parent_work_item_id,
+                filter.objective_id,
+                filter.routine_id,
                 filter.state,
                 if filter.include_terminal { 1_i64 } else { 0_i64 },
                 limit,
@@ -24113,6 +24208,30 @@ fn is_known_work_item_state(state: &str) -> bool {
     )
 }
 
+fn ensure_work_item_parent_not_self(
+    work_item_id: &str,
+    parent_work_item_id: Option<&str>,
+) -> Result<(), JournalError> {
+    if parent_work_item_id.is_some_and(|parent| parent == work_item_id) {
+        return Err(JournalError::InvalidArgument(
+            "parent_work_item_id cannot reference the same work item".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_valid_work_item_verification_state(state: &str) -> Result<(), JournalError> {
+    if is_known_work_item_verification_state(state) {
+        Ok(())
+    } else {
+        Err(JournalError::InvalidArgument(format!("unknown work item verification state: {state}")))
+    }
+}
+
+fn is_known_work_item_verification_state(state: &str) -> bool {
+    matches!(state, "unverified" | "pending" | "verified" | "failed" | "waived")
+}
+
 fn is_terminal_work_item_state(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "cancelled")
 }
@@ -24966,6 +25085,7 @@ fn query_work_item_by_id(
                     channel,
                     session_ulid,
                     run_ulid,
+                    parent_work_item_ulid,
                     objective_id,
                     routine_id,
                     title,
@@ -24977,8 +25097,10 @@ fn query_work_item_by_id(
                     claim_expires_at_unix_ms,
                     heartbeat_at_unix_ms,
                     dependencies_json,
+                    evidence_refs_json,
                     artifact_refs_json,
                     blocker_json,
+                    verification_state,
                     metadata_json,
                     created_at_unix_ms,
                     updated_at_unix_ms,
@@ -25001,23 +25123,26 @@ fn map_work_item_row(row: &rusqlite::Row<'_>) -> Result<WorkItemRecord, rusqlite
         channel: row.get(3)?,
         session_id: row.get(4)?,
         run_id: row.get(5)?,
-        objective_id: row.get(6)?,
-        routine_id: row.get(7)?,
-        title: row.get(8)?,
-        summary: row.get(9)?,
-        state: row.get(10)?,
-        priority: row.get(11)?,
-        assigned_worker: row.get(12)?,
-        claim_owner: row.get(13)?,
-        claim_expires_at_unix_ms: row.get(14)?,
-        heartbeat_at_unix_ms: row.get(15)?,
-        dependencies_json: row.get(16)?,
-        artifact_refs_json: row.get(17)?,
-        blocker_json: row.get(18)?,
-        metadata_json: row.get(19)?,
-        created_at_unix_ms: row.get(20)?,
-        updated_at_unix_ms: row.get(21)?,
-        completed_at_unix_ms: row.get(22)?,
+        parent_work_item_id: row.get(6)?,
+        objective_id: row.get(7)?,
+        routine_id: row.get(8)?,
+        title: row.get(9)?,
+        summary: row.get(10)?,
+        state: row.get(11)?,
+        priority: row.get(12)?,
+        assigned_worker: row.get(13)?,
+        claim_owner: row.get(14)?,
+        claim_expires_at_unix_ms: row.get(15)?,
+        heartbeat_at_unix_ms: row.get(16)?,
+        dependencies_json: row.get(17)?,
+        evidence_refs_json: row.get(18)?,
+        artifact_refs_json: row.get(19)?,
+        blocker_json: row.get(20)?,
+        verification_state: row.get(21)?,
+        metadata_json: row.get(22)?,
+        created_at_unix_ms: row.get(23)?,
+        updated_at_unix_ms: row.get(24)?,
+        completed_at_unix_ms: row.get(25)?,
     })
 }
 
@@ -29195,6 +29320,7 @@ mod tests {
                 channel: Some("cli".to_owned()),
                 session_id: None,
                 run_id: None,
+                parent_work_item_id: Some("work-item-root".to_owned()),
                 objective_id: Some("objective-1".to_owned()),
                 routine_id: None,
                 title: "Review incident".to_owned(),
@@ -29203,18 +29329,25 @@ mod tests {
                 priority: 10,
                 assigned_worker: None,
                 dependencies_json: "[]".to_owned(),
+                evidence_refs_json: r#"[{"kind":"session","id":"session-1"}]"#.to_owned(),
                 artifact_refs_json: "[]".to_owned(),
                 blocker_json: "{}".to_owned(),
+                verification_state: "pending".to_owned(),
                 metadata_json: "{}".to_owned(),
                 actor_principal: "user:ops".to_owned(),
             })
             .expect("work item should be created");
         assert_eq!(created.state, "queued");
+        assert_eq!(created.parent_work_item_id.as_deref(), Some("work-item-root"));
+        assert_eq!(created.verification_state, "pending");
+        assert!(created.evidence_refs_json.contains("session-1"));
 
         let completed = store
             .update_work_item(&WorkItemUpdateRequest {
                 work_item_id: "work-item-1".to_owned(),
                 state: Some("succeeded".to_owned()),
+                evidence_refs_json: Some(r#"[{"kind":"test","id":"unit"}]"#.to_owned()),
+                verification_state: Some("verified".to_owned()),
                 completed_at_unix_ms: Some(Some(1_730_000_000_000)),
                 actor_principal: "user:ops".to_owned(),
                 event_type: "work_item.completed".to_owned(),
@@ -29224,6 +29357,8 @@ mod tests {
             })
             .expect("work item should complete");
         assert_eq!(completed.completed_at_unix_ms, Some(1_730_000_000_000));
+        assert_eq!(completed.verification_state, "verified");
+        assert!(completed.evidence_refs_json.contains("unit"));
 
         let reopen = store.update_work_item(&WorkItemUpdateRequest {
             work_item_id: "work-item-1".to_owned(),

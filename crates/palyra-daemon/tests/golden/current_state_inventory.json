@@ -8220,6 +8220,48 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/workboard/items/{item_id}",
+        "http_method": "GET",
+        "method_name": "console.get.console.v1.workboard.items.by_item_id",
+        "stability": "gated_production",
+        "required_scope": "console.read",
+        "request_schema_id": "console.get.console.v1.workboard.items.by_item_id.request.method-registry.v1",
+        "request_schema_hash": "97ec6fa1d3ad55abab462a89e9242b8b011c1ca2fd812845903b0dac49cc09cb",
+        "response_schema_id": "console.get.console.v1.workboard.items.by_item_id.response.method-registry.v1",
+        "response_schema_hash": "cbc509210fb5ef7e51401a2dfdceac5484ed8bf811f07a0e92eaae0bb401007f",
+        "streaming_supported": false,
+        "idempotency_supported": true
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/workboard/items/{item_id}/artifacts",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.workboard.items.by_item_id.artifacts",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.workboard.items.by_item_id.artifacts.request.method-registry.v1",
+        "request_schema_hash": "f138aceb9974b7876ed319bc51f783b1b8f4f4dd53370d2cc30d7732ea4ba533",
+        "response_schema_id": "console.post.console.v1.workboard.items.by_item_id.artifacts.response.method-registry.v1",
+        "response_schema_hash": "62499e6768db05ec464c8719f756e63b8924a90e6e3ade514c739bb56e95ced1",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
+        "route": "/console/v1/workboard/items/{item_id}/block",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.workboard.items.by_item_id.block",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.workboard.items.by_item_id.block.request.method-registry.v1",
+        "request_schema_hash": "52b410acbf02d3701e584b7b850059f8eb327d70da322a8004a8a65a38c8d9d0",
+        "response_schema_id": "console.post.console.v1.workboard.items.by_item_id.block.response.method-registry.v1",
+        "response_schema_hash": "316746c84baa68b623d7f4e4bd5019ae20db50f5af0f715c6d215fdd45254b54",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/workboard/items/{item_id}/claim",
         "http_method": "POST",
         "method_name": "console.post.console.v1.workboard.items.by_item_id.claim",
@@ -9066,7 +9108,7 @@
       "diagnostics_sections": 45,
       "execution_backends": 5,
       "feature_rollout_flags": 26,
-      "method_registry_methods": 492,
+      "method_registry_methods": 495,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -9095,7 +9137,7 @@
         "admin": 52,
         "canvas": 5,
         "compat": 16,
-        "console": 416,
+        "console": 419,
         "public": 2,
         "realtime": 1
       }
