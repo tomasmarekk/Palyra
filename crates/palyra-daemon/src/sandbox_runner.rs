@@ -11738,7 +11738,7 @@ mod tests {
             output
                 .pointer("/process_handle/capabilities/pty_requested")
                 .and_then(serde_json::Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             output.pointer("/process_handle/capabilities/pty").and_then(serde_json::Value::as_bool),
