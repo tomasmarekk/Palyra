@@ -5329,11 +5329,84 @@ async fn process_lifecycle_tools_reject_unregistered_run_pid() {
         unowned.error
     );
 
+    let input_unowned = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        "proposal-process-input-unowned",
+        super::PROCESS_INPUT_TOOL_NAME,
+        serde_json::to_vec(&json!({
+            "pid": pid,
+            "input": "hello",
+        }))
+        .expect("process input should serialize")
+        .as_slice(),
+        None,
+    )
+    .await;
+
+    assert!(!input_unowned.success, "unregistered process input must fail");
+    assert!(
+        input_unowned.error.contains("not registered as a run-owned background process"),
+        "unexpected error: {}",
+        input_unowned.error
+    );
+
     state.record_run_background_process(context.run_id, pid);
     assert!(super::process_lifecycle_pid_is_run_owned(&state, context.run_id, pid));
     assert!(
         !super::process_lifecycle_pid_is_run_owned(&state, "run-process-lifecycle-other", pid),
         "PID ownership must stay bound to the active run id"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_input_journal_event_redacts_input_and_links_pid() {
+    let state = build_test_runtime_state(false);
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: "session-process-input-journal",
+        run_id: "run-process-input-journal",
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    let input = br#"{"pid":1234,"input":"secret stdin text","append_newline":true}"#;
+
+    super::record_process_input_journal_event(
+        &state,
+        context,
+        "proposal-process-input-journal",
+        input,
+    )
+    .await;
+
+    let snapshot = state
+        .recent_journal_snapshot(10)
+        .await
+        .expect("recent journal snapshot should be returned");
+    let event = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+            (payload.get("event_type").and_then(Value::as_str) == Some("process.input.delivered"))
+                .then_some(payload)
+        })
+        .expect("process input journal event should be recorded");
+
+    assert_eq!(event.get("pid").and_then(Value::as_u64), Some(1234));
+    assert_eq!(event.get("input").and_then(Value::as_str), Some("<redacted>"));
+    assert_eq!(event.get("redaction_level").and_then(Value::as_str), Some("input_redacted"));
+    assert_eq!(
+        event.get("proposal_id").and_then(Value::as_str),
+        Some("proposal-process-input-journal")
+    );
+    assert!(
+        !serde_json::to_string(&event)
+            .expect("event should serialize")
+            .contains("secret stdin text"),
+        "journal payload must not contain raw stdin input: {event}"
     );
 }
 

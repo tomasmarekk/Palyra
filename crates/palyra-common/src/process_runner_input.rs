@@ -61,6 +61,14 @@ pub struct ProcessRunnerToolInput {
     #[serde(default)]
     pub background: bool,
     #[serde(default)]
+    pub interactive: bool,
+    #[serde(default)]
+    pub stdin: bool,
+    #[serde(default)]
+    pub pty: bool,
+    #[serde(default)]
+    pub port_hints: Vec<u16>,
+    #[serde(default)]
     pub lifetime_mode: BackgroundLifetimeMode,
     #[serde(default)]
     pub keep_running_after_run: bool,
@@ -78,6 +86,13 @@ impl ProcessRunnerToolInput {
         } else {
             self.lifetime_mode
         }
+    }
+
+    /// Returns whether the caller explicitly requested a stdin-capable
+    /// background handle.
+    #[must_use]
+    pub const fn stdin_requested(&self) -> bool {
+        self.stdin || self.interactive
     }
 }
 
@@ -186,6 +201,9 @@ mod tests {
         assert_eq!(parsed.requested_egress_hosts, vec!["api.example.com"]);
         assert_eq!(parsed.timeout_ms, None);
         assert!(!parsed.background);
+        assert!(!parsed.stdin_requested());
+        assert!(!parsed.pty);
+        assert!(parsed.port_hints.is_empty());
         assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::RunOwned);
     }
 
@@ -218,6 +236,18 @@ mod tests {
         assert_eq!(parsed.command, "python3");
         assert!(parsed.background);
         assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::RunOwned);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_interactive_handle_fields() {
+        let input = br#"{"command":"python3","args":["repl.py"],"background":true,"interactive":true,"stdin":true,"pty":false,"port_hints":[5173,8787]}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("valid interactive process-runner payload should parse");
+
+        assert!(parsed.background);
+        assert!(parsed.stdin_requested());
+        assert!(!parsed.pty);
+        assert_eq!(parsed.port_hints, vec![5173, 8787]);
     }
 
     #[test]

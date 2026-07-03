@@ -21,9 +21,9 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     hash::{Hash, Hasher},
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
@@ -67,6 +67,7 @@ use palyra_sandbox::{
     build_tier_c_command_plan, current_backend_capabilities, current_backend_executor,
     current_backend_kind, TierCBackendError, TierCCommandPlan, TierCCommandRequest, TierCPolicy,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -105,6 +106,10 @@ const BACKGROUND_POST_OUTPUT_EXIT_CHECK_MS: u64 = 250;
 const BACKGROUND_METADATA_RETURN_RESERVE_MS: u64 = 100;
 const BACKGROUND_MONITOR_POLL_MS: u64 = 50;
 const BACKGROUND_TERMINATION_WAIT_MS: u64 = 1_000;
+const PROCESS_STDIN_INPUT_MAX_BYTES: usize = 8 * 1024;
+const PROCESS_STDIN_TOTAL_MAX_BYTES: usize = 64 * 1024;
+const PROCESS_STDIN_MAX_EVENTS: usize = 64;
+const MAX_PROCESS_PORT_HINTS: usize = 16;
 const DEFAULT_FOREGROUND_PROCESS_TIMEOUT_MS: u64 = 30_000;
 // Background lifetimes have a floor (short timeouts would kill dev servers mid-verification)
 // and a hard ceiling (no background process may outlive operator expectations unsupervised).
@@ -547,9 +552,40 @@ pub(crate) struct BackgroundProcessRuntimeStatus {
     pub(crate) tracked_process_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackgroundProcessHandleCapabilities {
+    pub(crate) stdin: bool,
+    pub(crate) pty: bool,
+    pub(crate) signals: bool,
+    pub(crate) background: bool,
+}
+
+impl BackgroundProcessHandleCapabilities {
+    const fn from_input(input: &ProcessRunnerInput) -> Self {
+        Self {
+            stdin: input.background && input.stdin_requested(),
+            pty: false,
+            signals: true,
+            background: input.background,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RegisteredBackgroundProcess {
     active: bool,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
+    stdin: Option<ChildStdin>,
+    stdin_bytes_written: usize,
+    stdin_events_written: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegisteredBackgroundProcessSnapshot {
+    active: bool,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
 }
 
 static REGISTERED_BACKGROUND_PROCESSES: OnceLock<Mutex<HashMap<u32, RegisteredBackgroundProcess>>> =
@@ -581,10 +617,25 @@ fn registered_background_processes() -> &'static Mutex<HashMap<u32, RegisteredBa
     REGISTERED_BACKGROUND_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_background_process_pid(pid: u32) -> Result<(), SandboxProcessRunError> {
+fn register_background_process_pid(
+    pid: u32,
+    capabilities: BackgroundProcessHandleCapabilities,
+    lifetime_mode: BackgroundLifetimeMode,
+    stdin: Option<ChildStdin>,
+) -> Result<(), SandboxProcessRunError> {
     match registered_background_processes().lock() {
         Ok(mut processes) => {
-            processes.insert(pid, RegisteredBackgroundProcess { active: true });
+            processes.insert(
+                pid,
+                RegisteredBackgroundProcess {
+                    active: true,
+                    capabilities,
+                    lifetime_mode,
+                    stdin,
+                    stdin_bytes_written: 0,
+                    stdin_events_written: 0,
+                },
+            );
             Ok(())
         }
         Err(error) => Err(SandboxProcessRunError {
@@ -597,14 +648,23 @@ fn register_background_process_pid(pid: u32) -> Result<(), SandboxProcessRunErro
 fn registered_background_process(
     command: &str,
     pid: u32,
-) -> Result<RegisteredBackgroundProcess, SandboxProcessRunError> {
+) -> Result<RegisteredBackgroundProcessSnapshot, SandboxProcessRunError> {
     match registered_background_processes().lock() {
-        Ok(processes) => processes.get(&pid).copied().ok_or_else(|| SandboxProcessRunError {
-            kind: SandboxProcessRunErrorKind::InvalidInput,
-            message: format!(
-                "palyra.process.run builtin '{command}' requires a pid returned by a live palyra.process.run background result; pid {pid} is not registered"
-            ),
-        }),
+        Ok(processes) => {
+            processes
+                .get(&pid)
+                .map(|process| RegisteredBackgroundProcessSnapshot {
+                    active: process.active,
+                    capabilities: process.capabilities,
+                    lifetime_mode: process.lifetime_mode,
+                })
+                .ok_or_else(|| SandboxProcessRunError {
+                    kind: SandboxProcessRunErrorKind::InvalidInput,
+                    message: format!(
+                        "palyra.process.run builtin '{command}' requires a pid returned by a live palyra.process.run background result; pid {pid} is not registered"
+                    ),
+                })
+        }
         Err(error) => Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: format!("background process registry lock poisoned for pid {pid}: {error}"),
@@ -616,6 +676,7 @@ fn mark_background_process_stopped(pid: u32) {
     if let Ok(mut processes) = registered_background_processes().lock() {
         if let Some(process) = processes.get_mut(&pid) {
             process.active = false;
+            process.stdin.take();
         }
     }
 }
@@ -1884,6 +1945,202 @@ pub(crate) fn background_process_status_by_pid(
     builtin_process_status_success("palyra.process.status", &args)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessInputToolInput {
+    pid: u32,
+    input: String,
+    #[serde(default)]
+    append_newline: bool,
+}
+
+/// Writes bounded stdin text into a live background process that was started
+/// with stdin capability.
+///
+/// # Errors
+/// Returns `InvalidInput` for malformed input, unregistered/non-stdin handles,
+/// exhausted per-process write budgets, or inactive processes; returns
+/// `RuntimeFailure` for registry lock or pipe-write failures.
+pub(crate) fn write_background_process_stdin(
+    input_json: &[u8],
+) -> Result<SandboxProcessRunSuccess, SandboxProcessRunError> {
+    let input = parse_process_input_tool_input(input_json)?;
+    let mut payload = input.input.into_bytes();
+    if input.append_newline {
+        payload.push(b'\n');
+    }
+    validate_process_stdin_payload(input.pid, payload.as_slice())?;
+    let status =
+        background_process_runtime_status(input.pid).map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.input failed to inspect pid {} before stdin write: {error}",
+                input.pid
+            ),
+        })?;
+    if !status.alive() {
+        mark_background_process_stopped(input.pid);
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input pid {} is not alive", input.pid),
+        });
+    }
+
+    let (bytes_written_total, events_written_total, capabilities, lifetime_mode) = {
+        let mut processes =
+            registered_background_processes().lock().map_err(|error| SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::RuntimeFailure,
+                message: format!(
+                    "background process registry lock poisoned for pid {}: {error}",
+                    input.pid
+                ),
+            })?;
+        let process = processes.get_mut(&input.pid).ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.input requires a pid returned by a live palyra.process.run background result; pid {} is not registered",
+                input.pid
+            ),
+        })?;
+        if !process.active {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!("palyra.process.input pid {} is no longer active", input.pid),
+            });
+        }
+        if !process.capabilities.stdin {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.input pid {} was not started with stdin capability",
+                    input.pid
+                ),
+            });
+        }
+        if process.stdin_events_written >= PROCESS_STDIN_MAX_EVENTS {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.input pid {} exceeded {PROCESS_STDIN_MAX_EVENTS} stdin writes",
+                    input.pid
+                ),
+            });
+        }
+        if process.stdin_bytes_written.saturating_add(payload.len()) > PROCESS_STDIN_TOTAL_MAX_BYTES
+        {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.input pid {} exceeded {PROCESS_STDIN_TOTAL_MAX_BYTES} total stdin bytes",
+                    input.pid
+                ),
+            });
+        }
+        let stdin = process.stdin.as_mut().ok_or_else(|| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input pid {} has no writable stdin handle", input.pid),
+        })?;
+        stdin.write_all(payload.as_slice()).map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.input failed to write stdin to pid {}: {error}",
+                input.pid
+            ),
+        })?;
+        stdin.flush().map_err(|error| SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "palyra.process.input failed to flush stdin to pid {}: {error}",
+                input.pid
+            ),
+        })?;
+        process.stdin_bytes_written = process.stdin_bytes_written.saturating_add(payload.len());
+        process.stdin_events_written = process.stdin_events_written.saturating_add(1);
+        (
+            process.stdin_bytes_written,
+            process.stdin_events_written,
+            process.capabilities,
+            process.lifetime_mode,
+        )
+    };
+
+    let output_json = serde_json::to_vec(&json!({
+        "exit_code": 0,
+        "stdout": format!("pid={} input_delivered=true bytes_written={}\n", input.pid, payload.len()),
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_redacted": false,
+        "stderr_redacted": false,
+        "duration_ms": 0,
+        "pid": input.pid,
+        "input_delivered": true,
+        "bytes_written": payload.len(),
+        "stdin_redacted": true,
+        "stdin_redaction_level": "input_redacted",
+        "stdin_events_written": events_written_total,
+        "stdin_bytes_written": bytes_written_total,
+        "process_handle": {
+            "kind": "pid",
+            "direct_process_pid": input.pid,
+            "capabilities": process_handle_capabilities_json(
+                capabilities,
+                &[],
+                lifetime_mode
+            ),
+        },
+        "tier": "builtin",
+        "sandbox_backend": "builtin_portable",
+    }))
+    .map_err(|error| SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::RuntimeFailure,
+        message: format!("failed to serialize sandbox process input output JSON: {error}"),
+    })?;
+    Ok(SandboxProcessRunSuccess { output_json })
+}
+
+fn parse_process_input_tool_input(
+    input_json: &[u8],
+) -> Result<ProcessInputToolInput, SandboxProcessRunError> {
+    let input = serde_json::from_slice::<ProcessInputToolInput>(input_json).map_err(|error| {
+        SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input invalid JSON: {error}"),
+        }
+    })?;
+    if input.pid == 0 {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.input pid must be greater than 0".to_owned(),
+        });
+    }
+    Ok(input)
+}
+
+fn validate_process_stdin_payload(pid: u32, payload: &[u8]) -> Result<(), SandboxProcessRunError> {
+    if payload.is_empty() {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input pid {pid} input must not be empty"),
+        });
+    }
+    if payload.len() > PROCESS_STDIN_INPUT_MAX_BYTES {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.input pid {pid} input exceeds {PROCESS_STDIN_INPUT_MAX_BYTES} bytes"
+            ),
+        });
+    }
+    if payload.contains(&0) {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!("palyra.process.input pid {pid} input contains a NUL byte"),
+        });
+    }
+    Ok(())
+}
+
 /// Probes direct-pid and process-tree liveness for a background process.
 ///
 /// # Errors
@@ -2042,15 +2299,15 @@ fn builtin_read_files_stdout(
         let mut chunk = Vec::new();
         // Read one byte beyond the remaining budget purely to detect truncation; the extra
         // byte is dropped below and never reaches the output.
-        file.by_ref().take((remaining + 1) as u64).read_to_end(&mut chunk).map_err(|error| {
-            SandboxProcessRunError {
+        Read::by_ref(&mut file).take((remaining + 1) as u64).read_to_end(&mut chunk).map_err(
+            |error| SandboxProcessRunError {
                 kind: SandboxProcessRunErrorKind::RuntimeFailure,
                 message: format!(
                     "palyra.process.run builtin '{command}' failed to read '{}': {error}",
                     file_path.display()
                 ),
-            }
-        })?;
+            },
+        )?;
         if chunk.len() > remaining {
             output.extend_from_slice(&chunk[..remaining]);
             truncated = true;
@@ -2288,6 +2545,27 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
                 message: "palyra.process.run timeout_ms must be greater than 0".to_owned(),
             });
         }
+    }
+    if input.stdin_requested() && !input.background {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.run stdin=true requires background=true".to_owned(),
+        });
+    }
+    if input.pty {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.run pty=true is not supported by this process runner"
+                .to_owned(),
+        });
+    }
+    if input.port_hints.len() > MAX_PROCESS_PORT_HINTS {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run port_hints supports at most {MAX_PROCESS_PORT_HINTS} entries"
+            ),
+        });
     }
     Ok(())
 }
@@ -5032,7 +5310,11 @@ fn spawn_background_process(
     } = request;
     let mut command = build_process_command(policy, input, workspace_root, cwd)?;
     configure_child_process_group(&mut command);
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let capabilities = BackgroundProcessHandleCapabilities::from_input(input);
+    command
+        .stdin(if capabilities.stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if !process_runner_allows_host_access(policy) {
         attach_resource_limits_unix(&mut command, policy);
     }
@@ -5054,7 +5336,18 @@ fn spawn_background_process(
     let windows_job_bound = bind_child_to_windows_background_job(&child, pid).is_ok();
     #[cfg(not(windows))]
     let windows_job_bound = false;
-    if let Err(error) = register_background_process_pid(pid) {
+    let stdin = capabilities.stdin.then(|| child.stdin.take()).flatten();
+    if capabilities.stdin && stdin.is_none() {
+        terminate_background_child(child);
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::RuntimeFailure,
+            message: format!(
+                "sandbox background process failed to open stdin handle for command '{}'",
+                input.command
+            ),
+        });
+    }
+    if let Err(error) = register_background_process_pid(pid, capabilities, lifetime_mode, stdin) {
         terminate_background_child(child);
         return Err(error);
     }
@@ -5235,6 +5528,7 @@ fn spawn_background_process(
             "direct_process_pid": pid,
             "process_tree": cfg!(windows),
             "windows_job_object": windows_job_bound,
+            "capabilities": process_handle_capabilities_json(capabilities, ports.as_slice(), lifetime_mode),
             "identity_note": "pid is the direct process spawned by palyra.process.run; a descendant process may own listening sockets"
         },
         "cleanup": cleanup,
@@ -5369,10 +5663,26 @@ fn infer_background_handoff_ports(
     stderr_text: &str,
 ) -> Vec<u16> {
     let mut ports = BTreeSet::new();
+    ports.extend(input.port_hints.iter().copied());
     collect_ports_from_args(input.args.as_slice(), &mut ports);
     collect_ports_from_text(stdout_text, &mut ports);
     collect_ports_from_text(stderr_text, &mut ports);
     ports.into_iter().collect()
+}
+
+fn process_handle_capabilities_json(
+    capabilities: BackgroundProcessHandleCapabilities,
+    ports: &[u16],
+    lifetime_mode: BackgroundLifetimeMode,
+) -> Value {
+    json!({
+        "stdin": capabilities.stdin,
+        "pty": capabilities.pty,
+        "signals": capabilities.signals,
+        "background": capabilities.background,
+        "port_hints": ports,
+        "lifetime_mode": lifetime_mode.as_str(),
+    })
 }
 
 fn collect_ports_from_args(args: &[String], ports: &mut BTreeSet<u16>) {
@@ -7677,6 +7987,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         }
@@ -8392,6 +8706,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -8841,6 +9159,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -8885,6 +9207,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9007,6 +9333,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9133,6 +9463,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9177,6 +9511,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9223,6 +9561,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9278,6 +9620,10 @@ mod tests {
                 requested_egress_hosts: Vec::new(),
                 timeout_ms: None,
                 background: false,
+                interactive: false,
+                stdin: false,
+                pty: false,
+                port_hints: Vec::new(),
                 lifetime_mode: BackgroundLifetimeMode::RunOwned,
                 keep_running_after_run: false,
             };
@@ -9349,6 +9695,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9483,6 +9833,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -9529,6 +9883,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -10635,6 +10993,165 @@ mod tests {
         assert!(output.pointer("/cleanup/manual_command/command").is_some());
 
         let _ = fs::remove_dir_all(workspace.as_path());
+    }
+
+    #[test]
+    fn background_process_registry_tracks_input_capabilities() {
+        let pid = 4_000_000_u32.saturating_add(std::process::id());
+        let input = ProcessRunnerInput {
+            command: "python".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            prepend_path: Vec::new(),
+            requested_egress_hosts: Vec::new(),
+            timeout_ms: None,
+            background: true,
+            interactive: true,
+            stdin: false,
+            pty: false,
+            port_hints: vec![5173],
+            lifetime_mode: BackgroundLifetimeMode::UntilVerifier,
+            keep_running_after_run: false,
+        };
+        let capabilities = super::BackgroundProcessHandleCapabilities::from_input(&input);
+
+        super::register_background_process_pid(
+            pid,
+            capabilities,
+            input.effective_lifetime_mode(),
+            None,
+        )
+        .expect("registry should accept stdin-capable metadata without a pipe");
+        let snapshot = super::registered_background_process("palyra.process.status", pid)
+            .expect("registered process should be readable");
+        super::mark_background_process_stopped(pid);
+
+        assert!(snapshot.active);
+        assert!(snapshot.capabilities.stdin);
+        assert!(!snapshot.capabilities.pty);
+        assert!(snapshot.capabilities.signals);
+        assert_eq!(snapshot.lifetime_mode, BackgroundLifetimeMode::UntilVerifier);
+    }
+
+    #[test]
+    fn process_input_rejects_oversized_payload_before_pid_lookup() {
+        let oversized = "x".repeat(super::PROCESS_STDIN_INPUT_MAX_BYTES + 1);
+        let input = serde_json::to_vec(&serde_json::json!({
+            "pid": 42,
+            "input": oversized
+        }))
+        .expect("input should serialize");
+
+        let error = super::write_background_process_stdin(input.as_slice())
+            .expect_err("oversized process input should be rejected before registry lookup");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("input exceeds"), "{}", error.message);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn background_process_accepts_bounded_stdin_input() {
+        let Some(python) = ["python3", "python", "py"].into_iter().find(|command| {
+            Command::new(command)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }) else {
+            return;
+        };
+        let workspace = unique_temp_dir("workspace-python-background-stdin");
+        fs::create_dir_all(workspace.as_path()).expect("workspace directory should be created");
+        fs::write(
+            workspace.join("stdin_ready.py"),
+            "import pathlib, sys, time\nprint('ready', flush=True)\nline = sys.stdin.readline()\npathlib.Path('stdin-result.txt').write_text(line, encoding='utf-8')\ntime.sleep(30)\n",
+        )
+        .expect("background stdin script should be written");
+        let mut policy =
+            sandbox_policy_with_allowed_executables(workspace.clone(), vec![python.to_owned()]);
+        policy.allow_interpreters = true;
+        policy.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+        let input = serde_json::to_vec(&serde_json::json!({
+            "command": python,
+            "args": ["stdin_ready.py"],
+            "background": true,
+            "stdin": true,
+            "port_hints": [8787],
+            "timeout_ms": BACKGROUND_TEST_EXECUTION_TIMEOUT_MS
+        }))
+        .expect("input should serialize");
+
+        let result =
+            run_constrained_process(&policy, input.as_slice(), background_test_execution_timeout())
+                .expect("stdin-capable background process should start");
+        let output: serde_json::Value =
+            serde_json::from_slice(&result.output_json).expect("output should parse");
+        let pid = output
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .expect("background process should return pid") as u32;
+
+        assert_eq!(
+            output
+                .pointer("/process_handle/capabilities/stdin")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            output.pointer("/process_handle/capabilities/pty").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            output
+                .pointer("/process_handle/capabilities/signals")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            output
+                .pointer("/process_handle/capabilities/port_hints/0")
+                .and_then(serde_json::Value::as_u64),
+            Some(8787)
+        );
+
+        let input_result = super::write_background_process_stdin(
+            serde_json::to_vec(&serde_json::json!({
+                "pid": pid,
+                "input": "hello from stdin",
+                "append_newline": true
+            }))
+            .expect("stdin input should serialize")
+            .as_slice(),
+        )
+        .expect("stdin input should be delivered to the process");
+        let input_output: serde_json::Value =
+            serde_json::from_slice(&input_result.output_json).expect("input output should parse");
+        assert_eq!(
+            input_output.get("input_delivered").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            input_output.get("stdin_redaction_level").and_then(serde_json::Value::as_str),
+            Some("input_redacted")
+        );
+
+        let result_path = workspace.join("stdin-result.txt");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !result_path.exists() {
+            if Instant::now() >= deadline {
+                let _ = super::stop_background_process_by_pid(pid);
+                panic!("stdin-capable background process did not write its result");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let delivered =
+            fs::read_to_string(result_path.as_path()).expect("stdin result should be readable");
+
+        let _ = super::stop_background_process_by_pid(pid);
+        let _ = fs::remove_dir_all(workspace.as_path());
+        assert_eq!(delivered.replace("\r\n", "\n"), "hello from stdin\n");
     }
 
     #[test]
@@ -12057,6 +12574,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };
@@ -12086,6 +12607,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
         };

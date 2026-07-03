@@ -406,6 +406,7 @@ fn process_run_allowlist_exposes_lifecycle_controls() {
     assert!(tool_names.contains(&"palyra.process.stop"));
     assert!(tool_names.contains(&"palyra.process.status"));
     assert!(tool_names.contains(&"palyra.process.list"));
+    assert!(tool_names.contains(&"palyra.process.input"));
 }
 
 #[test]

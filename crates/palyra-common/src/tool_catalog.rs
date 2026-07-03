@@ -297,8 +297,9 @@ impl ToolCatalogExposureMode {
 /// Expands profile names and explicit overrides into an effective tool allowlist.
 ///
 /// `disabled_tools` is applied last and therefore wins over profile, explicit,
-/// and extra grants. `palyra.process.run` expands to its lifecycle companions
-/// before disables are applied so operators can still remove a companion by name.
+/// and extra grants. `palyra.process.run` expands to its lifecycle/input
+/// companions before disables are applied so operators can still remove a
+/// companion by name.
 ///
 /// # Errors
 /// Returns [`ToolsetProfileError`] when a profile name is not built in.
@@ -380,7 +381,12 @@ fn push_effective_tool(tool: &str, tools: &mut Vec<String>, seen: &mut BTreeSet<
         return;
     }
     if tool == "palyra.process.run" {
-        for companion in ["palyra.process.stop", "palyra.process.status", "palyra.process.list"] {
+        for companion in [
+            "palyra.process.input",
+            "palyra.process.stop",
+            "palyra.process.status",
+            "palyra.process.list",
+        ] {
             if seen.insert(companion.to_owned()) {
                 tools.push(companion.to_owned());
             }
@@ -459,6 +465,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             default_sensitive: true,
         }),
         "palyra.process.run"
+        | "palyra.process.input"
         | "palyra.process.stop"
         | "palyra.process.status"
         | "palyra.process.list" => Some(ToolMetadata {
@@ -632,6 +639,8 @@ mod tests {
     fn process_runner_is_approval_required() {
         assert!(tool_requires_approval("palyra.process.run"));
         assert_eq!(tool_policy_capability_names("palyra.process.run"), vec!["process_exec"]);
+        assert!(tool_requires_approval("palyra.process.input"));
+        assert_eq!(tool_policy_capability_names("palyra.process.input"), vec!["process_exec"]);
     }
 
     #[test]
@@ -674,6 +683,7 @@ mod tests {
         assert_eq!(report.profiles, vec!["code"]);
         assert!(report.effective_allowed_tools.contains(&"palyra.fs.apply_patch".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.run".to_owned()));
+        assert!(report.effective_allowed_tools.contains(&"palyra.process.input".to_owned()));
         assert!(!report.effective_allowed_tools.contains(&"palyra.process.status".to_owned()));
         assert_eq!(
             report

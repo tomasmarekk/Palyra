@@ -203,6 +203,7 @@ pub(crate) const APPROVAL_REQUEST_SUMMARY_MAX_BYTES: usize = 1024;
 pub(crate) const TOOL_APPROVAL_RESPONSE_TIMEOUT: Duration =
     Duration::from_secs(APPROVAL_PROMPT_TIMEOUT_SECONDS as u64);
 const TOOL_APPROVAL_EXTERNAL_DECISION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROCESS_INPUT_WRITE_TIMEOUT_MS: u64 = 1_500;
 pub(crate) const SKILL_EXECUTION_DENY_REASON_PREFIX: &str =
     "skill execution blocked by security gate";
 
@@ -233,6 +234,7 @@ pub(crate) const WORKSPACE_SEARCH_TOOL_NAME: &str = "palyra.fs.search";
 pub(crate) const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 pub(crate) const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
 pub(crate) const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
+pub(crate) const PROCESS_INPUT_TOOL_NAME: &str = "palyra.process.input";
 pub(crate) const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
 pub(crate) const PROCESS_STATUS_TOOL_NAME: &str = "palyra.process.status";
 pub(crate) const PROCESS_LIST_TOOL_NAME: &str = "palyra.process.list";
@@ -1093,6 +1095,41 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         )
         .await;
         outcome
+    } else if tool_name == PROCESS_INPUT_TOOL_NAME {
+        let config =
+            process_runner_tool_config_for_session(runtime_state, context, input_json).await;
+        if !config.process_runner.enabled {
+            return build_tool_execution_outcome(
+                proposal_id,
+                PROCESS_INPUT_TOOL_NAME,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                "sandbox process runner is disabled by runtime policy".to_owned(),
+                false,
+                crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+                "none".to_owned(),
+            );
+        }
+        if let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) {
+            if !process_lifecycle_pid_is_run_owned(runtime_state, context.run_id, pid) {
+                return process_lifecycle_unowned_pid_outcome(
+                    &config,
+                    proposal_id,
+                    tool_name,
+                    input_json,
+                    pid,
+                );
+            }
+        }
+        let outcome =
+            execute_process_input_tool(&config, proposal_id, PROCESS_INPUT_TOOL_NAME, input_json)
+                .await;
+        if outcome.success {
+            record_process_input_journal_event(runtime_state, context, proposal_id, input_json)
+                .await;
+        }
+        outcome
     } else if matches!(tool_name, PROCESS_STOP_TOOL_NAME | PROCESS_STATUS_TOOL_NAME) {
         let config =
             process_runner_tool_config_for_session(runtime_state, context, input_json).await;
@@ -1600,6 +1637,126 @@ fn execute_process_list_tool(
     )
 }
 
+async fn execute_process_input_tool(
+    config: &ToolCallConfig,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let input = input_json.to_vec();
+    let result = tokio::time::timeout(
+        Duration::from_millis(PROCESS_INPUT_WRITE_TIMEOUT_MS),
+        tokio::task::spawn_blocking(move || {
+            crate::sandbox_runner::write_background_process_stdin(input.as_slice())
+        }),
+    )
+    .await;
+    match result {
+        Ok(Ok(Ok(success))) => build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            true,
+            success.output_json,
+            String::new(),
+            false,
+            crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+            crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+        ),
+        Ok(Ok(Err(error))) => build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            error.message,
+            false,
+            crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+            crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+        ),
+        Ok(Err(_)) => build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            "palyra.process.input worker panicked".to_owned(),
+            false,
+            crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+            crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+        ),
+        Err(_) => build_tool_execution_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            format!("palyra.process.input timed out after {PROCESS_INPUT_WRITE_TIMEOUT_MS}ms"),
+            true,
+            crate::sandbox_runner::process_runner_executor_name(&config.process_runner),
+            crate::sandbox_runner::process_runner_sandbox_enforcement_label(&config.process_runner),
+        ),
+    }
+}
+
+async fn record_process_input_journal_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) {
+    let Some(pid) = process_lifecycle_pid_from_tool_input(input_json) else {
+        return;
+    };
+    let payload = json!({
+        "schema_version": 1,
+        "event_type": "process.input.delivered",
+        "tool_name": PROCESS_INPUT_TOOL_NAME,
+        "proposal_id": proposal_id,
+        "session_id": context.session_id,
+        "run_id": context.run_id,
+        "pid": pid,
+        "input": "<redacted>",
+        "input_sha256": sha256_hex(input_json),
+        "created_at_unix_ms": current_unix_ms(),
+        "redaction_level": "input_redacted",
+    });
+    let payload_json = match serde_json::to_vec(&payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(
+                proposal_id,
+                error = %error,
+                "failed to serialize process input journal payload"
+            );
+            return;
+        }
+    };
+    if let Err(error) = runtime_state
+        .record_journal_event(JournalAppendRequest {
+            event_id: Ulid::new().to_string(),
+            session_id: context.session_id.to_owned(),
+            run_id: context.run_id.to_owned(),
+            kind: common_v1::journal_event::EventKind::ToolExecuted as i32,
+            actor: common_v1::journal_event::EventActor::System as i32,
+            timestamp_unix_ms: current_unix_ms(),
+            payload_json,
+            principal: context.principal.to_owned(),
+            device_id: context.device_id.to_owned(),
+            channel: context.channel.map(str::to_owned),
+        })
+        .await
+    {
+        warn!(
+            proposal_id,
+            pid,
+            status_code = ?error.code(),
+            status_message = %error.message(),
+            "process input journal write failed"
+        );
+    }
+}
+
 fn background_process_list_entry(
     pid: u32,
     status: Result<crate::sandbox_runner::BackgroundProcessRuntimeStatus, String>,
@@ -1686,6 +1843,11 @@ fn process_stop_outcome_verifies_tree_stopped(output_json: &[u8]) -> bool {
     }
 
     true
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn browser_session_id_from_create_output(output_json: &[u8]) -> Option<String> {

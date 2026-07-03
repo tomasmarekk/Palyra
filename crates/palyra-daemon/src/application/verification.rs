@@ -1340,6 +1340,10 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            interactive: false,
+            stdin: false,
+            pty: false,
+            port_hints: Vec::new(),
             lifetime_mode: Default::default(),
             keep_running_after_run: false,
         }

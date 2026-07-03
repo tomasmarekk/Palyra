@@ -20,7 +20,7 @@ use crate::{
         current_unix_ms, truncate_with_ellipsis, GatewayRuntimeState, ToolApprovalOutcome,
         ToolSkillContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, APPROVAL_DENIED_REASON,
         APPROVAL_POLICY_ID, APPROVAL_PROMPT_TIMEOUT_SECONDS, APPROVAL_REQUEST_SUMMARY_MAX_BYTES,
-        PROCESS_RUNNER_TOOL_NAME,
+        PROCESS_INPUT_TOOL_NAME, PROCESS_RUNNER_TOOL_NAME,
     },
     journal::{
         ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot, ApprovalPromptOption,
@@ -214,7 +214,20 @@ fn approval_input_details(tool_name: &str, input_json: &[u8], config: &ToolCallC
     if tool_name == PROCESS_RUNNER_TOOL_NAME {
         add_process_runner_background_lifetime_context(&mut details, input_json, config);
     }
+    if tool_name == PROCESS_INPUT_TOOL_NAME {
+        redact_process_input_approval_details(&mut details, input_json);
+    }
     details
+}
+
+fn redact_process_input_approval_details(details: &mut Value, input_json: &[u8]) {
+    let input_len = details.get("input").and_then(Value::as_str).map(str::len).unwrap_or_default();
+    if let Value::Object(details) = details {
+        details.insert("input".to_owned(), Value::String("<redacted>".to_owned()));
+        details.insert("input_bytes".to_owned(), json!(input_len));
+        details.insert("input_sha256".to_owned(), json!(sha256_hex(input_json)));
+        details.insert("redaction_level".to_owned(), json!("input_redacted"));
+    }
 }
 
 fn add_process_runner_background_lifetime_context(
@@ -275,6 +288,10 @@ pub(crate) fn build_tool_approval_subject_id(
             subject_id.push_str(lifetime);
         }
     }
+    if tool_name == PROCESS_INPUT_TOOL_NAME {
+        subject_id.push_str("|pid:");
+        subject_id.push_str(process_input_approval_pid(input_json).as_deref().unwrap_or("unknown"));
+    }
     if let Some(skill_context) = skill_context {
         subject_id.push_str("|skill:");
         subject_id.push_str(skill_context.skill_id());
@@ -286,6 +303,14 @@ fn process_runner_lifetime_approval_subject(input_json: &[u8]) -> Option<&'stati
     let input = parse_process_runner_tool_input(input_json).ok()?;
     let lifetime_mode = input.effective_lifetime_mode();
     lifetime_mode.is_detached_handoff().then_some(lifetime_mode.as_str())
+}
+
+fn process_input_approval_pid(input_json: &[u8]) -> Option<String> {
+    let payload = serde_json::from_slice::<Value>(input_json).ok()?;
+    let pid = payload
+        .get("pid")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok()))?;
+    (pid > 0).then(|| pid.to_string())
 }
 
 fn os_file_approval_fingerprint(input_json: &[u8]) -> String {
@@ -986,6 +1011,36 @@ mod tests {
             lifetime.get("approval_applies_to").and_then(Value::as_str),
             Some("effective_lifetime_ms")
         );
+    }
+
+    #[test]
+    fn process_input_approval_is_pid_scoped_and_redacted() {
+        let input = br#"{"pid":1234,"input":"super-secret-command","append_newline":true}"#;
+        let subject = build_tool_approval_subject_id(PROCESS_INPUT_TOOL_NAME, None, input);
+        let config = test_tool_call_config(PROCESS_INPUT_TOOL_NAME);
+        let pending =
+            build_pending_tool_approval(PROCESS_INPUT_TOOL_NAME, None, input, &config, None);
+
+        assert_eq!(subject, "tool:palyra.process.input|pid:1234");
+        assert!(!pending.request_summary.contains("super-secret-command"));
+        assert!(pending.request_summary.contains("<redacted>"));
+
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        let input_json = details_json
+            .get("input_json")
+            .expect("approval prompt should include redacted input JSON");
+        assert_eq!(input_json.get("pid").and_then(Value::as_u64), Some(1234));
+        assert_eq!(input_json.get("input").and_then(Value::as_str), Some("<redacted>"));
+        assert_eq!(
+            input_json.get("redaction_level").and_then(Value::as_str),
+            Some("input_redacted")
+        );
+        assert_eq!(
+            input_json.get("input_bytes").and_then(Value::as_u64),
+            Some("super-secret-command".len() as u64)
+        );
+        assert_eq!(input_json.get("input_sha256").and_then(Value::as_str).map(str::len), Some(64));
     }
 
     #[test]
