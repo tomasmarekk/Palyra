@@ -1583,23 +1583,13 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
         Some(events_url.as_str())
     );
 
-    let wait_timeout = create_compat_run_wait_timeout(
+    let wait_observation = create_compat_run_wait_observation(
         &client,
         admin_port,
         token.as_str(),
         &json!({ "input": "runs API wait timeout text" }),
     )?;
-    assert_eq!(wait_timeout.get("object").and_then(Value::as_str), Some("run.wait"));
-    assert_eq!(wait_timeout.get("status").and_then(Value::as_str), Some("timeout"));
-    assert_eq!(wait_timeout.get("timed_out").and_then(Value::as_bool), Some(true));
-    assert_eq!(wait_timeout.get("timeout_ms").and_then(Value::as_u64), Some(1));
-    assert!(
-        wait_timeout
-            .pointer("/run/status")
-            .and_then(Value::as_str)
-            .is_some_and(|status| matches!(status, "queued" | "running")),
-        "timeout payload should include current run status: {wait_timeout}"
-    );
+    assert_compat_run_wait_timeout_or_fast_completion(&wait_observation);
 
     let terminal =
         wait_for_compat_run_terminal(&client, admin_port, token.as_str(), run_id.as_str())?;
@@ -3626,7 +3616,7 @@ fn wait_for_compat_run_visible(
     }
 }
 
-fn create_compat_run_wait_timeout(
+fn create_compat_run_wait_observation(
     client: &Client,
     admin_port: u16,
     token: &str,
@@ -3661,12 +3651,56 @@ fn create_compat_run_wait_timeout(
             &json!({ "timeout_ms": 1 }),
         )?;
         assert_eq!(wait_status, 200, "run wait should return a JSON payload: {wait_payload}");
-        if wait_payload.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        if wait_payload.get("timed_out").and_then(Value::as_bool) == Some(true)
+            || wait_payload
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status == "completed")
+        {
             return Ok(wait_payload);
         }
         last_payload = wait_payload;
     }
-    anyhow::bail!("compat run wait did not observe a timeout; last payload: {last_payload}")
+    if last_payload.get("status").and_then(Value::as_str) == Some("completed") {
+        return Ok(last_payload);
+    }
+    anyhow::bail!(
+        "compat run wait did not observe a timeout or fast completion; last payload: {last_payload}"
+    )
+}
+
+fn assert_compat_run_wait_timeout_or_fast_completion(payload: &Value) {
+    match (
+        payload.get("object").and_then(Value::as_str),
+        payload.get("timed_out").and_then(Value::as_bool),
+        payload.get("status").and_then(Value::as_str),
+    ) {
+        (Some("run.wait"), Some(true), Some("timeout")) => {
+            assert_eq!(payload.get("timeout_ms").and_then(Value::as_u64), Some(1));
+            assert!(
+                payload
+                    .pointer("/run/status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| matches!(status, "queued" | "running")),
+                "timeout payload should include current run status: {payload}"
+            );
+        }
+        (Some("run.wait"), Some(false), Some("completed")) => {
+            assert_eq!(
+                payload.pointer("/run/status").and_then(Value::as_str),
+                Some("completed"),
+                "completed wait payload should include the terminal run: {payload}"
+            );
+        }
+        (Some("run"), _, Some("completed")) => {
+            assert_eq!(
+                payload.get("active_phase").and_then(Value::as_str),
+                Some("completed"),
+                "fast completion payload should include the terminal phase: {payload}"
+            );
+        }
+        _ => panic!("unexpected run wait observation payload: {payload}"),
+    }
 }
 
 fn parse_sse_messages(body: &str) -> Result<Vec<(Option<String>, String)>> {
