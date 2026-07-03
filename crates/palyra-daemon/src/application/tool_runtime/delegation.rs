@@ -6,7 +6,11 @@
 //! (`gateway::execute_tool_with_runtime_dispatch`); every free-text field is
 //! redacted before it becomes model-visible output.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use palyra_common::{
     redaction::{redact_auth_error, redact_url_segments_in_text},
@@ -26,6 +30,7 @@ use crate::{
     gateway::{
         current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext,
         DELEGATION_CONTROL_TOOL_NAME, DELEGATION_QUERY_TOOL_NAME, SESSIONS_SPAWN_TOOL_NAME,
+        SESSIONS_YIELD_TOOL_NAME,
     },
     journal::{
         OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskListFilter,
@@ -38,6 +43,8 @@ use crate::{
 const DELEGATION_TOOL_EXECUTOR: &str = "delegation_runtime";
 const DELEGATION_TOOL_SANDBOX: &str = "delegation_scope";
 const MAX_DELEGATION_TOOL_TASKS: usize = 256;
+const MAX_SESSIONS_YIELD_TIMEOUT_MS: u64 = 30_000;
+const SESSIONS_YIELD_POLL_INTERVAL_MS: u64 = 100;
 
 /// Combined input shape for both delegation tools; each operation reads only
 /// the fields it needs and ignores the rest.
@@ -156,6 +163,39 @@ struct SessionsSpawnBudgetInput {
     child_timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SessionsYieldInput {
+    #[serde(default)]
+    child_run_ids: Vec<String>,
+    #[serde(default)]
+    task_ids: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    return_mode: Option<SessionsYieldReturnMode>,
+    #[serde(default)]
+    partial_ok: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionsYieldReturnMode {
+    IdsOnly,
+    #[default]
+    Summary,
+    Full,
+}
+
+impl SessionsYieldReturnMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdsOnly => "ids_only",
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DelegationSpawnRequest {
     objective: String,
@@ -223,6 +263,12 @@ async fn execute_delegation_tool_inner(
             Status::invalid_argument(format!("sessions_spawn input is invalid JSON: {error}"))
         })?;
         return create_sessions_spawn(runtime, context, &input).await;
+    }
+    if tool_name == SESSIONS_YIELD_TOOL_NAME {
+        let input = serde_json::from_slice::<SessionsYieldInput>(input_json).map_err(|error| {
+            Status::invalid_argument(format!("sessions_yield input is invalid JSON: {error}"))
+        })?;
+        return create_sessions_yield(runtime, context, &input).await;
     }
 
     let input = serde_json::from_slice::<DelegationToolInput>(input_json).map_err(|error| {
@@ -486,6 +532,279 @@ fn sessions_spawn_response(
             "child_run_id": child_run_id,
             "state": task.state,
         },
+    })
+}
+
+async fn create_sessions_yield(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    input: &SessionsYieldInput,
+) -> Result<Value, Status> {
+    let timeout_ms = input.timeout_ms.unwrap_or(0).min(MAX_SESSIONS_YIELD_TIMEOUT_MS);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let output = sessions_yield_snapshot(runtime, context, input, timeout_ms).await?;
+        let complete = output.get("complete").and_then(Value::as_bool).unwrap_or(false);
+        if complete {
+            return Ok(output);
+        }
+        if timeout_ms == 0 || Instant::now() >= deadline {
+            if !input.partial_ok.unwrap_or(true) {
+                return Err(Status::deadline_exceeded(
+                    "sessions_yield timed out before all selected child runs completed",
+                ));
+            }
+            return Ok(output);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_millis(SESSIONS_YIELD_POLL_INTERVAL_MS)))
+            .await;
+    }
+}
+
+async fn sessions_yield_snapshot(
+    runtime: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    input: &SessionsYieldInput,
+    timeout_ms: u64,
+) -> Result<Value, Status> {
+    let child_run_ids = normalize_id_list(input.child_run_ids.as_slice());
+    let task_ids = normalize_id_list(input.task_ids.as_slice());
+    let requested_child_run_ids = child_run_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let requested_task_ids = task_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let requested_specific_children =
+        !requested_child_run_ids.is_empty() || !requested_task_ids.is_empty();
+    let filter = DelegationToolInput {
+        operation: "list".to_owned(),
+        objective: None,
+        profile_id: None,
+        template_id: None,
+        parent_run_id: None,
+        session_id: Some(context.session_id.to_owned()),
+        task_id: None,
+        run_id: None,
+        reason: None,
+        priority: None,
+        budget_tokens: None,
+        max_attempts: None,
+        execution_mode: None,
+        group_id: None,
+        model_profile: None,
+        memory_scope: None,
+        tool_allowlist: Vec::new(),
+        skill_allowlist: Vec::new(),
+        approval_required: None,
+        max_concurrent_children: None,
+        max_children_per_parent: None,
+        max_total_children: None,
+        max_parallel_groups: None,
+        max_depth: None,
+        max_budget_share_bps: None,
+        child_timeout_ms: None,
+        include_completed: Some(true),
+    };
+    let tasks = scoped_delegation_tasks(runtime, context, &filter, true).await?;
+    let return_mode = input.return_mode.unwrap_or_default();
+    let mut completions = Vec::new();
+    let mut pending = Vec::new();
+    let mut matched_child_run_ids = BTreeSet::new();
+    let mut matched_task_ids = BTreeSet::new();
+
+    for task in tasks {
+        if !sessions_yield_selects_task(
+            &task,
+            context.run_id,
+            requested_specific_children,
+            &requested_child_run_ids,
+            &requested_task_ids,
+        ) {
+            continue;
+        }
+        matched_task_ids.insert(task.task_id.clone());
+        if let Some(child_run_id) = task.target_run_id.as_ref() {
+            matched_child_run_ids.insert(child_run_id.clone());
+        }
+        let run = if let Some(run_id) = task.target_run_id.as_ref() {
+            runtime.orchestrator_run_status_snapshot(run_id.clone()).await?
+        } else {
+            None
+        };
+        let terminal = sessions_yield_task_terminal(&task, run.as_ref());
+        let projected = sessions_yield_task_projection(&task, run.as_ref(), return_mode, terminal);
+        if terminal {
+            completions.push(projected);
+        } else {
+            pending.push(projected);
+        }
+    }
+
+    for child_run_id in requested_child_run_ids.difference(&matched_child_run_ids) {
+        pending.push(sessions_yield_missing_child_json(Some(child_run_id.as_str()), None));
+    }
+    for task_id in requested_task_ids.difference(&matched_task_ids) {
+        pending.push(sessions_yield_missing_child_json(None, Some(task_id.as_str())));
+    }
+
+    let complete = pending.is_empty();
+    Ok(json!({
+        "schema_version": 1,
+        "operation": "sessions_yield",
+        "complete": complete,
+        "partial": !complete && !completions.is_empty(),
+        "timeout_ms": timeout_ms,
+        "return_mode": return_mode.as_str(),
+        "partial_ok": input.partial_ok.unwrap_or(true),
+        "completions": completions,
+        "pending": pending,
+        "idempotency_keys": completions
+            .iter()
+            .filter_map(|completion| completion.get("idempotency_key").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn sessions_yield_selects_task(
+    task: &OrchestratorBackgroundTaskRecord,
+    parent_run_id: &str,
+    requested_specific_children: bool,
+    requested_child_run_ids: &BTreeSet<String>,
+    requested_task_ids: &BTreeSet<String>,
+) -> bool {
+    if requested_specific_children {
+        return requested_task_ids.contains(task.task_id.as_str())
+            || task
+                .target_run_id
+                .as_ref()
+                .is_some_and(|child_run_id| requested_child_run_ids.contains(child_run_id));
+    }
+    task.parent_run_id.as_deref() == Some(parent_run_id)
+}
+
+fn sessions_yield_task_terminal(
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+) -> bool {
+    AuxiliaryTaskState::from_str(task.state.as_str()).is_some_and(AuxiliaryTaskState::is_terminal)
+        || run.is_some_and(|snapshot| sessions_yield_terminal_run_state(snapshot.state.as_str()))
+}
+
+fn sessions_yield_terminal_run_state(state: &str) -> bool {
+    matches!(state, "done" | "failed" | "cancelled" | "canceled" | "timed_out" | "rejected")
+}
+
+fn sessions_yield_task_projection(
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+    return_mode: SessionsYieldReturnMode,
+    terminal: bool,
+) -> Value {
+    let child_run_id =
+        task.target_run_id.as_deref().or_else(|| run.map(|snapshot| snapshot.run_id.as_str()));
+    let child_state = run.map(|snapshot| snapshot.state.as_str()).unwrap_or(task.state.as_str());
+    let idempotency_key = sessions_yield_idempotency_key(task, child_run_id, child_state, run);
+    let mut output = json!({
+        "task_id": task.task_id,
+        "child_run_id": child_run_id,
+        "child_session_id": task.session_id,
+        "state": child_state,
+        "terminal": terminal,
+        "idempotency_key": idempotency_key,
+        "transcript_ref": child_run_id.map(|run_id| json!({
+            "kind": "orchestrator_run_tape",
+            "status": if terminal { "complete" } else { "pending" },
+            "run_id": run_id,
+            "session_id": task.session_id,
+        })),
+    });
+    if return_mode == SessionsYieldReturnMode::IdsOnly {
+        return output;
+    }
+
+    let merge_preview = task_merge_preview(task, run);
+    if let Some(object) = output.as_object_mut() {
+        object
+            .insert("summary".to_owned(), json!(sessions_yield_summary(task, run, &merge_preview)));
+        object.insert(
+            "artifact_refs".to_owned(),
+            merge_preview.get("changed_artifacts").cloned().unwrap_or_else(|| json!([])),
+        );
+        object.insert(
+            "evidence_refs".to_owned(),
+            merge_preview.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+        );
+        object.insert(
+            "verification_state".to_owned(),
+            json!(sessions_yield_verification_state(child_state, terminal, &merge_preview)),
+        );
+        if return_mode == SessionsYieldReturnMode::Full {
+            object.insert("merge_preview".to_owned(), merge_preview);
+            object.insert("task".to_owned(), task_safe_json(task));
+            object.insert("child_run".to_owned(), run.map(run_safe_json).unwrap_or(Value::Null));
+        }
+    }
+    output
+}
+
+fn sessions_yield_summary(
+    task: &OrchestratorBackgroundTaskRecord,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+    merge_preview: &Value,
+) -> String {
+    if let Some(summary) = merge_preview.get("summary").and_then(Value::as_str) {
+        return summary.to_owned();
+    }
+    run.and_then(|snapshot| snapshot.last_error.as_deref())
+        .or(task.last_error.as_deref())
+        .map(safe_text)
+        .unwrap_or_else(|| "child run has not produced a merge summary yet".to_owned())
+}
+
+fn sessions_yield_verification_state(
+    child_state: &str,
+    terminal: bool,
+    merge_preview: &Value,
+) -> &'static str {
+    if !terminal {
+        return "pending";
+    }
+    if matches!(child_state, "failed" | "cancelled" | "canceled" | "timed_out" | "rejected") {
+        return "failed";
+    }
+    if merge_preview.get("approval_required").and_then(Value::as_bool).unwrap_or(false) {
+        return "review_required";
+    }
+    if merge_preview.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+        return "verified";
+    }
+    "completion_recorded"
+}
+
+fn sessions_yield_idempotency_key(
+    task: &OrchestratorBackgroundTaskRecord,
+    child_run_id: Option<&str>,
+    child_state: &str,
+    run: Option<&crate::journal::OrchestratorRunStatusSnapshot>,
+) -> String {
+    let completed_at = task
+        .completed_at_unix_ms
+        .or_else(|| run.and_then(|snapshot| snapshot.completed_at_unix_ms))
+        .unwrap_or(task.updated_at_unix_ms);
+    format!(
+        "subagent_completion:{}:{}:{}:{}",
+        task.task_id,
+        child_run_id.unwrap_or("pending"),
+        child_state,
+        completed_at
+    )
+}
+
+fn sessions_yield_missing_child_json(child_run_id: Option<&str>, task_id: Option<&str>) -> Value {
+    json!({
+        "task_id": task_id,
+        "child_run_id": child_run_id,
+        "state": "not_found",
+        "terminal": false,
+        "transcript_ref": Value::Null,
     })
 }
 
@@ -788,6 +1107,16 @@ fn normalize_tool_list(values: &[String]) -> Vec<String> {
     normalized
 }
 
+fn normalize_id_list(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .filter_map(|value| normalize_optional(Some(value.as_str())))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 /// Applies the model-visible redaction chain to free-form text.
 fn safe_text(value: &str) -> String {
     redact_url_segments_in_text(&redact_auth_error(value))
@@ -819,8 +1148,12 @@ fn build_outcome(
 mod tests {
     use super::{
         delegation_request_for_spawn, parent_tool_allowlist_for_spawn_resolution,
-        sessions_spawn_delegation_spawn_request, sessions_spawn_response, task_merge_preview,
-        task_safe_json, SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
+        sessions_spawn_delegation_spawn_request, sessions_spawn_response,
+        sessions_yield_idempotency_key, sessions_yield_missing_child_json,
+        sessions_yield_selects_task, sessions_yield_task_projection,
+        sessions_yield_terminal_run_state, task_merge_preview, task_safe_json,
+        SessionsSpawnBudgetInput, SessionsSpawnInput, SessionsSpawnReturnMode,
+        SessionsYieldReturnMode,
     };
     use crate::{
         delegation::{
@@ -831,6 +1164,7 @@ mod tests {
         journal::OrchestratorBackgroundTaskRecord,
     };
     use palyra_common::runtime_contracts::AuxiliaryTaskState;
+    use std::collections::BTreeSet;
 
     #[test]
     fn task_safe_json_redacts_objective_and_projects_scope() {
@@ -964,6 +1298,93 @@ mod tests {
         assert_eq!(SessionsSpawnReturnMode::IdsOnly.as_str(), "ids_only");
         assert_eq!(SessionsSpawnReturnMode::StatusRef.as_str(), "status_ref");
         assert_eq!(SessionsSpawnReturnMode::Ack.as_str(), "ack");
+    }
+
+    #[test]
+    fn sessions_yield_projection_returns_completion_contract() {
+        let mut task = sample_task();
+        task.state = AuxiliaryTaskState::Succeeded.as_str().to_owned();
+        task.completed_at_unix_ms = Some(20);
+        task.result_json = Some(
+            serde_json::json!({
+                "merge_result": {
+                    "summary_text": "Investigated https://example.com/callback?access_token=secret",
+                    "approval_required": false,
+                    "provenance": [{"kind":"message","label":"child summary","child_run_id":"child-run","requires_approval":false}],
+                    "artifact_references": [{"artifact_id":"artifact-1","artifact_kind":"report","label":"summary"}],
+                    "warnings": []
+                }
+            })
+            .to_string(),
+        );
+
+        let value =
+            sessions_yield_task_projection(&task, None, SessionsYieldReturnMode::Summary, true);
+        let text = value.to_string();
+
+        assert_eq!(value["task_id"], "task-1");
+        assert_eq!(value["child_run_id"], "child-run");
+        assert_eq!(value["child_session_id"], "session-1");
+        assert_eq!(value["terminal"], true);
+        assert_eq!(value["verification_state"], "verified");
+        assert_eq!(value["transcript_ref"]["run_id"], "child-run");
+        assert_eq!(value["artifact_refs"][0]["artifact_id"], "artifact-1");
+        assert!(value["idempotency_key"]
+            .as_str()
+            .expect("idempotency key should be present")
+            .starts_with("subagent_completion:task-1:child-run"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("access_token=secret"));
+    }
+
+    #[test]
+    fn sessions_yield_selects_requested_or_parent_children() {
+        let task = sample_task();
+        let requested_runs = ["child-run".to_owned()].into_iter().collect();
+        let requested_tasks = BTreeSet::new();
+
+        assert!(sessions_yield_selects_task(
+            &task,
+            "other-parent",
+            true,
+            &requested_runs,
+            &requested_tasks
+        ));
+        assert!(sessions_yield_selects_task(
+            &task,
+            "parent-run",
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new()
+        ));
+        assert!(!sessions_yield_selects_task(
+            &task,
+            "other-parent",
+            false,
+            &BTreeSet::new(),
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
+    fn sessions_yield_missing_and_timeout_helpers_are_stable() {
+        assert!(sessions_yield_terminal_run_state("done"));
+        assert!(sessions_yield_terminal_run_state("failed"));
+        assert!(!sessions_yield_terminal_run_state("running"));
+        assert_eq!(SessionsYieldReturnMode::IdsOnly.as_str(), "ids_only");
+        assert_eq!(SessionsYieldReturnMode::Summary.as_str(), "summary");
+        assert_eq!(SessionsYieldReturnMode::Full.as_str(), "full");
+
+        let missing = sessions_yield_missing_child_json(Some("child-missing"), None);
+        assert_eq!(missing["child_run_id"], "child-missing");
+        assert_eq!(missing["state"], "not_found");
+        assert_eq!(missing["terminal"], false);
+
+        let task = sample_task();
+        assert_eq!(
+            sessions_yield_idempotency_key(&task, Some("child-run"), "queued", None),
+            "subagent_completion:task-1:child-run:queued:1"
+        );
     }
 
     fn test_parent_context(parent_budget_tokens: Option<u64>) -> DelegationParentContext {

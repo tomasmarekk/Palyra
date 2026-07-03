@@ -215,6 +215,7 @@ const AUTOMATION_PROFILE_TOOLS: &[&str] = &[
     "palyra.delegation.query",
     "palyra.delegation.control",
     "sessions_spawn",
+    "sessions_yield",
     "palyra.http.fetch",
     "palyra.browser.session.create",
     "palyra.browser.session.close",
@@ -439,7 +440,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
         "palyra.delegation.control" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
-        "sessions_spawn" => {
+        "sessions_spawn" | "sessions_yield" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.plan.manage" => {
@@ -650,6 +651,8 @@ mod tests {
     fn sessions_spawn_is_sensitive_without_extra_policy_capabilities() {
         assert!(tool_requires_approval("sessions_spawn"));
         assert!(tool_policy_capability_names("sessions_spawn").is_empty());
+        assert!(tool_requires_approval("sessions_yield"));
+        assert!(tool_policy_capability_names("sessions_yield").is_empty());
     }
 
     #[test]
@@ -688,6 +691,7 @@ mod tests {
             .expect("automation profile should be valid");
 
         assert!(report.effective_allowed_tools.contains(&"sessions_spawn".to_owned()));
+        assert!(report.effective_allowed_tools.contains(&"sessions_yield".to_owned()));
     }
 
     #[test]

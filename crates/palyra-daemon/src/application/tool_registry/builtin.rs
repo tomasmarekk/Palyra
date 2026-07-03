@@ -829,6 +829,38 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "sessions_yield",
+            "Wait briefly for delegated Palyra child runs and return durable completion summaries without manual polling.",
+            object_schema(
+                &[],
+                vec![
+                    (
+                        "child_run_ids",
+                        json!({"type":"array","items":{"type":"string","maxLength":128},"maxItems":64,"description":"Optional child run ids returned by sessions_spawn. Omit ids to wait for child runs spawned by the current parent run."}),
+                    ),
+                    (
+                        "task_ids",
+                        json!({"type":"array","items":{"type":"string","maxLength":128},"maxItems":64,"description":"Optional background task ids returned by sessions_spawn."}),
+                    ),
+                    (
+                        "timeout_ms",
+                        json!({"type":"integer","minimum":0,"maximum":30000,"description":"Maximum time to wait for completions. Defaults to 0 for an immediate durable snapshot."}),
+                    ),
+                    (
+                        "return_mode",
+                        json!({"type":"string","enum":["ids_only","summary","full"],"description":"Controls completion detail. summary includes merge preview and transcript refs; full includes redacted task metadata."}),
+                    ),
+                    (
+                        "partial_ok",
+                        json!({"type":"boolean","description":"Defaults to true. When false, the tool returns a deadline error if any selected child is still pending at timeout."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.http.fetch",
             "Fetch an HTTP(S) URL through Palyra SSRF, header and content-type guardrails.",
             object_schema(
@@ -1579,6 +1611,27 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("allowed_tools description should be visible to models");
         assert!(allowed_tools_description.contains("empty array"));
+    }
+
+    #[test]
+    fn sessions_yield_registry_schema_exposes_wait_contract() {
+        let entry = registry_entry("sessions_yield").expect("sessions_yield entry exists");
+
+        assert_eq!(entry.approval_posture, ToolApprovalPosture::ApprovalRequired);
+        assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::Exclusive);
+        assert!(entry.description.contains("completion"));
+        assert!(entry.input_schema.pointer("/required/0").is_none());
+        assert!(entry.input_schema.pointer("/properties/child_run_ids").is_some());
+        assert!(entry.input_schema.pointer("/properties/task_ids").is_some());
+        assert_eq!(entry.input_schema["properties"]["timeout_ms"]["maximum"], 30000);
+        assert_eq!(
+            entry
+                .input_schema
+                .pointer("/properties/return_mode/enum/1")
+                .and_then(serde_json::Value::as_str),
+            Some("summary")
+        );
+        assert!(entry.input_schema.pointer("/properties/partial_ok").is_some());
     }
 
     #[test]
