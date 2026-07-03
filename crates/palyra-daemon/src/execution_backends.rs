@@ -31,7 +31,8 @@ use palyra_common::{
     process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
     redaction::{is_sensitive_key, redact_diagnostic_text},
     workspace_patch::{
-        apply_workspace_patch, compute_patch_sha256, redact_patch_preview, WorkspacePatchLimits,
+        apply_workspace_patch, compute_patch_sha256, redact_patch_preview,
+        WorkspacePatchFileAttestation, WorkspacePatchLimits, WorkspacePatchOutcome,
         WorkspacePatchRedactionPolicy, WorkspacePatchRequest,
     },
 };
@@ -337,7 +338,7 @@ impl WorkspaceStrategyDescriptor {
             lifecycle: "lease a remote worker workspace for one run-scoped grant".to_owned(),
             isolation: "remote lease boundary with attested allowed paths".to_owned(),
             cleanup: "lease TTL reap plus verified workspace/artifact/log cleanup".to_owned(),
-            writeback: WorkspaceWritebackMode::LeaseCommit,
+            writeback: WorkspaceWritebackMode::PatchBundle,
             requires_clean_git_state: false,
             requires_lease: true,
             digest_required: true,
@@ -1740,15 +1741,114 @@ pub(crate) struct DockerResourceUsage {
     pub(crate) cpu_time_limit_ms: u64,
 }
 
-/// Reviewed patch-bundle writeback produced from container workspace changes.
+/// Backend-neutral patch-bundle writeback produced from isolated workspace changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DockerPatchBundle {
+pub(crate) struct WorkspacePatchBundle {
     pub(crate) schema_version: u8,
+    pub(crate) backend_id: String,
+    pub(crate) source_manifest: WorkspacePatchBundleSourceManifest,
     pub(crate) reviewed: bool,
     pub(crate) patch_sha256: String,
     pub(crate) file_count: usize,
     pub(crate) files: Vec<String>,
+    pub(crate) touched_paths: Vec<WorkspacePatchBundleTouchedPath>,
+    pub(crate) symlink_guard_result: WorkspacePatchBundleSymlinkGuardResult,
+    pub(crate) binary_file_policy: WorkspacePatchBundleBinaryFilePolicy,
+    pub(crate) conflict_summary: WorkspacePatchBundleConflictSummary,
+    pub(crate) verification_stale_state: WorkspacePatchBundleVerificationState,
+    pub(crate) merge_preview: WorkspacePatchBundleMergePreview,
+    pub(crate) rollback_plan: WorkspacePatchBundleRollbackPlan,
+    pub(crate) checkpoint_pair: WorkspacePatchBundleCheckpointPair,
     pub(crate) redacted_preview: String,
+    #[serde(default, skip_serializing)]
+    pub(crate) patch_document: String,
+}
+
+pub(crate) type DockerPatchBundle = WorkspacePatchBundle;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleSourceManifest {
+    pub(crate) source_kind: String,
+    pub(crate) source_id: String,
+    pub(crate) source_digest_sha256: String,
+    pub(crate) workspace_strategy_digest: String,
+    pub(crate) artifact_transport: String,
+    pub(crate) writeback_mode: String,
+    pub(crate) authoritative_workspace_mutation: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleTouchedPath {
+    pub(crate) path: String,
+    pub(crate) workspace_root_index: usize,
+    pub(crate) operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) moved_from: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleSymlinkGuardResult {
+    pub(crate) checked: bool,
+    pub(crate) status: String,
+    pub(crate) rejected_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleBinaryFilePolicy {
+    pub(crate) mode: String,
+    pub(crate) text_only: bool,
+    pub(crate) rejected_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleConflictSummary {
+    pub(crate) status: String,
+    pub(crate) stale_view_possible: bool,
+    pub(crate) conflicting_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleVerificationState {
+    pub(crate) status: String,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleMergePreview {
+    pub(crate) mode: String,
+    pub(crate) apply_tool: String,
+    pub(crate) dry_run_success: bool,
+    pub(crate) review_required_before_apply: bool,
+    pub(crate) authoritative_workspace_mutation: bool,
+    pub(crate) files_changed: usize,
+    pub(crate) patch_sha256: String,
+    pub(crate) redacted_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleRollbackPlan {
+    pub(crate) mode: String,
+    pub(crate) checkpoint_pair_required: bool,
+    pub(crate) preflight_checkpoint_required: bool,
+    pub(crate) restore_report_required: bool,
+    pub(crate) restore_scope_kind: String,
+    pub(crate) target_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspacePatchBundleCheckpointPair {
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_job_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) preflight_checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) post_change_checkpoint_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_report_id: Option<String>,
 }
 
 /// Result returned by a Docker engine after running a container.
@@ -1854,13 +1954,17 @@ impl DockerEngine for DockerCliEngine {
 struct DockerWorkspaceWritebackCapture {
     original_root: PathBuf,
     temp_workspace: PathBuf,
+    source_manifest: WorkspacePatchBundleSourceManifest,
     tempdir: tempfile::TempDir,
 }
 
 impl DockerWorkspaceWritebackCapture {
     fn finish(self) -> Result<Option<DockerPatchBundle>, DockerEngineError> {
-        let patch_bundle =
-            docker_patch_bundle_from_workspace_diff(&self.original_root, &self.temp_workspace)?;
+        let patch_bundle = docker_patch_bundle_from_workspace_diff(
+            &self.original_root,
+            &self.temp_workspace,
+            self.source_manifest,
+        )?;
         self.tempdir.close().map_err(|error| DockerEngineError {
             reason_code: "docker.cleanup.volume_remove_failed".to_owned(),
             message: format!("failed to remove Docker writeback temp workspace: {error}"),
@@ -1902,11 +2006,13 @@ fn prepare_docker_run_plan(
             let temp_workspace = tempdir.path().join("workspace");
             copy_workspace_tree(canonical_host_path.as_path(), temp_workspace.as_path())?;
             mount.host_path = temp_workspace.display().to_string();
+            let source_manifest = docker_patch_bundle_source_manifest(&run_plan);
             return Ok((
                 run_plan,
                 Some(DockerWorkspaceWritebackCapture {
                     original_root: canonical_host_path,
                     temp_workspace,
+                    source_manifest,
                     tempdir,
                 }),
             ));
@@ -2017,6 +2123,7 @@ struct DockerWorkspaceFileSnapshot {
 fn docker_patch_bundle_from_workspace_diff(
     original_root: &Path,
     mutated_root: &Path,
+    source_manifest: WorkspacePatchBundleSourceManifest,
 ) -> Result<Option<DockerPatchBundle>, DockerEngineError> {
     let before = collect_workspace_file_snapshots(original_root, original_root)?;
     let after = collect_workspace_file_snapshots(mutated_root, mutated_root)?;
@@ -2031,24 +2138,165 @@ fn docker_patch_bundle_from_workspace_diff(
         dry_run: true,
         redaction_policy: redaction_policy.clone(),
     };
-    apply_workspace_patch(&[original_root.to_path_buf()], &request, &limits).map_err(|error| {
-        DockerEngineError {
+    let planned_outcome = apply_workspace_patch(&[original_root.to_path_buf()], &request, &limits)
+        .map_err(|error| DockerEngineError {
             reason_code: "docker.writeback.patch_validation_failed".to_owned(),
             message: format!("generated Docker writeback patch failed dry-run validation: {error}"),
-        }
-    })?;
-    Ok(Some(DockerPatchBundle {
-        schema_version: 1,
-        reviewed: true,
-        patch_sha256: compute_patch_sha256(patch_document.as_str()),
-        file_count: files.len(),
+        })?;
+    Ok(Some(workspace_patch_bundle_from_planned_patch(
+        ExecutionBackendPreference::Docker.as_str(),
+        source_manifest,
+        patch_document,
         files,
-        redacted_preview: redact_patch_preview(
-            patch_document.as_str(),
-            &redaction_policy,
-            limits.max_preview_bytes,
+        &planned_outcome,
+        &redaction_policy,
+        &limits,
+    )))
+}
+
+fn docker_patch_bundle_source_manifest(plan: &DockerRunPlan) -> WorkspacePatchBundleSourceManifest {
+    let source_descriptor = json!({
+        "schema_version": 1,
+        "source_kind": "docker_container_workspace",
+        "source_id": plan.profile_id,
+        "image_digest_sha256": plan.image_digest_sha256,
+        "workspace_strategy_digest": plan.workspace_strategy_digest,
+        "workspace_writeback": plan.workspace_writeback.as_str(),
+        "artifact_transport": "container_patch_bundle_transfer",
+    });
+    WorkspacePatchBundleSourceManifest {
+        source_kind: "docker_container_workspace".to_owned(),
+        source_id: plan.profile_id.clone(),
+        source_digest_sha256: sha256_hex(
+            serde_json::to_vec(&source_descriptor).unwrap_or_default().as_slice(),
         ),
-    }))
+        workspace_strategy_digest: plan.workspace_strategy_digest.clone(),
+        artifact_transport: "container_patch_bundle_transfer".to_owned(),
+        writeback_mode: plan.workspace_writeback.as_str().to_owned(),
+        authoritative_workspace_mutation: false,
+    }
+}
+
+fn workspace_patch_bundle_from_planned_patch(
+    backend_id: &str,
+    source_manifest: WorkspacePatchBundleSourceManifest,
+    patch_document: String,
+    files: Vec<String>,
+    planned_outcome: &WorkspacePatchOutcome,
+    redaction_policy: &WorkspacePatchRedactionPolicy,
+    limits: &WorkspacePatchLimits,
+) -> WorkspacePatchBundle {
+    let patch_sha256 = compute_patch_sha256(patch_document.as_str());
+    let redacted_preview =
+        redact_patch_preview(patch_document.as_str(), redaction_policy, limits.max_preview_bytes);
+    let touched_paths =
+        workspace_patch_bundle_touched_paths(planned_outcome.files_touched.as_slice());
+    let changed_paths = touched_paths
+        .iter()
+        .map(|path| path.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    WorkspacePatchBundle {
+        schema_version: 2,
+        backend_id: backend_id.to_owned(),
+        source_manifest,
+        reviewed: true,
+        patch_sha256: patch_sha256.clone(),
+        file_count: files.len(),
+        files: files.clone(),
+        touched_paths,
+        symlink_guard_result: WorkspacePatchBundleSymlinkGuardResult {
+            checked: true,
+            status: "passed".to_owned(),
+            rejected_paths: Vec::new(),
+        },
+        binary_file_policy: WorkspacePatchBundleBinaryFilePolicy {
+            mode: "reject_binary_text_patch_only".to_owned(),
+            text_only: true,
+            rejected_paths: Vec::new(),
+        },
+        conflict_summary: WorkspacePatchBundleConflictSummary {
+            status: "clean".to_owned(),
+            stale_view_possible: false,
+            conflicting_paths: Vec::new(),
+        },
+        verification_stale_state: WorkspacePatchBundleVerificationState {
+            status: "pending_after_bundle_apply".to_owned(),
+            reason_codes: vec!["verification.pending_after_patch_bundle_apply".to_owned()],
+            changed_paths,
+        },
+        merge_preview: WorkspacePatchBundleMergePreview {
+            mode: "dry_run_apply_patch".to_owned(),
+            apply_tool: "palyra.fs.apply_patch".to_owned(),
+            dry_run_success: true,
+            review_required_before_apply: true,
+            authoritative_workspace_mutation: false,
+            files_changed: files.len(),
+            patch_sha256: patch_sha256.clone(),
+            redacted_preview: redacted_preview.clone(),
+        },
+        rollback_plan: WorkspacePatchBundleRollbackPlan {
+            mode: "workspace_checkpoint_restore".to_owned(),
+            checkpoint_pair_required: true,
+            preflight_checkpoint_required: true,
+            restore_report_required: true,
+            restore_scope_kind: "workspace".to_owned(),
+            target_paths: files,
+        },
+        checkpoint_pair: WorkspacePatchBundleCheckpointPair {
+            status: "required_on_apply".to_owned(),
+            tool_job_ref: None,
+            mutation_id: None,
+            preflight_checkpoint_id: None,
+            post_change_checkpoint_id: None,
+            restore_report_id: None,
+        },
+        redacted_preview,
+        patch_document,
+    }
+}
+
+fn workspace_patch_bundle_touched_paths(
+    files_touched: &[WorkspacePatchFileAttestation],
+) -> Vec<WorkspacePatchBundleTouchedPath> {
+    files_touched
+        .iter()
+        .map(|file| WorkspacePatchBundleTouchedPath {
+            path: file.path.clone(),
+            workspace_root_index: file.workspace_root_index,
+            operation: file.operation.clone(),
+            moved_from: file.moved_from.clone(),
+        })
+        .collect()
+}
+
+fn workspace_patch_bundle_for_tool_job(
+    bundle: &WorkspacePatchBundle,
+    tool_job_ref: &str,
+) -> WorkspacePatchBundle {
+    let mut scoped = bundle.clone();
+    scoped.checkpoint_pair.tool_job_ref = Some(tool_job_ref.to_owned());
+    scoped
+}
+
+fn workspace_patch_bundle_manifest_projection(bundle: &WorkspacePatchBundle) -> serde_json::Value {
+    json!({
+        "schema_version": bundle.schema_version,
+        "backend_id": bundle.backend_id,
+        "source_manifest": bundle.source_manifest,
+        "patch_sha256": bundle.patch_sha256,
+        "file_count": bundle.file_count,
+        "files": bundle.files,
+        "touched_paths": bundle.touched_paths,
+        "symlink_guard_result": bundle.symlink_guard_result,
+        "binary_file_policy": bundle.binary_file_policy,
+        "conflict_summary": bundle.conflict_summary,
+        "verification_stale_state": bundle.verification_stale_state,
+        "merge_preview": bundle.merge_preview,
+        "rollback_plan": bundle.rollback_plan,
+        "checkpoint_pair": bundle.checkpoint_pair,
+    })
 }
 
 fn collect_workspace_file_snapshots(
@@ -2468,6 +2716,10 @@ fn docker_process_run_outcome(
             )
         })
         .ok();
+    let patch_bundle = report
+        .patch_bundle
+        .as_ref()
+        .map(|bundle| workspace_patch_bundle_for_tool_job(bundle, proposal_id));
     let output_manifest = json!({
         "schema_version": 1,
         "profile_id": plan.profile_id,
@@ -2476,7 +2728,8 @@ fn docker_process_run_outcome(
         "stderr_sha256": sha256_hex(report.stderr.as_slice()),
         "workspace_writeback": plan.workspace_writeback.as_str(),
         "cleanup_success": cleanup_success,
-        "patch_bundle_sha256": report.patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
+        "patch_bundle_sha256": patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
+        "patch_bundle": patch_bundle.as_ref().map(workspace_patch_bundle_manifest_projection),
     });
     let output_manifest_sha256 =
         sha256_hex(serde_json::to_vec(&output_manifest).unwrap_or_default().as_slice());
@@ -2503,7 +2756,7 @@ fn docker_process_run_outcome(
         "workspace_writeback": {
             "mode": plan.workspace_writeback.as_str(),
             "authoritative_workspace_mutation": false,
-            "patch_bundle": report.patch_bundle,
+            "patch_bundle": patch_bundle,
         },
         "cleanup": cleanup,
         "output_manifest": output_manifest,
@@ -2849,6 +3102,8 @@ pub(crate) struct SshWorkerRpcResultEnvelope {
     pub(crate) error: Option<String>,
     pub(crate) output_manifest_sha256: String,
     pub(crate) cleanup_report: WorkerCleanupReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) patch_bundle: Option<WorkspacePatchBundle>,
 }
 
 fn worker_cleanup_evidence(
@@ -3240,6 +3495,19 @@ fn ssh_worker_outcome_from_rpc_result(
             profile,
         );
     }
+    if let Some(bundle) = result.patch_bundle.as_ref() {
+        if let Err(message) = validate_remote_workspace_patch_bundle(bundle, request) {
+            return ssh_worker_bundle_contract_error_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                profile,
+                request,
+                &result,
+                message,
+            );
+        }
+    }
     if !result.cleanup_report.is_verified() {
         let cleanup_report = result.cleanup_report.clone();
         let output = json!({
@@ -3276,7 +3544,12 @@ fn ssh_worker_outcome_from_rpc_result(
             manifest,
         );
     }
-    let output_manifest_sha256 = result.output_manifest_sha256.clone();
+    let output_json = ssh_worker_output_json_with_writeback(proposal_id, request, &result);
+    let output_manifest_sha256 =
+        ssh_worker_output_manifest_sha256(request, &result, output_json.as_slice());
+    let trajectory_label =
+        ssh_worker_trajectory_label(profile, request, &result, output_manifest_sha256.as_str());
+    let error = result.error.clone().unwrap_or_default();
     let cleanup_report = result.cleanup_report.clone();
     let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
         backend_id: ExecutionBackendPreference::SshTunnel.as_str(),
@@ -3293,14 +3566,180 @@ fn ssh_worker_outcome_from_rpc_result(
         tool_name,
         input_json,
         result.success,
-        result.output_json.into_bytes(),
-        result.error.unwrap_or_default(),
+        output_json,
+        error,
         false,
         "ssh_tunnel".to_owned(),
-        format!(
-            "ssh_worker_rpc;profile_id={};workspace_strategy_sha256={};output_manifest_sha256={}",
-            profile.profile_id, request.workspace_strategy_digest, output_manifest_sha256
-        ),
+        trajectory_label,
+        manifest,
+    )
+}
+
+fn validate_remote_workspace_patch_bundle(
+    bundle: &WorkspacePatchBundle,
+    request: &SshWorkerRpcRequestEnvelope,
+) -> Result<(), String> {
+    if bundle.schema_version < 2 {
+        return Err("remote patch bundle schema_version must be at least 2".to_owned());
+    }
+    if bundle.backend_id != ExecutionBackendPreference::SshTunnel.as_str()
+        && bundle.backend_id != ExecutionBackendPreference::NetworkedWorker.as_str()
+    {
+        return Err(format!(
+            "remote patch bundle backend_id is unsupported: {}",
+            bundle.backend_id
+        ));
+    }
+    if !bundle.reviewed || !bundle.merge_preview.review_required_before_apply {
+        return Err("remote patch bundle must be marked review-required before apply".to_owned());
+    }
+    if bundle.source_manifest.authoritative_workspace_mutation
+        || bundle.merge_preview.authoritative_workspace_mutation
+    {
+        return Err(
+            "remote patch bundle must not claim direct authoritative workspace mutation".to_owned()
+        );
+    }
+    if bundle.source_manifest.writeback_mode != WorkspaceWritebackMode::PatchBundle.as_str()
+        || request.writeback_mode != WorkspaceWritebackMode::PatchBundle.as_str()
+    {
+        return Err("remote patch bundle writeback_mode must be patch_bundle".to_owned());
+    }
+    if bundle.source_manifest.workspace_strategy_digest != request.workspace_strategy_digest {
+        return Err(
+            "remote patch bundle workspace strategy digest does not match request".to_owned()
+        );
+    }
+    if !bundle.symlink_guard_result.checked || bundle.symlink_guard_result.status != "passed" {
+        return Err("remote patch bundle symlink guard did not pass".to_owned());
+    }
+    if !bundle.binary_file_policy.text_only || !bundle.binary_file_policy.rejected_paths.is_empty()
+    {
+        return Err("remote patch bundle contains unsupported binary file changes".to_owned());
+    }
+    if bundle.conflict_summary.status != "clean" || bundle.conflict_summary.stale_view_possible {
+        return Err("remote patch bundle conflict summary is not clean".to_owned());
+    }
+    if bundle.patch_sha256 != bundle.merge_preview.patch_sha256 {
+        return Err("remote patch bundle merge preview hash does not match patch hash".to_owned());
+    }
+    if bundle.file_count != bundle.files.len() {
+        return Err("remote patch bundle file_count does not match file list".to_owned());
+    }
+    if !bundle.rollback_plan.checkpoint_pair_required
+        || !bundle.rollback_plan.preflight_checkpoint_required
+        || !bundle.rollback_plan.restore_report_required
+    {
+        return Err("remote patch bundle rollback plan must require checkpoint restore".to_owned());
+    }
+    Ok(())
+}
+
+fn ssh_worker_output_json_with_writeback(
+    proposal_id: &str,
+    request: &SshWorkerRpcRequestEnvelope,
+    result: &SshWorkerRpcResultEnvelope,
+) -> Vec<u8> {
+    let Some(bundle) = result.patch_bundle.as_ref() else {
+        return result.output_json.as_bytes().to_vec();
+    };
+    let mut output = match serde_json::from_str::<serde_json::Value>(result.output_json.as_str()) {
+        Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => return result.output_json.as_bytes().to_vec(),
+    };
+    let Some(object) = output.as_object_mut() else {
+        return result.output_json.as_bytes().to_vec();
+    };
+    let tool_job_ref = format!("{proposal_id}:{}", request.request_id);
+    let scoped_bundle = workspace_patch_bundle_for_tool_job(bundle, tool_job_ref.as_str());
+    object.insert(
+        "workspace_writeback".to_owned(),
+        json!({
+            "mode": WorkspaceWritebackMode::PatchBundle.as_str(),
+            "authoritative_workspace_mutation": false,
+            "remote_backend": request.profile_id,
+            "artifact_transport": request.artifact_transport,
+            "patch_bundle": scoped_bundle,
+        }),
+    );
+    serde_json::to_vec(&output).unwrap_or_else(|_| result.output_json.as_bytes().to_vec())
+}
+
+fn ssh_worker_output_manifest_sha256(
+    request: &SshWorkerRpcRequestEnvelope,
+    result: &SshWorkerRpcResultEnvelope,
+    final_output_json: &[u8],
+) -> String {
+    let manifest = json!({
+        "schema_version": 1,
+        "worker_output_manifest_sha256": result.output_manifest_sha256,
+        "worker_output_json_sha256": result.output_json_sha256,
+        "final_output_json_sha256": sha256_hex(final_output_json),
+        "workspace_strategy_digest": request.workspace_strategy_digest,
+        "writeback_mode": request.writeback_mode,
+        "patch_bundle_sha256": result.patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
+        "patch_bundle_source": result.patch_bundle.as_ref().map(|bundle| &bundle.source_manifest),
+    });
+    sha256_hex(serde_json::to_vec(&manifest).unwrap_or_default().as_slice())
+}
+
+fn ssh_worker_trajectory_label(
+    profile: &SshWorkerBackendProfile,
+    request: &SshWorkerRpcRequestEnvelope,
+    result: &SshWorkerRpcResultEnvelope,
+    output_manifest_sha256: &str,
+) -> String {
+    let mut label = format!(
+        "ssh_worker_rpc;profile_id={};workspace_strategy_sha256={};output_manifest_sha256={}",
+        profile.profile_id, request.workspace_strategy_digest, output_manifest_sha256
+    );
+    if let Some(bundle) = result.patch_bundle.as_ref() {
+        label.push_str(";workspace_writeback=patch_bundle;patch_bundle_sha256=");
+        label.push_str(bundle.patch_sha256.as_str());
+    }
+    label
+}
+
+fn ssh_worker_bundle_contract_error_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    profile: &SshWorkerBackendProfile,
+    request: &SshWorkerRpcRequestEnvelope,
+    result: &SshWorkerRpcResultEnvelope,
+    message: String,
+) -> ToolExecutionOutcome {
+    let output = json!({
+        "success": false,
+        "event": "execution_backend.ssh_worker_runner",
+        "status": "patch_bundle_rejected",
+        "backend": ExecutionBackendPreference::SshTunnel.as_str(),
+        "profile_id": profile.profile_id,
+        "protocol": WORKER_REMOTE_TOOL_PROTOCOL,
+        "reason_code": "ssh_worker.patch_bundle.contract_invalid",
+        "repair_hint": "Return a reviewable patch_bundle writeback with no direct authoritative workspace mutation.",
+    });
+    let output_json = serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec());
+    let manifest = execution_attestation_manifest(ExecutionAttestationManifestInput {
+        backend_id: ExecutionBackendPreference::SshTunnel.as_str(),
+        runner_id: "ssh_worker_runner",
+        runner_version: "v1",
+        workspace_strategy_digest: request.workspace_strategy_digest.clone(),
+        input_manifest_sha256: request.input_json_sha256.clone(),
+        output_manifest_sha256: sha256_hex(output_json.as_slice()),
+        cleanup: worker_cleanup_evidence("ssh_worker_rpc_cleanup", &result.cleanup_report),
+        egress_posture: "operator_managed_ssh_tunnel_worker_rpc".to_owned(),
+    });
+    build_tool_execution_outcome_with_manifest(
+        proposal_id,
+        tool_name,
+        input_json,
+        false,
+        output_json,
+        redact_diagnostic_text(message.as_str()),
+        false,
+        "ssh_tunnel".to_owned(),
+        "ssh_worker_rpc_patch_bundle_rejected".to_owned(),
         manifest,
     )
 }
@@ -4186,6 +4625,10 @@ mod tests {
 
     use palyra_common::feature_rollouts::FeatureRolloutSource;
     use palyra_common::runtime_preview::RuntimePreviewMode;
+    use palyra_common::workspace_patch::{
+        apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
+        WorkspacePatchRequest,
+    };
     use palyra_workerd::{
         WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
         WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -4214,16 +4657,20 @@ mod tests {
         validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
         ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
         ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
-        DockerEngineError, DockerEngineFuture, DockerPatchBundle, DockerResourceUsage,
-        DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
-        ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
+        DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
         OperatorManagedSshTunnelTransport, SshWorkerBackendProfile, SshWorkerRpcFuture,
         SshWorkerRpcRequestEnvelope, SshWorkerRpcResultEnvelope, SshWorkerRpcTransport,
-        SshWorkerRunner, StuckToolJobRecoveryAction, WorkspaceStrategyDescriptor,
-        WorkspaceStrategyKind, WorkspaceWritebackMode,
+        SshWorkerRunner, StuckToolJobRecoveryAction, WorkspacePatchBundle,
+        WorkspacePatchBundleBinaryFilePolicy, WorkspacePatchBundleCheckpointPair,
+        WorkspacePatchBundleConflictSummary, WorkspacePatchBundleMergePreview,
+        WorkspacePatchBundleRollbackPlan, WorkspacePatchBundleSourceManifest,
+        WorkspacePatchBundleSymlinkGuardResult, WorkspacePatchBundleTouchedPath,
+        WorkspacePatchBundleVerificationState, WorkspaceStrategyDescriptor, WorkspaceStrategyKind,
+        WorkspaceWritebackMode,
     };
 
     const SAFE_DOCKER_IMAGE: &str =
@@ -4390,6 +4837,94 @@ mod tests {
         }
     }
 
+    fn test_workspace_patch_bundle(
+        backend_id: &str,
+        workspace_strategy_digest: String,
+    ) -> WorkspacePatchBundle {
+        let patch_sha256 =
+            "2222222222222222222222222222222222222222222222222222222222222222".to_owned();
+        WorkspacePatchBundle {
+            schema_version: 2,
+            backend_id: backend_id.to_owned(),
+            source_manifest: WorkspacePatchBundleSourceManifest {
+                source_kind: format!("{backend_id}_workspace"),
+                source_id: "test-source".to_owned(),
+                source_digest_sha256:
+                    "3333333333333333333333333333333333333333333333333333333333333333".to_owned(),
+                workspace_strategy_digest,
+                artifact_transport: "test_patch_bundle_transfer".to_owned(),
+                writeback_mode: WorkspaceWritebackMode::PatchBundle.as_str().to_owned(),
+                authoritative_workspace_mutation: false,
+            },
+            reviewed: true,
+            patch_sha256: patch_sha256.clone(),
+            file_count: 2,
+            files: vec!["a.txt".to_owned(), "b.txt".to_owned()],
+            touched_paths: vec![
+                WorkspacePatchBundleTouchedPath {
+                    path: "a.txt".to_owned(),
+                    workspace_root_index: 0,
+                    operation: "replace".to_owned(),
+                    moved_from: None,
+                },
+                WorkspacePatchBundleTouchedPath {
+                    path: "b.txt".to_owned(),
+                    workspace_root_index: 0,
+                    operation: "create".to_owned(),
+                    moved_from: None,
+                },
+            ],
+            symlink_guard_result: WorkspacePatchBundleSymlinkGuardResult {
+                checked: true,
+                status: "passed".to_owned(),
+                rejected_paths: Vec::new(),
+            },
+            binary_file_policy: WorkspacePatchBundleBinaryFilePolicy {
+                mode: "reject_binary_text_patch_only".to_owned(),
+                text_only: true,
+                rejected_paths: Vec::new(),
+            },
+            conflict_summary: WorkspacePatchBundleConflictSummary {
+                status: "clean".to_owned(),
+                stale_view_possible: false,
+                conflicting_paths: Vec::new(),
+            },
+            verification_stale_state: WorkspacePatchBundleVerificationState {
+                status: "pending_after_bundle_apply".to_owned(),
+                reason_codes: vec!["verification.pending_after_patch_bundle_apply".to_owned()],
+                changed_paths: vec!["a.txt".to_owned(), "b.txt".to_owned()],
+            },
+            merge_preview: WorkspacePatchBundleMergePreview {
+                mode: "dry_run_apply_patch".to_owned(),
+                apply_tool: "palyra.fs.apply_patch".to_owned(),
+                dry_run_success: true,
+                review_required_before_apply: true,
+                authoritative_workspace_mutation: false,
+                files_changed: 2,
+                patch_sha256: patch_sha256.clone(),
+                redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
+            },
+            rollback_plan: WorkspacePatchBundleRollbackPlan {
+                mode: "workspace_checkpoint_restore".to_owned(),
+                checkpoint_pair_required: true,
+                preflight_checkpoint_required: true,
+                restore_report_required: true,
+                restore_scope_kind: "workspace".to_owned(),
+                target_paths: vec!["a.txt".to_owned(), "b.txt".to_owned()],
+            },
+            checkpoint_pair: WorkspacePatchBundleCheckpointPair {
+                status: "required_on_apply".to_owned(),
+                tool_job_ref: None,
+                mutation_id: None,
+                preflight_checkpoint_id: None,
+                post_change_checkpoint_id: None,
+                restore_report_id: None,
+            },
+            redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
+            patch_document: String::new(),
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct FakeDockerEngine {
         result: Result<DockerRunReport, DockerEngineError>,
@@ -4420,6 +4955,7 @@ mod tests {
     struct FakeSshWorkerTransport {
         requests: Arc<Mutex<Vec<SshWorkerRpcRequestEnvelope>>>,
         result_json: serde_json::Value,
+        patch_bundle: Option<WorkspacePatchBundle>,
     }
 
     impl FakeSshWorkerTransport {
@@ -4427,7 +4963,22 @@ mod tests {
             result_json: serde_json::Value,
         ) -> (Self, Arc<Mutex<Vec<SshWorkerRpcRequestEnvelope>>>) {
             let requests = Arc::new(Mutex::new(Vec::new()));
-            (Self { requests: Arc::clone(&requests), result_json }, requests)
+            (Self { requests: Arc::clone(&requests), result_json, patch_bundle: None }, requests)
+        }
+
+        fn new_with_patch_bundle(
+            result_json: serde_json::Value,
+            patch_bundle: WorkspacePatchBundle,
+        ) -> (Self, Arc<Mutex<Vec<SshWorkerRpcRequestEnvelope>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    requests: Arc::clone(&requests),
+                    result_json,
+                    patch_bundle: Some(patch_bundle),
+                },
+                requests,
+            )
         }
     }
 
@@ -4448,6 +4999,7 @@ mod tests {
         ) -> SshWorkerRpcFuture<'a> {
             let requests = Arc::clone(&self.requests);
             let result_json = self.result_json.clone();
+            let patch_bundle = self.patch_bundle.clone();
             Box::pin(async move {
                 requests.lock().expect("fake ssh requests").push(request.clone());
                 let output_json =
@@ -4467,6 +5019,7 @@ mod tests {
                         removed_logs: true,
                         failure_reason: None,
                     },
+                    patch_bundle,
                 })
             })
         }
@@ -4725,10 +5278,81 @@ mod tests {
             "host workspace must not be mutated by Docker writeback capture"
         );
         assert_eq!(bundle.file_count, 2);
+        assert_eq!(bundle.schema_version, 2);
+        assert_eq!(bundle.backend_id, "docker");
+        assert!(bundle.reviewed);
+        assert_eq!(bundle.source_manifest.writeback_mode, "patch_bundle");
+        assert!(!bundle.source_manifest.authoritative_workspace_mutation);
+        assert!(bundle.symlink_guard_result.checked);
+        assert_eq!(bundle.symlink_guard_result.status, "passed");
+        assert!(bundle.binary_file_policy.text_only);
+        assert_eq!(bundle.conflict_summary.status, "clean");
+        assert_eq!(bundle.verification_stale_state.status, "pending_after_bundle_apply");
+        assert_eq!(bundle.merge_preview.mode, "dry_run_apply_patch");
+        assert!(bundle.merge_preview.review_required_before_apply);
+        assert!(!bundle.merge_preview.authoritative_workspace_mutation);
+        assert_eq!(bundle.rollback_plan.mode, "workspace_checkpoint_restore");
+        assert!(bundle.rollback_plan.checkpoint_pair_required);
+        assert!(bundle.rollback_plan.restore_report_required);
+        assert_eq!(bundle.checkpoint_pair.status, "required_on_apply");
         assert!(bundle.files.iter().any(|path| path == "notes.txt"));
         assert!(bundle.files.iter().any(|path| path == "new.txt"));
+        assert!(bundle.touched_paths.iter().any(|path| path.path == "notes.txt"));
+        assert_eq!(bundle.patch_sha256, bundle.merge_preview.patch_sha256);
+        assert_eq!(bundle.patch_sha256, sha256_hex(bundle.patch_document.as_bytes()));
         assert!(bundle.redacted_preview.contains("*** Replace File: notes.txt"));
         assert!(bundle.redacted_preview.contains("*** Add File: new.txt"));
+
+        let dry_run = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &WorkspacePatchRequest {
+                patch: bundle.patch_document.clone(),
+                dry_run: true,
+                redaction_policy: WorkspacePatchRedactionPolicy::default(),
+            },
+            &WorkspacePatchLimits::default(),
+        )
+        .expect("captured patch bundle should dry-run apply to authoritative workspace");
+        assert_eq!(dry_run.files_touched.len(), 2);
+        assert_eq!(dry_run.patch_sha256, bundle.patch_sha256);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_writeback_capture_rejects_symlink_paths() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.as_path()).expect("workspace should exist");
+        fs::write(workspace.join("target.txt"), "alpha\n").expect("seed file should be written");
+        std::os::unix::fs::symlink("target.txt", workspace.join("link.txt"))
+            .expect("symlink should be created");
+        let mut profile = safe_container_profile();
+        profile.mounts[0].host_path = workspace.display().to_string();
+        let plan = DockerRunPlan {
+            profile_id: profile.profile_id,
+            image: profile.image,
+            image_digest_sha256: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_owned(),
+            workspace_strategy_digest: WorkspaceStrategyDescriptor::container_volume()
+                .attestation_digest_sha256(),
+            user: profile.user,
+            readonly_rootfs: profile.readonly_rootfs,
+            network: profile.network,
+            mounts: profile.mounts,
+            env: profile.env,
+            command: "echo".to_owned(),
+            args: vec!["runner-ok".to_owned()],
+            working_dir: "/workspace".to_owned(),
+            limits: profile.limits,
+            workspace_writeback: WorkspaceWritebackMode::PatchBundle,
+            cleanup_strategy: profile.cleanup_strategy,
+        };
+
+        let error = prepare_docker_run_plan(&plan)
+            .expect_err("symlink paths must be rejected before Docker writeback starts");
+
+        assert_eq!(error.reason_code, "docker.writeback.symlink_unsupported");
+        assert!(error.message.contains("link.txt"), "{}", error.message);
     }
 
     #[tokio::test]
@@ -4871,15 +5495,10 @@ mod tests {
     #[tokio::test]
     async fn docker_runner_output_carries_reviewed_patch_bundle_writeback() {
         let mut report = docker_report_success();
-        report.patch_bundle = Some(DockerPatchBundle {
-            schema_version: 1,
-            reviewed: true,
-            patch_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
-                .to_owned(),
-            file_count: 2,
-            files: vec!["a.txt".to_owned(), "b.txt".to_owned()],
-            redacted_preview: "*** Begin Patch\n*** End Patch\n".to_owned(),
-        });
+        report.patch_bundle = Some(test_workspace_patch_bundle(
+            ExecutionBackendPreference::Docker.as_str(),
+            WorkspaceStrategyDescriptor::container_volume().attestation_digest_sha256(),
+        ));
         let (engine, _) = FakeDockerEngine::new(Ok(report));
         let runner = DockerRunner::new(safe_container_profile(), engine)
             .expect("safe Docker profile should build runner");
@@ -4907,6 +5526,20 @@ mod tests {
         );
         assert_eq!(payload["workspace_writeback"]["patch_bundle"]["reviewed"], true);
         assert_eq!(payload["workspace_writeback"]["patch_bundle"]["file_count"], 2);
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["merge_preview"]
+                ["review_required_before_apply"],
+            true
+        );
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["rollback_plan"]
+                ["restore_report_required"],
+            true
+        );
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["checkpoint_pair"]["tool_job_ref"],
+            "proposal-docker-patch"
+        );
     }
 
     #[tokio::test]
@@ -5006,6 +5639,111 @@ mod tests {
         assert!(!serde_json::to_string(request)
             .expect("request should serialize")
             .contains("vault://ssh/key"));
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_projects_remote_patch_bundle_for_review() {
+        let workspace_strategy_digest =
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256();
+        let patch_bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            workspace_strategy_digest.clone(),
+        );
+        let (transport, requests) = FakeSshWorkerTransport::new_with_patch_bundle(
+            serde_json::json!({"exit_code": 0, "stdout": "runner-ok\n"}),
+            patch_bundle,
+        );
+        let runner = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-patch",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        assert!(outcome
+            .attestation
+            .sandbox_enforcement
+            .contains("workspace_writeback=patch_bundle"));
+        assert!(outcome.attestation.sandbox_enforcement.contains("patch_bundle_sha256="));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("SSH worker output should be JSON");
+        assert_eq!(payload["workspace_writeback"]["mode"], "patch_bundle");
+        assert_eq!(payload["workspace_writeback"]["authoritative_workspace_mutation"], false);
+        assert_eq!(payload["workspace_writeback"]["patch_bundle"]["backend_id"], "ssh_tunnel");
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["source_manifest"]["writeback_mode"],
+            "patch_bundle"
+        );
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["merge_preview"]
+                ["review_required_before_apply"],
+            true
+        );
+        assert_eq!(
+            payload["workspace_writeback"]["patch_bundle"]["checkpoint_pair"]["tool_job_ref"],
+            format!(
+                "proposal-ssh-patch:{}",
+                requests.lock().expect("fake SSH requests")[0].request_id
+            )
+        );
+        let manifest = outcome
+            .attestation
+            .execution_manifest
+            .as_ref()
+            .expect("SSH worker outcome should carry an execution manifest");
+        assert_eq!(manifest.workspace_strategy_digest, workspace_strategy_digest);
+        assert_ne!(manifest.output_manifest_sha256, sha256_hex(b"ssh-worker-output-manifest"));
+
+        let requests = requests.lock().expect("fake SSH requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].writeback_mode, "patch_bundle");
+    }
+
+    #[tokio::test]
+    async fn ssh_worker_runner_rejects_direct_remote_workspace_mutation() {
+        let mut patch_bundle = test_workspace_patch_bundle(
+            ExecutionBackendPreference::SshTunnel.as_str(),
+            WorkspaceStrategyDescriptor::remote_lease_workspace().attestation_digest_sha256(),
+        );
+        patch_bundle.source_manifest.authoritative_workspace_mutation = true;
+        let (transport, _) = FakeSshWorkerTransport::new_with_patch_bundle(
+            serde_json::json!({"exit_code": 0, "stdout": "runner-ok\n"}),
+            patch_bundle,
+        );
+        let runner = SshWorkerRunner::new(safe_ssh_worker_profile(), transport)
+            .expect("safe SSH worker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-ssh-direct-mutation",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(!outcome.success);
+        assert!(outcome.error.contains("direct authoritative workspace mutation"));
+        assert_eq!(outcome.attestation.sandbox_enforcement, "ssh_worker_rpc_patch_bundle_rejected");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("SSH worker output should be JSON");
+        assert_eq!(payload["reason_code"], "ssh_worker.patch_bundle.contract_invalid");
     }
 
     #[tokio::test]
