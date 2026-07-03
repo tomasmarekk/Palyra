@@ -1385,6 +1385,10 @@ fn process_run_verification_output_summary(
     outcome: &ToolExecutionOutcome,
 ) -> crate::application::verification::VerificationOutputSummary {
     let payload = serde_json::from_slice::<Value>(outcome.output_json.as_slice()).ok();
+    let failure_class = payload
+        .as_ref()
+        .and_then(process_run_failure_class_from_output)
+        .filter(|value| !value.trim().is_empty());
     let stdout_tail = payload
         .as_ref()
         .and_then(|value| value.pointer("/streams/stdout/tail"))
@@ -1397,7 +1401,14 @@ fn process_run_verification_output_summary(
         .unwrap_or_default();
     let mut summary = String::new();
     let mut redacted_by_summary = false;
+    if let Some(failure_class) = failure_class {
+        summary.push_str("failure_class: ");
+        summary.push_str(failure_class);
+    }
     if !stdout_tail.trim().is_empty() {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
         let trimmed = stdout_tail.trim();
         let redacted_tail = redact_diagnostic_text(trimmed);
         redacted_by_summary |= redacted_tail != trimmed;
@@ -1434,6 +1445,13 @@ fn process_run_verification_output_summary(
         redacted,
         process_run_output_artifact_refs(payload.as_ref()),
     )
+}
+
+fn process_run_failure_class_from_output(payload: &Value) -> Option<&str> {
+    payload
+        .get("failure_class")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/model_summary/failure_class").and_then(Value::as_str))
 }
 
 fn process_run_verification_evidence_refs(

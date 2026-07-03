@@ -302,6 +302,235 @@ pub enum SandboxProcessRunErrorKind {
     RuntimeFailure,
 }
 
+/// Stable model-visible failure classes for `palyra.process.run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessFailureClass {
+    Disabled,
+    InvalidInput,
+    CommandNotFound,
+    PermissionDenied,
+    TimedOut,
+    Killed,
+    NonzeroExit,
+    OutputLimit,
+    SandboxDenied,
+    EgressDenied,
+    UnsupportedPlatform,
+    RuntimeFailure,
+}
+
+impl ProcessFailureClass {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::InvalidInput => "invalid_input",
+            Self::CommandNotFound => "command_not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::TimedOut => "timed_out",
+            Self::Killed => "killed",
+            Self::NonzeroExit => "nonzero_exit",
+            Self::OutputLimit => "output_limit",
+            Self::SandboxDenied => "sandbox_denied",
+            Self::EgressDenied => "egress_denied",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::RuntimeFailure => "runtime_failure",
+        }
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Disabled => "process.failure.disabled",
+            Self::InvalidInput => "process.failure.invalid_input",
+            Self::CommandNotFound => "process.failure.command_not_found",
+            Self::PermissionDenied => "process.failure.permission_denied",
+            Self::TimedOut => "process.failure.timed_out",
+            Self::Killed => "process.failure.killed",
+            Self::NonzeroExit => "process.failure.nonzero_exit",
+            Self::OutputLimit => "process.failure.output_limit",
+            Self::SandboxDenied => "process.failure.sandbox_denied",
+            Self::EgressDenied => "process.failure.egress_denied",
+            Self::UnsupportedPlatform => "process.failure.unsupported_platform",
+            Self::RuntimeFailure => "process.failure.runtime_failure",
+        }
+    }
+
+    const fn summary(self) -> &'static str {
+        match self {
+            Self::Disabled => "process runner is disabled by runtime policy",
+            Self::InvalidInput => "process request failed schema or safety validation",
+            Self::CommandNotFound => "the executable was not found on the daemon process path",
+            Self::PermissionDenied => {
+                "the operating system denied permission to start the executable"
+            }
+            Self::TimedOut => "the process exceeded its configured timeout and was terminated",
+            Self::Killed => {
+                "the process was terminated by cancellation or signal before successful exit"
+            }
+            Self::NonzeroExit => "the process ran and returned a non-zero exit code",
+            Self::OutputLimit => "the process exceeded its bounded stdout/stderr capture budget",
+            Self::SandboxDenied => "sandbox policy denied the process request before execution",
+            Self::EgressDenied => "egress policy denied the process request before execution",
+            Self::UnsupportedPlatform => {
+                "the selected platform cannot provide the required enforcement"
+            }
+            Self::RuntimeFailure => "the process runner failed outside a more specific class",
+        }
+    }
+
+    const fn repair_hint(self) -> &'static str {
+        match self {
+            Self::Disabled => "enable tool_call.process_runner and allowlist palyra.process.run before retrying",
+            Self::InvalidInput => "fix the process.run JSON shape, path, lifetime, or interaction flags before retrying",
+            Self::CommandNotFound => "install the executable on the daemon PATH, use an allowed exact path, or provide a trusted prepend_path",
+            Self::PermissionDenied => "fix file permissions or choose an executable the daemon user can run",
+            Self::TimedOut => "for tests/builds, fix the hang or increase timeout_ms; for servers, use background=true and stop the returned handle",
+            Self::Killed => "inspect cancellation/signal cause and rerun only if the process tree can complete within the run lifecycle",
+            Self::NonzeroExit => "inspect the redacted stdout/stderr tail, fix the command or inputs, then rerun",
+            Self::OutputLimit => "rerun with narrower output, redirect verbose logs to a file, or raise max_output_bytes by policy",
+            Self::SandboxDenied => "keep paths and executables inside the configured workspace/policy or adjust the policy explicitly",
+            Self::EgressDenied => "declare allowed requested_egress_hosts or use an offline command",
+            Self::UnsupportedPlatform => "select a supported runner/backend or change policy to a mode the platform can enforce",
+            Self::RuntimeFailure => "inspect the error and retry only after the underlying runtime issue is fixed",
+        }
+    }
+
+    const fn cleanup_status(self) -> &'static str {
+        match self {
+            Self::TimedOut | Self::Killed | Self::OutputLimit => "process_tree_terminated",
+            Self::NonzeroExit | Self::RuntimeFailure => "process_reaped_or_not_started",
+            _ => "process_not_started",
+        }
+    }
+}
+
+impl SandboxProcessRunErrorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::Cancelled => "cancelled",
+            Self::InvalidInput => "invalid_input",
+            Self::WorkspaceScopeDenied => "workspace_scope_denied",
+            Self::EgressDenied => "egress_denied",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::TimedOut => "timed_out",
+            Self::SpawnFailed => "spawn_failed",
+            Self::RuntimeFailure => "runtime_failure",
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn process_failure_class(error: &SandboxProcessRunError) -> ProcessFailureClass {
+    if let Some(class) = process_failure_class_from_message(error.message.as_str()) {
+        return class;
+    }
+    match error.kind {
+        SandboxProcessRunErrorKind::Disabled => ProcessFailureClass::Disabled,
+        SandboxProcessRunErrorKind::UnsupportedPlatform => ProcessFailureClass::UnsupportedPlatform,
+        SandboxProcessRunErrorKind::Cancelled => ProcessFailureClass::Killed,
+        SandboxProcessRunErrorKind::InvalidInput => ProcessFailureClass::InvalidInput,
+        SandboxProcessRunErrorKind::WorkspaceScopeDenied => ProcessFailureClass::SandboxDenied,
+        SandboxProcessRunErrorKind::EgressDenied => ProcessFailureClass::EgressDenied,
+        SandboxProcessRunErrorKind::QuotaExceeded => ProcessFailureClass::OutputLimit,
+        SandboxProcessRunErrorKind::TimedOut => ProcessFailureClass::TimedOut,
+        SandboxProcessRunErrorKind::SpawnFailed => classify_spawn_failure_message(&error.message),
+        SandboxProcessRunErrorKind::RuntimeFailure => ProcessFailureClass::RuntimeFailure,
+    }
+}
+
+#[must_use]
+pub(crate) fn process_failure_output_json(
+    error: &SandboxProcessRunError,
+    executor: &str,
+    sandbox_enforcement: &str,
+) -> Vec<u8> {
+    let failure_class = process_failure_class(error);
+    let payload = json!({
+        "success": false,
+        "schema_version": 2,
+        "tool": "palyra.process.run",
+        "failure_class": failure_class.as_str(),
+        "failure_reason_code": failure_class.reason_code(),
+        "error": error.message.as_str(),
+        "recovery_hint": failure_class.repair_hint(),
+        "timed_out": matches!(failure_class, ProcessFailureClass::TimedOut),
+        "executor": executor,
+        "sandbox_enforcement": sandbox_enforcement,
+        "model_summary": {
+            "failure_class": failure_class.as_str(),
+            "summary": failure_class.summary(),
+            "repair_hint": failure_class.repair_hint(),
+        },
+        "audit_detail": {
+            "error_kind": error.kind.as_str(),
+            "message": error.message.as_str(),
+        },
+        "cleanup_policy": {
+            "strategy": "local_sandbox_process_lifecycle",
+            "status": failure_class.cleanup_status(),
+        },
+    });
+    serde_json::to_vec(&payload)
+        .unwrap_or_else(|_| br#"{"success":false,"failure_class":"runtime_failure"}"#.to_vec())
+}
+
+fn process_failure_class_from_message(message: &str) -> Option<ProcessFailureClass> {
+    let class = message
+        .split(|character: char| character.is_whitespace() || character == ',' || character == ')')
+        .find_map(|token| {
+            token
+                .trim_matches(|character| matches!(character, '(' | ':' | ';'))
+                .strip_prefix("failure_class=")
+        })?;
+    process_failure_class_from_str(class)
+}
+
+fn process_failure_class_from_str(value: &str) -> Option<ProcessFailureClass> {
+    match value {
+        "disabled" => Some(ProcessFailureClass::Disabled),
+        "invalid_input" => Some(ProcessFailureClass::InvalidInput),
+        "command_not_found" => Some(ProcessFailureClass::CommandNotFound),
+        "permission_denied" => Some(ProcessFailureClass::PermissionDenied),
+        "timed_out" => Some(ProcessFailureClass::TimedOut),
+        "killed" => Some(ProcessFailureClass::Killed),
+        "nonzero_exit" => Some(ProcessFailureClass::NonzeroExit),
+        "output_limit" => Some(ProcessFailureClass::OutputLimit),
+        "sandbox_denied" => Some(ProcessFailureClass::SandboxDenied),
+        "egress_denied" => Some(ProcessFailureClass::EgressDenied),
+        "unsupported_platform" => Some(ProcessFailureClass::UnsupportedPlatform),
+        "runtime_failure" => Some(ProcessFailureClass::RuntimeFailure),
+        _ => None,
+    }
+}
+
+fn process_spawn_failure_class(error: &io::Error) -> ProcessFailureClass {
+    match error.kind() {
+        io::ErrorKind::NotFound => ProcessFailureClass::CommandNotFound,
+        io::ErrorKind::PermissionDenied => ProcessFailureClass::PermissionDenied,
+        _ => ProcessFailureClass::RuntimeFailure,
+    }
+}
+
+fn classify_spawn_failure_message(message: &str) -> ProcessFailureClass {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("no such file") {
+        ProcessFailureClass::CommandNotFound
+    } else if lower.contains("permission denied") || lower.contains("access is denied") {
+        ProcessFailureClass::PermissionDenied
+    } else {
+        ProcessFailureClass::RuntimeFailure
+    }
+}
+
+fn process_exit_failure_class(status: ExitStatus) -> ProcessFailureClass {
+    if status.code().is_none() {
+        return ProcessFailureClass::Killed;
+    }
+    ProcessFailureClass::NonzeroExit
+}
+
 /// Returns the stable executor label for telemetry: `host_process` for host path access, the
 /// backend-specific `sandbox_tier_c_*` name for tier C, and `sandbox_tier_b` otherwise.
 #[must_use]
@@ -1119,9 +1348,11 @@ pub fn run_constrained_process_with_cancellation_and_progress(
         });
     }
     if !capture.exit_status.success() {
+        let failure_class = process_exit_failure_class(capture.exit_status);
         return Err(SandboxProcessRunError {
             kind: SandboxProcessRunErrorKind::RuntimeFailure,
             message: process_failure_message(
+                failure_class,
                 capture.exit_status.code().unwrap_or(-1),
                 &capture.stdout,
                 &capture.stderr,
@@ -1150,6 +1381,7 @@ pub fn run_constrained_process_with_cancellation_and_progress(
 }
 
 fn process_failure_message(
+    failure_class: ProcessFailureClass,
     exit_code: i32,
     stdout: &StreamCapture,
     stderr: &StreamCapture,
@@ -1170,7 +1402,8 @@ fn process_failure_message(
         .map(|hint| format!(", hint={hint:?}"))
         .unwrap_or_default();
     format!(
-        "sandbox process exited unsuccessfully (code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{}{}{})",
+        "sandbox process exited unsuccessfully (failure_class={}, code={exit_code}, stdout_bytes={}, stdout_truncated={}, stderr_bytes={}, stderr_truncated={}{}{}{}{}{})",
+        failure_class.as_str(),
         stdout.bytes.len(),
         stdout.truncated,
         stderr.bytes.len(),
@@ -5639,12 +5872,14 @@ fn process_spawn_failed_message(
 ) -> String {
     let prepend_path_state =
         if input.prepend_path.is_empty() { "not_provided" } else { "provided" };
+    let failure_class = process_spawn_failure_class(error);
     format!(
-        "sandbox process spawn failed for command '{}': {error}. Runtime={}. \
+        "sandbox process spawn failed for command '{}' (failure_class={}): {error}. Runtime={}. \
         Lookup used cwd='{}', prepend_path={prepend_path_state}, and the daemon sanitized PATH, \
         not the interactive shell PATH. Install the executable on the trusted process-runner PATH \
         or use an exact executable path allowed by process_runner.allowed_executables.",
         input.command,
+        failure_class.as_str(),
         process_runner_executor_name(policy),
         cwd.display()
     )
@@ -5905,6 +6140,7 @@ fn spawn_background_process(
         },
         "cleanup": cleanup,
         "handoff": handoff,
+        "verification_hint": background_verification_hint(ports.as_slice(), durable_handoff),
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
         "process_risk": process_risk,
@@ -6005,8 +6241,26 @@ fn background_handoff_metadata(
         "auto_kill_after_ms": lifetime_ms,
         "max_lifetime_ms": max_lifetime_ms,
         "run_cleanup_behavior": "not_registered_for_terminal_run_cleanup",
+        "verification_hint": background_verification_hint(ports, true),
         "handoff_note": "This detached process may remain alive after the final answer; include the stop_command and any verified URL/port in the final answer."
     })
+}
+
+fn background_verification_hint(ports: &[u16], durable_handoff: bool) -> &'static str {
+    match (ports.is_empty(), durable_handoff) {
+        (true, true) => {
+            "No port was inferred; explicitly probe the service readiness before handoff and include cleanup.stop_command."
+        }
+        (false, true) => {
+            "Probe the inferred port before final handoff and include cleanup.stop_command with the verified URL."
+        }
+        (true, false) => {
+            "No port was inferred; use an explicit probe before relying on this run-owned background process."
+        }
+        (false, false) => {
+            "Probe the inferred port before browser or API verification; this process is run-owned and will be cleaned up automatically."
+        }
+    }
 }
 
 fn redacted_process_start_command(input: &ProcessRunnerInput) -> Value {
@@ -6233,10 +6487,12 @@ fn background_process_startup_failure(
     stdout: &StreamCapture,
     stderr: &StreamCapture,
 ) -> SandboxProcessRunError {
+    let failure_class = process_exit_failure_class(status);
     SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!(
-            "sandbox background process exited before startup check (code={}) for command '{}'{}{}; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
+            "sandbox background process exited before startup check (failure_class={}, code={}) for command '{}'{}{}; use the cwd field instead of command-line cwd flags, verify the server command, and probe the expected port before browser navigation",
+            failure_class.as_str(),
             status.code().unwrap_or(-1),
             input.command,
             redacted_process_output_preview(stdout.bytes.as_slice())
@@ -11787,6 +12043,16 @@ mod tests {
             output.pointer("/handoff/stop_command/command").and_then(serde_json::Value::as_str),
             Some("palyra.process.stop")
         );
+        assert!(output
+            .get("verification_hint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("Probe the inferred port"));
+        assert!(output
+            .pointer("/handoff/verification_hint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .contains("cleanup.stop_command"));
         assert_eq!(
             output
                 .pointer("/background_risk_posture/detached_handoff_requested")
@@ -13536,8 +13802,10 @@ mod tests {
             read_error: None,
         };
 
-        let message = process_failure_message(1, &stdout, &stderr);
+        let message =
+            process_failure_message(super::ProcessFailureClass::NonzeroExit, 1, &stdout, &stderr);
 
+        assert!(message.contains("failure_class=nonzero_exit"), "{message}");
         assert!(message.contains("stdout_bytes="), "{message}");
         assert!(message.contains("stderr_bytes="), "{message}");
         assert!(message.contains("stdout_preview="), "{message}");
@@ -13557,7 +13825,8 @@ mod tests {
         );
         let stderr = StreamCapture { bytes: stderr, truncated: false, read_error: None };
 
-        let message = process_failure_message(101, &stdout, &stderr);
+        let message =
+            process_failure_message(super::ProcessFailureClass::NonzeroExit, 101, &stdout, &stderr);
 
         assert!(message.contains("stderr_preview="), "{message}");
         assert!(message.contains("stderr_tail="), "{message}");
@@ -13576,7 +13845,8 @@ mod tests {
             read_error: None,
         };
 
-        let message = process_failure_message(1, &stdout, &stderr);
+        let message =
+            process_failure_message(super::ProcessFailureClass::NonzeroExit, 1, &stdout, &stderr);
 
         assert!(message.contains("WSL reports no installed Linux distributions"), "{message}");
         assert!(message.contains("command='pwsh'"), "{message}");
@@ -14120,10 +14390,64 @@ mod tests {
             super::process_spawn_failed_message(&policy, &input, workspace.as_path(), &error);
 
         assert!(message.contains("Runtime=sandbox_tier_b"));
+        assert!(message.contains("failure_class=command_not_found"));
         assert!(message.contains("prepend_path=not_provided"));
         assert!(message.contains("daemon sanitized PATH"));
         assert!(message.contains("not the interactive shell PATH"));
         assert!(message.contains("process_runner.allowed_executables"));
+    }
+
+    #[test]
+    fn process_failure_output_json_classifies_actionable_failures() {
+        let timeout = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::TimedOut,
+            message: "sandbox process timed out".to_owned(),
+        };
+        let timeout_output: serde_json::Value = serde_json::from_slice(
+            super::process_failure_output_json(&timeout, "sandbox_tier_b", "workspace_only")
+                .as_slice(),
+        )
+        .expect("timeout failure output should parse");
+        assert_eq!(timeout_output["failure_class"], "timed_out");
+        assert_eq!(timeout_output["cleanup_policy"]["status"], "process_tree_terminated");
+
+        let denied = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::WorkspaceScopeDenied,
+            message: "sandbox denied workspace escape".to_owned(),
+        };
+        assert_eq!(
+            super::process_failure_class(&denied),
+            super::ProcessFailureClass::SandboxDenied
+        );
+        let egress = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::EgressDenied,
+            message: "egress denied".to_owned(),
+        };
+        assert_eq!(super::process_failure_class(&egress), super::ProcessFailureClass::EgressDenied);
+        let output_limit = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::QuotaExceeded,
+            message: "output quota exceeded".to_owned(),
+        };
+        assert_eq!(
+            super::process_failure_class(&output_limit),
+            super::ProcessFailureClass::OutputLimit
+        );
+        let killed = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::Cancelled,
+            message: "process cancelled".to_owned(),
+        };
+        assert_eq!(super::process_failure_class(&killed), super::ProcessFailureClass::Killed);
+
+        let spawn = super::SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::SpawnFailed,
+            message:
+                "sandbox process spawn failed (failure_class=permission_denied): access is denied"
+                    .to_owned(),
+        };
+        assert_eq!(
+            super::process_failure_class(&spawn),
+            super::ProcessFailureClass::PermissionDenied
+        );
     }
 
     #[test]

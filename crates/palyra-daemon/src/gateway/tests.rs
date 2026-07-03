@@ -1391,6 +1391,25 @@ fn process_run_verification_summary_redacts_error_fallback() {
 }
 
 #[test]
+fn process_run_verification_summary_includes_failure_class() {
+    let outcome = cleanup_test_tool_outcome(
+        false,
+        json!({
+            "success": false,
+            "failure_class": "output_limit",
+            "model_summary": {
+                "failure_class": "output_limit"
+            }
+        }),
+    );
+
+    let summary = process_run_verification_output_summary(&outcome);
+
+    assert!(summary.text.contains("failure_class: output_limit"));
+    assert!(!summary.redacted);
+}
+
+#[test]
 fn process_run_verification_status_maps_attested_timeout() {
     let mut outcome = cleanup_test_tool_outcome(false, json!({}));
     outcome.attestation.timed_out = true;

@@ -50,6 +50,7 @@ pub(crate) enum VerificationKind {
     Build,
     Check,
     Format,
+    Inspect,
     Lint,
     Test,
     Typecheck,
@@ -62,6 +63,7 @@ impl VerificationKind {
             Self::Build => "build",
             Self::Check => "check",
             Self::Format => "format",
+            Self::Inspect => "inspect",
             Self::Lint => "lint",
             Self::Test => "test",
             Self::Typecheck => "typecheck",
@@ -267,7 +269,8 @@ impl VerificationCommandClassifier {
             canonical_command.executable.as_str(),
             classification_args.as_slice(),
         );
-        let is_verification = kind != VerificationKind::Unknown;
+        let is_verification =
+            !matches!(kind, VerificationKind::Inspect | VerificationKind::Unknown);
         let mut reason_codes = BTreeSet::new();
         reason_codes.insert(VerificationReasonCode::CommandClassified);
         if is_verification {
@@ -1010,6 +1013,10 @@ fn classify_command_parts(
         "gradle" | "gradlew" => classify_gradle(args),
         "make" => classify_make(args),
         "python" | "python3" | "py" => classify_python_module(args),
+        "git" => classify_git(args),
+        "ls" | "dir" | "cat" | "type" | "rg" | "grep" => {
+            (VerificationKind::Inspect, VerificationScope::Workspace)
+        }
         _ => (VerificationKind::Unknown, VerificationScope::Unknown),
     }
 }
@@ -1073,6 +1080,15 @@ fn classify_python_module(args: &[String]) -> (VerificationKind, VerificationSco
         Some("pytest") => (VerificationKind::Test, VerificationScope::Workspace),
         Some("mypy") => (VerificationKind::Typecheck, VerificationScope::Workspace),
         Some("ruff") => (VerificationKind::Lint, VerificationScope::Workspace),
+        _ => (VerificationKind::Unknown, VerificationScope::Unknown),
+    }
+}
+
+fn classify_git(args: &[String]) -> (VerificationKind, VerificationScope) {
+    match first_non_option_arg(args).as_deref() {
+        Some("diff" | "status" | "log" | "show" | "grep" | "ls-files") => {
+            (VerificationKind::Inspect, VerificationScope::Workspace)
+        }
         _ => (VerificationKind::Unknown, VerificationScope::Unknown),
     }
 }
@@ -1354,7 +1370,9 @@ mod tests {
         for (command, args, expected_kind) in [
             ("cargo", vec!["test"], VerificationKind::Test),
             ("cargo", vec!["check"], VerificationKind::Check),
+            ("cargo", vec!["build"], VerificationKind::Build),
             ("npm", vec!["test"], VerificationKind::Test),
+            ("npm", vec!["run", "lint"], VerificationKind::Lint),
             ("pnpm", vec!["test"], VerificationKind::Test),
             ("yarn", vec!["test"], VerificationKind::Test),
             ("pytest", vec![], VerificationKind::Test),
@@ -1387,6 +1405,20 @@ mod tests {
         assert!(!classification.is_verification);
         assert_eq!(classification.kind, VerificationKind::Unknown);
         assert_eq!(classification.scope, VerificationScope::Unknown);
+        assert!(classification
+            .reason_codes
+            .iter()
+            .any(|code| code == "verification.command_not_verification"));
+    }
+
+    #[test]
+    fn process_run_classifier_recognizes_inspect_without_counting_as_verification() {
+        let classification =
+            VerificationCommandClassifier::classify_process_run(&process_input("git", &["status"]));
+
+        assert_eq!(classification.kind, VerificationKind::Inspect);
+        assert_eq!(classification.scope, VerificationScope::Workspace);
+        assert!(!classification.is_verification);
         assert!(classification
             .reason_codes
             .iter()

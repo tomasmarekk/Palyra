@@ -36,7 +36,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::sandbox_runner::{
-    background_process_status_by_pid, process_runner_executor_name,
+    background_process_status_by_pid, process_failure_output_json, process_runner_executor_name,
     process_runner_sandbox_enforcement_label,
     run_constrained_process_with_cancellation_and_progress, stop_background_process_by_pid,
     EgressEnforcementMode, ProcessProgressSink, SandboxProcessRunErrorKind,
@@ -1391,6 +1391,12 @@ async fn execute_process_runner_tool(
             execution_manifest: None,
         },
         Ok(Err(error)) => {
+            let output_json = process_failure_output_json(
+                &error,
+                executor.as_str(),
+                sandbox_enforcement.as_str(),
+            );
+            let timed_out = matches!(error.kind, SandboxProcessRunErrorKind::TimedOut);
             if matches!(
                 error.kind,
                 SandboxProcessRunErrorKind::QuotaExceeded | SandboxProcessRunErrorKind::TimedOut
@@ -1399,9 +1405,9 @@ async fn execute_process_runner_tool(
             }
             ToolExecutionRawResult {
                 success: false,
-                output_json: b"{}".to_vec(),
+                output_json,
                 error: error.message,
-                timed_out: matches!(error.kind, SandboxProcessRunErrorKind::TimedOut),
+                timed_out,
                 executor: executor.clone(),
                 sandbox_enforcement: sandbox_enforcement.clone(),
                 execution_manifest: None,
@@ -2772,6 +2778,10 @@ mod tests {
             output.get("tool").and_then(serde_json::Value::as_str),
             Some("palyra.process.run")
         );
+        assert_eq!(
+            output.get("failure_class").and_then(serde_json::Value::as_str),
+            Some("disabled")
+        );
         assert!(
             output
                 .get("error")
@@ -2785,7 +2795,7 @@ mod tests {
                 .get("recovery_hint")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
-                .contains("Enable"),
+                .contains("enable"),
             "recovery hint should guide the operator: {output}"
         );
     }
