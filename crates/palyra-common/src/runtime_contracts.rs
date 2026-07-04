@@ -247,8 +247,8 @@ pub fn public_runtime_contract_snapshot() -> Value {
             ],
         },
         "acp_protocol": {
-            "snapshot_version": "runtime-contracts.acp.v1",
-            "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned.",
+            "snapshot_version": "runtime-contracts.acp.v2",
+            "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned; run.get is read-only run status.",
             "protocol_versions": {
                 "min": ACP_PROTOCOL_MIN_VERSION,
                 "max": ACP_PROTOCOL_MAX_VERSION,
@@ -274,8 +274,8 @@ pub fn public_runtime_contract_snapshot() -> Value {
                 ),
                 enum_contract_snapshot(
                     "AcpCommand",
-                    "runtime-contracts.acp_command.v1",
-                    "ACP command names are public method identifiers; acp.status remains an alias.",
+                    "runtime-contracts.acp_command.v2",
+                    "ACP command names are public method identifiers; run.get exposes read-only run status and acp.status remains an alias.",
                     AcpCommand::wire_contract_values(),
                 ),
                 enum_contract_snapshot(
@@ -2175,6 +2175,7 @@ runtime_contract_enum! {
         SessionConfigSet => "session.config.set",
         RunCreate => "run.create",
         RunAbort => "run.abort",
+        RunGet => "run.get",
         ApprovalList => "approval.list",
         ApprovalRequest => "approval.request",
         ApprovalDecide => "approval.decide",

@@ -170,6 +170,7 @@ async fn execute_acp_command(
             session_config_set(state, request_context, client, &envelope).await
         }
         AcpCommand::RunCreate
+        | AcpCommand::RunGet
         | AcpCommand::RunAbort
         | AcpCommand::ApprovalList
         | AcpCommand::ApprovalDecide => {
@@ -657,6 +658,10 @@ async fn dispatch_via_command_router(
             ensure_grant(client, AcpScope::RunsWrite, AcpCapability::RunControl)?;
             RealtimeCommand::RunAbort
         }
+        AcpCommand::RunGet => {
+            ensure_scope(client, AcpScope::RunsRead)?;
+            RealtimeCommand::RunGet
+        }
         AcpCommand::ApprovalList => {
             ensure_grant(client, AcpScope::ApprovalsRead, AcpCapability::ApprovalBridge)?;
             RealtimeCommand::ApprovalList
@@ -1080,16 +1085,21 @@ fn ensure_grant(
     scope: AcpScope,
     capability: AcpCapability,
 ) -> Result<(), AcpDispatchError> {
-    let scopes = client.scopes.iter().copied().collect::<BTreeSet<_>>();
+    ensure_scope(client, scope)?;
     let capabilities = client.capabilities.iter().copied().collect::<BTreeSet<_>>();
-    if !scopes.contains(&scope) {
-        return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
-            message: format!("missing ACP scope {}", scope.as_str()),
-        }));
-    }
     if !capabilities.contains(&capability) {
         return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
             message: format!("missing ACP capability {}", capability.as_str()),
+        }));
+    }
+    Ok(())
+}
+
+fn ensure_scope(client: &AcpClientContext, scope: AcpScope) -> Result<(), AcpDispatchError> {
+    let scopes = client.scopes.iter().copied().collect::<BTreeSet<_>>();
+    if !scopes.contains(&scope) {
+        return Err(AcpDispatchError::Acp(AcpRuntimeError::Permission {
+            message: format!("missing ACP scope {}", scope.as_str()),
         }));
     }
     Ok(())

@@ -3803,6 +3803,48 @@ impl GatewayRuntimeState {
             .map_err(|_| Status::internal("journal read worker panicked"))?
     }
 
+    /// Loads recent journal events for one run plus its scoped event count.
+    ///
+    /// # Errors
+    /// `internal` when journal reads fail or the blocking worker panics.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn journal_snapshot_for_run_blocking(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<JournalRecentSnapshot, Status> {
+        let limit = limit.clamp(1, MAX_JOURNAL_RECENT_EVENTS);
+        let events = self.journal_store.recent_for_run(run_id, limit).map_err(|error| {
+            Status::internal(format!("failed to load run journal events: {error}"))
+        })?;
+        let total_events = self.journal_store.total_events_for_run(run_id).map_err(|error| {
+            Status::internal(format!("failed to count run journal events: {error}"))
+        })? as u64;
+        Ok(JournalRecentSnapshot {
+            total_events,
+            hash_chain_enabled: self.journal_config.hash_chain_enabled,
+            events,
+        })
+    }
+
+    /// Async wrapper for `Self::journal_snapshot_for_run_blocking`.
+    ///
+    /// # Errors
+    /// Same as the blocking variant, plus `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn journal_snapshot_for_run(
+        self: &Arc<Self>,
+        run_id: String,
+        limit: usize,
+    ) -> Result<JournalRecentSnapshot, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.journal_snapshot_for_run_blocking(run_id.as_str(), limit)
+        })
+        .await
+        .map_err(|_| Status::internal("run journal read worker panicked"))?
+    }
+
     /// Builds the journal state doctor report on the blocking journal worker.
     ///
     /// # Errors

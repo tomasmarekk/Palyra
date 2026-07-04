@@ -191,6 +191,105 @@ pub(crate) struct VerificationStatusForCliAndConsoleDiagnostics {
     pub(crate) redaction_level: String,
 }
 
+/// Public, run-scoped artifact that explains which verification evidence exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummary {
+    pub(crate) schema_version: u32,
+    pub(crate) state: String,
+    pub(crate) rollout_enabled: bool,
+    pub(crate) changed_files: Vec<String>,
+    pub(crate) commands_executed: Vec<VerificationSummaryCommand>,
+    pub(crate) command_classification: Vec<VerificationSummaryCommandClassification>,
+    pub(crate) latest_verification_status: VerificationStatusForCliAndConsoleDiagnostics,
+    pub(crate) unverified_mutations: Vec<VerificationSummaryUnverifiedMutation>,
+    pub(crate) stale_evidence_reasons: Vec<String>,
+    pub(crate) diagnostics: Vec<VerificationSummaryDiagnostic>,
+    pub(crate) final_answer: VerificationSummaryFinalAnswer,
+    pub(crate) final_answer_allowed: bool,
+    pub(crate) final_answer_allowed_because: String,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) redaction_level: String,
+}
+
+/// Public command row derived from verification command/event projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummaryCommand {
+    pub(crate) command: String,
+    pub(crate) is_verification: bool,
+    pub(crate) kind: String,
+    pub(crate) scope: String,
+    pub(crate) status: Option<String>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+/// Public classification row for process commands, including unrelated commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummaryCommandClassification {
+    pub(crate) command: String,
+    pub(crate) is_verification: bool,
+    pub(crate) kind: String,
+    pub(crate) scope: String,
+    pub(crate) created_at_unix_ms: i64,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+/// Public stale/unknown requirement row for mutations that still need evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummaryUnverifiedMutation {
+    pub(crate) requirement_id: String,
+    pub(crate) required_kind: String,
+    pub(crate) changed_files: Vec<String>,
+    pub(crate) freshness_status: String,
+    pub(crate) min_created_at_unix_ms: i64,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+/// Public diagnostic evidence row from code-intelligence/LSP journal events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummaryDiagnostic {
+    pub(crate) event_type: String,
+    pub(crate) new_errors: u64,
+    pub(crate) new_warnings: u64,
+    pub(crate) degraded: bool,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) evidence_refs: Vec<String>,
+}
+
+/// Public final-answer verification decision derived from the finalizer envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VerificationSummaryFinalAnswer {
+    pub(crate) observed: bool,
+    pub(crate) status: Option<String>,
+    pub(crate) reason_code: Option<String>,
+    pub(crate) allowed: bool,
+    pub(crate) allowed_because: String,
+    pub(crate) pending_requirement_count: Option<u64>,
+    pub(crate) satisfied_requirement_count: Option<u64>,
+    pub(crate) evidence_refs: Vec<String>,
+    pub(crate) nudge: Option<String>,
+    pub(crate) unverified_reason: Option<String>,
+}
+
+/// Inputs for building a public verification summary without coupling to transport types.
+pub(crate) struct VerificationSummaryRequest<'a> {
+    pub(crate) rollout_enabled: bool,
+    pub(crate) journal_total_events: u64,
+    pub(crate) journal_window_events: u64,
+    pub(crate) projections: &'a [VerificationJournalProjection],
+    pub(crate) diagnostics: &'a [VerificationSummaryDiagnostic],
+    pub(crate) finalizer: Option<&'a Value>,
+}
+
 /// Stable reason codes used by verification journal payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerificationReasonCode {
@@ -631,6 +730,277 @@ pub(crate) fn verification_status_for_cli_and_console(
             VERIFICATION_FRESHNESS_CHECKED.to_owned(),
         ],
         redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+/// Builds a public artifact summary from run-scoped verification journal projections.
+#[must_use]
+pub(crate) fn verification_summary_for_public_artifact(
+    request: VerificationSummaryRequest<'_>,
+) -> VerificationSummary {
+    let latest_verification_status = verification_status_for_cli_and_console(
+        request.rollout_enabled,
+        request.journal_total_events,
+        request.journal_window_events,
+        request.projections,
+    );
+    let mut changed_files = Vec::new();
+    let mut commands_executed = Vec::new();
+    let mut command_classification = Vec::new();
+    let mut unverified_mutations = Vec::new();
+    let mut stale_evidence_reasons = Vec::new();
+    let mut evidence_refs = Vec::new();
+    let mut reason_codes = latest_verification_status.reason_codes.clone();
+
+    for projection in request.projections {
+        evidence_refs.extend(projection.evidence_refs.clone());
+        reason_codes.extend(projection.reason_codes.clone());
+
+        if let Some(classification) = projection.classification.as_ref() {
+            command_classification.push(VerificationSummaryCommandClassification {
+                command: classification.canonical_command.display.clone(),
+                is_verification: classification.is_verification,
+                kind: classification.kind.as_str().to_owned(),
+                scope: classification.scope.as_str().to_owned(),
+                created_at_unix_ms: projection.created_at_unix_ms,
+                reason_codes: classification.reason_codes.clone(),
+            });
+            if !classification.is_verification {
+                commands_executed.push(VerificationSummaryCommand {
+                    command: classification.canonical_command.display.clone(),
+                    is_verification: false,
+                    kind: classification.kind.as_str().to_owned(),
+                    scope: classification.scope.as_str().to_owned(),
+                    status: None,
+                    exit_code: None,
+                    created_at_unix_ms: projection.created_at_unix_ms,
+                    evidence_refs: projection.evidence_refs.clone(),
+                    reason_codes: classification.reason_codes.clone(),
+                });
+            }
+        }
+
+        if let Some(event) = projection.event.as_ref() {
+            changed_files.extend(event.changed_paths.iter().map(|path| public_changed_path(path)));
+            commands_executed.push(VerificationSummaryCommand {
+                command: event.canonical_command.clone(),
+                is_verification: true,
+                kind: event.kind.as_str().to_owned(),
+                scope: event.scope.as_str().to_owned(),
+                status: Some(event.status.as_str().to_owned()),
+                exit_code: event.exit_code,
+                created_at_unix_ms: event.created_at_unix_ms,
+                evidence_refs: normalize_string_set(event.evidence_refs.clone()),
+                reason_codes: event.reason_codes.clone(),
+            });
+        }
+
+        if let Some(state) = projection.state.as_ref() {
+            changed_files.extend(
+                state.requirement.changed_paths.iter().map(|path| public_changed_path(path)),
+            );
+            if !matches!(state.freshness.status, VerificationFreshnessStatus::Fresh) {
+                stale_evidence_reasons.extend(state.freshness.reason_codes.clone());
+                stale_evidence_reasons.push(state.requirement.reason_code.clone());
+                unverified_mutations.push(VerificationSummaryUnverifiedMutation {
+                    requirement_id: state.requirement.requirement_id.clone(),
+                    required_kind: state.requirement.required_kind.as_str().to_owned(),
+                    changed_files: normalize_string_set(
+                        state
+                            .requirement
+                            .changed_paths
+                            .iter()
+                            .map(|path| public_changed_path(path))
+                            .collect(),
+                    ),
+                    freshness_status: state.freshness.status.as_str().to_owned(),
+                    min_created_at_unix_ms: state.requirement.min_created_at_unix_ms,
+                    reason_codes: normalize_string_set(
+                        state
+                            .freshness
+                            .reason_codes
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once(state.requirement.reason_code.clone()))
+                            .collect(),
+                    ),
+                });
+            }
+        }
+
+        if let Some(freshness) = projection.freshness.as_ref() {
+            if !matches!(freshness.status, VerificationFreshnessStatus::Fresh) {
+                stale_evidence_reasons.extend(freshness.reason_codes.clone());
+            }
+        }
+    }
+
+    for diagnostic in request.diagnostics {
+        evidence_refs.extend(diagnostic.evidence_refs.clone());
+        reason_codes.extend(diagnostic.reason_codes.clone());
+        if diagnostic.degraded || diagnostic.new_errors > 0 {
+            stale_evidence_reasons.extend(diagnostic.reason_codes.clone());
+        }
+    }
+
+    let final_answer = final_answer_summary_from_finalizer(request.finalizer);
+    evidence_refs.extend(final_answer.evidence_refs.clone());
+    if let Some(reason_code) = final_answer.reason_code.as_ref() {
+        reason_codes.push(reason_code.clone());
+        if !final_answer.allowed {
+            stale_evidence_reasons.push(reason_code.clone());
+        }
+    }
+
+    let state = verification_summary_state(
+        request.rollout_enabled,
+        request.projections,
+        request.diagnostics,
+        &final_answer,
+    );
+    let final_answer_allowed = final_answer.allowed;
+    let final_answer_allowed_because = final_answer.allowed_because.clone();
+
+    VerificationSummary {
+        schema_version: VERIFICATION_SCHEMA_VERSION,
+        state,
+        rollout_enabled: request.rollout_enabled,
+        changed_files: normalize_string_set(changed_files),
+        commands_executed,
+        command_classification,
+        latest_verification_status,
+        unverified_mutations,
+        stale_evidence_reasons: normalize_string_set(stale_evidence_reasons),
+        diagnostics: request.diagnostics.to_vec(),
+        final_answer,
+        final_answer_allowed,
+        final_answer_allowed_because,
+        evidence_refs: normalize_string_set(evidence_refs),
+        reason_codes: normalize_string_set(reason_codes),
+        redaction_level: VERIFICATION_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+/// Parses a verification projection from a redacted journal payload.
+#[must_use]
+pub(crate) fn verification_projection_from_payload(
+    payload: &Value,
+) -> Option<VerificationJournalProjection> {
+    let event_type = payload.get("event_type").and_then(Value::as_str)?;
+    if !matches!(
+        event_type,
+        VERIFICATION_COMMAND_CLASSIFIED
+            | VERIFICATION_EVENT_RECORDED
+            | VERIFICATION_STATE_STALE
+            | VERIFICATION_FRESHNESS_CHECKED
+    ) {
+        return None;
+    }
+    serde_json::from_value::<VerificationJournalProjection>(payload.clone()).ok()
+}
+
+/// Parses a public code-intelligence diagnostics row from a redacted journal payload.
+#[must_use]
+pub(crate) fn verification_diagnostic_from_payload(
+    payload: &Value,
+) -> Option<VerificationSummaryDiagnostic> {
+    let event_type = payload.get("event").and_then(Value::as_str)?;
+    if !event_type.contains("diagnostics.delta") {
+        return None;
+    }
+    Some(VerificationSummaryDiagnostic {
+        event_type: event_type.to_owned(),
+        new_errors: payload.get("new_errors").and_then(Value::as_u64).unwrap_or(0),
+        new_warnings: payload.get("new_warnings").and_then(Value::as_u64).unwrap_or(0),
+        degraded: payload.get("degraded").and_then(Value::as_bool).unwrap_or(false),
+        reason_codes: json_string_array(payload.get("reason_codes")),
+        evidence_refs: json_string_array(payload.get("evidence_refs")),
+    })
+}
+
+fn verification_summary_state(
+    rollout_enabled: bool,
+    projections: &[VerificationJournalProjection],
+    diagnostics: &[VerificationSummaryDiagnostic],
+    final_answer: &VerificationSummaryFinalAnswer,
+) -> String {
+    if !rollout_enabled {
+        return "disabled".to_owned();
+    }
+    if projections.is_empty() && diagnostics.is_empty() && !final_answer.observed {
+        return "not_available".to_owned();
+    }
+    "available".to_owned()
+}
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn final_answer_summary_from_finalizer(
+    finalizer: Option<&Value>,
+) -> VerificationSummaryFinalAnswer {
+    let Some(finalizer) = finalizer else {
+        return VerificationSummaryFinalAnswer {
+            observed: false,
+            status: None,
+            reason_code: None,
+            allowed: false,
+            allowed_because: "verification.finalizer.not_observed".to_owned(),
+            pending_requirement_count: None,
+            satisfied_requirement_count: None,
+            evidence_refs: Vec::new(),
+            nudge: None,
+            unverified_reason: None,
+        };
+    };
+
+    let status = finalizer.get("status").and_then(Value::as_str).map(str::to_owned);
+    let reason_code = finalizer.get("reason_code").and_then(Value::as_str).map(str::to_owned);
+    let unverified_reason =
+        finalizer.get("unverified_reason").and_then(Value::as_str).map(str::to_owned);
+    let pending_requirement_count =
+        finalizer.get("pending_requirement_count").and_then(Value::as_u64);
+    let satisfied_requirement_count =
+        finalizer.get("satisfied_requirement_count").and_then(Value::as_u64);
+    let evidence_refs = finalizer
+        .get("evidence_refs")
+        .and_then(Value::as_array)
+        .map(|refs| refs.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let nudge = finalizer.get("nudge").and_then(Value::as_str).map(str::to_owned);
+
+    let allowed =
+        matches!(status.as_deref(), Some("not_required" | "verified" | "unverified_allowed"));
+    let allowed_because = match status.as_deref() {
+        Some("verified") => "verification.finalizer.fresh_verification_found".to_owned(),
+        Some("unverified_allowed") => unverified_reason
+            .as_ref()
+            .map(|reason| format!("verification.finalizer.unverified_allowed:{reason}"))
+            .unwrap_or_else(|| "verification.finalizer.unverified_allowed".to_owned()),
+        Some("not_required") => {
+            reason_code.clone().unwrap_or_else(|| "verification.finalizer.not_required".to_owned())
+        }
+        Some("nudge_required") => reason_code
+            .clone()
+            .unwrap_or_else(|| "verification.finalizer.nudge_required".to_owned()),
+        _ => reason_code.clone().unwrap_or_else(|| "verification.finalizer.unknown".to_owned()),
+    };
+
+    VerificationSummaryFinalAnswer {
+        observed: true,
+        status,
+        reason_code,
+        allowed,
+        allowed_because,
+        pending_requirement_count,
+        satisfied_requirement_count,
+        evidence_refs: normalize_string_set(evidence_refs),
+        nudge,
+        unverified_reason,
     }
 }
 
@@ -1276,6 +1646,27 @@ fn normalize_relative_path(path: &str) -> String {
     }
 }
 
+fn public_changed_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return ".".to_owned();
+    }
+    let path = trimmed.replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    let has_drive_prefix = path.as_bytes().get(1).is_some_and(|byte| *byte == b':');
+    let looks_absolute = path.starts_with('/') || has_drive_prefix || path.starts_with("~/");
+    let contains_private_home =
+        lower.contains("/users/") || lower.contains("/home/") || lower.contains("/desktop/");
+    if looks_absolute || contains_private_home {
+        return "<redacted:path>".to_owned();
+    }
+    let normalized = normalize_relative_path(path.as_str());
+    if normalized == "." || normalized.starts_with("_outside_workspace") {
+        return "<redacted:path>".to_owned();
+    }
+    normalized
+}
+
 fn normalize_string_set(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -1299,14 +1690,16 @@ mod tests {
         build_verification_state, canonicalize_verification_command,
         verification_command_classified_projection, verification_event_recorded_projection,
         verification_state_stale_projection, verification_status_for_cli_and_console,
-        VerificationCommandClassifier, VerificationDiagnosticsDecision, VerificationEvent,
-        VerificationEventCreateRequest, VerificationFreshnessStatus, VerificationKind,
-        VerificationOutputSummary, VerificationPatchStaleRequest, VerificationRequirement,
-        VerificationScope, VerificationStatus, VERIFICATION_COMMAND_CLASSIFIED,
-        VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL, VERIFICATION_SCHEMA_VERSION,
-        VERIFICATION_STATE_STALE,
+        verification_summary_for_public_artifact, VerificationCommandClassifier,
+        VerificationDiagnosticsDecision, VerificationEvent, VerificationEventCreateRequest,
+        VerificationFreshnessStatus, VerificationKind, VerificationOutputSummary,
+        VerificationPatchStaleRequest, VerificationRequirement, VerificationScope,
+        VerificationStatus, VerificationSummaryDiagnostic, VerificationSummaryRequest,
+        VERIFICATION_COMMAND_CLASSIFIED, VERIFICATION_EVENT_RECORDED, VERIFICATION_REDACTION_LEVEL,
+        VERIFICATION_SCHEMA_VERSION, VERIFICATION_STATE_STALE,
     };
     use palyra_common::process_runner_input::ProcessRunnerToolInput;
+    use serde_json::json;
 
     fn root_ref(id: &str) -> ProjectWorkspaceRootRef {
         ProjectWorkspaceRootRef {
@@ -1672,6 +2065,113 @@ mod tests {
         assert_eq!(no_evidence.decision, VerificationDiagnosticsDecision::NoEvidence);
         assert_eq!(no_evidence.verification_projection_events, 0);
         assert_eq!(no_evidence.redaction_level, VERIFICATION_REDACTION_LEVEL);
+    }
+
+    #[test]
+    fn verification_summary_keeps_unrelated_command_out_of_valid_evidence() {
+        let classification = VerificationCommandClassifier::classify_process_run(&process_input(
+            "curl",
+            &["https://example.invalid"],
+        ));
+        let projection =
+            verification_command_classified_projection("session-1", "run-1", 100, classification);
+
+        let summary = verification_summary_for_public_artifact(VerificationSummaryRequest {
+            rollout_enabled: true,
+            journal_total_events: 1,
+            journal_window_events: 1,
+            projections: &[projection],
+            diagnostics: &[],
+            finalizer: None,
+        });
+
+        assert_eq!(summary.latest_verification_status.classified_commands, 1);
+        assert_eq!(summary.commands_executed.len(), 1);
+        assert!(!summary.commands_executed[0].is_verification);
+        assert_eq!(summary.commands_executed[0].kind, "unknown");
+        assert_eq!(
+            summary.latest_verification_status.decision,
+            VerificationDiagnosticsDecision::Unknown
+        );
+    }
+
+    #[test]
+    fn verification_summary_redacts_absolute_changed_paths() {
+        let projection = verification_event_recorded_projection(event(
+            "event-abs",
+            VerificationStatus::Passed,
+            VerificationScope::ChangedPaths,
+            vec![r"C:\Users\Palo\Desktop\palyra-repo\palyra\src\lib.rs"],
+            1_000,
+        ));
+
+        let summary = verification_summary_for_public_artifact(VerificationSummaryRequest {
+            rollout_enabled: true,
+            journal_total_events: 1,
+            journal_window_events: 1,
+            projections: &[projection],
+            diagnostics: &[],
+            finalizer: None,
+        });
+
+        assert_eq!(summary.changed_files, vec!["<redacted:path>"]);
+        let encoded = serde_json::to_string(&summary).expect("summary should serialize");
+        assert!(!encoded.contains("Palo"), "{encoded}");
+        assert!(!encoded.contains("Users"), "{encoded}");
+    }
+
+    #[test]
+    fn verification_summary_exports_unverified_mutations_and_finalizer_reason() {
+        let requirement = VerificationRequirement::new(
+            "req-summary",
+            root_ref("root-a"),
+            VerificationKind::Test,
+            vec!["src/lib.rs".to_owned()],
+            2_000,
+            "verification.required_after_patch",
+        );
+        let state = build_verification_state(requirement, &[], 2_100);
+        let projection = verification_state_stale_projection("session-1", "run-1", state);
+        let diagnostic = VerificationSummaryDiagnostic {
+            event_type: "code_intel.diagnostics.delta".to_owned(),
+            new_errors: 1,
+            new_warnings: 0,
+            degraded: false,
+            reason_codes: vec!["code_intel.diagnostics.new_errors".to_owned()],
+            evidence_refs: vec!["diagnostics:after_patch".to_owned()],
+        };
+        let finalizer = json!({
+            "status": "nudge_required",
+            "reason_code": "verification.finalizer.stale_after_code_mutation",
+            "pending_requirement_count": 1,
+            "satisfied_requirement_count": 0,
+            "evidence_refs": ["verification_state:req-summary"],
+            "nudge": "Run tests before final answer."
+        });
+
+        let summary = verification_summary_for_public_artifact(VerificationSummaryRequest {
+            rollout_enabled: true,
+            journal_total_events: 2,
+            journal_window_events: 2,
+            projections: &[projection],
+            diagnostics: &[diagnostic],
+            finalizer: Some(&finalizer),
+        });
+
+        assert_eq!(summary.state, "available");
+        assert_eq!(summary.changed_files, vec!["src/lib.rs"]);
+        assert_eq!(summary.unverified_mutations.len(), 1);
+        assert_eq!(summary.unverified_mutations[0].freshness_status, "stale");
+        assert_eq!(summary.diagnostics[0].new_errors, 1);
+        assert!(!summary.final_answer_allowed);
+        assert_eq!(
+            summary.final_answer_allowed_because,
+            "verification.finalizer.stale_after_code_mutation"
+        );
+        assert!(summary
+            .stale_evidence_reasons
+            .iter()
+            .any(|reason| reason == "code_intel.diagnostics.new_errors"));
     }
 
     #[test]

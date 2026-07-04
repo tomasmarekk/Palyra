@@ -123,6 +123,29 @@ fn compact_tool_catalog_snapshot_preview(payload_bytes: usize) -> String {
     )
 }
 
+fn print_run_verification_summary(run_id: &str, summary: &Value) {
+    println!(
+        "run.verification run_id={} state={} decision={} latest_status={} commands={} stale_requirements={} final_answer_allowed={} final_answer_reason={}",
+        run_id,
+        summary.get("state").and_then(Value::as_str).unwrap_or("unknown"),
+        summary
+            .pointer("/latest_verification_status/decision")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        summary
+            .pointer("/latest_verification_status/latest_status")
+            .and_then(Value::as_str)
+            .unwrap_or("none"),
+        summary.get("commands_executed").and_then(Value::as_array).map_or(0, Vec::len),
+        summary.get("unverified_mutations").and_then(Value::as_array).map_or(0, Vec::len),
+        summary.get("final_answer_allowed").and_then(Value::as_bool).unwrap_or(false),
+        summary
+            .get("final_answer_allowed_because")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+}
+
 /// Truncates to at most `max_bytes` on a char boundary; the flag reports
 /// whether truncation occurred.
 fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
@@ -797,6 +820,9 @@ pub(crate) fn run_daemon(command: DaemonCommand) -> Result<()> {
                         response.continuation_required.unwrap_or(false),
                         response.reason_code.as_deref().unwrap_or("unknown")
                     );
+                }
+                if let Some(summary) = response.verification_summary.as_ref() {
+                    print_run_verification_summary(response.run_id.as_str(), summary);
                 }
             }
             std::io::stdout().flush().context("stdout flush failed")

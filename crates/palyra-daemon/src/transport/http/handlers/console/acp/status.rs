@@ -97,89 +97,152 @@ pub(super) fn build_acp_status_payload(
 }
 
 pub(super) fn acp_method_descriptors() -> Vec<Value> {
-    [
-        (AcpCommand::Status, AcpScope::SessionsRead, AcpCapability::RuntimeStatus, false),
-        (AcpCommand::SessionList, AcpScope::SessionsRead, AcpCapability::SessionList, false),
-        (AcpCommand::SessionLoad, AcpScope::SessionsRead, AcpCapability::SessionLoad, false),
-        (AcpCommand::SessionNew, AcpScope::SessionsWrite, AcpCapability::SessionNew, true),
-        (AcpCommand::SessionReplay, AcpScope::SessionsRead, AcpCapability::SessionReplay, false),
-        (AcpCommand::SessionFork, AcpScope::SessionsWrite, AcpCapability::SessionFork, true),
-        (
+    vec![
+        acp_method_descriptor(
+            AcpCommand::Status,
+            AcpScope::SessionsRead,
+            &[AcpCapability::RuntimeStatus],
+            false,
+        ),
+        acp_method_descriptor(
+            AcpCommand::SessionList,
+            AcpScope::SessionsRead,
+            &[AcpCapability::SessionList],
+            false,
+        ),
+        acp_method_descriptor(
+            AcpCommand::SessionLoad,
+            AcpScope::SessionsRead,
+            &[AcpCapability::SessionLoad],
+            false,
+        ),
+        acp_method_descriptor(
+            AcpCommand::SessionNew,
+            AcpScope::SessionsWrite,
+            &[AcpCapability::SessionNew],
+            true,
+        ),
+        acp_method_descriptor(
+            AcpCommand::SessionReplay,
+            AcpScope::SessionsRead,
+            &[AcpCapability::SessionReplay],
+            false,
+        ),
+        acp_method_descriptor(
+            AcpCommand::SessionFork,
+            AcpScope::SessionsWrite,
+            &[AcpCapability::SessionFork],
+            true,
+        ),
+        acp_method_descriptor(
             AcpCommand::SessionCompactPreview,
             AcpScope::SessionsRead,
-            AcpCapability::SessionCompact,
+            &[AcpCapability::SessionCompact],
             false,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::SessionCompactApply,
             AcpScope::SessionsWrite,
-            AcpCapability::SessionCompact,
+            &[AcpCapability::SessionCompact],
             true,
         ),
-        (AcpCommand::SessionExplain, AcpScope::SessionsRead, AcpCapability::SessionExplain, false),
-        (AcpCommand::ApprovalList, AcpScope::ApprovalsRead, AcpCapability::ApprovalBridge, false),
-        (
+        acp_method_descriptor(
+            AcpCommand::SessionExplain,
+            AcpScope::SessionsRead,
+            &[AcpCapability::SessionExplain],
+            false,
+        ),
+        acp_method_descriptor(
+            AcpCommand::ApprovalList,
+            AcpScope::ApprovalsRead,
+            &[AcpCapability::ApprovalBridge],
+            false,
+        ),
+        acp_method_descriptor(
             AcpCommand::ApprovalRequest,
             AcpScope::ApprovalsWrite,
-            AcpCapability::ApprovalBridge,
+            &[AcpCapability::ApprovalBridge],
             true,
         ),
-        (AcpCommand::ApprovalDecide, AcpScope::ApprovalsWrite, AcpCapability::ApprovalBridge, true),
-        (AcpCommand::RunCreate, AcpScope::RunsWrite, AcpCapability::RunControl, true),
-        (AcpCommand::RunAbort, AcpScope::RunsWrite, AcpCapability::RunControl, true),
-        (
+        acp_method_descriptor(
+            AcpCommand::ApprovalDecide,
+            AcpScope::ApprovalsWrite,
+            &[AcpCapability::ApprovalBridge],
+            true,
+        ),
+        acp_method_descriptor(
+            AcpCommand::RunCreate,
+            AcpScope::RunsWrite,
+            &[AcpCapability::RunControl],
+            true,
+        ),
+        acp_method_descriptor(
+            AcpCommand::RunAbort,
+            AcpScope::RunsWrite,
+            &[AcpCapability::RunControl],
+            true,
+        ),
+        acp_method_descriptor(AcpCommand::RunGet, AcpScope::RunsRead, &[], false),
+        acp_method_descriptor(
             AcpCommand::BindingList,
             AcpScope::BindingsRead,
-            AcpCapability::ConversationBindings,
+            &[AcpCapability::ConversationBindings],
             false,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingUpsert,
             AcpScope::BindingsWrite,
-            AcpCapability::ConversationBindings,
+            &[AcpCapability::ConversationBindings],
             true,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingGet,
             AcpScope::BindingsRead,
-            AcpCapability::ConversationBindings,
+            &[AcpCapability::ConversationBindings],
             false,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingDetach,
             AcpScope::BindingsWrite,
-            AcpCapability::ConversationBindings,
+            &[AcpCapability::ConversationBindings],
             true,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingRepairPlan,
             AcpScope::BindingsWrite,
-            AcpCapability::BindingRepair,
+            &[AcpCapability::BindingRepair],
             false,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingRepairApply,
             AcpScope::BindingsWrite,
-            AcpCapability::BindingRepair,
+            &[AcpCapability::BindingRepair],
             true,
         ),
-        (
+        acp_method_descriptor(
             AcpCommand::BindingExplain,
             AcpScope::BindingsRead,
-            AcpCapability::ConversationBindings,
+            &[AcpCapability::ConversationBindings],
             false,
         ),
     ]
-    .into_iter()
-    .map(|(command, scope, capability, side_effecting)| {
-        json!({
-            "command": command.as_str(),
-            "version": 1,
-            "required_scopes": [scope.as_str()],
-            "required_capabilities": [capability.as_str()],
-            "side_effecting": side_effecting,
-            "rate_limit_bucket": "acp.command",
-        })
+}
+
+fn acp_method_descriptor(
+    command: AcpCommand,
+    scope: AcpScope,
+    capabilities: &[AcpCapability],
+    side_effecting: bool,
+) -> Value {
+    json!({
+        "command": command.as_str(),
+        "version": 1,
+        "required_scopes": [scope.as_str()],
+        "required_capabilities": capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        "side_effecting": side_effecting,
+        "rate_limit_bucket": "acp.command",
     })
-    .collect()
 }

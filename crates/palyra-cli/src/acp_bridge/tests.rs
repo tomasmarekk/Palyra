@@ -2,10 +2,11 @@
 //! option semantics, session listing fallbacks, and binding lookups.
 
 use super::{
-    acp, build_tool_permission_request, map_list_sessions_response, map_permission_outcome,
-    AcpSessionDefaults, ActiveRunGuard, AgentConnection, BridgeState, ClientBridgeRequest,
-    PalyraAcpAgent, SessionBinding, PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE,
-    PERMISSION_REJECT_ALWAYS, PERMISSION_REJECT_ONCE,
+    acp, build_tool_permission_request, format_acp_verification_summary,
+    map_list_sessions_response, map_permission_outcome, AcpSessionDefaults, ActiveRunGuard,
+    AgentConnection, BridgeState, ClientBridgeRequest, PalyraAcpAgent, SessionBinding,
+    PERMISSION_ALLOW_ALWAYS, PERMISSION_ALLOW_ONCE, PERMISSION_REJECT_ALWAYS,
+    PERMISSION_REJECT_ONCE,
 };
 use crate::proto::palyra::{common::v1 as common_v1, gateway::v1 as gateway_v1};
 use serde_json::json;
@@ -71,6 +72,32 @@ fn active_run_guard_removes_registered_run_on_drop() {
         !state.active_runs.contains_key("acp-session-alpha"),
         "guard drop should remove stale active run ids"
     );
+}
+
+#[test]
+fn acp_verification_summary_text_reports_finalizer_reason() {
+    let summary = json!({
+        "state": "active",
+        "commands_executed": [{"command": "cargo test"}],
+        "latest_verification_status": {
+            "decision": "stale",
+            "reason_codes": ["verification.status.stale"],
+        },
+        "unverified_mutations": [{"path": "src/lib.rs"}],
+        "stale_evidence_reasons": ["changed_file_unverified"],
+        "final_answer_allowed": false,
+        "final_answer_allowed_because": "verification.final_answer.blocked",
+    });
+
+    let text = format_acp_verification_summary(&summary)
+        .expect("summary object should produce ACP-visible text");
+
+    assert!(text.contains("decision=stale"));
+    assert!(text.contains("final_answer_allowed=false"));
+    assert!(text.contains("reason=verification.final_answer.blocked"));
+    assert!(text.contains("commands=1"));
+    assert!(text.contains("unverified_mutations=1"));
+    assert!(text.contains("stale_requirements=1"));
 }
 
 #[tokio::test]

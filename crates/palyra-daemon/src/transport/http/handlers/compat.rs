@@ -1200,7 +1200,8 @@ pub(crate) async fn compat_run_detach_handler(
         now,
     )
     .await?;
-    let status = build_compat_run_status_payload(&snapshot, None);
+    let verification_summary = collect_compat_run_verification_summary(&state, &snapshot).await;
+    let status = build_compat_run_status_payload(&snapshot, None, verification_summary);
     touch_compat_api_token(
         &state,
         token.token_id.as_str(),
@@ -1884,7 +1885,8 @@ async fn build_compat_run_status_payload_for_snapshot(
     let pending_approval =
         load_compat_pending_approval_for_run(state, snapshot.run_id.as_str(), owner_principal)
             .await?;
-    Ok(build_compat_run_status_payload(snapshot, pending_approval.as_ref()))
+    let verification_summary = collect_compat_run_verification_summary(state, snapshot).await;
+    Ok(build_compat_run_status_payload(snapshot, pending_approval.as_ref(), verification_summary))
 }
 
 async fn load_compat_run_snapshot_for_owner(
@@ -2330,7 +2332,7 @@ fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -
             "total_tokens": 0,
         },
         "pending_approval": Value::Null,
-        "verification_summary": compat_run_verification_summary(None, None),
+        "verification_summary": compat_run_verification_summary(None, None, Value::Null),
         "last_error": Value::Null,
         "_palyra": {
             "principal": prepared.principal,
@@ -2344,6 +2346,7 @@ fn build_compat_run_status_payload_from_prepared(prepared: &CompatPreparedRun) -
 fn build_compat_run_status_payload(
     snapshot: &journal::OrchestratorRunStatusSnapshot,
     pending_approval: Option<&journal::ApprovalRecord>,
+    verification_summary: Value,
 ) -> Value {
     json!({
         "id": snapshot.run_id,
@@ -2368,6 +2371,7 @@ fn build_compat_run_status_payload(
         "verification_summary": compat_run_verification_summary(
             snapshot.delegation.as_ref(),
             snapshot.merge_result.as_ref(),
+            verification_summary,
         ),
         "last_error": snapshot.last_error,
         "_palyra": {
@@ -2429,20 +2433,179 @@ fn compat_run_pending_approval_payload(approval: &journal::ApprovalRecord) -> Va
     })
 }
 
+async fn collect_compat_run_verification_summary(
+    state: &AppState,
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+) -> Value {
+    let journal = match state.runtime.journal_snapshot_for_run(snapshot.run_id.clone(), 256).await {
+        Ok(journal) => journal,
+        Err(error) => {
+            return compat_verification_summary_unavailable(
+                state.runtime.config.feature_rollouts.verification_runtime.enabled,
+                "verification.status.journal_unavailable",
+                format!("failed to load run verification journal: {error}").as_str(),
+            );
+        }
+    };
+    let (projections, diagnostics) =
+        compat_verification_summary_inputs_from_journal(&journal.events);
+    let finalizer = collect_compat_run_verification_finalizer(state, snapshot).await;
+    let summary = crate::application::verification::verification_summary_for_public_artifact(
+        crate::application::verification::VerificationSummaryRequest {
+            rollout_enabled: state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            journal_total_events: journal.total_events,
+            journal_window_events: u64::try_from(journal.events.len()).unwrap_or(u64::MAX),
+            projections: projections.as_slice(),
+            diagnostics: diagnostics.as_slice(),
+            finalizer: finalizer.as_ref(),
+        },
+    );
+    serde_json::to_value(summary).unwrap_or_else(|error| {
+        compat_verification_summary_unavailable(
+            state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            "verification.status.serialization_failed",
+            format!("failed to serialize run verification summary: {error}").as_str(),
+        )
+    })
+}
+
+fn compat_verification_summary_inputs_from_journal(
+    events: &[crate::journal::JournalEventRecord],
+) -> (
+    Vec<crate::application::verification::VerificationJournalProjection>,
+    Vec<crate::application::verification::VerificationSummaryDiagnostic>,
+) {
+    let mut projections = Vec::new();
+    let mut diagnostics = Vec::new();
+    for event in events {
+        let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+            continue;
+        };
+        if let Some(projection) =
+            crate::application::verification::verification_projection_from_payload(&payload)
+        {
+            projections.push(projection);
+            continue;
+        }
+        if let Some(diagnostic) =
+            crate::application::verification::verification_diagnostic_from_payload(&payload)
+        {
+            diagnostics.push(diagnostic);
+        }
+    }
+    (projections, diagnostics)
+}
+
+async fn collect_compat_run_verification_finalizer(
+    state: &AppState,
+    snapshot: &journal::OrchestratorRunStatusSnapshot,
+) -> Option<Value> {
+    let after_seq = compat_tail_tape_after_seq(snapshot.tape_events, 256);
+    let tape = state
+        .runtime
+        .orchestrator_tape_snapshot(snapshot.run_id.clone(), after_seq, Some(256))
+        .await
+        .ok()?;
+    tape.events.iter().rev().find_map(|event| {
+        let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+        payload.pointer("/finalization/verification_finalizer").cloned()
+    })
+}
+
+fn compat_tail_tape_after_seq(tape_events: u64, limit: usize) -> Option<i64> {
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    (tape_events > limit).then(|| {
+        i64::try_from(tape_events.saturating_sub(limit).saturating_sub(1)).unwrap_or(i64::MAX)
+    })
+}
+
 fn compat_run_verification_summary(
     delegation: Option<&crate::delegation::DelegationSnapshot>,
     merge_result: Option<&crate::delegation::DelegationMergeResult>,
+    summary: Value,
 ) -> Value {
+    let mut summary = if summary.is_object() {
+        summary
+    } else {
+        compat_verification_summary_unavailable(
+            true,
+            "verification.status.no_recent_events",
+            "verification summary has not been observed yet",
+        )
+    };
     let delegation = delegation.and_then(|value| serde_json::to_value(value).ok());
     let merge_result = merge_result.and_then(|value| serde_json::to_value(value).ok());
+    if let Some(object) = summary.as_object_mut() {
+        if object.get("state").and_then(Value::as_str) == Some("not_available")
+            && (merge_result.is_some() || delegation.is_some())
+        {
+            object.insert("state".to_owned(), Value::String("available".to_owned()));
+        }
+        object.insert("delegation".to_owned(), delegation.unwrap_or(Value::Null));
+        object.insert("merge_result".to_owned(), merge_result.unwrap_or(Value::Null));
+    }
+    summary
+}
+
+fn compat_verification_summary_unavailable(
+    rollout_enabled: bool,
+    reason_code: &str,
+    error: &str,
+) -> Value {
     json!({
-        "state": if merge_result.is_some() || delegation.is_some() {
-            "available"
-        } else {
-            "not_available"
+        "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+        "state": if rollout_enabled { "unavailable" } else { "disabled" },
+        "rollout_enabled": rollout_enabled,
+        "changed_files": [],
+        "commands_executed": [],
+        "command_classification": [],
+        "latest_verification_status": {
+            "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+            "decision": if rollout_enabled { "unknown" } else { "disabled" },
+            "rollout_enabled": rollout_enabled,
+            "journal_total_events": Value::Null,
+            "journal_window_events": 0,
+            "verification_projection_events": 0,
+            "classified_commands": 0,
+            "recorded_events": 0,
+            "passing_events": 0,
+            "failed_events": 0,
+            "stale_requirements": 0,
+            "fresh_requirements": 0,
+            "unknown_requirements": 0,
+            "latest_event_type": Value::Null,
+            "latest_status": Value::Null,
+            "latest_created_at_unix_ms": Value::Null,
+            "reason_codes": [reason_code],
+            "journal_events": [
+                crate::application::verification::VERIFICATION_COMMAND_CLASSIFIED,
+                crate::application::verification::VERIFICATION_EVENT_RECORDED,
+                crate::application::verification::VERIFICATION_STATE_STALE,
+                crate::application::verification::VERIFICATION_FRESHNESS_CHECKED,
+            ],
+            "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
         },
-        "delegation": delegation,
-        "merge_result": merge_result,
+        "unverified_mutations": [],
+        "stale_evidence_reasons": [reason_code],
+        "diagnostics": [],
+        "final_answer": {
+            "observed": false,
+            "status": Value::Null,
+            "reason_code": Value::Null,
+            "allowed": false,
+            "allowed_because": "verification.finalizer.not_observed",
+            "pending_requirement_count": Value::Null,
+            "satisfied_requirement_count": Value::Null,
+            "evidence_refs": [],
+            "nudge": Value::Null,
+            "unverified_reason": Value::Null,
+        },
+        "final_answer_allowed": false,
+        "final_answer_allowed_because": "verification.finalizer.not_observed",
+        "evidence_refs": [],
+        "reason_codes": [reason_code],
+        "error": sanitize_http_error_message(error),
+        "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
     })
 }
 
@@ -5977,6 +6140,61 @@ mod tests {
             !encoded.contains("sk-test-secret"),
             "Responses SSE tool result payload must not contain raw tool output: {encoded}"
         );
+    }
+
+    #[test]
+    fn compat_run_status_payload_exports_verification_summary() {
+        let snapshot = journal::OrchestratorRunStatusSnapshot {
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAS".to_owned(),
+            state: "done".to_owned(),
+            cancel_requested: false,
+            cancel_reason: None,
+            principal: "user:ops".to_owned(),
+            device_id: "device:test".to_owned(),
+            channel: Some("compat-api".to_owned()),
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            created_at_unix_ms: 1_000,
+            started_at_unix_ms: 1_100,
+            completed_at_unix_ms: Some(1_200),
+            updated_at_unix_ms: 1_200,
+            last_error: None,
+            origin_kind: "compat".to_owned(),
+            origin_run_id: None,
+            parent_run_id: None,
+            triggered_by_principal: None,
+            parameter_delta_json: None,
+            delegation: None,
+            merge_result: None,
+            tape_events: 4,
+        };
+        let summary = json!({
+            "schema_version": 1,
+            "state": "available",
+            "latest_verification_status": {
+                "decision": "fresh",
+                "latest_status": "passed"
+            },
+            "commands_executed": [{
+                "command": "cargo test --workspace",
+                "status": "passed"
+            }],
+            "final_answer_allowed": true,
+            "final_answer_allowed_because": "verification.finalizer.fresh_verification_found"
+        });
+
+        let payload = build_compat_run_status_payload(&snapshot, None, summary);
+
+        assert_eq!(payload["object"], "run");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(
+            payload.pointer("/verification_summary/latest_verification_status/decision"),
+            Some(&json!("fresh"))
+        );
+        assert_eq!(payload.pointer("/verification_summary/delegation"), Some(&Value::Null));
+        assert_eq!(payload.pointer("/verification_summary/merge_result"), Some(&Value::Null));
     }
 
     #[test]

@@ -8473,6 +8473,79 @@ impl JournalStore {
         Ok(events)
     }
 
+    /// Returns the most recent journal events for one run, newest first.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn recent_for_run(
+        &self,
+        run_id: &str,
+        requested_limit: usize,
+    ) -> Result<Vec<JournalEventRecord>, JournalError> {
+        let limit = requested_limit.clamp(1, MAX_RECENT_EVENTS_LIMIT) as i64;
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    seq,
+                    event_ulid,
+                    session_ulid,
+                    run_ulid,
+                    kind,
+                    actor,
+                    timestamp_unix_ms,
+                    payload_json,
+                    redacted,
+                    hash,
+                    prev_hash,
+                    principal,
+                    device_id,
+                    channel,
+                    created_at_unix_ms
+                FROM journal_events
+                WHERE run_ulid = ?1
+                ORDER BY seq DESC
+                LIMIT ?2
+            "#,
+        )?;
+        let mut rows = statement.query(params![run_id, limit])?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            events.push(JournalEventRecord {
+                seq: row.get(0)?,
+                event_id: row.get(1)?,
+                session_id: row.get(2)?,
+                run_id: row.get(3)?,
+                kind: row.get(4)?,
+                actor: row.get(5)?,
+                timestamp_unix_ms: row.get(6)?,
+                payload_json: row.get(7)?,
+                redacted: row.get::<_, i64>(8)? == 1,
+                hash: row.get(9)?,
+                prev_hash: row.get(10)?,
+                principal: row.get(11)?,
+                device_id: row.get(12)?,
+                channel: row.get(13)?,
+                created_at_unix_ms: row.get(14)?,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Returns the total number of journal events for one run.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn total_events_for_run(&self, run_id: &str) -> Result<usize, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let total_events: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM journal_events WHERE run_ulid = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(total_events.max(0) as usize)
+    }
+
     /// Test-only direct upsert of a session row.
     ///
     /// # Errors

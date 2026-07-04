@@ -1,6 +1,6 @@
 {
   "acp_protocol": {
-    "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned.",
+    "changelog_note": "ACP bridge scopes, capabilities, commands, permission outcomes, and binding vocabularies are pinned; run.get is read-only run status.",
     "enums": [
       {
         "changelog_note": "ACP transport labels identify the bridge ingress.",
@@ -136,9 +136,9 @@
         ]
       },
       {
-        "changelog_note": "ACP command names are public method identifiers; acp.status remains an alias.",
+        "changelog_note": "ACP command names are public method identifiers; run.get exposes read-only run status and acp.status remains an alias.",
         "name": "AcpCommand",
-        "snapshot_version": "runtime-contracts.acp_command.v1",
+        "snapshot_version": "runtime-contracts.acp_command.v2",
         "values": [
           {
             "canonical": "status",
@@ -196,6 +196,10 @@
           },
           {
             "canonical": "run.abort",
+            "deprecated_aliases": []
+          },
+          {
+            "canonical": "run.get",
             "deprecated_aliases": []
           },
           {
@@ -452,7 +456,7 @@
       "max": 1,
       "min": 1
     },
-    "snapshot_version": "runtime-contracts.acp.v1"
+    "snapshot_version": "runtime-contracts.acp.v2"
   },
   "changelog_note": "Adds the canonical public runtime event taxonomy for run, model, tool, approval, verification, and heartbeat streams.",
   "compatibility_policy": {

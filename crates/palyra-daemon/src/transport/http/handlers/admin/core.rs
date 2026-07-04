@@ -517,10 +517,11 @@ pub(crate) async fn admin_run_status_handler(
             "orchestrator run not found after resolving {run_id} to {diagnostics_run_id}"
         ))));
     };
-    Ok(Json(
-        run_status_payload(&snapshot)
-            .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
-    ))
+    let verification_summary = collect_run_verification_summary(&state, &snapshot).await;
+    let mut payload = run_status_payload(&snapshot)
+        .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
+    payload["verification_summary"] = verification_summary;
+    Ok(Json(payload))
 }
 
 fn run_status_payload(snapshot: &OrchestratorRunStatusSnapshot) -> Result<Value, String> {
@@ -528,6 +529,153 @@ fn run_status_payload(snapshot: &OrchestratorRunStatusSnapshot) -> Result<Value,
         .map_err(|error| format!("failed to serialize run status snapshot: {error}"))?;
     enrich_run_status_lifecycle(&mut payload, snapshot);
     Ok(payload)
+}
+
+async fn collect_run_verification_summary(
+    state: &AppState,
+    snapshot: &OrchestratorRunStatusSnapshot,
+) -> Value {
+    let journal = match state.runtime.journal_snapshot_for_run(snapshot.run_id.clone(), 256).await {
+        Ok(journal) => journal,
+        Err(error) => {
+            return verification_summary_unavailable(
+                state.runtime.config.feature_rollouts.verification_runtime.enabled,
+                "verification.status.journal_unavailable",
+                format!("failed to load run verification journal: {error}").as_str(),
+            );
+        }
+    };
+    let (projections, diagnostics) = verification_summary_inputs_from_journal(&journal.events);
+    let finalizer = collect_run_verification_finalizer(state, snapshot).await;
+    let summary = crate::application::verification::verification_summary_for_public_artifact(
+        crate::application::verification::VerificationSummaryRequest {
+            rollout_enabled: state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            journal_total_events: journal.total_events,
+            journal_window_events: u64::try_from(journal.events.len()).unwrap_or(u64::MAX),
+            projections: projections.as_slice(),
+            diagnostics: diagnostics.as_slice(),
+            finalizer: finalizer.as_ref(),
+        },
+    );
+    serde_json::to_value(summary).unwrap_or_else(|error| {
+        verification_summary_unavailable(
+            state.runtime.config.feature_rollouts.verification_runtime.enabled,
+            "verification.status.serialization_failed",
+            format!("failed to serialize run verification summary: {error}").as_str(),
+        )
+    })
+}
+
+fn verification_summary_inputs_from_journal(
+    events: &[crate::journal::JournalEventRecord],
+) -> (
+    Vec<crate::application::verification::VerificationJournalProjection>,
+    Vec<crate::application::verification::VerificationSummaryDiagnostic>,
+) {
+    let mut projections = Vec::new();
+    let mut diagnostics = Vec::new();
+    for event in events {
+        let Ok(payload) = serde_json::from_str::<Value>(event.payload_json.as_str()) else {
+            continue;
+        };
+        if let Some(projection) =
+            crate::application::verification::verification_projection_from_payload(&payload)
+        {
+            projections.push(projection);
+            continue;
+        }
+        if let Some(diagnostic) =
+            crate::application::verification::verification_diagnostic_from_payload(&payload)
+        {
+            diagnostics.push(diagnostic);
+        }
+    }
+    (projections, diagnostics)
+}
+
+async fn collect_run_verification_finalizer(
+    state: &AppState,
+    snapshot: &OrchestratorRunStatusSnapshot,
+) -> Option<Value> {
+    let after_seq = tail_tape_after_seq(snapshot.tape_events, 256);
+    let tape = state
+        .runtime
+        .orchestrator_tape_snapshot(snapshot.run_id.clone(), after_seq, Some(256))
+        .await
+        .ok()?;
+    tape.events.iter().rev().find_map(|event| {
+        let payload = serde_json::from_str::<Value>(event.payload_json.as_str()).ok()?;
+        payload.pointer("/finalization/verification_finalizer").cloned()
+    })
+}
+
+fn tail_tape_after_seq(tape_events: u64, limit: usize) -> Option<i64> {
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    (tape_events > limit).then(|| {
+        i64::try_from(tape_events.saturating_sub(limit).saturating_sub(1)).unwrap_or(i64::MAX)
+    })
+}
+
+fn verification_summary_unavailable(
+    rollout_enabled: bool,
+    reason_code: &str,
+    error: &str,
+) -> Value {
+    json!({
+        "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+        "state": if rollout_enabled { "unavailable" } else { "disabled" },
+        "rollout_enabled": rollout_enabled,
+        "changed_files": [],
+        "commands_executed": [],
+        "command_classification": [],
+        "latest_verification_status": {
+            "schema_version": crate::application::verification::VERIFICATION_SCHEMA_VERSION,
+            "decision": if rollout_enabled { "unknown" } else { "disabled" },
+            "rollout_enabled": rollout_enabled,
+            "journal_total_events": Value::Null,
+            "journal_window_events": 0,
+            "verification_projection_events": 0,
+            "classified_commands": 0,
+            "recorded_events": 0,
+            "passing_events": 0,
+            "failed_events": 0,
+            "stale_requirements": 0,
+            "fresh_requirements": 0,
+            "unknown_requirements": 0,
+            "latest_event_type": Value::Null,
+            "latest_status": Value::Null,
+            "latest_created_at_unix_ms": Value::Null,
+            "reason_codes": [reason_code],
+            "journal_events": [
+                crate::application::verification::VERIFICATION_COMMAND_CLASSIFIED,
+                crate::application::verification::VERIFICATION_EVENT_RECORDED,
+                crate::application::verification::VERIFICATION_STATE_STALE,
+                crate::application::verification::VERIFICATION_FRESHNESS_CHECKED,
+            ],
+            "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
+        },
+        "unverified_mutations": [],
+        "stale_evidence_reasons": [reason_code],
+        "diagnostics": [],
+        "final_answer": {
+            "observed": false,
+            "status": Value::Null,
+            "reason_code": Value::Null,
+            "allowed": false,
+            "allowed_because": "verification.finalizer.not_observed",
+            "pending_requirement_count": Value::Null,
+            "satisfied_requirement_count": Value::Null,
+            "evidence_refs": [],
+            "nudge": Value::Null,
+            "unverified_reason": Value::Null,
+        },
+        "final_answer_allowed": false,
+        "final_answer_allowed_because": "verification.finalizer.not_observed",
+        "evidence_refs": [],
+        "reason_codes": [reason_code],
+        "error": sanitize_http_error_message(error),
+        "redaction_level": crate::application::verification::VERIFICATION_REDACTION_LEVEL,
+    })
 }
 
 fn enrich_run_status_lifecycle(payload: &mut Value, snapshot: &OrchestratorRunStatusSnapshot) {
@@ -611,8 +759,14 @@ pub(crate) async fn admin_run_wait_handler(
             timeout_ms,
             false,
             Some(outcome.canonical_state.as_str()),
-            run_status_payload(&outcome.snapshot)
-                .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
+            {
+                let verification_summary =
+                    collect_run_verification_summary(&state, &outcome.snapshot).await;
+                let mut run = run_status_payload(&outcome.snapshot)
+                    .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
+                run["verification_summary"] = verification_summary;
+                run
+            },
         ),
         Err(error) if error.code() == tonic::Code::DeadlineExceeded => {
             let snapshot = state
@@ -625,14 +779,14 @@ pub(crate) async fn admin_run_wait_handler(
                         "orchestrator run not found after resolving {run_id} to {diagnostics_run_id}"
                     )))
                 })?;
-            admin_run_wait_payload(
-                snapshot.run_id.as_str(),
-                timeout_ms,
-                true,
-                None,
-                run_status_payload(&snapshot)
-                    .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?,
-            )
+            admin_run_wait_payload(snapshot.run_id.as_str(), timeout_ms, true, None, {
+                let verification_summary =
+                    collect_run_verification_summary(&state, &snapshot).await;
+                let mut run = run_status_payload(&snapshot)
+                    .map_err(|error| runtime_status_response(tonic::Status::internal(error)))?;
+                run["verification_summary"] = verification_summary;
+                run
+            })
         }
         Err(error) => return Err(runtime_status_response(error)),
     };

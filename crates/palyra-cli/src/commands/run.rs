@@ -377,6 +377,7 @@ fn build_run_trajectory_jsonl(
             "subagent",
             "mcp_import",
             "policy_decision",
+            "verification_summary",
             "final_answer",
             "usage",
             "artifact"
@@ -480,6 +481,13 @@ fn build_run_trajectory_events(
             }),
         );
     }
+    push_trajectory_row(
+        &mut rows,
+        &mut seq,
+        "verification_summary",
+        "verification_summary",
+        build_run_verification_summary(bundle),
+    );
     push_trajectory_row(
         &mut rows,
         &mut seq,
@@ -634,8 +642,414 @@ fn project_tape_payload(event_type: &str, payload: &Value) -> Value {
     payload.clone()
 }
 
+fn build_run_verification_summary(bundle: &ReplayBundle) -> Value {
+    for event in &bundle.tape_events {
+        if event.event_type == "verification_summary" && event.payload.is_object() {
+            return event.payload.clone();
+        }
+        if let Some(summary) =
+            event.payload.get("verification_summary").filter(|value| value.is_object())
+        {
+            return summary.clone();
+        }
+    }
+
+    let mut changed_files = Vec::new();
+    let mut commands_executed = Vec::new();
+    let mut command_classification = Vec::new();
+    let mut unverified_mutations = Vec::new();
+    let mut stale_evidence_reasons = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut evidence_refs = Vec::new();
+    let mut reason_codes = Vec::new();
+    let mut finalizer = Value::Null;
+
+    for event in &bundle.tape_events {
+        let payload = &event.payload;
+        if let Some(projection_type) = payload.get("event_type").and_then(Value::as_str) {
+            reason_codes.extend(json_string_array(payload.get("reason_codes")));
+            evidence_refs.extend(json_string_array(payload.get("evidence_refs")));
+            if projection_type == "verification.command.classified" {
+                if let Some(classification) = payload.get("classification") {
+                    command_classification.push(public_verification_classification(
+                        classification,
+                        payload.get("created_at_unix_ms").and_then(Value::as_i64).unwrap_or(0),
+                    ));
+                    if !classification
+                        .get("is_verification")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        commands_executed.push(public_verification_command_from_classification(
+                            classification,
+                            payload.get("created_at_unix_ms").and_then(Value::as_i64).unwrap_or(0),
+                            payload.get("evidence_refs"),
+                        ));
+                    }
+                }
+            }
+            if projection_type == "verification.event.recorded" {
+                if let Some(verification_event) = payload.get("event") {
+                    changed_files.extend(
+                        verification_event
+                            .get("changed_paths")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(public_verification_path),
+                    );
+                    commands_executed
+                        .push(public_verification_command_from_event(verification_event));
+                }
+            }
+            if projection_type == "verification.state.stale" {
+                if let Some(state) = payload.get("state") {
+                    changed_files.extend(
+                        state
+                            .pointer("/requirement/changed_paths")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(public_verification_path),
+                    );
+                    let mutation = public_unverified_mutation_from_state(state);
+                    stale_evidence_reasons
+                        .extend(json_string_array(state.pointer("/freshness/reason_codes")));
+                    if let Some(reason) =
+                        state.pointer("/requirement/reason_code").and_then(Value::as_str)
+                    {
+                        stale_evidence_reasons.push(reason.to_owned());
+                    }
+                    unverified_mutations.push(mutation);
+                }
+            }
+            if projection_type == "verification.freshness.checked"
+                && payload
+                    .pointer("/freshness/status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status != "fresh")
+            {
+                stale_evidence_reasons
+                    .extend(json_string_array(payload.pointer("/freshness/reason_codes")));
+            }
+        }
+
+        if let Some(event_name) = payload.get("event").and_then(Value::as_str) {
+            if event_name.contains("diagnostics.delta") {
+                let diagnostic = json!({
+                    "event_type": event_name,
+                    "new_errors": payload.get("new_errors").and_then(Value::as_u64).unwrap_or(0),
+                    "new_warnings": payload.get("new_warnings").and_then(Value::as_u64).unwrap_or(0),
+                    "degraded": payload.get("degraded").and_then(Value::as_bool).unwrap_or(false),
+                    "reason_codes": json_string_array(payload.get("reason_codes")),
+                    "evidence_refs": json_string_array(payload.get("evidence_refs")),
+                });
+                if diagnostic.get("degraded").and_then(Value::as_bool).unwrap_or(false)
+                    || diagnostic.get("new_errors").and_then(Value::as_u64).unwrap_or(0) > 0
+                {
+                    stale_evidence_reasons
+                        .extend(json_string_array(diagnostic.get("reason_codes")));
+                }
+                evidence_refs.extend(json_string_array(diagnostic.get("evidence_refs")));
+                reason_codes.extend(json_string_array(diagnostic.get("reason_codes")));
+                diagnostics.push(diagnostic);
+            }
+        }
+
+        if let Some(value) = payload.pointer("/finalization/verification_finalizer") {
+            finalizer = value.clone();
+        }
+    }
+
+    let final_answer = public_final_answer_verification(&finalizer);
+    evidence_refs.extend(json_string_array(final_answer.get("evidence_refs")));
+    if let Some(reason) = final_answer.get("reason_code").and_then(Value::as_str) {
+        reason_codes.push(reason.to_owned());
+        if !final_answer.get("allowed").and_then(Value::as_bool).unwrap_or(false) {
+            stale_evidence_reasons.push(reason.to_owned());
+        }
+    }
+    let latest_status = latest_verification_status(
+        commands_executed.as_slice(),
+        unverified_mutations.as_slice(),
+        command_classification.len(),
+    );
+    let final_answer_allowed =
+        final_answer.get("allowed").and_then(Value::as_bool).unwrap_or(false);
+    let final_answer_allowed_because = final_answer
+        .get("allowed_because")
+        .and_then(Value::as_str)
+        .unwrap_or("verification.finalizer.not_observed")
+        .to_owned();
+    let state = if commands_executed.is_empty()
+        && command_classification.is_empty()
+        && unverified_mutations.is_empty()
+        && diagnostics.is_empty()
+        && !final_answer.get("observed").and_then(Value::as_bool).unwrap_or(false)
+    {
+        "not_available"
+    } else {
+        "available"
+    };
+
+    json!({
+        "schema_version": 1,
+        "state": state,
+        "rollout_enabled": true,
+        "changed_files": normalize_strings(changed_files),
+        "commands_executed": commands_executed,
+        "command_classification": command_classification,
+        "latest_verification_status": latest_status,
+        "unverified_mutations": unverified_mutations,
+        "stale_evidence_reasons": normalize_strings(stale_evidence_reasons),
+        "diagnostics": diagnostics,
+        "final_answer": final_answer,
+        "final_answer_allowed": final_answer_allowed,
+        "final_answer_allowed_because": final_answer_allowed_because,
+        "evidence_refs": normalize_strings(evidence_refs),
+        "reason_codes": normalize_strings(reason_codes),
+        "redaction_level": "metadata_and_redacted_summary",
+    })
+}
+
+fn public_verification_classification(classification: &Value, created_at_unix_ms: i64) -> Value {
+    json!({
+        "command": classification
+            .pointer("/canonical_command/display")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "is_verification": classification
+            .get("is_verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "kind": classification.get("kind").and_then(Value::as_str).unwrap_or("unknown"),
+        "scope": classification.get("scope").and_then(Value::as_str).unwrap_or("unknown"),
+        "created_at_unix_ms": created_at_unix_ms,
+        "reason_codes": json_string_array(classification.get("reason_codes")),
+    })
+}
+
+fn public_verification_command_from_classification(
+    classification: &Value,
+    created_at_unix_ms: i64,
+    evidence_refs: Option<&Value>,
+) -> Value {
+    json!({
+        "command": classification
+            .pointer("/canonical_command/display")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "is_verification": false,
+        "kind": classification.get("kind").and_then(Value::as_str).unwrap_or("unknown"),
+        "scope": classification.get("scope").and_then(Value::as_str).unwrap_or("unknown"),
+        "status": Value::Null,
+        "exit_code": Value::Null,
+        "created_at_unix_ms": created_at_unix_ms,
+        "evidence_refs": json_string_array(evidence_refs),
+        "reason_codes": json_string_array(classification.get("reason_codes")),
+    })
+}
+
+fn public_verification_command_from_event(event: &Value) -> Value {
+    json!({
+        "command": event
+            .get("canonical_command")
+            .and_then(Value::as_str)
+            .or_else(|| event.get("command").and_then(Value::as_str))
+            .unwrap_or(""),
+        "is_verification": true,
+        "kind": event.get("kind").and_then(Value::as_str).unwrap_or("unknown"),
+        "scope": event.get("scope").and_then(Value::as_str).unwrap_or("unknown"),
+        "status": event.get("status").and_then(Value::as_str),
+        "exit_code": event.get("exit_code").and_then(Value::as_i64),
+        "created_at_unix_ms": event.get("created_at_unix_ms").and_then(Value::as_i64).unwrap_or(0),
+        "evidence_refs": json_string_array(event.get("evidence_refs")),
+        "reason_codes": json_string_array(event.get("reason_codes")),
+    })
+}
+
+fn public_unverified_mutation_from_state(state: &Value) -> Value {
+    json!({
+        "requirement_id": state
+            .pointer("/requirement/requirement_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "required_kind": state
+            .pointer("/requirement/required_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "changed_files": normalize_strings(
+            state
+                .pointer("/requirement/changed_paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(public_verification_path)
+                .collect(),
+        ),
+        "freshness_status": state
+            .pointer("/freshness/status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        "min_created_at_unix_ms": state
+            .pointer("/requirement/min_created_at_unix_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        "reason_codes": normalize_strings(
+            json_string_array(state.pointer("/freshness/reason_codes"))
+                .into_iter()
+                .chain(
+                    state
+                        .pointer("/requirement/reason_code")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                )
+                .collect(),
+        ),
+    })
+}
+
+fn public_final_answer_verification(finalizer: &Value) -> Value {
+    let status = finalizer.get("status").and_then(Value::as_str);
+    let reason_code = finalizer.get("reason_code").and_then(Value::as_str);
+    let unverified_reason = finalizer.get("unverified_reason").and_then(Value::as_str);
+    let allowed = matches!(status, Some("not_required" | "verified" | "unverified_allowed"));
+    let allowed_because = match status {
+        Some("verified") => "verification.finalizer.fresh_verification_found".to_owned(),
+        Some("unverified_allowed") => unverified_reason
+            .map(|reason| format!("verification.finalizer.unverified_allowed:{reason}"))
+            .unwrap_or_else(|| "verification.finalizer.unverified_allowed".to_owned()),
+        Some("not_required") => {
+            reason_code.unwrap_or("verification.finalizer.not_required").to_owned()
+        }
+        Some("nudge_required") => {
+            reason_code.unwrap_or("verification.finalizer.nudge_required").to_owned()
+        }
+        Some(_) => reason_code.unwrap_or("verification.finalizer.unknown").to_owned(),
+        None => "verification.finalizer.not_observed".to_owned(),
+    };
+    json!({
+        "observed": finalizer.is_object(),
+        "status": status,
+        "reason_code": reason_code,
+        "allowed": allowed,
+        "allowed_because": allowed_because,
+        "pending_requirement_count": finalizer.get("pending_requirement_count").and_then(Value::as_u64),
+        "satisfied_requirement_count": finalizer.get("satisfied_requirement_count").and_then(Value::as_u64),
+        "evidence_refs": json_string_array(finalizer.get("evidence_refs")),
+        "nudge": finalizer.get("nudge").and_then(Value::as_str),
+        "unverified_reason": unverified_reason,
+    })
+}
+
+fn latest_verification_status(
+    commands_executed: &[Value],
+    unverified_mutations: &[Value],
+    classified_commands: usize,
+) -> Value {
+    let failed_events = commands_executed
+        .iter()
+        .filter(|command| {
+            command
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "failed" | "timed_out" | "cancelled"))
+        })
+        .count();
+    let passing_events = commands_executed
+        .iter()
+        .filter(|command| command.get("status").and_then(Value::as_str) == Some("passed"))
+        .count();
+    let stale_requirements = unverified_mutations.len();
+    let decision = if stale_requirements > 0 {
+        "stale"
+    } else if failed_events > 0 {
+        "failed"
+    } else if passing_events > 0 {
+        "fresh"
+    } else if classified_commands == 0 {
+        "no_evidence"
+    } else {
+        "unknown"
+    };
+    json!({
+        "schema_version": 1,
+        "decision": decision,
+        "rollout_enabled": true,
+        "journal_total_events": Value::Null,
+        "journal_window_events": Value::Null,
+        "verification_projection_events": Value::Null,
+        "classified_commands": classified_commands,
+        "recorded_events": commands_executed
+            .iter()
+            .filter(|command| command.get("is_verification").and_then(Value::as_bool).unwrap_or(false))
+            .count(),
+        "passing_events": passing_events,
+        "failed_events": failed_events,
+        "stale_requirements": stale_requirements,
+        "fresh_requirements": 0,
+        "unknown_requirements": 0,
+        "latest_event_type": Value::Null,
+        "latest_status": commands_executed
+            .iter()
+            .rev()
+            .find_map(|command| command.get("status").and_then(Value::as_str)),
+        "latest_created_at_unix_ms": commands_executed
+            .iter()
+            .filter_map(|command| command.get("created_at_unix_ms").and_then(Value::as_i64))
+            .max(),
+        "reason_codes": [format!("verification.status.replay_export.{decision}")],
+        "journal_events": [
+            "verification.command.classified",
+            "verification.event.recorded",
+            "verification.state.stale",
+            "verification.freshness.checked",
+        ],
+        "redaction_level": "metadata_and_redacted_summary",
+    })
+}
+
+fn public_verification_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return ".".to_owned();
+    }
+    let path = trimmed.replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    let has_drive_prefix = path.as_bytes().get(1).is_some_and(|byte| *byte == b':');
+    let looks_absolute = path.starts_with('/') || has_drive_prefix || path.starts_with("~/");
+    let contains_private_home =
+        lower.contains("/users/") || lower.contains("/home/") || lower.contains("/desktop/");
+    if looks_absolute || contains_private_home || path.contains("..") {
+        "<redacted:path>".to_owned()
+    } else {
+        path.trim_start_matches("./").to_owned()
+    }
+}
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+fn normalize_strings(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn trajectory_event_category(event_type: &str) -> &'static str {
     match event_type {
+        "verification_summary" => "verification_summary",
         "model_token" | "provider.stream.delta" | "provider.stream.completed" => "provider_stream",
         "tool_proposal" => "tool_proposal",
         "tool_result" | "tool_attestation" => "tool_output",
@@ -644,6 +1058,7 @@ fn trajectory_event_category(event_type: &str) -> &'static str {
         value if value.contains("compact") => "compaction_boundary",
         value if value.contains("subagent") || value.contains("delegation") => "subagent",
         value if value.contains("mcp") => "mcp_import",
+        value if value.contains("verification") => "verification_summary",
         value if value.contains("policy") || value.contains("decision") => "policy_decision",
         "final_answer" | "run_completed" => "final_answer",
         _ => "provider_stream",
@@ -911,6 +1326,23 @@ fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunRep
             "prompt_tokens": payload.get("prompt_tokens").and_then(Value::as_i64),
             "completion_tokens": payload.get("completion_tokens").and_then(Value::as_i64),
             "total_tokens": payload.get("total_tokens").and_then(Value::as_i64),
+        }),
+        "verification_summary" => json!({
+            "decision": payload
+                .pointer("/latest_verification_status/decision")
+                .and_then(Value::as_str),
+            "commands": payload
+                .get("commands_executed")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            "unverified_mutations": payload
+                .get("unverified_mutations")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            "final_answer_allowed": payload.get("final_answer_allowed").and_then(Value::as_bool),
+            "final_answer_allowed_because": payload
+                .get("final_answer_allowed_because")
+                .and_then(Value::as_str),
         }),
         value if value.contains("mcp") => project_mcp_public_payload(payload),
         _ => json!({}),
@@ -1315,6 +1747,7 @@ fn build_run_export_payload(
     redacted: bool,
 ) -> Result<Value> {
     let manifest = build_run_export_manifest(bundle, format, redacted)?;
+    let verification_summary = build_run_verification_summary(bundle);
     let payload = match format {
         RunExportFormatArg::PalyraAttested => json!({
             "schema_version": 1,
@@ -1335,6 +1768,7 @@ fn build_run_export_payload(
                     "flow_events": bundle.flow_events,
                 },
                 "attestations": build_tool_attestation_index(bundle),
+                "verification_summary": verification_summary,
                 "artifact_refs": bundle.artifact_refs,
                 "expected": bundle.expected,
                 "redaction_manifest": bundle.redaction,
@@ -1393,6 +1827,7 @@ fn build_run_export_payload(
                 "tool_calls": bundle.tool_exchanges,
                 "approvals": bundle.approvals,
                 "attestations": build_tool_attestation_index(bundle),
+                "verification_summary": verification_summary,
                 "artifacts": bundle.artifact_refs,
             },
         }),
@@ -1451,6 +1886,7 @@ fn build_run_export_manifest(
             "approvals": !bundle.approvals.is_empty(),
             "tool_calls": !bundle.tool_exchanges.is_empty(),
             "attestations": bundle.tool_exchanges.iter().any(|exchange| exchange.attestation.is_some()),
+            "verification_summary": true,
             "artifact_ids": !bundle.artifact_refs.is_empty(),
             "redaction_manifest": true,
             "final_response": bundle.expected.final_answer_summary.is_some()
@@ -1579,6 +2015,60 @@ mod tests {
             "trajectory JSONL should export backend execution manifests"
         );
         assert!(!text.contains("secret-token"));
+    }
+
+    #[test]
+    fn trajectory_jsonl_includes_verification_summary() {
+        let bundle = fixture_verification_bundle();
+
+        let (bytes, _) =
+            build_run_trajectory_jsonl(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        let values = String::from_utf8(bytes)
+            .expect("trajectory should be UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("jsonl row should parse"))
+            .collect::<Vec<_>>();
+        let manifest = &values[0];
+        let summary_event = values
+            .iter()
+            .find(|row| {
+                row.get("event_type").and_then(Value::as_str) == Some("verification_summary")
+            })
+            .expect("verification summary event should be exported");
+
+        assert!(manifest
+            .get("event_classes")
+            .and_then(Value::as_array)
+            .is_some_and(|classes| classes.iter().any(|class| class == "verification_summary")));
+        assert_eq!(
+            summary_event.get("category").and_then(Value::as_str),
+            Some("verification_summary")
+        );
+        assert_eq!(
+            summary_event.pointer("/payload/latest_verification_status/decision"),
+            Some(&json!("stale"))
+        );
+        assert_eq!(
+            summary_event.pointer("/payload/commands_executed/0/status"),
+            Some(&json!("passed"))
+        );
+        assert_eq!(
+            summary_event.pointer("/payload/changed_files/0"),
+            Some(&json!("<redacted:path>"))
+        );
+        assert_eq!(summary_event.pointer("/payload/final_answer_allowed"), Some(&json!(false)));
+        assert_eq!(
+            summary_event.pointer("/payload/final_answer_allowed_because"),
+            Some(&json!("verification.finalizer.stale_after_code_mutation"))
+        );
+
+        let export =
+            build_run_export_payload(&bundle, RunExportFormatArg::PalyraAttested, true).unwrap();
+        assert_eq!(export.pointer("/manifest/includes/verification_summary"), Some(&json!(true)));
+        assert_eq!(
+            export.pointer("/trajectory/verification_summary/latest_verification_status/decision"),
+            Some(&json!("stale"))
+        );
     }
 
     #[test]
@@ -1853,6 +2343,113 @@ mod tests {
                         "catalog_generation": 7,
                         "status": "available",
                         "imported_tools": ["mcp.docs.search", "mcp.docs.write_note"]
+                    }),
+                },
+            ],
+        )
+    }
+
+    fn fixture_verification_bundle() -> ReplayBundle {
+        fixture_bundle_with_named_tool(
+            "palyra.shell",
+            json!({
+                "proposal_id": "proposal-1",
+                "success": true,
+                "output_json": "done",
+                "error": "",
+                "attestation": { "execution_sha256": "a".repeat(64) },
+            }),
+            vec![
+                ReplayTapeEvent {
+                    seq: 1,
+                    event_type: "verification.command.classified".to_owned(),
+                    payload: json!({
+                        "event_type": "verification.command.classified",
+                        "created_at_unix_ms": 1_000,
+                        "reason_codes": ["verification.command_classified", "verification.command_supported"],
+                        "evidence_refs": ["tool_call:process-1"],
+                        "classification": {
+                            "canonical_command": {
+                                "display": "cargo test --workspace"
+                            },
+                            "is_verification": true,
+                            "kind": "test",
+                            "scope": "workspace",
+                            "reason_codes": ["verification.command_classified", "verification.command_supported"]
+                        }
+                    }),
+                },
+                ReplayTapeEvent {
+                    seq: 2,
+                    event_type: "verification.event.recorded".to_owned(),
+                    payload: json!({
+                        "event_type": "verification.event.recorded",
+                        "created_at_unix_ms": 1_100,
+                        "reason_codes": ["verification.event_recorded", "verification.event_status_passed"],
+                        "evidence_refs": ["tool_call:process-1"],
+                        "event": {
+                            "canonical_command": "cargo test --workspace",
+                            "kind": "test",
+                            "scope": "workspace",
+                            "status": "passed",
+                            "exit_code": 0,
+                            "changed_paths": [r"C:\Users\Palo\Desktop\palyra-repo\palyra\src\lib.rs"],
+                            "created_at_unix_ms": 1_100,
+                            "evidence_refs": ["tool_call:process-1"],
+                            "reason_codes": ["verification.event_recorded", "verification.event_status_passed"]
+                        }
+                    }),
+                },
+                ReplayTapeEvent {
+                    seq: 3,
+                    event_type: "verification.state.stale".to_owned(),
+                    payload: json!({
+                        "event_type": "verification.state.stale",
+                        "created_at_unix_ms": 1_200,
+                        "reason_codes": ["verification.required_after_patch", "verification.state_stale"],
+                        "evidence_refs": ["workspace_patch:mutation-1"],
+                        "state": {
+                            "requirement": {
+                                "requirement_id": "verification.required_after_patch.lint",
+                                "required_kind": "lint",
+                                "changed_paths": ["src/lib.rs"],
+                                "min_created_at_unix_ms": 1_150,
+                                "reason_code": "verification.required_after_patch"
+                            },
+                            "freshness": {
+                                "status": "stale",
+                                "reason_codes": ["verification.no_passing_evidence", "verification.state_stale"]
+                            }
+                        }
+                    }),
+                },
+                ReplayTapeEvent {
+                    seq: 4,
+                    event_type: "code_intel.diagnostics.delta".to_owned(),
+                    payload: json!({
+                        "event": "code_intel.diagnostics.delta",
+                        "new_errors": 1,
+                        "new_warnings": 0,
+                        "degraded": false,
+                        "reason_codes": ["code_intel.diagnostics.new_errors"],
+                        "evidence_refs": ["diagnostics:after_patch"]
+                    }),
+                },
+                ReplayTapeEvent {
+                    seq: 5,
+                    event_type: "agent_loop.terminated".to_owned(),
+                    payload: json!({
+                        "event": "agent_loop.terminated",
+                        "finalization": {
+                            "verification_finalizer": {
+                                "status": "nudge_required",
+                                "reason_code": "verification.finalizer.stale_after_code_mutation",
+                                "pending_requirement_count": 1,
+                                "satisfied_requirement_count": 0,
+                                "evidence_refs": ["verification_state:lint"],
+                                "nudge": "Run lint before final answer."
+                            }
+                        }
                     }),
                 },
             ],

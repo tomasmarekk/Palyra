@@ -7232,6 +7232,12 @@ mod agent_stream_output_tests {
             "continuation_required": true,
             "continuation_available": true,
             "reason_code": "wall_clock",
+            "verification_summary": {
+                "state": "available",
+                "latest_verification_status": {
+                    "decision": "stale"
+                }
+            },
             "cancel_requested": false,
             "prompt_tokens": 10,
             "completion_tokens": 2,
@@ -7244,11 +7250,20 @@ mod agent_stream_output_tests {
         assert_eq!(response.lifecycle_state.as_deref(), Some("needs_continuation"));
         assert_eq!(response.continuation_required, Some(true));
         assert_eq!(response.reason_code.as_deref(), Some("wall_clock"));
+        assert_eq!(
+            response
+                .verification_summary
+                .as_ref()
+                .and_then(|summary| summary.pointer("/latest_verification_status/decision"))
+                .and_then(Value::as_str),
+            Some("stale")
+        );
 
         let encoded = serde_json::to_value(&response).expect("response should encode");
         assert_eq!(encoded["lifecycle_state"], "needs_continuation");
         assert_eq!(encoded["continuation_required"], true);
         assert_eq!(encoded["reason_code"], "wall_clock");
+        assert_eq!(encoded["verification_summary"]["state"], "available");
     }
 
     #[test]
@@ -12728,6 +12743,8 @@ struct RunStatusResponse {
     continuation_available: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_summary: Option<Value>,
     cancel_requested: bool,
     prompt_tokens: u64,
     completion_tokens: u64,

@@ -712,8 +712,42 @@ impl PalyraAcpAgent {
                 _ => {}
             }
         }
+        self.send_verification_summary_update(&arguments.session_id, run_input.run_id.as_str())
+            .await?;
 
         Ok(acp::PromptResponse::new(stop_reason))
+    }
+
+    async fn send_verification_summary_update(
+        &self,
+        session_id: &acp::SessionId,
+        run_id: &str,
+    ) -> acp::Result<()> {
+        let Some(text) = self.verification_summary_text_for_run(run_id).await? else {
+            return Ok(());
+        };
+        self.send_session_update(
+            session_id,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::from(
+                text,
+            ))),
+        )
+        .await
+    }
+
+    async fn verification_summary_text_for_run(&self, run_id: &str) -> acp::Result<Option<String>> {
+        let Some(daemon) = &self.daemon else {
+            return Ok(None);
+        };
+        match daemon.command("run.get", json!({ "run_id": run_id })).await {
+            Ok(response) => {
+                Ok(response.get("verification_summary").and_then(format_acp_verification_summary))
+            }
+            Err(_) => Ok(Some(
+                "Verification evidence: unavailable; reason=verification.status.fetch_failed."
+                    .to_owned(),
+            )),
+        }
     }
 }
 
@@ -959,6 +993,38 @@ fn parse_json_bytes(raw: &[u8]) -> Option<Value> {
         return None;
     }
     serde_json::from_slice::<Value>(raw).ok()
+}
+
+fn format_acp_verification_summary(summary: &Value) -> Option<String> {
+    if !summary.is_object() {
+        return None;
+    }
+    let decision = summary
+        .pointer("/latest_verification_status/decision")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let state = summary.get("state").and_then(Value::as_str).unwrap_or("unknown");
+    let final_answer_allowed = summary
+        .get("final_answer_allowed")
+        .and_then(Value::as_bool)
+        .map(|allowed| allowed.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let reason = summary
+        .get("final_answer_allowed_because")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            summary.pointer("/latest_verification_status/reason_codes/0").and_then(Value::as_str)
+        })
+        .unwrap_or("verification.status.unknown");
+    let command_count =
+        summary.get("commands_executed").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let unverified_mutations =
+        summary.get("unverified_mutations").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let stale_requirements =
+        summary.get("stale_evidence_reasons").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    Some(format!(
+        "\nVerification evidence: decision={decision}; state={state}; final_answer_allowed={final_answer_allowed}; reason={reason}; commands={command_count}; unverified_mutations={unverified_mutations}; stale_requirements={stale_requirements}.\n"
+    ))
 }
 
 /// Maps a gateway tool-approval request onto an ACP permission request.
