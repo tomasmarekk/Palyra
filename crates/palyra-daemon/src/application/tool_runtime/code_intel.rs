@@ -53,6 +53,197 @@ pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
 pub(crate) const CODE_INTEL_PYTHON_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.python.snapshot_captured";
 
+/// Diagnostics-only language-server descriptor exposed in redacted snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LanguageServerDescriptor {
+    pub language: CodeIntelLanguage,
+    pub provider: String,
+    pub binary_label: String,
+    pub diagnostics_only: bool,
+    pub supports_symbols: bool,
+    pub supports_references: bool,
+    pub timeout_ms: u64,
+    pub idle_reap_ms: u64,
+    pub redaction_level: String,
+    #[serde(skip)]
+    binary: String,
+}
+
+/// Static registry for the first diagnostics-capable language servers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LanguageServerRegistry {
+    descriptors: BTreeMap<CodeIntelLanguage, LanguageServerDescriptor>,
+}
+
+impl LanguageServerRegistry {
+    fn from_config(config: &CodeIntelConfig) -> Self {
+        let descriptors = [
+            (CodeIntelLanguage::Rust, config.rust_analyzer_binary.as_str()),
+            (CodeIntelLanguage::TypeScript, config.typescript_server_binary.as_str()),
+            (CodeIntelLanguage::Python, config.pyright_binary.as_str()),
+        ]
+        .into_iter()
+        .map(|(language, binary)| {
+            (
+                language,
+                LanguageServerDescriptor {
+                    language,
+                    provider: language.provider_name().to_owned(),
+                    binary_label: diagnostic_binary_label(binary),
+                    diagnostics_only: true,
+                    supports_symbols: false,
+                    supports_references: false,
+                    timeout_ms: config.timeout_ms,
+                    idle_reap_ms: config.idle_reap_ms,
+                    redaction_level:
+                        crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                            .to_owned(),
+                    binary: binary.to_owned(),
+                },
+            )
+        })
+        .collect();
+        Self { descriptors }
+    }
+
+    fn descriptors(&self) -> Vec<LanguageServerDescriptor> {
+        self.descriptors.values().cloned().collect()
+    }
+}
+
+/// Diagnostics supervisor facade for provider process lifecycle decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LspProcessManager {
+    registry: LanguageServerRegistry,
+}
+
+impl LspProcessManager {
+    fn from_config(config: &CodeIntelConfig) -> Self {
+        Self { registry: LanguageServerRegistry::from_config(config) }
+    }
+
+    fn provider_statuses(
+        &self,
+        touched_languages: &BTreeSet<CodeIntelLanguage>,
+    ) -> Vec<CodeIntelProviderStatus> {
+        self.registry
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| provider_status_for_descriptor(descriptor, touched_languages))
+            .collect()
+    }
+
+    fn disabled_provider_statuses(&self) -> Vec<CodeIntelProviderStatus> {
+        self.registry
+            .descriptors()
+            .into_iter()
+            .map(|descriptor| CodeIntelProviderStatus {
+                provider: descriptor.provider,
+                language: descriptor.language,
+                status: "disabled".to_owned(),
+                binary: descriptor.binary_label,
+                reason_code: "code_intel.disabled".to_owned(),
+                repair_hint:
+                    "Set tool_call.code_intel.enabled=true to enable post-write diagnostics."
+                        .to_owned(),
+            })
+            .collect()
+    }
+}
+
+/// Result of resolving the workspace root used by diagnostics providers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkspaceRootResolution {
+    pub workspace_root: Option<PathBuf>,
+    pub reason_codes: Vec<String>,
+    pub redaction_level: String,
+}
+
+/// Workspace-root resolver that keeps diagnostics scoped to agent roots.
+pub(crate) struct WorkspaceRootResolver<'a> {
+    config: &'a CodeIntelConfig,
+    workspace_roots: &'a [PathBuf],
+}
+
+impl<'a> WorkspaceRootResolver<'a> {
+    fn new(config: &'a CodeIntelConfig, workspace_roots: &'a [PathBuf]) -> Self {
+        Self { config, workspace_roots }
+    }
+
+    fn resolve(&self) -> WorkspaceRootResolution {
+        let mut reason_codes = Vec::new();
+        if let Some(configured) = self.config.workspace_root.as_ref() {
+            if self.workspace_roots.is_empty()
+                || self.workspace_roots.iter().any(|root| path_is_within_root(configured, root))
+            {
+                return WorkspaceRootResolution {
+                    workspace_root: Some(configured.clone()),
+                    reason_codes,
+                    redaction_level:
+                        crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                            .to_owned(),
+                };
+            }
+            reason_codes.push("code_intel.workspace_root_rejected".to_owned());
+        }
+        WorkspaceRootResolution {
+            workspace_root: self.workspace_roots.first().cloned(),
+            reason_codes,
+            redaction_level: crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                .to_owned(),
+        }
+    }
+}
+
+/// One line-shift rule for comparing diagnostics across a patch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RangeShift {
+    pub path: String,
+    pub start_line: u32,
+    pub old_line_count: u32,
+    pub new_line_count: u32,
+}
+
+/// Maps after-patch diagnostic positions back to pre-patch coordinates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RangeShiftMapper {
+    shifts_by_path: BTreeMap<String, Vec<RangeShift>>,
+}
+
+impl RangeShiftMapper {
+    #[cfg(test)]
+    fn new(shifts: Vec<RangeShift>) -> Self {
+        let mut shifts_by_path = BTreeMap::<String, Vec<RangeShift>>::new();
+        for shift in shifts {
+            shifts_by_path.entry(shift.path.clone()).or_default().push(shift);
+        }
+        for shifts in shifts_by_path.values_mut() {
+            shifts.sort_by_key(|shift| shift.start_line);
+        }
+        Self { shifts_by_path }
+    }
+
+    fn identity_for_files(files: &BTreeSet<String>) -> Self {
+        let shifts_by_path =
+            files.iter().map(|path| (path.clone(), Vec::new())).collect::<BTreeMap<_, _>>();
+        Self { shifts_by_path }
+    }
+
+    fn map_after_position(&self, path: &str, line: u32, column: u32) -> (u32, u32) {
+        let Some(shifts) = self.shifts_by_path.get(path) else {
+            return (line, column);
+        };
+        let mut mapped_line = i64::from(line);
+        for shift in shifts {
+            if line <= shift.start_line {
+                continue;
+            }
+            mapped_line -= i64::from(shift.new_line_count) - i64::from(shift.old_line_count);
+        }
+        (u32::try_from(mapped_line.max(1)).unwrap_or(u32::MAX), column)
+    }
+}
+
 /// Normalized diagnostic severity. Higher ranks are worse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,13 +326,14 @@ pub(crate) fn capture_diagnostic_snapshot(
     workspace_roots: &[PathBuf],
     files_touched: &[WorkspacePatchFileAttestation],
 ) -> DiagnosticSnapshot {
+    let process_manager = LspProcessManager::from_config(config);
     if !config.enabled {
         return DiagnosticSnapshot {
             schema_version: CODE_INTEL_SCHEMA_VERSION,
             enabled: false,
             workspace_root: None,
             files: Vec::new(),
-            provider_status: disabled_provider_statuses(config),
+            provider_status: process_manager.disabled_provider_statuses(),
             items: Vec::new(),
             truncated: false,
             degraded: false,
@@ -149,8 +341,9 @@ pub(crate) fn capture_diagnostic_snapshot(
         };
     }
 
-    let workspace_root = configured_workspace_root(config, workspace_roots);
-    let mut reason_codes = Vec::new();
+    let workspace_resolution = WorkspaceRootResolver::new(config, workspace_roots).resolve();
+    let workspace_root = workspace_resolution.workspace_root;
+    let mut reason_codes = workspace_resolution.reason_codes;
     let mut files =
         normalize_touched_files(files_touched, workspace_root.as_deref(), &mut reason_codes);
     files.sort();
@@ -159,7 +352,7 @@ pub(crate) fn capture_diagnostic_snapshot(
     let languages =
         files.iter().filter_map(|path| CodeIntelLanguage::from_path(path)).collect::<BTreeSet<_>>();
 
-    let provider_status = provider_statuses_for_languages(config, &languages);
+    let provider_status = process_manager.provider_statuses(&languages);
     reason_codes.extend(
         provider_status
             .iter()
@@ -358,6 +551,7 @@ pub(crate) fn diagnostic_delta(
     }
 
     let touched = after.files.iter().cloned().collect::<BTreeSet<_>>();
+    let range_shift_mapper = RangeShiftMapper::identity_for_files(&touched);
     let before_severity_by_key = before
         .items
         .iter()
@@ -370,7 +564,8 @@ pub(crate) fn diagnostic_delta(
         if !touched.contains(item.path.as_str()) {
             continue;
         }
-        let previous = before_severity_by_key.get(&diagnostic_key_without_severity(item));
+        let previous = before_severity_by_key
+            .get(&diagnostic_key_without_severity_with_mapper(item, &range_shift_mapper));
         if previous.is_none_or(|severity| item.severity > *severity) {
             if items.len() >= config.max_items {
                 truncated = true;
@@ -1661,7 +1856,7 @@ fn configured_workspace_root(
     config: &CodeIntelConfig,
     workspace_roots: &[PathBuf],
 ) -> Option<PathBuf> {
-    config.workspace_root.clone().or_else(|| workspace_roots.first().cloned())
+    WorkspaceRootResolver::new(config, workspace_roots).resolve().workspace_root
 }
 
 fn normalize_touched_files(
@@ -1686,75 +1881,64 @@ fn normalize_touched_files(
         .collect()
 }
 
-fn provider_statuses_for_languages(
-    config: &CodeIntelConfig,
+fn provider_status_for_descriptor(
+    descriptor: LanguageServerDescriptor,
     touched_languages: &BTreeSet<CodeIntelLanguage>,
-) -> Vec<CodeIntelProviderStatus> {
-    [
-        (CodeIntelLanguage::Rust, config.rust_analyzer_binary.as_str()),
-        (CodeIntelLanguage::TypeScript, config.typescript_server_binary.as_str()),
-        (CodeIntelLanguage::Python, config.pyright_binary.as_str()),
-    ]
-    .into_iter()
-    .map(|(language, binary)| {
-        if !touched_languages.contains(&language) {
-            return CodeIntelProviderStatus {
-                provider: language.provider_name().to_owned(),
-                language,
-                status: "skipped".to_owned(),
-                binary: binary.to_owned(),
-                reason_code: format!("code_intel.provider_skipped.{}", language.as_str()),
-                repair_hint: "No touched file uses this language provider.".to_owned(),
-            };
+) -> CodeIntelProviderStatus {
+    if !touched_languages.contains(&descriptor.language) {
+        return CodeIntelProviderStatus {
+            provider: descriptor.provider,
+            language: descriptor.language,
+            status: "skipped".to_owned(),
+            binary: descriptor.binary_label,
+            reason_code: format!("code_intel.provider_skipped.{}", descriptor.language.as_str()),
+            repair_hint: "No touched file uses this language provider.".to_owned(),
+        };
+    }
+    if executable_is_available(descriptor.binary.as_str()) {
+        CodeIntelProviderStatus {
+            provider: descriptor.provider,
+            language: descriptor.language,
+            status: "ready".to_owned(),
+            binary: descriptor.binary_label,
+            reason_code: format!("code_intel.provider_ready.{}", descriptor.language.as_str()),
+            repair_hint: "Provider binary was found in the configured path.".to_owned(),
         }
-        if executable_is_available(binary) {
-            CodeIntelProviderStatus {
-                provider: language.provider_name().to_owned(),
-                language,
-                status: "ready".to_owned(),
-                binary: binary.to_owned(),
-                reason_code: format!("code_intel.provider_ready.{}", language.as_str()),
-                repair_hint: "Provider binary was found in the configured path.".to_owned(),
-            }
-        } else {
-            CodeIntelProviderStatus {
-                provider: language.provider_name().to_owned(),
-                language,
-                status: "missing_binary".to_owned(),
-                binary: binary.to_owned(),
-                reason_code: format!("code_intel.provider_missing.{}", language.as_str()),
-                repair_hint: format!(
-                    "Install '{}' or set tool_call.code_intel.{}_binary to an executable path.",
-                    binary,
-                    match language {
-                        CodeIntelLanguage::Rust => "rust_analyzer",
-                        CodeIntelLanguage::TypeScript => "typescript_server",
-                        CodeIntelLanguage::Python => "pyright",
-                    }
-                ),
-            }
+    } else {
+        CodeIntelProviderStatus {
+            provider: descriptor.provider,
+            language: descriptor.language,
+            status: "missing_binary".to_owned(),
+            binary: descriptor.binary_label.clone(),
+            reason_code: format!("code_intel.provider_missing.{}", descriptor.language.as_str()),
+            repair_hint: format!(
+                "Install '{}' or set tool_call.code_intel.{}_binary to an executable path.",
+                descriptor.binary_label,
+                match descriptor.language {
+                    CodeIntelLanguage::Rust => "rust_analyzer",
+                    CodeIntelLanguage::TypeScript => "typescript_server",
+                    CodeIntelLanguage::Python => "pyright",
+                }
+            ),
         }
-    })
-    .collect()
+    }
 }
 
-fn disabled_provider_statuses(config: &CodeIntelConfig) -> Vec<CodeIntelProviderStatus> {
-    [
-        (CodeIntelLanguage::Rust, config.rust_analyzer_binary.as_str()),
-        (CodeIntelLanguage::TypeScript, config.typescript_server_binary.as_str()),
-        (CodeIntelLanguage::Python, config.pyright_binary.as_str()),
-    ]
-    .into_iter()
-    .map(|(language, binary)| CodeIntelProviderStatus {
-        provider: language.provider_name().to_owned(),
-        language,
-        status: "disabled".to_owned(),
-        binary: binary.to_owned(),
-        reason_code: "code_intel.disabled".to_owned(),
-        repair_hint: "Set tool_call.code_intel.enabled=true to enable post-write diagnostics."
-            .to_owned(),
-    })
-    .collect()
+fn diagnostic_binary_label(binary: &str) -> String {
+    let trimmed = binary.trim();
+    if trimmed.is_empty() {
+        return "<unset>".to_owned();
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("<configured-binary>")
+            .to_owned();
+    }
+    trimmed.to_owned()
 }
 
 fn executable_is_available(binary: &str) -> bool {
@@ -1783,15 +1967,41 @@ fn executable_candidates(binary: &str) -> Vec<String> {
 }
 
 fn diagnostic_key_without_severity(item: &CodeDiagnostic) -> String {
-    format!(
-        "{}\0{}\0{}\0{}\0{}\0{}",
-        item.path,
+    diagnostic_key_parts_without_severity(
+        item.path.as_str(),
         item.line,
         item.column,
-        item.code.as_deref().unwrap_or(""),
-        item.message,
-        item.source
+        item.code.as_deref(),
+        item.message.as_str(),
+        item.source.as_str(),
     )
+}
+
+fn diagnostic_key_without_severity_with_mapper(
+    item: &CodeDiagnostic,
+    range_shift_mapper: &RangeShiftMapper,
+) -> String {
+    let (line, column) =
+        range_shift_mapper.map_after_position(item.path.as_str(), item.line, item.column);
+    diagnostic_key_parts_without_severity(
+        item.path.as_str(),
+        line,
+        column,
+        item.code.as_deref(),
+        item.message.as_str(),
+        item.source.as_str(),
+    )
+}
+
+fn diagnostic_key_parts_without_severity(
+    path: &str,
+    line: u32,
+    column: u32,
+    code: Option<&str>,
+    message: &str,
+    source: &str,
+) -> String {
+    format!("{}\0{}\0{}\0{}\0{}\0{}", path, line, column, code.unwrap_or(""), message, source)
 }
 
 fn normalize_diagnostic_path(path: &str, workspace_root: &Path) -> Option<String> {
@@ -1874,6 +2084,67 @@ mod tests {
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.reason_codes, vec!["code_intel.disabled"]);
         assert_eq!(snapshot.provider_status.len(), 3);
+    }
+
+    #[test]
+    fn language_server_registry_redacts_binary_paths_and_limits_scope() {
+        let config = CodeIntelConfig {
+            enabled: true,
+            rust_analyzer_binary: "tools/rust-analyzer".to_owned(),
+            ..CodeIntelConfig::default()
+        };
+        let manager = LspProcessManager::from_config(&config);
+        let descriptors = manager.registry.descriptors();
+        let rust = descriptors
+            .iter()
+            .find(|descriptor| descriptor.language == CodeIntelLanguage::Rust)
+            .expect("rust descriptor should be registered");
+        let statuses = manager.provider_statuses(&BTreeSet::from([CodeIntelLanguage::Rust]));
+        let rust_status = statuses
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::Rust)
+            .expect("rust status should exist");
+
+        assert!(rust.diagnostics_only);
+        assert!(!rust.supports_symbols);
+        assert!(!rust.supports_references);
+        assert_eq!(rust.binary_label, "rust-analyzer");
+        assert_eq!(rust_status.binary, "rust-analyzer");
+        assert!(!rust_status.repair_hint.contains("tools/"));
+    }
+
+    #[test]
+    fn workspace_root_resolver_rejects_out_of_scope_config_root() {
+        let config = CodeIntelConfig {
+            enabled: true,
+            workspace_root: Some(PathBuf::from("../outside")),
+            ..CodeIntelConfig::default()
+        };
+        let snapshot = capture_diagnostic_snapshot(
+            &config,
+            &[PathBuf::from("workspace")],
+            &[touched("src/lib.rs")],
+        );
+
+        assert_eq!(snapshot.workspace_root.as_deref(), Some("workspace"));
+        assert!(snapshot
+            .reason_codes
+            .iter()
+            .any(|code| code == "code_intel.workspace_root_rejected"));
+    }
+
+    #[test]
+    fn range_shift_mapper_maps_after_patch_lines_to_before_positions() {
+        let mapper = RangeShiftMapper::new(vec![RangeShift {
+            path: "src/lib.rs".to_owned(),
+            start_line: 10,
+            old_line_count: 1,
+            new_line_count: 3,
+        }]);
+
+        assert_eq!(mapper.map_after_position("src/lib.rs", 9, 2), (9, 2));
+        assert_eq!(mapper.map_after_position("src/lib.rs", 14, 4), (12, 4));
+        assert_eq!(mapper.map_after_position("src/other.rs", 14, 4), (14, 4));
     }
 
     #[test]
