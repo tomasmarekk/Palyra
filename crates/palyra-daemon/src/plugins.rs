@@ -1383,6 +1383,21 @@ fn supported_plugin_contract_adapters() -> Vec<TypedPluginContractAdapterSupport
             "connectors.adapter_sdk",
             connector_capability_classes,
         ),
+        plugin_contract_adapter_support(
+            TypedPluginContractKind::AgentHarness,
+            "runtime.agent_harness",
+            Vec::new(),
+        ),
+        plugin_contract_adapter_support(
+            TypedPluginContractKind::ToolResultMiddleware,
+            "runtime.tool_result_middleware",
+            Vec::new(),
+        ),
+        plugin_contract_adapter_support(
+            TypedPluginContractKind::PluginLifecycleHook,
+            "plugins.lifecycle_hook",
+            Vec::new(),
+        ),
     ]
 }
 

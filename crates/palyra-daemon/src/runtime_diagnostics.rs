@@ -34,7 +34,7 @@ use palyra_common::runtime_contracts::{
     PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
 };
 #[cfg(test)]
-use palyra_plugins_sdk::plugin_sdk_contract_snapshot;
+use palyra_plugins_sdk::{plugin_sdk_contract_snapshot, PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION};
 #[cfg(test)]
 use palyra_skills::skill_manifest_contract_snapshot;
 
@@ -1803,7 +1803,10 @@ mod tests {
         );
         validate_public_contract_snapshot(&snapshot["runtime_contracts_abi"])
             .expect("runtime contracts snapshot should be public-safe");
-        assert_eq!(snapshot["plugin_sdk_abi"]["snapshot_version"], "plugin-sdk-contracts.v1");
+        assert_eq!(
+            snapshot["plugin_sdk_abi"]["snapshot_version"],
+            PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION
+        );
         validate_public_contract_snapshot(&snapshot["plugin_sdk_abi"])
             .expect("plugin SDK snapshot should be public-safe");
         assert_eq!(
