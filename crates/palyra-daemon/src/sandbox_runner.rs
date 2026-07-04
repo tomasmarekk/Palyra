@@ -11780,15 +11780,20 @@ mod tests {
 
         let result_path = workspace.join("stdin-result.txt");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !result_path.exists() {
+        let mut delivered = String::new();
+        while delivered.replace("\r\n", "\n") != "hello from stdin\n" {
             if Instant::now() >= deadline {
                 let _ = super::stop_background_process_by_pid(pid);
-                panic!("stdin-capable background process did not write its result");
+                panic!(
+                    "stdin-capable background process did not write expected result; latest={delivered:?}"
+                );
+            }
+            if result_path.exists() {
+                delivered =
+                    fs::read_to_string(result_path.as_path()).unwrap_or_else(|_| String::new());
             }
             thread::sleep(Duration::from_millis(25));
         }
-        let delivered =
-            fs::read_to_string(result_path.as_path()).expect("stdin result should be readable");
 
         let _ = super::stop_background_process_by_pid(pid);
         let _ = fs::remove_dir_all(workspace.as_path());
