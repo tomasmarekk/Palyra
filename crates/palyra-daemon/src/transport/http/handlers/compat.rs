@@ -5879,6 +5879,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn responses_failed_stream_event_emits_terminal_sse_frame() {
+        let (sender, mut receiver) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+
+        assert!(
+            send_compat_responses_failed_stream_event(
+                &sender,
+                CompatResponsesFailedStreamEvent {
+                    response_id: "resp_01",
+                    run_id: "run_01",
+                    session_id: "session_01",
+                    created_at_unix_ms: 42_000,
+                    code: "provider.stream.malformed_chunk",
+                    message: "provider stream emitted malformed SSE".to_owned(),
+                    public_event: None,
+                },
+            )
+            .await,
+            "failed stream event should fit in the bounded SSE buffer"
+        );
+
+        let frame = receiver.recv().await.expect("failed SSE frame should be sent");
+        let bytes = frame.expect("failed SSE frame should carry bytes");
+        let encoded = std::str::from_utf8(bytes.as_ref()).expect("SSE frame should be UTF-8");
+        let data = encoded
+            .strip_prefix("event: response.failed\ndata: ")
+            .expect("frame should use response.failed SSE event")
+            .trim();
+        let payload: Value = serde_json::from_str(data).expect("SSE payload should be JSON");
+
+        assert_eq!(payload.pointer("/type").and_then(Value::as_str), Some("response.failed"));
+        assert_eq!(payload.pointer("/response/status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            payload.pointer("/response/error/code").and_then(Value::as_str),
+            Some("provider.stream.malformed_chunk")
+        );
+        assert_eq!(
+            payload.pointer("/response/_palyra/run_id").and_then(Value::as_str),
+            Some("run_01")
+        );
+        assert_eq!(
+            payload.pointer("/response/_palyra/session_id").and_then(Value::as_str),
+            Some("session_01")
+        );
+    }
+
     #[test]
     fn responses_tool_result_stream_payload_uses_artifact_ref_without_raw_output() {
         let tool_call = CompatStreamToolCall {

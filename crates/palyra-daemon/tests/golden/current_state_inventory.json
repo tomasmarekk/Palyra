@@ -1173,17 +1173,18 @@
       "owner_component": "model provider streaming",
       "required_tests": [
         "cargo test -p palyra-model-providers --locked",
-        "cargo test -p palyra-daemon provider_stream --locked"
+        "cargo test -p palyra-daemon provider_stream --locked",
+        "cargo test -p palyra-daemon responses_failed_stream_event --locked"
       ],
       "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
       "activation_blockers": [
         "Enable feature_rollouts.provider_stream_normalizer or PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER after required tests and owner acceptance pass.",
-        "stream normalization needs provider compatibility fixtures before stable rollout"
+        "stream normalization must keep malformed chunks, idle timeouts, duplicate deltas, late usage, and public failed SSE frames covered"
       ],
       "acceptance_criteria": [
-        "rollout appears in /console/v1/diagnostics with maturity metadata",
-        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
-        "current_state_inventory golden records maturity changes"
+        "normalizer emits hash-only audit events for malformed or recovered provider SSE frames",
+        "unrecoverable provider streams emit one terminal failed event on public SSE APIs",
+        "diagnostics expose the rollout maturity and activation blockers"
       ],
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",

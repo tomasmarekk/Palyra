@@ -113,7 +113,10 @@ pub use snapshots::{
     ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
 };
 pub use streaming::{
-    provider_output_from_text_and_tools, ProviderStreamAccumulator, ProviderStreamEvent,
+    normalize_provider_sse_stream, normalize_provider_sse_stream_with_idle_timeout,
+    provider_output_from_text_and_tools, ProviderSseAuditEvent, ProviderSseAuditSeverity,
+    ProviderSseNormalizationReport, ProviderStreamAccumulator, ProviderStreamEvent,
+    PROVIDER_SSE_NORMALIZER_AUDIT_EVENT,
 };
 pub use tool_repair::{
     decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,

@@ -35,6 +35,7 @@ const EXECUTION_BACKEND_TESTS: &[&str] = &[
 const MODEL_PROVIDER_TESTS: &[&str] = &[
     "cargo test -p palyra-model-providers --locked",
     "cargo test -p palyra-daemon provider_stream --locked",
+    "cargo test -p palyra-daemon responses_failed_stream_event --locked",
 ];
 const COMPACTION_TESTS: &[&str] = &[
     "cargo test -p palyra-daemon session_compaction --locked",
@@ -634,8 +635,14 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         maturity: FeatureRolloutMaturity::PreviewOnly,
         required_tests: MODEL_PROVIDER_TESTS,
         public_api_exposure: INTERNAL_EXPOSURE,
-        activation_blockers: &["stream normalization needs provider compatibility fixtures before stable rollout"],
-        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        activation_blockers: &[
+            "stream normalization must keep malformed chunks, idle timeouts, duplicate deltas, late usage, and public failed SSE frames covered",
+        ],
+        acceptance_criteria: &[
+            "normalizer emits hash-only audit events for malformed or recovered provider SSE frames",
+            "unrecoverable provider streams emit one terminal failed event on public SSE APIs",
+            "diagnostics expose the rollout maturity and activation blockers",
+        ],
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
         stable_dependencies: NO_STABLE_DEPENDENCIES,
