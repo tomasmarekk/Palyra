@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "nullable_one_of_object",
+      "dialect": "openai_compatible",
+      "input": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": ["string", "null"],
+                "enum": ["fast", "deep", null]
+              }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": {}
+      },
+      "expected_provider_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "enum": ["fast", "deep"]
+          }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+      },
+      "expected_step_reason_codes": [
+        "schema.one_of_single_branch",
+        "schema.default_removed",
+        "schema.nullable_union_removed",
+        "schema.enum_null_removed"
+      ]
+    },
+    {
+      "id": "all_of_object_merge",
+      "dialect": "anthropic",
+      "input": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "text": {
+                "enum": ["short", "long"]
+              }
+            },
+            "required": ["text"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "count": {
+                "type": "integer",
+                "default": 1
+              }
+            },
+            "required": ["count"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "expected_provider_schema": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string",
+            "enum": ["short", "long"]
+          }
+        },
+        "required": ["count", "text"],
+        "additionalProperties": false
+      },
+      "expected_step_reason_codes": [
+        "schema.all_of_merged",
+        "schema.enum_type_inferred",
+        "schema.default_removed"
+      ]
+    },
+    {
+      "id": "redundant_not_null",
+      "dialect": "openai_compatible",
+      "input": {
+        "type": "object",
+        "not": {
+          "type": "null"
+        },
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "expected_provider_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "expected_step_reason_codes": [
+        "schema.redundant_not_null_removed"
+      ]
+    }
+  ]
+}

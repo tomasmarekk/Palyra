@@ -21,6 +21,8 @@ pub(super) const TOOL_CATALOG_SCHEMA_VERSION: u32 = 1;
 pub(super) const TOOL_REGISTRY_ENTRY_VERSION: u32 = 1;
 /// Schema version stamped into every [`ToolCallRejection`] record.
 pub(super) const TOOL_REJECTION_SCHEMA_VERSION: u32 = 1;
+/// Schema version stamped into provider-schema transform audit records.
+pub(super) const TOOL_SCHEMA_TRANSFORM_AUDIT_VERSION: u32 = 1;
 /// Maximum schema nesting depth accepted by provider sanitization and validation.
 pub(super) const MAX_SCHEMA_DEPTH: usize = 8;
 /// Maximum number of properties accepted on a single object schema node.
@@ -196,12 +198,32 @@ pub(crate) struct ModelVisibleTool {
     pub(crate) provider_schema: Value,
     pub(crate) internal_schema_hash: String,
     pub(crate) provider_schema_hash: String,
+    pub(crate) provider_schema_transform: ToolSchemaTransformAudit,
     pub(crate) description_hash: String,
     pub(crate) capabilities: Vec<String>,
     pub(crate) approval_posture: ToolApprovalPosture,
     pub(crate) projection_policy: ToolResultProjectionPolicy,
     pub(crate) parallelism_policy: ToolParallelismPolicy,
     pub(crate) exposure_reason: String,
+}
+
+/// Hash-only audit of provider schema normalization for one exposed tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolSchemaTransformAudit {
+    pub(crate) schema_version: u32,
+    pub(crate) dialect: ToolSchemaDialect,
+    pub(crate) input_schema_hash: String,
+    pub(crate) output_schema_hash: String,
+    pub(crate) steps: Vec<ToolSchemaTransformStep>,
+}
+
+/// One deterministic provider-schema transform step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolSchemaTransformStep {
+    pub(crate) json_pointer: String,
+    pub(crate) reason_code: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
 }
 
 /// One compact index entry describing a policy-visible target tool without

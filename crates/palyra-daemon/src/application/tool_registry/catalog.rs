@@ -20,13 +20,13 @@ use super::hashing::{
     canonical_json_bytes, catalog_hash_payload, stable_hash_bytes, stable_hash_value,
 };
 use super::schema::{
-    exposure_reason, filtered, provider_tool_payload, sanitize_schema_for_provider,
+    exposure_reason, filtered, provider_tool_payload, sanitize_schema_for_provider_with_audit,
 };
 use super::types::{
     AvailabilityProbeResult, FilteredToolCatalogEntry, ModelVisibleTool,
     ModelVisibleToolCatalogSnapshot, ToolCatalogBridgeError, ToolCatalogBuildRequest,
     ToolCatalogFilterReasonCode, ToolCatalogIndex, ToolCatalogIndexEntry, ToolCatalogInvokeTarget,
-    ToolRegistryEntry, ToolResultProjectionPolicy, ToolSchemaDialect,
+    ToolRegistryEntry, ToolResultProjectionPolicy, ToolSchemaDialect, ToolSchemaTransformAudit,
     TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SCHEMA_VERSION,
     TOOL_CATALOG_SEARCH_TOOL_NAME,
 };
@@ -119,18 +119,23 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_records(
             ));
             continue;
         }
-        let provider_schema = match sanitize_schema_for_provider(&entry.input_schema, dialect) {
-            Ok(schema) => schema,
-            Err(error) => {
-                filtered_tools.push(filtered(
-                    entry.name.as_str(),
-                    ToolCatalogFilterReasonCode::ProviderSchemaIncompatible,
-                    error.message.as_str(),
-                ));
-                continue;
-            }
-        };
-        authorized_target_tools.push(visible_tool_from_entry(entry, provider_schema));
+        let (provider_schema, provider_schema_transform) =
+            match sanitize_schema_for_provider_with_audit(&entry.input_schema, dialect) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    filtered_tools.push(filtered(
+                        entry.name.as_str(),
+                        ToolCatalogFilterReasonCode::ProviderSchemaIncompatible,
+                        error.message.as_str(),
+                    ));
+                    continue;
+                }
+            };
+        authorized_target_tools.push(visible_tool_from_entry(
+            entry,
+            provider_schema,
+            provider_schema_transform,
+        ));
     }
 
     // Surface allowlisted names with no registry entry so operators see
@@ -566,7 +571,11 @@ fn bridge_error(reason_code: &str, message: &str) -> ToolCatalogBridgeError {
     ToolCatalogBridgeError { reason_code: reason_code.to_owned(), message: message.to_owned() }
 }
 
-fn visible_tool_from_entry(entry: ToolRegistryEntry, provider_schema: Value) -> ModelVisibleTool {
+fn visible_tool_from_entry(
+    entry: ToolRegistryEntry,
+    provider_schema: Value,
+    provider_schema_transform: ToolSchemaTransformAudit,
+) -> ModelVisibleTool {
     ModelVisibleTool {
         name: entry.name,
         description_hash: stable_hash_bytes(entry.description.as_bytes()),
@@ -574,6 +583,7 @@ fn visible_tool_from_entry(entry: ToolRegistryEntry, provider_schema: Value) -> 
         version: entry.version,
         provenance: entry.provenance,
         provider_schema_hash: stable_hash_value(&provider_schema),
+        provider_schema_transform,
         internal_schema_hash: entry.schema_hash,
         schema: entry.input_schema,
         provider_schema,
@@ -611,9 +621,9 @@ fn catalog_bridge_tools(dialect: ToolSchemaDialect) -> Vec<ModelVisibleTool> {
         .iter()
         .filter_map(|tool_name| registry_entry(tool_name))
         .filter_map(|entry| {
-            sanitize_schema_for_provider(&entry.input_schema, dialect)
-                .ok()
-                .map(|provider_schema| visible_tool_from_entry(entry, provider_schema))
+            sanitize_schema_for_provider_with_audit(&entry.input_schema, dialect).ok().map(
+                |(provider_schema, audit)| visible_tool_from_entry(entry, provider_schema, audit),
+            )
         })
         .collect()
 }

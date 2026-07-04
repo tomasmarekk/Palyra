@@ -102,14 +102,24 @@ fn parse_visible_tool_arguments(
 ) -> Result<(Value, Vec<ToolArgumentNormalizationStep>), Box<ToolCallRejection>> {
     match serde_json::from_slice::<Value>(input_json) {
         Ok(value) if value.is_object() => Ok((value, Vec::new())),
-        Ok(Value::String(text)) => strict_preview_repair_argument_object(text.as_str())
-            .map(|value| (value, strict_preview_repair_steps()))
+        Ok(Value::String(text)) => stringified_json_repair_argument_object(text.as_str())
+            .or_else(|| {
+                strict_preview_repair_argument_object(text.as_str())
+                    .map(|value| (value, strict_preview_repair_steps()))
+            })
             .ok_or_else(|| Box::new(not_object_rejection(snapshot, tool_name, raw_json_hash))),
+        Ok(Value::Array(values)) if values.len() == 1 && values[0].is_object() => {
+            let value = values.into_iter().next().expect("single array value should exist");
+            Ok((value, single_object_array_repair_steps()))
+        }
         Ok(_) => Err(Box::new(not_object_rejection(snapshot, tool_name, raw_json_hash))),
         Err(error) => {
             let input = std::str::from_utf8(input_json).unwrap_or_default();
-            strict_preview_repair_argument_object(input)
-                .map(|value| (value, strict_preview_repair_steps()))
+            truncated_json_repair_argument_object(input)
+                .or_else(|| {
+                    strict_preview_repair_argument_object(input)
+                        .map(|value| (value, strict_preview_repair_steps()))
+                })
                 .ok_or_else(|| {
                     Box::new(ToolCallRejection {
                         schema_version: TOOL_REJECTION_SCHEMA_VERSION,
@@ -149,13 +159,91 @@ fn strict_preview_repair_argument_object(input: &str) -> Option<Value> {
         .or_else(|| parse_wrapped_json_object(input.trim(), "tool_arguments"))
 }
 
+fn stringified_json_repair_argument_object(
+    input: &str,
+) -> Option<(Value, Vec<ToolArgumentNormalizationStep>)> {
+    parse_json_object(input.trim()).map(|value| {
+        (
+            value,
+            root_repair_steps(
+                "string",
+                "object",
+                "tool_call.arguments.stringified_json_object_repair",
+            ),
+        )
+    })
+}
+
+fn truncated_json_repair_argument_object(
+    input: &str,
+) -> Option<(Value, Vec<ToolArgumentNormalizationStep>)> {
+    let input = input.trim();
+    let suffix = missing_json_container_suffix(input)?;
+    let repaired = format!("{input}{suffix}");
+    parse_json_object(repaired.as_str()).map(|value| {
+        (
+            value,
+            root_repair_steps(
+                "truncated_json",
+                "object",
+                "tool_call.arguments.truncated_json_repair",
+            ),
+        )
+    })
+}
+
 fn strict_preview_repair_steps() -> Vec<ToolArgumentNormalizationStep> {
+    root_repair_steps("string", "object", "tool_call.arguments.strict_preview_repair")
+}
+
+fn single_object_array_repair_steps() -> Vec<ToolArgumentNormalizationStep> {
+    root_repair_steps("array", "object", "tool_call.arguments.single_object_array_repair")
+}
+
+fn root_repair_steps(
+    from_type: &str,
+    to_type: &str,
+    reason_code: &str,
+) -> Vec<ToolArgumentNormalizationStep> {
     vec![ToolArgumentNormalizationStep {
         json_pointer: "/".to_owned(),
-        from_type: "string".to_owned(),
-        to_type: "object".to_owned(),
-        reason_code: "tool_call.arguments.strict_preview_repair".to_owned(),
+        from_type: from_type.to_owned(),
+        to_type: to_type.to_owned(),
+        reason_code: reason_code.to_owned(),
     }]
+}
+
+fn missing_json_container_suffix(input: &str) -> Option<String> {
+    if !input.starts_with('{') {
+        return None;
+    }
+    let mut expected_closers = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => expected_closers.push('}'),
+            '[' => expected_closers.push(']'),
+            '}' | ']' if expected_closers.pop() != Some(ch) => return None,
+            '}' | ']' => {}
+            _ => {}
+        }
+    }
+    if in_string || expected_closers.is_empty() {
+        return None;
+    }
+    Some(expected_closers.into_iter().rev().collect())
 }
 
 fn parse_code_fenced_json_object(input: &str) -> Option<Value> {

@@ -3,17 +3,18 @@
 
 use super::builtin::registry_entry;
 use super::catalog::clear_availability_probe_cache_for_tests;
+use super::schema::sanitize_schema_for_provider_with_audit;
 use super::types::{
-    ModelVisibleToolCatalogSnapshot, ToolCallRejectionKind, ToolCatalogFilterReasonCode,
-    ToolParallelismPolicy,
+    ModelVisibleToolCatalogSnapshot, ToolApprovalPosture, ToolCallRejectionKind,
+    ToolCatalogFilterReasonCode, ToolParallelismPolicy, ToolRegistryEntry,
 };
 use super::{
     build_model_visible_tool_catalog_snapshot, describe_catalog_tool, projection_policy_for_tool,
     provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
-    snapshot_to_provider_request_value, validate_tool_call_against_catalog_snapshot,
-    ToolCatalogBuildRequest, ToolCatalogPolicySnapshot, ToolExposureSurface,
-    ToolResultProjectionPolicy, ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
-    TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
+    snapshot_to_provider_request_value, stable_hash_value,
+    validate_tool_call_against_catalog_snapshot, ToolCatalogBuildRequest,
+    ToolCatalogPolicySnapshot, ToolExposureSurface, ToolResultProjectionPolicy, ToolSchemaDialect,
+    TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
 };
 use crate::{
     sandbox_runner::{EgressEnforcementMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier},
@@ -24,6 +25,8 @@ use palyra_common::tool_catalog::ToolCatalogExposureMode;
 use std::sync::{Mutex, OnceLock};
 
 static AVAILABILITY_PROBE_CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const SCHEMA_TRANSFORM_FIXTURE: &str =
+    include_str!("../../../../../fixtures/provider_compat/schema_transform_cases.json");
 
 fn config(allowed_tools: &[&str]) -> ToolCallConfig {
     ToolCallConfig {
@@ -376,6 +379,92 @@ fn intake_strict_preview_repairs_standalone_json_object_wrapper() {
     assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
 }
 
+fn echo_snapshot() -> ModelVisibleToolCatalogSnapshot {
+    let config = config(&["palyra.echo"]);
+    build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    })
+}
+
+#[test]
+fn intake_repairs_stringified_json_arguments() {
+    let snapshot = echo_snapshot();
+
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        b"\"{\\\"text\\\":\\\"hello\\\"}\"",
+    )
+    .expect("stringified JSON object should repair");
+
+    assert_eq!(
+        normalized.audit.steps[0].reason_code,
+        "tool_call.arguments.stringified_json_object_repair"
+    );
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
+fn intake_repairs_single_object_array_arguments() {
+    let snapshot = echo_snapshot();
+
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        br#"[{"text":"hello"}]"#,
+    )
+    .expect("single object array should repair");
+
+    assert_eq!(
+        normalized.audit.steps[0].reason_code,
+        "tool_call.arguments.single_object_array_repair"
+    );
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
+fn intake_repairs_unambiguous_truncated_json_arguments() {
+    let snapshot = echo_snapshot();
+
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        b"{\"text\":\"hello\"",
+    )
+    .expect("missing final object closer should repair");
+
+    assert_eq!(normalized.audit.steps[0].reason_code, "tool_call.arguments.truncated_json_repair");
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
+fn intake_rejects_ambiguous_argument_repairs() {
+    let snapshot = echo_snapshot();
+
+    let array_rejection = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        br#"[{"text":"one"},{"text":"two"}]"#,
+    )
+    .expect_err("multi-object array should be ambiguous");
+    assert_eq!(array_rejection.reason_code, "tool_call.arguments.not_object");
+
+    let bad_json_rejection =
+        validate_tool_call_against_catalog_snapshot(&snapshot, "palyra.echo", b"{\"text\":")
+            .expect_err("missing value cannot repair safely");
+    assert_eq!(bad_json_rejection.kind, ToolCallRejectionKind::MalformedArguments);
+    assert_eq!(bad_json_rejection.reason_code, "tool_call.arguments.invalid_json");
+}
+
 #[test]
 fn process_run_allowlist_exposes_lifecycle_controls() {
     let mut config = config(&["palyra.process.run"]);
@@ -626,6 +715,126 @@ fn anthropic_catalog_exposes_routines_control_trigger_payload() {
     let tools = provider_tools_from_catalog_snapshot(&payload, ToolSchemaDialect::Anthropic);
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "palyra.routines.control");
+}
+
+#[test]
+fn schema_transform_fixture_cases_match_expected_provider_schema() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(SCHEMA_TRANSFORM_FIXTURE).expect("schema transform fixture parses");
+    let cases = fixture["cases"].as_array().expect("fixture cases should be an array");
+
+    for case in cases {
+        let dialect = match case["dialect"].as_str().expect("case dialect should be a string") {
+            "anthropic" => ToolSchemaDialect::Anthropic,
+            "deterministic" => ToolSchemaDialect::Deterministic,
+            _ => ToolSchemaDialect::OpenAiCompatible,
+        };
+        let input = &case["input"];
+        let (provider_schema, audit) = sanitize_schema_for_provider_with_audit(input, dialect)
+            .unwrap_or_else(|error| {
+                panic!("case {} should transform: {}", case["id"], error.message)
+            });
+        assert_eq!(
+            provider_schema, case["expected_provider_schema"],
+            "case {} should match expected provider schema",
+            case["id"]
+        );
+        let reasons = audit.steps.iter().map(|step| step.reason_code.as_str()).collect::<Vec<_>>();
+        let expected_reasons = case["expected_step_reason_codes"]
+            .as_array()
+            .expect("case expected reasons should be an array")
+            .iter()
+            .map(|value| value.as_str().expect("reason should be a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, expected_reasons, "case {} should match audit steps", case["id"]);
+        assert_eq!(audit.input_schema_hash, stable_hash_value(input));
+        assert_eq!(audit.output_schema_hash, stable_hash_value(&provider_schema));
+    }
+}
+
+#[test]
+fn schema_transform_rejects_ambiguous_composition() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},
+            {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        ]
+    });
+
+    let error =
+        sanitize_schema_for_provider_with_audit(&schema, ToolSchemaDialect::OpenAiCompatible)
+            .expect_err("ambiguous oneOf should fail closed");
+
+    assert_eq!(error.reason_code, "schema.one_of_ambiguous");
+}
+
+#[test]
+fn provider_request_hash_tracks_transformed_schema_payload() {
+    let input_schema = serde_json::json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "text": {"type": ["string", "null"]}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            },
+            {"type":"null"}
+        ]
+    });
+    let tool_name = "palyra.test.schema_transform";
+    let config = config(&[tool_name]);
+    let external_tool = schema_transform_test_tool(tool_name, input_schema);
+    let snapshot = super::build_model_visible_tool_catalog_snapshot_with_external_tools(
+        ToolCatalogBuildRequest {
+            config: &config,
+            catalog_policy: &catalog_policy(&config),
+            browser_service_enabled: false,
+            browser_service_configured: false,
+            request_context: &request_context(),
+            provider_kind: "openai_compatible",
+            provider_model_id: Some("gpt-test"),
+            surface: ToolExposureSurface::RunStream,
+            remaining_tool_budget: None,
+            created_at_unix_ms: 42,
+        },
+        &[external_tool],
+    );
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .expect("schema transform tool should be visible");
+
+    assert_eq!(tool.provider_schema_transform.input_schema_hash, tool.internal_schema_hash);
+    assert_eq!(tool.provider_schema_transform.output_schema_hash, tool.provider_schema_hash);
+
+    let payload = snapshot_to_provider_request_value(&snapshot);
+    let request_hash = stable_hash_value(&payload);
+    let mut mutated_payload = payload.clone();
+    mutated_payload["tools"][0]["provider_schema"]["properties"]["text"]["maxLength"] =
+        serde_json::json!(12);
+    assert_ne!(request_hash, stable_hash_value(&mutated_payload));
+}
+
+fn schema_transform_test_tool(
+    tool_name: &str,
+    input_schema: serde_json::Value,
+) -> ToolRegistryEntry {
+    ToolRegistryEntry {
+        name: tool_name.to_owned(),
+        description: "Schema transform fixture tool".to_owned(),
+        version: 1,
+        provenance: "test".to_owned(),
+        schema_hash: stable_hash_value(&input_schema),
+        input_schema,
+        capabilities: vec!["test".to_owned()],
+        approval_posture: ToolApprovalPosture::Safe,
+        projection_policy: ToolResultProjectionPolicy::InlineUnlessLarge,
+        parallelism_policy: ToolParallelismPolicy::ReadOnly,
+        target_surfaces: vec![ToolExposureSurface::RunStream],
+    }
 }
 
 #[test]
