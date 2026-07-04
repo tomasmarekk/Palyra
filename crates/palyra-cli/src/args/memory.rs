@@ -232,6 +232,19 @@ pub enum MemoryCommand {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum MemoryLearningCommand {
+    Graph {
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            help = "Include recent recall artifacts as audit-only graph nodes"
+        )]
+        include_artifacts: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     List {
         #[arg(long)]
         candidate_kind: Option<String>,
@@ -294,6 +307,19 @@ pub enum MemoryLearningCommand {
         candidate_id: String,
         #[arg(long)]
         summary: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    #[command(name = "mutation-plan")]
+    MutationPlan {
+        candidate_id: String,
+        action: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        replacement_json: Option<String>,
+        #[arg(long)]
+        merge_target_id: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

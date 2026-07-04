@@ -158,6 +158,14 @@ pub enum RoutinesCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Suggestions {
+        #[command(subcommand)]
+        command: RoutineSuggestionsCommand,
+    },
+    Blueprints {
+        #[command(subcommand)]
+        command: RoutineBlueprintsCommand,
+    },
     SchedulePreview {
         phrase: String,
         #[arg(long, default_value = "local")]
@@ -192,6 +200,182 @@ pub enum RoutinesCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum RoutineSuggestionsCommand {
+    List {
+        #[arg(long, value_enum)]
+        status: Option<AutomationSuggestionStatusArg>,
+        #[arg(long, value_enum)]
+        candidate_type: Option<AutomationCandidateTypeArg>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        suggestion_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Create {
+        #[arg(long, value_enum, default_value_t = AutomationSuggestionSourceArg::Operator)]
+        source: AutomationSuggestionSourceArg,
+        #[arg(long, value_enum)]
+        candidate_type: AutomationCandidateTypeArg,
+        #[arg(long)]
+        spec: Option<String>,
+        #[arg(long, default_value_t = false, conflicts_with = "spec")]
+        spec_stdin: bool,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, value_enum, default_value_t = AutomationRiskLevelArg::Medium)]
+        risk_level: AutomationRiskLevelArg,
+        #[arg(long = "required-approval")]
+        required_approvals: Vec<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Accept {
+        suggestion_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Dismiss {
+        suggestion_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Snooze {
+        suggestion_id: String,
+        #[arg(long)]
+        until_unix_ms: i64,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum RoutineBlueprintsCommand {
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Show {
+        blueprint_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    CreateSuggestion {
+        blueprint_id: String,
+        #[arg(long)]
+        parameters: Option<String>,
+        #[arg(long, default_value_t = false, conflicts_with = "parameters")]
+        parameters_stdin: bool,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutomationSuggestionSourceArg {
+    Agent,
+    Operator,
+    Blueprint,
+    Doctor,
+    RoutineInsight,
+    LearningGraph,
+}
+
+impl AutomationSuggestionSourceArg {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Operator => "operator",
+            Self::Blueprint => "blueprint",
+            Self::Doctor => "doctor",
+            Self::RoutineInsight => "routine_insight",
+            Self::LearningGraph => "learning_graph",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutomationCandidateTypeArg {
+    Routine,
+    Cron,
+    Objective,
+}
+
+impl AutomationCandidateTypeArg {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Routine => "routine",
+            Self::Cron => "cron",
+            Self::Objective => "objective",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutomationRiskLevelArg {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl AutomationRiskLevelArg {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutomationSuggestionStatusArg {
+    Proposed,
+    Accepted,
+    Dismissed,
+    Snoozed,
+    Expired,
+    Superseded,
+}
+
+impl AutomationSuggestionStatusArg {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Accepted => "accepted",
+            Self::Dismissed => "dismissed",
+            Self::Snoozed => "snoozed",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

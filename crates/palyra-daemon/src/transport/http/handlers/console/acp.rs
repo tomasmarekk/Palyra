@@ -18,8 +18,9 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     acp::{
-        AcpEventLedgerAppend, AcpPendingPromptUpsert, AcpRuntimeError, AcpSessionBindingUpsert,
-        ConversationBindingFilter, ConversationBindingUpsert,
+        AcpEventLedgerAppend, AcpPendingPromptUpsert, AcpPresentationProjectionInput,
+        AcpRuntimeError, AcpSessionBindingUpsert, ConversationBindingFilter,
+        ConversationBindingUpsert,
     },
     application::session_compaction::{
         apply_session_compaction, preview_session_compaction, SessionCompactionApplyRequest,
@@ -793,6 +794,19 @@ async fn approval_request(
     let approval_id =
         optional_string(&envelope.params, "approval_id").unwrap_or_else(|| Ulid::new().to_string());
     validate_canonical(&approval_id, "approval_id")?;
+    let tape_segment = optional_string(&envelope.params, "tape_segment");
+    let source_binding = optional_string(&envelope.params, "source_binding");
+    let compaction_generation = optional_u64(&envelope.params, "compaction_generation");
+    let presentation =
+        crate::acp::build_acp_presentation_projection(AcpPresentationProjectionInput {
+            event_kind: "approval.request",
+            run_id: Some(run_id.as_str()),
+            session_id: Some(session_id.as_str()),
+            tape_segment: tape_segment.as_deref(),
+            compaction_generation,
+            source_binding: source_binding.as_deref(),
+            payload: &envelope.params,
+        });
     let record = state
         .runtime
         .create_approval_record(ApprovalCreateRequest {
@@ -840,6 +854,7 @@ async fn approval_request(
                     "source": "acp",
                     "client_id": client.client_id,
                     "evidence_refs": envelope.params.get("evidence_refs").cloned().unwrap_or_else(|| json!([])),
+                    "presentation": presentation.clone(),
                 })
                 .to_string(),
                 policy_explanation: "Converted from ACP permission request; no secrets persisted".to_owned(),
@@ -878,11 +893,12 @@ async fn approval_request(
                     "session_id": record.session_id.as_str(),
                     "subject_id": subject_id.as_str(),
                     "risk_level": risk_level.as_str(),
+                    "presentation": presentation.clone(),
                 }),
             },
         )?;
     }
-    Ok(json!({ "approval": record }))
+    Ok(json!({ "approval": record, "presentation": presentation }))
 }
 
 struct AcpLedgerEventRecordRequest {

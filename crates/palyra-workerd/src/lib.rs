@@ -715,6 +715,267 @@ impl Default for WorkerFleetPolicy {
     }
 }
 
+/// Trust state for an observed worker or paired-node endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedEndpointTrustState {
+    Unknown,
+    PendingApproval,
+    Trusted,
+    Rejected,
+    Revoked,
+}
+
+/// Transport used by an observed worker or paired-node endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedEndpointTransport {
+    Quic,
+    Grpc,
+    Http,
+    Local,
+    LanDiscoveryPreview,
+    TailscalePreview,
+}
+
+/// Last health observation for a trusted endpoint identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedEndpointHealth {
+    pub healthy: bool,
+    pub checked_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+/// Persistable registry record for one worker or paired-node endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedEndpointRecord {
+    pub endpoint_id: String,
+    pub trust_state: TrustedEndpointTrustState,
+    pub last_seen_unix_ms: i64,
+    pub capabilities: Vec<String>,
+    pub transport: TrustedEndpointTransport,
+    pub identity_digest_sha256: String,
+    #[serde(default)]
+    pub policy_bindings: Vec<String>,
+    pub health: TrustedEndpointHealth,
+}
+
+/// Policy controlling endpoint trust and preview discovery features.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedEndpointPolicy {
+    pub trusted_capabilities: Vec<String>,
+    pub allow_trust_on_first_use_without_approval: bool,
+    pub lan_discovery_enabled: bool,
+    pub tailscale_profile_enabled: bool,
+}
+
+impl Default for TrustedEndpointPolicy {
+    fn default() -> Self {
+        Self {
+            trusted_capabilities: WORKER_REMOTE_TOOL_CAPABILITIES
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect(),
+            allow_trust_on_first_use_without_approval: false,
+            lan_discovery_enabled: false,
+            tailscale_profile_enabled: false,
+        }
+    }
+}
+
+/// Machine-readable capability negotiation result for backend selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedEndpointCapabilityNegotiation {
+    pub endpoint_id: String,
+    pub usable: bool,
+    pub trust_state: TrustedEndpointTrustState,
+    pub healthy_identity: bool,
+    pub granted_capabilities: Vec<String>,
+    pub denied_capabilities: Vec<String>,
+    pub decision_reason: String,
+}
+
+/// Errors returned by [`TrustedEndpointRegistry`] validation and lookup.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum TrustedEndpointError {
+    #[error("trusted endpoint id must not be empty")]
+    MissingEndpointId,
+    #[error("trusted endpoint identity digest must not be empty")]
+    MissingIdentityDigest,
+    #[error("trusted endpoint '{0}' is not registered")]
+    UnknownEndpoint(String),
+    #[error("trusted endpoint '{0}' requires explicit approval before use")]
+    TrustRequired(String),
+    #[error("trusted endpoint '{0}' identity health is not usable")]
+    UnhealthyIdentity(String),
+}
+
+/// In-memory trusted endpoint registry; callers persist [`TrustedEndpointRecord`] values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedEndpointRegistry {
+    endpoints: BTreeMap<String, TrustedEndpointRecord>,
+}
+
+impl TrustedEndpointRegistry {
+    /// Inserts or refreshes an observed endpoint without granting trust.
+    ///
+    /// Unknown endpoints remain [`TrustedEndpointTrustState::PendingApproval`]
+    /// unless policy explicitly allows TOFU without approval.
+    ///
+    /// # Errors
+    /// Returns [`TrustedEndpointError`] for blank endpoint ids or identity digests.
+    pub fn observe_endpoint(
+        &mut self,
+        mut record: TrustedEndpointRecord,
+        policy: &TrustedEndpointPolicy,
+    ) -> Result<TrustedEndpointRecord, TrustedEndpointError> {
+        validate_trusted_endpoint_record(&record)?;
+        if !policy.allow_trust_on_first_use_without_approval
+            && matches!(record.trust_state, TrustedEndpointTrustState::Unknown)
+        {
+            record.trust_state = TrustedEndpointTrustState::PendingApproval;
+        }
+        record.capabilities.sort_by_key(|capability| capability.to_ascii_lowercase());
+        record.capabilities.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        self.endpoints.insert(record.endpoint_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    /// Marks an observed endpoint trusted after an explicit operator/admin decision.
+    ///
+    /// # Errors
+    /// Returns [`TrustedEndpointError::UnknownEndpoint`] when the endpoint was not observed first.
+    pub fn approve_endpoint(
+        &mut self,
+        endpoint_id: &str,
+        policy_bindings: Vec<String>,
+        now_unix_ms: i64,
+    ) -> Result<TrustedEndpointRecord, TrustedEndpointError> {
+        let endpoint = self
+            .endpoints
+            .get_mut(endpoint_id)
+            .ok_or_else(|| TrustedEndpointError::UnknownEndpoint(endpoint_id.to_owned()))?;
+        endpoint.trust_state = TrustedEndpointTrustState::Trusted;
+        endpoint.policy_bindings = policy_bindings;
+        endpoint.last_seen_unix_ms = now_unix_ms;
+        Ok(endpoint.clone())
+    }
+
+    /// Negotiates a requested capability set for backend selection.
+    ///
+    /// Unknown, untrusted, unhealthy, preview-disabled, or policy-denied endpoints
+    /// return `usable=false`; callers must not select them for execution.
+    ///
+    /// # Errors
+    /// Returns [`TrustedEndpointError::UnknownEndpoint`] when `endpoint_id` is not registered.
+    pub fn negotiate_capabilities(
+        &self,
+        endpoint_id: &str,
+        requested_capabilities: &[String],
+        policy: &TrustedEndpointPolicy,
+    ) -> Result<TrustedEndpointCapabilityNegotiation, TrustedEndpointError> {
+        let endpoint = self
+            .endpoints
+            .get(endpoint_id)
+            .ok_or_else(|| TrustedEndpointError::UnknownEndpoint(endpoint_id.to_owned()))?;
+        let preview_gate = match endpoint.transport {
+            TrustedEndpointTransport::LanDiscoveryPreview => policy.lan_discovery_enabled,
+            TrustedEndpointTransport::TailscalePreview => policy.tailscale_profile_enabled,
+            _ => true,
+        };
+        if !preview_gate {
+            return Ok(endpoint_negotiation(
+                endpoint,
+                false,
+                Vec::new(),
+                requested_capabilities.to_vec(),
+                "preview_transport_disabled",
+            ));
+        }
+        if !matches!(endpoint.trust_state, TrustedEndpointTrustState::Trusted) {
+            return Ok(endpoint_negotiation(
+                endpoint,
+                false,
+                Vec::new(),
+                requested_capabilities.to_vec(),
+                "trust_required",
+            ));
+        }
+        if !endpoint.health.healthy {
+            return Ok(endpoint_negotiation(
+                endpoint,
+                false,
+                Vec::new(),
+                requested_capabilities.to_vec(),
+                "unhealthy_identity",
+            ));
+        }
+
+        let endpoint_capabilities = endpoint
+            .capabilities
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let trusted_capabilities = policy
+            .trusted_capabilities
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        let mut granted = Vec::new();
+        let mut denied = Vec::new();
+        for capability in requested_capabilities {
+            let normalized = capability.to_ascii_lowercase();
+            if endpoint_capabilities.contains(normalized.as_str())
+                && trusted_capabilities.contains(normalized.as_str())
+            {
+                granted.push(capability.clone());
+            } else {
+                denied.push(capability.clone());
+            }
+        }
+        let usable = denied.is_empty();
+        Ok(endpoint_negotiation(
+            endpoint,
+            usable,
+            granted,
+            denied,
+            if usable { "granted" } else { "capability_denied" },
+        ))
+    }
+}
+
+fn validate_trusted_endpoint_record(
+    record: &TrustedEndpointRecord,
+) -> Result<(), TrustedEndpointError> {
+    if record.endpoint_id.trim().is_empty() {
+        return Err(TrustedEndpointError::MissingEndpointId);
+    }
+    if record.identity_digest_sha256.trim().is_empty() {
+        return Err(TrustedEndpointError::MissingIdentityDigest);
+    }
+    Ok(())
+}
+
+fn endpoint_negotiation(
+    endpoint: &TrustedEndpointRecord,
+    usable: bool,
+    granted_capabilities: Vec<String>,
+    denied_capabilities: Vec<String>,
+    decision_reason: &str,
+) -> TrustedEndpointCapabilityNegotiation {
+    TrustedEndpointCapabilityNegotiation {
+        endpoint_id: endpoint.endpoint_id.clone(),
+        usable,
+        trust_state: endpoint.trust_state,
+        healthy_identity: endpoint.health.healthy,
+        granted_capabilities,
+        denied_capabilities,
+        decision_reason: decision_reason.to_owned(),
+    }
+}
+
 /// Errors returned by [`WorkerFleetManager`] lifecycle operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum WorkerLifecycleError {
@@ -1552,6 +1813,8 @@ fn worker_supports_capabilities(
 #[cfg(test)]
 mod tests {
     use super::{
+        TrustedEndpointHealth, TrustedEndpointPolicy, TrustedEndpointRecord,
+        TrustedEndpointRegistry, TrustedEndpointTransport, TrustedEndpointTrustState,
         WorkerArtifactTransport, WorkerAttestation, WorkerCleanupReport, WorkerFleetManager,
         WorkerFleetPolicy, WorkerLeaseRequest, WorkerLifecycleError, WorkerLifecycleState,
         WorkerRemoteIdentity, WorkerRemoteLeaseBinding, WorkerRemoteToolContractError,
@@ -1579,6 +1842,92 @@ mod tests {
             issued_at_unix_ms: 1_000,
             expires_at_unix_ms: 10_000,
         }
+    }
+
+    fn trusted_endpoint_record() -> TrustedEndpointRecord {
+        TrustedEndpointRecord {
+            endpoint_id: "worker-endpoint-a".to_owned(),
+            trust_state: TrustedEndpointTrustState::Unknown,
+            last_seen_unix_ms: 2_000,
+            capabilities: vec!["tool:palyra.fs.read_file".to_owned()],
+            transport: TrustedEndpointTransport::Quic,
+            identity_digest_sha256: hex_digest("a"),
+            policy_bindings: Vec::new(),
+            health: TrustedEndpointHealth {
+                healthy: true,
+                checked_at_unix_ms: 2_000,
+                failure_reason: None,
+            },
+        }
+    }
+
+    #[test]
+    fn trusted_endpoint_observation_requires_explicit_approval() {
+        let mut registry = TrustedEndpointRegistry::default();
+        let policy = TrustedEndpointPolicy::default();
+
+        let record = registry
+            .observe_endpoint(trusted_endpoint_record(), &policy)
+            .expect("endpoint observation should persist");
+        let negotiation = registry
+            .negotiate_capabilities(
+                record.endpoint_id.as_str(),
+                &["tool:palyra.fs.read_file".to_owned()],
+                &policy,
+            )
+            .expect("observed endpoint should be negotiable");
+
+        assert_eq!(record.trust_state, TrustedEndpointTrustState::PendingApproval);
+        assert!(!negotiation.usable);
+        assert_eq!(negotiation.decision_reason, "trust_required");
+    }
+
+    #[test]
+    fn trusted_endpoint_negotiation_grants_only_policy_capabilities() {
+        let mut registry = TrustedEndpointRegistry::default();
+        let policy = TrustedEndpointPolicy::default();
+        registry
+            .observe_endpoint(trusted_endpoint_record(), &policy)
+            .expect("endpoint observation should persist");
+        registry
+            .approve_endpoint("worker-endpoint-a", vec!["operator-approved".to_owned()], 2_100)
+            .expect("endpoint approval should succeed");
+
+        let negotiation = registry
+            .negotiate_capabilities(
+                "worker-endpoint-a",
+                &["tool:palyra.fs.read_file".to_owned(), "tool:palyra.untrusted".to_owned()],
+                &policy,
+            )
+            .expect("trusted endpoint should negotiate");
+
+        assert!(!negotiation.usable);
+        assert_eq!(negotiation.granted_capabilities, ["tool:palyra.fs.read_file"]);
+        assert_eq!(negotiation.denied_capabilities, ["tool:palyra.untrusted"]);
+        assert_eq!(negotiation.decision_reason, "capability_denied");
+    }
+
+    #[test]
+    fn trusted_endpoint_preview_transports_are_disabled_by_default() {
+        let mut registry = TrustedEndpointRegistry::default();
+        let policy = TrustedEndpointPolicy::default();
+        let mut record = trusted_endpoint_record();
+        record.transport = TrustedEndpointTransport::LanDiscoveryPreview;
+        registry.observe_endpoint(record, &policy).expect("endpoint observation should persist");
+        registry
+            .approve_endpoint("worker-endpoint-a", vec!["operator-approved".to_owned()], 2_100)
+            .expect("endpoint approval should succeed");
+
+        let negotiation = registry
+            .negotiate_capabilities(
+                "worker-endpoint-a",
+                &["tool:palyra.fs.read_file".to_owned()],
+                &policy,
+            )
+            .expect("trusted endpoint should negotiate");
+
+        assert!(!negotiation.usable);
+        assert_eq!(negotiation.decision_reason, "preview_transport_disabled");
     }
 
     fn lease_request(run_id: &str, ttl_ms: u64) -> WorkerLeaseRequest {

@@ -54,6 +54,14 @@ pub enum PluginsCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    Health {
+        #[arg(long)]
+        plugin_id: Option<String>,
+        #[arg(long)]
+        skill_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Validate {
         #[arg(long = "artifact", alias = "artifact-path")]
         artifact_path: String,

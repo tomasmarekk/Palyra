@@ -13,6 +13,8 @@ pub struct UpdateCommand {
     pub archive: Option<String>,
     #[arg(long, default_value_t = false)]
     pub check: bool,
+    #[arg(long, default_value_t = false)]
+    pub release_readiness: bool,
     #[arg(long, default_value_t = false, conflicts_with = "yes")]
     pub dry_run: bool,
     #[arg(long, default_value_t = false, conflicts_with = "dry_run")]

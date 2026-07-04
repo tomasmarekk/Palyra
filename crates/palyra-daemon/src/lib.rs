@@ -56,6 +56,7 @@ mod acp;
 mod agents;
 pub mod app;
 pub mod application;
+mod automation;
 mod auxiliary_executor;
 mod background_queue;
 mod channel_router;
@@ -813,6 +814,14 @@ struct ConsoleLearningCandidatesQuery {
     max_confidence: Option<f64>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsoleLearningGraphQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    include_artifacts: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

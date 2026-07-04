@@ -1057,6 +1057,42 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/console/v1/cron/jobs/{job_id}/runs", get(console::cron::console_cron_runs_handler))
         .route("/console/v1/routines", get(console::routines::console_routines_list_handler))
         .route("/console/v1/routines", post(console::routines::console_routine_upsert_handler))
+        .route(
+            "/console/v1/automation/suggestions",
+            get(console::automation::console_automation_suggestions_list_handler),
+        )
+        .route(
+            "/console/v1/automation/suggestions",
+            post(console::automation::console_automation_suggestion_create_handler),
+        )
+        .route(
+            "/console/v1/automation/suggestions/{suggestion_id}",
+            get(console::automation::console_automation_suggestion_get_handler),
+        )
+        .route(
+            "/console/v1/automation/suggestions/{suggestion_id}/accept",
+            post(console::automation::console_automation_suggestion_accept_handler),
+        )
+        .route(
+            "/console/v1/automation/suggestions/{suggestion_id}/dismiss",
+            post(console::automation::console_automation_suggestion_dismiss_handler),
+        )
+        .route(
+            "/console/v1/automation/suggestions/{suggestion_id}/snooze",
+            post(console::automation::console_automation_suggestion_snooze_handler),
+        )
+        .route(
+            "/console/v1/automation/blueprints",
+            get(console::automation::console_automation_blueprints_list_handler),
+        )
+        .route(
+            "/console/v1/automation/blueprints/create-suggestion",
+            post(console::automation::console_automation_blueprint_create_suggestion_handler),
+        )
+        .route(
+            "/console/v1/automation/blueprints/{blueprint_id}",
+            get(console::automation::console_automation_blueprint_get_handler),
+        )
         .route("/console/v1/objectives", get(console::objectives::console_objectives_list_handler))
         .route(
             "/console/v1/objectives",
@@ -1217,12 +1253,20 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(console::memory::console_learning_candidates_list_handler),
         )
         .route(
+            "/console/v1/memory/learning/graph",
+            get(console::memory::console_learning_graph_handler),
+        )
+        .route(
             "/console/v1/memory/learning/curator/report",
             post(console::memory::console_learning_curator_report_handler),
         )
         .route(
             "/console/v1/memory/learning/candidates/{candidate_id}/history",
             get(console::memory::console_learning_candidate_history_handler),
+        )
+        .route(
+            "/console/v1/memory/learning/candidates/{candidate_id}/mutation-plan",
+            post(console::memory::console_learning_candidate_mutation_plan_handler),
         )
         .route(
             "/console/v1/memory/learning/candidates/{candidate_id}/review",
@@ -1423,6 +1467,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(console::skills::console_procedure_skill_promote_handler),
         )
         .route("/console/v1/plugins", get(console::plugins::console_plugins_list_handler))
+        .route("/console/v1/plugins/health", get(console::plugins::console_plugins_health_handler))
         .route(
             "/console/v1/plugins/install-or-bind",
             post(console::plugins::console_plugins_install_or_bind_handler),

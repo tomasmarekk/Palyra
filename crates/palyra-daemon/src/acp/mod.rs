@@ -48,6 +48,7 @@ const ACP_BINDINGS_INDEX_FORMAT: VersionedJsonFormat =
 const MAX_TEXT_BYTES: usize = 512;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_EVENT_LEDGER_PAYLOAD_BYTES: usize = 16 * 1024;
+const ACP_PRESENTATION_SCHEMA_VERSION: u32 = 1;
 pub(crate) const MAX_EVENT_LEDGER_EVENTS: usize = 1_024;
 pub(crate) const MAX_EVENT_LEDGER_EVENTS_PER_SESSION: usize = 200;
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
@@ -281,6 +282,107 @@ pub(crate) struct BindingExplainSnapshot {
     pub(crate) stale_permissions: bool,
     pub(crate) last_event_id: Option<String>,
     pub(crate) delivery_cursor: u64,
+}
+
+/// Input used to build the editor-facing ACP presentation projection.
+pub(crate) struct AcpPresentationProjectionInput<'a> {
+    pub(crate) event_kind: &'a str,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) tape_segment: Option<&'a str>,
+    pub(crate) compaction_generation: Option<u64>,
+    pub(crate) source_binding: Option<&'a str>,
+    pub(crate) payload: &'a Value,
+}
+
+/// Metadata attached to every ACP presentation object.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcpPresentationMetadata {
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) tape_segment: Option<String>,
+    pub(crate) compaction_generation: Option<u64>,
+    pub(crate) source_binding: Option<String>,
+}
+
+/// Reviewable edit proposal shown by ACP clients before workspace mutation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcpEditProposalPresentation {
+    pub(crate) proposal_id: String,
+    pub(crate) diff_summary: String,
+    pub(crate) risk_level: String,
+    pub(crate) affected_files: Vec<String>,
+    pub(crate) approval_actions: Vec<String>,
+    pub(crate) provenance_refs: Vec<String>,
+}
+
+/// Rich content block classes rendered by ACP clients.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AcpRichContentBlockKind {
+    Image,
+    EmbeddedResource,
+    FileResource,
+    FileUri,
+    SearchResult,
+    BrowserResult,
+    MemoryResult,
+    ArtifactRef,
+}
+
+/// Redacted ACP rich content block. It carries references and preview text,
+/// not raw binary data or secret-bearing payloads.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcpRichContentBlock {
+    pub(crate) block_id: String,
+    pub(crate) block_kind: AcpRichContentBlockKind,
+    pub(crate) source_ref: String,
+    pub(crate) title: String,
+    pub(crate) preview: Option<String>,
+    pub(crate) provenance_refs: Vec<String>,
+}
+
+/// Renderer policy for one ACP tool-output class.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcpToolOutputRenderer {
+    pub(crate) renderer: String,
+    pub(crate) content_policy: String,
+    pub(crate) redaction_policy: String,
+}
+
+/// Editor-facing projection for ACP events, approvals, and replay entries.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct AcpPresentationProjection {
+    pub(crate) schema_version: u32,
+    pub(crate) event_type: String,
+    pub(crate) event_kind: String,
+    pub(crate) metadata: AcpPresentationMetadata,
+    pub(crate) edit_proposal: Option<AcpEditProposalPresentation>,
+    pub(crate) rich_blocks: Vec<AcpRichContentBlock>,
+    pub(crate) renderers: Vec<AcpToolOutputRenderer>,
+    pub(crate) redaction_level: String,
+}
+
+/// Builds a redacted ACP presentation projection from event or approval params.
+pub(crate) fn build_acp_presentation_projection(
+    input: AcpPresentationProjectionInput<'_>,
+) -> AcpPresentationProjection {
+    AcpPresentationProjection {
+        schema_version: ACP_PRESENTATION_SCHEMA_VERSION,
+        event_type: "acp.presentation_projection".to_owned(),
+        event_kind: normalize_text_lossy(input.event_kind, 80),
+        metadata: AcpPresentationMetadata {
+            run_id: input.run_id.map(ToOwned::to_owned),
+            session_id: input.session_id.map(ToOwned::to_owned),
+            tape_segment: input.tape_segment.map(|value| normalize_text_lossy(value, 120)),
+            compaction_generation: input.compaction_generation,
+            source_binding: input.source_binding.map(|value| normalize_text_lossy(value, 160)),
+        },
+        edit_proposal: edit_proposal_from_presentation_payload(input.payload),
+        rich_blocks: rich_blocks_from_presentation_payload(input.payload),
+        renderers: renderers_from_presentation_payload(input.payload),
+        redaction_level: "metadata_only".to_owned(),
+    }
 }
 
 /// Thread-safe owner of the ACP bindings index and per-client rate limits.
@@ -1126,6 +1228,206 @@ pub(crate) fn translate_palyra_event_type(event_type: &str) -> AcpRuntimeResult<
             message: format!("unsupported transcript event type '{other}'"),
         }),
     }
+}
+
+fn edit_proposal_from_presentation_payload(payload: &Value) -> Option<AcpEditProposalPresentation> {
+    let proposal = payload.get("edit_proposal").unwrap_or(payload);
+    let affected_files = string_array_from_json(proposal, "affected_files")
+        .or_else(|| string_array_from_json(proposal, "paths"))
+        .unwrap_or_default();
+    let diff_summary = string_from_json(proposal, "diff_summary")
+        .or_else(|| string_from_json(proposal, "summary"));
+    if diff_summary.is_none() && affected_files.is_empty() {
+        return None;
+    }
+    let diff_summary = diff_summary.unwrap_or_else(|| {
+        format!("{} file(s) require review before mutation", affected_files.len())
+    });
+    let proposal_id = string_from_json(proposal, "proposal_id")
+        .or_else(|| string_from_json(payload, "approval_id"))
+        .unwrap_or_else(|| sha256_hex(proposal.to_string().as_bytes()).chars().take(24).collect());
+    let provenance_refs = string_array_from_json(proposal, "provenance_refs")
+        .or_else(|| string_array_from_json(payload, "evidence_refs"))
+        .unwrap_or_default();
+    Some(AcpEditProposalPresentation {
+        proposal_id: normalize_text_lossy(proposal_id.as_str(), 120),
+        diff_summary: normalize_text_lossy(diff_summary.as_str(), 600),
+        risk_level: string_from_json(proposal, "risk_level")
+            .unwrap_or_else(|| "review".to_owned())
+            .trim()
+            .to_ascii_lowercase(),
+        affected_files: affected_files
+            .into_iter()
+            .map(|path| normalize_text_lossy(path.as_str(), 240))
+            .collect(),
+        approval_actions: vec!["approve".to_owned(), "reject".to_owned(), "modify".to_owned()],
+        provenance_refs: provenance_refs
+            .into_iter()
+            .map(|reference| normalize_text_lossy(reference.as_str(), 240))
+            .collect(),
+    })
+}
+
+fn rich_blocks_from_presentation_payload(payload: &Value) -> Vec<AcpRichContentBlock> {
+    let mut blocks = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in ["rich_blocks", "resources", "source_refs", "evidence_refs"] {
+        let Some(values) = payload.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            if let Some(block) = rich_block_from_value(value) {
+                if seen.insert(block.block_id.clone()) {
+                    blocks.push(block);
+                }
+            }
+        }
+    }
+    blocks.sort_by(|left, right| {
+        left.block_kind.cmp(&right.block_kind).then(left.source_ref.cmp(&right.source_ref))
+    });
+    blocks
+}
+
+fn rich_block_from_value(value: &Value) -> Option<AcpRichContentBlock> {
+    let (kind, source_ref, title, preview, provenance_refs) = match value {
+        Value::Object(_) => {
+            let raw_kind = string_from_json(value, "kind")
+                .or_else(|| string_from_json(value, "type"))
+                .or_else(|| string_from_json(value, "source_type"))?;
+            let source_ref = string_from_json(value, "source_ref")
+                .or_else(|| string_from_json(value, "ref"))
+                .or_else(|| string_from_json(value, "uri"))
+                .or_else(|| string_from_json(value, "url"))
+                .or_else(|| string_from_json(value, "path"))
+                .or_else(|| string_from_json(value, "artifact_id"))
+                .or_else(|| string_from_json(value, "memory_id"))
+                .or_else(|| string_from_json(value, "document_id"))?;
+            (
+                parse_rich_block_kind(raw_kind.as_str())?,
+                source_ref,
+                string_from_json(value, "title").or_else(|| string_from_json(value, "label")),
+                string_from_json(value, "preview")
+                    .or_else(|| string_from_json(value, "summary"))
+                    .or_else(|| string_from_json(value, "snippet")),
+                string_array_from_json(value, "provenance_refs").unwrap_or_default(),
+            )
+        }
+        Value::String(raw) => {
+            let kind = if raw.starts_with("file://") {
+                AcpRichContentBlockKind::FileUri
+            } else {
+                parse_rich_block_kind(raw)?
+            };
+            (kind, raw.clone(), None, None, Vec::new())
+        }
+        _ => return None,
+    };
+    let source_ref = normalize_text_lossy(source_ref.as_str(), 360);
+    let block_id =
+        sha256_hex(format!("{kind:?}:{source_ref}").as_bytes()).chars().take(24).collect();
+    Some(AcpRichContentBlock {
+        block_id,
+        block_kind: kind,
+        title: normalize_text_lossy(title.unwrap_or_else(|| source_ref.clone()).as_str(), 160),
+        source_ref,
+        preview: preview.map(|text| normalize_text_lossy(text.as_str(), 600)),
+        provenance_refs: provenance_refs
+            .into_iter()
+            .map(|reference| normalize_text_lossy(reference.as_str(), 240))
+            .collect(),
+    })
+}
+
+fn parse_rich_block_kind(raw: &str) -> Option<AcpRichContentBlockKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "image" | "image_ref" => Some(AcpRichContentBlockKind::Image),
+        "embedded_resource" | "embedded" => Some(AcpRichContentBlockKind::EmbeddedResource),
+        "file_resource" | "file" => Some(AcpRichContentBlockKind::FileResource),
+        "file_uri" | "uri" => Some(AcpRichContentBlockKind::FileUri),
+        "search_result" | "search" => Some(AcpRichContentBlockKind::SearchResult),
+        "browser_result" | "browser" => Some(AcpRichContentBlockKind::BrowserResult),
+        "memory_result" | "memory" => Some(AcpRichContentBlockKind::MemoryResult),
+        "artifact_ref" | "artifact" | "audit_artifact" => {
+            Some(AcpRichContentBlockKind::ArtifactRef)
+        }
+        _ => None,
+    }
+}
+
+fn renderers_from_presentation_payload(payload: &Value) -> Vec<AcpToolOutputRenderer> {
+    let mut renderers = Vec::new();
+    let mut seen = BTreeSet::new();
+    for key in ["tool_name", "output_kind", "renderer", "kind"] {
+        if let Some(raw) = string_from_json(payload, key) {
+            if let Some(renderer) = renderer_for_tool_output(raw.as_str()) {
+                seen.insert(renderer.to_owned());
+            }
+        }
+    }
+    if let Some(outputs) = payload.get("outputs").and_then(Value::as_array) {
+        for output in outputs {
+            for key in ["kind", "tool_name", "renderer"] {
+                if let Some(raw) = string_from_json(output, key) {
+                    if let Some(renderer) = renderer_for_tool_output(raw.as_str()) {
+                        seen.insert(renderer.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    for renderer in seen {
+        renderers.push(AcpToolOutputRenderer {
+            renderer,
+            content_policy: "redacted_preview_with_artifact_refs".to_owned(),
+            redaction_policy: "secrets_and_large_payloads_withheld".to_owned(),
+        });
+    }
+    renderers
+}
+
+fn renderer_for_tool_output(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.contains("patch") || normalized.contains("diff") {
+        Some("workspace_patch")
+    } else if normalized.contains("read") || normalized.contains("file") {
+        Some("file_read")
+    } else if normalized.contains("search") || normalized.contains("grep") {
+        Some("search_results")
+    } else if normalized.contains("shell") || normalized.contains("process") {
+        Some("shell_output")
+    } else if normalized.contains("browser") {
+        Some("browser_result")
+    } else if normalized.contains("memory") || normalized.contains("recall") {
+        Some("memory_result")
+    } else if normalized.contains("verification") || normalized.contains("test") {
+        Some("verification_evidence")
+    } else {
+        None
+    }
+}
+
+fn string_from_json(value: &Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(|raw| raw.to_owned())
+}
+
+fn string_array_from_json(value: &Value, key: &str) -> Option<Vec<String>> {
+    value.get(key).and_then(value_string_array)
+}
+
+fn value_string_array(value: &Value) -> Option<Vec<String>> {
+    let values = value.as_array()?;
+    Some(values.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect())
+}
+
+fn normalize_text_lossy(raw: &str, max_chars: usize) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(max_chars.saturating_sub(3)).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn create_state_dir(root: &Path) -> AcpRuntimeResult<()> {

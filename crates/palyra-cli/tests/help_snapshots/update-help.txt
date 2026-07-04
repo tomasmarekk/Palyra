@@ -9,6 +9,8 @@ Options:
 
       --check
 
+      --release-readiness
+
       --dry-run
 
       --yes

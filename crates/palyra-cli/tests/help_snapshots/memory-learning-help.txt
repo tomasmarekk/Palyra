@@ -1,11 +1,13 @@
 Usage: palyra memory learning [OPTIONS] <COMMAND>
 
 Commands:
+  graph
   list
   history
   review
   eval
   apply
+  mutation-plan
   preferences
   promote-procedure
 

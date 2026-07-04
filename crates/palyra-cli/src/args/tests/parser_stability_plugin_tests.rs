@@ -423,6 +423,28 @@ fn parse_plugins_doctor_command() {
 }
 
 #[test]
+fn parse_plugins_health_command() {
+    let health = Cli::parse_from([
+        "palyra",
+        "plugins",
+        "health",
+        "--plugin-id",
+        "acme.echo_http_plugin",
+        "--skill-id",
+        "acme.echo_http",
+        "--json",
+    ]);
+    match health.command {
+        Command::Plugins { command: PluginsCommand::Health { plugin_id, skill_id, json } } => {
+            assert_eq!(plugin_id.as_deref(), Some("acme.echo_http_plugin"));
+            assert_eq!(skill_id.as_deref(), Some("acme.echo_http"));
+            assert!(json);
+        }
+        other => panic!("unexpected health parse result: {other:?}"),
+    }
+}
+
+#[test]
 fn parse_plugins_local_validation_commands() {
     let validate = Cli::parse_from([
         "palyra",

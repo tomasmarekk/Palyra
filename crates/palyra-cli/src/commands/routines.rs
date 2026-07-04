@@ -15,8 +15,9 @@ use serde_json::{json, Map, Value};
 
 use crate::cli::{
     CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg, RoutineApprovalModeArg,
-    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
-    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg, RoutinesCommand,
+    RoutineBlueprintsCommand, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
+    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg,
+    RoutineSuggestionsCommand, RoutineTriggerKindArg, RoutinesCommand,
 };
 use crate::*;
 
@@ -333,6 +334,12 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             let payload = list_routine_templates_value(&context.client).await?;
             emit_routine_templates(&payload, output::preferred_json(json))
         }
+        RoutinesCommand::Suggestions { command } => {
+            run_routine_suggestions_command(&context.client, command).await
+        }
+        RoutinesCommand::Blueprints { command } => {
+            run_routine_blueprints_command(&context.client, command).await
+        }
         RoutinesCommand::SchedulePreview { phrase, timezone, json } => {
             let payload =
                 preview_routine_schedule_value(&context.client, phrase.as_str(), timezone.as_str())
@@ -348,6 +355,155 @@ pub(crate) async fn run_routines_async(command: RoutinesCommand) -> Result<()> {
             let export = read_import_bundle(file.as_deref(), stdin)?;
             let payload = import_routine_value(&context.client, export, id, enabled).await?;
             emit_routine_import(&payload, output::preferred_json(json))
+        }
+    }
+}
+
+async fn run_routine_suggestions_command(
+    client: &control_plane::ControlPlaneClient,
+    command: RoutineSuggestionsCommand,
+) -> Result<()> {
+    match command {
+        RoutineSuggestionsCommand::List { status, candidate_type, json } => {
+            let payload = client
+                .list_automation_suggestions(
+                    status.map(|value| value.as_str().to_owned()),
+                    candidate_type.map(|value| value.as_str().to_owned()),
+                )
+                .await?;
+            emit_automation_suggestions(
+                "routines.suggestions.list",
+                &payload,
+                output::preferred_json(json),
+            )
+        }
+        RoutineSuggestionsCommand::Show { suggestion_id, json } => {
+            let payload = client.get_automation_suggestion(suggestion_id.as_str()).await?;
+            emit_automation_suggestion(
+                "routines.suggestions.show",
+                &payload,
+                output::preferred_json(json),
+            )
+        }
+        RoutineSuggestionsCommand::Create {
+            source,
+            candidate_type,
+            spec,
+            spec_stdin,
+            reason,
+            risk_level,
+            required_approvals,
+            session,
+            run,
+            json,
+        } => {
+            let proposed_spec =
+                read_json_object_argument("automation suggestion spec", spec, spec_stdin)?
+                    .unwrap_or_else(|| json!({}));
+            let payload = json!({
+                "source": source.as_str(),
+                "candidate_type": candidate_type.as_str(),
+                "proposed_spec": proposed_spec,
+                "reason": reason,
+                "risk_level": risk_level.as_str(),
+                "required_approvals": required_approvals,
+                "created_from_session_id": session,
+                "created_from_run_id": run,
+                "provenance": {
+                    "session_id": session,
+                    "run_id": run,
+                    "evidence_refs": []
+                }
+            });
+            let response = client.create_automation_suggestion(&payload).await?;
+            emit_automation_suggestion(
+                "routines.suggestions.create",
+                &response,
+                output::preferred_json(json),
+            )
+        }
+        RoutineSuggestionsCommand::Accept { suggestion_id, reason, json } => {
+            let payload = transition_payload(reason, None);
+            let response =
+                client.accept_automation_suggestion(suggestion_id.as_str(), &payload).await?;
+            emit_automation_suggestion_transition(
+                "routines.suggestions.accept",
+                &response,
+                output::preferred_json(json),
+            )
+        }
+        RoutineSuggestionsCommand::Dismiss { suggestion_id, reason, json } => {
+            let payload = transition_payload(reason, None);
+            let response =
+                client.dismiss_automation_suggestion(suggestion_id.as_str(), &payload).await?;
+            emit_automation_suggestion(
+                "routines.suggestions.dismiss",
+                &response,
+                output::preferred_json(json),
+            )
+        }
+        RoutineSuggestionsCommand::Snooze { suggestion_id, until_unix_ms, reason, json } => {
+            let payload = transition_payload(reason, Some(until_unix_ms));
+            let response =
+                client.snooze_automation_suggestion(suggestion_id.as_str(), &payload).await?;
+            emit_automation_suggestion(
+                "routines.suggestions.snooze",
+                &response,
+                output::preferred_json(json),
+            )
+        }
+    }
+}
+
+async fn run_routine_blueprints_command(
+    client: &control_plane::ControlPlaneClient,
+    command: RoutineBlueprintsCommand,
+) -> Result<()> {
+    match command {
+        RoutineBlueprintsCommand::List { json } => {
+            let payload = client.list_automation_blueprints().await?;
+            emit_automation_blueprints(
+                "routines.blueprints.list",
+                &payload,
+                output::preferred_json(json),
+            )
+        }
+        RoutineBlueprintsCommand::Show { blueprint_id, json } => {
+            let payload = client.get_automation_blueprint(blueprint_id.as_str()).await?;
+            emit_automation_blueprint(
+                "routines.blueprints.show",
+                &payload,
+                output::preferred_json(json),
+            )
+        }
+        RoutineBlueprintsCommand::CreateSuggestion {
+            blueprint_id,
+            parameters,
+            parameters_stdin,
+            reason,
+            session,
+            run,
+            json,
+        } => {
+            let parameters = read_json_object_argument(
+                "automation blueprint parameters",
+                parameters,
+                parameters_stdin,
+            )?
+            .unwrap_or_else(|| json!({}));
+            let payload = json!({
+                "blueprint_id": blueprint_id,
+                "parameters": parameters,
+                "reason": reason,
+                "session_id": session,
+                "run_id": run,
+            });
+            let response = client.create_automation_blueprint_suggestion(&payload).await?;
+            emit_automation_suggestion(
+                "routines.blueprints.create_suggestion",
+                &response,
+                output::preferred_json(json),
+            )
         }
     }
 }
@@ -611,6 +767,122 @@ pub(crate) fn json_i64_at(value: &Value, pointer: &str) -> Option<i64> {
 /// Returns the raw JSON value at a pointer, or `None` if absent.
 pub(crate) fn json_value_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
     value.pointer(pointer)
+}
+
+fn transition_payload(reason: Option<String>, snoozed_until_unix_ms: Option<i64>) -> Value {
+    json!({
+        "actor": "operator",
+        "reason": reason,
+        "snoozed_until_unix_ms": snoozed_until_unix_ms,
+    })
+}
+
+fn emit_automation_suggestions(event: &str, payload: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode automation suggestions output as JSON",
+        );
+    }
+    let suggestions =
+        payload.pointer("/suggestions").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    println!("{event} count={}", suggestions.len());
+    for suggestion in suggestions {
+        print_automation_suggestion_line(event, suggestion);
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_automation_suggestion(event: &str, payload: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode automation suggestion output as JSON",
+        );
+    }
+    let suggestion = payload.pointer("/suggestion").unwrap_or(payload);
+    print_automation_suggestion_line(event, suggestion);
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_automation_suggestion_transition(event: &str, payload: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode automation suggestion transition output as JSON",
+        );
+    }
+    let suggestion = payload.pointer("/suggestion").unwrap_or(payload);
+    let plan = payload.pointer("/accept_plan").unwrap_or(&Value::Null);
+    println!(
+        "{event} id={} status={} action={} review_required={} approval_policy_preserved={}",
+        json_optional_string_at(suggestion, "/suggestion_id")
+            .unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/status").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(plan, "/action").unwrap_or_else(|| "none".to_owned()),
+        json_bool_at(plan, "/review_required").unwrap_or(false),
+        json_bool_at(plan, "/approval_policy_preserved").unwrap_or(false),
+    );
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_automation_blueprints(event: &str, payload: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode automation blueprints output as JSON",
+        );
+    }
+    let blueprints =
+        payload.pointer("/blueprints").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    println!("{event} count={}", blueprints.len());
+    for blueprint in blueprints {
+        print_automation_blueprint_line(event, blueprint);
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_automation_blueprint(event: &str, payload: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(
+            payload,
+            "failed to encode automation blueprint output as JSON",
+        );
+    }
+    let blueprint = payload.pointer("/blueprint").unwrap_or(payload);
+    print_automation_blueprint_line(event, blueprint);
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn print_automation_suggestion_line(event: &str, suggestion: &Value) {
+    println!(
+        "{event}.suggestion id={} status={} type={} risk={} source={} reason={}",
+        json_optional_string_at(suggestion, "/suggestion_id")
+            .unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/status").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/candidate_type")
+            .unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/risk_level").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/source").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(suggestion, "/reason").unwrap_or_default(),
+    );
+}
+
+fn print_automation_blueprint_line(event: &str, blueprint: &Value) {
+    let capabilities = blueprint
+        .pointer("/required_capabilities")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    println!(
+        "{event}.blueprint id={} type={} risk={} capabilities={} verification={}",
+        json_optional_string_at(blueprint, "/id").unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(blueprint, "/candidate_type")
+            .unwrap_or_else(|| "unknown".to_owned()),
+        json_optional_string_at(blueprint, "/risk_level").unwrap_or_else(|| "unknown".to_owned()),
+        capabilities,
+        json_optional_string_at(blueprint, "/verification_strategy").unwrap_or_default(),
+    );
 }
 
 fn emit_routines_status(payload: &Value, json: bool) -> Result<()> {
@@ -1394,6 +1666,25 @@ fn read_optional_json_object(
         (Some(_), true) => {
             anyhow::bail!("--trigger-payload conflicts with --trigger-payload-stdin")
         }
+    }
+}
+
+fn read_json_object_argument(
+    label: &str,
+    inline: Option<String>,
+    from_stdin: bool,
+) -> Result<Option<Value>> {
+    match (inline, from_stdin) {
+        (Some(text), false) => Ok(Some(Value::Object(parse_json_object(text.as_str(), label)?))),
+        (None, true) => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .with_context(|| format!("failed to read {label} from stdin"))?;
+            Ok(Some(Value::Object(parse_json_object(buffer.as_str(), label)?)))
+        }
+        (None, false) => Ok(None),
+        (Some(_), true) => anyhow::bail!("inline {label} conflicts with stdin {label}"),
     }
 }
 

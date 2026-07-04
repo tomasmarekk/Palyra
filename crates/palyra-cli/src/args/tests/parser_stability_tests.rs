@@ -3,7 +3,10 @@
 
 use clap::Parser;
 
-use crate::cli::MemoryWorkspaceCommand;
+use crate::cli::{
+    AutomationCandidateTypeArg, AutomationRiskLevelArg, AutomationSuggestionSourceArg,
+    MemoryWorkspaceCommand, RoutineBlueprintsCommand, RoutineSuggestionsCommand,
+};
 
 use super::*;
 
@@ -176,6 +179,25 @@ fn parse_devices_command<const N: usize>(args: [&str; N]) -> DevicesCommand {
 }
 
 #[test]
+fn parse_memory_learning_graph() {
+    let graph = parse_memory_learning_command([
+        "palyra",
+        "memory",
+        "learning",
+        "graph",
+        "--limit",
+        "48",
+        "--include-artifacts",
+        "false",
+        "--json",
+    ]);
+    assert_eq!(
+        graph,
+        MemoryLearningCommand::Graph { limit: Some(48), include_artifacts: false, json: true }
+    );
+}
+
+#[test]
 fn parse_memory_learning_list() {
     let list = parse_memory_learning_command([
         "palyra",
@@ -304,6 +326,34 @@ fn parse_memory_learning_apply() {
 }
 
 #[test]
+fn parse_memory_learning_mutation_plan() {
+    let plan = parse_memory_learning_command([
+        "palyra",
+        "memory",
+        "learning",
+        "mutation-plan",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB8",
+        "archive",
+        "--reason",
+        "duplicate after review",
+        "--merge-target-id",
+        "01ARZ3NDEKTSV4RRFFQ69G5FB9",
+        "--json",
+    ]);
+    assert_eq!(
+        plan,
+        MemoryLearningCommand::MutationPlan {
+            candidate_id: "01ARZ3NDEKTSV4RRFFQ69G5FB8".to_owned(),
+            action: "archive".to_owned(),
+            reason: "duplicate after review".to_owned(),
+            replacement_json: None,
+            merge_target_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FB9".to_owned()),
+            json: true,
+        }
+    );
+}
+
+#[test]
 fn parse_memory_learning_promote_procedure() {
     let promote = parse_memory_learning_command([
         "palyra",
@@ -358,6 +408,109 @@ fn parse_memory_learning_promote_procedure_can_leave_candidate_pending() {
             json: false,
         }
     );
+}
+
+#[test]
+fn parse_routines_suggestions_create() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "routines",
+        "suggestions",
+        "create",
+        "--source",
+        "learning-graph",
+        "--candidate-type",
+        "routine",
+        "--spec",
+        "{\"name\":\"daily summary\"}",
+        "--reason",
+        "operator requested review",
+        "--risk-level",
+        "low",
+        "--required-approval",
+        "operator",
+        "--session",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--run",
+        "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+        "--json",
+    ]);
+
+    match parsed.command {
+        Command::Routines {
+            command:
+                RoutinesCommand::Suggestions {
+                    command:
+                        RoutineSuggestionsCommand::Create {
+                            source,
+                            candidate_type,
+                            spec,
+                            spec_stdin,
+                            reason,
+                            risk_level,
+                            required_approvals,
+                            session,
+                            run,
+                            json,
+                        },
+                },
+        } => {
+            assert_eq!(source, AutomationSuggestionSourceArg::LearningGraph);
+            assert_eq!(candidate_type, AutomationCandidateTypeArg::Routine);
+            assert_eq!(spec.as_deref(), Some("{\"name\":\"daily summary\"}"));
+            assert!(!spec_stdin);
+            assert_eq!(reason, "operator requested review");
+            assert_eq!(risk_level, AutomationRiskLevelArg::Low);
+            assert_eq!(required_approvals, ["operator"]);
+            assert_eq!(session.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+            assert_eq!(run.as_deref(), Some("01BX5ZZKBKACTAV9WEVGEMMVRZ"));
+            assert!(json);
+        }
+        other => panic!("unexpected routines suggestions parse result: {other:?}"),
+    }
+}
+
+#[test]
+fn parse_routines_blueprint_create_suggestion() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "routines",
+        "blueprints",
+        "create-suggestion",
+        "summary_report",
+        "--parameters",
+        "{\"channel\":\"ops\"}",
+        "--reason",
+        "template review",
+        "--json",
+    ]);
+
+    match parsed.command {
+        Command::Routines {
+            command:
+                RoutinesCommand::Blueprints {
+                    command:
+                        RoutineBlueprintsCommand::CreateSuggestion {
+                            blueprint_id,
+                            parameters,
+                            parameters_stdin,
+                            reason,
+                            session,
+                            run,
+                            json,
+                        },
+                },
+        } => {
+            assert_eq!(blueprint_id, "summary_report");
+            assert_eq!(parameters.as_deref(), Some("{\"channel\":\"ops\"}"));
+            assert!(!parameters_stdin);
+            assert_eq!(reason, "template review");
+            assert_eq!(session, None);
+            assert_eq!(run, None);
+            assert!(json);
+        }
+        other => panic!("unexpected routines blueprints parse result: {other:?}"),
+    }
 }
 
 #[test]

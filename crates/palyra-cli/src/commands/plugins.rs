@@ -111,6 +111,13 @@ async fn run_plugins_async(command: PluginsCommand) -> Result<()> {
                 .await?;
             emit_plugin_doctor(envelope, json)
         }
+        PluginsCommand::Health { plugin_id, skill_id, json } => {
+            let envelope = context
+                .client
+                .get_plugin_health(&control_plane::PluginBindingsQuery { plugin_id, skill_id })
+                .await?;
+            emit_plugin_health(&envelope, json)
+        }
         PluginsCommand::Install {
             plugin_id,
             skill_id,
@@ -583,6 +590,59 @@ fn emit_plugin_doctor(
             if let Some(reasons) = plugin.get("reasons").and_then(Value::as_array) {
                 for reason in reasons.iter().filter_map(Value::as_str) {
                     println!("plugins.doctor.reason {}", reason);
+                }
+            }
+        }
+    }
+    std::io::stdout().flush().context("stdout flush failed")
+}
+
+fn emit_plugin_health(envelope: &Value, json: bool) -> Result<()> {
+    if output::preferred_json(json) {
+        return output::print_json_pretty(envelope, "failed to encode plugin health as JSON");
+    }
+    if output::preferred_ndjson(json, false) {
+        output::print_json_line(envelope, "failed to encode plugin health as NDJSON")?;
+        return std::io::stdout().flush().context("stdout flush failed");
+    }
+
+    let object = envelope.as_object();
+    let schema_version = object
+        .and_then(|value| value.get("schema_version"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let root =
+        object.and_then(|value| value.get("plugins_root")).and_then(Value::as_str).unwrap_or("n/a");
+    let total =
+        json_path_value(object, &["summary", "total"]).and_then(Value::as_u64).unwrap_or_default();
+    let ready =
+        json_path_value(object, &["summary", "ready"]).and_then(Value::as_u64).unwrap_or_default();
+    let unhealthy = json_path_value(object, &["summary", "unhealthy"])
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    println!(
+        "plugins.health schema_version={} root={} total={} ready={} unhealthy={}",
+        schema_version, root, total, ready, unhealthy
+    );
+    if let Some(entries) = object.and_then(|value| value.get("entries")).and_then(Value::as_array) {
+        for entry in entries {
+            println!(
+                "plugins.health.entry plugin_id={} status={} ready={} enabled={} skill_id={} version={} hot_reload={}",
+                entry.get("plugin_id").and_then(Value::as_str).unwrap_or("unknown"),
+                entry.get("status").and_then(Value::as_str).unwrap_or("failed_init"),
+                entry.get("ready").and_then(Value::as_bool).unwrap_or(false),
+                entry.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                entry.get("skill_id").and_then(Value::as_str).unwrap_or("unknown"),
+                entry.get("skill_version").and_then(Value::as_str).unwrap_or("current"),
+                entry.get("hot_reload")
+                    .and_then(Value::as_object)
+                    .and_then(|hot_reload| hot_reload.get("reload_mode"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            );
+            if let Some(reasons) = entry.get("reasons").and_then(Value::as_array) {
+                for reason in reasons.iter().filter_map(Value::as_str) {
+                    println!("plugins.health.reason {}", reason);
                 }
             }
         }

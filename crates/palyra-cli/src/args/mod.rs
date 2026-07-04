@@ -138,8 +138,10 @@ pub use protocol::ProtocolCommand;
 pub use qa::QaCommand;
 pub use reset::{ResetCommand, ResetScopeArg};
 pub use routines::{
-    RoutineApprovalModeArg, RoutineDeliveryModeArg, RoutineExecutionPostureArg,
-    RoutinePreviewTimezoneArg, RoutineRunModeArg, RoutineSilentPolicyArg, RoutineTriggerKindArg,
+    AutomationCandidateTypeArg, AutomationRiskLevelArg, AutomationSuggestionSourceArg,
+    AutomationSuggestionStatusArg, RoutineApprovalModeArg, RoutineBlueprintsCommand,
+    RoutineDeliveryModeArg, RoutineExecutionPostureArg, RoutinePreviewTimezoneArg,
+    RoutineRunModeArg, RoutineSilentPolicyArg, RoutineSuggestionsCommand, RoutineTriggerKindArg,
     RoutineUpsertCommand, RoutinesCommand,
 };
 pub use run::{RunCommand, RunControlActivePhaseArg, RunControlCommandArg, RunExportFormatArg};

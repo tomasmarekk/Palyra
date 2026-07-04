@@ -72,6 +72,12 @@ const LEARNING_CURATOR_REDACTION_LEVEL: &str = "metadata_only";
 const LEARNING_AUDIT_METADATA_REDACTION_LEVEL: &str = "metadata_only";
 const LEARNING_MODEL_CONTEXT_TRUST_LABEL: &str = "historical_reference";
 const LEARNING_MODEL_CONTEXT_INSTRUCTION_AUTHORITY: &str = "none";
+pub(crate) const LEARNING_GRAPH_PROJECTION_EVENT_COMPLETED: &str =
+    "learning_graph_projection.completed";
+const LEARNING_GRAPH_PROJECTION_SCHEMA_VERSION: u64 = 1;
+pub(crate) const LEARNING_MEMORY_MUTATION_PLAN_EVENT_COMPLETED: &str =
+    "learning_memory_mutation_plan.completed";
+const LEARNING_MEMORY_MUTATION_PLAN_SCHEMA_VERSION: u64 = 1;
 pub(crate) const SKILL_INVOCATION_HYGIENE_EVENT_COMPLETED: &str =
     "skill_invocation_hygiene_pro_learning_pipeline.completed";
 const SKILL_INVOCATION_HYGIENE_SCHEMA_VERSION: u64 = 1;
@@ -81,6 +87,13 @@ const CACHE_AWARE_BACKGROUND_LEARNING_REVIEW_SCHEMA_VERSION: u64 = 1;
 pub(crate) const PREFERENCE_PROCEDURE_CONFLICT_REPORT_EVENT_COMPLETED: &str =
     "preference_a_procedure_conflict_reports.completed";
 const PREFERENCE_PROCEDURE_CONFLICT_REPORT_SCHEMA_VERSION: u64 = 1;
+
+mod projection;
+
+pub(crate) use projection::{
+    learning_graph_projection, learning_memory_mutation_plan_for_candidate,
+    LearningGraphProjectionInput, LearningMemoryMutationPlan, LearningMemoryMutationPlanRequest,
+};
 
 /// Candidate-local input for the skill invocation hygiene projection.
 pub(crate) struct SkillInvocationHygieneInput<'a> {
@@ -3295,8 +3308,10 @@ pub(crate) fn shadow_learning_candidate_lifecycle(
 
 #[cfg(test)]
 mod tests {
+    use super::projection::{LearningGraphEdgeKind, LearningGraphNodeKind};
     use super::*;
     use crate::gateway::LearningRuntimeConfig;
+    use crate::journal::RecallArtifactRecord;
     use crate::journal::{OrchestratorRunStatusSnapshot, OrchestratorSessionTranscriptRecord};
 
     fn sample_run() -> OrchestratorRunStatusSnapshot {
@@ -3412,6 +3427,24 @@ mod tests {
         }
     }
 
+    fn recall_artifact_record(artifact_id: &str, payload: Value) -> RecallArtifactRecord {
+        RecallArtifactRecord {
+            artifact_id: artifact_id.to_owned(),
+            artifact_kind: "learning_curator_report".to_owned(),
+            principal: "user:ops".to_owned(),
+            device_id: "dev-01".to_owned(),
+            channel: Some("cli".to_owned()),
+            session_id: None,
+            query: "learning curator report".to_owned(),
+            summary: "graph fixture".to_owned(),
+            payload,
+            diagnostics: json!({}),
+            provenance: json!({}),
+            created_by_principal: "user:ops".to_owned(),
+            created_at_unix_ms: 1_700_000_000_100,
+        }
+    }
+
     fn learning_candidate_create_request(
         candidate_id: &str,
         dedupe_key: &str,
@@ -3439,6 +3472,92 @@ mod tests {
             provenance_json: "[]".to_owned(),
             source_task_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FT1".to_owned()),
         }
+    }
+
+    #[test]
+    fn learning_graph_projection_links_artifacts_without_recall_inclusion() {
+        let candidate = learning_candidate_record(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+            "preference",
+            "queued",
+            "pref-style",
+            json!({"key": "interaction.style", "value": "brief"}),
+            1_700_000_000_000,
+        );
+        let mut preference =
+            learning_preference_record("01ARZ3NDEKTSV4RRFFQ69G5FA2", "interaction.style", "brief");
+        preference.candidate_id = Some(candidate.candidate_id.clone());
+        let artifact = recall_artifact_record(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+            json!({
+                "refs": [
+                    candidate.candidate_id.clone(),
+                    preference.preference_id.clone(),
+                ],
+            }),
+        );
+
+        let graph = learning_graph_projection(LearningGraphProjectionInput {
+            generated_at_unix_ms: 1_700_000_000_500,
+            candidates: std::slice::from_ref(&candidate),
+            preferences: std::slice::from_ref(&preference),
+            recall_artifacts: std::slice::from_ref(&artifact),
+        });
+
+        assert_eq!(graph.node_count, 3);
+        assert_eq!(graph.nodes_by_kind.get(&LearningGraphNodeKind::RecallArtifact), Some(&1));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.edge_kind == LearningGraphEdgeKind::CandidatePreferenceSource }));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.edge_kind == LearningGraphEdgeKind::CandidateArtifactEvidence }));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.edge_kind == LearningGraphEdgeKind::PreferenceArtifactEvidence }));
+        let artifact_node = graph
+            .nodes
+            .iter()
+            .find(|node| node.node_kind == LearningGraphNodeKind::RecallArtifact)
+            .expect("artifact node should exist");
+        assert!(!artifact_node.recall_included);
+        assert_eq!(artifact_node.recall_state, "audit_artifact_excluded_from_prompt_context");
+    }
+
+    #[test]
+    fn learning_memory_mutation_plan_archives_through_review_only() {
+        let candidate = learning_candidate_record(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA4",
+            "patch_procedure",
+            "queued",
+            "procedure-release",
+            json!({"title": "Release routine"}),
+            1_700_000_000_000,
+        );
+
+        let plan = learning_memory_mutation_plan_for_candidate(
+            &candidate,
+            "user:ops",
+            1_700_000_000_600,
+            LearningMemoryMutationPlanRequest {
+                action: "archive".to_owned(),
+                reason: "duplicate candidate after operator review".to_owned(),
+                replacement_content: None,
+                merge_target_id: None,
+            },
+        )
+        .expect("archive plan should be valid");
+
+        assert_eq!(plan.review_status, "suppressed");
+        assert_eq!(plan.recall_effect.after, "retired_candidate_excluded");
+        assert!(!plan.recall_effect.direct_recall_write);
+        assert_eq!(
+            plan.operator_steps[0].body.get("status").and_then(Value::as_str),
+            Some("suppressed")
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ Commands:
   check
   explain
   doctor
+  health
   validate
   dry-run
   permissions

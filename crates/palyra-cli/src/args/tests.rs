@@ -985,6 +985,7 @@ fn parse_update_check_json_flag() {
                 install_root: None,
                 archive: None,
                 check: true,
+                release_readiness: false,
                 dry_run: false,
                 yes: false,
                 skip_service_restart: false,
@@ -1063,10 +1064,31 @@ fn parse_update_check_with_archive_hint() {
                 install_root: Some("install".to_owned()),
                 archive: Some("artifacts/palyra-headless.zip".to_owned()),
                 check: true,
+                release_readiness: false,
                 dry_run: false,
                 yes: false,
                 skip_service_restart: true,
                 json: false,
+            }
+        }
+    );
+}
+
+#[test]
+fn parse_update_release_readiness() {
+    let parsed = Cli::parse_from(["palyra", "update", "--release-readiness", "--json"]);
+    assert_eq!(
+        parsed.command,
+        Command::Update {
+            command: UpdateCommand {
+                install_root: None,
+                archive: None,
+                check: false,
+                release_readiness: true,
+                dry_run: false,
+                yes: false,
+                skip_service_restart: false,
+                json: true,
             }
         }
     );

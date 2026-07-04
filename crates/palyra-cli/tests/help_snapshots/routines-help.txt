@@ -16,6 +16,8 @@ Commands:
   dispatch
   delete                [aliases: rm]
   templates
+  suggestions
+  blueprints
   schedule-preview
   export
   import

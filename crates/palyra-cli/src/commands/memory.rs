@@ -1054,6 +1054,22 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
             )
         }
         MemoryCommand::Learning { command } => match command {
+            MemoryLearningCommand::Graph { limit, include_artifacts, json } => {
+                let path = build_console_query_path(
+                    "console/v1/memory/learning/graph",
+                    vec![
+                        ("limit", limit.map(|value| value.to_string())),
+                        ("include_artifacts", Some(include_artifacts.to_string())),
+                    ],
+                );
+                let payload = context.client.get_json_value(path.as_str()).await?;
+                emit_admin_payload(
+                    "memory.learning.graph",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/graph"],
+                )
+            }
             MemoryLearningCommand::List {
                 candidate_kind,
                 status,
@@ -1205,6 +1221,46 @@ async fn run_memory_admin_async(command: MemoryCommand) -> Result<()> {
                     &payload,
                     output::preferred_json(json),
                     &["/candidate", "/apply"],
+                )
+            }
+            MemoryLearningCommand::MutationPlan {
+                candidate_id,
+                action,
+                reason,
+                replacement_json,
+                merge_target_id,
+                json,
+            } => {
+                let replacement_content = replacement_json
+                    .as_deref()
+                    .map(|raw| {
+                        serde_json::from_str::<Value>(raw).with_context(|| {
+                            "memory learning mutation-plan --replacement-json must be valid JSON"
+                        })
+                    })
+                    .transpose()?;
+                let request = json!({
+                    "action": action,
+                    "reason": reason,
+                    "replacement_content": replacement_content,
+                    "merge_target_id": merge_target_id,
+                });
+                let payload = context
+                    .client
+                    .post_json_value(
+                        format!(
+                            "console/v1/memory/learning/candidates/{}/mutation-plan",
+                            percent_encode_component(candidate_id.as_str())
+                        )
+                        .as_str(),
+                        &request,
+                    )
+                    .await?;
+                emit_admin_payload(
+                    "memory.learning.mutation_plan",
+                    &payload,
+                    output::preferred_json(json),
+                    &["/plan", "/artifact"],
                 )
             }
             MemoryLearningCommand::Preferences {

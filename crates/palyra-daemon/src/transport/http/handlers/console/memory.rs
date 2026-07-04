@@ -32,11 +32,13 @@ use crate::journal::{
 use crate::*;
 use crate::{
     application::learning::{
-        apply_patch_learning_candidate, apply_preference_candidate,
-        preference_procedure_conflict_report, project_skill_invocation_hygiene_for_candidate,
-        shadow_learning_candidate_lifecycle, LearningCurator, LearningCuratorInput,
-        LearningCuratorReport, PreferenceProcedureConflictReport,
-        LEARNING_CURATOR_EVENT_REPORT_CREATED,
+        apply_patch_learning_candidate, apply_preference_candidate, learning_graph_projection,
+        learning_memory_mutation_plan_for_candidate, preference_procedure_conflict_report,
+        project_skill_invocation_hygiene_for_candidate, shadow_learning_candidate_lifecycle,
+        LearningCurator, LearningCuratorInput, LearningCuratorReport, LearningGraphProjectionInput,
+        LearningMemoryMutationPlan, LearningMemoryMutationPlanRequest,
+        PreferenceProcedureConflictReport, LEARNING_CURATOR_EVENT_REPORT_CREATED,
+        LEARNING_MEMORY_MUTATION_PLAN_EVENT_COMPLETED,
     },
     application::memory_provider::{
         explain_provider_hit, memory_provider_prefetch_snapshot, memory_provider_status_snapshot,
@@ -66,6 +68,7 @@ const MEMORY_INDEX_BATCH_LIMIT_REASON: &str = "batch_limit_reached";
 /// Error message returned while another index run holds the single-flight
 /// guard.
 const MEMORY_INDEX_CONCURRENT_RUN_MESSAGE: &str = "memory index run already in progress";
+const RECALL_ARTIFACT_KIND_LEARNING_MEMORY_MUTATION_PLAN: &str = "learning_memory_mutation_plan";
 
 /// `GET /console/v1/memory/status` — aggregates the memory subsystem view:
 /// usage, embeddings, retrieval backend plus diagnostics, providers,
@@ -925,6 +928,81 @@ pub(crate) async fn console_learning_curator_report_handler(
     })))
 }
 
+/// `GET /console/v1/memory/learning/graph` — returns a redacted,
+/// observe-only graph projection across learning candidates, preferences,
+/// and recent recall artifacts.
+///
+/// # Errors
+/// Returns an error response when authorization or any journal query fails.
+pub(crate) async fn console_learning_graph_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsoleLearningGraphQuery>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(128).clamp(1, 512);
+    let candidates = state
+        .runtime
+        .list_learning_candidates(journal::LearningCandidateListFilter {
+            candidate_id: None,
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            session_id: None,
+            scope_kind: None,
+            scope_id: None,
+            candidate_kind: None,
+            status: None,
+            risk_level: None,
+            source_task_id: None,
+            min_confidence: None,
+            max_confidence: None,
+            limit,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let preferences = state
+        .runtime
+        .list_learning_preferences(journal::LearningPreferenceListFilter {
+            owner_principal: Some(session.context.principal.clone()),
+            device_id: None,
+            channel: session.context.channel.clone(),
+            scope_kind: None,
+            scope_id: None,
+            status: None,
+            key: None,
+            limit,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let recall_artifacts = if query.include_artifacts.unwrap_or(true) {
+        state
+            .runtime
+            .list_recall_artifacts(RecallArtifactListFilter {
+                principal: session.context.principal.clone(),
+                device_id: session.context.device_id.clone(),
+                channel: session.context.channel.clone(),
+                session_id: None,
+                artifact_kind: None,
+                limit: limit.min(128),
+            })
+            .await
+            .map_err(runtime_status_response)?
+    } else {
+        Vec::new()
+    };
+    let graph = learning_graph_projection(LearningGraphProjectionInput {
+        generated_at_unix_ms: current_unix_ms(),
+        candidates: candidates.as_slice(),
+        preferences: preferences.as_slice(),
+        recall_artifacts: recall_artifacts.as_slice(),
+    });
+    Ok(Json(json!({
+        "graph": graph,
+        "contract": contract_descriptor(),
+    })))
+}
+
 /// `GET /console/v1/memory/learning/candidates` — lists the caller's learning
 /// candidates with optional filters and a lifecycle summary.
 ///
@@ -1008,6 +1086,64 @@ pub(crate) async fn console_learning_candidate_history_handler(
         "evals": evals,
         "rollouts": rollouts,
         "lifecycle": lifecycle,
+        "contract": contract_descriptor(),
+    })))
+}
+
+/// `POST /console/v1/memory/learning/candidates/{candidate_id}/mutation-plan`
+/// builds and stores an audit-only mutation plan for edit/archive/restore,
+/// conflict, merge, or reject flows. Executing the plan remains a separate
+/// review call so this endpoint cannot silently activate or delete memory.
+///
+/// # Errors
+/// Returns a not-found response when the candidate does not exist for the
+/// caller, an invalid-argument response for malformed plan input, and an
+/// error response when artifact creation or audit logging fails.
+pub(crate) async fn console_learning_candidate_mutation_plan_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(candidate_id): Path<String>,
+    Json(payload): Json<LearningMemoryMutationPlanRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    let candidate =
+        load_console_learning_candidate(&state, &session.context, candidate_id.as_str()).await?;
+    let plan = learning_memory_mutation_plan_for_candidate(
+        &candidate,
+        session.context.principal.as_str(),
+        current_unix_ms(),
+        payload,
+    )
+    .map_err(runtime_status_response)?;
+    let artifact = state
+        .runtime
+        .create_recall_artifact(build_learning_memory_mutation_plan_artifact_request(
+            &session.context,
+            session.context.channel.clone(),
+            &plan,
+        ))
+        .await
+        .map_err(runtime_status_response)?;
+    state
+        .runtime
+        .record_console_event(
+            &session.context,
+            LEARNING_MEMORY_MUTATION_PLAN_EVENT_COMPLETED,
+            json!({
+                "artifact_id": artifact.artifact_id,
+                "plan_id": plan.plan_id,
+                "target": plan.target,
+                "action": plan.action,
+                "review_status": plan.review_status,
+                "decision": plan.decision,
+                "direct_recall_write": plan.recall_effect.direct_recall_write,
+            }),
+        )
+        .await
+        .map_err(runtime_status_response)?;
+    Ok(Json(json!({
+        "plan": plan,
+        "artifact": artifact,
         "contract": contract_descriptor(),
     })))
 }
@@ -2214,6 +2350,54 @@ fn build_learning_curator_artifact_request(
                 .into_iter()
                 .collect::<Vec<_>>(),
             "redaction_level": report.redaction_level,
+        }),
+        created_by_principal: context.principal.clone(),
+    }
+}
+
+fn build_learning_memory_mutation_plan_artifact_request(
+    context: &RequestContext,
+    channel: Option<String>,
+    plan: &LearningMemoryMutationPlan,
+) -> RecallArtifactCreateRequest {
+    RecallArtifactCreateRequest {
+        artifact_id: plan.plan_id.clone(),
+        artifact_kind: RECALL_ARTIFACT_KIND_LEARNING_MEMORY_MUTATION_PLAN.to_owned(),
+        principal: context.principal.clone(),
+        device_id: context.device_id.clone(),
+        channel,
+        session_id: None,
+        query: format!("learning memory mutation plan {}", plan.plan_id),
+        summary: format!(
+            "{} candidate {} as {}",
+            plan.action, plan.target.target_id, plan.review_status
+        ),
+        payload: json!({
+            "plan": plan,
+            "durable_memory_write": false,
+        }),
+        diagnostics: json!({
+            "event_type": plan.event_type,
+            "decision": plan.decision,
+            "action": plan.action,
+            "review_status": plan.review_status,
+            "direct_recall_write": plan.recall_effect.direct_recall_write,
+            "recall_before": plan.recall_effect.before,
+            "recall_after": plan.recall_effect.after,
+            "redaction_level": plan.redaction_level,
+        }),
+        provenance: json!({
+            "source": "learning_memory_mutation_plan",
+            "event_type": plan.event_type,
+            "plan_id": plan.plan_id,
+            "target": plan.target,
+            "evidence_refs": plan
+                .action_payload
+                .get("evidence_refs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            "redaction_level": plan.redaction_level,
         }),
         created_by_principal: context.principal.clone(),
     }

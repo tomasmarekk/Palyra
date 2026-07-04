@@ -1328,6 +1328,26 @@ impl ControlPlaneClient {
         .await
     }
 
+    /// Returns plugin health sentinels via `GET console/v1/plugins/health`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn get_plugin_health(
+        &self,
+        query: &PluginBindingsQuery,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/plugins/health",
+                vec![("plugin_id", query.plugin_id.clone()), ("skill_id", query.skill_id.clone())],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
     /// Fetches one plugin binding via `GET console/v1/plugins/{plugin_id}`.
     ///
     /// # Errors
@@ -1420,6 +1440,150 @@ impl ControlPlaneClient {
             Method::POST,
             format!("console/v1/plugins/{}/delete", urlencoding(plugin_id)),
             None::<&Value>,
+            true,
+        )
+        .await
+    }
+
+    /// Lists automation suggestions via `GET console/v1/automation/suggestions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn list_automation_suggestions(
+        &self,
+        status: Option<String>,
+        candidate_type: Option<String>,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            build_query_path(
+                "console/v1/automation/suggestions",
+                vec![("status", status), ("candidate_type", candidate_type)],
+            ),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    /// Fetches one automation suggestion via `GET console/v1/automation/suggestions/{id}`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn get_automation_suggestion(
+        &self,
+        suggestion_id: &str,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/automation/suggestions/{}", urlencoding(suggestion_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    /// Creates an automation suggestion via `POST console/v1/automation/suggestions`.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn create_automation_suggestion(
+        &self,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::POST, "console/v1/automation/suggestions", Some(request), true)
+            .await
+    }
+
+    /// Accepts an automation suggestion.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn accept_automation_suggestion(
+        &self,
+        suggestion_id: &str,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.transition_automation_suggestion(suggestion_id, "accept", request).await
+    }
+
+    /// Dismisses an automation suggestion.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn dismiss_automation_suggestion(
+        &self,
+        suggestion_id: &str,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.transition_automation_suggestion(suggestion_id, "dismiss", request).await
+    }
+
+    /// Snoozes an automation suggestion.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn snooze_automation_suggestion(
+        &self,
+        suggestion_id: &str,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.transition_automation_suggestion(suggestion_id, "snooze", request).await
+    }
+
+    /// Lists built-in automation blueprints.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn list_automation_blueprints(&self) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(Method::GET, "console/v1/automation/blueprints", None::<&Value>, false)
+            .await
+    }
+
+    /// Fetches one built-in automation blueprint.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn get_automation_blueprint(
+        &self,
+        blueprint_id: &str,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::GET,
+            format!("console/v1/automation/blueprints/{}", urlencoding(blueprint_id)),
+            None::<&Value>,
+            false,
+        )
+        .await
+    }
+
+    /// Creates a suggestion from a built-in automation blueprint.
+    ///
+    /// # Errors
+    /// Returns [`ControlPlaneClientError`] on transport, HTTP, or response-decode failure.
+    pub async fn create_automation_blueprint_suggestion(
+        &self,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            "console/v1/automation/blueprints/create-suggestion",
+            Some(request),
+            true,
+        )
+        .await
+    }
+
+    async fn transition_automation_suggestion(
+        &self,
+        suggestion_id: &str,
+        action: &str,
+        request: &Value,
+    ) -> Result<Value, ControlPlaneClientError> {
+        self.request_json(
+            Method::POST,
+            format!("console/v1/automation/suggestions/{}/{}", urlencoding(suggestion_id), action),
+            Some(request),
             true,
         )
         .await

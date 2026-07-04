@@ -129,6 +129,75 @@ pub(crate) async fn console_plugins_list_handler(
     })))
 }
 
+/// Returns the current plugin health sentinel view.
+///
+/// # Errors
+/// Returns an error response when session authorization, plugin-root
+/// resolution, validation, or index persistence fails.
+pub(crate) async fn console_plugins_health_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConsolePluginsListQuery>,
+) -> Result<Json<Value>, Response> {
+    let _session = authorize_console_session(&state, &headers, false)?;
+    let plugins_root = resolve_plugins_root().map_err(internal_console_error)?;
+    let mut index =
+        load_plugin_bindings_index(plugins_root.as_path()).map_err(internal_console_error)?;
+    if let Some(plugin_id) =
+        query.plugin_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        index.entries.retain(|entry| entry.plugin_id == plugin_id.to_ascii_lowercase());
+    }
+    if let Some(skill_id) =
+        query.skill_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        index.entries.retain(|entry| entry.skill_id == skill_id.to_ascii_lowercase());
+    }
+
+    let mut dirty = false;
+    let mut ready = 0_usize;
+    let mut unhealthy = 0_usize;
+    let mut statuses = BTreeMap::<String, usize>::new();
+    let mut entries = Vec::with_capacity(index.entries.len());
+    for binding in &mut index.entries {
+        let (updated_binding, check, _) =
+            evaluate_plugin_binding(&state, plugins_root.as_path(), binding).await?;
+        if *binding != updated_binding {
+            *binding = updated_binding.clone();
+            dirty = true;
+        }
+        let entry = build_plugin_health_entry(&updated_binding, &check);
+        let status =
+            entry.get("status").and_then(Value::as_str).unwrap_or("failed_init").to_owned();
+        *statuses.entry(status).or_default() += 1;
+        if entry.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+            ready += 1;
+        } else {
+            unhealthy += 1;
+        }
+        entries.push(entry);
+    }
+    if dirty {
+        save_plugin_bindings_index(plugins_root.as_path(), &index)
+            .map_err(internal_console_error)?;
+    }
+
+    Ok(Json(json!({
+        "contract": contract_descriptor(),
+        "schema_version": index.schema_version,
+        "plugins_root": plugins_root,
+        "summary": {
+            "total": entries.len(),
+            "ready": ready,
+            "unhealthy": unhealthy,
+            "statuses": statuses,
+        },
+        "policy": plugin_health_policy_contract(),
+        "entries": entries,
+        "page": build_page_info(entries.len().max(1), entries.len(), None),
+    })))
+}
+
 /// Returns one plugin binding with validation and installed-skill details.
 ///
 /// # Errors
@@ -688,6 +757,168 @@ async fn evaluate_plugin_binding(
     ))
 }
 
+fn build_plugin_health_entry(binding: &PluginBindingRecord, check: &Value) -> Value {
+    let object = check.as_object();
+    let ready = json_bool(object, "ready");
+    let reasons = json_string_array(object, "reasons").unwrap_or_default();
+    let remediation = json_string_array(object, "remediation").unwrap_or_default();
+    let discovery_state = json_path_string(object, &["discovery", "state"]);
+    let config_state = json_path_string(object, &["config", "validation", "state"]);
+    let contracts_mode = json_path_string(object, &["contracts", "mode"]);
+    let contracts_ready = json_path_bool_opt(object, &["contracts", "ready"]);
+    let current_binding_version =
+        json_path_bool_opt(object, &["resolved", "current_binding_version"]);
+    let status = classify_plugin_health_status(
+        binding.enabled,
+        ready,
+        reasons.as_slice(),
+        discovery_state.as_deref(),
+        current_binding_version,
+    );
+    json!({
+        "plugin_id": binding.plugin_id,
+        "skill_id": binding.skill_id,
+        "skill_version": binding.skill_version.as_deref().unwrap_or("current"),
+        "enabled": binding.enabled,
+        "ready": ready,
+        "status": status,
+        "discovery": discovery_state,
+        "config": config_state,
+        "contracts_mode": contracts_mode,
+        "contracts_ready": contracts_ready,
+        "reasons": reasons,
+        "remediation": remediation,
+        "sentinel": {
+            "filesystem_checked": object.and_then(|value| value.get("discovery")).is_some(),
+            "config_validated": object.and_then(|value| value.get("config")).is_some(),
+            "capability_diff_checked": object.and_then(|value| value.get("capabilities")).is_some(),
+            "typed_contracts_checked": object.and_then(|value| value.get("contracts")).is_some(),
+            "hook_timeout_status": if status == "hook_timeout" { "tripped" } else { "clear" },
+        },
+        "hot_reload": plugin_hot_reload_decision(status),
+    })
+}
+
+fn classify_plugin_health_status(
+    enabled: bool,
+    ready: bool,
+    reasons: &[String],
+    discovery_state: Option<&str>,
+    current_binding_version: Option<bool>,
+) -> &'static str {
+    if !enabled {
+        return "disabled";
+    }
+    let reason_text = reasons.join("\n").to_ascii_lowercase();
+    if reason_text.contains("quarantined") {
+        return "quarantined";
+    }
+    if reason_text.contains("timeout") {
+        return "hook_timeout";
+    }
+    if reason_text.contains("capability") || reason_text.contains("binding/policy drift") {
+        return "capability_denied";
+    }
+    if current_binding_version == Some(false)
+        || discovery_state
+            .map(|state| state.to_ascii_lowercase().contains("stale"))
+            .unwrap_or(false)
+    {
+        return "stale_version";
+    }
+    if ready {
+        return "loaded";
+    }
+    "failed_init"
+}
+
+fn plugin_hot_reload_decision(status: &str) -> Value {
+    let reload_mode = match status {
+        "loaded" => "eligible",
+        "disabled" => "blocked_until_enabled",
+        "stale_version" => "reload_after_rebind",
+        "quarantined" => "blocked_until_unquarantined",
+        _ => "blocked_until_healthy",
+    };
+    json!({
+        "reload_mode": reload_mode,
+        "in_flight_run_policy": "snapshot_current_plugin_until_run_end",
+        "lifecycle_hook_policy": "defer_reload_until_no_active_invocation",
+        "breaking_capability_drift": "fail_closed",
+    })
+}
+
+fn plugin_health_policy_contract() -> Value {
+    json!({
+        "status_vocabulary": [
+            "loaded",
+            "disabled",
+            "quarantined",
+            "failed_init",
+            "hook_timeout",
+            "capability_denied",
+            "stale_version",
+        ],
+        "sentinel_sources": [
+            "binding_index",
+            "filesystem_safety",
+            "installed_skill_status",
+            "capability_diff",
+            "typed_contract_negotiation",
+            "config_validation",
+        ],
+        "hot_reload": {
+            "in_flight_run_policy": "snapshot_current_plugin_until_run_end",
+            "plugin_lifecycle_hook": "defer_reload_until_no_active_invocation",
+            "delivery_adapter": "fail_closed_on_breaking_capability_drift",
+        },
+        "install_race": {
+            "binding_write": "atomic_index_rewrite",
+            "plugin_root": "prepare_before_enable",
+            "config_instance": "validate_against_manifest_payload_sha256",
+        },
+    })
+}
+
+fn json_bool(object: Option<&serde_json::Map<String, Value>>, key: &str) -> bool {
+    object.and_then(|value| value.get(key)).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn json_string_array(
+    object: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+) -> Option<Vec<String>> {
+    object
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>())
+}
+
+fn json_path_string(
+    object: Option<&serde_json::Map<String, Value>>,
+    path: &[&str],
+) -> Option<String> {
+    json_path_value(object, path).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn json_path_bool_opt(
+    object: Option<&serde_json::Map<String, Value>>,
+    path: &[&str],
+) -> Option<bool> {
+    json_path_value(object, path).and_then(Value::as_bool)
+}
+
+fn json_path_value<'a>(
+    object: Option<&'a serde_json::Map<String, Value>>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let mut current = object?.get(path.first().copied()?)?;
+    for segment in &path[1..] {
+        current = current.as_object()?.get(*segment)?;
+    }
+    Some(current)
+}
+
 fn build_contracts_payload(
     report: &palyra_plugins_runtime::TypedPluginContractNegotiationReport,
     host_adapters: Value,
@@ -1158,4 +1389,34 @@ fn not_found_console_error(error: anyhow::Error) -> Response {
     runtime_status_response(tonic::Status::not_found(sanitize_http_error_message(
         error.to_string().as_str(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_plugin_health_status;
+
+    #[test]
+    fn plugin_health_status_disabled_wins() {
+        let reasons = vec!["typed plugin contract negotiation failed".to_owned()];
+
+        let status = classify_plugin_health_status(false, false, reasons.as_slice(), None, None);
+
+        assert_eq!(status, "disabled");
+    }
+
+    #[test]
+    fn plugin_health_status_detects_capability_denial() {
+        let reasons = vec!["plugin capability profile has binding/policy drift".to_owned()];
+
+        let status = classify_plugin_health_status(true, false, reasons.as_slice(), None, None);
+
+        assert_eq!(status, "capability_denied");
+    }
+
+    #[test]
+    fn plugin_health_status_detects_stale_version() {
+        let status = classify_plugin_health_status(true, false, &[], Some("valid"), Some(false));
+
+        assert_eq!(status, "stale_version");
+    }
 }

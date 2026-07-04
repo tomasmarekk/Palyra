@@ -144,6 +144,64 @@ fn event_ledger_redacts_payload_and_keeps_only_hashable_replay_metadata() {
 }
 
 #[test]
+fn presentation_projection_builds_edit_proposal_and_rich_blocks() {
+    let payload = json!({
+        "approval_id": "approval-123",
+        "edit_proposal": {
+            "diff_summary": "Update workspace configuration",
+            "risk_level": "High",
+            "affected_files": ["crates/palyra-daemon/src/lib.rs"],
+            "provenance_refs": ["workspace_patch:abc123"],
+        },
+        "rich_blocks": [
+            {
+                "kind": "file_uri",
+                "uri": "file:///repo/crates/palyra-daemon/src/lib.rs",
+                "title": "daemon lib",
+                "preview": "module registration changed",
+            },
+            {
+                "kind": "artifact_ref",
+                "artifact_id": "artifact-1",
+            },
+        ],
+        "tool_name": "palyra.fs.apply_patch",
+    });
+
+    let projection = build_acp_presentation_projection(AcpPresentationProjectionInput {
+        event_kind: "approval.request",
+        run_id: Some("run-1"),
+        session_id: Some("session-1"),
+        tape_segment: Some("42..44"),
+        compaction_generation: Some(3),
+        source_binding: Some("acpbind_123"),
+        payload: &payload,
+    });
+
+    let proposal = projection.edit_proposal.as_ref().expect("edit proposal should be projected");
+    assert_eq!(proposal.proposal_id, "approval-123");
+    assert_eq!(proposal.risk_level, "high");
+    assert_eq!(proposal.approval_actions, ["approve", "reject", "modify"]);
+    assert_eq!(proposal.affected_files, ["crates/palyra-daemon/src/lib.rs"]);
+    assert_eq!(projection.rich_blocks.len(), 2);
+    assert!(projection
+        .rich_blocks
+        .iter()
+        .any(|block| block.block_kind == AcpRichContentBlockKind::FileUri));
+    assert!(projection.renderers.iter().any(|renderer| renderer.renderer == "workspace_patch"));
+    assert_eq!(
+        projection.metadata,
+        AcpPresentationMetadata {
+            run_id: Some("run-1".to_owned()),
+            session_id: Some("session-1".to_owned()),
+            tape_segment: Some("42..44".to_owned()),
+            compaction_generation: Some(3),
+            source_binding: Some("acpbind_123".to_owned()),
+        }
+    );
+}
+
+#[test]
 fn reconnect_returns_event_ledger_records_after_client_cursor() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let runtime = AcpRuntime::open(tempdir.path().join("acp")).expect("runtime should open");

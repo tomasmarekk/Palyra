@@ -10,6 +10,7 @@ pub(crate) mod agents;
 pub(crate) mod approvals;
 pub(crate) mod audit;
 pub(crate) mod auth;
+pub(crate) mod automation;
 pub(crate) mod browser;
 pub(crate) mod channels;
 pub(crate) mod chat;
