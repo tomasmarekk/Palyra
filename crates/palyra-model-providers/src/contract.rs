@@ -761,6 +761,33 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
     &value[..boundary]
 }
 
+/// Detailed state for one zero-based provider/model attempt in a completion.
+///
+/// Values are safe for run snapshots and health surfaces: credential ids are
+/// stable references, never raw secret material, and provider messages stay in
+/// coarse error classes or repair hints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAttemptState {
+    pub attempt_index: u32,
+    pub provider_profile_id: String,
+    pub credential_id: String,
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_unix_ms: Option<i64>,
+    pub prompt_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_microusd: Option<u64>,
+    pub final_disposition: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_hint: Option<String>,
+}
+
 /// Audit record of one provider/model attempt within a single completion,
 /// covering cache hits, failover hops, and terminal errors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -772,6 +799,8 @@ pub struct ProviderAttemptSummary {
     pub served_from_cache: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ProviderAttemptState>,
 }
 
 /// Full result of one provider completion call: the bounded turn output, its

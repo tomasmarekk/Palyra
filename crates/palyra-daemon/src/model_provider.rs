@@ -28,7 +28,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
-use reqwest::Client;
+use reqwest::{header::RETRY_AFTER, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
@@ -82,12 +82,12 @@ pub use palyra_model_providers::{
 pub use palyra_model_providers::{
     AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
     EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
-    PromptCacheStrategy, ProviderAttemptSummary, ProviderEvent, ProviderFinishReason,
-    ProviderImageInput, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-    ProviderMessageToolCall, ProviderOutputContentPart, ProviderPromptCacheHint,
-    ProviderPromptSegment, ProviderPromptSegmentKind, ProviderRawProviderRefs,
-    ProviderReasoningEffort, ProviderRedactionState, ProviderRequest, ProviderResponse,
-    ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
+    PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary, ProviderEvent,
+    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
+    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
+    ProviderPromptCacheHint, ProviderPromptSegment, ProviderPromptSegmentKind,
+    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
+    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
@@ -755,6 +755,141 @@ struct RegistryProviderRuntime {
     provider: Arc<dyn ModelProvider>,
 }
 
+fn provider_attempt_index(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+fn registry_provider_credential_id(entry: &ProviderRegistryEntryConfig) -> String {
+    normalized_provider_credential_id(
+        entry.provider_id.as_str(),
+        entry.auth_profile_id.as_deref(),
+        entry.credential_source,
+    )
+}
+
+fn provider_attempt_summary(
+    provider_id: String,
+    model_id: String,
+    outcome: &str,
+    retryable: bool,
+    served_from_cache: bool,
+    reason_code: Option<String>,
+    state: Option<ProviderAttemptState>,
+) -> ProviderAttemptSummary {
+    ProviderAttemptSummary {
+        provider_id,
+        model_id,
+        outcome: outcome.to_owned(),
+        retryable,
+        served_from_cache,
+        reason_code,
+        state,
+    }
+}
+
+fn provider_attempt_success_state(
+    attempt_index: usize,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+    response: &ProviderResponse,
+    final_disposition: &str,
+    served_from_cache: bool,
+) -> ProviderAttemptState {
+    let total_tokens = response.prompt_tokens.saturating_add(response.completion_tokens);
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: runtime.entry.provider_id.clone(),
+        credential_id: registry_provider_credential_id(&runtime.entry),
+        model_id: model.model_id.clone(),
+        error_class: None,
+        retry_after_ms: None,
+        cooldown_until_unix_ms: None,
+        prompt_tokens: response.prompt_tokens,
+        output_tokens: response.completion_tokens,
+        cache_tokens: if served_from_cache { total_tokens } else { 0 },
+        estimated_cost_microusd: None,
+        final_disposition: final_disposition.to_owned(),
+        repair_hint: None,
+    }
+}
+
+fn provider_attempt_error_state(
+    attempt_index: usize,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+    error: &ProviderError,
+    observed_at_unix_ms: i64,
+) -> ProviderAttemptState {
+    let failure = error.failure_snapshot();
+    let retry_after_ms = failure.recovery.retry_after_ms;
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: runtime.entry.provider_id.clone(),
+        credential_id: registry_provider_credential_id(&runtime.entry),
+        model_id: model.model_id.clone(),
+        error_class: Some(failure.class.as_str().to_owned()),
+        retry_after_ms,
+        cooldown_until_unix_ms: retry_after_ms.map(|value| {
+            observed_at_unix_ms.saturating_add(i64::try_from(value).unwrap_or(i64::MAX))
+        }),
+        prompt_tokens: 0,
+        output_tokens: 0,
+        cache_tokens: 0,
+        estimated_cost_microusd: None,
+        final_disposition: provider_attempt_error_disposition(&failure).to_owned(),
+        repair_hint: provider_attempt_repair_hint(&failure),
+    }
+}
+
+fn provider_attempt_skipped_state(
+    attempt_index: usize,
+    model: &ProviderModelEntryConfig,
+    runtime: &RegistryProviderRuntime,
+    blocked_by: &ProviderAttemptState,
+) -> ProviderAttemptState {
+    ProviderAttemptState {
+        attempt_index: provider_attempt_index(attempt_index),
+        provider_profile_id: runtime.entry.provider_id.clone(),
+        credential_id: registry_provider_credential_id(&runtime.entry),
+        model_id: model.model_id.clone(),
+        error_class: blocked_by.error_class.clone(),
+        retry_after_ms: blocked_by.retry_after_ms,
+        cooldown_until_unix_ms: blocked_by.cooldown_until_unix_ms,
+        prompt_tokens: 0,
+        output_tokens: 0,
+        cache_tokens: 0,
+        estimated_cost_microusd: None,
+        final_disposition: "skipped_credential_cooldown".to_owned(),
+        repair_hint: blocked_by.repair_hint.clone(),
+    }
+}
+
+fn provider_attempt_error_disposition(failure: &ProviderFailureSnapshot) -> &'static str {
+    match failure.recovery.category.as_str() {
+        "auth" => "credential_refresh_required",
+        "rate_limit" => "retry_after_required",
+        "quota" => "quota_action_required",
+        "transient" => "retryable_failure",
+        _ => "failed",
+    }
+}
+
+fn provider_attempt_repair_hint(failure: &ProviderFailureSnapshot) -> Option<String> {
+    match failure.recovery.category.as_str() {
+        "auth" => Some(
+            "refresh the provider credential or select another credential before retrying"
+                .to_owned(),
+        ),
+        "rate_limit" => Some("respect retry_after before retrying this credential".to_owned()),
+        "quota" => Some("increase quota or route to another provider profile".to_owned()),
+        _ => None,
+    }
+}
+
+fn provider_failure_blocks_credential(failure: &ProviderFailureSnapshot) -> bool {
+    matches!(failure.recovery.category.as_str(), "auth" | "rate_limit" | "quota")
+}
+
 #[derive(Debug, Clone)]
 struct CachedProviderResponse {
     inserted_seq: u64,
@@ -990,6 +1125,7 @@ impl RegistryBackedModelProvider {
         &self,
         cache_key: &str,
         model: &ProviderModelEntryConfig,
+        runtime: &RegistryProviderRuntime,
     ) -> Option<ProviderResponse> {
         if !self.registry.response_cache_enabled {
             return None;
@@ -1017,14 +1153,15 @@ impl RegistryBackedModelProvider {
         response.retry_count = 0;
         response.served_from_cache = true;
         response.failover_count = 0;
-        response.attempts = vec![ProviderAttemptSummary {
-            provider_id: model.provider_id.clone(),
-            model_id: model.model_id.clone(),
-            outcome: "cache_hit".to_owned(),
-            retryable: false,
-            served_from_cache: true,
-            reason_code: Some("response_cache_hit".to_owned()),
-        }];
+        response.attempts = vec![provider_attempt_summary(
+            model.provider_id.clone(),
+            model.model_id.clone(),
+            "cache_hit",
+            false,
+            true,
+            Some("response_cache_hit".to_owned()),
+            Some(provider_attempt_success_state(0, model, runtime, &response, "cache_hit", true)),
+        )];
         Some(response)
     }
 
@@ -1249,6 +1386,7 @@ impl ModelProvider for RegistryBackedModelProvider {
             let mut attempts = Vec::new();
             let mut failover_count = 0_u32;
             let mut last_error = None;
+            let mut blocked_credentials = HashMap::<String, ProviderAttemptState>::new();
 
             for (index, model) in candidates.iter().enumerate() {
                 // Registry normalization guarantees every model references a
@@ -1257,8 +1395,28 @@ impl ModelProvider for RegistryBackedModelProvider {
                     .providers
                     .get(model.provider_id.as_str())
                     .ok_or(ProviderError::StatePoisoned)?;
+                let credential_id = registry_provider_credential_id(&runtime.entry);
+                if let Some(blocked_by) = blocked_credentials.get(credential_id.as_str()) {
+                    let state = provider_attempt_skipped_state(index, model, runtime, blocked_by);
+                    attempts.push(provider_attempt_summary(
+                        model.provider_id.clone(),
+                        model.model_id.clone(),
+                        "skipped",
+                        false,
+                        false,
+                        Some("credential_cooldown".to_owned()),
+                        Some(state),
+                    ));
+                    if index + 1 < candidates.len() {
+                        failover_count = failover_count.saturating_add(1);
+                        continue;
+                    }
+                    break;
+                }
                 let cache_key = self.response_cache_key(&request, model);
-                if let Some(mut cached) = self.lookup_cached_response(cache_key.as_str(), model) {
+                if let Some(mut cached) =
+                    self.lookup_cached_response(cache_key.as_str(), model, runtime)
+                {
                     cached.failover_count = failover_count;
                     cached.attempts = attempts.into_iter().chain(cached.attempts).collect();
                     self.record_runtime_metrics(
@@ -1280,18 +1438,18 @@ impl ModelProvider for RegistryBackedModelProvider {
                         response.model_id = model.model_id.clone();
                         response.served_from_cache = false;
                         response.failover_count = failover_count;
-                        attempts.push(ProviderAttemptSummary {
-                            provider_id: model.provider_id.clone(),
-                            model_id: model.model_id.clone(),
-                            outcome: if index == 0 {
-                                "success".to_owned()
-                            } else {
-                                "failover_success".to_owned()
-                            },
-                            retryable: false,
-                            served_from_cache: false,
-                            reason_code: (index > 0).then(|| "failover_success".to_owned()),
-                        });
+                        let outcome = if index == 0 { "success" } else { "failover_success" };
+                        attempts.push(provider_attempt_summary(
+                            model.provider_id.clone(),
+                            model.model_id.clone(),
+                            outcome,
+                            false,
+                            false,
+                            (index > 0).then(|| "failover_success".to_owned()),
+                            Some(provider_attempt_success_state(
+                                index, model, runtime, &response, outcome, false,
+                            )),
+                        ));
                         response.attempts = attempts;
                         self.insert_cached_response(cache_key, &response);
                         self.record_runtime_metrics(
@@ -1316,16 +1474,29 @@ impl ModelProvider for RegistryBackedModelProvider {
                                 | ProviderError::MissingApiKey
                                 | ProviderError::MissingAnthropicApiKey
                         );
-                        attempts.push(ProviderAttemptSummary {
-                            provider_id: model.provider_id.clone(),
-                            model_id: model.model_id.clone(),
-                            outcome: "error".to_owned(),
+                        let failure = error.failure_snapshot();
+                        let state = provider_attempt_error_state(
+                            index,
+                            model,
+                            runtime,
+                            &error,
+                            current_unix_ms().unwrap_or_default(),
+                        );
+                        let blocks_credential = provider_failure_blocks_credential(&failure);
+                        attempts.push(provider_attempt_summary(
+                            model.provider_id.clone(),
+                            model.model_id.clone(),
+                            "error",
                             retryable,
-                            served_from_cache: false,
-                            reason_code: Some(error.envelope().provider_trace_ref.unwrap_or_else(
-                                || error.classification().class.as_str().to_owned(),
-                            )),
-                        });
+                            false,
+                            Some(error.envelope().provider_trace_ref.unwrap_or_else(|| {
+                                error.classification().class.as_str().to_owned()
+                            })),
+                            Some(state.clone()),
+                        ));
+                        if blocks_credential {
+                            blocked_credentials.insert(state.credential_id.clone(), state);
+                        }
                         last_error = Some(error);
                         if index + 1 < candidates.len() {
                             failover_count = failover_count.saturating_add(1);
@@ -2198,6 +2369,7 @@ impl ModelProvider for DeterministicProvider {
                     retryable: false,
                     served_from_cache: false,
                     reason_code: None,
+                    state: None,
                 }],
             })
         })
@@ -2411,6 +2583,26 @@ impl AttemptError {
             classification: retryable_invalid_response_classification(provider_detail),
         }
     }
+}
+
+fn retry_after_ms_from_response(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000))
+}
+
+fn classify_http_provider_failure_with_retry_after(
+    status_code: u16,
+    retryable: bool,
+    provider_detail: &str,
+    response_body: &str,
+    retry_after_ms: Option<u64>,
+) -> ProviderFailureClassification {
+    classify_http_provider_failure(status_code, retryable, provider_detail, response_body)
+        .with_retry_after_ms(retry_after_ms)
 }
 
 fn selected_chat_model_id<'a>(
@@ -2684,6 +2876,7 @@ impl OpenAiCompatibleEmbeddingsProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
             let body_text = response
                 .text()
                 .await
@@ -2694,11 +2887,12 @@ impl OpenAiCompatibleEmbeddingsProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
-                classify_http_provider_failure(
+                classify_http_provider_failure_with_retry_after(
                     status,
                     retryable,
                     "openai_compatible_embeddings_http",
                     body_text.as_str(),
+                    retry_after_ms,
                 ),
             ));
         }
@@ -3048,6 +3242,7 @@ impl OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
             let body_text = response
                 .text()
                 .await
@@ -3058,11 +3253,12 @@ impl OpenAiCompatibleProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
-                classify_http_provider_failure(
+                classify_http_provider_failure_with_retry_after(
                     status,
                     retryable,
                     "openai_compatible_chat_http",
                     body_text.as_str(),
+                    retry_after_ms,
                 ),
             ));
         }
@@ -3191,6 +3387,7 @@ impl OpenAiCompatibleProvider {
                 retryable: false,
                 served_from_cache: false,
                 reason_code: None,
+                state: None,
             }],
         })
     }
@@ -3274,6 +3471,7 @@ impl OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
             let body_text = response
                 .text()
                 .await
@@ -3284,11 +3482,12 @@ impl OpenAiCompatibleProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
-                classify_http_provider_failure(
+                classify_http_provider_failure_with_retry_after(
                     status,
                     retryable,
                     "openai_codex_responses_http",
                     body_text.as_str(),
+                    retry_after_ms,
                 ),
             ));
         }
@@ -3361,6 +3560,7 @@ impl OpenAiCompatibleProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
             let body_text = response
                 .text()
                 .await
@@ -3371,11 +3571,12 @@ impl OpenAiCompatibleProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
-                classify_http_provider_failure(
+                classify_http_provider_failure_with_retry_after(
                     status,
                     retryable,
                     "openai_compatible_audio_http",
                     body_text.as_str(),
+                    retry_after_ms,
                 ),
             ));
         }
@@ -3697,6 +3898,7 @@ fn openai_codex_provider_response(
             retryable: false,
             served_from_cache: false,
             reason_code: None,
+            state: None,
         }],
     })
 }
@@ -4314,6 +4516,7 @@ impl AnthropicProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retryable = OPENAI_RETRYABLE_STATUS_CODES.contains(&status);
+            let retry_after_ms = retry_after_ms_from_response(&response);
             let body_text = response
                 .text()
                 .await
@@ -4324,11 +4527,12 @@ impl AnthropicProvider {
                     sanitize_remote_error(&body_text)
                 ),
                 retryable,
-                classify_http_provider_failure(
+                classify_http_provider_failure_with_retry_after(
                     status,
                     retryable,
                     "anthropic_chat_http",
                     body_text.as_str(),
+                    retry_after_ms,
                 ),
             ));
         }
@@ -4448,6 +4652,7 @@ impl AnthropicProvider {
                 retryable: false,
                 served_from_cache: false,
                 reason_code: None,
+                state: None,
             }],
         })
     }
@@ -5802,6 +6007,13 @@ mod tests {
                 },
                 "internal_schema_hash": "internal_schema_sha256",
                 "provider_schema_hash": "provider_schema_sha256",
+                "provider_schema_transform": {
+                    "schema_version": 1,
+                    "dialect": "open_ai_compatible",
+                    "input_schema_hash": "internal_schema_sha256",
+                    "output_schema_hash": "provider_schema_sha256",
+                    "steps": []
+                },
                 "description_hash": "description_sha256",
                 "capabilities": ["diagnostics"],
                 "approval_posture": "safe",
@@ -5830,6 +6042,13 @@ mod tests {
                 },
                 "internal_schema_hash": "internal_schema_sha256",
                 "provider_schema_hash": "provider_schema_sha256",
+                "provider_schema_transform": {
+                    "schema_version": 1,
+                    "dialect": "open_ai_compatible",
+                    "input_schema_hash": "internal_schema_sha256",
+                    "output_schema_hash": "provider_schema_sha256",
+                    "steps": []
+                },
                 "description_hash": "description_sha256",
                 "capabilities": ["diagnostics"],
                 "approval_posture": "safe",
@@ -6387,12 +6606,113 @@ mod tests {
         assert_eq!(response.model_id, "claude-3-5-sonnet-latest");
         assert_eq!(response.failover_count, 1);
         assert_eq!(response.attempts.len(), 2);
+        let failed_state =
+            response.attempts[0].state.as_ref().expect("failed attempt should expose state");
+        assert_eq!(failed_state.attempt_index, 0);
+        assert_eq!(failed_state.provider_profile_id, "openai-primary");
+        assert_eq!(failed_state.model_id, "gpt-4o-mini");
+        assert_eq!(failed_state.final_disposition, "retryable_failure");
+        assert_eq!(failed_state.error_class.as_deref(), Some("provider_unavailable"));
+        let success_state =
+            response.attempts[1].state.as_ref().expect("success attempt should expose state");
+        assert_eq!(success_state.attempt_index, 1);
+        assert_eq!(success_state.provider_profile_id, "anthropic-primary");
+        assert_eq!(success_state.prompt_tokens, response.prompt_tokens);
+        assert_eq!(success_state.output_tokens, response.completion_tokens);
+        assert_eq!(success_state.cache_tokens, 0);
+        assert_eq!(success_state.final_disposition, "failover_success");
         assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
         assert_eq!(anthropic_request_count.load(Ordering::Relaxed), 1);
 
         let snapshot = provider.status_snapshot();
         assert_eq!(snapshot.registry.default_chat_model_id.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(snapshot.registry.providers.len(), 2);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
+        anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_auth_expired_attempt_exposes_repair_hint() {
+        let (openai_base_url, openai_request_count, openai_handle) = spawn_scripted_server(vec![(
+            401_u16,
+            r#"{"error":{"message":"access token expired"}}"#.to_owned(),
+        )]);
+        let (anthropic_base_url, anthropic_request_count, anthropic_handle) =
+            spawn_scripted_server(vec![(
+                200_u16,
+                r#"{"content":[{"type":"text","text":"fallback after auth"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#
+                    .to_owned(),
+            )]);
+        let provider =
+            build_model_provider(&multi_provider_test_config(openai_base_url, anthropic_base_url))
+                .expect("registry-backed provider should build");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text(
+                "recover from auth".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("fallback provider should recover from expired auth");
+
+        let failed_state =
+            response.attempts[0].state.as_ref().expect("auth attempt should expose state");
+        assert_eq!(failed_state.error_class.as_deref(), Some("auth_expired"));
+        assert_eq!(failed_state.final_disposition, "credential_refresh_required");
+        assert!(failed_state
+            .repair_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("refresh the provider credential")));
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(anthropic_request_count.load(Ordering::Relaxed), 1);
+
+        openai_handle.join().expect("openai scripted server thread should exit");
+        anthropic_handle.join().expect("anthropic scripted server thread should exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_provider_rate_limit_attempt_respects_retry_after() {
+        let (openai_base_url, openai_request_count, _openai_requests, openai_handle) =
+            spawn_inspecting_scripted_server_with_headers(vec![(
+                429_u16,
+                vec![("Retry-After".to_owned(), "2".to_owned())],
+                r#"{"error":{"message":"rate limit exceeded"}}"#.to_owned(),
+            )]);
+        let (anthropic_base_url, anthropic_request_count, anthropic_handle) =
+            spawn_scripted_server(vec![(
+                200_u16,
+                r#"{"content":[{"type":"text","text":"fallback after rate limit"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":2}}"#
+                    .to_owned(),
+            )]);
+        let provider =
+            build_model_provider(&multi_provider_test_config(openai_base_url, anthropic_base_url))
+                .expect("registry-backed provider should build");
+
+        let response = provider
+            .complete(ProviderRequest::from_input_text(
+                "recover from rate limit".to_owned(),
+                false,
+                Vec::new(),
+                None,
+            ))
+            .await
+            .expect("fallback provider should recover from rate limit");
+
+        let failed_state =
+            response.attempts[0].state.as_ref().expect("rate-limit attempt should expose state");
+        assert_eq!(failed_state.error_class.as_deref(), Some("rate_limit"));
+        assert_eq!(failed_state.retry_after_ms, Some(2_000));
+        assert!(failed_state.cooldown_until_unix_ms.is_some());
+        assert_eq!(failed_state.final_disposition, "retry_after_required");
+        assert!(failed_state
+            .repair_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("retry_after")));
+        assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(anthropic_request_count.load(Ordering::Relaxed), 1);
 
         openai_handle.join().expect("openai scripted server thread should exit");
         anthropic_handle.join().expect("anthropic scripted server thread should exit");
@@ -6511,6 +6831,13 @@ mod tests {
         assert!(!first.served_from_cache);
         assert!(second.served_from_cache);
         assert_eq!(second.attempts.len(), 1);
+        let cache_state =
+            second.attempts[0].state.as_ref().expect("cache hit should expose attempt state");
+        assert_eq!(cache_state.final_disposition, "cache_hit");
+        assert_eq!(
+            cache_state.cache_tokens,
+            second.prompt_tokens.saturating_add(second.completion_tokens)
+        );
         assert_eq!(openai_request_count.load(Ordering::Relaxed), 1);
         let snapshot = provider.status_snapshot();
         assert!(snapshot.response_cache.enabled);
@@ -7313,6 +7640,8 @@ Then I will continue."#;
 
     type InspectingServer =
         (String, Arc<AtomicUsize>, Arc<Mutex<Vec<CapturedHttpRequest>>>, thread::JoinHandle<()>);
+    type ScriptedResponseHeaders = Vec<(String, String)>;
+    type ScriptedHttpResponse = (u16, ScriptedResponseHeaders, String);
 
     fn spawn_scripted_server(
         responses: Vec<(u16, String)>,
@@ -7323,6 +7652,16 @@ Then I will continue."#;
     }
 
     fn spawn_inspecting_scripted_server(responses: Vec<(u16, String)>) -> InspectingServer {
+        let responses = responses
+            .into_iter()
+            .map(|(status_code, body)| (status_code, Vec::new(), body))
+            .collect();
+        spawn_inspecting_scripted_server_with_headers(responses)
+    }
+
+    fn spawn_inspecting_scripted_server_with_headers(
+        responses: Vec<ScriptedHttpResponse>,
+    ) -> InspectingServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         listener
             .set_nonblocking(false)
@@ -7334,7 +7673,7 @@ Then I will continue."#;
         let request_log_for_thread = Arc::clone(&request_log);
         let handle = thread::spawn(move || {
             let started_at = Instant::now();
-            for (status_code, body) in responses {
+            for (status_code, headers, body) in responses {
                 let (mut stream, _) = listener.accept().expect("scripted server should accept");
                 request_count_for_thread.fetch_add(1, Ordering::Relaxed);
                 let mut captured = read_http_request(&mut stream);
@@ -7352,8 +7691,12 @@ Then I will continue."#;
                     504 => "Gateway Timeout",
                     _ => "Error",
                 };
+                let extra_headers = headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>();
                 let response = format!(
-                    "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream

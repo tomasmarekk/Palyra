@@ -315,7 +315,7 @@ impl ProviderRecoveryAction {
 pub struct ProviderRecoveryPlanSnapshot {
     pub category: String,
     pub action: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
 }
 
@@ -329,6 +329,8 @@ pub struct ProviderFailureClassification {
     pub status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ProviderFailureClassification {
@@ -340,17 +342,28 @@ impl ProviderFailureClassification {
         status_code: Option<u16>,
         provider_detail: Option<String>,
     ) -> Self {
-        Self { class, recommended_action, status_code, provider_detail }
+        Self { class, recommended_action, status_code, provider_detail, retry_after_ms: None }
+    }
+
+    /// Returns this classification with a provider-supplied retry delay.
+    #[must_use]
+    pub const fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
     }
 
     /// Renders this classification into a serializable snapshot carrying
     /// `message`; the recovery plan is derived from the failure class.
     #[must_use]
     pub fn snapshot(&self, message: String) -> ProviderFailureSnapshot {
+        let mut recovery = provider_recovery_plan(self);
+        if self.retry_after_ms.is_some() {
+            recovery.retry_after_ms = self.retry_after_ms;
+        }
         ProviderFailureSnapshot {
             class: self.class.as_str().to_owned(),
             recommended_action: self.recommended_action.as_str().to_owned(),
-            recovery: provider_recovery_plan(self),
+            recovery,
             status_code: self.status_code,
             provider_detail: self.provider_detail.clone(),
             message,
