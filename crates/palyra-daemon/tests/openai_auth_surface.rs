@@ -1606,7 +1606,11 @@ fn compat_runs_create_status_events_idempotency_and_owner_scope() -> Result<()> 
     assert_eq!(terminal.get("pending_approval"), Some(&Value::Null));
     assert_eq!(
         terminal.pointer("/verification_summary/state").and_then(Value::as_str),
-        Some("not_available")
+        Some("disabled")
+    );
+    assert_eq!(
+        terminal.pointer("/verification_summary/rollout_enabled").and_then(Value::as_bool),
+        Some(false)
     );
 
     let (wait_completed_status, wait_completed_response) = compat_post_json(
