@@ -14,13 +14,13 @@ use super::{
     ChannelProviderArg, ChannelResolveEntityArg, ChannelsCommand, ChannelsDiscordCommand,
     ChannelsRouterCommand, Cli, Command, CompletionShell, ConfigCommand, ConfigureSectionArg,
     CronCommand, CronConcurrencyPolicyArg, CronMisfirePolicyArg, CronScheduleTypeArg,
-    DaemonCommand, DevicesCommand, DocsCommand, ExtensionCommand, FlowStateArg, FlowsCommand,
-    GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg, JobsCommand,
-    JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpDoctorArgs, McpEgressPolicyArg,
-    McpLoginArgs, McpProbeArgs, McpRegistryMutateArgs, McpReloadArgs, McpRuntimeConnectionArgs,
-    McpSamplingModeArg, McpStatusArgs, McpSubcommand, McpToolsArgs, McpTransportArg,
-    McpTrustLevelArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg, MemorySourceArg,
-    MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
+    DaemonCommand, DevicesCommand, DocsCommand, DoctorSeverityArg, ExtensionCommand, FlowStateArg,
+    FlowsCommand, GatewayBindProfileArg, HooksCommand, InitModeArg, InitTlsScaffoldArg,
+    JobsCommand, JournalCheckpointModeArg, McpApprovalProfileArg, McpCommand, McpDoctorArgs,
+    McpEgressPolicyArg, McpLoginArgs, McpProbeArgs, McpRegistryMutateArgs, McpReloadArgs,
+    McpRuntimeConnectionArgs, McpSamplingModeArg, McpStatusArgs, McpSubcommand, McpToolsArgs,
+    McpTransportArg, McpTrustLevelArg, MemoryCommand, MemoryLearningCommand, MemoryScopeArg,
+    MemorySourceArg, MessageCommand, ModelsCommand, NodeCommand, NodesCommand, ObjectiveKindArg,
     ObjectivePriorityArg, ObjectiveScheduleTypeArg, ObjectiveUpsertCommandArgs, ObjectivesCommand,
     OnboardingAuthMethodArg, OnboardingCommand, OnboardingFlowArg, PairingClientKindArg,
     PairingCommand, PairingMethodArg, PairingStateArg, PatchBundleCommand, PatchCommand,
@@ -504,7 +504,11 @@ fn parse_doctor_strict() {
         Command::Doctor {
             strict: true,
             json: false,
+            lint: false,
+            deep: false,
+            severity_min: None,
             repair: false,
+            fix: false,
             dry_run: false,
             force: false,
             only: Vec::new(),
@@ -522,7 +526,11 @@ fn parse_doctor_json() {
         Command::Doctor {
             strict: false,
             json: true,
+            lint: false,
+            deep: false,
+            severity_min: None,
             repair: false,
+            fix: false,
             dry_run: false,
             force: false,
             only: Vec::new(),
@@ -552,12 +560,47 @@ fn parse_doctor_repair_preview_filters() {
         Command::Doctor {
             strict: false,
             json: false,
+            lint: false,
+            deep: false,
+            severity_min: None,
             repair: true,
+            fix: false,
             dry_run: true,
             force: true,
             only: vec!["config.schema_version".to_owned()],
             skip: vec!["stale_runtime.cleanup".to_owned()],
             rollback_run: Some("01ARZ3NDEKTSV4RRFFQ69G5FB0".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn parse_doctor_lint_deep_fix() {
+    let parsed = Cli::parse_from([
+        "palyra",
+        "doctor",
+        "--lint",
+        "--deep",
+        "--severity-min",
+        "warning",
+        "--fix",
+        "--dry-run",
+    ]);
+    assert_eq!(
+        parsed.command,
+        Command::Doctor {
+            strict: false,
+            json: false,
+            lint: true,
+            deep: true,
+            severity_min: Some(DoctorSeverityArg::Warning),
+            repair: false,
+            fix: true,
+            dry_run: true,
+            force: false,
+            only: Vec::new(),
+            skip: Vec::new(),
+            rollback_run: None,
         }
     );
 }

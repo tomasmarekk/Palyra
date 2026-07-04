@@ -5,6 +5,7 @@
 //! prior state. Secret-bearing files and their backups are written with
 //! owner-only permissions.
 
+use crate::cli::DoctorSeverityArg;
 use crate::*;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -29,6 +30,7 @@ use toml::Value as TomlValue;
 use ulid::Ulid;
 
 const DOCTOR_EXECUTION_SCHEMA_VERSION: u32 = 1;
+const DOCTOR_REGISTRY_SCHEMA_VERSION: u32 = 1;
 const DOCTOR_RECOVERY_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const DOCTOR_RECOVERY_RUNS_RELATIVE_DIR: &str = "recovery/runs";
 const DOCTOR_RECOVERY_MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -59,6 +61,9 @@ const DOCTOR_SUPPORT_BUNDLE_MANIFEST_LIMIT: usize = 5;
 pub(crate) struct DoctorCommandRequest {
     pub(crate) strict: bool,
     pub(crate) json: bool,
+    pub(crate) lint: bool,
+    pub(crate) deep: bool,
+    pub(crate) severity_min: Option<DoctorSeverityArg>,
     pub(crate) repair: bool,
     pub(crate) dry_run: bool,
     pub(crate) force: bool,
@@ -94,7 +99,52 @@ pub(crate) struct DoctorExecutionReport {
     diagnostics: DoctorReport,
     tools: DoctorToolsReport,
     unified: UnifiedDoctorReport,
+    registry: DoctorRegistryReport,
     recovery: DoctorRecoveryReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorRegistryReport {
+    schema_version: u32,
+    mode: String,
+    status: String,
+    severity_min: String,
+    checks: Vec<DoctorRegistryCheck>,
+    summary: DoctorRegistrySummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorRegistryCheck {
+    check_id: String,
+    component: String,
+    severity: String,
+    status: String,
+    summary: String,
+    evidence: Vec<String>,
+    fix_hint: String,
+    auto_fix: Option<DoctorAutoFixPlan>,
+    requires_restart: bool,
+    docs_ref: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorAutoFixPlan {
+    supported: bool,
+    dry_run: String,
+    apply: String,
+    rollback_hint: String,
+    requires_restart: bool,
+    risk: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DoctorRegistrySummary {
+    total_checks: usize,
+    failed_checks: usize,
+    blocking_failed: usize,
+    warning_failed: usize,
+    info_failed: usize,
+    lint_failures: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -362,6 +412,12 @@ pub(crate) fn run_doctor(request: DoctorCommandRequest) -> Result<()> {
             anyhow::bail!("strict doctor failed: {}", check.key);
         }
     }
+    if request.lint && execution.registry.summary.lint_failures > 0 {
+        anyhow::bail!(
+            "doctor lint failed with {} finding(s) at or above the selected severity",
+            execution.registry.summary.lint_failures
+        );
+    }
     std::io::stdout().flush().context("stdout flush failed")
 }
 
@@ -373,6 +429,9 @@ pub(crate) fn build_doctor_execution_preview_value() -> Result<JsonValue> {
     let execution = build_doctor_execution(&DoctorCommandRequest {
         strict: false,
         json: true,
+        lint: false,
+        deep: false,
+        severity_min: None,
         repair: true,
         dry_run: true,
         force: false,
@@ -419,6 +478,13 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
     let diagnostics = build_doctor_report(checks.as_slice())?;
     let tools = build_doctor_tools_report(&environment);
     let unified = build_unified_doctor_report(&diagnostics, &tools, &environment)?;
+    let repair_plans = if request.rollback_run.is_some() {
+        Vec::new()
+    } else {
+        evaluate_repair_plans(&environment)?
+    };
+    let registry =
+        build_doctor_registry_report(&diagnostics, &tools, repair_plans.as_slice(), request);
     let mut recovery = DoctorRecoveryReport {
         requested: request.repair || request.rollback_run.is_some(),
         dry_run: request.dry_run,
@@ -446,8 +512,8 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
             DoctorExecutionMode::RollbackApply
         }
     } else if request.repair {
-        let plans = evaluate_repair_plans(&environment)?;
-        let plans = plans
+        let plans = repair_plans
+            .clone()
             .into_iter()
             .filter(|entry| {
                 step_selected(
@@ -482,6 +548,7 @@ fn build_doctor_execution(request: &DoctorCommandRequest) -> Result<DoctorExecut
         diagnostics,
         tools,
         unified,
+        registry,
         recovery,
     })
 }
@@ -587,6 +654,228 @@ fn build_doctor_tools_report(environment: &DoctorEnvironment) -> DoctorToolsRepo
         provider_compatibility: "validated per provider when the daemon builds a catalog snapshot"
             .to_owned(),
         repair_hints,
+    }
+}
+
+fn build_doctor_registry_report(
+    diagnostics: &DoctorReport,
+    tools: &DoctorToolsReport,
+    repair_plans: &[DoctorRepairPlan],
+    request: &DoctorCommandRequest,
+) -> DoctorRegistryReport {
+    let report_min =
+        request.severity_min.map(doctor_severity_from_arg).unwrap_or(DoctorSeverity::Info);
+    let lint_min =
+        request.severity_min.map(doctor_severity_from_arg).unwrap_or(DoctorSeverity::Blocking);
+    let mut checks = Vec::new();
+
+    for check in diagnostics.checks.iter() {
+        if doctor_severity_rank(check.severity) < doctor_severity_rank(report_min) {
+            continue;
+        }
+        checks.push(registry_check_from_doctor_check(check));
+    }
+
+    for probe in tools.runtime_availability_probes.as_slice() {
+        let status = if probe.status == "available" { "passed" } else { "failed" };
+        let check = DoctorRegistryCheck {
+            check_id: format!("tool_runtime.{}", probe.runtime),
+            component: "execution_backend".to_owned(),
+            severity: DoctorSeverity::Warning.as_str().to_owned(),
+            status: status.to_owned(),
+            summary: format!("tool runtime '{}' availability is {}", probe.runtime, probe.status),
+            evidence: vec![format!("doctor.tools.probe:{}", probe.runtime)],
+            fix_hint: probe.repair_hint.clone(),
+            auto_fix: None,
+            requires_restart: false,
+            docs_ref: "palyra doctor --help".to_owned(),
+        };
+        if doctor_severity_rank(DoctorSeverity::Warning) >= doctor_severity_rank(report_min) {
+            checks.push(check);
+        }
+    }
+
+    for plan in repair_plans {
+        if doctor_severity_rank(plan.step.severity) < doctor_severity_rank(report_min) {
+            continue;
+        }
+        checks.push(registry_check_from_repair_plan(plan));
+    }
+
+    if request.deep {
+        append_deep_registry_placeholders(&mut checks, report_min);
+    }
+
+    checks.sort_by(|left, right| {
+        left.component.cmp(&right.component).then_with(|| left.check_id.cmp(&right.check_id))
+    });
+    let failed_checks = checks.iter().filter(|check| check.status == "failed").count();
+    let blocking_failed = checks
+        .iter()
+        .filter(|check| check.status == "failed" && check.severity == "blocking")
+        .count();
+    let warning_failed = checks
+        .iter()
+        .filter(|check| check.status == "failed" && check.severity == "warning")
+        .count();
+    let info_failed =
+        checks.iter().filter(|check| check.status == "failed" && check.severity == "info").count();
+    let lint_failures = checks
+        .iter()
+        .filter(|check| {
+            check.status == "failed"
+                && doctor_severity_rank(doctor_severity_from_str(check.severity.as_str()))
+                    >= doctor_severity_rank(lint_min)
+        })
+        .count();
+    DoctorRegistryReport {
+        schema_version: DOCTOR_REGISTRY_SCHEMA_VERSION,
+        mode: if request.deep { "deep" } else { "standard" }.to_owned(),
+        status: if failed_checks == 0 { "ok" } else { "degraded" }.to_owned(),
+        severity_min: report_min.as_str().to_owned(),
+        summary: DoctorRegistrySummary {
+            total_checks: checks.len(),
+            failed_checks,
+            blocking_failed,
+            warning_failed,
+            info_failed,
+            lint_failures,
+        },
+        checks,
+    }
+}
+
+fn registry_check_from_doctor_check(check: &DoctorCheck) -> DoctorRegistryCheck {
+    let component = subsystem_for_doctor_check(check.key).to_owned();
+    let status = if check.ok { "passed" } else { "failed" };
+    DoctorRegistryCheck {
+        check_id: check.key.to_owned(),
+        component: component.clone(),
+        severity: check.severity.as_str().to_owned(),
+        status: status.to_owned(),
+        summary: format!("{} check '{}' {}", component, check.key, status),
+        evidence: vec![format!("doctor.check:{}", check.key)],
+        fix_hint: check
+            .remediation
+            .first()
+            .copied()
+            .unwrap_or(if check.ok { "no action required" } else { "inspect doctor output" })
+            .to_owned(),
+        auto_fix: None,
+        requires_restart: false,
+        docs_ref: "palyra doctor --help".to_owned(),
+    }
+}
+
+fn registry_check_from_repair_plan(plan: &DoctorRepairPlan) -> DoctorRegistryCheck {
+    let supported =
+        plan.step.apply_supported && !plan.step.security_sensitive && !plan.step.requires_force;
+    DoctorRegistryCheck {
+        check_id: plan.step.id.clone(),
+        component: component_for_repair_step(plan.step.id.as_str()).to_owned(),
+        severity: plan.step.severity.as_str().to_owned(),
+        status: "failed".to_owned(),
+        summary: plan.step.title.clone(),
+        evidence: vec![format!("doctor.repair_plan:{}", plan.step.id)],
+        fix_hint: plan.step.description.clone(),
+        auto_fix: Some(DoctorAutoFixPlan {
+            supported,
+            dry_run: format!("palyra doctor --fix --dry-run --only {} --json", plan.step.id),
+            apply: if supported {
+                format!("palyra doctor --fix --only {} --json", plan.step.id)
+            } else {
+                "manual review required".to_owned()
+            },
+            rollback_hint: "after apply, use the reported palyra doctor --rollback-run command"
+                .to_owned(),
+            requires_restart: false,
+            risk: if supported { "low" } else { "manual_review" }.to_owned(),
+        }),
+        requires_restart: false,
+        docs_ref: "palyra doctor --help".to_owned(),
+    }
+}
+
+fn append_deep_registry_placeholders(
+    checks: &mut Vec<DoctorRegistryCheck>,
+    report_min: DoctorSeverity,
+) {
+    if doctor_severity_rank(DoctorSeverity::Info) < doctor_severity_rank(report_min) {
+        return;
+    }
+    for (check_id, component, summary) in [
+        (
+            "journal.health",
+            "journal",
+            "deep journal health is available through daemon diagnostics and support bundle output",
+        ),
+        (
+            "mcp.health",
+            "mcp",
+            "deep MCP health is available through palyra mcp doctor and daemon diagnostics",
+        ),
+        (
+            "plugin.health",
+            "plugin_health",
+            "deep plugin health is available through palyra plugins doctor and daemon diagnostics",
+        ),
+        (
+            "session_locks.health",
+            "session_locks",
+            "deep session lock health is available from runtime diagnostics",
+        ),
+    ] {
+        checks.push(DoctorRegistryCheck {
+            check_id: check_id.to_owned(),
+            component: component.to_owned(),
+            severity: DoctorSeverity::Info.as_str().to_owned(),
+            status: "skipped".to_owned(),
+            summary: summary.to_owned(),
+            evidence: vec!["doctor.deep.runtime_required".to_owned()],
+            fix_hint:
+                "run with a reachable daemon and export a support bundle for runtime evidence"
+                    .to_owned(),
+            auto_fix: None,
+            requires_restart: false,
+            docs_ref: "palyra doctor --help".to_owned(),
+        });
+    }
+}
+
+fn doctor_severity_from_arg(value: DoctorSeverityArg) -> DoctorSeverity {
+    match value {
+        DoctorSeverityArg::Blocking => DoctorSeverity::Blocking,
+        DoctorSeverityArg::Warning => DoctorSeverity::Warning,
+        DoctorSeverityArg::Info => DoctorSeverity::Info,
+    }
+}
+
+fn doctor_severity_from_str(value: &str) -> DoctorSeverity {
+    match value {
+        "blocking" => DoctorSeverity::Blocking,
+        "warning" => DoctorSeverity::Warning,
+        _ => DoctorSeverity::Info,
+    }
+}
+
+const fn doctor_severity_rank(value: DoctorSeverity) -> u8 {
+    match value {
+        DoctorSeverity::Blocking => 3,
+        DoctorSeverity::Warning => 2,
+        DoctorSeverity::Info => 1,
+    }
+}
+
+fn component_for_repair_step(step_id: &str) -> &'static str {
+    match step_id.split('.').next().unwrap_or(step_id) {
+        "auth_registry" => "vault",
+        "browser" => "api_compatibility",
+        "gateway_access" => "api_compatibility",
+        "node_runtime" => "session_locks",
+        "access_registry" => "policy",
+        "stale_runtime" => "execution_backend",
+        "cli_profiles" | "config" | "routine_registry" => "config",
+        _ => "doctor",
     }
 }
 
@@ -3089,6 +3378,32 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
         )
         .as_str(),
     )?;
+    output::print_text_line(
+        format!(
+            "doctor.registry status={} mode={} checks={} failed={} lint_failures={} severity_min={}",
+            execution.registry.status,
+            execution.registry.mode,
+            execution.registry.summary.total_checks,
+            execution.registry.summary.failed_checks,
+            execution.registry.summary.lint_failures,
+            execution.registry.severity_min
+        )
+        .as_str(),
+    )?;
+    for check in execution.registry.checks.iter().filter(|check| check.status != "passed").take(12)
+    {
+        output::print_text_line(
+            format!(
+                "doctor.registry.check id={} component={} severity={} status={} fix_hint=\"{}\"",
+                check.check_id,
+                check.component,
+                check.severity,
+                check.status,
+                check.fix_hint.replace('"', "'")
+            )
+            .as_str(),
+        )?;
+    }
     output::print_text_line(
         format!(
             "doctor.connectivity http_ok={} grpc_ok={} admin_ok={}",

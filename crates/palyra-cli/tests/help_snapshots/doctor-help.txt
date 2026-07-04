@@ -5,7 +5,11 @@ Usage: palyra doctor [OPTIONS]
 Options:
       --strict
       --json
+      --lint
+      --deep
+      --severity-min <SEVERITY_MIN>  [possible values: blocking, warning, info]
       --repair
+      --fix
       --dry-run
       --force
       --only <ONLY>

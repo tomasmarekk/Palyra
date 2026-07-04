@@ -448,6 +448,14 @@ pub enum LogLevelArg {
     Trace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorSeverityArg {
+    Blocking,
+    Warning,
+    Info,
+}
+
 #[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
 #[command(next_help_heading = "Global Options")]
 pub struct RootOptions {
@@ -554,7 +562,15 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
         #[arg(long, default_value_t = false)]
+        lint: bool,
+        #[arg(long, default_value_t = false)]
+        deep: bool,
+        #[arg(long = "severity-min", value_enum)]
+        severity_min: Option<DoctorSeverityArg>,
+        #[arg(long, default_value_t = false)]
         repair: bool,
+        #[arg(long, default_value_t = false)]
+        fix: bool,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
         #[arg(long, default_value_t = false)]

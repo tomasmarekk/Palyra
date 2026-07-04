@@ -317,18 +317,32 @@ fn run_cli() -> Result<()> {
         CliCommand::Setup { mode, path, force, tls_scaffold, wizard, wizard_options } => {
             commands::setup::run_setup(mode, path, force, tls_scaffold, wizard, wizard_options)
         }
-        CliCommand::Doctor { strict, json, repair, dry_run, force, only, skip, rollback_run } => {
-            commands::doctor::run_doctor(commands::doctor::DoctorCommandRequest {
-                strict,
-                json,
-                repair,
-                dry_run,
-                force,
-                only,
-                skip,
-                rollback_run,
-            })
-        }
+        CliCommand::Doctor {
+            strict,
+            json,
+            lint,
+            deep,
+            severity_min,
+            repair,
+            fix,
+            dry_run,
+            force,
+            only,
+            skip,
+            rollback_run,
+        } => commands::doctor::run_doctor(commands::doctor::DoctorCommandRequest {
+            strict,
+            json,
+            lint,
+            deep,
+            severity_min,
+            repair: repair || fix,
+            dry_run,
+            force,
+            only,
+            skip,
+            rollback_run,
+        }),
         CliCommand::Health { url, grpc_url, json } => {
             commands::health::run_health(url, grpc_url, json)
         }
