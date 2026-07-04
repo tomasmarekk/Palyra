@@ -19,6 +19,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -99,6 +101,24 @@ const CONTEXT_INSPECTOR_PROMPT_CATEGORIES: &[&str] = &[
     "tool_results",
     "current_turn",
 ];
+const DEFAULT_CONTEXT_ENGINE_ID: &str = "default_context_engine";
+const DEFAULT_CONTEXT_ENGINE_VERSION: &str = "context_engine.default.v1";
+const CONTEXT_ENGINE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_ENGINE_LIFECYCLE_HOOKS: &[&str] = &[
+    "prepare_context",
+    "tool_schemas",
+    "handle_context_tool_call",
+    "after_turn",
+    "compact_if_needed",
+    "estimate_breakdown",
+];
+type ContextEnginePrepareFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PreparedModelProviderInput, Status>> + Send + 'a>>;
+// Registry variants implement the full lifecycle contract; the production
+// default currently exercises only `prepare_context` on the hot path.
+#[allow(dead_code)]
+type ContextEngineCompactFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ContextEngineCompactionOutcome, Status>> + Send + 'a>>;
 
 /// High-level plan label chosen by [`select_strategy`] and surfaced in the
 /// assembly trace; it describes why the prompt was shaped the way it was.
@@ -298,6 +318,22 @@ pub(crate) struct ContextEngineInstructionExplain {
     pub(crate) surface: ToolExposureSurface,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineDescriptor {
+    pub(crate) engine_id: String,
+    pub(crate) label: String,
+    pub(crate) version: String,
+    pub(crate) lifecycle_hooks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineRegistrySnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) selected_engine_id: String,
+    pub(crate) registry_hash: String,
+    pub(crate) engines: Vec<ContextEngineDescriptor>,
+}
+
 /// Full deterministic trace of one prompt assembly: strategy, budget and
 /// cache accounting, quality-gate verdicts, and per-segment include/drop
 /// decisions. Serialized verbatim into the [`CONTEXT_ENGINE_PLAN_EVENT`]
@@ -313,6 +349,8 @@ pub(crate) struct ContextEngineExplain {
     pub(crate) summary_quality: Option<SummaryQualityGateExplain>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) instruction: Option<ContextEngineInstructionExplain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) engine_registry: Option<ContextEngineRegistrySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_input_snapshot_hash: Option<String>,
     pub(crate) reason_codes: Vec<String>,
@@ -433,6 +471,224 @@ pub(crate) struct ContextInspectorBreakdownDiff {
     pub(crate) selected_tokens: i64,
     pub(crate) reserved_tokens: i64,
     pub(crate) pruned_tokens: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineToolSchemaPlan {
+    pub(crate) catalog_hash: Option<String>,
+    pub(crate) tool_count: usize,
+    pub(crate) estimated_overhead_tokens: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineToolCallOutcome {
+    pub(crate) handled: bool,
+    pub(crate) reason_code: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextEngineAfterTurnDisposition {
+    Noop,
+    NeedsCompactionCheck,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextEngineAfterTurnInput<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) session_id: &'a str,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineAfterTurnOutcome {
+    pub(crate) disposition: ContextEngineAfterTurnDisposition,
+    pub(crate) reason_code: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextEngineCompactionRequest<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) session_id: &'a str,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextEngineCompactionDisposition {
+    NotNeeded,
+    Deferred,
+    Applied,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextEngineCompactionOutcome {
+    pub(crate) disposition: ContextEngineCompactionDisposition,
+    pub(crate) reason_code: String,
+}
+
+#[allow(dead_code)]
+pub(crate) trait ContextEngine: Sync {
+    fn descriptor(&self) -> ContextEngineDescriptor;
+
+    fn prepare_context<'a>(
+        &'a self,
+        runtime_state: &'a Arc<GatewayRuntimeState>,
+        context: &'a RequestContext,
+        request: PrepareModelProviderInputRequest<'a>,
+    ) -> ContextEnginePrepareFuture<'a>;
+
+    fn tool_schemas(
+        &self,
+        tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+    ) -> ContextEngineToolSchemaPlan;
+
+    fn handle_context_tool_call(
+        &self,
+        tool_call: ContextEngineToolCall,
+    ) -> ContextEngineToolCallOutcome;
+
+    fn after_turn(&self, input: ContextEngineAfterTurnInput<'_>) -> ContextEngineAfterTurnOutcome;
+
+    fn compact_if_needed<'a>(
+        &'a self,
+        runtime_state: &'a Arc<GatewayRuntimeState>,
+        context: &'a RequestContext,
+        request: ContextEngineCompactionRequest<'a>,
+    ) -> ContextEngineCompactFuture<'a>;
+
+    fn estimate_breakdown(&self, explain: &ContextAssemblyTrace) -> ContextInspectorSnapshot;
+}
+
+struct DefaultContextEngine;
+
+static DEFAULT_CONTEXT_ENGINE: DefaultContextEngine = DefaultContextEngine;
+
+impl DefaultContextEngine {
+    fn descriptor_value() -> ContextEngineDescriptor {
+        ContextEngineDescriptor {
+            engine_id: DEFAULT_CONTEXT_ENGINE_ID.to_owned(),
+            label: "Default ContextEngine".to_owned(),
+            version: DEFAULT_CONTEXT_ENGINE_VERSION.to_owned(),
+            lifecycle_hooks: CONTEXT_ENGINE_LIFECYCLE_HOOKS
+                .iter()
+                .map(|hook| (*hook).to_owned())
+                .collect(),
+        }
+    }
+}
+
+impl ContextEngine for DefaultContextEngine {
+    fn descriptor(&self) -> ContextEngineDescriptor {
+        Self::descriptor_value()
+    }
+
+    fn prepare_context<'a>(
+        &'a self,
+        runtime_state: &'a Arc<GatewayRuntimeState>,
+        context: &'a RequestContext,
+        request: PrepareModelProviderInputRequest<'a>,
+    ) -> ContextEnginePrepareFuture<'a> {
+        Box::pin(prepare_model_provider_input_with_default_context_engine(
+            runtime_state,
+            context,
+            request,
+        ))
+    }
+
+    fn tool_schemas(
+        &self,
+        tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+    ) -> ContextEngineToolSchemaPlan {
+        ContextEngineToolSchemaPlan {
+            catalog_hash: tool_catalog_snapshot.map(|snapshot| snapshot.catalog_hash.clone()),
+            tool_count: tool_catalog_snapshot.map_or(0, |snapshot| snapshot.tools.len()),
+            estimated_overhead_tokens: estimate_tool_schema_overhead_tokens(tool_catalog_snapshot),
+        }
+    }
+
+    fn handle_context_tool_call(
+        &self,
+        tool_call: ContextEngineToolCall,
+    ) -> ContextEngineToolCallOutcome {
+        ContextEngineToolCallOutcome {
+            handled: false,
+            reason_code: format!("unsupported_context_tool:{}", tool_call.name),
+        }
+    }
+
+    fn after_turn(&self, input: ContextEngineAfterTurnInput<'_>) -> ContextEngineAfterTurnOutcome {
+        ContextEngineAfterTurnOutcome {
+            disposition: ContextEngineAfterTurnDisposition::Noop,
+            reason_code: format!("default_after_turn_noop:{}:{}", input.session_id, input.run_id),
+        }
+    }
+
+    fn compact_if_needed<'a>(
+        &'a self,
+        _runtime_state: &'a Arc<GatewayRuntimeState>,
+        _context: &'a RequestContext,
+        request: ContextEngineCompactionRequest<'a>,
+    ) -> ContextEngineCompactFuture<'a> {
+        Box::pin(async move {
+            Ok(ContextEngineCompactionOutcome {
+                disposition: ContextEngineCompactionDisposition::NotNeeded,
+                reason_code: format!(
+                    "default_compaction_delegated_to_provider_input:{}:{}",
+                    request.session_id, request.run_id
+                ),
+            })
+        })
+    }
+
+    fn estimate_breakdown(&self, explain: &ContextAssemblyTrace) -> ContextInspectorSnapshot {
+        context_inspector_snapshot(explain)
+    }
+}
+
+pub(crate) struct ContextEngineRegistry {
+    selected_engine_id: &'static str,
+}
+
+impl ContextEngineRegistry {
+    pub(crate) const fn production_default() -> Self {
+        Self { selected_engine_id: DEFAULT_CONTEXT_ENGINE_ID }
+    }
+
+    pub(crate) fn selected_engine(&self) -> &'static dyn ContextEngine {
+        match self.selected_engine_id {
+            DEFAULT_CONTEXT_ENGINE_ID => &DEFAULT_CONTEXT_ENGINE,
+            _ => &DEFAULT_CONTEXT_ENGINE,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ContextEngineRegistrySnapshot {
+        let engines = vec![DefaultContextEngine::descriptor_value()];
+        let registry_hash = stable_sha256_json(&json!({
+            "schema_version": CONTEXT_ENGINE_REGISTRY_SCHEMA_VERSION,
+            "selected_engine_id": self.selected_engine_id,
+            "engines": engines.as_slice(),
+        }));
+        ContextEngineRegistrySnapshot {
+            schema_version: CONTEXT_ENGINE_REGISTRY_SCHEMA_VERSION,
+            selected_engine_id: self.selected_engine_id.to_owned(),
+            registry_hash,
+            engines,
+        }
+    }
 }
 
 /// One candidate prompt block before budgeting. `priority` decides eviction
@@ -612,6 +868,16 @@ struct ContextReferenceParameterDelta {
 /// [`MemoryPromptFailureMode::FallbackToRawInput`].
 #[allow(clippy::result_large_err)]
 pub(crate) async fn prepare_model_provider_input_with_context_engine(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: &RequestContext,
+    request: PrepareModelProviderInputRequest<'_>,
+) -> Result<PreparedModelProviderInput, Status> {
+    let registry = ContextEngineRegistry::production_default();
+    registry.selected_engine().prepare_context(runtime_state, context, request).await
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_model_provider_input_with_default_context_engine(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: &RequestContext,
     request: PrepareModelProviderInputRequest<'_>,
@@ -907,6 +1173,8 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         model_family: compiled_instructions.model_family.clone(),
         surface: compiled_instructions.surface,
     });
+    assembled.explain.engine_registry =
+        Some(ContextEngineRegistry::production_default().snapshot());
     assembled.explain.provider_input_snapshot_hash =
         Some(context_inspector_provider_input_hash(&assembled.explain));
 
@@ -1221,6 +1489,7 @@ fn assemble_segments(
             },
             summary_quality,
             instruction: None,
+            engine_registry: None,
             provider_input_snapshot_hash: None,
             reason_codes,
             assembly_steps,
@@ -1704,6 +1973,7 @@ fn context_inspector_provider_input_hash(explain: &ContextAssemblyTrace) -> Stri
         "trace_schema_version": explain.schema_version,
         "trace_id": explain.trace_id.as_str(),
         "strategy": explain.strategy,
+        "engine_registry": explain.engine_registry.as_ref(),
         "instruction": explain.instruction.as_ref().map(|instruction| json!({
             "version": instruction.version,
             "hash": instruction.hash.as_str(),
@@ -2473,6 +2743,7 @@ fn context_assembly_diagnostics_payload_with_previous(
         "trace_id": explain.trace_id.as_str(),
         "strategy": explain.strategy,
         "provider_input_snapshot_hash": provider_input_snapshot_hash,
+        "engine_registry": explain.engine_registry.as_ref(),
         "reason_codes": explain.reason_codes.as_slice(),
         "instruction": explain.instruction.as_ref().map(|instruction| json!({
             "version": instruction.version,
@@ -2825,17 +3096,28 @@ fn estimate_tokens(text: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         assemble_segments, context_assembly_diagnostics_payload, context_inspector_snapshot,
         diff_context_inspector_snapshots, render_agent_plan_context_block,
-        resolve_provider_context_budget, select_strategy, ContextEngineStrategy,
-        ContextInspectorBreakdownItem, ContextInspectorSnapshot, ContextSegment,
-        ContextSegmentKind, ContextSourceKind, ProviderBudgetProfile, ProviderContextBudget,
-        SummaryQualityGateExplain,
+        resolve_provider_context_budget, select_strategy, ContextEngine,
+        ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
+        ContextEngineAfterTurnOutcome, ContextEngineCompactFuture,
+        ContextEngineCompactionDisposition, ContextEngineCompactionOutcome,
+        ContextEngineCompactionRequest, ContextEngineDescriptor, ContextEnginePrepareFuture,
+        ContextEngineRegistry, ContextEngineStrategy, ContextEngineToolCall,
+        ContextEngineToolCallOutcome, ContextEngineToolSchemaPlan, ContextInspectorBreakdownItem,
+        ContextInspectorSnapshot, ContextSegment, ContextSegmentKind, ContextSourceKind,
+        ProviderBudgetProfile, ProviderContextBudget, SummaryQualityGateExplain,
+        DEFAULT_CONTEXT_ENGINE_ID, DEFAULT_CONTEXT_ENGINE_VERSION,
     };
     use crate::application::plan_state::{
         AgentPlanItem, AgentPlanStatus, AGENT_PLAN_SCHEMA_VERSION,
     };
+    use crate::application::session_compaction::render_compaction_prompt_block;
+    use crate::application::tool_registry::ModelVisibleToolCatalogSnapshot;
+    use crate::gateway::GatewayRuntimeState;
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
         ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
@@ -2846,6 +3128,7 @@ mod tests {
     use crate::transport::grpc::auth::RequestContext;
     use palyra_safety::{SafetyAction, TrustLabel};
     use serde_json::{json, Value};
+    use tonic::Status;
 
     fn segment(
         kind: ContextSegmentKind,
@@ -2911,6 +3194,84 @@ mod tests {
             .iter()
             .find(|item| item.category == category)
             .expect("breakdown category should be present")
+    }
+
+    struct FakeContextEngine;
+
+    impl ContextEngine for FakeContextEngine {
+        fn descriptor(&self) -> ContextEngineDescriptor {
+            ContextEngineDescriptor {
+                engine_id: "fake_context_engine".to_owned(),
+                label: "Fake ContextEngine".to_owned(),
+                version: "fake.v1".to_owned(),
+                lifecycle_hooks: vec![
+                    "prepare_context".to_owned(),
+                    "handle_context_tool_call".to_owned(),
+                    "estimate_breakdown".to_owned(),
+                ],
+            }
+        }
+
+        fn prepare_context<'a>(
+            &'a self,
+            _runtime_state: &'a Arc<GatewayRuntimeState>,
+            _context: &'a RequestContext,
+            _request: crate::application::provider_input::PrepareModelProviderInputRequest<'a>,
+        ) -> ContextEnginePrepareFuture<'a> {
+            Box::pin(async { Err(Status::unimplemented("fake context engine")) })
+        }
+
+        fn tool_schemas(
+            &self,
+            _tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+        ) -> ContextEngineToolSchemaPlan {
+            ContextEngineToolSchemaPlan {
+                catalog_hash: Some("fake_catalog".to_owned()),
+                tool_count: 1,
+                estimated_overhead_tokens: 42,
+            }
+        }
+
+        fn handle_context_tool_call(
+            &self,
+            tool_call: ContextEngineToolCall,
+        ) -> ContextEngineToolCallOutcome {
+            ContextEngineToolCallOutcome {
+                handled: tool_call.name == "context.inspect",
+                reason_code: "fake_context_tool_handled".to_owned(),
+            }
+        }
+
+        fn after_turn(
+            &self,
+            input: ContextEngineAfterTurnInput<'_>,
+        ) -> ContextEngineAfterTurnOutcome {
+            ContextEngineAfterTurnOutcome {
+                disposition: ContextEngineAfterTurnDisposition::NeedsCompactionCheck,
+                reason_code: format!("fake_after_turn:{}", input.session_id),
+            }
+        }
+
+        fn compact_if_needed<'a>(
+            &'a self,
+            _runtime_state: &'a Arc<GatewayRuntimeState>,
+            _context: &'a RequestContext,
+            request: ContextEngineCompactionRequest<'a>,
+        ) -> ContextEngineCompactFuture<'a> {
+            Box::pin(async move {
+                Ok(ContextEngineCompactionOutcome {
+                    disposition: ContextEngineCompactionDisposition::Deferred,
+                    reason_code: format!("fake_compaction_deferred:{}", request.run_id),
+                })
+            })
+        }
+
+        fn estimate_breakdown(
+            &self,
+            explain: &super::ContextAssemblyTrace,
+        ) -> ContextInspectorSnapshot {
+            context_inspector_snapshot(explain)
+        }
     }
 
     fn budget(
@@ -3186,6 +3547,42 @@ mod tests {
             .expect("plan segment should be selected");
         assert_eq!(segment.source_kind, ContextSourceKind::RuntimeState);
         assert_eq!(segment.include_reason, "active_agent_plan_state");
+    }
+
+    #[test]
+    fn context_engine_trait_accepts_fake_engine_hooks() {
+        let engine = FakeContextEngine;
+        let descriptor = engine.descriptor();
+
+        assert_eq!(descriptor.engine_id, "fake_context_engine");
+        assert!(descriptor.lifecycle_hooks.iter().any(|hook| hook == "prepare_context"));
+        assert_eq!(engine.tool_schemas(None).estimated_overhead_tokens, 42);
+        assert!(
+            engine
+                .handle_context_tool_call(ContextEngineToolCall {
+                    name: "context.inspect".to_owned(),
+                    arguments: json!({"run_id": "run-1"}),
+                })
+                .handled
+        );
+        let after_turn = engine
+            .after_turn(ContextEngineAfterTurnInput { run_id: "run-1", session_id: "session-1" });
+        assert_eq!(after_turn.disposition, ContextEngineAfterTurnDisposition::NeedsCompactionCheck);
+    }
+
+    #[test]
+    fn default_context_engine_registry_exposes_schema_snapshot() {
+        let registry = ContextEngineRegistry::production_default();
+        let descriptor = registry.selected_engine().descriptor();
+        let snapshot = registry.snapshot();
+
+        assert_eq!(descriptor.engine_id, DEFAULT_CONTEXT_ENGINE_ID);
+        assert_eq!(descriptor.version, DEFAULT_CONTEXT_ENGINE_VERSION);
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.selected_engine_id, DEFAULT_CONTEXT_ENGINE_ID);
+        assert!(!snapshot.registry_hash.is_empty());
+        assert_eq!(snapshot.engines, vec![descriptor]);
+        assert_eq!(registry.selected_engine().tool_schemas(None).tool_count, 0);
     }
 
     #[test]
@@ -3633,6 +4030,91 @@ mod tests {
             .reason_codes
             .iter()
             .any(|reason| reason == "summary_quality_clean"));
+    }
+
+    #[test]
+    fn context_plan_trace_records_selected_engine_registry_snapshot() {
+        let mut assembled = assemble_segments(
+            &[segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None)],
+            ContextEngineStrategy::Noop,
+            budget(4_096, 768, 256, 128, false),
+            &RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "device".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            "session-1",
+            None,
+        );
+        assembled.explain.engine_registry =
+            Some(ContextEngineRegistry::production_default().snapshot());
+
+        let payload = serde_json::to_value(&assembled.explain).expect("trace should serialize");
+
+        assert_eq!(
+            payload.pointer("/engine_registry/schema_version").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            payload.pointer("/engine_registry/selected_engine_id").and_then(Value::as_str),
+            Some(DEFAULT_CONTEXT_ENGINE_ID)
+        );
+        assert!(payload
+            .pointer("/engine_registry/registry_hash")
+            .and_then(Value::as_str)
+            .is_some());
+    }
+
+    #[test]
+    fn compressed_summary_stale_task_remains_non_authoritative_context() {
+        let summary = render_compaction_prompt_block(
+            "artifact-1",
+            "automatic",
+            "budget_guard_v1",
+            "Stale task: deploy the abandoned prototype branch.",
+        );
+        let assembled = assemble_segments(
+            &[
+                segment_with_content(
+                    ContextSegmentKind::SessionCompactionSummary,
+                    "session_compaction_summary",
+                    summary,
+                    96,
+                    80,
+                    false,
+                ),
+                segment(ContextSegmentKind::UserInput, "new request", 24, 100, false, true, None),
+            ],
+            ContextEngineStrategy::CheckpointAware,
+            budget(4_096, 768, 256, 128, false),
+            &RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "device".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            "session-1",
+            None,
+        );
+
+        assert!(assembled.prompt_text.contains("instruction_authority=\"none\""));
+        let summary_segment = assembled
+            .explain
+            .selected_segments
+            .iter()
+            .find(|segment| segment.kind == ContextSegmentKind::SessionCompactionSummary)
+            .expect("compaction summary should be selected");
+        assert_eq!(summary_segment.source_kind, ContextSourceKind::Memory);
+        assert_eq!(
+            breakdown(&context_inspector_snapshot(&assembled.explain), "compaction_summary")
+                .selected_segments,
+            1
+        );
+        assert!(
+            !assembled.explain.assembly_steps.iter().any(|step| {
+                step.step == "instruction_compiler" && step.label == "session_compaction_summary"
+            }),
+            "stale summary tasks must never be promoted into instruction compiler steps"
+        );
     }
 
     #[test]
