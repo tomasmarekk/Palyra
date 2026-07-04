@@ -17,7 +17,10 @@
 //! `application::provider_input`, whose `prepare_model_provider_input`
 //! delegates here whenever the context-engine feature rollout is enabled.
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use palyra_safety::{
     transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
@@ -81,6 +84,21 @@ const AGENT_PLAN_CONTEXT_FIELD_PREVIEW_CHARS: usize = 240;
 pub(crate) const CONTEXT_ENGINE_PLAN_EVENT: &str = "context.engine.plan";
 /// Schema version stamped into [`ContextEngineExplain`] and its trace hash.
 pub(crate) const CONTEXT_ASSEMBLY_TRACE_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_INSPECTOR_SCHEMA_VERSION: u32 = 1;
+const CONTEXT_INSPECTOR_PROMPT_CATEGORIES: &[&str] = &[
+    "system",
+    "developer",
+    "session_history",
+    "compaction_summary",
+    "tool_schemas",
+    "memory_recall",
+    "workspace_context",
+    "attachments",
+    "runtime_state",
+    "channel_history",
+    "tool_results",
+    "current_turn",
+];
 
 /// High-level plan label chosen by [`select_strategy`] and surfaced in the
 /// assembly trace; it describes why the prompt was shaped the way it was.
@@ -295,6 +313,8 @@ pub(crate) struct ContextEngineExplain {
     pub(crate) summary_quality: Option<SummaryQualityGateExplain>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) instruction: Option<ContextEngineInstructionExplain>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_input_snapshot_hash: Option<String>,
     pub(crate) reason_codes: Vec<String>,
     pub(crate) assembly_steps: Vec<PromptAssemblyStepExplain>,
     pub(crate) selected_segments: Vec<ContextEngineSegmentExplain>,
@@ -304,6 +324,116 @@ pub(crate) struct ContextEngineExplain {
 /// Alias used where the explain payload is consumed as a journaled trace
 /// rather than as a live planning result.
 pub(crate) type ContextAssemblyTrace = ContextEngineExplain;
+
+/// Support-facing context inspector snapshot derived from the deterministic
+/// assembly trace without copying raw prompt text or source identifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) trace_id: String,
+    pub(crate) snapshot_hash: String,
+    pub(crate) provider_input_snapshot_hash: String,
+    pub(crate) redaction_level: String,
+    pub(crate) strategy: ContextEngineStrategy,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) window: ContextInspectorWindow,
+    pub(crate) prompt_cache: ContextInspectorPromptCache,
+    pub(crate) compaction: ContextInspectorCompaction,
+    pub(crate) prompt_breakdown: Vec<ContextInspectorBreakdownItem>,
+    pub(crate) pruned_items: Vec<ContextInspectorPrunedItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorWindow {
+    pub(crate) max_context_tokens: u64,
+    pub(crate) input_budget_tokens: u64,
+    pub(crate) selected_tokens: u64,
+    pub(crate) available_tokens: u64,
+    pub(crate) dropped_tokens: u64,
+    pub(crate) overflow_tokens: u64,
+    pub(crate) usage_bps: u64,
+    pub(crate) overflow_risk: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorPromptCache {
+    pub(crate) provider_cache_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stable_prefix_hash: Option<String>,
+    pub(crate) stable_prefix_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_scope_hash: Option<String>,
+    pub(crate) cache_scope_key_redacted: bool,
+    pub(crate) trust_scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorCompaction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summary_verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeated_compaction_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) contradiction_signals: Option<usize>,
+    pub(crate) selected_summary_segments: usize,
+    pub(crate) pruned_summary_segments: usize,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorBreakdownItem {
+    pub(crate) category: String,
+    pub(crate) selected_segments: usize,
+    pub(crate) pruned_segments: usize,
+    pub(crate) selected_tokens: u64,
+    pub(crate) reserved_tokens: u64,
+    pub(crate) pruned_tokens: u64,
+    pub(crate) source_ref_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) source_ref_hashes: Vec<String>,
+    pub(crate) trust_labels: Vec<String>,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorPrunedItem {
+    pub(crate) kind: ContextSegmentKind,
+    pub(crate) category: String,
+    pub(crate) label: String,
+    pub(crate) estimated_tokens: u64,
+    pub(crate) reason_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorDiff {
+    pub(crate) schema_version: u32,
+    pub(crate) left_snapshot_hash: String,
+    pub(crate) right_snapshot_hash: String,
+    pub(crate) window_delta: ContextInspectorWindowDelta,
+    pub(crate) changed_categories: Vec<ContextInspectorBreakdownDiff>,
+    pub(crate) added_reason_codes: Vec<String>,
+    pub(crate) removed_reason_codes: Vec<String>,
+    pub(crate) added_pruned_items: Vec<ContextInspectorPrunedItem>,
+    pub(crate) removed_pruned_items: Vec<ContextInspectorPrunedItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorWindowDelta {
+    pub(crate) selected_tokens: i64,
+    pub(crate) available_tokens: i64,
+    pub(crate) dropped_tokens: i64,
+    pub(crate) overflow_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ContextInspectorBreakdownDiff {
+    pub(crate) category: String,
+    pub(crate) selected_segments: i64,
+    pub(crate) pruned_segments: i64,
+    pub(crate) selected_tokens: i64,
+    pub(crate) reserved_tokens: i64,
+    pub(crate) pruned_tokens: i64,
+}
 
 /// One candidate prompt block before budgeting. `priority` decides eviction
 /// order (higher survives longer), `stable` marks cache-prefix-eligible
@@ -777,6 +907,8 @@ pub(crate) async fn prepare_model_provider_input_with_context_engine(
         model_family: compiled_instructions.model_family.clone(),
         surface: compiled_instructions.surface,
     });
+    assembled.explain.provider_input_snapshot_hash =
+        Some(context_inspector_provider_input_hash(&assembled.explain));
 
     record_context_engine_plan(runtime_state, run_id, tape_seq, assembled.explain.clone()).await?;
     if assembled.explain.budget.overflow_tokens > 0 {
@@ -1089,6 +1221,7 @@ fn assemble_segments(
             },
             summary_quality,
             instruction: None,
+            provider_input_snapshot_hash: None,
             reason_codes,
             assembly_steps,
             selected_segments: selected_segment_explain,
@@ -1308,6 +1441,398 @@ fn stable_sha256_json(value: &Value) -> String {
 
 fn cache_scope_hash(value: &str) -> String {
     crate::sha256_hex(value.as_bytes())
+}
+
+#[derive(Default)]
+struct ContextInspectorBreakdownAccumulator {
+    selected_segments: usize,
+    pruned_segments: usize,
+    selected_tokens: u64,
+    reserved_tokens: u64,
+    pruned_tokens: u64,
+    source_ref_count: usize,
+    source_ref_hashes: BTreeSet<String>,
+    trust_labels: BTreeSet<String>,
+    reason_codes: BTreeSet<String>,
+}
+
+impl ContextInspectorBreakdownAccumulator {
+    fn into_item(self, category: String) -> ContextInspectorBreakdownItem {
+        ContextInspectorBreakdownItem {
+            category,
+            selected_segments: self.selected_segments,
+            pruned_segments: self.pruned_segments,
+            selected_tokens: self.selected_tokens,
+            reserved_tokens: self.reserved_tokens,
+            pruned_tokens: self.pruned_tokens,
+            source_ref_count: self.source_ref_count,
+            source_ref_hashes: self.source_ref_hashes.into_iter().collect(),
+            trust_labels: self.trust_labels.into_iter().collect(),
+            reason_codes: self.reason_codes.into_iter().collect(),
+        }
+    }
+}
+
+pub(crate) fn context_inspector_snapshot(
+    explain: &ContextAssemblyTrace,
+) -> ContextInspectorSnapshot {
+    let provider_input_snapshot_hash = explain
+        .provider_input_snapshot_hash
+        .clone()
+        .unwrap_or_else(|| context_inspector_provider_input_hash(explain));
+    let mut snapshot = ContextInspectorSnapshot {
+        schema_version: CONTEXT_INSPECTOR_SCHEMA_VERSION,
+        trace_id: explain.trace_id.clone(),
+        snapshot_hash: String::new(),
+        provider_input_snapshot_hash,
+        redaction_level: "metadata_with_hashed_source_refs".to_owned(),
+        strategy: explain.strategy,
+        reason_codes: explain.reason_codes.clone(),
+        window: context_inspector_window(explain),
+        prompt_cache: context_inspector_prompt_cache(explain),
+        compaction: context_inspector_compaction(explain),
+        prompt_breakdown: context_inspector_prompt_breakdown(explain),
+        pruned_items: context_inspector_pruned_items(explain),
+    };
+    snapshot.snapshot_hash = context_inspector_snapshot_hash(&snapshot);
+    snapshot
+}
+
+pub(crate) fn diff_context_inspector_snapshots(
+    left: &ContextInspectorSnapshot,
+    right: &ContextInspectorSnapshot,
+) -> ContextInspectorDiff {
+    let left_reasons = left.reason_codes.iter().cloned().collect::<BTreeSet<_>>();
+    let right_reasons = right.reason_codes.iter().cloned().collect::<BTreeSet<_>>();
+    let left_pruned = pruned_item_map(left.pruned_items.as_slice());
+    let right_pruned = pruned_item_map(right.pruned_items.as_slice());
+
+    ContextInspectorDiff {
+        schema_version: CONTEXT_INSPECTOR_SCHEMA_VERSION,
+        left_snapshot_hash: left.snapshot_hash.clone(),
+        right_snapshot_hash: right.snapshot_hash.clone(),
+        window_delta: ContextInspectorWindowDelta {
+            selected_tokens: signed_u64_delta(
+                right.window.selected_tokens,
+                left.window.selected_tokens,
+            ),
+            available_tokens: signed_u64_delta(
+                right.window.available_tokens,
+                left.window.available_tokens,
+            ),
+            dropped_tokens: signed_u64_delta(
+                right.window.dropped_tokens,
+                left.window.dropped_tokens,
+            ),
+            overflow_tokens: signed_u64_delta(
+                right.window.overflow_tokens,
+                left.window.overflow_tokens,
+            ),
+        },
+        changed_categories: breakdown_diffs(
+            left.prompt_breakdown.as_slice(),
+            right.prompt_breakdown.as_slice(),
+        ),
+        added_reason_codes: right_reasons.difference(&left_reasons).cloned().collect(),
+        removed_reason_codes: left_reasons.difference(&right_reasons).cloned().collect(),
+        added_pruned_items: right_pruned
+            .iter()
+            .filter(|(key, _)| !left_pruned.contains_key(*key))
+            .map(|(_, item)| item.clone())
+            .collect(),
+        removed_pruned_items: left_pruned
+            .iter()
+            .filter(|(key, _)| !right_pruned.contains_key(*key))
+            .map(|(_, item)| item.clone())
+            .collect(),
+    }
+}
+
+fn context_inspector_window(explain: &ContextAssemblyTrace) -> ContextInspectorWindow {
+    let available_tokens =
+        explain.budget.input_budget_tokens.saturating_sub(explain.budget.selected_tokens);
+    let usage_bps = ratio_bps(explain.budget.selected_tokens, explain.budget.input_budget_tokens);
+    ContextInspectorWindow {
+        max_context_tokens: explain.budget.max_context_tokens,
+        input_budget_tokens: explain.budget.input_budget_tokens,
+        selected_tokens: explain.budget.selected_tokens,
+        available_tokens,
+        dropped_tokens: explain.budget.dropped_tokens,
+        overflow_tokens: explain.budget.overflow_tokens,
+        usage_bps,
+        overflow_risk: explain.budget.overflow_tokens > 0
+            || explain.budget.dropped_tokens > 0
+            || usage_bps >= 9_000,
+    }
+}
+
+fn context_inspector_prompt_cache(explain: &ContextAssemblyTrace) -> ContextInspectorPromptCache {
+    ContextInspectorPromptCache {
+        provider_cache_supported: explain.cache.provider_cache_supported,
+        stable_prefix_hash: explain.cache.stable_prefix_hash.clone(),
+        stable_prefix_tokens: explain.cache.stable_prefix_tokens,
+        cache_scope_hash: explain.cache.cache_scope_key.as_deref().map(cache_scope_hash),
+        cache_scope_key_redacted: explain.cache.cache_scope_key.is_some(),
+        trust_scope: explain.cache.trust_scope.clone(),
+    }
+}
+
+fn context_inspector_compaction(explain: &ContextAssemblyTrace) -> ContextInspectorCompaction {
+    let selected_summary_segments = explain
+        .selected_segments
+        .iter()
+        .filter(|segment| context_inspector_category_for_kind(segment.kind) == "compaction_summary")
+        .count();
+    let pruned_summary_segments = explain
+        .dropped_segments
+        .iter()
+        .filter(|segment| context_inspector_category_for_kind(segment.kind) == "compaction_summary")
+        .count();
+    let mut reason_codes = BTreeSet::new();
+    if let Some(summary) = explain.summary_quality.as_ref() {
+        reason_codes.insert(format!("summary_quality_{}", summary.verdict));
+        reason_codes.extend(summary.reasons.iter().cloned());
+    }
+    if selected_summary_segments > 0 {
+        reason_codes.insert("compaction_summary_selected".to_owned());
+    }
+    if pruned_summary_segments > 0 {
+        reason_codes.insert("compaction_summary_pruned".to_owned());
+    }
+
+    ContextInspectorCompaction {
+        summary_verdict: explain.summary_quality.as_ref().map(|summary| summary.verdict.clone()),
+        repeated_compaction_depth: explain
+            .summary_quality
+            .as_ref()
+            .map(|summary| summary.repeated_compaction_depth),
+        contradiction_signals: explain
+            .summary_quality
+            .as_ref()
+            .map(|summary| summary.contradiction_signals),
+        selected_summary_segments,
+        pruned_summary_segments,
+        reason_codes: reason_codes.into_iter().collect(),
+    }
+}
+
+fn context_inspector_prompt_breakdown(
+    explain: &ContextAssemblyTrace,
+) -> Vec<ContextInspectorBreakdownItem> {
+    let mut categories = CONTEXT_INSPECTOR_PROMPT_CATEGORIES
+        .iter()
+        .map(|category| ((*category).to_owned(), ContextInspectorBreakdownAccumulator::default()))
+        .collect::<BTreeMap<_, _>>();
+
+    for segment in &explain.selected_segments {
+        let category = context_inspector_category_for_kind(segment.kind).to_owned();
+        let entry = categories.entry(category).or_default();
+        entry.selected_segments = entry.selected_segments.saturating_add(1);
+        entry.selected_tokens = entry.selected_tokens.saturating_add(segment.estimated_tokens);
+        entry.source_ref_count = entry.source_ref_count.saturating_add(segment.source_refs.len());
+        entry.source_ref_hashes.extend(segment.source_refs.iter().map(|value| {
+            let hash = cache_scope_hash(value);
+            format!("ref_{}", &hash[..16])
+        }));
+        entry.trust_labels.insert(segment.trust_label.as_str().to_owned());
+        entry.reason_codes.insert(segment.include_reason.clone());
+        if !segment.safety_findings.is_empty() {
+            entry.reason_codes.insert("safety_findings_present".to_owned());
+        }
+    }
+
+    for segment in &explain.dropped_segments {
+        let category = context_inspector_category_for_kind(segment.kind).to_owned();
+        let entry = categories.entry(category).or_default();
+        entry.pruned_segments = entry.pruned_segments.saturating_add(1);
+        entry.pruned_tokens = entry.pruned_tokens.saturating_add(segment.estimated_tokens);
+        entry.reason_codes.insert(segment.reason.clone());
+    }
+
+    if explain.budget.tool_schema_overhead_tokens > 0 {
+        let entry = categories.entry("tool_schemas".to_owned()).or_default();
+        entry.reserved_tokens =
+            entry.reserved_tokens.saturating_add(explain.budget.tool_schema_overhead_tokens);
+        entry.reason_codes.insert("tool_schema_overhead_reserved".to_owned());
+        entry.trust_labels.insert("trusted_local".to_owned());
+    }
+
+    categories.into_iter().map(|(category, accumulator)| accumulator.into_item(category)).collect()
+}
+
+fn context_inspector_pruned_items(
+    explain: &ContextAssemblyTrace,
+) -> Vec<ContextInspectorPrunedItem> {
+    explain
+        .dropped_segments
+        .iter()
+        .map(|segment| ContextInspectorPrunedItem {
+            kind: segment.kind,
+            category: context_inspector_category_for_kind(segment.kind).to_owned(),
+            label: segment.label.clone(),
+            estimated_tokens: segment.estimated_tokens,
+            reason_code: segment.reason.clone(),
+        })
+        .collect()
+}
+
+fn context_inspector_category_for_kind(kind: ContextSegmentKind) -> &'static str {
+    match kind {
+        ContextSegmentKind::SystemInstructions => "system",
+        ContextSegmentKind::DeveloperInstructions | ContextSegmentKind::PreferenceContext => {
+            "developer"
+        }
+        ContextSegmentKind::SessionTail => "session_history",
+        ContextSegmentKind::SessionCompactionSummary | ContextSegmentKind::CheckpointSummary => {
+            "compaction_summary"
+        }
+        ContextSegmentKind::ExplicitRecall | ContextSegmentKind::MemoryRecall => "memory_recall",
+        ContextSegmentKind::ProjectContext | ContextSegmentKind::ContextReferences => {
+            "workspace_context"
+        }
+        ContextSegmentKind::AttachmentRecall => "attachments",
+        ContextSegmentKind::AgentPlanState => "runtime_state",
+        ContextSegmentKind::ChannelAmbientContext => "channel_history",
+        ContextSegmentKind::ToolExchange => "tool_results",
+        ContextSegmentKind::UserInput => "current_turn",
+    }
+}
+
+fn context_inspector_provider_input_hash(explain: &ContextAssemblyTrace) -> String {
+    stable_sha256_json(&json!({
+        "schema_version": CONTEXT_INSPECTOR_SCHEMA_VERSION,
+        "trace_schema_version": explain.schema_version,
+        "trace_id": explain.trace_id.as_str(),
+        "strategy": explain.strategy,
+        "instruction": explain.instruction.as_ref().map(|instruction| json!({
+            "version": instruction.version,
+            "hash": instruction.hash.as_str(),
+            "provider_kind": instruction.provider_kind.as_str(),
+            "model_family": instruction.model_family.as_str(),
+            "surface": instruction.surface,
+        })),
+        "budget": {
+            "profile_id": explain.budget.profile_id.as_str(),
+            "provider_id": explain.budget.provider_id.as_str(),
+            "provider_kind": explain.budget.provider_kind.as_str(),
+            "model_id": explain.budget.model_id.as_str(),
+            "input_budget_tokens": explain.budget.input_budget_tokens,
+            "selected_tokens": explain.budget.selected_tokens,
+            "dropped_tokens": explain.budget.dropped_tokens,
+            "overflow_tokens": explain.budget.overflow_tokens,
+        },
+        "selected_segments": explain.selected_segments.iter().map(|segment| json!({
+            "kind": segment.kind,
+            "source_kind": segment.source_kind,
+            "label": segment.label.as_str(),
+            "estimated_tokens": segment.estimated_tokens,
+            "include_reason": segment.include_reason.as_str(),
+            "redaction_status": segment.redaction_status.as_str(),
+            "stable": segment.stable,
+            "protected": segment.protected,
+            "trust_label": segment.trust_label.as_str(),
+            "safety_action": segment.safety_action.as_str(),
+            "safety_findings": segment.safety_findings.as_slice(),
+            "group_id": segment.group_id.as_deref(),
+            "source_ref_hashes": segment.source_refs.iter().map(|value| {
+                let hash = cache_scope_hash(value);
+                format!("ref_{}", &hash[..16])
+            }).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "dropped_segments": explain.dropped_segments.iter().map(|segment| json!({
+            "kind": segment.kind,
+            "label": segment.label.as_str(),
+            "estimated_tokens": segment.estimated_tokens,
+            "reason": segment.reason.as_str(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn context_inspector_snapshot_hash(snapshot: &ContextInspectorSnapshot) -> String {
+    let mut payload = serde_json::to_value(snapshot).unwrap_or_else(|_| Value::Null);
+    if let Value::Object(object) = &mut payload {
+        object.remove("snapshot_hash");
+    }
+    stable_sha256_json(&payload)
+}
+
+fn breakdown_diffs(
+    left: &[ContextInspectorBreakdownItem],
+    right: &[ContextInspectorBreakdownItem],
+) -> Vec<ContextInspectorBreakdownDiff> {
+    let left_by_category =
+        left.iter().map(|item| (item.category.clone(), item)).collect::<BTreeMap<_, _>>();
+    let right_by_category =
+        right.iter().map(|item| (item.category.clone(), item)).collect::<BTreeMap<_, _>>();
+    let mut categories = BTreeSet::new();
+    categories.extend(left_by_category.keys().cloned());
+    categories.extend(right_by_category.keys().cloned());
+
+    categories
+        .into_iter()
+        .filter_map(|category| {
+            let left = left_by_category.get(category.as_str()).copied();
+            let right = right_by_category.get(category.as_str()).copied();
+            let diff = ContextInspectorBreakdownDiff {
+                category,
+                selected_segments: signed_usize_delta(
+                    right.map_or(0, |item| item.selected_segments),
+                    left.map_or(0, |item| item.selected_segments),
+                ),
+                pruned_segments: signed_usize_delta(
+                    right.map_or(0, |item| item.pruned_segments),
+                    left.map_or(0, |item| item.pruned_segments),
+                ),
+                selected_tokens: signed_u64_delta(
+                    right.map_or(0, |item| item.selected_tokens),
+                    left.map_or(0, |item| item.selected_tokens),
+                ),
+                reserved_tokens: signed_u64_delta(
+                    right.map_or(0, |item| item.reserved_tokens),
+                    left.map_or(0, |item| item.reserved_tokens),
+                ),
+                pruned_tokens: signed_u64_delta(
+                    right.map_or(0, |item| item.pruned_tokens),
+                    left.map_or(0, |item| item.pruned_tokens),
+                ),
+            };
+            (diff.selected_segments != 0
+                || diff.pruned_segments != 0
+                || diff.selected_tokens != 0
+                || diff.reserved_tokens != 0
+                || diff.pruned_tokens != 0)
+                .then_some(diff)
+        })
+        .collect()
+}
+
+fn pruned_item_map(
+    items: &[ContextInspectorPrunedItem],
+) -> BTreeMap<String, ContextInspectorPrunedItem> {
+    items.iter().map(|item| (pruned_item_key(item), item.clone())).collect()
+}
+
+fn pruned_item_key(item: &ContextInspectorPrunedItem) -> String {
+    format!("{}:{}:{}:{}", item.kind.as_str(), item.label, item.estimated_tokens, item.reason_code)
+}
+
+fn ratio_bps(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return u64::from(numerator > 0) * 10_000;
+    }
+    ((u128::from(numerator) * 10_000) / u128::from(denominator)).min(u128::from(u64::MAX)) as u64
+}
+
+fn signed_u64_delta(right: u64, left: u64) -> i64 {
+    signed_i128_delta(i128::from(right), i128::from(left))
+}
+
+fn signed_usize_delta(right: usize, left: usize) -> i64 {
+    signed_i128_delta(right as i128, left as i128)
+}
+
+fn signed_i128_delta(right: i128, left: i128) -> i64 {
+    (right - left).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// Builds the sorted, deduplicated reason-code list summarizing why the
@@ -1912,20 +2437,42 @@ async fn record_context_engine_plan(
             })?,
         })
         .await?;
-    runtime_state.record_context_assembly_trace(context_assembly_diagnostics_payload(&explain));
+    let previous_snapshot = latest_context_inspector_snapshot(runtime_state);
+    runtime_state.record_context_assembly_trace(
+        context_assembly_diagnostics_payload_with_previous(&explain, previous_snapshot.as_ref()),
+    );
     *tape_seq = tape_seq.saturating_add(1);
     Ok(())
 }
 
+fn latest_context_inspector_snapshot(
+    runtime_state: &GatewayRuntimeState,
+) -> Option<ContextInspectorSnapshot> {
+    runtime_state.context_assembly_traces_snapshot().into_iter().find_map(|trace| {
+        trace
+            .get("context_inspector")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ContextInspectorSnapshot>(value).ok())
+    })
+}
+
 /// Privacy-reduced trace for runtime diagnostics: segment previews and
-/// source refs are omitted entirely (only their redaction state is
+/// raw source refs are omitted entirely (only counts and hashed refs are
 /// disclosed) and the identity-bearing cache scope key is replaced by a
 /// non-reversible hash. Pinned by the diagnostics redaction tests.
-fn context_assembly_diagnostics_payload(explain: &ContextAssemblyTrace) -> Value {
-    json!({
+fn context_assembly_diagnostics_payload_with_previous(
+    explain: &ContextAssemblyTrace,
+    previous_snapshot: Option<&ContextInspectorSnapshot>,
+) -> Value {
+    let inspector = context_inspector_snapshot(explain);
+    let provider_input_snapshot_hash = inspector.provider_input_snapshot_hash.clone();
+    let diff_from_previous =
+        previous_snapshot.map(|previous| diff_context_inspector_snapshots(previous, &inspector));
+    let mut payload = json!({
         "schema_version": explain.schema_version,
         "trace_id": explain.trace_id.as_str(),
         "strategy": explain.strategy,
+        "provider_input_snapshot_hash": provider_input_snapshot_hash,
         "reason_codes": explain.reason_codes.as_slice(),
         "instruction": explain.instruction.as_ref().map(|instruction| json!({
             "version": instruction.version,
@@ -1978,7 +2525,23 @@ fn context_assembly_diagnostics_payload(explain: &ContextAssemblyTrace) -> Value
             "estimated_tokens": segment.estimated_tokens,
             "reason": segment.reason.as_str(),
         })).collect::<Vec<_>>(),
-    })
+        "context_inspector": inspector,
+    });
+    if let Some(diff) = diff_from_previous {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "context_inspector_diff_from_previous".to_owned(),
+                serde_json::to_value(diff)
+                    .unwrap_or_else(|_| json!({"error": "diff_encode_failed"})),
+            );
+        }
+    }
+    payload
+}
+
+#[cfg(test)]
+fn context_assembly_diagnostics_payload(explain: &ContextAssemblyTrace) -> Value {
+    context_assembly_diagnostics_payload_with_previous(explain, None)
 }
 
 /// Appends a segment unless its content is blank; empty segments would only
@@ -2263,8 +2826,10 @@ fn estimate_tokens(text: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_segments, context_assembly_diagnostics_payload, render_agent_plan_context_block,
-        resolve_provider_context_budget, select_strategy, ContextEngineStrategy, ContextSegment,
+        assemble_segments, context_assembly_diagnostics_payload, context_inspector_snapshot,
+        diff_context_inspector_snapshots, render_agent_plan_context_block,
+        resolve_provider_context_budget, select_strategy, ContextEngineStrategy,
+        ContextInspectorBreakdownItem, ContextInspectorSnapshot, ContextSegment,
         ContextSegmentKind, ContextSourceKind, ProviderBudgetProfile, ProviderContextBudget,
         SummaryQualityGateExplain,
     };
@@ -2335,6 +2900,17 @@ mod tests {
             ContextSegment::trusted(kind, label, content, priority, false, protected, None);
         segment.estimated_tokens = estimated_tokens;
         segment
+    }
+
+    fn breakdown<'a>(
+        snapshot: &'a ContextInspectorSnapshot,
+        category: &str,
+    ) -> &'a ContextInspectorBreakdownItem {
+        snapshot
+            .prompt_breakdown
+            .iter()
+            .find(|item| item.category == category)
+            .expect("breakdown category should be present")
     }
 
     fn budget(
@@ -2922,6 +3498,141 @@ mod tests {
                 .all(|segment| segment.get("preview_redacted").and_then(Value::as_bool).is_some()),
             "diagnostics payload should disclose only preview redaction state"
         );
+        assert!(
+            payload.pointer("/provider_input_snapshot_hash").and_then(Value::as_str).is_some(),
+            "diagnostics should expose a stable provider input snapshot hash"
+        );
+        assert!(
+            payload
+                .pointer("/context_inspector/window/available_tokens")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "diagnostics should expose support-safe context window usage"
+        );
+    }
+
+    #[test]
+    fn context_inspector_snapshot_groups_prompt_sources_and_window_usage() {
+        let mut provider_budget = budget(4_096, 768, 256, 128, true);
+        provider_budget.tool_schema_overhead_tokens = 96;
+        provider_budget.profile.tool_schema_overhead_tokens = 96;
+        let assembled = assemble_segments(
+            &[
+                segment(
+                    ContextSegmentKind::SystemInstructions,
+                    "system prompt",
+                    32,
+                    100,
+                    true,
+                    true,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::DeveloperInstructions,
+                    "developer policy",
+                    24,
+                    99,
+                    true,
+                    true,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::SessionTail,
+                    "session tail",
+                    40,
+                    70,
+                    false,
+                    false,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::SessionCompactionSummary,
+                    "compaction summary",
+                    30,
+                    80,
+                    true,
+                    false,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::MemoryRecall,
+                    "memory recall",
+                    50,
+                    60,
+                    false,
+                    false,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::ContextReferences,
+                    "workspace refs",
+                    34,
+                    90,
+                    false,
+                    true,
+                    None,
+                ),
+                segment(
+                    ContextSegmentKind::AttachmentRecall,
+                    "attachment",
+                    12,
+                    85,
+                    false,
+                    false,
+                    None,
+                ),
+                segment(ContextSegmentKind::UserInput, "question", 20, 100, false, true, None),
+            ],
+            ContextEngineStrategy::Summarizing,
+            provider_budget,
+            &RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "device".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            "session-1",
+            Some(SummaryQualityGateExplain {
+                verdict: "allow".to_owned(),
+                repeated_compaction_depth: 1,
+                contradiction_signals: 0,
+                reasons: vec!["summary_quality_clean".to_owned()],
+            }),
+        );
+
+        let snapshot = context_inspector_snapshot(&assembled.explain);
+
+        assert_eq!(snapshot.schema_version, 1);
+        assert!(!snapshot.snapshot_hash.is_empty());
+        assert!(!snapshot.provider_input_snapshot_hash.is_empty());
+        assert_eq!(
+            snapshot.window.input_budget_tokens,
+            assembled.explain.budget.input_budget_tokens
+        );
+        assert_eq!(
+            snapshot.window.available_tokens,
+            assembled
+                .explain
+                .budget
+                .input_budget_tokens
+                .saturating_sub(assembled.explain.budget.selected_tokens)
+        );
+        assert!(!snapshot.window.overflow_risk);
+        assert_eq!(breakdown(&snapshot, "system").selected_tokens, 32);
+        assert_eq!(breakdown(&snapshot, "developer").selected_tokens, 24);
+        assert_eq!(breakdown(&snapshot, "session_history").selected_tokens, 40);
+        assert_eq!(breakdown(&snapshot, "compaction_summary").selected_tokens, 30);
+        assert_eq!(breakdown(&snapshot, "memory_recall").selected_tokens, 50);
+        assert_eq!(breakdown(&snapshot, "workspace_context").selected_tokens, 34);
+        assert_eq!(breakdown(&snapshot, "attachments").selected_tokens, 12);
+        assert_eq!(breakdown(&snapshot, "tool_schemas").reserved_tokens, 96);
+        assert_eq!(breakdown(&snapshot, "current_turn").selected_segments, 1);
+        assert_eq!(snapshot.compaction.summary_verdict.as_deref(), Some("allow"));
+        assert_eq!(snapshot.compaction.selected_summary_segments, 1);
+        assert!(snapshot
+            .compaction
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "summary_quality_clean"));
     }
 
     #[test]
@@ -2969,6 +3680,79 @@ mod tests {
             memory_segment.preview.contains("<redacted>"),
             "redacted previews should show the redaction marker"
         );
+
+        let snapshot = context_inspector_snapshot(&assembled.explain);
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should encode");
+        assert!(
+            !encoded.contains("sk-test-secret-token"),
+            "context inspector snapshots must not leak memory recall secrets"
+        );
+        let memory_breakdown = breakdown(&snapshot, "memory_recall");
+        assert_eq!(memory_breakdown.source_ref_count, 1);
+        assert!(
+            memory_breakdown.source_ref_hashes.iter().all(|value| value.starts_with("ref_")),
+            "inspector should expose hashed source refs rather than raw source identifiers"
+        );
+        assert!(
+            !encoded.contains("segment:memory_recall"),
+            "support-safe inspector output must not expose raw source refs"
+        );
+    }
+
+    #[test]
+    fn context_inspector_diff_reports_pruned_context_changes() {
+        let segments = [
+            segment(ContextSegmentKind::MemoryRecall, "memory", 640, 40, false, false, None),
+            segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None),
+        ];
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let left = context_inspector_snapshot(
+            &assemble_segments(
+                &segments,
+                ContextEngineStrategy::Noop,
+                budget(4_096, 768, 256, 128, false),
+                &context,
+                "session-1",
+                None,
+            )
+            .explain,
+        );
+        let right = context_inspector_snapshot(
+            &assemble_segments(
+                &segments,
+                ContextEngineStrategy::CostAware,
+                budget(1_024, 512, 128, 128, false),
+                &context,
+                "session-1",
+                None,
+            )
+            .explain,
+        );
+
+        let diff = diff_context_inspector_snapshots(&left, &right);
+
+        assert_ne!(left.snapshot_hash, right.snapshot_hash);
+        assert_eq!(diff.window_delta.dropped_tokens, 640);
+        assert!(
+            diff.added_pruned_items.iter().any(|item| {
+                item.kind == ContextSegmentKind::MemoryRecall
+                    && item.reason_code == "dropped_by_budget"
+            }),
+            "diff should identify newly pruned memory with a reason code"
+        );
+        let memory_diff = diff
+            .changed_categories
+            .iter()
+            .find(|item| item.category == "memory_recall")
+            .expect("memory category should change");
+        assert_eq!(memory_diff.selected_segments, -1);
+        assert_eq!(memory_diff.pruned_segments, 1);
+        assert_eq!(memory_diff.selected_tokens, -640);
+        assert_eq!(memory_diff.pruned_tokens, 640);
     }
 
     #[test]
