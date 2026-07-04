@@ -2858,9 +2858,12 @@ fn build_support_bundle_runtime_snapshot(
     let admin_status = diagnostics.admin_status.as_ref();
     let runs_started = support_json_u64(admin_status, &["/counters/orchestrator_runs_started"]);
     let runs_completed = support_json_u64(admin_status, &["/counters/orchestrator_runs_completed"]);
+    let runs_failed = support_json_u64(admin_status, &["/counters/orchestrator_runs_failed"]);
     let runs_cancelled = support_json_u64(admin_status, &["/counters/orchestrator_runs_cancelled"]);
-    let active_runs_count =
-        runs_started.saturating_sub(runs_completed).saturating_sub(runs_cancelled);
+    let active_runs_count = runs_started
+        .saturating_sub(runs_completed)
+        .saturating_sub(runs_failed)
+        .saturating_sub(runs_cancelled);
     let queue_depth = support_json_u64(
         admin_status,
         &[

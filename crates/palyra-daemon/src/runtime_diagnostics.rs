@@ -521,6 +521,7 @@ pub(crate) fn build_agent_runtime_metrics_snapshot(
         "runs": {
             "started_total": status.counters.orchestrator_runs_started,
             "completed_total": status.counters.orchestrator_runs_completed,
+            "failed_total": status.counters.orchestrator_runs_failed,
             "cancelled_total": status.counters.orchestrator_runs_cancelled,
         },
         "provider": provider_metrics_json(provider_metrics),
@@ -623,11 +624,7 @@ pub(crate) fn build_daemon_lifecycle_snapshot_from_status(
     status: &GatewayStatusSnapshot,
     runtime_preview_payload: &Value,
 ) -> DaemonLifecycleSnapshot {
-    let active_runs = status
-        .counters
-        .orchestrator_runs_started
-        .saturating_sub(status.counters.orchestrator_runs_completed)
-        .saturating_sub(status.counters.orchestrator_runs_cancelled);
+    let active_runs = status.counters.active_orchestrator_runs();
     let pending_approvals = status
         .counters
         .approvals_tool_requested
@@ -873,6 +870,30 @@ pub(crate) fn render_prometheus_metrics(
         "palyra_agent_runs_completed_total",
         &[],
         status.counters.orchestrator_runs_completed,
+    );
+    push_help(
+        &mut output,
+        "palyra_agent_runs_failed_total",
+        "Total agent runs failed by the daemon.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_agent_runs_failed_total",
+        &[],
+        status.counters.orchestrator_runs_failed,
+    );
+    push_help(
+        &mut output,
+        "palyra_agent_runs_cancelled_total",
+        "Total agent runs cancelled by the daemon.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_agent_runs_cancelled_total",
+        &[],
+        status.counters.orchestrator_runs_cancelled,
     );
     push_help(
         &mut output,

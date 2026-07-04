@@ -768,11 +768,7 @@ fn normalized_reload_config(config: &crate::config::LoadedConfig) -> crate::conf
 }
 
 fn estimate_active_runs(state: &AppState) -> u64 {
-    let counters = state.runtime.counters.snapshot();
-    counters
-        .orchestrator_runs_started
-        .saturating_sub(counters.orchestrator_runs_completed)
-        .saturating_sub(counters.orchestrator_runs_cancelled)
+    state.runtime.counters.snapshot().active_orchestrator_runs()
 }
 
 fn memory_runtime_config_from_loaded(loaded: &crate::config::LoadedConfig) -> MemoryRuntimeConfig {

@@ -528,10 +528,7 @@ fn stale_runs_status(
     queue_depth: u64,
     now_unix_ms: i64,
 ) -> MaintenanceTaskStatus {
-    let active_runs = counters
-        .orchestrator_runs_started
-        .saturating_sub(counters.orchestrator_runs_completed)
-        .saturating_sub(counters.orchestrator_runs_cancelled);
+    let active_runs = counters.active_orchestrator_runs();
     let (state, severity, last_result, remediation) = if active_runs > 0 && queue_depth > 0 {
         (
             "watching",
@@ -563,6 +560,7 @@ fn stale_runs_status(
             "queue_depth": queue_depth,
             "runs_started": counters.orchestrator_runs_started,
             "runs_completed": counters.orchestrator_runs_completed,
+            "runs_failed": counters.orchestrator_runs_failed,
             "runs_cancelled": counters.orchestrator_runs_cancelled,
         }),
         remediation,

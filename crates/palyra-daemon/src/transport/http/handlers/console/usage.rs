@@ -2526,10 +2526,7 @@ fn build_operator_operations_overview_insight(
     plugins: &OperatorPluginInsight,
     cron: &OperatorCronInsight,
 ) -> OperatorOperationsOverviewInsight {
-    let stuck_runs = counters
-        .orchestrator_runs_started
-        .saturating_sub(counters.orchestrator_runs_completed)
-        .saturating_sub(counters.orchestrator_runs_cancelled);
+    let stuck_runs = counters.active_orchestrator_runs();
     let queue_backlog =
         counters.channel_router_queue_depth.saturating_add(runtime_decision.metrics.queue_depth);
     let provider_cooldowns = lease_snapshot.credential_feedback.len();

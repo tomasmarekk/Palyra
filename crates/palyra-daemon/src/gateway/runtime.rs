@@ -853,6 +853,7 @@ pub(crate) struct RuntimeCounters {
     journal_redacted_events: AtomicU64,
     orchestrator_runs_started: AtomicU64,
     orchestrator_runs_completed: AtomicU64,
+    orchestrator_runs_failed: AtomicU64,
     orchestrator_runs_cancelled: AtomicU64,
     orchestrator_cancel_requests: AtomicU64,
     orchestrator_tape_events: AtomicU64,
@@ -999,6 +1000,7 @@ pub struct CountersSnapshot {
     pub journal_redacted_events: u64,
     pub orchestrator_runs_started: u64,
     pub orchestrator_runs_completed: u64,
+    pub orchestrator_runs_failed: u64,
     pub orchestrator_runs_cancelled: u64,
     pub orchestrator_cancel_requests: u64,
     pub orchestrator_tape_events: u64,
@@ -1374,6 +1376,7 @@ impl RuntimeCounters {
             journal_redacted_events: self.journal_redacted_events.load(Ordering::Relaxed),
             orchestrator_runs_started: self.orchestrator_runs_started.load(Ordering::Relaxed),
             orchestrator_runs_completed: self.orchestrator_runs_completed.load(Ordering::Relaxed),
+            orchestrator_runs_failed: self.orchestrator_runs_failed.load(Ordering::Relaxed),
             orchestrator_runs_cancelled: self.orchestrator_runs_cancelled.load(Ordering::Relaxed),
             orchestrator_cancel_requests: self.orchestrator_cancel_requests.load(Ordering::Relaxed),
             orchestrator_tape_events: self.orchestrator_tape_events.load(Ordering::Relaxed),
@@ -1478,6 +1481,17 @@ impl RuntimeCounters {
             canvas_closed: self.canvas_closed.load(Ordering::Relaxed),
             canvas_denied: self.canvas_denied.load(Ordering::Relaxed),
         }
+    }
+}
+
+impl CountersSnapshot {
+    /// Returns runs that have started but have not reached any terminal state.
+    #[must_use]
+    pub(crate) fn active_orchestrator_runs(&self) -> u64 {
+        self.orchestrator_runs_started
+            .saturating_sub(self.orchestrator_runs_completed)
+            .saturating_sub(self.orchestrator_runs_failed)
+            .saturating_sub(self.orchestrator_runs_cancelled)
     }
 }
 
@@ -1765,6 +1779,7 @@ impl GatewayRuntimeState {
                 journal_redacted_events: AtomicU64::new(0),
                 orchestrator_runs_started: AtomicU64::new(0),
                 orchestrator_runs_completed: AtomicU64::new(0),
+                orchestrator_runs_failed: AtomicU64::new(0),
                 orchestrator_runs_cancelled: AtomicU64::new(0),
                 orchestrator_cancel_requests: AtomicU64::new(0),
                 orchestrator_tape_events: AtomicU64::new(0),
@@ -5325,10 +5340,19 @@ impl GatewayRuntimeState {
         })
         .await
         .map_err(|_| Status::internal("orchestrator run state worker panicked"))??;
-        if state == RunLifecycleState::Done {
-            self.counters.orchestrator_runs_completed.fetch_add(1, Ordering::Relaxed);
-        } else if state == RunLifecycleState::Cancelled {
-            self.counters.orchestrator_runs_cancelled.fetch_add(1, Ordering::Relaxed);
+        match state {
+            RunLifecycleState::Done => {
+                self.counters.orchestrator_runs_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            RunLifecycleState::Failed => {
+                self.counters.orchestrator_runs_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            RunLifecycleState::Cancelled => {
+                self.counters.orchestrator_runs_cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            RunLifecycleState::Pending
+            | RunLifecycleState::Accepted
+            | RunLifecycleState::InProgress => {}
         }
         self.orchestrator_run_notify.notify_waiters();
         Ok(())

@@ -6131,6 +6131,52 @@ async fn failed_run_finalization_cleans_run_owned_process_tracking() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_run_does_not_remain_lifecycle_active() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+
+    state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
+        .await
+        .expect("run should enter in_progress");
+    assert_eq!(state.counters.snapshot().active_orchestrator_runs(), 1);
+
+    state
+        .update_orchestrator_run_state(
+            run_id,
+            RunLifecycleState::Failed,
+            Some("provider error forced terminal failure".to_owned()),
+        )
+        .await
+        .expect("run should transition to failed");
+
+    let status = state.status_snapshot(
+        RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+        },
+        &GatewayAuthConfig {
+            require_auth: true,
+            admin_token: Some("token".to_owned()),
+            connector_token: None,
+            bound_principal: Some("user:ops".to_owned()),
+        },
+    );
+    let lifecycle = crate::runtime_diagnostics::build_daemon_lifecycle_snapshot_from_status(
+        &status,
+        &json!({}),
+    );
+
+    assert_eq!(status.counters.orchestrator_runs_started, 1);
+    assert_eq!(status.counters.orchestrator_runs_failed, 1);
+    assert_eq!(status.counters.active_orchestrator_runs(), 0);
+    assert_eq!(lifecycle.active_runs, 0);
+}
+
 #[test]
 fn tool_outcomes_record_and_forget_run_cleanup_resources() {
     let state = build_test_runtime_state(false);
