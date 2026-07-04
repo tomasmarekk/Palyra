@@ -352,7 +352,7 @@ fn default_browser_session_persistence_id(agent_session_id: &str) -> String {
     format!("{PREFIX}{}", hex::encode(digest.finalize()))
 }
 
-/// Confines `file://` navigation targets to the agent's workspace roots.
+/// Confines `file://` navigation targets to the run's browser-readable workspace roots.
 ///
 /// Non-file URLs pass through untouched. The target must canonicalize to a
 /// regular file inside one of the resolved workspace roots, which blocks
@@ -381,19 +381,27 @@ async fn validate_browser_file_url_workspace_scope(
         return Err("palyra.browser.navigate file URL target is not a regular file".to_owned());
     }
 
-    let canonical_roots = resolve_browser_configured_agent_workspace_roots(
-        runtime_state,
-        context,
-        BROWSER_NAVIGATE_TOOL_NAME,
+    let canonical_roots =
+        resolve_browser_read_workspace_roots(runtime_state, context, BROWSER_NAVIGATE_TOOL_NAME)
+            .await?;
+    validate_browser_file_url_path_scope(
+        url,
+        canonical_target.as_path(),
+        canonical_roots.as_slice(),
     )
-    .await?;
-    if canonical_file_path_is_inside_workspace_roots(canonical_target.as_path(), &canonical_roots) {
+}
+
+fn validate_browser_file_url_path_scope(
+    url: &str,
+    canonical_target: &Path,
+    canonical_roots: &[PathBuf],
+) -> Result<(), String> {
+    if canonical_file_path_is_inside_workspace_roots(canonical_target, canonical_roots) {
         return Ok(());
     }
-    Err(
-        "palyra.browser.navigate file:// URLs must point at a regular file inside the active agent workspace roots"
-            .to_owned(),
-    )
+    Err(format!(
+        "palyra.browser.navigate file:// URL {url} must point at a regular file inside the active agent or run-launch workspace roots"
+    ))
 }
 
 /// Converts a `file://` URL to a local path, rejecting embedded credentials
@@ -471,20 +479,27 @@ fn browser_windows_path_prefix_text(path: &Path) -> String {
     normalized
 }
 
-/// Resolves the agent for this execution context and returns only its
-/// configured workspace roots. Use this for browser read/navigation
-/// authorization; launch-context roots are intentionally excluded.
+/// Resolves the agent for this execution context plus run-launch workspace roots.
+/// Use this for browser read/navigation authorization where the CLI launch
+/// directory is an explicit workspace boundary for the current run.
 ///
 /// # Errors
 /// Returns a tool-facing message when agent resolution fails or the roots do
 /// not canonicalize to existing directories.
-async fn resolve_browser_configured_agent_workspace_roots(
+async fn resolve_browser_read_workspace_roots(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
     tool_name: &str,
 ) -> Result<Vec<PathBuf>, String> {
-    let (workspace_roots, _) =
+    let (workspace_roots, source) =
         browser_agent_workspace_root_inputs(runtime_state, context, tool_name).await?;
+    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        workspace_roots.as_slice(),
+        source,
+    )
+    .await;
     canonicalize_browser_workspace_roots(tool_name, workspace_roots.as_slice())
 }
 
@@ -567,12 +582,9 @@ async fn read_browser_upload_file(
     context: ToolRuntimeExecutionContext<'_>,
     file_path: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    let workspace_roots = resolve_browser_configured_agent_workspace_roots(
-        runtime_state,
-        context,
-        BROWSER_UPLOAD_TOOL_NAME,
-    )
-    .await?;
+    let workspace_roots =
+        resolve_browser_read_workspace_roots(runtime_state, context, BROWSER_UPLOAD_TOOL_NAME)
+            .await?;
     let path_env = run_launch_context_path_env(runtime_state, context.run_id).await;
     let user_owned_roots = browser_user_owned_os_roots();
     let canonical = resolve_browser_upload_path(
@@ -5292,9 +5304,10 @@ mod tests {
         default_browser_session_persistence_id, filter_browser_network_log_entries_since,
         normalize_browser_press_key_input, parse_browser_download_artifact_id,
         parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_workspace_relative_path,
-        write_browser_output_file, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
-        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        resolve_browser_upload_path, validate_browser_file_url_path_scope,
+        validate_browser_workspace_relative_path, write_browser_output_file,
+        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -6506,7 +6519,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_file_url_scope_does_not_treat_launch_workspace_as_agent_workspace() {
+    fn browser_file_url_scope_accepts_run_launch_workspace_root() {
         let temp = tempfile::tempdir().expect("tempdir should be created");
         let agent_workspace = temp.path().join("agent-workspace");
         let launch_workspace = temp.path().join("launch-workspace");
@@ -6527,16 +6540,21 @@ mod tests {
         let canonical_launch =
             launch_workspace.canonicalize().expect("launch workspace should canonicalize");
 
-        assert!(!canonical_file_path_is_inside_workspace_roots(
+        let denied = validate_browser_file_url_path_scope(
+            launch_url.as_str(),
             launch_target.as_path(),
-            std::slice::from_ref(&canonical_agent)
-        ));
+            std::slice::from_ref(&canonical_agent),
+        )
+        .expect_err("agent-only roots should still reject the launch sibling");
+        assert!(denied.contains("run-launch workspace roots"), "{denied}");
         assert!(
-            canonical_file_path_is_inside_workspace_roots(
+            validate_browser_file_url_path_scope(
+                launch_url.as_str(),
                 launch_target.as_path(),
                 &[canonical_launch, canonical_agent]
-            ),
-            "adding launch roots would widen browser file:// read scope"
+            )
+            .is_ok(),
+            "run-launch roots are an explicit browser file:// read boundary for the current run"
         );
     }
 }

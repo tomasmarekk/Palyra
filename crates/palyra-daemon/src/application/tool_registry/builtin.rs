@@ -1467,7 +1467,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "url",
                 json!({
                     "type":"string",
-                    "description":"Target URL. file:// URLs are supported only for regular files inside the active agent workspace roots; after opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
+                    "description":"Target URL. file:// URLs are supported only for regular files inside active agent workspace roots or run-launch workspace roots; after opening one, use palyra.browser.observe for DOM/text evidence instead of treating a filesystem read as browser validation."
                 }),
             ));
             properties.push((
@@ -1542,7 +1542,7 @@ fn browser_tool_schema(tool_name: &str) -> Value {
             ));
             properties.push((
                 "file_path",
-                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, approved user-owned OS roots, or explicit launch environment path prefix to upload. The daemon resolves and audits the path; protected system paths are denied."}),
+                json!({"type":"string","description":"Workspace-relative path, absolute path inside active agent workspace roots, run-launch workspace roots, approved user-owned OS roots, or explicit launch environment path prefix to upload. The daemon resolves and audits the path; protected system paths are denied."}),
             ));
             properties
                 .push(("capture_failure_screenshot", json!({"type":"boolean","default":true})));
