@@ -46,6 +46,10 @@ const BROWSER_SERVICE_STATE_DIR: &str = "browser-cli";
 const BROWSER_SERVICE_METADATA_FILE_NAME: &str = "browser-service.json";
 const BROWSER_SERVICE_STDOUT_LOG_FILE_NAME: &str = "browserd.stdout.log";
 const BROWSER_SERVICE_STDERR_LOG_FILE_NAME: &str = "browserd.stderr.log";
+const BROWSER_LIFECYCLE_MANAGED_RUNNING: &str = "managed_running";
+const BROWSER_LIFECYCLE_UNMANAGED_RUNNING: &str = "unmanaged_running";
+const BROWSER_LIFECYCLE_STALE_METADATA: &str = "stale_metadata";
+const BROWSER_LIFECYCLE_STOPPED: &str = "stopped";
 const BROWSERD_STATE_ENCRYPTION_KEY_ENV: &str = "PALYRA_BROWSERD_STATE_ENCRYPTION_KEY";
 const BROWSERD_AUTH_TOKEN_ENV: &str = "PALYRA_BROWSERD_AUTH_TOKEN";
 const BROWSERD_STATE_ENCRYPTION_KEY_LEN: usize = 32;
@@ -150,11 +154,14 @@ struct BrowserLifecyclePayload {
     action: String,
     running: bool,
     pid: Option<u32>,
+    lifecycle_state: &'static str,
+    lifecycle_owner: &'static str,
     grpc_url: String,
     health_base_url: String,
     stdout_log_path: Option<String>,
     stderr_log_path: Option<String>,
     detail: String,
+    cleanup_hint: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -187,6 +194,10 @@ struct BrowserStatusPayload {
     grpc_ok: bool,
     grpc_error: Option<String>,
     lifecycle_running: bool,
+    lifecycle_state: &'static str,
+    lifecycle_owner: &'static str,
+    lifecycle_detail: String,
+    cleanup_hint: Option<String>,
     lifecycle_metadata: Option<BrowserServiceMetadata>,
     config_path: Option<String>,
     policy: BrowserPolicySnapshot,
@@ -717,6 +728,8 @@ async fn run_browser_status(
     }
     let lifecycle_running =
         effective_browser_lifecycle_running(cli_lifecycle_running, browserd_reachable);
+    let lifecycle_state =
+        browser_lifecycle_state(metadata.as_ref(), cli_lifecycle_running, browserd_reachable);
     let mut warnings = browser_status_warnings(
         &policy,
         &control_plane,
@@ -746,6 +759,10 @@ async fn run_browser_status(
         grpc_ok: grpc_error.is_none(),
         grpc_error,
         lifecycle_running,
+        lifecycle_state,
+        lifecycle_owner: browser_lifecycle_owner(lifecycle_state),
+        lifecycle_detail: browser_lifecycle_detail(lifecycle_state),
+        cleanup_hint: browser_lifecycle_cleanup_hint(lifecycle_state),
         lifecycle_metadata: metadata,
         config_path: resolved.config_path,
         policy,
@@ -1012,15 +1029,19 @@ async fn run_browser_start(
         } else if !metadata_running {
             lifecycle_warnings.push(browser_stale_lifecycle_metadata_warning());
         }
+        let lifecycle_state = browser_lifecycle_state(metadata.as_ref(), metadata_running, true);
         let payload = BrowserLifecyclePayload {
             action: "start".to_owned(),
             running: true,
             pid: metadata.as_ref().and_then(|value| metadata_running.then_some(value.pid)),
+            lifecycle_state,
+            lifecycle_owner: browser_lifecycle_owner(lifecycle_state),
             grpc_url: resolved.connection.grpc_url,
             health_base_url: resolved.connection.health_base_url,
             stdout_log_path: metadata.as_ref().map(|value| value.stdout_log_path.clone()),
             stderr_log_path: metadata.as_ref().map(|value| value.stderr_log_path.clone()),
             detail: "browser service health and gRPC endpoints are already reachable".to_owned(),
+            cleanup_hint: browser_lifecycle_cleanup_hint(lifecycle_state),
             warnings: lifecycle_warnings,
         };
         let value =
@@ -1123,12 +1144,15 @@ async fn run_browser_start(
                         action: "start".to_owned(),
                         running: true,
                         pid: Some(metadata.pid),
+                        lifecycle_state: BROWSER_LIFECYCLE_MANAGED_RUNNING,
+                        lifecycle_owner: "cli",
                         grpc_url: resolved.connection.grpc_url,
                         health_base_url: resolved.connection.health_base_url,
                         stdout_log_path: Some(metadata.stdout_log_path),
                         stderr_log_path: Some(metadata.stderr_log_path),
                         detail: "browser service started and passed non-secret readiness checks"
                             .to_owned(),
+                        cleanup_hint: None,
                         warnings: lifecycle_warnings,
                     };
                     let value = serde_json::to_value(&payload)
@@ -1212,11 +1236,14 @@ async fn run_browser_stop(json: bool) -> Result<()> {
         action: "stop".to_owned(),
         running: false,
         pid: Some(metadata.pid),
+        lifecycle_state: BROWSER_LIFECYCLE_STOPPED,
+        lifecycle_owner: "none",
         grpc_url: metadata.grpc_url,
         health_base_url: metadata.health_base_url,
         stdout_log_path: Some(metadata.stdout_log_path),
         stderr_log_path: Some(metadata.stderr_log_path),
         detail: "browser service stopped and lifecycle metadata removed".to_owned(),
+        cleanup_hint: None,
         warnings: Vec::new(),
     };
     let value =
@@ -1331,6 +1358,12 @@ fn browser_stop_without_metadata_payload(
         action: "stop".to_owned(),
         running: browserd_reachable,
         pid: None,
+        lifecycle_state: if browserd_reachable {
+            BROWSER_LIFECYCLE_UNMANAGED_RUNNING
+        } else {
+            BROWSER_LIFECYCLE_STOPPED
+        },
+        lifecycle_owner: if browserd_reachable { "external" } else { "none" },
         grpc_url: connection.grpc_url.clone(),
         health_base_url: connection.health_base_url.clone(),
         stdout_log_path: None,
@@ -1342,6 +1375,7 @@ fn browser_stop_without_metadata_payload(
             "no CLI-managed browser service metadata found and configured browser endpoints are not reachable"
                 .to_owned()
         },
+        cleanup_hint: browserd_reachable.then(browser_unmanaged_lifecycle_cleanup_hint),
         warnings: browserd_reachable
             .then(|| browser_unmanaged_lifecycle_warning(health_reachable && grpc_reachable))
             .into_iter()
@@ -3721,6 +3755,70 @@ fn effective_browser_lifecycle_running(
     cli_lifecycle_running
 }
 
+fn browser_lifecycle_state(
+    metadata: Option<&BrowserServiceMetadata>,
+    cli_lifecycle_running: bool,
+    browserd_reachable: bool,
+) -> &'static str {
+    if cli_lifecycle_running {
+        BROWSER_LIFECYCLE_MANAGED_RUNNING
+    } else if metadata.is_some() {
+        BROWSER_LIFECYCLE_STALE_METADATA
+    } else if browserd_reachable {
+        BROWSER_LIFECYCLE_UNMANAGED_RUNNING
+    } else {
+        BROWSER_LIFECYCLE_STOPPED
+    }
+}
+
+fn browser_lifecycle_owner(lifecycle_state: &str) -> &'static str {
+    match lifecycle_state {
+        BROWSER_LIFECYCLE_MANAGED_RUNNING | BROWSER_LIFECYCLE_STALE_METADATA => "cli",
+        BROWSER_LIFECYCLE_UNMANAGED_RUNNING => "external",
+        _ => "none",
+    }
+}
+
+fn browser_lifecycle_detail(lifecycle_state: &str) -> String {
+    match lifecycle_state {
+        BROWSER_LIFECYCLE_MANAGED_RUNNING => {
+            "browser service is running under CLI lifecycle metadata".to_owned()
+        }
+        BROWSER_LIFECYCLE_STALE_METADATA => {
+            "CLI lifecycle metadata exists, but the recorded browserd pid is not running"
+                .to_owned()
+        }
+        BROWSER_LIFECYCLE_UNMANAGED_RUNNING => browser_unmanaged_lifecycle_detail(),
+        _ => {
+            "no CLI-managed browser service metadata found and configured browser endpoints are not reachable"
+                .to_owned()
+        }
+    }
+}
+
+fn browser_lifecycle_cleanup_hint(lifecycle_state: &str) -> Option<String> {
+    match lifecycle_state {
+        BROWSER_LIFECYCLE_UNMANAGED_RUNNING => Some(browser_unmanaged_lifecycle_cleanup_hint()),
+        BROWSER_LIFECYCLE_STALE_METADATA => Some(browser_stale_lifecycle_cleanup_hint()),
+        _ => None,
+    }
+}
+
+fn browser_unmanaged_lifecycle_detail() -> String {
+    "browserd endpoint is reachable, but this CLI state root has no browser-service.json lifecycle metadata"
+        .to_owned()
+}
+
+fn browser_unmanaged_lifecycle_cleanup_hint() -> String {
+    "Stop the owning supervisor/process or rerun with the PALYRA_STATE_ROOT/profile that started browserd; this CLI will not terminate unknown PIDs. After endpoints are free, run `palyra browser start --setup`."
+        .to_owned()
+}
+
+fn browser_stale_lifecycle_cleanup_hint() -> String {
+    "Stop the process currently owning the configured browser endpoints or remove stale lifecycle metadata after confirming the recorded pid is gone, then rerun `palyra browser start --setup`."
+        .to_owned()
+}
+
 fn browser_unmanaged_lifecycle_warning(browserd_healthy: bool) -> String {
     let readiness = if browserd_healthy {
         "health and gRPC endpoints are reachable"
@@ -4454,14 +4552,20 @@ fn browser_snapshot_emits_json_to_stdout(mode: BrowserOutputMode, output_written
 
 fn format_browser_status_text(payload: &BrowserStatusPayload) -> String {
     let mut lines = vec![format!(
-        "browser.status service={} health_ok={} grpc_ok={} lifecycle_running={} grpc_url={} health_url={}",
+        "browser.status service={} health_ok={} grpc_ok={} lifecycle_running={} lifecycle_state={} lifecycle_owner={} grpc_url={} health_url={}",
         payload.service,
         payload.health_ok,
         payload.grpc_ok,
         payload.lifecycle_running,
+        payload.lifecycle_state,
+        payload.lifecycle_owner,
         payload.grpc_url,
         payload.health_base_url,
     )];
+    lines.push(format!("browser.lifecycle_detail {}", payload.lifecycle_detail));
+    if let Some(cleanup_hint) = payload.cleanup_hint.as_deref() {
+        lines.push(format!("browser.cleanup_hint {cleanup_hint}"));
+    }
     lines.push(format!(
         "browser.policy enabled={} auth_token_configured={} browser_tools_allowlisted={} missing_browser_tools={} endpoint={} connect_timeout_ms={} request_timeout_ms={} max_screenshot_bytes={} max_title_bytes={}",
         payload.policy.configured_enabled,
@@ -4548,16 +4652,22 @@ fn format_browser_setup_text(payload: &BrowserSetupPayload) -> String {
 
 fn format_browser_lifecycle_text(payload: &BrowserLifecyclePayload) -> String {
     let mut text = format!(
-        "browser.{} running={} pid={} grpc_url={} health_url={} stdout_log={} stderr_log={} detail={}",
+        "browser.{} running={} pid={} lifecycle_state={} lifecycle_owner={} grpc_url={} health_url={} stdout_log={} stderr_log={} detail={}",
         payload.action,
         payload.running,
         payload.pid.map(|value| value.to_string()).unwrap_or_else(|| "-".to_owned()),
+        payload.lifecycle_state,
+        payload.lifecycle_owner,
         payload.grpc_url,
         payload.health_base_url,
         payload.stdout_log_path.as_deref().unwrap_or("-"),
         payload.stderr_log_path.as_deref().unwrap_or("-"),
         payload.detail,
     );
+    if let Some(cleanup_hint) = payload.cleanup_hint.as_deref() {
+        text.push('\n');
+        text.push_str(format!("browser.cleanup_hint {cleanup_hint}").as_str());
+    }
     for warning in &payload.warnings {
         text.push('\n');
         text.push_str(format!("browser.warning {warning}").as_str());
@@ -5111,7 +5221,8 @@ mod tests {
     use super::{
         browser_command_payload_should_emit, browser_command_policy_action,
         browser_control_plane_request_timeout, browser_failure_detail,
-        browser_identifier_json_value, browser_open_cleanup_status_text, browser_open_output_value,
+        browser_identifier_json_value, browser_lifecycle_cleanup_hint, browser_lifecycle_owner,
+        browser_lifecycle_state, browser_open_cleanup_status_text, browser_open_output_value,
         browser_service_auth_token_command, browser_service_enable_command,
         browser_service_stop_complete, browser_service_stop_pending_reasons,
         browser_session_handle_text, browser_setup_gateway_reload_warning,
@@ -6069,6 +6180,17 @@ mod tests {
             !effective_browser_lifecycle_running(false, true),
             "reachable unmanaged browserd must not be rendered as CLI lifecycle-running"
         );
+        let lifecycle_state = browser_lifecycle_state(None, false, true);
+        assert_eq!(lifecycle_state, "unmanaged_running");
+        assert_eq!(browser_lifecycle_owner(lifecycle_state), "external");
+        assert!(
+            browser_lifecycle_cleanup_hint(lifecycle_state).as_deref().is_some_and(|hint| {
+                hint.contains("owning supervisor/process")
+                    && hint.contains("PALYRA_STATE_ROOT/profile")
+                    && hint.contains("will not terminate unknown PIDs")
+            }),
+            "unmanaged browserd should expose a safe cleanup hint"
+        );
 
         let warnings = browser_status_warnings(
             &policy,
@@ -6113,6 +6235,17 @@ mod tests {
                 .any(|warning| warning.contains("no CLI lifecycle metadata")),
             "partially reachable unmanaged browserd should still produce a lifecycle warning: {degraded_warnings:?}"
         );
+
+        let stale_state =
+            browser_lifecycle_state(Some(&browser_metadata_with_token()), false, true);
+        assert_eq!(stale_state, "stale_metadata");
+        assert_eq!(browser_lifecycle_owner(stale_state), "cli");
+        assert!(
+            browser_lifecycle_cleanup_hint(stale_state)
+                .as_deref()
+                .is_some_and(|hint| hint.contains("stale lifecycle metadata")),
+            "stale metadata should expose a distinct cleanup hint"
+        );
     }
 
     #[test]
@@ -6122,9 +6255,18 @@ mod tests {
 
         assert!(payload.running, "reachable endpoint should not be reported as stopped");
         assert_eq!(payload.pid, None);
+        assert_eq!(payload.lifecycle_state, "unmanaged_running");
+        assert_eq!(payload.lifecycle_owner, "external");
         assert_eq!(payload.grpc_url, connection.grpc_url);
         assert_eq!(payload.health_base_url, connection.health_base_url);
         assert!(payload.detail.contains("no process was stopped"));
+        assert!(
+            payload.cleanup_hint.as_deref().is_some_and(|hint| {
+                hint.contains("owning supervisor/process")
+                    && hint.contains("will not terminate unknown PIDs")
+            }),
+            "unmanaged stop payload should expose a safe cleanup hint: {payload:?}"
+        );
         assert!(
             payload.warnings.iter().any(|warning| {
                 warning.contains("no CLI lifecycle metadata")
