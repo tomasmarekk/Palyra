@@ -10,7 +10,7 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use palyra_common::{
     runtime_contracts::{
-        resolve_run_lifecycle_hook_decisions, RunLifecycleHookDecision,
+        resolve_run_lifecycle_hook_decisions, AgentHookKind, RunLifecycleHookDecision,
         RunLifecycleHookDecisionKind, RunLifecycleHookPhase, RunLifecycleHookResolution,
     },
     versioned_json::{
@@ -348,6 +348,9 @@ pub(crate) fn delete_hook_binding(
 /// Fails for event names outside the supported gateway, skill, and run-lifecycle set.
 pub(crate) fn normalize_hook_event(raw: &str) -> Result<&'static str> {
     let normalized = raw.trim().to_ascii_lowercase();
+    if let Some(kind) = AgentHookKind::parse(normalized.as_str()) {
+        return Ok(kind.as_str());
+    }
     if let Some(phase) = RunLifecycleHookPhase::parse_hook_event(normalized.as_str()) {
         return Ok(hook_event_kind_for_lifecycle_phase(phase).as_str());
     }
@@ -1092,6 +1095,15 @@ mod tests {
         assert_eq!(
             normalize_hook_event("approval:requested").expect("approval alias should normalize"),
             "approval_requested"
+        );
+        assert_eq!(
+            normalize_hook_event("before_prompt_build").expect("agent hook should normalize"),
+            "before_prompt_build"
+        );
+        assert_eq!(
+            normalize_hook_event("tool_result_model_feed")
+                .expect("tool result middleware hook should normalize"),
+            "tool_result_model_feed"
         );
     }
 

@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v3";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v4";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,7 +121,7 @@ pub fn public_runtime_contract_snapshot() -> Value {
     json!({
         "schema_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         "snapshot_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
-        "changelog_note": "Adds the canonical public runtime event taxonomy for run, model, tool, approval, verification, and heartbeat streams.",
+        "changelog_note": "Adds agent hook, harness, and tool-result middleware contracts to the public runtime snapshot.",
         "compatibility_policy": compatibility_policy_snapshot(),
         "public_runtime_events": public_runtime_event_taxonomy_snapshot(),
         "runtime_enums": [
@@ -164,6 +164,8 @@ pub fn public_runtime_contract_snapshot() -> Value {
                 RunLifecycleHookDecisionKind::wire_contract_values(),
             ),
         ],
+        "agent_hooks": agent_hook_contract_snapshot(),
+        "agent_harness": agent_harness_contract_snapshot(),
         "tool_result_projection": {
             "snapshot_version": "runtime-contracts.tool_result_projection.v1",
             "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
@@ -199,6 +201,7 @@ pub fn public_runtime_contract_snapshot() -> Value {
                     ArtifactRetentionDisposition::wire_contract_values(),
                 ),
             ],
+            "middleware": tool_result_middleware_contract_snapshot(),
         },
         "realtime_protocol": {
             "snapshot_version": "runtime-contracts.realtime.v1",
@@ -399,6 +402,92 @@ fn public_runtime_event_taxonomy_snapshot() -> Value {
         "redaction_postures": PublicRuntimeEventRedactionPosture::wire_contract_values(),
         "journal_mappings": PublicRuntimeEventJournalMapping::wire_contract_values(),
         "events": PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
+    })
+}
+
+fn agent_hook_contract_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.agent_hooks.v1",
+        "changelog_note": "Agent hooks define stable hook names, default redaction, capability grants, timeouts, priorities, and decision shapes.",
+        "kinds": enum_contract_snapshot(
+            "AgentHookKind",
+            "runtime-contracts.agent_hook_kind.v1",
+            "Agent hook names are public plugin and harness extension points.",
+            AgentHookKind::wire_contract_values(),
+        ),
+        "decision_authority": enum_contract_snapshot(
+            "AgentHookDecisionAuthority",
+            "runtime-contracts.agent_hook_decision_authority.v1",
+            "Hook authority distinguishes observe-only hooks from hooks that may affect control flow.",
+            AgentHookDecisionAuthority::wire_contract_values(),
+        ),
+        "capability_grants": enum_contract_snapshot(
+            "AgentHookCapabilityGrant",
+            "runtime-contracts.agent_hook_capability_grant.v1",
+            "Hook capability grants are host-issued and plugins cannot self-escalate to raw or mutating data.",
+            AgentHookCapabilityGrant::wire_contract_values(),
+        ),
+        "redaction_postures": enum_contract_snapshot(
+            "AgentHookRedactionPosture",
+            "runtime-contracts.agent_hook_redaction_posture.v1",
+            "Hook redaction postures describe the strongest payload view available without additional trusted grants.",
+            AgentHookRedactionPosture::wire_contract_values(),
+        ),
+        "decision_kinds": enum_contract_snapshot(
+            "AgentHookDecisionKind",
+            "runtime-contracts.agent_hook_decision_kind.v1",
+            "Agent hook decision names cover run gates, delivery rewrites, and tool-result middleware outcomes.",
+            AgentHookDecisionKind::wire_contract_values(),
+        ),
+        "descriptors": AGENT_HOOK_DESCRIPTORS,
+    })
+}
+
+fn agent_harness_contract_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.agent_harness.v1",
+        "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, and journal writes host-owned.",
+        "selection_modes": enum_contract_snapshot(
+            "AgentHarnessSelectionMode",
+            "runtime-contracts.agent_harness_selection_mode.v1",
+            "Harness selection modes are policy-visible and must not silently fall back for mutating attempts.",
+            AgentHarnessSelectionMode::wire_contract_values(),
+        ),
+        "support_outcomes": enum_contract_snapshot(
+            "AgentHarnessSupportOutcome",
+            "runtime-contracts.agent_harness_support_outcome.v1",
+            "Harness support outcomes are audited before an attempt is routed.",
+            AgentHarnessSupportOutcome::wire_contract_values(),
+        ),
+        "callback_kinds": enum_contract_snapshot(
+            "AgentHarnessCallbackKind",
+            "runtime-contracts.agent_harness_callback_kind.v1",
+            "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
+            AgentHarnessCallbackKind::wire_contract_values(),
+        ),
+        "prepared_attempt_schema": PREPARED_AGENT_ATTEMPT_SCHEMA,
+    })
+}
+
+fn tool_result_middleware_contract_snapshot() -> Value {
+    json!({
+        "snapshot_version": "runtime-contracts.tool_result_middleware.v1",
+        "changelog_note": "Runtime-neutral tool-result middleware may only preserve or downgrade model visibility while keeping audit artifacts host-owned.",
+        "phases": [
+            AgentHookKind::BeforeToolResultProject,
+            AgentHookKind::ToolResultProjected,
+            AgentHookKind::ToolResultPersist,
+            AgentHookKind::ToolResultModelFeed,
+        ],
+        "visibility_order_low_to_high": [
+            ToolResultVisibility::AuditArtifact,
+            ToolResultVisibility::RedactedPreview,
+            ToolResultVisibility::ModelSummary,
+            ToolResultVisibility::ModelInline,
+        ],
+        "allowed_decisions": TOOL_RESULT_MIDDLEWARE_DECISIONS,
+        "host_policy_authoritative": true,
+        "visibility_escalation_allowed": false,
     })
 }
 
@@ -1296,6 +1385,619 @@ impl RunLifecycleHookDecisionKind {
 }
 
 runtime_contract_enum! {
+    /// Stable hook extension points exposed to plugins, harnesses, and diagnostics.
+    pub enum AgentHookKind {
+        GatewayStartup => "gateway:startup",
+        SkillEnabled => "skill:enabled",
+        SkillQuarantined => "skill:quarantined",
+        SkillDisabled => "skill:disabled",
+        RunStarted => "run_started" | "run:started",
+        RunFinished => "run_finished" | "run:finished",
+        BeforeContextBuild => "before_context_build" | "context:before_build",
+        AfterContextBuild => "after_context_build" | "context:after_build",
+        BeforeToolPolicy => "before_tool_policy" | "tool:before_policy",
+        AfterToolResult => "after_tool_result" | "tool:after_result",
+        MemoryCandidateCreated => "memory_candidate_created" | "memory:candidate_created",
+        LearningCandidateReviewed => "learning_candidate_reviewed" | "learning:candidate_reviewed",
+        ArtifactCreated => "artifact_created" | "artifact:created",
+        ApprovalRequested => "approval_requested" | "approval:requested",
+        RunBeforeRun => "run:before_run" | "before_run",
+        RunBeforeTool => "run:before_tool" | "before_tool",
+        RunAfterTool => "run:after_tool" | "after_tool",
+        RunBeforeDelivery => "run:before_delivery" | "before_delivery",
+        RunAfterRun => "run:after_run" | "after_run",
+        BeforeModelResolve => "before_model_resolve",
+        BeforePromptBuild => "before_prompt_build",
+        BeforeAgentRun => "before_agent_run",
+        BeforeAgentReply => "before_agent_reply",
+        BeforeAgentFinalize => "before_agent_finalize",
+        AgentEnd => "agent_end",
+        ModelCallStarted => "model_call_started",
+        ModelCallEnded => "model_call_ended",
+        BeforeToolCall => "before_tool_call",
+        AfterToolCall => "after_tool_call",
+        ToolResultPersist => "tool_result_persist",
+        InboundClaim => "inbound_claim",
+        BeforeMessageWrite => "before_message_write",
+        MessageSending => "message_sending",
+        ReplyPayloadSending => "reply_payload_sending",
+        ReplyDispatch => "reply_dispatch",
+        SessionStart => "session_start",
+        SessionEnd => "session_end",
+        BeforeReset => "before_reset",
+        BeforeCompaction => "before_compaction",
+        AfterCompaction => "after_compaction",
+        SubagentSpawned => "subagent_spawned",
+        SubagentEnded => "subagent_ended",
+        BeforeToolResultProject => "before_tool_result_project",
+        ToolResultProjected => "tool_result_projected",
+        ToolResultModelFeed => "tool_result_model_feed"
+    }
+}
+
+impl AgentHookKind {
+    /// Returns `true` for the runtime-neutral tool-result middleware phases.
+    #[must_use]
+    pub const fn is_tool_result_middleware(self) -> bool {
+        matches!(
+            self,
+            Self::BeforeToolResultProject
+                | Self::ToolResultProjected
+                | Self::ToolResultPersist
+                | Self::ToolResultModelFeed
+        )
+    }
+
+    /// Returns the public descriptor for this hook kind, when the kind is part of the agent
+    /// hook surface rather than the legacy gateway/skill compatibility event set.
+    #[must_use]
+    pub fn descriptor(self) -> Option<&'static AgentHookDescriptor> {
+        agent_hook_descriptor(self)
+    }
+}
+
+runtime_contract_enum! {
+    /// Whether a hook is observe-only or may return host-interpreted decisions.
+    pub enum AgentHookDecisionAuthority {
+        ObservationOnly => "observation_only",
+        DecisionCapable => "decision_capable"
+    }
+}
+
+runtime_contract_enum! {
+    /// Capability grants the host may issue to a hook invocation.
+    pub enum AgentHookCapabilityGrant {
+        MetadataOnly => "metadata_only",
+        RedactedPayload => "redacted_payload",
+        RawPromptTrusted => "raw_prompt_trusted",
+        DeliveryMutation => "delivery_mutation",
+        ToolResultTransform => "tool_result_transform",
+        ExecEnvResolve => "exec_env_resolve"
+    }
+}
+
+runtime_contract_enum! {
+    /// Default payload posture used before any trusted capability grant is applied.
+    pub enum AgentHookRedactionPosture {
+        MetadataOnly => "metadata_only",
+        RedactedPayload => "redacted_payload",
+        RedactedSummary => "redacted_summary",
+        TrustedRawPayload => "trusted_raw_payload"
+    }
+}
+
+runtime_contract_enum! {
+    /// Decisions a hook or middleware phase may ask the host to apply.
+    pub enum AgentHookDecisionKind {
+        Continue => "continue",
+        Annotate => "annotate",
+        RequestApproval => "request_approval",
+        Block => "block",
+        TransformPreview => "transform_preview",
+        ReplaceSummary => "replace_summary",
+        AttachArtifact => "attach_artifact",
+        RedactFields => "redact_fields",
+        DowngradeVisibility => "downgrade_visibility",
+        RequestFullReadApproval => "request_full_read_approval",
+        FailPersistence => "fail_persistence",
+        AuditOnly => "audit_only"
+    }
+}
+
+impl AgentHookDecisionKind {
+    /// Returns `true` when the decision can stop or fail the guarded operation.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::RequestApproval
+                | Self::Block
+                | Self::RequestFullReadApproval
+                | Self::FailPersistence
+        )
+    }
+
+    /// Returns `true` when the decision asks the host to mutate payload visible to another
+    /// runtime stage.
+    #[must_use]
+    pub const fn mutates_payload(self) -> bool {
+        matches!(
+            self,
+            Self::TransformPreview
+                | Self::ReplaceSummary
+                | Self::AttachArtifact
+                | Self::RedactFields
+                | Self::DowngradeVisibility
+        )
+    }
+}
+
+/// Public descriptor for one agent hook kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AgentHookDescriptor {
+    /// Hook kind being described.
+    pub kind: AgentHookKind,
+    /// Whether the hook may return host-interpreted decisions.
+    pub decision_authority: AgentHookDecisionAuthority,
+    /// Default host-side timeout in milliseconds.
+    pub default_timeout_ms: u64,
+    /// Conflict-resolution priority; higher values are considered first.
+    pub priority: u16,
+    /// Default payload posture before additional trusted grants.
+    pub redaction: AgentHookRedactionPosture,
+    /// Capability grants the host may issue for this hook kind.
+    pub allowed_capability_grants: &'static [AgentHookCapabilityGrant],
+    /// Decisions accepted from this hook kind.
+    pub allowed_decisions: &'static [AgentHookDecisionKind],
+    /// Whether timeout or panic should fail the guarded runtime stage closed.
+    pub fail_closed: bool,
+    /// Stable audit event emitted for hook invocation or denial.
+    pub audit_event: &'static str,
+    /// Stable metrics bucket for hook duration.
+    pub metrics_name: &'static str,
+}
+
+impl AgentHookDescriptor {
+    /// Deterministic decision the host records when this hook times out.
+    #[must_use]
+    pub const fn timeout_decision(self) -> AgentHookDecisionKind {
+        if self.fail_closed {
+            if self.kind.is_tool_result_middleware() {
+                AgentHookDecisionKind::FailPersistence
+            } else {
+                AgentHookDecisionKind::Block
+            }
+        } else {
+            AgentHookDecisionKind::AuditOnly
+        }
+    }
+
+    /// Returns `true` when all requested grants are within the descriptor's allowlist.
+    #[must_use]
+    pub fn permits_capability_grants(&self, requested: &[AgentHookCapabilityGrant]) -> bool {
+        requested.iter().all(|grant| self.allowed_capability_grants.contains(grant))
+    }
+
+    /// Returns `true` when the hook accepts this decision kind.
+    #[must_use]
+    pub fn permits_decision(&self, decision: AgentHookDecisionKind) -> bool {
+        self.allowed_decisions.contains(&decision)
+    }
+}
+
+const NO_HOOK_DECISIONS: &[AgentHookDecisionKind] = &[];
+const RUN_GATE_HOOK_DECISIONS: &[AgentHookDecisionKind] = &[
+    AgentHookDecisionKind::Continue,
+    AgentHookDecisionKind::Annotate,
+    AgentHookDecisionKind::RequestApproval,
+    AgentHookDecisionKind::Block,
+];
+const DELIVERY_HOOK_DECISIONS: &[AgentHookDecisionKind] = &[
+    AgentHookDecisionKind::Continue,
+    AgentHookDecisionKind::Annotate,
+    AgentHookDecisionKind::RequestApproval,
+    AgentHookDecisionKind::Block,
+    AgentHookDecisionKind::TransformPreview,
+];
+/// Decisions accepted by the tool-result middleware pipeline.
+pub const TOOL_RESULT_MIDDLEWARE_DECISIONS: &[AgentHookDecisionKind] = &[
+    AgentHookDecisionKind::Continue,
+    AgentHookDecisionKind::ReplaceSummary,
+    AgentHookDecisionKind::AttachArtifact,
+    AgentHookDecisionKind::RedactFields,
+    AgentHookDecisionKind::DowngradeVisibility,
+    AgentHookDecisionKind::RequestFullReadApproval,
+    AgentHookDecisionKind::FailPersistence,
+    AgentHookDecisionKind::AuditOnly,
+];
+
+const METADATA_HOOK_GRANTS: &[AgentHookCapabilityGrant] = &[AgentHookCapabilityGrant::MetadataOnly];
+const REDACTED_HOOK_GRANTS: &[AgentHookCapabilityGrant] =
+    &[AgentHookCapabilityGrant::MetadataOnly, AgentHookCapabilityGrant::RedactedPayload];
+const PROMPT_HOOK_GRANTS: &[AgentHookCapabilityGrant] = &[
+    AgentHookCapabilityGrant::MetadataOnly,
+    AgentHookCapabilityGrant::RedactedPayload,
+    AgentHookCapabilityGrant::RawPromptTrusted,
+];
+const DELIVERY_HOOK_GRANTS: &[AgentHookCapabilityGrant] = &[
+    AgentHookCapabilityGrant::MetadataOnly,
+    AgentHookCapabilityGrant::RedactedPayload,
+    AgentHookCapabilityGrant::DeliveryMutation,
+];
+const TOOL_RESULT_HOOK_GRANTS: &[AgentHookCapabilityGrant] = &[
+    AgentHookCapabilityGrant::MetadataOnly,
+    AgentHookCapabilityGrant::RedactedPayload,
+    AgentHookCapabilityGrant::ToolResultTransform,
+];
+const EXEC_ENV_HOOK_GRANTS: &[AgentHookCapabilityGrant] = &[
+    AgentHookCapabilityGrant::MetadataOnly,
+    AgentHookCapabilityGrant::RedactedPayload,
+    AgentHookCapabilityGrant::ExecEnvResolve,
+];
+
+const fn observe_hook(
+    kind: AgentHookKind,
+    redaction: AgentHookRedactionPosture,
+    priority: u16,
+    grants: &'static [AgentHookCapabilityGrant],
+) -> AgentHookDescriptor {
+    AgentHookDescriptor {
+        kind,
+        decision_authority: AgentHookDecisionAuthority::ObservationOnly,
+        default_timeout_ms: 500,
+        priority,
+        redaction,
+        allowed_capability_grants: grants,
+        allowed_decisions: NO_HOOK_DECISIONS,
+        fail_closed: false,
+        audit_event: "hook.observed",
+        metrics_name: "hook.duration",
+    }
+}
+
+const fn decision_hook(
+    kind: AgentHookKind,
+    redaction: AgentHookRedactionPosture,
+    priority: u16,
+    grants: &'static [AgentHookCapabilityGrant],
+    decisions: &'static [AgentHookDecisionKind],
+    fail_closed: bool,
+) -> AgentHookDescriptor {
+    AgentHookDescriptor {
+        kind,
+        decision_authority: AgentHookDecisionAuthority::DecisionCapable,
+        default_timeout_ms: 1_000,
+        priority,
+        redaction,
+        allowed_capability_grants: grants,
+        allowed_decisions: decisions,
+        fail_closed,
+        audit_event: "hook.decision",
+        metrics_name: "hook.duration",
+    }
+}
+
+/// Agent hook descriptors pinned by the public runtime contract snapshot.
+pub const AGENT_HOOK_DESCRIPTORS: &[AgentHookDescriptor] = &[
+    decision_hook(
+        AgentHookKind::RunBeforeRun,
+        AgentHookRedactionPosture::MetadataOnly,
+        800,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::RunBeforeTool,
+        AgentHookRedactionPosture::RedactedPayload,
+        850,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::RunAfterTool,
+        AgentHookRedactionPosture::RedactedPayload,
+        500,
+        REDACTED_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::RunBeforeDelivery,
+        AgentHookRedactionPosture::RedactedPayload,
+        850,
+        DELIVERY_HOOK_GRANTS,
+        DELIVERY_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::RunAfterRun,
+        AgentHookRedactionPosture::MetadataOnly,
+        400,
+        METADATA_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeModelResolve,
+        AgentHookRedactionPosture::MetadataOnly,
+        650,
+        EXEC_ENV_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::BeforePromptBuild,
+        AgentHookRedactionPosture::MetadataOnly,
+        700,
+        PROMPT_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeAgentRun,
+        AgentHookRedactionPosture::RedactedSummary,
+        760,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::BeforeAgentReply,
+        AgentHookRedactionPosture::RedactedPayload,
+        500,
+        REDACTED_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeAgentFinalize,
+        AgentHookRedactionPosture::RedactedSummary,
+        700,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::AgentEnd,
+        AgentHookRedactionPosture::MetadataOnly,
+        300,
+        METADATA_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::ModelCallStarted,
+        AgentHookRedactionPosture::MetadataOnly,
+        300,
+        METADATA_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::ModelCallEnded,
+        AgentHookRedactionPosture::RedactedSummary,
+        300,
+        REDACTED_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeToolCall,
+        AgentHookRedactionPosture::RedactedPayload,
+        820,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::AfterToolCall,
+        AgentHookRedactionPosture::RedactedPayload,
+        400,
+        REDACTED_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::InboundClaim,
+        AgentHookRedactionPosture::MetadataOnly,
+        900,
+        METADATA_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeMessageWrite,
+        AgentHookRedactionPosture::RedactedPayload,
+        760,
+        DELIVERY_HOOK_GRANTS,
+        DELIVERY_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::MessageSending,
+        AgentHookRedactionPosture::RedactedPayload,
+        760,
+        DELIVERY_HOOK_GRANTS,
+        DELIVERY_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::ReplyPayloadSending,
+        AgentHookRedactionPosture::RedactedPayload,
+        760,
+        DELIVERY_HOOK_GRANTS,
+        DELIVERY_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::ReplyDispatch,
+        AgentHookRedactionPosture::MetadataOnly,
+        400,
+        METADATA_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::SessionStart,
+        AgentHookRedactionPosture::MetadataOnly,
+        350,
+        METADATA_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::SessionEnd,
+        AgentHookRedactionPosture::MetadataOnly,
+        350,
+        METADATA_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeReset,
+        AgentHookRedactionPosture::MetadataOnly,
+        800,
+        METADATA_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeCompaction,
+        AgentHookRedactionPosture::RedactedSummary,
+        650,
+        REDACTED_HOOK_GRANTS,
+        RUN_GATE_HOOK_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::AfterCompaction,
+        AgentHookRedactionPosture::RedactedSummary,
+        350,
+        REDACTED_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::SubagentSpawned,
+        AgentHookRedactionPosture::MetadataOnly,
+        350,
+        METADATA_HOOK_GRANTS,
+    ),
+    observe_hook(
+        AgentHookKind::SubagentEnded,
+        AgentHookRedactionPosture::RedactedSummary,
+        350,
+        REDACTED_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::BeforeToolResultProject,
+        AgentHookRedactionPosture::RedactedPayload,
+        780,
+        TOOL_RESULT_HOOK_GRANTS,
+        TOOL_RESULT_MIDDLEWARE_DECISIONS,
+        true,
+    ),
+    observe_hook(
+        AgentHookKind::ToolResultProjected,
+        AgentHookRedactionPosture::RedactedSummary,
+        420,
+        TOOL_RESULT_HOOK_GRANTS,
+    ),
+    decision_hook(
+        AgentHookKind::ToolResultPersist,
+        AgentHookRedactionPosture::RedactedPayload,
+        780,
+        TOOL_RESULT_HOOK_GRANTS,
+        TOOL_RESULT_MIDDLEWARE_DECISIONS,
+        true,
+    ),
+    decision_hook(
+        AgentHookKind::ToolResultModelFeed,
+        AgentHookRedactionPosture::RedactedSummary,
+        780,
+        TOOL_RESULT_HOOK_GRANTS,
+        TOOL_RESULT_MIDDLEWARE_DECISIONS,
+        true,
+    ),
+];
+
+/// Returns the public descriptor for an agent hook kind.
+#[must_use]
+pub fn agent_hook_descriptor(kind: AgentHookKind) -> Option<&'static AgentHookDescriptor> {
+    AGENT_HOOK_DESCRIPTORS.iter().find(|descriptor| descriptor.kind == kind)
+}
+
+runtime_contract_enum! {
+    /// Host-owned policy for routing a prepared attempt to an agent harness.
+    pub enum AgentHarnessSelectionMode {
+        Auto => "auto",
+        Explicit => "explicit",
+        ModelScoped => "model_scoped",
+        ProviderScoped => "provider_scoped"
+    }
+}
+
+runtime_contract_enum! {
+    /// Result of asking a harness whether it supports a prepared attempt.
+    pub enum AgentHarnessSupportOutcome {
+        Declined => "declined",
+        Supported => "supported",
+        Preferred => "preferred"
+    }
+}
+
+runtime_contract_enum! {
+    /// Callback channels a harness may use to emit host-owned attempt events.
+    pub enum AgentHarnessCallbackKind {
+        PartialReply => "partial_reply",
+        ToolEvent => "tool_event",
+        LifecycleEvent => "lifecycle_event",
+        FinalOutcome => "final_outcome"
+    }
+}
+
+/// Snapshot-pinned schema descriptor for the host-sanitized attempt object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PreparedAgentAttemptSchemaDescriptor {
+    /// Schema version of the descriptor.
+    pub schema_version: u32,
+    /// Stable schema identifier.
+    pub schema_id: &'static str,
+    /// Fields visible to a harness after host sanitization.
+    pub harness_visible_fields: &'static [&'static str],
+    /// Fields and authorities retained by the host.
+    pub host_owned_authorities: &'static [&'static str],
+    /// Callback kinds exposed instead of direct journal writes.
+    pub callback_kinds: &'static [AgentHarnessCallbackKind],
+    /// Whether a harness may bypass the host journal API.
+    pub direct_journal_write_allowed: bool,
+    /// Whether tool execution and approval policy stay with the host.
+    pub host_owns_tool_execution: bool,
+}
+
+/// Public schema descriptor for prepared agent attempts handed to native harnesses.
+pub const PREPARED_AGENT_ATTEMPT_SCHEMA: PreparedAgentAttemptSchemaDescriptor =
+    PreparedAgentAttemptSchemaDescriptor {
+        schema_version: 1,
+        schema_id: "runtime-contracts.prepared_agent_attempt.v1",
+        harness_visible_fields: &[
+            "run_id",
+            "session_id",
+            "provider",
+            "model",
+            "auth_state_metadata",
+            "context_token_budget",
+            "reasoning_policy",
+            "sanitized_transcript_view",
+            "tool_surface",
+            "tool_policy",
+            "workspace_root",
+            "sandbox",
+            "trace_context",
+            "callbacks",
+            "cancellation",
+        ],
+        host_owned_authorities: &[
+            "provider_resolution",
+            "credential_material",
+            "raw_transcript",
+            "workspace_policy",
+            "sandbox_policy",
+            "tool_execution",
+            "approval_resolution",
+            "journal_writes",
+        ],
+        callback_kinds: &[
+            AgentHarnessCallbackKind::PartialReply,
+            AgentHarnessCallbackKind::ToolEvent,
+            AgentHarnessCallbackKind::LifecycleEvent,
+            AgentHarnessCallbackKind::FinalOutcome,
+        ],
+        direct_journal_write_allowed: false,
+        host_owns_tool_execution: true,
+    };
+
+runtime_contract_enum! {
     /// Stable actor kind names for runtime audit records.
     pub enum RuntimeActorKind {
         System => "system",
@@ -1346,6 +2048,49 @@ runtime_contract_enum! {
         AuditArtifact => "audit_artifact",
         RedactedPreview => "redacted_preview"
     }
+}
+
+impl ToolResultVisibility {
+    /// Ordering used by tool-result middleware checks; larger values expose more to the model.
+    #[must_use]
+    pub const fn model_visibility_rank(self) -> u8 {
+        match self {
+            Self::AuditArtifact => 0,
+            Self::RedactedPreview => 1,
+            Self::ModelSummary => 2,
+            Self::ModelInline => 3,
+        }
+    }
+}
+
+/// Failure returned when middleware tries to broaden tool-result visibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultMiddlewarePolicyError {
+    pub code: String,
+    pub message: String,
+}
+
+/// Validates that middleware preserves or downgrades host-selected tool-result visibility.
+///
+/// # Errors
+///
+/// Returns `visibility_escalation_denied` when `requested` would expose more content to the
+/// model than `host_visibility` permits.
+pub fn validate_tool_result_visibility_downgrade(
+    host_visibility: ToolResultVisibility,
+    requested: ToolResultVisibility,
+) -> Result<ToolResultVisibility, ToolResultMiddlewarePolicyError> {
+    if requested.model_visibility_rank() <= host_visibility.model_visibility_rank() {
+        return Ok(requested);
+    }
+    Err(ToolResultMiddlewarePolicyError {
+        code: "visibility_escalation_denied".to_owned(),
+        message: format!(
+            "tool result middleware cannot raise visibility from {} to {}",
+            host_visibility.as_str(),
+            requested.as_str()
+        ),
+    })
 }
 
 runtime_contract_enum! {
@@ -2691,7 +3436,9 @@ mod tests {
         validate_public_runtime_event, validate_public_runtime_event_name,
         validate_public_runtime_event_sequence, AcpBindingConflictKind, AcpBindingRepairActionKind,
         AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange,
-        AcpScope, AcpSessionBindingRecord, AcpSessionMode, AcpTransportKind, ArtifactReadRequest,
+        AcpScope, AcpSessionBindingRecord, AcpSessionMode, AcpTransportKind,
+        AgentHarnessCallbackKind, AgentHookCapabilityGrant, AgentHookDecisionAuthority,
+        AgentHookDecisionKind, AgentHookKind, AgentHookRedactionPosture, ArtifactReadRequest,
         ArtifactRetentionDisposition, ArtifactRetentionPolicy, AuxiliaryTaskKind,
         AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
         PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, PruningPolicyClass,
@@ -2704,8 +3451,8 @@ mod tests {
         ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
-        PUBLIC_RUNTIME_EVENT_DESCRIPTORS, REALTIME_PROTOCOL_MAX_VERSION,
-        REALTIME_PROTOCOL_MIN_VERSION,
+        AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA, PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
+        REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -3138,6 +3885,97 @@ mod tests {
         let error = super::resolve_run_lifecycle_hook_decisions(phase, decisions)
             .expect_err("after_run must not accept terminal decisions");
         assert_eq!(error.code, "decision_not_allowed_in_phase");
+    }
+
+    #[test]
+    fn agent_hook_descriptors_pin_redaction_and_decision_authority() {
+        let before_prompt = AgentHookKind::BeforePromptBuild
+            .descriptor()
+            .expect("before_prompt_build descriptor should exist");
+        assert_eq!(before_prompt.decision_authority, AgentHookDecisionAuthority::DecisionCapable);
+        assert_eq!(before_prompt.redaction, AgentHookRedactionPosture::MetadataOnly);
+        assert!(before_prompt
+            .allowed_capability_grants
+            .contains(&AgentHookCapabilityGrant::RawPromptTrusted));
+        assert!(before_prompt.permits_capability_grants(&[
+            AgentHookCapabilityGrant::MetadataOnly,
+            AgentHookCapabilityGrant::RedactedPayload,
+        ]));
+
+        let model_started = AgentHookKind::ModelCallStarted
+            .descriptor()
+            .expect("model_call_started descriptor should exist");
+        assert_eq!(model_started.decision_authority, AgentHookDecisionAuthority::ObservationOnly);
+        assert!(model_started.allowed_decisions.is_empty());
+        assert!(
+            !model_started.permits_capability_grants(&[AgentHookCapabilityGrant::RawPromptTrusted])
+        );
+    }
+
+    #[test]
+    fn agent_hook_timeout_outcomes_are_deterministic() {
+        let gate = AgentHookKind::BeforeToolCall
+            .descriptor()
+            .expect("before_tool_call descriptor should exist");
+        assert_eq!(gate.timeout_decision(), AgentHookDecisionKind::Block);
+
+        let observe =
+            AgentHookKind::AgentEnd.descriptor().expect("agent_end descriptor should exist");
+        assert_eq!(observe.timeout_decision(), AgentHookDecisionKind::AuditOnly);
+
+        let persist = AgentHookKind::ToolResultPersist
+            .descriptor()
+            .expect("tool_result_persist descriptor should exist");
+        assert_eq!(persist.timeout_decision(), AgentHookDecisionKind::FailPersistence);
+    }
+
+    #[test]
+    fn prepared_attempt_schema_keeps_journal_and_tools_host_owned() {
+        let schema =
+            serde_json::to_value(PREPARED_AGENT_ATTEMPT_SCHEMA).expect("schema should serialize");
+        assert_eq!(schema["host_owns_tool_execution"], true);
+        assert_eq!(schema["direct_journal_write_allowed"], false);
+        assert!(PREPARED_AGENT_ATTEMPT_SCHEMA
+            .callback_kinds
+            .contains(&AgentHarnessCallbackKind::PartialReply));
+        assert!(PREPARED_AGENT_ATTEMPT_SCHEMA
+            .host_owned_authorities
+            .contains(&"approval_resolution"));
+    }
+
+    #[test]
+    fn tool_result_middleware_may_only_downgrade_visibility() {
+        assert_eq!(
+            super::validate_tool_result_visibility_downgrade(
+                ToolResultVisibility::ModelSummary,
+                ToolResultVisibility::RedactedPreview,
+            )
+            .expect("downgrade should be accepted"),
+            ToolResultVisibility::RedactedPreview
+        );
+
+        let error = super::validate_tool_result_visibility_downgrade(
+            ToolResultVisibility::RedactedPreview,
+            ToolResultVisibility::ModelInline,
+        )
+        .expect_err("visibility escalation must be rejected");
+        assert_eq!(error.code, "visibility_escalation_denied");
+    }
+
+    #[test]
+    fn agent_hook_contract_snapshot_covers_all_descriptors() {
+        assert!(AGENT_HOOK_DESCRIPTORS.len() >= 30);
+        for descriptor in AGENT_HOOK_DESCRIPTORS {
+            assert!(AgentHookKind::parse(descriptor.kind.as_str()).is_some());
+            if descriptor.decision_authority == AgentHookDecisionAuthority::ObservationOnly {
+                assert!(descriptor.allowed_decisions.is_empty());
+            }
+            if descriptor.kind.is_tool_result_middleware() {
+                assert!(descriptor
+                    .allowed_capability_grants
+                    .contains(&AgentHookCapabilityGrant::ToolResultTransform));
+            }
+        }
     }
 
     #[test]

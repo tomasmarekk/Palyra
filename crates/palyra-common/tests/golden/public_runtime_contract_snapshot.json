@@ -458,7 +458,1029 @@
     },
     "snapshot_version": "runtime-contracts.acp.v2"
   },
-  "changelog_note": "Adds the canonical public runtime event taxonomy for run, model, tool, approval, verification, and heartbeat streams.",
+  "agent_harness": {
+    "callback_kinds": {
+      "changelog_note": "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
+      "name": "AgentHarnessCallbackKind",
+      "snapshot_version": "runtime-contracts.agent_harness_callback_kind.v1",
+      "values": [
+        {
+          "canonical": "partial_reply",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_event",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "lifecycle_event",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "final_outcome",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, and journal writes host-owned.",
+    "prepared_attempt_schema": {
+      "callback_kinds": [
+        "partial_reply",
+        "tool_event",
+        "lifecycle_event",
+        "final_outcome"
+      ],
+      "direct_journal_write_allowed": false,
+      "harness_visible_fields": [
+        "run_id",
+        "session_id",
+        "provider",
+        "model",
+        "auth_state_metadata",
+        "context_token_budget",
+        "reasoning_policy",
+        "sanitized_transcript_view",
+        "tool_surface",
+        "tool_policy",
+        "workspace_root",
+        "sandbox",
+        "trace_context",
+        "callbacks",
+        "cancellation"
+      ],
+      "host_owned_authorities": [
+        "provider_resolution",
+        "credential_material",
+        "raw_transcript",
+        "workspace_policy",
+        "sandbox_policy",
+        "tool_execution",
+        "approval_resolution",
+        "journal_writes"
+      ],
+      "host_owns_tool_execution": true,
+      "schema_id": "runtime-contracts.prepared_agent_attempt.v1",
+      "schema_version": 1
+    },
+    "selection_modes": {
+      "changelog_note": "Harness selection modes are policy-visible and must not silently fall back for mutating attempts.",
+      "name": "AgentHarnessSelectionMode",
+      "snapshot_version": "runtime-contracts.agent_harness_selection_mode.v1",
+      "values": [
+        {
+          "canonical": "auto",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "explicit",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model_scoped",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider_scoped",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "snapshot_version": "runtime-contracts.agent_harness.v1",
+    "support_outcomes": {
+      "changelog_note": "Harness support outcomes are audited before an attempt is routed.",
+      "name": "AgentHarnessSupportOutcome",
+      "snapshot_version": "runtime-contracts.agent_harness_support_outcome.v1",
+      "values": [
+        {
+          "canonical": "declined",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "supported",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "preferred",
+          "deprecated_aliases": []
+        }
+      ]
+    }
+  },
+  "agent_hooks": {
+    "capability_grants": {
+      "changelog_note": "Hook capability grants are host-issued and plugins cannot self-escalate to raw or mutating data.",
+      "name": "AgentHookCapabilityGrant",
+      "snapshot_version": "runtime-contracts.agent_hook_capability_grant.v1",
+      "values": [
+        {
+          "canonical": "metadata_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redacted_payload",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "raw_prompt_trusted",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "delivery_mutation",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_result_transform",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "exec_env_resolve",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "changelog_note": "Agent hooks define stable hook names, default redaction, capability grants, timeouts, priorities, and decision shapes.",
+    "decision_authority": {
+      "changelog_note": "Hook authority distinguishes observe-only hooks from hooks that may affect control flow.",
+      "name": "AgentHookDecisionAuthority",
+      "snapshot_version": "runtime-contracts.agent_hook_decision_authority.v1",
+      "values": [
+        {
+          "canonical": "observation_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "decision_capable",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "decision_kinds": {
+      "changelog_note": "Agent hook decision names cover run gates, delivery rewrites, and tool-result middleware outcomes.",
+      "name": "AgentHookDecisionKind",
+      "snapshot_version": "runtime-contracts.agent_hook_decision_kind.v1",
+      "values": [
+        {
+          "canonical": "continue",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "annotate",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "request_approval",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "block",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "transform_preview",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "replace_summary",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "attach_artifact",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redact_fields",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "downgrade_visibility",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "request_full_read_approval",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "fail_persistence",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "audit_only",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "descriptors": [
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "run:before_run",
+        "metrics_name": "hook.duration",
+        "priority": 800,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "run:before_tool",
+        "metrics_name": "hook.duration",
+        "priority": 850,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "run:after_tool",
+        "metrics_name": "hook.duration",
+        "priority": 500,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "delivery_mutation"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block",
+          "transform_preview"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "run:before_delivery",
+        "metrics_name": "hook.duration",
+        "priority": 850,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "run:after_run",
+        "metrics_name": "hook.duration",
+        "priority": 400,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "exec_env_resolve"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_model_resolve",
+        "metrics_name": "hook.duration",
+        "priority": 650,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "raw_prompt_trusted"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_prompt_build",
+        "metrics_name": "hook.duration",
+        "priority": 700,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_agent_run",
+        "metrics_name": "hook.duration",
+        "priority": 760,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "before_agent_reply",
+        "metrics_name": "hook.duration",
+        "priority": 500,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_agent_finalize",
+        "metrics_name": "hook.duration",
+        "priority": 700,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "agent_end",
+        "metrics_name": "hook.duration",
+        "priority": 300,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "model_call_started",
+        "metrics_name": "hook.duration",
+        "priority": 300,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "model_call_ended",
+        "metrics_name": "hook.duration",
+        "priority": 300,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_tool_call",
+        "metrics_name": "hook.duration",
+        "priority": 820,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "after_tool_call",
+        "metrics_name": "hook.duration",
+        "priority": 400,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "inbound_claim",
+        "metrics_name": "hook.duration",
+        "priority": 900,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "delivery_mutation"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block",
+          "transform_preview"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_message_write",
+        "metrics_name": "hook.duration",
+        "priority": 760,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "delivery_mutation"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block",
+          "transform_preview"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "message_sending",
+        "metrics_name": "hook.duration",
+        "priority": 760,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "delivery_mutation"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block",
+          "transform_preview"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "reply_payload_sending",
+        "metrics_name": "hook.duration",
+        "priority": 760,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "reply_dispatch",
+        "metrics_name": "hook.duration",
+        "priority": 400,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "session_start",
+        "metrics_name": "hook.duration",
+        "priority": 350,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "session_end",
+        "metrics_name": "hook.duration",
+        "priority": 350,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_reset",
+        "metrics_name": "hook.duration",
+        "priority": 800,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "annotate",
+          "request_approval",
+          "block"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_compaction",
+        "metrics_name": "hook.duration",
+        "priority": 650,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "after_compaction",
+        "metrics_name": "hook.duration",
+        "priority": 350,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "subagent_spawned",
+        "metrics_name": "hook.duration",
+        "priority": 350,
+        "redaction": "metadata_only"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "subagent_ended",
+        "metrics_name": "hook.duration",
+        "priority": 350,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "tool_result_transform"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "replace_summary",
+          "attach_artifact",
+          "redact_fields",
+          "downgrade_visibility",
+          "request_full_read_approval",
+          "fail_persistence",
+          "audit_only"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "before_tool_result_project",
+        "metrics_name": "hook.duration",
+        "priority": 780,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "tool_result_transform"
+        ],
+        "allowed_decisions": [],
+        "audit_event": "hook.observed",
+        "decision_authority": "observation_only",
+        "default_timeout_ms": 500,
+        "fail_closed": false,
+        "kind": "tool_result_projected",
+        "metrics_name": "hook.duration",
+        "priority": 420,
+        "redaction": "redacted_summary"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "tool_result_transform"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "replace_summary",
+          "attach_artifact",
+          "redact_fields",
+          "downgrade_visibility",
+          "request_full_read_approval",
+          "fail_persistence",
+          "audit_only"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "tool_result_persist",
+        "metrics_name": "hook.duration",
+        "priority": 780,
+        "redaction": "redacted_payload"
+      },
+      {
+        "allowed_capability_grants": [
+          "metadata_only",
+          "redacted_payload",
+          "tool_result_transform"
+        ],
+        "allowed_decisions": [
+          "continue",
+          "replace_summary",
+          "attach_artifact",
+          "redact_fields",
+          "downgrade_visibility",
+          "request_full_read_approval",
+          "fail_persistence",
+          "audit_only"
+        ],
+        "audit_event": "hook.decision",
+        "decision_authority": "decision_capable",
+        "default_timeout_ms": 1000,
+        "fail_closed": true,
+        "kind": "tool_result_model_feed",
+        "metrics_name": "hook.duration",
+        "priority": 780,
+        "redaction": "redacted_summary"
+      }
+    ],
+    "kinds": {
+      "changelog_note": "Agent hook names are public plugin and harness extension points.",
+      "name": "AgentHookKind",
+      "snapshot_version": "runtime-contracts.agent_hook_kind.v1",
+      "values": [
+        {
+          "canonical": "gateway:startup",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "skill:enabled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "skill:quarantined",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "skill:disabled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "run_started",
+          "deprecated_aliases": [
+            "run:started"
+          ]
+        },
+        {
+          "canonical": "run_finished",
+          "deprecated_aliases": [
+            "run:finished"
+          ]
+        },
+        {
+          "canonical": "before_context_build",
+          "deprecated_aliases": [
+            "context:before_build"
+          ]
+        },
+        {
+          "canonical": "after_context_build",
+          "deprecated_aliases": [
+            "context:after_build"
+          ]
+        },
+        {
+          "canonical": "before_tool_policy",
+          "deprecated_aliases": [
+            "tool:before_policy"
+          ]
+        },
+        {
+          "canonical": "after_tool_result",
+          "deprecated_aliases": [
+            "tool:after_result"
+          ]
+        },
+        {
+          "canonical": "memory_candidate_created",
+          "deprecated_aliases": [
+            "memory:candidate_created"
+          ]
+        },
+        {
+          "canonical": "learning_candidate_reviewed",
+          "deprecated_aliases": [
+            "learning:candidate_reviewed"
+          ]
+        },
+        {
+          "canonical": "artifact_created",
+          "deprecated_aliases": [
+            "artifact:created"
+          ]
+        },
+        {
+          "canonical": "approval_requested",
+          "deprecated_aliases": [
+            "approval:requested"
+          ]
+        },
+        {
+          "canonical": "run:before_run",
+          "deprecated_aliases": [
+            "before_run"
+          ]
+        },
+        {
+          "canonical": "run:before_tool",
+          "deprecated_aliases": [
+            "before_tool"
+          ]
+        },
+        {
+          "canonical": "run:after_tool",
+          "deprecated_aliases": [
+            "after_tool"
+          ]
+        },
+        {
+          "canonical": "run:before_delivery",
+          "deprecated_aliases": [
+            "before_delivery"
+          ]
+        },
+        {
+          "canonical": "run:after_run",
+          "deprecated_aliases": [
+            "after_run"
+          ]
+        },
+        {
+          "canonical": "before_model_resolve",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_prompt_build",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_agent_run",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_agent_reply",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_agent_finalize",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "agent_end",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model_call_started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model_call_ended",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_tool_call",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "after_tool_call",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_result_persist",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "inbound_claim",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_message_write",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "message_sending",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reply_payload_sending",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reply_dispatch",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "session_start",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "session_end",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_reset",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_compaction",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "after_compaction",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "subagent_spawned",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "subagent_ended",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "before_tool_result_project",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_result_projected",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_result_model_feed",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "redaction_postures": {
+      "changelog_note": "Hook redaction postures describe the strongest payload view available without additional trusted grants.",
+      "name": "AgentHookRedactionPosture",
+      "snapshot_version": "runtime-contracts.agent_hook_redaction_posture.v1",
+      "values": [
+        {
+          "canonical": "metadata_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redacted_payload",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "redacted_summary",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "trusted_raw_payload",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "snapshot_version": "runtime-contracts.agent_hooks.v1"
+  },
+  "changelog_note": "Adds agent hook, harness, and tool-result middleware contracts to the public runtime snapshot.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -1622,7 +2644,7 @@
     }
   ],
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v3",
+  "snapshot_version": "runtime-contracts.v4",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [
@@ -1742,6 +2764,34 @@
         ]
       }
     ],
+    "middleware": {
+      "allowed_decisions": [
+        "continue",
+        "replace_summary",
+        "attach_artifact",
+        "redact_fields",
+        "downgrade_visibility",
+        "request_full_read_approval",
+        "fail_persistence",
+        "audit_only"
+      ],
+      "changelog_note": "Runtime-neutral tool-result middleware may only preserve or downgrade model visibility while keeping audit artifacts host-owned.",
+      "host_policy_authoritative": true,
+      "phases": [
+        "before_tool_result_project",
+        "tool_result_projected",
+        "tool_result_persist",
+        "tool_result_model_feed"
+      ],
+      "snapshot_version": "runtime-contracts.tool_result_middleware.v1",
+      "visibility_escalation_allowed": false,
+      "visibility_order_low_to_high": [
+        "audit_artifact",
+        "redacted_preview",
+        "model_summary",
+        "model_inline"
+      ]
+    },
     "snapshot_version": "runtime-contracts.tool_result_projection.v1"
   }
 }
