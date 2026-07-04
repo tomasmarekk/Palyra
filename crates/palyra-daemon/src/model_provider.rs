@@ -6020,6 +6020,7 @@ mod tests {
                 "approval_posture": "safe",
                 "projection_policy": "inline_unless_large",
                 "parallelism_policy": "read_only",
+                "replay_safety_class": "read_only",
                 "exposure_reason": "allowlisted_policy_visible"
             }],
             "tools": [{
@@ -6055,6 +6056,7 @@ mod tests {
                 "approval_posture": "safe",
                 "projection_policy": "inline_unless_large",
                 "parallelism_policy": "read_only",
+                "replay_safety_class": "read_only",
                 "exposure_reason": "allowlisted_policy_visible"
             }],
             "filtered_tools": []
