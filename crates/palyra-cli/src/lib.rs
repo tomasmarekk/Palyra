@@ -13152,6 +13152,9 @@ mod cli_v1_tests {
     #[test]
     fn doctor_connectivity_targets_follow_root_context_config() -> anyhow::Result<()> {
         let _lock = env_lock().lock().expect("env lock should be available");
+        let _daemon_url = ScopedEnvVar::unset("PALYRA_DAEMON_URL");
+        let _grpc_url = ScopedEnvVar::unset("PALYRA_GATEWAY_GRPC_URL");
+        let _admin_token = ScopedEnvVar::unset("PALYRA_ADMIN_TOKEN");
         crate::app::clear_root_context_for_tests();
         let tempdir = tempfile::tempdir()?;
         let state_root = tempdir.path().join("state");

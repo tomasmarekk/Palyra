@@ -3735,6 +3735,7 @@ enabled = true
     fn auth_profile_probe_resolves_desktop_runtime_profile_from_configured_parent_vault() {
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
+        let _auth_profiles_path = ScopedAuthProfilesPath::unset();
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
@@ -3802,6 +3803,7 @@ enabled = true
     fn auth_profile_probe_resolves_xai_runtime_profile_from_configured_parent_vault() {
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
+        let _auth_profiles_path = ScopedAuthProfilesPath::unset();
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
