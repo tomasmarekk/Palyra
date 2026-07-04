@@ -104,6 +104,45 @@ pub(crate) async fn admin_status_handler(
         &memory_payload,
         &tool_jobs,
     );
+    let lifecycle = crate::runtime_diagnostics::build_daemon_lifecycle_snapshot_from_status(
+        &snapshot,
+        runtime_preview_payload,
+    );
+    let metrics_catalog = crate::runtime_diagnostics::build_metrics_catalog_snapshot();
+    let trace_export = crate::runtime_diagnostics::build_trace_exporter_contract();
+    let diagnostics_timeline =
+        crate::runtime_diagnostics::build_diagnostics_timeline_contract(generated_at_unix_ms);
+    let active_tool_jobs = json!({
+        "total": tool_jobs.len(),
+        "active": tool_jobs.iter().filter(|job| job.state.is_active()).count(),
+        "states": tool_jobs.iter().map(|job| job.state.as_str()).collect::<Vec<_>>(),
+    });
+    let shutdown_forensics =
+        crate::support::build_shutdown_forensic_snapshot(crate::support::ShutdownForensicInput {
+            generated_at_unix_ms,
+            active_sessions: 0,
+            active_runs: lifecycle.active_runs,
+            queue_depth: lifecycle.queue_depth,
+            pending_approvals: lifecycle.pending_approvals,
+            provider_lease_state: json!({"state": "not_reported"}),
+            active_tool_jobs,
+            child_process_tree: json!({"state": "not_collected"}),
+            mcp_state: mcp_payload.clone(),
+            worker_leases: networked_workers_payload.clone(),
+            recent_runtime_errors: Vec::new(),
+        });
+    let support_runtime = crate::support::build_support_runtime_snapshot(
+        generated_at_unix_ms,
+        None,
+        vec!["daemon".to_owned(), "runtime_diagnostics".to_owned(), "support_bundle".to_owned()],
+        json!({
+            "lifecycle": lifecycle.clone(),
+            "shutdown_forensics": shutdown_forensics.clone(),
+            "metrics_catalog": metrics_catalog.clone(),
+            "timeline": diagnostics_timeline.clone(),
+            "trace_export": trace_export.clone(),
+        }),
+    );
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
         map.insert("mcp".to_owned(), mcp_payload);
@@ -129,7 +168,26 @@ pub(crate) async fn admin_status_handler(
                 )))
             })?,
         );
+        map.insert(
+            "lifecycle".to_owned(),
+            serde_json::to_value(lifecycle).map_err(|error| {
+                runtime_status_response(tonic::Status::internal(format!(
+                    "failed to serialize lifecycle snapshot: {error}"
+                )))
+            })?,
+        );
         map.insert("agent_runtime_metrics".to_owned(), runtime_metrics);
+        map.insert("metrics_catalog".to_owned(), metrics_catalog);
+        map.insert("trace_export".to_owned(), trace_export.clone());
+        map.insert(
+            "runtime_diagnostics".to_owned(),
+            json!({
+                "timeline": diagnostics_timeline,
+                "trace_export": trace_export,
+                "shutdown_forensics": shutdown_forensics,
+                "support_runtime": support_runtime,
+            }),
+        );
     }
     Ok(Json(payload))
 }

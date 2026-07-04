@@ -300,6 +300,16 @@ fn build_embedded_support_bundle(generated_at_unix_ms: i64) -> Result<SupportBun
     let build = build_metadata();
     let diagnostics = build_support_bundle_diagnostics_snapshot();
     let profile = app::current_root_context().and_then(|context| context.active_profile_context());
+    let config = build_support_bundle_config_snapshot();
+    let observability = build_support_bundle_observability_snapshot(&diagnostics);
+    let journal = build_support_bundle_journal_snapshot(32, 16);
+    let runtime = build_support_bundle_runtime_snapshot(
+        generated_at_unix_ms,
+        &config,
+        &observability,
+        &diagnostics,
+        &journal,
+    );
     Ok(SupportBundle {
         schema_version: 1,
         generated_at_unix_ms,
@@ -316,12 +326,13 @@ fn build_embedded_support_bundle(generated_at_unix_ms: i64) -> Result<SupportBun
         },
         doctor,
         recovery: Some(commands::doctor::build_doctor_support_bundle_value()?),
-        config: build_support_bundle_config_snapshot(),
-        observability: build_support_bundle_observability_snapshot(&diagnostics),
+        config,
+        observability,
         triage: build_support_bundle_triage_snapshot(),
         replay: build_support_bundle_replay_snapshot(),
+        runtime,
         diagnostics,
-        journal: build_support_bundle_journal_snapshot(32, 16),
+        journal,
         truncated: false,
         warnings: Vec::new(),
     })

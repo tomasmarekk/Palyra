@@ -2847,6 +2847,195 @@ fn build_support_bundle_runtime_support_snapshot(
     }
 }
 
+fn build_support_bundle_runtime_snapshot(
+    generated_at_unix_ms: i64,
+    config: &SupportBundleConfigSnapshot,
+    observability: &SupportBundleObservabilitySnapshot,
+    diagnostics: &SupportBundleDiagnosticsSnapshot,
+    journal: &SupportBundleJournalSnapshot,
+) -> SupportBundleRuntimeSnapshot {
+    let build = build_metadata();
+    let admin_status = diagnostics.admin_status.as_ref();
+    let runs_started = support_json_u64(admin_status, &["/counters/orchestrator_runs_started"]);
+    let runs_completed = support_json_u64(admin_status, &["/counters/orchestrator_runs_completed"]);
+    let runs_cancelled = support_json_u64(admin_status, &["/counters/orchestrator_runs_cancelled"]);
+    let active_runs_count =
+        runs_started.saturating_sub(runs_completed).saturating_sub(runs_cancelled);
+    let queue_depth = support_json_u64(
+        admin_status,
+        &[
+            "/counters/channel_router_queue_depth",
+            "/observability/runtime_preview/metrics/queue_depth",
+        ],
+    );
+    let approvals_requested =
+        support_json_u64(admin_status, &["/counters/approvals_tool_requested"]);
+    let approvals_resolved = support_json_sum_u64(
+        admin_status,
+        &[
+            "/counters/approvals_tool_resolved_allow",
+            "/counters/approvals_tool_resolved_deny",
+            "/counters/approvals_tool_resolved_timeout",
+            "/counters/approvals_tool_resolved_error",
+        ],
+    );
+    let active_sessions_count = support_json_u64(
+        admin_status,
+        &["/health/active_sessions", "/sessions/active", "/counters/orchestrator_sessions_active"],
+    );
+    let enabled_modules = build_support_bundle_enabled_modules(config, diagnostics);
+    SupportBundleRuntimeSnapshot {
+        schema_version: 1,
+        generated_at_unix_ms,
+        daemon_version: build.version.to_owned(),
+        config_hash_sha256: config.config_hash_sha256.clone(),
+        enabled_modules,
+        active_sessions_count,
+        active_runs_count,
+        queue_depth,
+        pending_approvals: approvals_requested.saturating_sub(approvals_resolved),
+        provider_lease_state: support_json_value(admin_status, &["/provider_leases"])
+            .unwrap_or_else(|| json!({"state": "not_reported"})),
+        mcp_state: support_json_value(admin_status, &["/mcp"])
+            .unwrap_or_else(|| json!({"state": "not_reported"})),
+        worker_state: diagnostics
+            .worker_status
+            .clone()
+            .or_else(|| support_json_value(admin_status, &["/networked_workers"]))
+            .unwrap_or_else(|| json!({"state": "not_reported"})),
+        sandbox_state: support_json_value(admin_status, &["/execution_backends"])
+            .unwrap_or_else(|| json!({"state": "not_reported"})),
+        last_shutdown_snapshot: support_json_value(
+            admin_status,
+            &["/observability/shutdown_forensics", "/runtime/shutdown_forensics"],
+        )
+        .unwrap_or_else(|| json!({"state": "not_recorded"})),
+        recent_failed_runs: json!({
+            "source": "journal.last_errors",
+            "count": journal.last_errors.len(),
+            "records": journal.last_errors.iter().take(8).collect::<Vec<_>>(),
+        }),
+        journal_health: json!({
+            "available": journal.available,
+            "hash_chain_enabled": journal.hash_chain_enabled,
+            "latest_hash_present": journal.latest_hash.is_some(),
+            "last_error_count": journal.last_errors.len(),
+            "error": journal.error.clone(),
+        }),
+        vault_health: support_json_value(admin_status, &["/vault", "/auth/vault"]).unwrap_or_else(
+            || {
+                json!({
+                    "state": "metadata_only",
+                    "secret_fields_redacted": config
+                        .redacted_summary
+                        .as_ref()
+                        .and_then(|summary| summary.pointer("/secret_fields_redacted"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                })
+            },
+        ),
+        policy_health: support_json_value(admin_status, &["/policy", "/runtime_health/policy"])
+            .unwrap_or_else(|| json!({"state": "not_reported"})),
+        doctor_findings: json!({
+            "required_checks_failed": diagnostics
+                .admin_status
+                .as_ref()
+                .and_then(|payload| payload.pointer("/doctor/summary/required_checks_failed"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "offline_doctor_embedded": true,
+        }),
+        diagnostics_timeline: support_json_value(
+            admin_status,
+            &["/runtime_diagnostics/timeline", "/observability/diagnostics_timeline"],
+        )
+        .unwrap_or_else(|| {
+            json!({
+                "state": "not_available",
+                "source": "PALYRA_DIAGNOSTICS_TIMELINE_PATH",
+                "note": "timeline subset is included when daemon diagnostics exposes it",
+            })
+        }),
+        trace_export: support_json_value(
+            admin_status,
+            &["/observability/trace_export", "/runtime_diagnostics/trace_export"],
+        )
+        .unwrap_or_else(|| {
+            json!({
+                "state": "contract_only",
+                "default_exporter": "jsonl",
+                "external_exporters": ["otlp", "langfuse"],
+            })
+        }),
+        redaction: json!({
+            "level": "support_bundle_strict",
+            "raw_provider_payloads": false,
+            "raw_oauth_grants": false,
+            "raw_vault_refs": false,
+            "raw_paths": false,
+            "source": "redact_json_value_tree",
+        }),
+        truncation: json!({
+            "max_bytes_enforced": true,
+            "large_artifacts_index_only": true,
+            "journal_hashes_retained": journal.recent_hashes.len(),
+            "journal_errors_retained": journal.last_errors.len(),
+        }),
+        observability_runtime_support: serde_json::to_value(&observability.runtime_support)
+            .unwrap_or(Value::Null),
+    }
+}
+
+fn build_support_bundle_enabled_modules(
+    config: &SupportBundleConfigSnapshot,
+    diagnostics: &SupportBundleDiagnosticsSnapshot,
+) -> Vec<String> {
+    let mut modules = vec![
+        "cli".to_owned(),
+        "daemon".to_owned(),
+        "doctor".to_owned(),
+        "support_bundle".to_owned(),
+    ];
+    if diagnostics.browser_status.is_some() {
+        modules.push("browserd".to_owned());
+    }
+    if diagnostics.worker_status.is_some() {
+        modules.push("networked_workers".to_owned());
+    }
+    if let Some(sections) = config
+        .redacted_summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/top_level_sections"))
+        .and_then(Value::as_array)
+    {
+        for section in sections.iter().filter_map(Value::as_str) {
+            modules.push(section.to_owned());
+        }
+    }
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+fn support_json_u64(root: Option<&Value>, pointers: &[&str]) -> u64 {
+    pointers
+        .iter()
+        .find_map(|pointer| root.and_then(|value| value.pointer(pointer)).and_then(Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn support_json_sum_u64(root: Option<&Value>, pointers: &[&str]) -> u64 {
+    pointers
+        .iter()
+        .filter_map(|pointer| root.and_then(|value| value.pointer(pointer)).and_then(Value::as_u64))
+        .sum()
+}
+
+fn support_json_value(root: Option<&Value>, pointers: &[&str]) -> Option<Value> {
+    pointers.iter().find_map(|pointer| root.and_then(|value| value.pointer(pointer)).cloned())
+}
+
 fn build_support_bundle_triage_snapshot() -> SupportBundleTriageSnapshot {
     SupportBundleTriageSnapshot {
         playbook: "embedded-support-triage-v1".to_owned(),
@@ -12397,6 +12586,7 @@ struct SupportBundle {
     observability: SupportBundleObservabilitySnapshot,
     triage: SupportBundleTriageSnapshot,
     replay: SupportBundleReplaySnapshot,
+    runtime: SupportBundleRuntimeSnapshot,
     diagnostics: SupportBundleDiagnosticsSnapshot,
     journal: SupportBundleJournalSnapshot,
     truncated: bool,
@@ -12487,6 +12677,35 @@ struct SupportBundleRuntimeSupportSnapshot {
     replay_bundle_metadata: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     worker_diagnostics: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportBundleRuntimeSnapshot {
+    schema_version: u32,
+    generated_at_unix_ms: i64,
+    daemon_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_hash_sha256: Option<String>,
+    enabled_modules: Vec<String>,
+    active_sessions_count: u64,
+    active_runs_count: u64,
+    queue_depth: u64,
+    pending_approvals: u64,
+    provider_lease_state: Value,
+    mcp_state: Value,
+    worker_state: Value,
+    sandbox_state: Value,
+    last_shutdown_snapshot: Value,
+    recent_failed_runs: Value,
+    journal_health: Value,
+    vault_health: Value,
+    policy_health: Value,
+    doctor_findings: Value,
+    diagnostics_timeline: Value,
+    trace_export: Value,
+    redaction: Value,
+    truncation: Value,
+    observability_runtime_support: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -14411,8 +14630,8 @@ mod diagnostics_bundle_tests {
         SupportBundleBuildSnapshot, SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
-        SupportBundleReplaySnapshot, SupportBundleRuntimeSupportSnapshot,
-        SupportBundleTriageSnapshot,
+        SupportBundleReplaySnapshot, SupportBundleRuntimeSnapshot,
+        SupportBundleRuntimeSupportSnapshot, SupportBundleTriageSnapshot,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -14738,6 +14957,76 @@ mod diagnostics_bundle_tests {
                     ],
                 },
                 offline_only: true,
+            },
+            runtime: SupportBundleRuntimeSnapshot {
+                schema_version: 1,
+                generated_at_unix_ms: 1_730_000_000_000,
+                daemon_version: "0.1.0".to_owned(),
+                config_hash_sha256: Some("c".repeat(64)),
+                enabled_modules: vec![
+                    "cli".to_owned(),
+                    "daemon".to_owned(),
+                    "doctor".to_owned(),
+                    "support_bundle".to_owned(),
+                ],
+                active_sessions_count: 1,
+                active_runs_count: 0,
+                queue_depth: 0,
+                pending_approvals: 0,
+                provider_lease_state: json!({"state": "not_reported"}),
+                mcp_state: json!({"state": "not_reported"}),
+                worker_state: json!({"state": "not_reported"}),
+                sandbox_state: json!({"state": "not_reported"}),
+                last_shutdown_snapshot: json!({"state": "not_recorded"}),
+                recent_failed_runs: json!({
+                    "source": "journal.last_errors",
+                    "count": 0,
+                    "records": [],
+                }),
+                journal_health: json!({
+                    "available": true,
+                    "hash_chain_enabled": true,
+                    "latest_hash_present": true,
+                    "last_error_count": 0,
+                    "error": null,
+                }),
+                vault_health: json!({"state": "metadata_only"}),
+                policy_health: json!({"state": "not_reported"}),
+                doctor_findings: json!({
+                    "required_checks_failed": null,
+                    "offline_doctor_embedded": true,
+                }),
+                diagnostics_timeline: json!({
+                    "state": "not_available",
+                    "source": "PALYRA_DIAGNOSTICS_TIMELINE_PATH",
+                }),
+                trace_export: json!({
+                    "state": "contract_only",
+                    "default_exporter": "jsonl",
+                    "external_exporters": ["otlp", "langfuse"],
+                }),
+                redaction: json!({
+                    "level": "support_bundle_strict",
+                    "raw_provider_payloads": false,
+                    "raw_oauth_grants": false,
+                    "raw_vault_refs": false,
+                    "raw_paths": false,
+                    "source": "redact_json_value_tree",
+                }),
+                truncation: json!({
+                    "max_bytes_enforced": true,
+                    "large_artifacts_index_only": true,
+                    "journal_hashes_retained": hashes.len(),
+                    "journal_errors_retained": errors.len(),
+                }),
+                observability_runtime_support: json!({
+                    "queue_state": {
+                        "runtime_preview": {
+                            "state": "active",
+                            "metrics": { "queue_depth": 0, "pruning_tokens_saved": 128 }
+                        }
+                    }
+                }),
             },
             diagnostics: SupportBundleDiagnosticsSnapshot {
                 gateway_health: Some(json!({

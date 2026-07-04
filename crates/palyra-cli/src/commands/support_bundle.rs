@@ -57,6 +57,16 @@ fn run_support_bundle_export(
     let build = build_metadata();
     let diagnostics = build_support_bundle_diagnostics_snapshot();
     let profile = app::current_root_context().and_then(|context| context.active_profile_context());
+    let config = build_support_bundle_config_snapshot();
+    let observability = build_support_bundle_observability_snapshot(&diagnostics);
+    let journal = build_support_bundle_journal_snapshot(journal_hash_limit, error_limit);
+    let runtime = build_support_bundle_runtime_snapshot(
+        generated_at_unix_ms,
+        &config,
+        &observability,
+        &diagnostics,
+        &journal,
+    );
     let mut bundle = SupportBundle {
         schema_version: 1,
         generated_at_unix_ms,
@@ -73,12 +83,13 @@ fn run_support_bundle_export(
         },
         doctor,
         recovery: Some(commands::doctor::build_doctor_support_bundle_value()?),
-        config: build_support_bundle_config_snapshot(),
-        observability: build_support_bundle_observability_snapshot(&diagnostics),
+        config,
+        observability,
         triage: build_support_bundle_triage_snapshot(),
         replay: build_support_bundle_replay_snapshot(),
+        runtime,
         diagnostics,
-        journal: build_support_bundle_journal_snapshot(journal_hash_limit, error_limit),
+        journal,
         truncated: false,
         warnings: Vec::new(),
     };

@@ -10,6 +10,9 @@
 
 use std::collections::BTreeMap;
 
+use palyra_common::redaction::{
+    is_sensitive_key, redact_diagnostic_text, redact_internal_runtime_paths,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -45,6 +48,14 @@ pub(crate) const RUNTIME_HEALTH_SCHEMA_VERSION: u32 = 1;
 pub(crate) const AGENT_RUNTIME_METRICS_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the OTel span contract payload.
 pub(crate) const OTEL_SPAN_CONTRACT_SCHEMA_VERSION: u32 = 1;
+/// Schema version for daemon lifecycle drain/resume diagnostics.
+pub(crate) const DAEMON_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+/// Schema version for bounded JSONL runtime timeline events.
+pub(crate) const RUNTIME_TIMELINE_SCHEMA_VERSION: u32 = 1;
+/// Schema version for the Prometheus metric catalog and label policy.
+pub(crate) const METRICS_CATALOG_SCHEMA_VERSION: u32 = 1;
+/// Schema version for redacted local trace export records.
+pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
 /// Schema version for the test-only ABI contract snapshot suite.
 #[cfg(test)]
 pub(crate) const CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -64,6 +75,95 @@ const TOOL_CATALOG_BUILD_BUDGET_MS: u64 = 250;
 const ROUTE_PLANNING_BUDGET_MS: u64 = 250;
 const DAEMON_STARTUP_BASELINE_RSS_BYTES: u64 = 256 * 1024 * 1024;
 const AGENT_LOOP_BASELINE_RSS_BYTES: u64 = 384 * 1024 * 1024;
+const DIAGNOSTICS_TIMELINE_PAYLOAD_LIMIT_BYTES: usize = 2_048;
+const PROMETHEUS_SERIES_CAP: u64 = 256;
+const FORBIDDEN_METRIC_LABEL_KEYS: &[&str] =
+    &["run_id", "session_id", "tool_call_id", "path", "principal", "raw_user", "prompt"];
+const BOUNDED_METRIC_LABEL_KEYS: &[&str] =
+    &["component", "provider_kind", "state", "stat", "status", "token_type"];
+
+/// Coarse process lifecycle state surfaced by drain/restart diagnostics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DaemonLifecycleState {
+    Running,
+    Draining,
+    Drained,
+    ShutdownRequested,
+}
+
+impl DaemonLifecycleState {
+    pub(crate) const fn accepts_new_runs(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// Aggregated restart-resume guard counters shown in diagnostics and bundles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResumeGuardCounters {
+    pub(crate) incomplete_runs: u64,
+    pub(crate) safe_to_resume: u64,
+    pub(crate) requires_operator_review: u64,
+    pub(crate) stale_tool_execution: u64,
+    pub(crate) approval_pending: u64,
+    pub(crate) interrupted_by_shutdown: u64,
+}
+
+/// Operator-facing lifecycle snapshot for drain and restart-resume posture.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DaemonLifecycleSnapshot {
+    pub(crate) schema_version: u32,
+    pub(crate) state: DaemonLifecycleState,
+    pub(crate) accepts_new_runs: bool,
+    pub(crate) active_runs: u64,
+    pub(crate) queue_depth: u64,
+    pub(crate) pending_approvals: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) drain_started_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shutdown_requested_at_unix_ms: Option<i64>,
+    pub(crate) resume_guard: ResumeGuardCounters,
+    pub(crate) reason_codes: Vec<String>,
+    pub(crate) repair_hints: Vec<String>,
+}
+
+/// One bounded diagnostics timeline event. Payload values are redacted before
+/// JSONL export; labels stay low-cardinality and correlation ids are isolated
+/// from Prometheus labels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiagnosticsTimelineEvent {
+    pub(crate) schema_version: u32,
+    pub(crate) monotonic_ms: u64,
+    pub(crate) wall_time_unix_ms: i64,
+    pub(crate) component: String,
+    pub(crate) phase: String,
+    pub(crate) outcome: String,
+    pub(crate) correlation: BTreeMap<String, String>,
+    pub(crate) payload: Value,
+    pub(crate) redaction_level: String,
+}
+
+/// One redacted span record for local JSONL trace export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TraceSpanRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) trace_id: String,
+    pub(crate) span_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_span_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) component: String,
+    pub(crate) started_at_unix_ms: i64,
+    pub(crate) duration_ms: u64,
+    pub(crate) outcome: String,
+    pub(crate) correlation: BTreeMap<String, String>,
+    pub(crate) attributes: Value,
+    pub(crate) redaction_level: String,
+}
 
 /// Three-level health verdict used per component and overall.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -464,6 +564,283 @@ pub(crate) fn build_agent_runtime_metrics_snapshot(
     })
 }
 
+/// Builds a drain-aware lifecycle snapshot for admin, CLI, and support-bundle surfaces.
+pub(crate) fn build_daemon_lifecycle_snapshot(
+    state: DaemonLifecycleState,
+    active_runs: u64,
+    queue_depth: u64,
+    pending_approvals: u64,
+    drain_started_at_unix_ms: Option<i64>,
+    shutdown_requested_at_unix_ms: Option<i64>,
+    resume_guard: ResumeGuardCounters,
+) -> DaemonLifecycleSnapshot {
+    let mut reason_codes = Vec::new();
+    let mut repair_hints = Vec::new();
+    if !state.accepts_new_runs() {
+        reason_codes.push("daemon.lifecycle.not_accepting_new_runs".to_owned());
+        repair_hints.push("wait for active runs to drain before restart".to_owned());
+    }
+    if resume_guard.requires_operator_review > 0 {
+        reason_codes.push("daemon.lifecycle.resume_requires_operator_review".to_owned());
+        repair_hints
+            .push("inspect resume guard findings before replaying interrupted runs".to_owned());
+    }
+    if resume_guard.approval_pending > 0 {
+        reason_codes.push("daemon.lifecycle.approval_pending_after_restart".to_owned());
+        repair_hints.push("resolve pending approvals before continuing affected runs".to_owned());
+    }
+    if resume_guard.stale_tool_execution > 0 {
+        reason_codes.push("daemon.lifecycle.stale_tool_execution".to_owned());
+        repair_hints.push("verify tool side effects before resuming the run".to_owned());
+    }
+    if active_runs == 0 && matches!(state, DaemonLifecycleState::Draining) {
+        reason_codes.push("daemon.lifecycle.drain_complete".to_owned());
+        repair_hints.push("transition daemon lifecycle to drained".to_owned());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
+    repair_hints.sort();
+    repair_hints.dedup();
+
+    DaemonLifecycleSnapshot {
+        schema_version: DAEMON_LIFECYCLE_SCHEMA_VERSION,
+        state,
+        accepts_new_runs: state.accepts_new_runs(),
+        active_runs,
+        queue_depth,
+        pending_approvals,
+        drain_started_at_unix_ms,
+        shutdown_requested_at_unix_ms,
+        resume_guard,
+        reason_codes,
+        repair_hints,
+    }
+}
+
+/// Projects current gateway counters into the lifecycle contract when no
+/// explicit drain marker is active.
+pub(crate) fn build_daemon_lifecycle_snapshot_from_status(
+    status: &GatewayStatusSnapshot,
+    runtime_preview_payload: &Value,
+) -> DaemonLifecycleSnapshot {
+    let active_runs = status
+        .counters
+        .orchestrator_runs_started
+        .saturating_sub(status.counters.orchestrator_runs_completed)
+        .saturating_sub(status.counters.orchestrator_runs_cancelled);
+    let pending_approvals = status
+        .counters
+        .approvals_tool_requested
+        .saturating_sub(status.counters.approvals_tool_resolved_allow)
+        .saturating_sub(status.counters.approvals_tool_resolved_deny)
+        .saturating_sub(status.counters.approvals_tool_resolved_timeout)
+        .saturating_sub(status.counters.approvals_tool_resolved_error);
+    let resume_guard = ResumeGuardCounters {
+        incomplete_runs: active_runs,
+        approval_pending: pending_approvals,
+        interrupted_by_shutdown: read_u64(
+            runtime_preview_payload,
+            "/resume_guard/interrupted_by_shutdown",
+        ),
+        ..ResumeGuardCounters::default()
+    };
+    build_daemon_lifecycle_snapshot(
+        DaemonLifecycleState::Running,
+        active_runs,
+        status.counters.channel_router_queue_depth,
+        pending_approvals,
+        None,
+        None,
+        resume_guard,
+    )
+}
+
+/// Returns the metric catalog and cardinality policy consumed by `/metrics`
+/// tests and support bundles.
+pub(crate) fn build_metrics_catalog_snapshot() -> Value {
+    json!({
+        "schema_version": METRICS_CATALOG_SCHEMA_VERSION,
+        "series_cap": PROMETHEUS_SERIES_CAP,
+        "dropped_series_metric": "palyra_metrics_dropped_series_total",
+        "label_policy": {
+            "bounded_label_keys": BOUNDED_METRIC_LABEL_KEYS,
+            "forbidden_label_keys": FORBIDDEN_METRIC_LABEL_KEYS,
+            "max_label_value_bytes": 64,
+            "rejects_absolute_paths": true,
+            "rejects_principals": true,
+            "rejects_canonical_ids": true,
+            "rejects_secret_like_values": true,
+        },
+        "metrics": [
+            {"name": "palyra_agent_runs_started_total", "type": "counter", "labels": []},
+            {"name": "palyra_agent_runs_completed_total", "type": "counter", "labels": []},
+            {"name": "palyra_model_provider_requests_total", "type": "counter", "labels": ["provider_kind"]},
+            {"name": "palyra_model_provider_errors_total", "type": "counter", "labels": ["provider_kind"]},
+            {"name": "palyra_model_provider_tokens_total", "type": "counter", "labels": ["provider_kind", "token_type"]},
+            {"name": "palyra_model_provider_latency_ms", "type": "gauge", "labels": ["provider_kind", "stat"]},
+            {"name": "palyra_tool_execution_attempts_total", "type": "counter", "labels": []},
+            {"name": "palyra_tool_execution_failures_total", "type": "counter", "labels": []},
+            {"name": "palyra_tool_execution_timeouts_total", "type": "counter", "labels": []},
+            {"name": "palyra_tool_job_state", "type": "gauge", "labels": ["state"]},
+            {"name": "palyra_memory_recall_requests_total", "type": "counter", "labels": []},
+            {"name": "palyra_channel_delivery_events_total", "type": "counter", "labels": ["status"]},
+            {"name": "palyra_metrics_dropped_series_total", "type": "counter", "labels": []},
+        ],
+    })
+}
+
+/// Validates that Prometheus labels stay low-cardinality and secret-free.
+pub(crate) fn validate_metric_labels(labels: &[(&str, &str)]) -> Result<(), String> {
+    for (key, value) in labels {
+        if FORBIDDEN_METRIC_LABEL_KEYS.contains(key) {
+            return Err(format!("metric label '{key}' is forbidden"));
+        }
+        if !BOUNDED_METRIC_LABEL_KEYS.contains(key) {
+            return Err(format!("metric label '{key}' is not in the bounded label catalog"));
+        }
+        validate_metric_label_value(key, value)?;
+    }
+    Ok(())
+}
+
+fn validate_metric_label_value(key: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("metric label '{key}' must not be empty"));
+    }
+    if trimmed.len() > 64 {
+        return Err(format!("metric label '{key}' exceeds 64 bytes"));
+    }
+    if looks_like_absolute_path(trimmed) {
+        return Err(format!("metric label '{key}' must not contain absolute paths"));
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("user:")
+        || lowered.starts_with("admin:")
+        || lowered.contains(" bearer ")
+        || lowered.starts_with("bearer ")
+        || lowered.contains("token=")
+        || lowered.contains("password=")
+        || lowered.contains("secret=")
+        || lowered.starts_with("sk-")
+        || looks_like_ulid(trimmed)
+    {
+        return Err(format!(
+            "metric label '{key}' contains a high-cardinality or secret-like value"
+        ));
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')) {
+        return Err(format!("metric label '{key}' contains unsupported characters"));
+    }
+    Ok(())
+}
+
+/// Renders timeline events as bounded redacted JSONL.
+pub(crate) fn render_diagnostics_timeline_jsonl(
+    events: &[DiagnosticsTimelineEvent],
+) -> Result<String, serde_json::Error> {
+    let mut output = String::new();
+    for event in events {
+        let mut redacted = event.clone();
+        redact_diagnostics_value(&mut redacted.payload, None);
+        bound_timeline_payload(&mut redacted.payload);
+        output.push_str(serde_json::to_string(&redacted)?.as_str());
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// Builds the runtime diagnostics timeline contract and a redacted one-line
+/// sample so support bundles can validate JSONL parsing without a live file.
+pub(crate) fn build_diagnostics_timeline_contract(generated_at_unix_ms: i64) -> Value {
+    let event = DiagnosticsTimelineEvent {
+        schema_version: RUNTIME_TIMELINE_SCHEMA_VERSION,
+        monotonic_ms: 0,
+        wall_time_unix_ms: generated_at_unix_ms,
+        component: "daemon".to_owned(),
+        phase: "diagnostics_contract".to_owned(),
+        outcome: "contract_ready".to_owned(),
+        correlation: BTreeMap::new(),
+        payload: json!({
+            "source": "runtime_diagnostics",
+            "path_env": "PALYRA_DIAGNOSTICS_TIMELINE_PATH",
+        }),
+        redaction_level: "strict_bounded".to_owned(),
+    };
+    let sample_jsonl =
+        render_diagnostics_timeline_jsonl(&[event]).unwrap_or_else(|_| String::new());
+    json!({
+        "schema_version": RUNTIME_TIMELINE_SCHEMA_VERSION,
+        "status": "contract_ready",
+        "path_env": "PALYRA_DIAGNOSTICS_TIMELINE_PATH",
+        "config_path_key": "diagnostics.timeline.path",
+        "payload_limit_bytes": DIAGNOSTICS_TIMELINE_PAYLOAD_LIMIT_BYTES,
+        "required_fields": [
+            "monotonic_ms",
+            "wall_time_unix_ms",
+            "component",
+            "phase",
+            "outcome",
+            "correlation",
+            "payload",
+            "redaction_level"
+        ],
+        "sample_jsonl": sample_jsonl,
+    })
+}
+
+/// Returns the trace exporter contract. OTLP and Langfuse stay explicit
+/// opt-in adapters; local JSONL is the safe default implementation.
+pub(crate) fn build_trace_exporter_contract() -> Value {
+    let jsonl_renderer_ok = render_trace_jsonl(&[]).is_ok();
+    json!({
+        "schema_version": TRACE_EXPORT_SCHEMA_VERSION,
+        "default_exporter": "jsonl",
+        "exporters": [
+            {
+                "kind": "jsonl",
+                "status": "implemented",
+                "redaction": "strict_before_write",
+                "blocking_policy": "never_block_agent_loop",
+                "renderer_ok": jsonl_renderer_ok,
+            },
+            {
+                "kind": "otlp",
+                "status": "config_flag_required",
+                "redaction": "strict_before_export",
+                "blocking_policy": "drop_on_exporter_failure",
+            },
+            {
+                "kind": "langfuse",
+                "status": "config_flag_required",
+                "redaction": "strict_before_export",
+                "blocking_policy": "drop_on_exporter_failure",
+            },
+        ],
+        "drop_counter": "palyra_trace_export_dropped_spans_total",
+    })
+}
+
+/// Renders redacted trace spans for the local JSONL exporter.
+pub(crate) fn render_trace_jsonl(spans: &[TraceSpanRecord]) -> Result<String, serde_json::Error> {
+    let mut output = String::new();
+    for span in spans {
+        let mut redacted = span.clone();
+        redacted.name = sanitize_diagnostics_string(redacted.name.as_str(), Some("name"));
+        redacted.component =
+            sanitize_low_cardinality_value(redacted.component.as_str(), "trace.component");
+        redacted.outcome =
+            sanitize_low_cardinality_value(redacted.outcome.as_str(), "trace.outcome");
+        for value in redacted.correlation.values_mut() {
+            *value = sanitize_diagnostics_string(value.as_str(), Some("correlation"));
+        }
+        redact_diagnostics_value(&mut redacted.attributes, None);
+        output.push_str(serde_json::to_string(&redacted)?.as_str());
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 /// Renders the Prometheus text exposition for the daemon's core counters and
 /// gauges. Labels are restricted to bounded values (provider kind, job
 /// state, delivery status) -- never principals, sessions, or paths -- to keep
@@ -541,6 +918,36 @@ pub(crate) fn render_prometheus_metrics(
     );
     push_help(
         &mut output,
+        "palyra_model_provider_tokens_total",
+        "Total model provider token usage by bounded provider kind and token type.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_model_provider_tokens_total",
+        &[("provider_kind", status.model_provider.kind.as_str()), ("token_type", "prompt")],
+        status.model_provider.runtime_metrics.total_prompt_tokens,
+    );
+    push_sample(
+        &mut output,
+        "palyra_model_provider_tokens_total",
+        &[("provider_kind", status.model_provider.kind.as_str()), ("token_type", "completion")],
+        status.model_provider.runtime_metrics.total_completion_tokens,
+    );
+    push_help(
+        &mut output,
+        "palyra_model_provider_retries_total",
+        "Total model provider retry attempts by bounded provider kind.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_model_provider_retries_total",
+        &[("provider_kind", status.model_provider.kind.as_str())],
+        status.model_provider.runtime_metrics.total_retry_attempts,
+    );
+    push_help(
+        &mut output,
         "palyra_tool_execution_attempts_total",
         "Total tool execution attempts.",
         "counter",
@@ -550,6 +957,30 @@ pub(crate) fn render_prometheus_metrics(
         "palyra_tool_execution_attempts_total",
         &[],
         status.counters.tool_execution_attempts,
+    );
+    push_help(
+        &mut output,
+        "palyra_tool_execution_failures_total",
+        "Total tool execution failures.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_tool_execution_failures_total",
+        &[],
+        status.counters.tool_execution_failures,
+    );
+    push_help(
+        &mut output,
+        "palyra_tool_execution_timeouts_total",
+        "Total tool execution timeouts.",
+        "counter",
+    );
+    push_sample(
+        &mut output,
+        "palyra_tool_execution_timeouts_total",
+        &[],
+        status.counters.tool_execution_timeouts,
     );
     push_help(
         &mut output,
@@ -598,6 +1029,20 @@ pub(crate) fn render_prometheus_metrics(
         &[("status", "failed")],
         status.counters.channel_reply_failures,
     );
+    push_help(
+        &mut output,
+        "palyra_metrics_dropped_series_total",
+        "Prometheus series dropped by the metrics label validator or series cap.",
+        "counter",
+    );
+    push_sample(&mut output, "palyra_metrics_dropped_series_total", &[], 0);
+    push_help(
+        &mut output,
+        "palyra_metrics_series_cap",
+        "Configured maximum series emitted by the built-in metrics endpoint.",
+        "gauge",
+    );
+    push_sample(&mut output, "palyra_metrics_series_cap", &[], PROMETHEUS_SERIES_CAP);
     output
 }
 
@@ -1469,6 +1914,75 @@ fn metrics(entries: &[(&str, u64)]) -> BTreeMap<String, u64> {
     entries.iter().map(|(key, value)| ((*key).to_owned(), *value)).collect()
 }
 
+fn bound_timeline_payload(value: &mut Value) {
+    let Ok(encoded) = serde_json::to_vec(value) else {
+        *value = json!({
+            "truncated": true,
+            "reason": "payload_encode_failed",
+        });
+        return;
+    };
+    if encoded.len() <= DIAGNOSTICS_TIMELINE_PAYLOAD_LIMIT_BYTES {
+        return;
+    }
+    *value = json!({
+        "truncated": true,
+        "original_bytes": encoded.len(),
+        "limit_bytes": DIAGNOSTICS_TIMELINE_PAYLOAD_LIMIT_BYTES,
+        "redaction_level": "strict_bounded",
+    });
+}
+
+fn redact_diagnostics_value(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                redact_diagnostics_value(child, Some(key.as_str()));
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_diagnostics_value(child, key_context);
+            }
+        }
+        Value::String(raw) => {
+            *raw = sanitize_diagnostics_string(raw.as_str(), key_context);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn sanitize_diagnostics_string(raw: &str, key_context: Option<&str>) -> String {
+    if key_context.is_some_and(is_sensitive_key) {
+        return "<redacted>".to_owned();
+    }
+    let redacted = redact_diagnostic_text(raw);
+    let redacted = redact_internal_runtime_paths(redacted.as_str());
+    if redacted.contains("vault://") || redacted.contains("vault:") {
+        return "<vault_ref:redacted>".to_owned();
+    }
+    redacted
+}
+
+fn sanitize_low_cardinality_value(raw: &str, label_name: &str) -> String {
+    validate_metric_label_value(label_name, raw)
+        .map_or_else(|_| "invalid_label_redacted".to_owned(), |_| raw.to_owned())
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || value.starts_with('/')
+        || value.starts_with("\\\\")
+}
+
+fn looks_like_ulid(value: &str) -> bool {
+    value.len() == 26 && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
 fn read_u64(value: &Value, pointer: &str) -> u64 {
     value.pointer(pointer).and_then(Value::as_u64).unwrap_or_default()
 }
@@ -1510,6 +2024,10 @@ fn push_help(output: &mut String, name: &str, help: &str, metric_type: &str) {
 }
 
 fn push_sample(output: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    debug_assert!(
+        validate_metric_labels(labels).is_ok(),
+        "invalid metric labels for {name}: {labels:?}"
+    );
     output.push_str(name);
     if !labels.is_empty() {
         output.push('{');
@@ -1773,15 +2291,104 @@ mod tests {
         push_sample(
             &mut rendered,
             "palyra_model_provider_requests_total",
-            &[("provider_kind", "deterministic\n\"provider\"")],
+            &[("provider_kind", "deterministic_provider")],
             2,
         );
 
         assert!(rendered.contains(
-            "palyra_model_provider_requests_total{provider_kind=\"deterministic\\n\\\"provider\\\"\"} 2"
+            "palyra_model_provider_requests_total{provider_kind=\"deterministic_provider\"} 2"
         ));
         assert!(!rendered.contains("principal"));
         assert!(!rendered.contains("session_id"));
+    }
+
+    #[test]
+    fn lifecycle_snapshot_blocks_new_runs_while_draining() {
+        let snapshot = build_daemon_lifecycle_snapshot(
+            DaemonLifecycleState::Draining,
+            2,
+            3,
+            1,
+            Some(1_730_000_000_000),
+            None,
+            ResumeGuardCounters {
+                incomplete_runs: 2,
+                requires_operator_review: 1,
+                approval_pending: 1,
+                ..ResumeGuardCounters::default()
+            },
+        );
+
+        assert_eq!(snapshot.schema_version, DAEMON_LIFECYCLE_SCHEMA_VERSION);
+        assert_eq!(snapshot.state, DaemonLifecycleState::Draining);
+        assert!(!snapshot.accepts_new_runs);
+        assert!(snapshot
+            .reason_codes
+            .contains(&"daemon.lifecycle.not_accepting_new_runs".to_owned()));
+        assert!(snapshot
+            .reason_codes
+            .contains(&"daemon.lifecycle.resume_requires_operator_review".to_owned()));
+    }
+
+    #[test]
+    fn metrics_label_validator_rejects_high_cardinality_and_secret_values() {
+        assert!(validate_metric_labels(&[("provider_kind", "openai-compatible")]).is_ok());
+        assert!(validate_metric_labels(&[("principal", "user:alice")]).is_err());
+        assert!(validate_metric_labels(&[("provider_kind", "01ARZ3NDEKTSV4RRFFQ69G5FB0")]).is_err());
+        assert!(validate_metric_labels(&[("provider_kind", "C:\\Users\\Palo\\secret")]).is_err());
+        assert!(validate_metric_labels(&[("provider_kind", "Bearer raw")]).is_err());
+        assert_eq!(build_metrics_catalog_snapshot()["series_cap"], PROMETHEUS_SERIES_CAP);
+    }
+
+    #[test]
+    fn timeline_jsonl_redacts_and_bounds_payloads() {
+        let event = DiagnosticsTimelineEvent {
+            schema_version: RUNTIME_TIMELINE_SCHEMA_VERSION,
+            monotonic_ms: 42,
+            wall_time_unix_ms: 1_730_000_000_000,
+            component: "provider".to_owned(),
+            phase: "request".to_owned(),
+            outcome: "failed".to_owned(),
+            correlation: BTreeMap::from([("run".to_owned(), "run-1".to_owned())]),
+            payload: json!({
+                "authorization": "Bearer raw",
+                "message": format!("token=abc {}", "x".repeat(3_000)),
+            }),
+            redaction_level: "strict_bounded".to_owned(),
+        };
+
+        let jsonl = render_diagnostics_timeline_jsonl(&[event]).expect("timeline should render");
+        assert!(jsonl.contains("\"truncated\":true"));
+        assert!(!jsonl.contains("Bearer raw"));
+        assert!(!jsonl.contains("abc "));
+    }
+
+    #[test]
+    fn trace_jsonl_redacts_attributes_before_export() {
+        let span = TraceSpanRecord {
+            schema_version: TRACE_EXPORT_SCHEMA_VERSION,
+            trace_id: "trace-1".to_owned(),
+            span_id: "span-1".to_owned(),
+            parent_span_id: None,
+            name: "tool execution".to_owned(),
+            component: "tool_runtime".to_owned(),
+            started_at_unix_ms: 1_730_000_000_000,
+            duration_ms: 25,
+            outcome: "failed".to_owned(),
+            correlation: BTreeMap::from([("run_id".to_owned(), "run_123".to_owned())]),
+            attributes: json!({
+                "url": "https://example.test/callback?token=raw",
+                "refresh_token": "raw-refresh",
+            }),
+            redaction_level: "strict".to_owned(),
+        };
+
+        let jsonl = render_trace_jsonl(&[span]).expect("trace should render");
+        assert!(jsonl.contains("\"component\":\"tool_runtime\""));
+        assert!(jsonl.contains("\"url\""));
+        assert!(!jsonl.contains("token=raw"));
+        assert!(!jsonl.contains("raw-refresh"));
+        assert_eq!(build_trace_exporter_contract()["default_exporter"], "jsonl");
     }
 
     #[test]
