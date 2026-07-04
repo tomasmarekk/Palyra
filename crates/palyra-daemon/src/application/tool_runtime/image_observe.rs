@@ -290,6 +290,7 @@ fn image_observe_unsupported_base() -> Value {
         "oracle_workaround_allowed": false,
         "next_action": IMAGE_OBSERVE_UNSUPPORTED_NEXT_ACTION,
         "claim_boundary": "image content is unknown; do not claim image-derived facts unless a later successful OCR/vision capability provides them",
+        "runtime_contract": "palyra.image.observe uses the local image observation runtime; provider/model vision capability in model routing does not by itself enable OCR, vision, or provider handoff for this tool",
         "ocr": {
             "available": false,
             "text": "",
@@ -316,6 +317,11 @@ fn image_observe_capabilities() -> Value {
         "ocr_available": false,
         "vision_available": false,
         "provider_handoff_available": false,
+        "runtime_mode": "metadata_only_unsupported",
+        "provider_vision_bridge": {
+            "available": false,
+            "reason": "provider/model vision capability is not wired to palyra.image.observe in this runtime",
+        },
         "fallback": "unsupported_capability",
         "unsupported_capability": {
             "name": "ocr_or_vision",
@@ -533,6 +539,12 @@ mod tests {
         assert_eq!(output["blocked_capability"], "ocr_or_vision");
         assert_eq!(output["should_continue_image_task"], false);
         assert_eq!(output["oracle_workaround_allowed"], false);
+        assert!(output["runtime_contract"]
+            .as_str()
+            .expect("runtime contract should be model-visible")
+            .contains("provider/model vision capability"));
+        assert_eq!(output["capabilities"]["runtime_mode"], "metadata_only_unsupported");
+        assert_eq!(output["capabilities"]["provider_vision_bridge"]["available"], false);
         assert!(output["next_action"]
             .as_str()
             .expect("next action should be model-visible")

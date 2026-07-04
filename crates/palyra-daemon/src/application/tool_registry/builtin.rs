@@ -572,7 +572,7 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
         entry(
             "palyra.image.observe",
-            "Observe an image path or artifact without returning base64; returns OCR/vision metadata when available, otherwise a structured unsupported capability error that forbids verifier-oracle workarounds.",
+            "Resolve an image path or artifact without returning base64. Current local image runtime is metadata-only unless an OCR/vision backend is configured; when unsupported, this tool intentionally returns error_code=vision_not_available, capability_status=unsupported, provider_handoff_available=false, and next_action telling the agent to stop image-dependent visual claims. Provider/model vision capability in model routing does not by itself enable this local tool.",
             object_schema(
                 &[],
                 vec![

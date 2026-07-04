@@ -1317,8 +1317,9 @@ fn artifact_read_schema_defaults_to_text_preview() {
 fn image_observe_schema_exposes_path_and_artifact_targets() {
     let entry = registry_entry("palyra.image.observe").expect("image observe should be registered");
 
-    assert!(entry.description.contains("unsupported capability error"));
-    assert!(entry.description.contains("forbids verifier-oracle workarounds"));
+    assert!(entry.description.contains("error_code=vision_not_available"));
+    assert!(entry.description.contains("provider_handoff_available=false"));
+    assert!(entry.description.contains("Provider/model vision capability"));
     assert!(entry.input_schema["properties"].get("path").is_some());
     assert!(entry.input_schema["properties"].get("artifact_id").is_some());
     assert_eq!(entry.parallelism_policy, ToolParallelismPolicy::ReadOnly);
