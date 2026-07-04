@@ -17,7 +17,10 @@ use serde_json::{json, Value};
 use crate::{
     application::verification::{VerificationCommandClassifier, VerificationKind},
     gateway::current_unix_ms,
-    model_provider::{ProviderMessage, ProviderMessageRole, ProviderResponse, ProviderTurnOutput},
+    model_provider::{
+        ProviderMessage, ProviderMessageRole, ProviderResponse, ProviderTurnOutput,
+        TerminalOutcomeClass, TerminalOutcomeClassification,
+    },
 };
 use palyra_common::process_runner_input::parse_process_runner_tool_input;
 
@@ -423,6 +426,7 @@ pub(crate) struct AgentLoopFinalizationEnvelope {
     pub(crate) status: String,
     pub(crate) lifecycle_state: String,
     pub(crate) reason_code: String,
+    pub(crate) terminal_outcome: TerminalOutcomeClassification,
     pub(crate) partial: bool,
     pub(crate) continuation_required: bool,
     pub(crate) user_visible_message: String,
@@ -764,6 +768,8 @@ impl AgentRunLoopState {
     ) -> AgentLoopFinalizationEnvelope {
         let user_visible_message = user_visible_message.into();
         let outcome = self.finalization_outcome(reason);
+        let terminal_outcome =
+            terminal_outcome_from_finalization(reason, user_visible_message.as_str());
         let evidence_checkpoint = self.progress_checkpoint(run_id, reason);
         let final_answer_contract = final_answer_contract(run_id, outcome, reason);
         let evidence_summary = final_answer_evidence_summary(
@@ -782,6 +788,7 @@ impl AgentRunLoopState {
             status: outcome.status.to_owned(),
             lifecycle_state: outcome.lifecycle_state.to_owned(),
             reason_code: outcome.reason_code.to_owned(),
+            terminal_outcome,
             partial: outcome.partial,
             continuation_required: outcome.continuation_required,
             user_visible_message,
@@ -941,6 +948,53 @@ fn final_answer_contract(
         },
         event_types: final_answer_event_types(),
         redaction_level: FINAL_ANSWER_CONTRACT_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn terminal_outcome_from_finalization(
+    reason: AgentLoopTerminationReason,
+    user_visible_message: &str,
+) -> TerminalOutcomeClassification {
+    match reason {
+        AgentLoopTerminationReason::FinalAnswer => TerminalOutcomeClassification::runtime_observed(
+            TerminalOutcomeClass::VisibleText,
+            "terminal_outcome.visible_text",
+            user_visible_message.trim().len(),
+            0,
+        ),
+        AgentLoopTerminationReason::ProviderError => TerminalOutcomeClassification::runtime(
+            TerminalOutcomeClass::ProviderError,
+            "terminal_outcome.provider_error",
+        ),
+        AgentLoopTerminationReason::IncompleteFinalAnswer => {
+            let normalized = user_visible_message.to_ascii_lowercase();
+            let class = if normalized.contains("reasoning-only") {
+                TerminalOutcomeClass::ReasoningOnly
+            } else if normalized.contains("empty final answer") {
+                TerminalOutcomeClass::Empty
+            } else if normalized.contains("planning or intent statement") {
+                TerminalOutcomeClass::PlanningOnly
+            } else {
+                TerminalOutcomeClass::ProtocolError
+            };
+            TerminalOutcomeClassification::runtime(
+                class,
+                format!("terminal_outcome.{}", class.as_str()),
+            )
+        }
+        AgentLoopTerminationReason::ApprovalDenied
+        | AgentLoopTerminationReason::RepeatedToolFailure
+        | AgentLoopTerminationReason::ContextBudgetExhausted
+        | AgentLoopTerminationReason::BrowserFollowupTimeout
+        | AgentLoopTerminationReason::ToolFollowupTimeout
+        | AgentLoopTerminationReason::RunLoopPhaseTimeout
+        | AgentLoopTerminationReason::WallClock
+        | AgentLoopTerminationReason::Cancellation
+        | AgentLoopTerminationReason::MaxTurns
+        | AgentLoopTerminationReason::MaxToolCalls => TerminalOutcomeClassification::runtime(
+            TerminalOutcomeClass::ProtocolError,
+            format!("terminal_outcome.{}", reason.as_str()),
+        ),
     }
 }
 
@@ -2755,6 +2809,15 @@ mod tests {
             serde_json::from_value(finalization.clone()).expect("finalization should round-trip");
 
         assert_eq!(finalization["final_answer_contract"]["decision"], "accepted");
+        assert_eq!(finalization["terminal_outcome"]["class"], "visible_text");
+        assert_eq!(
+            finalization["terminal_outcome"]["reason_code"],
+            "terminal_outcome.visible_text"
+        );
+        assert_eq!(
+            finalization["terminal_outcome"]["visible_text_bytes"],
+            serde_json::json!("Created extract.js.".len())
+        );
         assert_eq!(
             finalization["final_answer_contract"]["journal_projection"]["event_type"],
             FINAL_ANSWER_CONTRACT_COMPLETED_EVENT
@@ -2884,6 +2947,7 @@ mod tests {
             serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
 
         assert_eq!(parsed["finalization"]["status"], "failed");
+        assert_eq!(parsed["finalization"]["terminal_outcome"]["class"], "protocol_error");
         assert_eq!(parsed["finalization"]["final_answer_contract"]["decision"], "rejected");
         assert_eq!(
             parsed["finalization"]["final_answer_contract"]["journal_projection"]["event_type"],
@@ -2891,6 +2955,28 @@ mod tests {
         );
         assert_eq!(parsed["finalization"]["evidence_summary"]["coverage"], "no_tool_evidence");
         assert_eq!(parsed["finalization"]["evidence_summary"]["tool_count"], 0);
+    }
+
+    #[test]
+    fn terminal_outcome_serializes_reasoning_only_recovery() {
+        let state = AgentRunLoopState::new(vec![ProviderMessage::user_text("hello")], 2, 1, 10_000);
+
+        let payload = state.termination_payload(
+            "run-01",
+            AgentLoopTerminationReason::IncompleteFinalAnswer,
+            "model returned reasoning-only output without a user-visible final answer",
+            None,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(payload.as_str()).expect("termination payload should be JSON");
+
+        assert_eq!(parsed["finalization"]["terminal_outcome"]["class"], "reasoning_only");
+        assert_eq!(
+            parsed["finalization"]["terminal_outcome"]["reason_code"],
+            "terminal_outcome.reasoning_only"
+        );
+        assert_eq!(parsed["finalization"]["terminal_outcome"]["requires_recovery"], true);
+        assert_eq!(parsed["finalization"]["final_answer_contract"]["decision"], "rejected");
     }
 
     #[test]

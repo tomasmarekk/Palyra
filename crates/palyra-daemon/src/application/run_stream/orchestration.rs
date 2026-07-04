@@ -51,13 +51,14 @@ use crate::{
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
     model_provider::{
-        bounded_provider_turn_output_for_persistence, decide_tool_repair_candidate,
-        normalize_assistant_output_for_tool_repair, provider_events_from_output,
-        tool_repair_audit_events_for_decision, ProviderEvent, ProviderFinishReason,
-        ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
+        bounded_provider_turn_output_for_persistence, classify_terminal_outcome,
+        decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
+        provider_events_from_output, tool_repair_audit_events_for_decision, ProviderEvent,
+        ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
-        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage,
-        DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES, PROVIDER_RECOVERY_DECISION_EVENT,
+        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass,
+        TerminalOutcomeClassification, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+        PROVIDER_RECOVERY_DECISION_EVENT,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -228,6 +229,8 @@ pub(crate) enum RunStreamProviderResponseOutcome {
         /// Normalized attempts used only by the no-progress controller.
         run_progress_attempts: Vec<RunProgressAttempt>,
         provider_trace_ref: Option<String>,
+        /// Provider-neutral class for the final shape of this turn.
+        terminal_outcome: TerminalOutcomeClassification,
         /// Final reply text; `Some` only when no tool results are pending.
         final_reply_text: Option<String>,
         /// Final output still needing tape persistence (deferred-token path).
@@ -2306,6 +2309,7 @@ pub(crate) async fn process_run_stream_message(
                 completed_tool_names,
                 run_progress_attempts,
                 provider_trace_ref,
+                terminal_outcome,
                 final_reply_text,
                 final_provider_output,
                 final_reply_tokens_deferred,
@@ -2313,9 +2317,11 @@ pub(crate) async fn process_run_stream_message(
                 loop_state.append_assistant_turn(&provider_output);
                 let should_refeed_tool_results = !tool_result_messages.is_empty();
                 if !should_refeed_tool_results {
-                    if let Some(message) =
-                        incomplete_terminal_final_answer(final_reply_text.as_deref(), &loop_state)
-                    {
+                    if let Some(message) = incomplete_terminal_outcome_message(
+                        &terminal_outcome,
+                        final_reply_text.as_deref(),
+                        &loop_state,
+                    ) {
                         if let Some(recovery_prompt) = final_answer_recovery_prompt(
                             message.as_str(),
                             &loop_state,
@@ -2769,6 +2775,7 @@ async fn process_run_stream_provider_response(
     model_token_compaction_emitted: &mut bool,
 ) -> Result<RunStreamProviderResponseOutcome, Status> {
     let provider_output = bounded_provider_turn_output_for_persistence(&provider_response.output);
+    let terminal_outcome = classify_terminal_outcome(&provider_output);
     // Turns with tool proposals stream their text immediately (it is progress
     // narration). Turns without tool proposals defer token emission: the text
     // is a candidate final answer that may still be rejected by the
@@ -2925,6 +2932,7 @@ async fn process_run_stream_provider_response(
         completed_tool_names,
         run_progress_attempts,
         provider_trace_ref: provider_output.raw_provider_refs.provider_trace_ref.clone(),
+        terminal_outcome,
         final_reply_text: (!has_pending_tool_results).then_some(reply_text),
         final_provider_output: (!has_pending_tool_results && !stream_model_tokens_immediately)
             .then_some(Box::new(provider_output)),
@@ -3644,6 +3652,11 @@ fn final_answer_recovery_prompt(
 
     let normalized = message.to_ascii_lowercase();
     if loop_state.completed_tool_calls() == 0 {
+        if normalized.contains("empty final answer") || normalized.contains("reasoning-only") {
+            return Some(
+                "The provider did not produce a user-visible final answer. Retry the turn once with a concise user-visible answer, or issue the minimal structured tool call required to make progress. Do not return analysis-only text or an empty response.",
+            );
+        }
         if normalized.contains("planning or intent statement")
             && user_requested_summary_only_closeout(loop_state.messages().as_slice())
         {
@@ -3916,6 +3929,28 @@ fn incomplete_final_answer_without_tools(
         );
     }
     None
+}
+
+fn incomplete_terminal_outcome_message(
+    terminal_outcome: &TerminalOutcomeClassification,
+    text: Option<&str>,
+    loop_state: &AgentRunLoopState,
+) -> Option<String> {
+    match terminal_outcome.class {
+        TerminalOutcomeClass::ReasoningOnly => Some(
+            "model returned reasoning-only output without a user-visible final answer".to_owned(),
+        ),
+        TerminalOutcomeClass::Empty
+        | TerminalOutcomeClass::PlanningOnly
+        | TerminalOutcomeClass::VisibleText
+        | TerminalOutcomeClass::IntentionalSilent => {
+            incomplete_terminal_final_answer(text, loop_state)
+        }
+        TerminalOutcomeClass::ToolOnly => None,
+        TerminalOutcomeClass::ProviderError | TerminalOutcomeClass::ProtocolError => {
+            Some(format!("model terminal outcome was {}", terminal_outcome.class.as_str()))
+        }
+    }
 }
 
 fn incomplete_terminal_final_answer(
@@ -4333,21 +4368,22 @@ mod tests {
         contains_raw_provider_tool_call_markup, effective_provider_request_deadline,
         final_answer_recovery_fallback_summary, final_answer_recovery_prompt,
         followup_timeout_recovery_prompt, incomplete_final_answer_without_tools,
-        incomplete_terminal_final_answer, is_browser_tool_name,
-        is_run_stream_response_channel_closed, length_recovery_prompt, phase_heartbeat_interval,
-        provider_error_partial_summary, provider_model_override_for_routing,
-        provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
-        provider_request_timeout_message, provider_request_timeout_status,
-        provider_status_recovery_decision_payload, provider_timeout_termination_reason,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        run_progress_attempt_from_tool_result, should_emit_budget_exhausted_partial_summary,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunLoopPhase, RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
+        incomplete_terminal_final_answer, incomplete_terminal_outcome_message,
+        is_browser_tool_name, is_run_stream_response_channel_closed, length_recovery_prompt,
+        phase_heartbeat_interval, provider_error_partial_summary,
+        provider_model_override_for_routing, provider_output_needs_tool_repair_audit,
+        provider_request_deadline_timeout, provider_request_timeout_message,
+        provider_request_timeout_status, provider_status_recovery_decision_payload,
+        provider_timeout_termination_reason, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamToolResultForModel, BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
     };
@@ -4357,7 +4393,7 @@ mod tests {
         ProviderFinishReason, ProviderMessage, ProviderMessageContentPart,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
         ProviderRouteCandidateTrace, ProviderRouteSelectionTrace, ProviderTurnOutput,
-        ProviderUsage,
+        ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
     };
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -5781,6 +5817,60 @@ mod tests {
             .is_none(),
             "final-answer recovery must be attempted at most once per run"
         );
+    }
+
+    #[test]
+    fn empty_final_without_tools_gets_one_recovery_prompt() {
+        let state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Explain the current status.".to_owned())],
+            4,
+            8,
+            10_000,
+        );
+
+        let prompt = final_answer_recovery_prompt(
+            "model returned an empty final answer without executing any requested tools",
+            &state,
+            false,
+        )
+        .expect("empty no-tool final answer should get one recovery turn");
+
+        assert!(prompt.contains("user-visible final answer"));
+        assert!(
+            final_answer_recovery_prompt(
+                "model returned an empty final answer without executing any requested tools",
+                &state,
+                true,
+            )
+            .is_none(),
+            "empty no-tool recovery must remain bounded"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_terminal_outcome_gets_recovery_prompt() {
+        let state = AgentRunLoopState::new(
+            vec![ProviderMessage::user_text("Summarize the repo.".to_owned())],
+            4,
+            8,
+            10_000,
+        );
+        let terminal_outcome = TerminalOutcomeClassification::runtime(
+            TerminalOutcomeClass::ReasoningOnly,
+            "terminal_outcome.reasoning_only",
+        );
+
+        let message = incomplete_terminal_outcome_message(
+            &terminal_outcome,
+            Some("Reasoning: I need to inspect the repo."),
+            &state,
+        )
+        .expect("reasoning-only output must not be accepted as final");
+        let prompt = final_answer_recovery_prompt(message.as_str(), &state, false)
+            .expect("reasoning-only output should get one recovery turn");
+
+        assert!(message.contains("reasoning-only"));
+        assert!(prompt.contains("analysis-only text"));
     }
 
     #[test]

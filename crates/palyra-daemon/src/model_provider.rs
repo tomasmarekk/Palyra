@@ -72,22 +72,23 @@ use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
+    classify_terminal_outcome, AudioTranscriptionRequest, AudioTranscriptionResponse,
+    AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy,
+    PromptCacheReport, PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary,
+    ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+    ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
+    ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
+    ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
+    ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+};
+#[allow(unused_imports)]
+pub use palyra_model_providers::{
     decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
     tool_repair_audit_events_for_decision, NormalizedAssistantOutput, ProviderNeutralStreamEvent,
     ProviderStreamSegment, ToolProposalCandidate, ToolRepairAuditEvent, ToolRepairBoundary,
     ToolRepairBoundaryState, ToolRepairCandidate, ToolRepairCandidateFormat, ToolRepairDecision,
     ToolRepairDecisionStatus, ToolRepairStreamNormalizer, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
-};
-#[allow(unused_imports)]
-pub use palyra_model_providers::{
-    AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
-    EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
-    PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary, ProviderEvent,
-    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
-    ProviderPromptCacheHint, ProviderPromptSegment, ProviderPromptSegmentKind,
-    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{

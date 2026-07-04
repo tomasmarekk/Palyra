@@ -493,6 +493,128 @@ impl ProviderFinishReason {
     }
 }
 
+/// Provider-neutral class for the terminal shape of one model turn.
+///
+/// This is intentionally about what the runtime can safely do next, not
+/// vendor-specific stop reasons. A turn with only tool proposals is not a
+/// final answer; empty, reasoning-only, and planning-only turns require a
+/// recovery path before the run may be accepted as complete.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOutcomeClass {
+    /// The turn contains user-visible answer text.
+    VisibleText,
+    /// The provider emitted no visible text and no structured tool proposal.
+    Empty,
+    /// The provider emitted only internal reasoning or analysis text.
+    ReasoningOnly,
+    /// The provider emitted intent to do work instead of a result or tool call.
+    PlanningOnly,
+    /// The provider emitted structured tool proposals and no visible answer.
+    ToolOnly,
+    /// The provider intentionally stopped without user-visible content.
+    IntentionalSilent,
+    /// The provider request failed before a usable turn was produced.
+    ProviderError,
+    /// The provider turn violated the runtime protocol.
+    ProtocolError,
+}
+
+impl TerminalOutcomeClass {
+    /// Stable snake_case label used in telemetry and tape payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VisibleText => "visible_text",
+            Self::Empty => "empty",
+            Self::ReasoningOnly => "reasoning_only",
+            Self::PlanningOnly => "planning_only",
+            Self::ToolOnly => "tool_only",
+            Self::IntentionalSilent => "intentional_silent",
+            Self::ProviderError => "provider_error",
+            Self::ProtocolError => "protocol_error",
+        }
+    }
+
+    /// Returns whether accepting the turn as complete would be unsafe.
+    #[must_use]
+    pub const fn requires_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::Empty
+                | Self::ReasoningOnly
+                | Self::PlanningOnly
+                | Self::ProviderError
+                | Self::ProtocolError
+        )
+    }
+
+    /// Returns whether the turn should continue into tool execution.
+    #[must_use]
+    pub const fn continues_tool_execution(self) -> bool {
+        matches!(self, Self::ToolOnly)
+    }
+}
+
+/// Structured terminal-outcome report for one provider turn or runtime failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalOutcomeClassification {
+    /// Coarse terminal class selected by the runtime.
+    pub class: TerminalOutcomeClass,
+    /// Stable reason code suitable for tape, journal, and QA reports.
+    pub reason_code: String,
+    /// Whether the runtime must recover or fail instead of accepting completion.
+    pub requires_recovery: bool,
+    /// Whether the turn contains structured tool proposals to execute.
+    pub continues_tool_execution: bool,
+    /// UTF-8 byte length of user-visible text in this turn.
+    pub visible_text_bytes: usize,
+    /// Number of structured tool calls proposed by this turn.
+    pub tool_call_count: usize,
+    /// Provider finish reason when this report came from a provider turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<ProviderFinishReason>,
+}
+
+impl TerminalOutcomeClassification {
+    fn from_class(
+        class: TerminalOutcomeClass,
+        reason_code: impl Into<String>,
+        visible_text_bytes: usize,
+        tool_call_count: usize,
+        finish_reason: Option<ProviderFinishReason>,
+    ) -> Self {
+        Self {
+            class,
+            reason_code: reason_code.into(),
+            requires_recovery: class.requires_recovery(),
+            continues_tool_execution: class.continues_tool_execution(),
+            visible_text_bytes,
+            tool_call_count,
+            finish_reason,
+        }
+    }
+
+    /// Builds a runtime-side terminal outcome when no provider turn output
+    /// is available at finalization.
+    #[must_use]
+    pub fn runtime(class: TerminalOutcomeClass, reason_code: impl Into<String>) -> Self {
+        Self::from_class(class, reason_code, 0, 0, None)
+    }
+
+    /// Builds a runtime-side terminal outcome with observed text/tool counts
+    /// when the full provider turn is no longer available.
+    #[must_use]
+    pub fn runtime_observed(
+        class: TerminalOutcomeClass,
+        reason_code: impl Into<String>,
+        visible_text_bytes: usize,
+        tool_call_count: usize,
+    ) -> Self {
+        Self::from_class(class, reason_code, visible_text_bytes, tool_call_count, None)
+    }
+}
+
 /// Token accounting for one turn. `source` distinguishes provider-reported
 /// counts ("provider") from local estimates ("estimated") so downstream
 /// budget logic can weigh them differently.
@@ -653,6 +775,147 @@ impl ProviderTurnOutput {
         }
     }
 }
+
+/// Classifies the terminal shape of a bounded provider turn.
+///
+/// The classifier uses only provider-neutral output structure plus
+/// conservative text markers. It never rewrites text or tool calls; callers
+/// decide whether to retry, execute tools, nudge verification, or fail closed.
+#[must_use]
+pub fn classify_terminal_outcome(output: &ProviderTurnOutput) -> TerminalOutcomeClassification {
+    let visible_text = terminal_visible_text(output);
+    let trimmed_text = visible_text.trim();
+    let visible_text_bytes = trimmed_text.len();
+    let tool_call_count = output
+        .content_parts
+        .iter()
+        .filter(|part| matches!(part, ProviderOutputContentPart::ToolCall { .. }))
+        .count();
+    let class = if tool_call_count > 0 && trimmed_text.is_empty() {
+        TerminalOutcomeClass::ToolOnly
+    } else if trimmed_text.is_empty() {
+        match output.finish_reason {
+            ProviderFinishReason::Cancelled => TerminalOutcomeClass::IntentionalSilent,
+            _ => TerminalOutcomeClass::Empty,
+        }
+    } else if terminal_text_is_reasoning_only(trimmed_text) {
+        TerminalOutcomeClass::ReasoningOnly
+    } else if terminal_text_is_planning_only(trimmed_text) {
+        TerminalOutcomeClass::PlanningOnly
+    } else {
+        TerminalOutcomeClass::VisibleText
+    };
+    TerminalOutcomeClassification::from_class(
+        class,
+        format!("terminal_outcome.{}", class.as_str()),
+        visible_text_bytes,
+        tool_call_count,
+        Some(output.finish_reason),
+    )
+}
+
+fn terminal_visible_text(output: &ProviderTurnOutput) -> String {
+    let parts = output
+        .content_parts
+        .iter()
+        .filter_map(|part| match part {
+            ProviderOutputContentPart::Text { text } => Some(text.as_str()),
+            ProviderOutputContentPart::ToolCall { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        output.full_text.clone()
+    } else {
+        parts.join("")
+    }
+}
+
+fn terminal_text_is_reasoning_only(text: &str) -> bool {
+    let normalized = normalize_terminal_text(text);
+    const REASONING_PREFIXES: &[&str] = &[
+        "analysis:",
+        "reasoning:",
+        "thought:",
+        "<analysis>",
+        "<reasoning>",
+        "<thought>",
+        "[analysis]",
+        "[reasoning]",
+        "[thought]",
+    ];
+    REASONING_PREFIXES.iter().any(|prefix| normalized.starts_with(prefix))
+        && !normalized.contains("final:")
+        && !normalized.contains("answer:")
+        && !normalized.contains("result:")
+}
+
+fn terminal_text_is_planning_only(text: &str) -> bool {
+    let normalized = normalize_terminal_text(text);
+    if TERMINAL_PLANNING_NEGATIONS.iter().any(|marker| normalized.contains(marker)) {
+        return false;
+    }
+    TERMINAL_PLANNING_MARKERS.iter().any(|marker| normalized.contains(marker))
+        && TERMINAL_PLANNING_ACTIONS
+            .iter()
+            .any(|marker| terminal_text_has_word(normalized.as_str(), marker))
+}
+
+fn normalize_terminal_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_text_has_word(normalized: &str, marker: &str) -> bool {
+    normalized
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == marker)
+}
+
+const TERMINAL_PLANNING_MARKERS: &[&str] = &[
+    "let me ",
+    "i will ",
+    "i'll ",
+    "i need to ",
+    "i should ",
+    "i am going to ",
+    "i'm going to ",
+    "next, i ",
+];
+
+const TERMINAL_PLANNING_NEGATIONS: &[&str] = &[
+    "i will not ",
+    "i won't ",
+    "i should not ",
+    "i don't need to ",
+    "i do not need to ",
+    "i am not going to ",
+    "i'm not going to ",
+];
+
+const TERMINAL_PLANNING_ACTIONS: &[&str] = &[
+    "apply_patch",
+    "browse",
+    "build",
+    "check",
+    "create",
+    "edit",
+    "fix",
+    "implement",
+    "inspect",
+    "list",
+    "open",
+    "patch",
+    "read",
+    "run",
+    "search",
+    "test",
+    "update",
+    "verify",
+    "write",
+];
 
 /// Returns a copy of `output` with `full_text` and every text content part
 /// re-bounded for persistence, flagging truncation when any part was cut.
@@ -942,9 +1205,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        bounded_provider_turn_output_for_persistence, provider_events_from_output, ProviderEvent,
-        ProviderFinishReason, ProviderOutputContentPart, ProviderRawProviderRefs,
-        ProviderRedactionState, ProviderTurnOutput, ProviderUsage, MAX_PROVIDER_TURN_TEXT_BYTES,
+        bounded_provider_turn_output_for_persistence, classify_terminal_outcome,
+        provider_events_from_output, ProviderEvent, ProviderFinishReason,
+        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRedactionState,
+        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, MAX_PROVIDER_TURN_TEXT_BYTES,
     };
 
     fn provider_output(
@@ -1077,5 +1341,79 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(final_flags, vec![false, true]);
+    }
+
+    #[test]
+    fn terminal_outcome_classifier_distinguishes_visible_and_empty_turns() {
+        let visible = ProviderTurnOutput::text(
+            "Final answer.".to_owned(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(1, 2, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+        let empty = ProviderTurnOutput::text(
+            String::new(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(1, 0, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        let visible_class = classify_terminal_outcome(&visible);
+        let empty_class = classify_terminal_outcome(&empty);
+
+        assert_eq!(visible_class.class, TerminalOutcomeClass::VisibleText);
+        assert!(!visible_class.requires_recovery);
+        assert_eq!(empty_class.class, TerminalOutcomeClass::Empty);
+        assert!(empty_class.requires_recovery);
+    }
+
+    #[test]
+    fn terminal_outcome_classifier_marks_reasoning_only_as_recoverable() {
+        let output = ProviderTurnOutput::text(
+            "Reasoning: I need to inspect the repository first.".to_owned(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(1, 8, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        let classification = classify_terminal_outcome(&output);
+
+        assert_eq!(classification.class, TerminalOutcomeClass::ReasoningOnly);
+        assert_eq!(classification.reason_code, "terminal_outcome.reasoning_only");
+        assert!(classification.requires_recovery);
+    }
+
+    #[test]
+    fn terminal_outcome_classifier_marks_planning_only_as_recoverable() {
+        let output = ProviderTurnOutput::text(
+            "I'll create the files and run tests next.".to_owned(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(1, 8, "test"),
+            ProviderRawProviderRefs::default(),
+        );
+
+        let classification = classify_terminal_outcome(&output);
+
+        assert_eq!(classification.class, TerminalOutcomeClass::PlanningOnly);
+        assert!(classification.requires_recovery);
+    }
+
+    #[test]
+    fn terminal_outcome_classifier_keeps_tool_only_on_execution_path() {
+        let output = provider_output(
+            vec![ProviderOutputContentPart::ToolCall {
+                proposal_id: "proposal-1".to_owned(),
+                tool_name: "palyra.process.run".to_owned(),
+                input_json: json!({"command": "cargo", "args": ["test"]}),
+            }],
+            ProviderFinishReason::ToolCalls,
+        );
+
+        let classification = classify_terminal_outcome(&output);
+
+        assert_eq!(classification.class, TerminalOutcomeClass::ToolOnly);
+        assert!(!classification.requires_recovery);
+        assert!(classification.continues_tool_execution);
+        assert_eq!(classification.tool_call_count, 1);
     }
 }

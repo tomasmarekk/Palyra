@@ -34,15 +34,16 @@ pub use config::{
 };
 pub use contract::{
     append_provider_text_with_hard_limit, bounded_provider_turn_output_for_persistence,
-    model_id_supports_reasoning_effort, provider_events_from_output, provider_request_has_vision,
-    AudioTranscriptionRequest, AudioTranscriptionResponse, AudioTranscriptionSegment,
-    EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy, PromptCacheReport,
-    PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary, ProviderEvent,
-    ProviderFinishReason, ProviderImageInput, ProviderMessage, ProviderMessageContentPart,
-    ProviderMessageRole, ProviderMessageToolCall, ProviderOutputContentPart,
-    ProviderPromptCacheHint, ProviderPromptSegment, ProviderPromptSegmentKind,
-    ProviderRawProviderRefs, ProviderReasoningEffort, ProviderRedactionState, ProviderRequest,
-    ProviderResponse, ProviderServiceTier, ProviderTurnOutput, ProviderUsage,
+    classify_terminal_outcome, model_id_supports_reasoning_effort, provider_events_from_output,
+    provider_request_has_vision, AudioTranscriptionRequest, AudioTranscriptionResponse,
+    AudioTranscriptionSegment, EmbeddingsRequest, EmbeddingsResponse, PromptCachePolicy,
+    PromptCacheReport, PromptCacheStrategy, ProviderAttemptState, ProviderAttemptSummary,
+    ProviderEvent, ProviderFinishReason, ProviderImageInput, ProviderMessage,
+    ProviderMessageContentPart, ProviderMessageRole, ProviderMessageToolCall,
+    ProviderOutputContentPart, ProviderPromptCacheHint, ProviderPromptSegment,
+    ProviderPromptSegmentKind, ProviderRawProviderRefs, ProviderReasoningEffort,
+    ProviderRedactionState, ProviderRequest, ProviderResponse, ProviderServiceTier,
+    ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
     DEFAULT_PROVIDER_STREAM_EVENT_TOKEN_CHUNK_SIZE, MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 pub use discovery::{
