@@ -26,7 +26,7 @@ fixtures:
       error_message: Tool-call arguments ended before a complete JSON object.
     expected:
       verdict: fail_closed
-      failure_class: malformed_response
+      failure_class: truncated_tool_arguments
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Reject the incomplete tool proposal and surface malformed_response evidence.
@@ -44,7 +44,7 @@ fixtures:
       error_message: Tool-call arguments are not valid JSON.
     expected:
       verdict: fail_closed
-      failure_class: malformed_response
+      failure_class: bad_tool_arguments
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Reject invalid tool JSON before execution and include the JSON parser failure in QA evidence.
@@ -62,7 +62,7 @@ fixtures:
       error_message: Provider emitted a tool name outside the model-visible catalog.
     expected:
       verdict: fail_closed
-      failure_class: malformed_response
+      failure_class: bad_tool_arguments
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Deny the unknown tool name and do not dispatch any tool execution.
@@ -80,7 +80,7 @@ fixtures:
       error_message: Provider returned an empty assistant final answer.
     expected:
       verdict: recover
-      failure_class: malformed_response
+      failure_class: empty_output
       recovery_decision: retry_same_provider
       fail_closed: false
       recovery_path: Retry the same provider once with the prior context and record empty_response evidence.
@@ -97,7 +97,7 @@ fixtures:
       error_message: Maximum context length exceeded.
     expected:
       verdict: recover
-      failure_class: context_window_exceeded
+      failure_class: context_overflow
       recovery_decision: compact_and_retry
       fail_closed: false
       recovery_path: Compact the session context, preserve tool results, and retry with a smaller prompt.
@@ -114,7 +114,7 @@ fixtures:
       error_message: Provider rate limit exceeded.
     expected:
       verdict: recover
-      failure_class: rate_limited
+      failure_class: rate_limit
       recovery_decision: retry_after
       fail_closed: false
       recovery_path: Respect retry-after/backoff before retrying the same provider.
@@ -131,7 +131,7 @@ fixtures:
       error_message: Provider quota exhausted.
     expected:
       verdict: fail_closed
-      failure_class: quota_exceeded
+      failure_class: quota
       recovery_decision: ask_user
       fail_closed: true
       recovery_path: Stop the run and ask the operator to update billing or select another authorized provider.
@@ -165,7 +165,7 @@ fixtures:
       error_message: Provider rejected the requested schema contract.
     expected:
       verdict: fail_closed
-      failure_class: permanent_upstream
+      failure_class: schema_rejected
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Fail closed unless a tested schema downgrade or fallback model is explicitly configured.
@@ -182,7 +182,7 @@ fixtures:
       error_message: Provider stream emitted malformed SSE JSON.
     expected:
       verdict: recover
-      failure_class: malformed_response
+      failure_class: malformed_stream
       recovery_decision: retry_same_provider
       fail_closed: false
       recovery_path: Discard the partial chunk, mark the stream malformed, and retry through the stream normalizer.
@@ -199,7 +199,7 @@ fixtures:
       error_message: Tool result payload exceeded the provider follow-up limit.
     expected:
       verdict: fail_closed
-      failure_class: context_window_exceeded
+      failure_class: payload_too_large
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Refuse to resend the oversized tool result until a redacted or summarized artifact is available.
@@ -217,7 +217,7 @@ fixtures:
       error_message: Provider emitted final text before patch verification completed.
     expected:
       verdict: fail_closed
-      failure_class: malformed_response
+      failure_class: premature_final
       recovery_decision: fail_closed
       fail_closed: true
       recovery_path: Hold the run in verification-required state and reject the premature final answer.

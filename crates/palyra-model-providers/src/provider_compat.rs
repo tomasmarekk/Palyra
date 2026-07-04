@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    sanitize_remote_error, ProviderFailureClass, ProviderRecoveryDecisionKind,
-    QaMockProviderBehaviorKind,
+    sanitize_remote_error, ProviderFailureClass, ProviderFailureClassification,
+    ProviderFailureClassifier, ProviderRecoveryDecisionKind, QaMockProviderBehaviorKind,
 };
 
 /// Current provider compatibility fixture pack schema version.
@@ -498,6 +498,18 @@ pub fn provider_compat_fixture_pack_report(
         raw_payload_redaction: pack.anonymization.redaction_level.clone(),
         fixtures,
     }
+}
+
+/// Classifies one compatibility fixture with the runtime provider classifier.
+#[must_use]
+pub fn provider_compat_fixture_classification(
+    fixture: &ProviderCompatFixture,
+) -> ProviderFailureClassification {
+    ProviderFailureClassifier::new().classify_fixture_category(
+        fixture.category.as_str(),
+        fixture.raw_payload.status_code,
+        fixture.id.as_str(),
+    )
 }
 
 fn provider_compat_fixture_report(fixture: &ProviderCompatFixture) -> ProviderCompatFixtureReport {
@@ -1146,13 +1158,24 @@ fn parse_failure_class(value: &str) -> Option<ProviderFailureClass> {
         "auth_invalid" => Some(ProviderFailureClass::AuthInvalid),
         "auth_expired" => Some(ProviderFailureClass::AuthExpired),
         "permission_denied" => Some(ProviderFailureClass::PermissionDenied),
+        "rate_limit" => Some(ProviderFailureClass::RateLimit),
         "rate_limited" => Some(ProviderFailureClass::RateLimited),
+        "quota" => Some(ProviderFailureClass::Quota),
         "quota_exceeded" => Some(ProviderFailureClass::QuotaExceeded),
+        "schema_rejected" => Some(ProviderFailureClass::SchemaRejected),
+        "bad_tool_arguments" => Some(ProviderFailureClass::BadToolArguments),
+        "truncated_tool_arguments" => Some(ProviderFailureClass::TruncatedToolArguments),
+        "context_overflow" => Some(ProviderFailureClass::ContextOverflow),
         "transient_upstream" => Some(ProviderFailureClass::TransientUpstream),
         "permanent_upstream" => Some(ProviderFailureClass::PermanentUpstream),
         "context_window_exceeded" => Some(ProviderFailureClass::ContextWindowExceeded),
         "content_policy_blocked" => Some(ProviderFailureClass::ContentPolicyBlocked),
         "malformed_response" => Some(ProviderFailureClass::MalformedResponse),
+        "malformed_stream" => Some(ProviderFailureClass::MalformedStream),
+        "empty_output" => Some(ProviderFailureClass::EmptyOutput),
+        "premature_final" => Some(ProviderFailureClass::PrematureFinal),
+        "payload_too_large" => Some(ProviderFailureClass::PayloadTooLarge),
+        "provider_unavailable" => Some(ProviderFailureClass::ProviderUnavailable),
         "network_unavailable" => Some(ProviderFailureClass::NetworkUnavailable),
         "provider_timeout" => Some(ProviderFailureClass::ProviderTimeout),
         _ => None,
@@ -1163,6 +1186,7 @@ fn parse_recovery_decision(value: &str) -> Option<ProviderRecoveryDecisionKind> 
     match value {
         "retry_same_provider" => Some(ProviderRecoveryDecisionKind::RetrySameProvider),
         "retry_after" => Some(ProviderRecoveryDecisionKind::RetryAfter),
+        "retry_transformed" => Some(ProviderRecoveryDecisionKind::RetryTransformed),
         "refresh_credential" => Some(ProviderRecoveryDecisionKind::RefreshCredential),
         "failover_provider" => Some(ProviderRecoveryDecisionKind::FailoverProvider),
         "compact_and_retry" => Some(ProviderRecoveryDecisionKind::CompactAndRetry),
@@ -1198,6 +1222,7 @@ fn push_issue(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ProviderError, ProviderFailureAction};
 
     const EXAMPLE_PACK: &str =
         include_str!("../../../fixtures/provider_compat/p0_provider_compat_pack.yaml");
@@ -1228,10 +1253,42 @@ mod tests {
 
         assert_eq!(
             context_overflow.expected_failure_class,
-            ProviderFailureClass::ContextWindowExceeded.as_str()
+            ProviderFailureClass::ContextOverflow.as_str()
         );
         assert_eq!(context_overflow.expected_recovery_decision, "compact_and_retry");
         assert!(context_overflow.recovery_path.to_ascii_lowercase().contains("compact"));
+    }
+
+    #[test]
+    fn fixture_expected_outcomes_match_provider_classifier() {
+        let pack = parse_provider_compat_fixture_pack_yaml(EXAMPLE_PACK)
+            .expect("provider compatibility fixture pack should parse");
+
+        for fixture in pack.fixtures.iter() {
+            let classification = provider_compat_fixture_classification(fixture);
+            assert_eq!(
+                classification.class, fixture.expected.failure_class,
+                "fixture {} should match classifier failure class",
+                fixture.id
+            );
+            let retryable = classification.recommended_action == ProviderFailureAction::Retry;
+            let error = ProviderError::RequestFailed {
+                message: fixture
+                    .mock_behavior
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| fixture.title.clone()),
+                retryable,
+                retry_count: 0,
+                classification,
+            };
+            assert_eq!(
+                error.envelope().recovery_decision.decision,
+                fixture.expected.recovery_decision,
+                "fixture {} should match classifier recovery decision",
+                fixture.id
+            );
+        }
     }
 
     #[test]
@@ -1271,7 +1328,7 @@ fixtures:
     }
 
     #[test]
-    fn invalid_tool_json_fixture_is_fail_closed_malformed_response() {
+    fn invalid_tool_json_fixture_is_fail_closed_bad_tool_arguments() {
         let pack = parse_provider_compat_fixture_pack_yaml(EXAMPLE_PACK)
             .expect("provider compatibility fixture pack should parse");
         let fixture = pack
@@ -1281,7 +1338,7 @@ fixtures:
             .expect("invalid JSON arguments fixture should be present");
 
         assert_eq!(fixture.expected.verdict, ProviderCompatExpectedVerdict::FailClosed);
-        assert_eq!(fixture.expected.failure_class, ProviderFailureClass::MalformedResponse);
+        assert_eq!(fixture.expected.failure_class, ProviderFailureClass::BadToolArguments);
         assert_eq!(fixture.expected.recovery_decision, ProviderRecoveryDecisionKind::FailClosed);
         assert!(fixture.expected.fail_closed);
     }

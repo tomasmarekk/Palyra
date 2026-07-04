@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ProviderErrorEnvelope;
+use crate::{ProviderErrorEnvelope, ProviderRecoveryDecisionKind};
 
 /// Terminal failure of a provider operation after the per-provider retry
 /// budget is spent.
@@ -163,13 +163,24 @@ pub enum ProviderFailureClass {
     AuthInvalid,
     AuthExpired,
     PermissionDenied,
+    RateLimit,
     RateLimited,
+    Quota,
     QuotaExceeded,
+    SchemaRejected,
+    BadToolArguments,
+    TruncatedToolArguments,
+    ContextOverflow,
     TransientUpstream,
     PermanentUpstream,
     ContextWindowExceeded,
     ContentPolicyBlocked,
     MalformedResponse,
+    MalformedStream,
+    EmptyOutput,
+    PrematureFinal,
+    PayloadTooLarge,
+    ProviderUnavailable,
     NetworkUnavailable,
     ProviderTimeout,
 }
@@ -182,13 +193,24 @@ impl ProviderFailureClass {
             Self::AuthInvalid => "auth_invalid",
             Self::AuthExpired => "auth_expired",
             Self::PermissionDenied => "permission_denied",
+            Self::RateLimit => "rate_limit",
             Self::RateLimited => "rate_limited",
+            Self::Quota => "quota",
             Self::QuotaExceeded => "quota_exceeded",
+            Self::SchemaRejected => "schema_rejected",
+            Self::BadToolArguments => "bad_tool_arguments",
+            Self::TruncatedToolArguments => "truncated_tool_arguments",
+            Self::ContextOverflow => "context_overflow",
             Self::TransientUpstream => "transient_upstream",
             Self::PermanentUpstream => "permanent_upstream",
             Self::ContextWindowExceeded => "context_window_exceeded",
             Self::ContentPolicyBlocked => "content_policy_blocked",
             Self::MalformedResponse => "malformed_response",
+            Self::MalformedStream => "malformed_stream",
+            Self::EmptyOutput => "empty_output",
+            Self::PrematureFinal => "premature_final",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::ProviderUnavailable => "provider_unavailable",
             Self::NetworkUnavailable => "network_unavailable",
             Self::ProviderTimeout => "provider_timeout",
         }
@@ -262,10 +284,12 @@ impl ProviderFailureCategory {
 pub enum ProviderRecoveryAction {
     RetrySame,
     RetryAfter,
+    RetryTransformed,
     FallbackModel,
     CompactAndRetry,
     AskUser,
     Abort,
+    FailClosed,
 }
 
 impl ProviderRecoveryAction {
@@ -275,10 +299,12 @@ impl ProviderRecoveryAction {
         match self {
             Self::RetrySame => "retry_same",
             Self::RetryAfter => "retry_after",
+            Self::RetryTransformed => "retry_transformed",
             Self::FallbackModel => "fallback_model",
             Self::CompactAndRetry => "compact_and_retry",
             Self::AskUser => "ask_user",
             Self::Abort => "abort",
+            Self::FailClosed => "fail_closed",
         }
     }
 }
@@ -355,6 +381,145 @@ impl ProviderFailureSnapshot {
     }
 }
 
+/// Provider-neutral retry policy derived from a recovery decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRetryPolicy {
+    /// Maximum additional provider attempts allowed by this policy.
+    pub max_attempts: u32,
+    /// Whether the retry must first transform the provider request payload.
+    pub requires_transformed_request: bool,
+    /// Whether the retry must compact context before sending a new request.
+    pub requires_context_compaction: bool,
+    /// Whether the retry must switch to an authorized fallback provider.
+    pub requires_provider_failover: bool,
+    /// Whether the retry must refresh credentials through the auth/vault boundary.
+    pub requires_credential_refresh: bool,
+}
+
+impl ProviderRetryPolicy {
+    /// Builds a retry policy for the recovery decision selected by the classifier.
+    #[must_use]
+    pub const fn for_decision(decision: ProviderRecoveryDecisionKind) -> Self {
+        match decision {
+            ProviderRecoveryDecisionKind::RetrySameProvider
+            | ProviderRecoveryDecisionKind::RetryAfter => Self {
+                max_attempts: 1,
+                requires_transformed_request: false,
+                requires_context_compaction: false,
+                requires_provider_failover: false,
+                requires_credential_refresh: false,
+            },
+            ProviderRecoveryDecisionKind::RetryTransformed => Self {
+                max_attempts: 1,
+                requires_transformed_request: true,
+                requires_context_compaction: false,
+                requires_provider_failover: false,
+                requires_credential_refresh: false,
+            },
+            ProviderRecoveryDecisionKind::CompactAndRetry => Self {
+                max_attempts: 1,
+                requires_transformed_request: false,
+                requires_context_compaction: true,
+                requires_provider_failover: false,
+                requires_credential_refresh: false,
+            },
+            ProviderRecoveryDecisionKind::FailoverProvider => Self {
+                max_attempts: 1,
+                requires_transformed_request: false,
+                requires_context_compaction: false,
+                requires_provider_failover: true,
+                requires_credential_refresh: false,
+            },
+            ProviderRecoveryDecisionKind::RefreshCredential => Self {
+                max_attempts: 1,
+                requires_transformed_request: false,
+                requires_context_compaction: false,
+                requires_provider_failover: false,
+                requires_credential_refresh: true,
+            },
+            ProviderRecoveryDecisionKind::AskUser
+            | ProviderRecoveryDecisionKind::Abort
+            | ProviderRecoveryDecisionKind::FailClosed => Self {
+                max_attempts: 0,
+                requires_transformed_request: false,
+                requires_context_compaction: false,
+                requires_provider_failover: false,
+                requires_credential_refresh: false,
+            },
+        }
+    }
+}
+
+/// Central provider failure classifier used by runtime code and fixture validation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderFailureClassifier;
+
+impl ProviderFailureClassifier {
+    /// Creates a provider failure classifier with the built-in taxonomy.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Classifies an HTTP provider failure by status and redacted response body.
+    #[must_use]
+    pub fn classify_http_failure(
+        self,
+        status_code: u16,
+        retryable: bool,
+        provider_detail: &str,
+        response_body: &str,
+    ) -> ProviderFailureClassification {
+        classify_http_provider_failure(status_code, retryable, provider_detail, response_body)
+    }
+
+    /// Classifies a provider compatibility fixture category.
+    #[must_use]
+    pub fn classify_fixture_category(
+        self,
+        category: &str,
+        status_code: Option<u16>,
+        provider_detail: &str,
+    ) -> ProviderFailureClassification {
+        let (class, action) = match category {
+            "truncated_tool_args" => (
+                ProviderFailureClass::TruncatedToolArguments,
+                ProviderFailureAction::FailClosedNoRetry,
+            ),
+            "invalid_json_arguments" | "invalid_tool_name" => {
+                (ProviderFailureClass::BadToolArguments, ProviderFailureAction::FailClosedNoRetry)
+            }
+            "empty_final_answer" => {
+                (ProviderFailureClass::EmptyOutput, ProviderFailureAction::Retry)
+            }
+            "context_overflow" => {
+                (ProviderFailureClass::ContextOverflow, ProviderFailureAction::ReevaluateBudget)
+            }
+            "rate_limit" => (ProviderFailureClass::RateLimit, ProviderFailureAction::Retry),
+            "quota" => (ProviderFailureClass::Quota, ProviderFailureAction::UserActionRequired),
+            "auth_expired" => {
+                (ProviderFailureClass::AuthExpired, ProviderFailureAction::RotateCredential)
+            }
+            "unsupported_schema" => {
+                (ProviderFailureClass::SchemaRejected, ProviderFailureAction::FailClosedNoRetry)
+            }
+            "malformed_sse_chunk" => {
+                (ProviderFailureClass::MalformedStream, ProviderFailureAction::Retry)
+            }
+            "tool_result_too_large" => {
+                (ProviderFailureClass::PayloadTooLarge, ProviderFailureAction::FailClosedNoRetry)
+            }
+            "premature_final_after_patch" => {
+                (ProviderFailureClass::PrematureFinal, ProviderFailureAction::FailClosedNoRetry)
+            }
+            _ => {
+                (ProviderFailureClass::PermanentUpstream, ProviderFailureAction::FailClosedNoRetry)
+            }
+        };
+        provider_failure_classification(class, action, status_code, provider_detail)
+    }
+}
+
 fn provider_recovery_plan(
     classification: &ProviderFailureClassification,
 ) -> ProviderRecoveryPlanSnapshot {
@@ -365,14 +530,24 @@ fn provider_recovery_plan(
         ProviderFailureClass::PermissionDenied => {
             (ProviderFailureCategory::Policy, ProviderRecoveryAction::AskUser)
         }
-        ProviderFailureClass::RateLimited => {
+        ProviderFailureClass::RateLimit | ProviderFailureClass::RateLimited => {
             (ProviderFailureCategory::RateLimit, ProviderRecoveryAction::RetryAfter)
         }
-        ProviderFailureClass::QuotaExceeded => {
+        ProviderFailureClass::Quota | ProviderFailureClass::QuotaExceeded => {
             (ProviderFailureCategory::Quota, ProviderRecoveryAction::AskUser)
         }
-        ProviderFailureClass::ContextWindowExceeded => {
+        ProviderFailureClass::ContextOverflow | ProviderFailureClass::ContextWindowExceeded => {
             (ProviderFailureCategory::ContextOverflow, ProviderRecoveryAction::CompactAndRetry)
+        }
+        ProviderFailureClass::SchemaRejected
+        | ProviderFailureClass::BadToolArguments
+        | ProviderFailureClass::TruncatedToolArguments
+        | ProviderFailureClass::PayloadTooLarge
+        | ProviderFailureClass::PrematureFinal => {
+            (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::FailClosed)
+        }
+        ProviderFailureClass::MalformedStream | ProviderFailureClass::EmptyOutput => {
+            (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::RetrySame)
         }
         ProviderFailureClass::ContentPolicyBlocked => {
             (ProviderFailureCategory::SafetyStop, ProviderRecoveryAction::Abort)
@@ -380,7 +555,9 @@ fn provider_recovery_plan(
         ProviderFailureClass::MalformedResponse => {
             (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::FallbackModel)
         }
-        ProviderFailureClass::NetworkUnavailable | ProviderFailureClass::ProviderTimeout => {
+        ProviderFailureClass::ProviderUnavailable
+        | ProviderFailureClass::NetworkUnavailable
+        | ProviderFailureClass::ProviderTimeout => {
             (ProviderFailureCategory::Transient, ProviderRecoveryAction::RetrySame)
         }
         ProviderFailureClass::TransientUpstream => {
@@ -519,7 +696,16 @@ pub fn classify_http_provider_failure(
         || normalized_body.contains("token plan usage limit")
         || normalized_body.contains("usage limit reached")
     {
-        (ProviderFailureClass::QuotaExceeded, ProviderFailureAction::UserActionRequired)
+        (ProviderFailureClass::Quota, ProviderFailureAction::UserActionRequired)
+    } else if status_code == 429 {
+        (ProviderFailureClass::RateLimit, ProviderFailureAction::Retry)
+    } else if matches!(status_code, 400 | 422)
+        && (normalized_body.contains("json_schema")
+            || normalized_body.contains("response_format")
+            || normalized_body.contains("schema")
+            || normalized_body.contains("unsupported"))
+    {
+        (ProviderFailureClass::SchemaRejected, ProviderFailureAction::FailClosedNoRetry)
     } else if matches!(status_code, 400 | 413)
         && (normalized_body.contains("context")
             || normalized_body.contains("maximum context")
@@ -527,7 +713,13 @@ pub fn classify_http_provider_failure(
             || normalized_body.contains("token limit")
             || normalized_body.contains("too many tokens"))
     {
-        (ProviderFailureClass::ContextWindowExceeded, ProviderFailureAction::UserActionRequired)
+        (ProviderFailureClass::ContextOverflow, ProviderFailureAction::ReevaluateBudget)
+    } else if status_code == 413
+        || normalized_body.contains("payload too large")
+        || normalized_body.contains("request body too large")
+        || normalized_body.contains("tool result payload too large")
+    {
+        (ProviderFailureClass::PayloadTooLarge, ProviderFailureAction::FailClosedNoRetry)
     } else if normalized_body.contains("policy")
         || normalized_body.contains("safety")
         || normalized_body.contains("moderation")
@@ -536,8 +728,12 @@ pub fn classify_http_provider_failure(
         (ProviderFailureClass::ContentPolicyBlocked, ProviderFailureAction::FailClosedNoRetry)
     } else if status_code == 403 {
         (ProviderFailureClass::PermissionDenied, ProviderFailureAction::UserActionRequired)
-    } else if status_code == 429 {
-        (ProviderFailureClass::RateLimited, ProviderFailureAction::ReevaluateBudget)
+    } else if matches!(status_code, 502..=504)
+        || normalized_body.contains("provider unavailable")
+        || normalized_body.contains("service unavailable")
+        || normalized_body.contains("upstream unavailable")
+    {
+        (ProviderFailureClass::ProviderUnavailable, ProviderFailureAction::Retry)
     } else if retryable {
         (ProviderFailureClass::TransientUpstream, ProviderFailureAction::Retry)
     } else {

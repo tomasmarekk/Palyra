@@ -218,7 +218,7 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
         .context("invalid JSON arguments fixture should be reported")?;
     assert_eq!(
         invalid_json.get("expected_failure_class").and_then(Value::as_str),
-        Some("malformed_response")
+        Some("bad_tool_arguments")
     );
     assert_eq!(
         invalid_json.get("expected_recovery_decision").and_then(Value::as_str),

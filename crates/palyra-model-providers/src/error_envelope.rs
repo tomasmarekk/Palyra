@@ -55,6 +55,7 @@ pub enum ProviderRetryability {
 pub enum ProviderRecoveryDecisionKind {
     RetrySameProvider,
     RetryAfter,
+    RetryTransformed,
     RefreshCredential,
     FailoverProvider,
     CompactAndRetry,
@@ -70,6 +71,7 @@ impl ProviderRecoveryDecisionKind {
         match self {
             Self::RetrySameProvider => "retry_same_provider",
             Self::RetryAfter => "retry_after",
+            Self::RetryTransformed => "retry_transformed",
             Self::RefreshCredential => "refresh_credential",
             Self::FailoverProvider => "failover_provider",
             Self::CompactAndRetry => "compact_and_retry",
@@ -122,14 +124,16 @@ impl ProviderErrorEnvelope {
         let classification = error.failure_snapshot();
         let kind = provider_error_kind(error, &classification);
         let retryability = provider_retryability(error, &classification);
-        let failover_eligible =
-            matches!(
-                kind,
-                ProviderErrorKind::RateLimit
-                    | ProviderErrorKind::TransientNetwork
-                    | ProviderErrorKind::Timeout
-                    | ProviderErrorKind::MalformedResponse
-            ) || matches!(classification.recommended_action.as_str(), "provider_failover");
+        let malformed_failover_eligible =
+            matches!(classification.class.as_str(), "malformed_response");
+        let failover_eligible = matches!(
+            kind,
+            ProviderErrorKind::RateLimit
+                | ProviderErrorKind::TransientNetwork
+                | ProviderErrorKind::Timeout
+        ) || (matches!(kind, ProviderErrorKind::MalformedResponse)
+            && malformed_failover_eligible)
+            || matches!(classification.recommended_action.as_str(), "provider_failover");
         // Severity is derived, not stored: anything retryable or failover
         // eligible is recoverable by definition; malformed/internal failures
         // degrade the run; everything else needs operator action.
@@ -204,6 +208,7 @@ fn provider_recovery_decision_kind(
         ProviderRetryability::RetrySameProvider => ProviderRecoveryDecisionKind::RetrySameProvider,
         ProviderRetryability::RefreshCredential => ProviderRecoveryDecisionKind::RefreshCredential,
         ProviderRetryability::NotRetryable => match recovery_action {
+            "retry_transformed" => ProviderRecoveryDecisionKind::RetryTransformed,
             "compact_and_retry" => ProviderRecoveryDecisionKind::CompactAndRetry,
             "ask_user" => ProviderRecoveryDecisionKind::AskUser,
             "abort" => ProviderRecoveryDecisionKind::Abort,
@@ -239,11 +244,22 @@ fn provider_error_kind(
         ProviderError::RequestFailed { .. } | ProviderError::InvalidResponse { .. } => {
             match classification.class.as_str() {
                 "auth_invalid" | "auth_expired" | "permission_denied" => ProviderErrorKind::Auth,
-                "quota_exceeded" => ProviderErrorKind::Quota,
-                "rate_limited" => ProviderErrorKind::RateLimit,
-                "network_unavailable" => ProviderErrorKind::TransientNetwork,
+                "quota" | "quota_exceeded" => ProviderErrorKind::Quota,
+                "rate_limit" | "rate_limited" => ProviderErrorKind::RateLimit,
+                "network_unavailable" | "provider_unavailable" => {
+                    ProviderErrorKind::TransientNetwork
+                }
                 "provider_timeout" => ProviderErrorKind::Timeout,
-                "malformed_response" => ProviderErrorKind::MalformedResponse,
+                "schema_rejected"
+                | "bad_tool_arguments"
+                | "truncated_tool_arguments"
+                | "context_overflow"
+                | "malformed_response"
+                | "malformed_stream"
+                | "empty_output"
+                | "premature_final"
+                | "payload_too_large" => ProviderErrorKind::MalformedResponse,
+                "context_window_exceeded" => ProviderErrorKind::MalformedResponse,
                 "content_policy_blocked" => ProviderErrorKind::ProviderPolicy,
                 "transient_upstream" => ProviderErrorKind::TransientNetwork,
                 _ => ProviderErrorKind::Internal,
@@ -261,9 +277,14 @@ fn provider_retryability(
         ProviderError::MissingApiKey | ProviderError::MissingAnthropicApiKey => {
             ProviderRetryability::RefreshCredential
         }
+        ProviderError::RequestFailed { classification, .. }
+            if matches!(classification.class, ProviderFailureClass::AuthExpired) =>
+        {
+            ProviderRetryability::RefreshCredential
+        }
         ProviderError::RequestFailed { retryable: true, .. } => {
             if classification.recovery.retry_after_ms.is_some()
-                || classification.class == ProviderFailureClass::RateLimited.as_str()
+                || matches!(classification.class.as_str(), "rate_limit" | "rate_limited")
             {
                 ProviderRetryability::RetryAfter
             } else {
@@ -348,7 +369,7 @@ mod tests {
             "context exceeded",
         );
 
-        assert_eq!(snapshot.class, ProviderFailureClass::ContextWindowExceeded.as_str());
+        assert_eq!(snapshot.class, ProviderFailureClass::ContextOverflow.as_str());
         assert_eq!(decision.decision, ProviderRecoveryDecisionKind::CompactAndRetry);
         assert_eq!(decision.reason_code, "provider.recovery.compact_and_retry");
     }

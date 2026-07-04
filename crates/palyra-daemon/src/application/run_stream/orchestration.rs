@@ -3871,12 +3871,15 @@ fn provider_status_recovery_decision(
             ("ask_user", "provider.recovery.ask_user")
         }
         Code::InvalidArgument
-            if message.contains("context_window_exceeded")
+            if message.contains("context_overflow")
+                || message.contains("context_window_exceeded")
                 || message.to_ascii_lowercase().contains("context") =>
         {
             ("compact_and_retry", "provider.recovery.compact_and_retry")
         }
-        Code::Internal if message.contains("malformed_response") => {
+        Code::Internal
+            if message.contains("malformed_response") || message.contains("malformed_stream") =>
+        {
             ("failover_provider", "provider.recovery.failover_provider")
         }
         _ => ("fail_closed", "provider.recovery.fail_closed"),

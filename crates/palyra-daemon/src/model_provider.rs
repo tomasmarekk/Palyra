@@ -416,13 +416,23 @@ fn credential_availability_state(
             "auth_invalid" => "auth_invalid",
             "auth_expired" => "auth_expired",
             "permission_denied" => "permission_denied",
-            "rate_limited" => "rate_limited",
-            "quota_exceeded" => "quota_exceeded",
-            "context_window_exceeded" | "content_policy_blocked" => "available",
+            "rate_limit" | "rate_limited" => "rate_limited",
+            "quota" | "quota_exceeded" => "quota_exceeded",
+            "context_overflow" | "context_window_exceeded" | "content_policy_blocked" => {
+                "available"
+            }
             "network_unavailable"
+            | "provider_unavailable"
             | "provider_timeout"
             | "transient_upstream"
+            | "schema_rejected"
+            | "bad_tool_arguments"
+            | "truncated_tool_arguments"
             | "malformed_response"
+            | "malformed_stream"
+            | "empty_output"
+            | "premature_final"
+            | "payload_too_large"
             | "permanent_upstream" => "provider_degraded",
             _ => "degraded",
         };
@@ -445,14 +455,25 @@ fn provider_effective_health_state(
     }
     if let Some(last_error) = metrics.last_error.as_ref() {
         return match last_error.class.as_str() {
-            "auth_invalid" | "auth_expired" | "permission_denied" | "quota_exceeded" => {
+            "auth_invalid" | "auth_expired" | "permission_denied" | "quota" | "quota_exceeded" => {
                 "unavailable"
             }
-            "rate_limited"
+            "rate_limit"
+            | "rate_limited"
             | "network_unavailable"
+            | "provider_unavailable"
             | "provider_timeout"
             | "transient_upstream"
+            | "context_overflow"
+            | "context_window_exceeded"
+            | "schema_rejected"
+            | "bad_tool_arguments"
+            | "truncated_tool_arguments"
             | "malformed_response"
+            | "malformed_stream"
+            | "empty_output"
+            | "premature_final"
+            | "payload_too_large"
             | "permanent_upstream" => "degraded",
             _ => "degraded",
         };
@@ -4981,7 +5002,7 @@ mod tests {
         let rate_limit =
             classify_http_provider_failure(429, true, "openai_chat_http", "rate limit exceeded")
                 .snapshot("redacted 429".to_owned());
-        assert_eq!(rate_limit.class, "rate_limited");
+        assert_eq!(rate_limit.class, "rate_limit");
         assert_eq!(rate_limit.recovery.category, "rate_limit");
         assert_eq!(rate_limit.recovery.action, "retry_after");
 
@@ -4992,7 +5013,7 @@ mod tests {
             "insufficient_quota: billing credits exhausted",
         )
         .snapshot("redacted quota".to_owned());
-        assert_eq!(quota.class, "quota_exceeded");
+        assert_eq!(quota.class, "quota");
         assert_eq!(quota.recovery.category, "quota");
         assert_eq!(quota.recovery.action, "ask_user");
 
@@ -5003,7 +5024,7 @@ mod tests {
             "Token Plan usage limit reached",
         )
         .snapshot("redacted minimax quota".to_owned());
-        assert_eq!(minimax_plan_limit.class, "quota_exceeded");
+        assert_eq!(minimax_plan_limit.class, "quota");
         assert_eq!(minimax_plan_limit.recovery.category, "quota");
         assert_eq!(minimax_plan_limit.recovery.action, "ask_user");
 
