@@ -3667,6 +3667,7 @@ enabled = true
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
         let _auth_profiles_path = ScopedAuthProfilesPath::unset();
+        let _state_root = ScopedStateRoot::unset();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
         let desktop_runtime = state_root.join(DESKTOP_CONTROL_CENTER_DIR).join(DESKTOP_RUNTIME_DIR);
@@ -3736,6 +3737,7 @@ enabled = true
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
         let _auth_profiles_path = ScopedAuthProfilesPath::unset();
+        let _state_root = ScopedStateRoot::unset();
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
@@ -3804,6 +3806,7 @@ enabled = true
         let _env_guard =
             crate::app::test_env_lock_for_tests().lock().expect("env lock should be available");
         let _auth_profiles_path = ScopedAuthProfilesPath::unset();
+        let _state_root = ScopedStateRoot::unset();
         let _vault_backend = ScopedVaultBackend::encrypted_file();
         let tempdir = tempfile::tempdir().expect("tempdir should be created");
         let state_root = tempdir.path().join("state");
@@ -3881,6 +3884,10 @@ enabled = true
         previous: Option<std::ffi::OsString>,
     }
 
+    struct ScopedStateRoot {
+        previous: Option<std::ffi::OsString>,
+    }
+
     impl ScopedAuthProfilesPath {
         fn unset() -> Self {
             let previous = std::env::var_os("PALYRA_AUTH_PROFILES_PATH");
@@ -3898,6 +3905,28 @@ enabled = true
                 // SAFETY: this test holds the shared CLI test env lock while the override is active.
                 unsafe {
                     std::env::set_var("PALYRA_AUTH_PROFILES_PATH", previous);
+                }
+            }
+        }
+    }
+
+    impl ScopedStateRoot {
+        fn unset() -> Self {
+            let previous = std::env::var_os("PALYRA_STATE_ROOT");
+            // SAFETY: this test holds the shared CLI test env lock while the override is active.
+            unsafe {
+                std::env::remove_var("PALYRA_STATE_ROOT");
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedStateRoot {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: this test holds the shared CLI test env lock while the override is active.
+                unsafe {
+                    std::env::set_var("PALYRA_STATE_ROOT", previous);
                 }
             }
         }
