@@ -31,6 +31,7 @@ use tonic::Status;
 use ulid::Ulid;
 
 use crate::{
+    application::tool_registry::ToolReplaySafetyClass,
     domain::workspace::{
         apply_workspace_managed_block, curated_workspace_roots, curated_workspace_templates,
         current_daily_workspace_path, scan_workspace_content_for_prompt_injection,
@@ -2942,6 +2943,14 @@ fn require_review_for_unreviewed_durable_write_candidates(
 fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> String {
     let quality_gates =
         build_quality_gate_metrics(input.active_task_summary, input.candidates, input.writes);
+    let retry_safety_report = build_compaction_retry_safety_report(
+        input.active_task_summary,
+        input.candidates,
+        input.writes,
+        input.safeguard,
+        input.provider_evidence,
+        &quality_gates,
+    );
     json!({
         "session_id": input.session.session_id,
         "branch_state": input.session.branch_state,
@@ -2961,6 +2970,7 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         "compaction_safeguard": input.safeguard,
         "provider_evidence": input.provider_evidence,
         "quality_gates": quality_gates,
+        "retry_safety_report": retry_safety_report,
         "compression": {
             "compressor_mode": input.compressor_mode.unwrap_or("deterministic"),
             "fallback_used": input.fallback_used,
@@ -2969,6 +2979,96 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         },
     })
     .to_string()
+}
+
+fn build_compaction_retry_safety_report(
+    active_task_summary: &SessionActiveTaskSummary,
+    candidates: &[SessionCompactionCandidate],
+    writes: &[SessionCompactionWritePreview],
+    safeguard: &CompactionSafeguardProjection,
+    provider_evidence: &ProviderBackedEvidenceProjection,
+    quality_gates: &SessionCompactionQualityGateMetrics,
+) -> Value {
+    let mutation_class = ToolReplaySafetyClass::RequiresHumanConfirmation;
+    let completed_mutations = writes
+        .iter()
+        .filter(|write| matches!(write.status.as_str(), "applied" | "noop"))
+        .map(|write| {
+            json!({
+                "target_path": write.target_path.as_str(),
+                "status": write.status.as_str(),
+                "action": write.action.as_str(),
+                "candidate_ids": write.candidate_ids.as_slice(),
+                "replay_safety_class": mutation_class.as_str(),
+                "requires_replay_evidence": mutation_class.requires_replay_evidence(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let tool_failures = writes
+        .iter()
+        .filter(|write| write.status == "review_required" || write.conflict_reason.is_some())
+        .map(|write| {
+            json!({
+                "target_path": write.target_path.as_str(),
+                "status": write.status.as_str(),
+                "action": write.action.as_str(),
+                "conflict_reason": write.conflict_reason.as_deref(),
+            })
+        })
+        .chain(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.disposition.starts_with("blocked_"))
+                .map(|candidate| {
+                    json!({
+                        "candidate_id": candidate.candidate_id.as_str(),
+                        "category": candidate.category.as_str(),
+                        "disposition": candidate.disposition.as_str(),
+                        "rationale": candidate.rationale.as_str(),
+                    })
+                }),
+        )
+        .collect::<Vec<_>>();
+    let workspace_operations = writes
+        .iter()
+        .map(|write| {
+            json!({
+                "target_path": write.target_path.as_str(),
+                "status": write.status.as_str(),
+                "action": write.action.as_str(),
+                "candidate_count": write.candidate_ids.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_action =
+        active_task_summary.open_action_items.first().cloned().unwrap_or_else(|| "none".to_owned());
+
+    json!({
+        "schema_version": 1,
+        "current_task": {
+            "active_goal": active_task_summary.active_goal.as_str(),
+            "open_decision_count": active_task_summary.open_decisions.len(),
+            "open_action_item_count": active_task_summary.open_action_items.len(),
+        },
+        "completed_mutations": completed_mutations,
+        "tool_failures": tool_failures,
+        "workspace_operations": workspace_operations,
+        "verification_state": {
+            "safeguard_decision": &safeguard.decision,
+            "safeguard_reason_codes": safeguard.reason_codes.as_slice(),
+            "provider_evidence_decision": &provider_evidence.decision,
+            "provider_evidence_reason_code": &provider_evidence.reason_code,
+            "review_required_count": quality_gates.review_required_count,
+            "blocked_write_count": quality_gates.blocked_write_count,
+            "applied_write_count": quality_gates.applied_write_count,
+        },
+        "next_action": next_action,
+        "mutation_replay_guard": {
+            "replay_safety_class": mutation_class.as_str(),
+            "automatic_replay_allowed": false,
+            "required_evidence": ["tool_attestation", "approval_or_compaction_safeguard"],
+        },
+    })
 }
 
 fn build_quality_gate_metrics(
@@ -4144,6 +4244,95 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("metadata_only")
         );
+    }
+
+    #[test]
+    fn compaction_summary_json_projects_retry_safety_report() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload = if seq % 3 == 0 {
+                    format!(
+                        r#"{{"text":"Decision: keep mutating retry evidence in the compaction tape {seq}."}}"#
+                    )
+                } else if seq % 3 == 1 {
+                    format!(
+                        r#"{{"text":"Next action: verify the mutating retry guard before replay {seq}."}}"#
+                    )
+                } else {
+                    format!(r#"{{"text":"Workspace operation checkpoint {seq} stays auditable."}}"#)
+                };
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        let plan = build_session_compaction_plan(
+            &session_record(),
+            transcript.as_slice(),
+            &[],
+            &[],
+            Some("unit_retry_safety"),
+            Some("unit_policy"),
+        );
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should parse");
+        let retry_safety_report =
+            summary.get("retry_safety_report").expect("summary should include retry safety report");
+
+        assert!(plan.eligible);
+        assert_eq!(
+            retry_safety_report.pointer("/schema_version").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            retry_safety_report
+                .pointer("/current_task/open_action_item_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                >= 1
+        );
+        assert_eq!(
+            retry_safety_report
+                .pointer("/mutation_replay_guard/replay_safety_class")
+                .and_then(serde_json::Value::as_str),
+            Some("requires_human_confirmation")
+        );
+        assert_eq!(
+            retry_safety_report
+                .pointer("/mutation_replay_guard/automatic_replay_allowed")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(retry_safety_report
+            .pointer("/mutation_replay_guard/required_evidence")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.len() >= 2));
+        assert!(retry_safety_report
+            .pointer("/workspace_operations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|operations| !operations.is_empty()));
+        assert!(
+            retry_safety_report
+                .pointer("/completed_mutations")
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "report should carry the completed-mutation section even in preview mode"
+        );
+        assert!(
+            retry_safety_report
+                .pointer("/tool_failures")
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "report should carry tool-failure evidence for replay consumers"
+        );
+        assert_eq!(
+            retry_safety_report
+                .pointer("/verification_state/safeguard_decision")
+                .and_then(serde_json::Value::as_str),
+            Some("passed")
+        );
+        assert!(retry_safety_report
+            .pointer("/next_action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.contains("mutating retry guard")));
     }
 
     #[test]

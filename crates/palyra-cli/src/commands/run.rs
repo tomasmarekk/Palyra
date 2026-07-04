@@ -525,6 +525,8 @@ fn push_tool_exchange_rows(
     exchange: &ReplayToolExchange,
     artifact_index: &mut Vec<Value>,
 ) -> Result<()> {
+    let replay_safety_class =
+        replay_safety_class_for_tool_input(exchange.tool_name.as_str(), &exchange.input);
     push_trajectory_row(
         rows,
         seq,
@@ -535,6 +537,7 @@ fn push_tool_exchange_rows(
             "tool_name": exchange.tool_name,
             "input": exchange.input,
             "input_hash_sha256": sha256_json_value(&exchange.input)?,
+            "replay_safety_class": replay_safety_class,
         }),
     );
     if let Some(decision) = exchange.decision.as_ref() {
@@ -709,6 +712,7 @@ struct RunReplayPublicEvent {
 struct RunReplayToolProposal {
     proposal_id: String,
     tool_name: String,
+    replay_safety_class: String,
     mutation_class: String,
     recorded_output: bool,
 }
@@ -789,7 +793,7 @@ fn replay_trajectory_document(
     if !unsafe_mutations.is_empty() {
         diffs.push(RunReplayDiff {
             path: "$.tool_proposals".to_owned(),
-            expected: "non-idempotent mutations require recorded tool output".to_owned(),
+            expected: "mutating tools require recorded tool output".to_owned(),
             actual: format!(
                 "{} unsafe mutation(s) without recorded output",
                 unsafe_mutations.len()
@@ -840,10 +844,16 @@ fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummar
                         (payload_str(payload, "proposal_id"), payload_str(payload, "tool_name"))
                     {
                         tool_proposals.entry(proposal_id.to_owned()).or_insert_with(|| {
+                            let replay_safety_class =
+                                replay_safety_class_for_tool(tool_name, payload);
                             RunReplayToolProposal {
                                 proposal_id: proposal_id.to_owned(),
                                 tool_name: tool_name.to_owned(),
-                                mutation_class: mutation_class_for_tool(tool_name, payload),
+                                mutation_class: mutation_class_for_replay_safety_class(
+                                    replay_safety_class.as_str(),
+                                )
+                                .to_owned(),
+                                replay_safety_class,
                                 recorded_output: false,
                             }
                         });
@@ -887,11 +897,7 @@ fn summarize_run_trajectory(document: &RunTrajectoryDocument) -> RunReplaySummar
 fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunReplayPublicEvent {
     let payload = row.get("payload").unwrap_or(&Value::Null);
     let stable_payload = match event_type {
-        "tool_proposal" => json!({
-            "tool_name": payload_str(payload, "tool_name"),
-            "mutation_class": payload_str(payload, "tool_name")
-                .map(|tool_name| mutation_class_for_tool(tool_name, payload)),
-        }),
+        "tool_proposal" => public_tool_proposal_payload(payload),
         "tool_output" => json!({
             "tool_name": payload_str(payload, "tool_name"),
             "recorded_output": payload_str(payload, "proposal_id").is_some(),
@@ -914,6 +920,18 @@ fn public_event_for_row(row: &Value, event_type: &str, category: &str) -> RunRep
         category: category.to_owned(),
         stable_payload,
     }
+}
+
+fn public_tool_proposal_payload(payload: &Value) -> Value {
+    let replay_safety_class = payload_str(payload, "tool_name")
+        .map(|tool_name| replay_safety_class_for_tool(tool_name, payload));
+    json!({
+        "tool_name": payload_str(payload, "tool_name"),
+        "mutation_class": replay_safety_class
+            .as_deref()
+            .map(mutation_class_for_replay_safety_class),
+        "replay_safety_class": replay_safety_class,
+    })
 }
 
 fn project_mcp_public_payload(payload: &Value) -> Value {
@@ -1013,21 +1031,72 @@ fn collect_mcp_tool_names_from_value(value: &Value, names: &mut BTreeSet<String>
     }
 }
 
-fn mutation_class_for_tool(tool_name: &str, payload: &Value) -> String {
-    if payload.get("input").and_then(|input| input.get("mutation_class")).and_then(Value::as_str)
-        == Some("non_idempotent")
+fn replay_safety_class_for_tool(tool_name: &str, payload: &Value) -> String {
+    let input = payload.get("input").unwrap_or(&Value::Null);
+    if let Some(explicit_class) = payload
+        .get("replay_safety_class")
+        .and_then(Value::as_str)
+        .and_then(normalize_replay_safety_class)
+        .or_else(|| {
+            input
+                .get("replay_safety_class")
+                .and_then(Value::as_str)
+                .and_then(normalize_replay_safety_class)
+        })
     {
-        return "non_idempotent".to_owned();
+        return explicit_class.to_owned();
+    }
+    replay_safety_class_for_tool_input(tool_name, input)
+}
+
+fn replay_safety_class_for_tool_input(tool_name: &str, input: &Value) -> String {
+    if let Some(explicit_class) =
+        input.get("mutation_class").and_then(Value::as_str).and_then(normalize_replay_safety_class)
+    {
+        return explicit_class.to_owned();
     }
     let normalized = tool_name.to_ascii_lowercase();
+    if normalized.contains("browser.")
+        || normalized.contains("process.")
+        || normalized.contains("shell")
+        || normalized.contains("exec")
+    {
+        return "external_side_effect".to_owned();
+    }
     if ["write", "patch", "delete", "remove", "move", "rename", "shell", "exec"]
         .iter()
         .any(|needle| normalized.contains(needle))
     {
-        "non_idempotent".to_owned()
+        "non_idempotent_write".to_owned()
     } else {
-        "replay_safe".to_owned()
+        "read_only".to_owned()
     }
+}
+
+fn normalize_replay_safety_class(value: &str) -> Option<&'static str> {
+    match value.trim() {
+        "read_only" | "replay_safe" => Some("read_only"),
+        "idempotent" | "idempotent_write" => Some("idempotent_write"),
+        "non_idempotent" | "non_idempotent_write" => Some("non_idempotent_write"),
+        "external_side_effect" => Some("external_side_effect"),
+        "requires_human_confirmation" => Some("requires_human_confirmation"),
+        _ => None,
+    }
+}
+
+fn mutation_class_for_replay_safety_class(replay_safety_class: &str) -> &'static str {
+    if replay_safety_class_requires_recorded_evidence(replay_safety_class) {
+        "non_idempotent"
+    } else {
+        "replay_safe"
+    }
+}
+
+fn replay_safety_class_requires_recorded_evidence(replay_safety_class: &str) -> bool {
+    matches!(
+        replay_safety_class,
+        "non_idempotent_write" | "external_side_effect" | "requires_human_confirmation"
+    )
 }
 
 fn unsafe_mutations_without_recorded_outputs(
@@ -1036,11 +1105,17 @@ fn unsafe_mutations_without_recorded_outputs(
     summary
         .tool_proposals
         .iter()
-        .filter(|proposal| proposal.mutation_class == "non_idempotent" && !proposal.recorded_output)
+        .filter(|proposal| {
+            replay_safety_class_requires_recorded_evidence(proposal.replay_safety_class.as_str())
+                && !proposal.recorded_output
+        })
         .map(|proposal| RunReplayUnsafeMutation {
             proposal_id: proposal.proposal_id.clone(),
             tool_name: proposal.tool_name.clone(),
-            reason: "non-idempotent mutation lacks recorded tool output evidence".to_owned(),
+            reason: format!(
+                "{} replay safety class lacks recorded tool output evidence",
+                proposal.replay_safety_class
+            ),
         })
         .collect()
 }
@@ -1672,6 +1747,35 @@ mod tests {
         assert_eq!(report.unsafe_mutations.len(), 1);
         assert_eq!(report.unsafe_mutations[0].proposal_id, "proposal-unsafe");
         assert!(report.diffs.iter().any(|diff| diff.path == "$.tool_proposals"));
+    }
+
+    #[test]
+    fn replay_rejects_side_effect_class_without_recorded_evidence() {
+        let document = RunTrajectoryDocument {
+            manifest: json!({ "artifact_index": [] }),
+            events: vec![json!({
+                "schema_version": 1,
+                "line_type": "event",
+                "seq": 0,
+                "event_type": "tool_proposal",
+                "category": "tool_proposal",
+                "payload": {
+                    "proposal_id": "proposal-side-effect",
+                    "tool_name": "palyra.browser.click",
+                    "replay_safety_class": "external_side_effect",
+                    "input": { "selector": "#submit" },
+                },
+            })],
+        };
+
+        let report = replay_trajectory_document(&document, None).unwrap();
+
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.unsafe_mutations.len(), 1);
+        assert_eq!(report.summary.tool_proposals[0].replay_safety_class, "external_side_effect");
+        assert_eq!(report.summary.tool_proposals[0].mutation_class, "non_idempotent");
+        assert_eq!(report.unsafe_mutations[0].proposal_id, "proposal-side-effect");
+        assert!(report.unsafe_mutations[0].reason.contains("external_side_effect"));
     }
 
     #[test]

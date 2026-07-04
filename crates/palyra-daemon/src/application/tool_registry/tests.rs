@@ -6,7 +6,7 @@ use super::catalog::clear_availability_probe_cache_for_tests;
 use super::schema::sanitize_schema_for_provider_with_audit;
 use super::types::{
     ModelVisibleToolCatalogSnapshot, ToolApprovalPosture, ToolCallRejectionKind,
-    ToolCatalogFilterReasonCode, ToolParallelismPolicy, ToolRegistryEntry,
+    ToolCatalogFilterReasonCode, ToolParallelismPolicy, ToolRegistryEntry, ToolReplaySafetyClass,
 };
 use super::{
     build_model_visible_tool_catalog_snapshot, describe_catalog_tool, projection_policy_for_tool,
@@ -105,6 +105,55 @@ fn catalog_snapshot_exposes_allowlisted_tools_with_schema_hashes() {
     assert!(snapshot.tools.iter().all(|tool| !tool.internal_schema_hash.is_empty()));
     assert!(snapshot.filtered_tools.iter().any(|tool| tool.name == "palyra.process.run"));
     assert!(snapshot.snapshot_id.starts_with("toolcat_"));
+}
+
+#[test]
+fn registry_entries_classify_replay_safety() {
+    let echo = registry_entry("palyra.echo").expect("echo entry exists");
+    let sleep = registry_entry("palyra.sleep").expect("sleep entry exists");
+    let process_run = registry_entry("palyra.process.run").expect("process run entry exists");
+    let browser_type = registry_entry("palyra.browser.type").expect("browser type entry exists");
+
+    assert_eq!(echo.replay_safety_class, ToolReplaySafetyClass::ReadOnly);
+    assert_eq!(sleep.replay_safety_class, ToolReplaySafetyClass::IdempotentWrite);
+    assert!(process_run.replay_safety_class.requires_replay_evidence());
+    assert!(browser_type.replay_safety_class.requires_replay_evidence());
+}
+
+#[test]
+fn catalog_snapshot_projects_replay_safety_to_tools_and_index() {
+    let config = config(&["palyra.echo", "palyra.sleep"]);
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: Some("gpt-test"),
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+
+    let sleep_tool = snapshot
+        .tools
+        .iter()
+        .find(|tool| tool.name == "palyra.sleep")
+        .expect("sleep should be visible");
+    let sleep_index = snapshot
+        .index
+        .entries
+        .iter()
+        .find(|entry| entry.name == "palyra.sleep")
+        .expect("sleep should be indexed");
+
+    assert_eq!(sleep_tool.replay_safety_class, ToolReplaySafetyClass::IdempotentWrite);
+    assert_eq!(sleep_index.replay_safety_class, ToolReplaySafetyClass::IdempotentWrite);
+    assert!(serde_json::to_value(&snapshot)
+        .expect("snapshot should serialize")
+        .to_string()
+        .contains("idempotent_write"));
 }
 
 #[test]
@@ -833,6 +882,7 @@ fn schema_transform_test_tool(
         approval_posture: ToolApprovalPosture::Safe,
         projection_policy: ToolResultProjectionPolicy::InlineUnlessLarge,
         parallelism_policy: ToolParallelismPolicy::ReadOnly,
+        replay_safety_class: ToolReplaySafetyClass::ReadOnly,
         target_surfaces: vec![ToolExposureSurface::RunStream],
     }
 }

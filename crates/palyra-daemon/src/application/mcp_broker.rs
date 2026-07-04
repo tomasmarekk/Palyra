@@ -31,7 +31,7 @@ use super::tool_registry::{
     stable_hash_bytes, stable_hash_value, FilteredToolCatalogEntry,
     ModelVisibleToolCatalogSnapshot, ToolApprovalPosture, ToolCatalogBuildRequest,
     ToolCatalogFilterReasonCode, ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry,
-    ToolResultProjectionPolicy, ToolSchemaDialect,
+    ToolReplaySafetyClass, ToolResultProjectionPolicy, ToolSchemaDialect,
 };
 
 const MCP_SCHEMA_VERSION: u32 = 1;
@@ -2415,6 +2415,11 @@ fn registry_entry_from_mcp_tool(
         approval_posture,
         projection_policy,
         parallelism_policy: ToolParallelismPolicy::Exclusive,
+        replay_safety_class: if approval_posture == ToolApprovalPosture::ApprovalRequired {
+            ToolReplaySafetyClass::RequiresHumanConfirmation
+        } else {
+            ToolReplaySafetyClass::ExternalSideEffect
+        },
         target_surfaces: vec![ToolExposureSurface::RunStream, ToolExposureSurface::RouteMessage],
     }
 }

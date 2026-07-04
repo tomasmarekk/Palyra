@@ -591,6 +591,7 @@ fn visible_tool_from_entry(
         approval_posture: entry.approval_posture,
         projection_policy: entry.projection_policy,
         parallelism_policy: entry.parallelism_policy,
+        replay_safety_class: entry.replay_safety_class,
         exposure_reason: exposure_reason(entry.approval_posture).to_owned(),
     }
 }
@@ -658,6 +659,7 @@ fn index_entry_for_tool(tool: &ModelVisibleTool) -> ToolCatalogIndexEntry {
         exposure_reason: tool.exposure_reason.clone(),
         repair_hint: repair_hint_for_tool(tool),
         projection_policy: tool.projection_policy,
+        replay_safety_class: tool.replay_safety_class,
         provider_schema_hash: tool.provider_schema_hash.clone(),
         internal_schema_hash: tool.internal_schema_hash.clone(),
     }

@@ -122,6 +122,40 @@ impl ToolParallelismPolicy {
     }
 }
 
+/// Replay safety class used by compaction, trajectory export, and replay
+/// runners to decide whether a tool call may be repeated automatically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolReplaySafetyClass {
+    ReadOnly,
+    IdempotentWrite,
+    NonIdempotentWrite,
+    ExternalSideEffect,
+    RequiresHumanConfirmation,
+}
+
+impl ToolReplaySafetyClass {
+    /// Stable snake_case label used in catalog hashes and tape payloads.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::IdempotentWrite => "idempotent_write",
+            Self::NonIdempotentWrite => "non_idempotent_write",
+            Self::ExternalSideEffect => "external_side_effect",
+            Self::RequiresHumanConfirmation => "requires_human_confirmation",
+        }
+    }
+
+    /// Returns true when replay needs prior execution evidence or explicit
+    /// human confirmation before repeating the call.
+    pub(crate) const fn requires_replay_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::NonIdempotentWrite | Self::ExternalSideEffect | Self::RequiresHumanConfirmation
+        )
+    }
+}
+
 /// How a tool result is projected back into model context (inline, summarized, or redacted).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +217,7 @@ pub(crate) struct ToolRegistryEntry {
     pub(crate) approval_posture: ToolApprovalPosture,
     pub(crate) projection_policy: ToolResultProjectionPolicy,
     pub(crate) parallelism_policy: ToolParallelismPolicy,
+    pub(crate) replay_safety_class: ToolReplaySafetyClass,
     pub(crate) target_surfaces: Vec<ToolExposureSurface>,
 }
 
@@ -204,6 +239,7 @@ pub(crate) struct ModelVisibleTool {
     pub(crate) approval_posture: ToolApprovalPosture,
     pub(crate) projection_policy: ToolResultProjectionPolicy,
     pub(crate) parallelism_policy: ToolParallelismPolicy,
+    pub(crate) replay_safety_class: ToolReplaySafetyClass,
     pub(crate) exposure_reason: String,
 }
 
@@ -239,6 +275,7 @@ pub(crate) struct ToolCatalogIndexEntry {
     pub(crate) exposure_reason: String,
     pub(crate) repair_hint: String,
     pub(crate) projection_policy: ToolResultProjectionPolicy,
+    pub(crate) replay_safety_class: ToolReplaySafetyClass,
     pub(crate) provider_schema_hash: String,
     pub(crate) internal_schema_hash: String,
 }

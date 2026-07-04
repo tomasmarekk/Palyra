@@ -37,7 +37,7 @@ pub(crate) use types::{
     FilteredToolCatalogEntry, ModelVisibleToolCatalogSnapshot, NormalizedToolCall,
     ToolApprovalPosture, ToolArgumentNormalizationAudit, ToolCallRejection, ToolCatalogBridgeError,
     ToolCatalogBuildRequest, ToolCatalogFilterReasonCode, ToolCatalogPolicySnapshot,
-    ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry, ToolResultProjectionPolicy,
-    ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME, TOOL_CATALOG_INVOKE_TOOL_NAME,
-    TOOL_CATALOG_SEARCH_TOOL_NAME,
+    ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry, ToolReplaySafetyClass,
+    ToolResultProjectionPolicy, ToolSchemaDialect, TOOL_CATALOG_DESCRIBE_TOOL_NAME,
+    TOOL_CATALOG_INVOKE_TOOL_NAME, TOOL_CATALOG_SEARCH_TOOL_NAME,
 };

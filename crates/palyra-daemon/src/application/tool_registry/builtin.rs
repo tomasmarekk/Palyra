@@ -12,7 +12,7 @@ use crate::tool_protocol::{tool_metadata, tool_requires_approval};
 use super::hashing::stable_hash_value;
 use super::types::{
     ToolApprovalPosture, ToolExposureSurface, ToolParallelismPolicy, ToolRegistryEntry,
-    ToolResultProjectionPolicy, TOOL_REGISTRY_ENTRY_VERSION,
+    ToolReplaySafetyClass, ToolResultProjectionPolicy, TOOL_REGISTRY_ENTRY_VERSION,
 };
 
 /// Returns every builtin tool registry entry, sorted by name.
@@ -1277,6 +1277,11 @@ fn entry(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let approval_posture = if tool_requires_approval(name) {
+        ToolApprovalPosture::ApprovalRequired
+    } else {
+        ToolApprovalPosture::Safe
+    };
     ToolRegistryEntry {
         name: name.to_owned(),
         description: description.to_owned(),
@@ -1285,15 +1290,55 @@ fn entry(
         schema_hash: stable_hash_value(&input_schema),
         input_schema,
         capabilities,
-        approval_posture: if tool_requires_approval(name) {
-            ToolApprovalPosture::ApprovalRequired
-        } else {
-            ToolApprovalPosture::Safe
-        },
+        approval_posture,
         projection_policy,
         parallelism_policy,
+        replay_safety_class: replay_safety_class_for_tool(
+            name,
+            parallelism_policy,
+            approval_posture,
+        ),
         target_surfaces: vec![ToolExposureSurface::RunStream, ToolExposureSurface::RouteMessage],
     }
+}
+
+fn replay_safety_class_for_tool(
+    name: &str,
+    parallelism_policy: ToolParallelismPolicy,
+    approval_posture: ToolApprovalPosture,
+) -> ToolReplaySafetyClass {
+    if approval_posture == ToolApprovalPosture::ApprovalRequired {
+        return ToolReplaySafetyClass::RequiresHumanConfirmation;
+    }
+    if has_external_side_effect_family(name) {
+        return ToolReplaySafetyClass::ExternalSideEffect;
+    }
+    match parallelism_policy {
+        ToolParallelismPolicy::ReadOnly => ToolReplaySafetyClass::ReadOnly,
+        ToolParallelismPolicy::Idempotent => ToolReplaySafetyClass::IdempotentWrite,
+        ToolParallelismPolicy::Exclusive => ToolReplaySafetyClass::NonIdempotentWrite,
+    }
+}
+
+fn has_external_side_effect_family(name: &str) -> bool {
+    matches!(
+        name,
+        "palyra.browser.navigate"
+            | "palyra.browser.reload"
+            | "palyra.browser.click"
+            | "palyra.browser.type"
+            | "palyra.browser.fill"
+            | "palyra.browser.upload"
+            | "palyra.browser.press"
+            | "palyra.browser.select"
+            | "palyra.browser.permissions.set"
+            | "palyra.browser.tabs.open"
+            | "palyra.browser.tabs.close"
+            | "palyra.process.run"
+            | "palyra.process.input"
+            | "palyra.process.send_keys"
+            | "palyra.process.stop"
+    )
 }
 
 /// Builds a `type: object` schema from `(name, schema)` property pairs.
