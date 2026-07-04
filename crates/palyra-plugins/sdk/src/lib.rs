@@ -53,7 +53,7 @@ pub const DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS: u64 = 2_000;
 /// Schema version for the public plugin SDK contract snapshot.
 pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current plugin SDK contract snapshot.
-pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION: &str = "plugin-sdk-contracts.v1";
+pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION: &str = "plugin-sdk-contracts.v2";
 
 /// Typed plugin extension points the host can negotiate.
 ///
@@ -74,6 +74,9 @@ pub enum TypedPluginContractKind {
     SchedulerTaskProvider,
     ModelAuthProvider,
     ConnectorAdapter,
+    AgentHarness,
+    ToolResultMiddleware,
+    PluginLifecycleHook,
 }
 
 impl TypedPluginContractKind {
@@ -93,6 +96,9 @@ impl TypedPluginContractKind {
             Self::SchedulerTaskProvider => "scheduler_task_provider",
             Self::ModelAuthProvider => "model_auth_provider",
             Self::ConnectorAdapter => "connector_adapter",
+            Self::AgentHarness => "agent_harness",
+            Self::ToolResultMiddleware => "tool_result_middleware",
+            Self::PluginLifecycleHook => "plugin_lifecycle_hook",
         }
     }
 }
@@ -216,6 +222,26 @@ pub struct PluginSdkContractSnapshot {
     pub typed_contracts: Vec<TypedPluginContractDescriptor>,
     /// Capability-scoped host service descriptors exposed to plugins.
     pub host_capability_services: Vec<HostCapabilityServiceDescriptor>,
+    /// Stable capability-manifest surface used by local conformance tooling.
+    pub capability_manifest: PluginCapabilityManifestDescriptor,
+}
+
+/// Stable descriptor for plugin capability manifests used by conformance tooling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCapabilityManifestDescriptor {
+    /// Descriptor schema version.
+    pub schema_version: u32,
+    /// Versioned schema identifier.
+    pub schema_id: String,
+    /// Required manifest paths for SDK conformance.
+    pub required_manifest_fields: Vec<String>,
+    /// Lifecycle hooks a plugin can expose to the host.
+    pub lifecycle_hooks: Vec<TypedPluginContractOperation>,
+    /// Built-in fixture ids local testkits should report.
+    pub conformance_fixtures: Vec<String>,
+    /// Whether SDK conformance permits importing private host modules.
+    pub internal_host_modules_allowed: bool,
 }
 
 /// Sensitivity classification applied to a contract's payload data.
@@ -288,6 +314,15 @@ pub enum TypedPluginContractOperation {
     ConnectorInbound,
     ConnectorOutbound,
     ConnectorRateLimit,
+    ClaimAgentAttempt,
+    RunAgentAttempt,
+    TransformToolResult,
+    OnInstall,
+    OnEnable,
+    OnDisable,
+    OnUpgrade,
+    OnUninstall,
+    OnHealthCheck,
 }
 
 impl TypedPluginContractOperation {
@@ -312,6 +347,15 @@ impl TypedPluginContractOperation {
             Self::ConnectorInbound => "connector_inbound",
             Self::ConnectorOutbound => "connector_outbound",
             Self::ConnectorRateLimit => "connector_rate_limit",
+            Self::ClaimAgentAttempt => "claim_agent_attempt",
+            Self::RunAgentAttempt => "run_agent_attempt",
+            Self::TransformToolResult => "transform_tool_result",
+            Self::OnInstall => "on_install",
+            Self::OnEnable => "on_enable",
+            Self::OnDisable => "on_disable",
+            Self::OnUpgrade => "on_upgrade",
+            Self::OnUninstall => "on_uninstall",
+            Self::OnHealthCheck => "on_health_check",
         }
     }
 }
@@ -489,6 +533,9 @@ pub fn all_typed_plugin_contract_kinds() -> Vec<TypedPluginContractKind> {
         TypedPluginContractKind::SchedulerTaskProvider,
         TypedPluginContractKind::ModelAuthProvider,
         TypedPluginContractKind::ConnectorAdapter,
+        TypedPluginContractKind::AgentHarness,
+        TypedPluginContractKind::ToolResultMiddleware,
+        TypedPluginContractKind::PluginLifecycleHook,
     ]
 }
 
@@ -772,6 +819,86 @@ pub fn typed_plugin_contract_descriptor(
             vec!["connector.adapter_invoked".to_owned(), "connector.binding_discovered".to_owned()],
             vec!["connector.rate_limit".to_owned(), "connector.delivery_latency".to_owned()],
         ),
+        TypedPluginContractKind::AgentHarness => build_descriptor(
+            kind,
+            version,
+            "palyra.plugin.agent_harness.prepared_attempt.v1",
+            "palyra.plugin.agent_harness.outcome.v1",
+            TypedPluginDataSensitivity::Sensitive,
+            vec![
+                TypedPluginContractOperation::ClaimAgentAttempt,
+                TypedPluginContractOperation::RunAgentAttempt,
+            ],
+            Vec::new(),
+            vec![
+                "contract_negotiation_failed".to_owned(),
+                "harness_claim_declined".to_owned(),
+                "harness_attempt_timeout".to_owned(),
+                "harness_callback_denied".to_owned(),
+            ],
+            vec![
+                "attempt.sanitized_transcript_view".to_owned(),
+                "attempt.auth_state_metadata".to_owned(),
+            ],
+            vec![
+                "agent_harness.claim".to_owned(),
+                "agent_harness.started".to_owned(),
+                "agent_harness.completed".to_owned(),
+            ],
+            vec!["agent_harness.claim_latency".to_owned(), "agent_harness.run_latency".to_owned()],
+        ),
+        TypedPluginContractKind::ToolResultMiddleware => build_descriptor(
+            kind,
+            version,
+            "palyra.plugin.tool_result_middleware.input.v1",
+            "palyra.plugin.tool_result_middleware.decision.v1",
+            TypedPluginDataSensitivity::Sensitive,
+            vec![TypedPluginContractOperation::TransformToolResult],
+            Vec::new(),
+            vec![
+                "contract_negotiation_failed".to_owned(),
+                "tool_result_visibility_escalation_denied".to_owned(),
+                "tool_result_transform_invalid".to_owned(),
+                "tool_result_persistence_failed".to_owned(),
+            ],
+            vec!["tool_result.redacted_preview".to_owned(), "tool_result.artifact_ref".to_owned()],
+            vec![
+                "tool_result.middleware_invoked".to_owned(),
+                "tool_result.middleware_decision".to_owned(),
+            ],
+            vec![
+                "tool_result.middleware_latency".to_owned(),
+                "tool_result.visibility_downgrade".to_owned(),
+            ],
+        ),
+        TypedPluginContractKind::PluginLifecycleHook => build_descriptor(
+            kind,
+            version,
+            "palyra.plugin.lifecycle_hook.input.v1",
+            "palyra.plugin.lifecycle_hook.output.v1",
+            TypedPluginDataSensitivity::Internal,
+            vec![
+                TypedPluginContractOperation::OnInstall,
+                TypedPluginContractOperation::OnEnable,
+                TypedPluginContractOperation::OnDisable,
+                TypedPluginContractOperation::OnUpgrade,
+                TypedPluginContractOperation::OnUninstall,
+                TypedPluginContractOperation::OnHealthCheck,
+            ],
+            Vec::new(),
+            vec![
+                "contract_negotiation_failed".to_owned(),
+                "lifecycle_hook_timeout".to_owned(),
+                "lifecycle_hook_invalid_output".to_owned(),
+                "lifecycle_hook_quarantined".to_owned(),
+            ],
+            vec!["lifecycle.operator_context".to_owned()],
+            vec![
+                "plugin.lifecycle_hook.invoked".to_owned(),
+                "plugin.lifecycle_hook.failed".to_owned(),
+            ],
+            vec!["plugin.lifecycle_hook_latency".to_owned(), "plugin.lifecycle_health".to_owned()],
+        ),
     };
     Some(descriptor)
 }
@@ -846,6 +973,24 @@ pub fn built_in_sdk_contract_fixtures() -> Vec<SdkContractSimulationFixture> {
             requested_capability_classes: vec![TypedPluginCapabilityClass::Channels],
         },
         SdkContractSimulationFixture {
+            name: "good.agent_harness.host_callbacks_only".to_owned(),
+            expected_accepted: true,
+            declarations: vec![TypedPluginContractDeclaration {
+                kind: TypedPluginContractKind::AgentHarness,
+                version: DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION,
+            }],
+            requested_capability_classes: Vec::new(),
+        },
+        SdkContractSimulationFixture {
+            name: "good.tool_result_middleware.redacted_payload".to_owned(),
+            expected_accepted: true,
+            declarations: vec![TypedPluginContractDeclaration {
+                kind: TypedPluginContractKind::ToolResultMiddleware,
+                version: DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION,
+            }],
+            requested_capability_classes: Vec::new(),
+        },
+        SdkContractSimulationFixture {
             name: "bad.run_lifecycle_hook.secret_capability".to_owned(),
             expected_accepted: false,
             declarations: vec![TypedPluginContractDeclaration {
@@ -862,6 +1007,15 @@ pub fn built_in_sdk_contract_fixtures() -> Vec<SdkContractSimulationFixture> {
                 version: DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION + 1,
             }],
             requested_capability_classes: vec![TypedPluginCapabilityClass::Channels],
+        },
+        SdkContractSimulationFixture {
+            name: "bad.lifecycle_hook.secret_capability".to_owned(),
+            expected_accepted: false,
+            declarations: vec![TypedPluginContractDeclaration {
+                kind: TypedPluginContractKind::PluginLifecycleHook,
+                version: DEFAULT_TYPED_PLUGIN_CONTRACT_VERSION,
+            }],
+            requested_capability_classes: vec![TypedPluginCapabilityClass::Secrets],
         },
     ]
 }
@@ -904,7 +1058,7 @@ pub fn plugin_sdk_contract_snapshot() -> PluginSdkContractSnapshot {
         schema_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         snapshot_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION.to_owned(),
         changelog_note:
-            "Initial plugin SDK contract snapshot; breaking changes require an ABI migration note."
+            "Adds agent harness, tool-result middleware, plugin lifecycle, and capability manifest descriptors."
                 .to_owned(),
         compatibility_policy: PluginSdkCompatibilityPolicy {
             breaking_change_requires_version_bump: true,
@@ -918,6 +1072,43 @@ pub fn plugin_sdk_contract_snapshot() -> PluginSdkContractSnapshot {
         sdk_abi_max_major: SDK_ABI_MAX_MAJOR,
         typed_contracts: supported_typed_plugin_contracts(),
         host_capability_services: supported_host_capability_services(),
+        capability_manifest: plugin_capability_manifest_descriptor(),
+    }
+}
+
+/// Returns the stable plugin capability manifest descriptor published by the SDK.
+#[must_use]
+pub fn plugin_capability_manifest_descriptor() -> PluginCapabilityManifestDescriptor {
+    PluginCapabilityManifestDescriptor {
+        schema_version: 1,
+        schema_id: "palyra.plugin.capability_manifest.v1".to_owned(),
+        required_manifest_fields: vec![
+            "operator.plugin.plugin_id".to_owned(),
+            "operator.plugin.abi_major".to_owned(),
+            "operator.plugin.default_module_path".to_owned(),
+            "operator.plugin.contracts".to_owned(),
+            "operator.plugin.required_capabilities".to_owned(),
+        ],
+        lifecycle_hooks: vec![
+            TypedPluginContractOperation::OnInstall,
+            TypedPluginContractOperation::OnEnable,
+            TypedPluginContractOperation::OnDisable,
+            TypedPluginContractOperation::OnUpgrade,
+            TypedPluginContractOperation::OnUninstall,
+            TypedPluginContractOperation::OnHealthCheck,
+        ],
+        conformance_fixtures: vec![
+            "approval_api".to_owned(),
+            "resource_permissions".to_owned(),
+            "egress_policy".to_owned(),
+            "secret_redaction".to_owned(),
+            "hook_timeout".to_owned(),
+            "invalid_manifest".to_owned(),
+            "invalid_signature".to_owned(),
+            "permission_denied".to_owned(),
+            "output_too_large".to_owned(),
+        ],
+        internal_host_modules_allowed: false,
     }
 }
 
@@ -1106,8 +1297,8 @@ mod tests {
     use super::{
         all_typed_plugin_contract_kinds, built_in_sdk_contract_fixtures,
         default_typed_plugin_contract_version, host_capability_service_descriptor,
-        plugin_sdk_contract_snapshot, sdk_abi_compatibility, sdk_abi_version,
-        simulate_sdk_contract_fixture, supported_host_capability_services,
+        plugin_capability_manifest_descriptor, plugin_sdk_contract_snapshot, sdk_abi_compatibility,
+        sdk_abi_version, simulate_sdk_contract_fixture, supported_host_capability_services,
         supported_typed_plugin_contracts, typed_contract_abi_fingerprint,
         typed_contract_abi_snapshot, typed_plugin_contract_descriptor, wit_package_id, wit_source,
         HostCapabilityServiceKind, TypedPluginCapabilityClass, TypedPluginContractKind,
@@ -1234,6 +1425,22 @@ mod tests {
                     .allowed_capability_classes
                     .contains(&TypedPluginCapabilityClass::Channels)
         }));
+        assert!(supported.iter().any(|descriptor| {
+            descriptor.kind == TypedPluginContractKind::AgentHarness
+                && descriptor.operations.contains(&TypedPluginContractOperation::RunAgentAttempt)
+                && descriptor.allowed_capability_classes.is_empty()
+        }));
+        assert!(supported.iter().any(|descriptor| {
+            descriptor.kind == TypedPluginContractKind::ToolResultMiddleware
+                && descriptor
+                    .operations
+                    .contains(&TypedPluginContractOperation::TransformToolResult)
+                && descriptor.allowed_capability_classes.is_empty()
+        }));
+        assert!(supported.iter().any(|descriptor| {
+            descriptor.kind == TypedPluginContractKind::PluginLifecycleHook
+                && descriptor.operations.contains(&TypedPluginContractOperation::OnHealthCheck)
+        }));
     }
 
     #[test]
@@ -1289,8 +1496,22 @@ mod tests {
     }
 
     #[test]
+    fn capability_manifest_descriptor_pins_testkit_surface() {
+        let descriptor = plugin_capability_manifest_descriptor();
+
+        assert_eq!(descriptor.schema_id, "palyra.plugin.capability_manifest.v1");
+        assert!(!descriptor.internal_host_modules_allowed);
+        assert!(descriptor
+            .required_manifest_fields
+            .contains(&"operator.plugin.contracts".to_owned()));
+        assert!(descriptor.lifecycle_hooks.contains(&TypedPluginContractOperation::OnInstall));
+        assert!(descriptor.conformance_fixtures.contains(&"hook_timeout".to_owned()));
+        assert!(descriptor.conformance_fixtures.contains(&"output_too_large".to_owned()));
+    }
+
+    #[test]
     fn typed_contract_abi_fingerprint_matches_golden() {
-        const EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT: u64 = 0xf789_73f0_e89b_94ec;
+        const EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT: u64 = 0xb9d0_eb2a_e2b8_4caf;
         let snapshot = typed_contract_abi_snapshot();
         assert_eq!(
             typed_contract_abi_fingerprint(),
@@ -1304,7 +1525,7 @@ mod tests {
         let snapshot = serde_json::to_value(plugin_sdk_contract_snapshot())
             .expect("plugin SDK snapshot should serialize");
         assert_eq!(snapshot["schema_version"], 1);
-        assert_eq!(snapshot["snapshot_version"], "plugin-sdk-contracts.v1");
+        assert_eq!(snapshot["snapshot_version"], "plugin-sdk-contracts.v2");
         assert!(snapshot["compatibility_policy"]["breaking_change_requires_migration_note"]
             .as_bool()
             .unwrap_or_default());

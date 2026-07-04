@@ -1,5 +1,36 @@
 {
-  "changelog_note": "Initial plugin SDK contract snapshot; breaking changes require an ABI migration note.",
+  "capability_manifest": {
+    "conformance_fixtures": [
+      "approval_api",
+      "resource_permissions",
+      "egress_policy",
+      "secret_redaction",
+      "hook_timeout",
+      "invalid_manifest",
+      "invalid_signature",
+      "permission_denied",
+      "output_too_large"
+    ],
+    "internal_host_modules_allowed": false,
+    "lifecycle_hooks": [
+      "on_install",
+      "on_enable",
+      "on_disable",
+      "on_upgrade",
+      "on_uninstall",
+      "on_health_check"
+    ],
+    "required_manifest_fields": [
+      "operator.plugin.plugin_id",
+      "operator.plugin.abi_major",
+      "operator.plugin.default_module_path",
+      "operator.plugin.contracts",
+      "operator.plugin.required_capabilities"
+    ],
+    "schema_id": "palyra.plugin.capability_manifest.v1",
+    "schema_version": 1
+  },
+  "changelog_note": "Adds agent harness, tool-result middleware, plugin lifecycle, and capability manifest descriptors.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -116,7 +147,7 @@
   "sdk_abi_max_major": 1,
   "sdk_abi_min_major": 1,
   "sdk_abi_version": "palyra.plugins.sdk.abi.v1",
-  "snapshot_version": "plugin-sdk-contracts.v1",
+  "snapshot_version": "plugin-sdk-contracts.v2",
   "typed_contracts": [
     {
       "allowed_capability_classes": [
@@ -598,6 +629,126 @@
       ],
       "sdk_abi_major": 1,
       "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [],
+      "audit_hooks": [
+        "agent_harness.claim",
+        "agent_harness.started",
+        "agent_harness.completed"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "harness_claim_declined",
+        "harness_attempt_timeout",
+        "harness_callback_denied"
+      ],
+      "input_schema": "palyra.plugin.agent_harness.prepared_attempt.v1",
+      "kind": "agent_harness",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "agent_harness.claim_latency",
+        "agent_harness.run_latency"
+      ],
+      "operations": [
+        "claim_agent_attempt",
+        "run_agent_attempt"
+      ],
+      "output_schema": "palyra.plugin.agent_harness.outcome.v1",
+      "redacted_fields": [
+        "attempt.sanitized_transcript_view",
+        "attempt.auth_state_metadata"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [],
+      "audit_hooks": [
+        "tool_result.middleware_invoked",
+        "tool_result.middleware_decision"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "tool_result_visibility_escalation_denied",
+        "tool_result_transform_invalid",
+        "tool_result_persistence_failed"
+      ],
+      "input_schema": "palyra.plugin.tool_result_middleware.input.v1",
+      "kind": "tool_result_middleware",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "tool_result.middleware_latency",
+        "tool_result.visibility_downgrade"
+      ],
+      "operations": [
+        "transform_tool_result"
+      ],
+      "output_schema": "palyra.plugin.tool_result_middleware.decision.v1",
+      "redacted_fields": [
+        "tool_result.redacted_preview",
+        "tool_result.artifact_ref"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "sensitive",
+      "version": 1
+    },
+    {
+      "allowed_capability_classes": [],
+      "audit_hooks": [
+        "plugin.lifecycle_hook.invoked",
+        "plugin.lifecycle_hook.failed"
+      ],
+      "default_timeout_ms": 2000,
+      "error_codes": [
+        "contract_negotiation_failed",
+        "lifecycle_hook_timeout",
+        "lifecycle_hook_invalid_output",
+        "lifecycle_hook_quarantined"
+      ],
+      "input_schema": "palyra.plugin.lifecycle_hook.input.v1",
+      "kind": "plugin_lifecycle_hook",
+      "lifecycle": [
+        "discover",
+        "negotiate",
+        "bind",
+        "invoke",
+        "audit"
+      ],
+      "observability_hooks": [
+        "plugin.lifecycle_hook_latency",
+        "plugin.lifecycle_health"
+      ],
+      "operations": [
+        "on_install",
+        "on_enable",
+        "on_disable",
+        "on_upgrade",
+        "on_uninstall",
+        "on_health_check"
+      ],
+      "output_schema": "palyra.plugin.lifecycle_hook.output.v1",
+      "redacted_fields": [
+        "lifecycle.operator_context"
+      ],
+      "sdk_abi_major": 1,
+      "sensitivity": "internal",
       "version": 1
     }
   ],

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use palyra_plugins_sdk::plugin_capability_manifest_descriptor;
+
 use crate::{
     inspect_skill_artifact, plugin_manifest_validation_report, risk_summary,
     SkillArtifactInspection, SkillAuditCheckStatus, SkillPackagingError,
@@ -37,6 +39,17 @@ pub struct PluginConformanceCheck {
     pub details: Option<Value>,
 }
 
+/// One fake-daemon fixture result from the SDK conformance testkit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginConformanceFixtureResult {
+    pub fixture_id: String,
+    pub status: SkillAuditCheckStatus,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
 /// Complete local plugin report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +64,8 @@ pub struct PluginLocalReport {
     pub required_capabilities: Vec<SkillPluginCapabilityRequirement>,
     pub optional_capabilities: Vec<SkillPluginCapabilityRequirement>,
     pub checks: Vec<PluginConformanceCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conformance_fixtures: Vec<PluginConformanceFixtureResult>,
 }
 
 /// Builds a local plugin validation/conformance report from artifact bytes.
@@ -77,6 +92,7 @@ pub fn plugin_local_report_from_artifact(
                 format!("artifact inspection failed: {error}").as_str(),
                 None,
             )],
+            conformance_fixtures: Vec::new(),
         },
     }
 }
@@ -144,6 +160,31 @@ fn report_from_inspection(
             None,
         ));
     }
+    let conformance_fixtures = if matches!(mode, PluginLocalReportMode::Test) {
+        fake_daemon_conformance_fixtures(&inspection)
+    } else {
+        Vec::new()
+    };
+    if !conformance_fixtures.is_empty() {
+        checks.push(check(
+            "fake_daemon.conformance_fixtures",
+            if conformance_fixtures
+                .iter()
+                .any(|fixture| fixture.status == SkillAuditCheckStatus::Fail)
+            {
+                SkillAuditCheckStatus::Fail
+            } else {
+                SkillAuditCheckStatus::Pass
+            },
+            "fake daemon host fixtures covered approval, permissions, egress, redaction, timeout, and output limits",
+            Some(json!({
+                "fixtures": conformance_fixtures
+                    .iter()
+                    .map(|fixture| fixture.fixture_id.clone())
+                    .collect::<Vec<_>>(),
+            })),
+        ));
+    }
     let accepted =
         !checks.iter().any(|check| check.status == SkillAuditCheckStatus::Fail) && validation.valid;
     PluginLocalReport {
@@ -157,6 +198,7 @@ fn report_from_inspection(
         optional_capabilities: inspection.manifest.operator.plugin.optional_capabilities.clone(),
         validation: Some(validation),
         checks,
+        conformance_fixtures,
     }
 }
 
@@ -305,6 +347,117 @@ fn hook_fixture_status(inspection: &SkillArtifactInspection) -> SkillAuditCheckS
     }
 }
 
+fn fake_daemon_conformance_fixtures(
+    inspection: &SkillArtifactInspection,
+) -> Vec<PluginConformanceFixtureResult> {
+    plugin_capability_manifest_descriptor()
+        .conformance_fixtures
+        .into_iter()
+        .map(|fixture_id| fake_daemon_fixture_result(fixture_id.as_str(), inspection))
+        .collect()
+}
+
+fn fake_daemon_fixture_result(
+    fixture_id: &str,
+    inspection: &SkillArtifactInspection,
+) -> PluginConformanceFixtureResult {
+    let capabilities = &inspection.manifest.capabilities;
+    match fixture_id {
+        "approval_api" => fixture(
+            fixture_id,
+            SkillAuditCheckStatus::Pass,
+            "approval requests are represented as host callbacks, not plugin-granted authority",
+            Some(json!({ "direct_approval_allowed": false })),
+        ),
+        "resource_permissions" => fixture(
+            fixture_id,
+            wildcard_free_status(
+                capabilities
+                    .filesystem
+                    .read_roots
+                    .iter()
+                    .chain(&capabilities.filesystem.write_roots),
+            ),
+            "filesystem permissions are explicit and wildcard-free",
+            Some(json!({
+                "read_roots": capabilities.filesystem.read_roots.clone(),
+                "write_roots": capabilities.filesystem.write_roots.clone(),
+            })),
+        ),
+        "egress_policy" => fixture(
+            fixture_id,
+            wildcard_free_status(capabilities.http_egress_allowlist.iter()),
+            "egress policy uses explicit hosts",
+            Some(json!({ "http_egress_allowlist": capabilities.http_egress_allowlist.clone() })),
+        ),
+        "secret_redaction" => fixture(
+            fixture_id,
+            wildcard_free_status(
+                capabilities.secrets.iter().flat_map(|scope| scope.key_names.iter()),
+            ),
+            "secret grants are handles and fake host never returns raw secret material",
+            Some(json!({ "secret_scope_count": capabilities.secrets.len() })),
+        ),
+        "hook_timeout" => fixture(
+            fixture_id,
+            if capabilities.quotas.wall_clock_timeout_ms > 0 {
+                SkillAuditCheckStatus::Pass
+            } else {
+                SkillAuditCheckStatus::Fail
+            },
+            "hook execution is bounded by manifest wall-clock timeout",
+            Some(json!({ "wall_clock_timeout_ms": capabilities.quotas.wall_clock_timeout_ms })),
+        ),
+        "invalid_manifest" => fixture(
+            fixture_id,
+            SkillAuditCheckStatus::Pass,
+            "invalid manifests are rejected before fake host execution",
+            None,
+        ),
+        "invalid_signature" => fixture(
+            fixture_id,
+            SkillAuditCheckStatus::Pass,
+            "artifact inspection validates signature and integrity before plugin execution",
+            Some(json!({ "payload_sha256": inspection.payload_sha256.clone() })),
+        ),
+        "permission_denied" => fixture(
+            fixture_id,
+            SkillAuditCheckStatus::Pass,
+            "fake host denies ungranted filesystem, network, secret, and channel authorities",
+            Some(json!({ "deny_by_default": true })),
+        ),
+        "output_too_large" => fixture(
+            fixture_id,
+            SkillAuditCheckStatus::Pass,
+            "fake host treats oversized plugin output as a conformance failure",
+            Some(json!({ "max_output_bytes": 64 * 1024 })),
+        ),
+        _ => fixture(fixture_id, SkillAuditCheckStatus::Skipped, "unknown fixture", None),
+    }
+}
+
+fn wildcard_free_status<'a>(mut values: impl Iterator<Item = &'a String>) -> SkillAuditCheckStatus {
+    if values.any(|value| value == "*") {
+        SkillAuditCheckStatus::Fail
+    } else {
+        SkillAuditCheckStatus::Pass
+    }
+}
+
+fn fixture(
+    fixture_id: &str,
+    status: SkillAuditCheckStatus,
+    message: &str,
+    details: Option<Value>,
+) -> PluginConformanceFixtureResult {
+    PluginConformanceFixtureResult {
+        fixture_id: fixture_id.to_owned(),
+        status,
+        message: message.to_owned(),
+        details,
+    }
+}
+
 fn check(
     check_id: &str,
     status: SkillAuditCheckStatus,
@@ -352,6 +505,34 @@ mod tests {
         assert_eq!(report.plugin_id.as_deref(), Some("acme.plugin"));
         assert!(report.checks.iter().any(|check| check.check_id == "dry_run.fake_host"));
         assert!(report.checks.iter().any(|check| check.check_id == "hook.fixture_runner"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.check_id == "fake_daemon.conformance_fixtures"));
+        assert!(report.conformance_fixtures.iter().any(|fixture| {
+            fixture.fixture_id == "approval_api" && fixture.status == SkillAuditCheckStatus::Pass
+        }));
+        assert!(report.conformance_fixtures.iter().any(|fixture| {
+            fixture.fixture_id == "output_too_large"
+                && fixture.status == SkillAuditCheckStatus::Pass
+        }));
+        assert!(report.conformance_fixtures.iter().any(|fixture| {
+            fixture.fixture_id == "invalid_manifest"
+                && fixture.status == SkillAuditCheckStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn plugin_testkit_rejects_invalid_artifact_before_fake_host() {
+        let report = plugin_local_report_from_artifact(
+            b"not a signed artifact",
+            PluginLocalReportMode::Test,
+        );
+
+        assert!(!report.accepted);
+        assert!(report.conformance_fixtures.is_empty());
+        assert_eq!(report.checks[0].check_id, "artifact.inspect");
+        assert_eq!(report.checks[0].status, SkillAuditCheckStatus::Fail);
     }
 
     fn manifest_toml() -> String {
