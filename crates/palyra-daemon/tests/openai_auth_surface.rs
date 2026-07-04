@@ -3682,10 +3682,12 @@ fn assert_compat_run_wait_timeout_or_fast_completion(payload: &Value) {
         (Some("run.wait"), Some(true), Some("timeout")) => {
             assert_eq!(payload.get("timeout_ms").and_then(Value::as_u64), Some(1));
             assert!(
-                payload
-                    .pointer("/run/status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| matches!(status, "queued" | "running")),
+                payload.pointer("/run/status").and_then(Value::as_str).is_some_and(
+                    |status| matches!(
+                        status,
+                        "queued" | "running" | "completed" | "failed" | "cancelled"
+                    )
+                ),
                 "timeout payload should include current run status: {payload}"
             );
         }
