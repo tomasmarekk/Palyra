@@ -13,6 +13,7 @@ use std::{
 use palyra_common::tool_catalog::ToolCatalogExposureMode;
 use serde_json::{json, Value};
 
+use crate::sandbox_runner::EgressEnforcementMode;
 use crate::tool_protocol::ToolCallConfig;
 
 use super::builtin::{registry_entries, registry_entry};
@@ -92,6 +93,7 @@ pub(crate) fn build_model_visible_tool_catalog_snapshot_with_external_records(
     registered_names.extend(external_registered_names.iter().cloned());
 
     for entry in registry {
+        let entry = runtime_adjusted_registry_entry(entry, request.config);
         if is_catalog_bridge_tool(entry.name.as_str()) {
             continue;
         }
@@ -785,6 +787,33 @@ fn tool_keywords(tool: &ModelVisibleTool) -> Vec<String> {
         }
     }
     keywords
+}
+
+fn runtime_adjusted_registry_entry(
+    mut entry: ToolRegistryEntry,
+    config: &ToolCallConfig,
+) -> ToolRegistryEntry {
+    if entry.name == "palyra.process.run"
+        && !matches!(
+            config.process_runner.egress_enforcement_mode,
+            EgressEnforcementMode::Preflight
+        )
+    {
+        remove_object_schema_property(&mut entry.input_schema, "requested_egress_hosts");
+        entry.schema_hash = stable_hash_value(&entry.input_schema);
+        entry.description = format!(
+            "{} Current process-runner egress profile is '{}', so requested_egress_hosts is hidden for this run; omit it for ordinary local commands, use palyra.http.fetch or browser tools for network retrieval, or enable tool_call.process_runner.egress_enforcement_mode='preflight' for host preflight checks.",
+            entry.description,
+            config.process_runner.egress_enforcement_mode.as_str()
+        );
+    }
+    entry
+}
+
+fn remove_object_schema_property(schema: &mut Value, property: &str) {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.remove(property);
+    }
 }
 
 fn estimate_provider_tool_bytes(tools: &[ModelVisibleTool], dialect: ToolSchemaDialect) -> usize {

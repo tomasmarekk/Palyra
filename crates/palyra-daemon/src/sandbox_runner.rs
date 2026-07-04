@@ -5527,7 +5527,7 @@ fn validate_requested_egress_hosts_require_enforcement(
     }
     Err(SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::EgressDenied,
-        message: "sandbox denied: requested_egress_hosts requires active process-runner egress enforcement; current egress_enforcement_mode is none".to_owned(),
+        message: "sandbox denied: requested_egress_hosts is only usable when tool_call.process_runner.egress_enforcement_mode='preflight'; current egress_enforcement_mode is none. Omit requested_egress_hosts for ordinary local commands, use palyra.http.fetch or browser tools for network retrieval, or ask an operator to enable process-runner preflight egress checks.".to_owned(),
     })
 }
 
@@ -14240,6 +14240,13 @@ mod tests {
         assert!(
             error.message.contains("requested_egress_hosts")
                 && error.message.contains("egress_enforcement_mode is none"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("palyra.http.fetch")
+                && error.message.contains("browser tools")
+                && error.message.contains("enable process-runner preflight"),
             "{}",
             error.message
         );

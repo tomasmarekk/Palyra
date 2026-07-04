@@ -549,6 +549,61 @@ fn process_run_allowlist_exposes_lifecycle_controls() {
 }
 
 #[test]
+fn process_run_schema_hides_requested_egress_hosts_when_profile_cannot_enforce_them() {
+    let mut config = config(&["palyra.process.run"]);
+    config.process_runner.enabled = true;
+    config.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let process_run =
+        snapshot.tools.iter().find(|tool| tool.name == "palyra.process.run").expect("tool");
+
+    assert!(process_run.schema["properties"].get("requested_egress_hosts").is_none());
+    assert!(process_run.provider_schema["properties"].get("requested_egress_hosts").is_none());
+    assert!(
+        process_run.description.contains("egress profile is 'none'")
+            && process_run.description.contains("palyra.http.fetch")
+            && process_run.description.contains("egress_enforcement_mode='preflight'"),
+        "{}",
+        process_run.description
+    );
+}
+
+#[test]
+fn process_run_schema_keeps_requested_egress_hosts_in_preflight_profile() {
+    let mut config = config(&["palyra.process.run"]);
+    config.process_runner.enabled = true;
+    config.process_runner.egress_enforcement_mode = EgressEnforcementMode::Preflight;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &catalog_policy(&config),
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+    let process_run =
+        snapshot.tools.iter().find(|tool| tool.name == "palyra.process.run").expect("tool");
+
+    assert!(process_run.schema["properties"].get("requested_egress_hosts").is_some());
+    assert!(process_run.provider_schema["properties"].get("requested_egress_hosts").is_some());
+}
+
+#[test]
 fn plugin_run_visibility_tracks_wasm_runtime_policy() {
     let mut config = config(&["palyra.plugin.run"]);
     let disabled_snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
