@@ -13,7 +13,6 @@
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
-use base64::Engine as _;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,6 +29,7 @@ use crate::{
     application::memory::{
         redact_memory_text_for_output, MEMORY_CONTEXT_FENCE_VERSION, MEMORY_TRUST_LABEL_RETRIEVED,
     },
+    application::multimodal_context::build_multimodal_provider_input_plan,
     application::project_context::{
         preview_project_context, render_project_context_prompt, ProjectContextPreviewEnvelope,
     },
@@ -57,7 +57,7 @@ use crate::{
     },
     domain::workspace::WorkspaceRiskState,
     gateway::{
-        ingest_memory_best_effort, non_empty, truncate_with_ellipsis, GatewayRuntimeState,
+        ingest_memory_best_effort, truncate_with_ellipsis, GatewayRuntimeState,
         MAX_PREVIOUS_RUN_CONTEXT_ENTRY_CHARS, MAX_PREVIOUS_RUN_CONTEXT_TAPE_EVENTS,
         MAX_PREVIOUS_RUN_CONTEXT_TURNS, MEMORY_AUTO_INJECT_MIN_SCORE,
     },
@@ -308,50 +308,7 @@ pub(crate) fn build_provider_image_inputs(
     attachments: &[common_v1::MessageAttachment],
     media_config: &MediaRuntimeConfig,
 ) -> Vec<ProviderImageInput> {
-    let mut inputs = Vec::new();
-    let mut total_bytes = 0usize;
-    for attachment in attachments {
-        if attachment.kind != common_v1::message_attachment::AttachmentKind::Image as i32 {
-            continue;
-        }
-        if inputs.len() >= media_config.vision_max_image_count {
-            break;
-        }
-        let Some(mime_type) = non_empty(attachment.declared_content_type.clone()) else {
-            continue;
-        };
-        if !media_config.vision_allowed_content_types.iter().any(|allowed| allowed == &mime_type) {
-            continue;
-        }
-        if attachment.inline_bytes.is_empty() {
-            continue;
-        }
-        let image_bytes = attachment.inline_bytes.len();
-        if image_bytes > media_config.vision_max_image_bytes {
-            continue;
-        }
-        if total_bytes.saturating_add(image_bytes) > media_config.vision_max_total_bytes {
-            break;
-        }
-        let width_px = (attachment.width_px > 0).then_some(attachment.width_px);
-        let height_px = (attachment.height_px > 0).then_some(attachment.height_px);
-        if width_px.is_some_and(|value| value > media_config.vision_max_dimension_px)
-            || height_px.is_some_and(|value| value > media_config.vision_max_dimension_px)
-        {
-            continue;
-        }
-        total_bytes = total_bytes.saturating_add(image_bytes);
-        inputs.push(ProviderImageInput {
-            mime_type,
-            bytes_base64: base64::engine::general_purpose::STANDARD
-                .encode(attachment.inline_bytes.as_slice()),
-            file_name: non_empty(attachment.filename.clone()),
-            width_px,
-            height_px,
-            artifact_id: attachment.artifact_id.as_ref().map(|value| value.ulid.clone()),
-        });
-    }
-    inputs
+    build_multimodal_provider_input_plan(attachments, media_config).vision_inputs
 }
 
 /// Prepends auto-injected memory and workspace-memory recall to the prompt.

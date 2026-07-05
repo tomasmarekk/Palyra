@@ -1554,6 +1554,10 @@ fn browser_tool_names() -> &'static [&'static str] {
         "palyra.browser.screenshot",
         "palyra.browser.pdf",
         "palyra.browser.observe",
+        "palyra.browser.vision",
+        "palyra.browser.images.list",
+        "palyra.browser.dialog",
+        "palyra.browser.cdp.invoke",
         "palyra.browser.storage",
         "palyra.browser.network_log",
         "palyra.browser.console_log",
@@ -1597,6 +1601,18 @@ fn browser_tool_description(tool_name: &str) -> &'static str {
         }
         "palyra.browser.observe" => {
             "Observe visible browser state, bounded DOM/accessibility visible text evidence, redacted form/storage metadata, and optional read-only selector geometry/computed-style captures for layout assertions."
+        }
+        "palyra.browser.vision" => {
+            "Capture browser visual evidence as metadata only and fail closed when no OCR/vision bridge is configured; never returns model-visible image bytes."
+        }
+        "palyra.browser.images.list" => {
+            "List image elements from the current browser DOM as bounded metadata and artifact-safe references; raw image bytes and data URIs are omitted."
+        }
+        "palyra.browser.dialog" => {
+            "Inspect or request handling of browser dialog state through the brokered browser runtime; fails closed when dialog RPC support is unavailable."
+        }
+        "palyra.browser.cdp.invoke" => {
+            "Policy-gated Chromium DevTools Protocol escape hatch for a small read-only allowlist; hidden from default profiles and fails closed without backend support."
         }
         "palyra.browser.storage" => {
             "Inspect browser cookies/localStorage names and value metadata for diagnostics; secret values are withheld from model-visible output."
@@ -1875,6 +1891,48 @@ fn browser_tool_schema(tool_name: &str) -> Value {
                 "max_capture_text_bytes",
                 json!({"type":"integer","minimum":0,"description":"Maximum text preview bytes per captured selector. Defaults to a small bounded preview."}),
             ));
+        }
+        "palyra.browser.vision" => {
+            properties.push((
+                "question",
+                json!({"type":"string","description":"Short visual question to answer if a future OCR/vision bridge is configured. Current runtime returns only screenshot metadata and an explicit vision_not_available error."}),
+            ));
+            properties.push((
+                "max_bytes",
+                json!({"type":"integer","minimum":1,"description":"Maximum screenshot bytes to capture for metadata. Image bytes are never returned to the model."}),
+            ));
+            required.push("question");
+        }
+        "palyra.browser.images.list" => {
+            properties.push((
+                "max_count",
+                json!({"type":"integer","minimum":1,"maximum":100,"description":"Maximum image elements to return. Results are DOM metadata only; image bytes and data URIs are omitted."}),
+            ));
+            properties.push((
+                "max_dom_snapshot_bytes",
+                json!({"type":"integer","minimum":0,"description":"Bound for the DOM snapshot used to derive image metadata."}),
+            ));
+        }
+        "palyra.browser.dialog" => {
+            properties.push((
+                "action",
+                json!({"type":"string","enum":["inspect","accept","dismiss","respond"],"default":"inspect","description":"Dialog operation to request. Mutating actions fail closed unless browserd exposes native dialog support."}),
+            ));
+            properties.push((
+                "prompt_text",
+                json!({"type":"string","description":"Text for prompt dialogs when action=respond. Ignored when native dialog support is unavailable."}),
+            ));
+        }
+        "palyra.browser.cdp.invoke" => {
+            properties.push((
+                "method",
+                json!({"type":"string","description":"Read-only CDP method from the daemon allowlist, for example Page.getLayoutMetrics. Runtime denies methods outside the allowlist before contacting browserd."}),
+            ));
+            properties.push((
+                "params",
+                json!({"type":"object","description":"CDP parameters. Kept bounded by the browser tool input limit.","additionalProperties":true}),
+            ));
+            required.push("method");
         }
         _ => {}
     }
@@ -2460,5 +2518,42 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("viewport device scale description should be visible to models");
         assert!(scale_description.contains("safety limits"));
+    }
+
+    #[test]
+    fn browser_rescue_registry_exposes_fail_closed_contracts() {
+        let vision = registry_entry("palyra.browser.vision").expect("vision entry exists");
+        assert!(vision.description.contains("never returns model-visible image bytes"));
+        assert_eq!(
+            vision.input_schema.pointer("/required/1").and_then(serde_json::Value::as_str),
+            Some("question")
+        );
+        let question_description = vision
+            .input_schema
+            .pointer("/properties/question/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("vision question description should be visible to models");
+        assert!(question_description.contains("vision_not_available"));
+
+        let images =
+            registry_entry("palyra.browser.images.list").expect("images list entry exists");
+        assert!(images.description.contains("raw image bytes"));
+        assert_eq!(images.input_schema["properties"]["max_count"]["maximum"], 100);
+
+        let dialog = registry_entry("palyra.browser.dialog").expect("dialog entry exists");
+        let dialog_actions = dialog
+            .input_schema
+            .pointer("/properties/action/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("dialog action enum should be visible");
+        assert!(dialog_actions.iter().any(|value| value.as_str() == Some("accept")));
+        assert!(dialog.description.contains("fails closed"));
+
+        let cdp = registry_entry("palyra.browser.cdp.invoke").expect("cdp entry exists");
+        assert!(cdp.description.contains("hidden from default profiles"));
+        assert_eq!(
+            cdp.input_schema.pointer("/required/1").and_then(serde_json::Value::as_str),
+            Some("method")
+        );
     }
 }

@@ -199,6 +199,8 @@ const RESEARCH_PROFILE_TOOLS: &[&str] = &[
     "palyra.browser.reload",
     "palyra.browser.title",
     "palyra.browser.observe",
+    "palyra.browser.vision",
+    "palyra.browser.images.list",
     "palyra.browser.screenshot",
     "palyra.browser.pdf",
     "palyra.browser.scroll",
@@ -568,6 +570,12 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             default_sensitive: true,
         }),
         "palyra.browser.observe" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.vision" | "palyra.browser.images.list" => {
+            Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
+        }
+        "palyra.browser.dialog" | "palyra.browser.cdp.invoke" => {
             Some(ToolMetadata { capabilities: NETWORK_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.browser.storage" => {

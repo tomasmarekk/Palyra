@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "browser_vision_unsupported_no_raw_image",
+      "tool": "palyra.browser.vision",
+      "expected_error_code": "vision_not_available",
+      "raw_image_bytes_model_visible": false,
+      "required_fields": ["screenshot.sha256", "image_base64_omitted"]
+    },
+    {
+      "id": "browser_images_list_metadata_only",
+      "tool": "palyra.browser.images.list",
+      "expected_source": "browser.observe.dom_snapshot",
+      "raw_image_bytes_model_visible": false,
+      "required_fields": ["images[].src", "images[].artifact_ref"]
+    },
+    {
+      "id": "browser_dialog_backend_unavailable",
+      "tool": "palyra.browser.dialog",
+      "expected_error_code": "dialog_backend_unavailable",
+      "mutated_page": false
+    },
+    {
+      "id": "browser_cdp_denies_non_allowlisted_method",
+      "tool": "palyra.browser.cdp.invoke",
+      "input": {
+        "method": "Runtime.evaluate"
+      },
+      "expected_error_code": "cdp_method_denied"
+    },
+    {
+      "id": "multimodal_unsupported_recovery_ladder",
+      "anomaly": "multimodal_unsupported",
+      "expected_actions": [
+        "shrink_multimodal",
+        "strip_unsupported_content",
+        "retry_with_prompt",
+        "fail_deterministic"
+      ]
+    }
+  ]
+}

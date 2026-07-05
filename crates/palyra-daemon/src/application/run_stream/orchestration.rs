@@ -219,6 +219,9 @@ fn provider_turn_anomaly_from_response_failure(
     if message.contains("finish_reason=tool_calls") || message.contains("without payload") {
         return ProviderTurnAnomaly::ToolCallsFinishWithoutPayload;
     }
+    if response_failure_mentions_unsupported_multimodal(message.as_str()) {
+        return ProviderTurnAnomaly::MultimodalUnsupported;
+    }
     if message.contains("raw tool-call markup") {
         return ProviderTurnAnomaly::MalformedToolSequence;
     }
@@ -231,6 +234,17 @@ fn provider_turn_anomaly_from_response_failure(
         AgentLoopTerminationReason::ContextBudgetExhausted => ProviderTurnAnomaly::ContextOverflow,
         _ => ProviderTurnAnomaly::MalformedStream,
     }
+}
+
+fn response_failure_mentions_unsupported_multimodal(message: &str) -> bool {
+    message.contains("vision_unsupported")
+        || message.contains("does not support vision inputs")
+        || message.contains("unsupported multimodal")
+        || (message.contains("unsupported content type")
+            && (message.contains("image") || message.contains("multimodal")))
+        || (message.contains("unsupported")
+            && message.contains("image")
+            && message.contains("provider"))
 }
 
 /// Agent-loop phase covered by a local deadline before the provider watchdog starts.
@@ -5355,20 +5369,20 @@ mod tests {
         provider_output_needs_tool_repair_audit, provider_request_deadline_timeout,
         provider_request_timeout_message, provider_request_timeout_status,
         provider_status_recovery_decision_payload, provider_timeout_termination_reason,
-        provider_waiting_status_message, repeated_tool_failure_signature,
-        run_loop_phase_timeout_message, run_loop_phase_timeout_partial_summary,
-        run_loop_phase_timeout_payload, run_loop_phase_waiting_status_message,
-        run_progress_attempt_from_tool_result, run_stream_agent_harness_selection_mode,
-        run_stream_harness_selection_payload, run_stream_harness_started_payload,
-        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
-        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
-        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
-        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
-        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
-        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
-        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
-        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
-        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        provider_turn_anomaly_from_response_failure, provider_waiting_status_message,
+        repeated_tool_failure_signature, run_loop_phase_timeout_message,
+        run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
+        run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
+        run_stream_agent_harness_selection_mode, run_stream_harness_selection_payload,
+        run_stream_harness_started_payload, run_stream_harness_terminal_event,
+        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
+        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
+        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
+        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
+        tool_result_to_provider_message, truncated_final_answer_without_tools,
+        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
+        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
+        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
@@ -5381,6 +5395,7 @@ mod tests {
         HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_COMPLETED_EVENT, HARNESS_RUN_FAILED_EVENT,
         HARNESS_RUN_STARTED_EVENT,
     };
+    use crate::application::provider_turn_recovery::ProviderTurnAnomaly;
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
     use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
     use crate::journal::OrchestratorQueuedInputRecord;
@@ -5448,6 +5463,21 @@ mod tests {
             updated_at_unix_ms: accepted_at_unix_ms,
             origin_run_id: Some("run_active".to_owned()),
         }
+    }
+
+    #[test]
+    fn response_failure_classifies_unsupported_multimodal_errors() {
+        let explicit = provider_turn_anomaly_from_response_failure(
+            AgentLoopTerminationReason::ProviderError,
+            "provider returned vision_unsupported for this model",
+        );
+        let content_type = provider_turn_anomaly_from_response_failure(
+            AgentLoopTerminationReason::ProviderError,
+            "unsupported content type image/webp in multimodal request",
+        );
+
+        assert_eq!(explicit, ProviderTurnAnomaly::MultimodalUnsupported);
+        assert_eq!(content_type, ProviderTurnAnomaly::MultimodalUnsupported);
     }
 
     #[test]

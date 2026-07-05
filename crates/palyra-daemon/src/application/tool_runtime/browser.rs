@@ -46,9 +46,10 @@ use crate::{
     },
     gateway::{
         current_unix_ms, truncate_with_ellipsis, BrowserServiceRuntimeConfig, GatewayRuntimeState,
-        ToolRuntimeExecutionContext, BROWSER_CLICK_TOOL_NAME, BROWSER_CONSOLE_LOG_TOOL_NAME,
-        BROWSER_DOWNLOADS_GET_TOOL_NAME, BROWSER_DOWNLOADS_LIST_TOOL_NAME, BROWSER_FILL_TOOL_NAME,
-        BROWSER_HIGHLIGHT_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME, BROWSER_NETWORK_LOG_TOOL_NAME,
+        ToolRuntimeExecutionContext, BROWSER_CDP_INVOKE_TOOL_NAME, BROWSER_CLICK_TOOL_NAME,
+        BROWSER_CONSOLE_LOG_TOOL_NAME, BROWSER_DIALOG_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME,
+        BROWSER_DOWNLOADS_LIST_TOOL_NAME, BROWSER_FILL_TOOL_NAME, BROWSER_HIGHLIGHT_TOOL_NAME,
+        BROWSER_IMAGES_LIST_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME, BROWSER_NETWORK_LOG_TOOL_NAME,
         BROWSER_OBSERVE_TOOL_NAME, BROWSER_PDF_TOOL_NAME, BROWSER_PERMISSIONS_GET_TOOL_NAME,
         BROWSER_PERMISSIONS_SET_TOOL_NAME, BROWSER_PRESS_TOOL_NAME, BROWSER_RELOAD_TOOL_NAME,
         BROWSER_RESET_STATE_TOOL_NAME, BROWSER_SCREENSHOT_TOOL_NAME, BROWSER_SCROLL_TOOL_NAME,
@@ -56,8 +57,8 @@ use crate::{
         BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_STORAGE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME,
         BROWSER_TABS_LIST_TOOL_NAME, BROWSER_TABS_OPEN_TOOL_NAME, BROWSER_TABS_SWITCH_TOOL_NAME,
         BROWSER_TITLE_TOOL_NAME, BROWSER_TYPE_TOOL_NAME, BROWSER_UPLOAD_TOOL_NAME,
-        BROWSER_VIEWPORT_TOOL_NAME, BROWSER_WAIT_FOR_TOOL_NAME, IMAGE_OBSERVE_TOOL_NAME,
-        MAX_BROWSER_TOOL_INPUT_BYTES,
+        BROWSER_VIEWPORT_TOOL_NAME, BROWSER_VISION_TOOL_NAME, BROWSER_WAIT_FOR_TOOL_NAME,
+        IMAGE_OBSERVE_TOOL_NAME, MAX_BROWSER_TOOL_INPUT_BYTES,
     },
     sandbox_runner::process_runner_allows_host_access,
     tool_protocol::{ToolAttestation, ToolExecutionOutcome},
@@ -102,6 +103,11 @@ const BROWSER_DOWNLOAD_TOOL_MAX_BYTES: u64 = 512 * 1024;
 const BROWSER_VIEWPORT_HEIGHT_TOLERANCE_PX: u32 = 80;
 const BROWSER_OBSERVE_MAX_CAPTURE_SELECTORS: usize = 8;
 const BROWSER_OBSERVE_MAX_COMPUTED_STYLE_PROPERTIES: usize = 16;
+const BROWSER_IMAGES_LIST_DEFAULT_MAX_COUNT: usize = 20;
+const BROWSER_IMAGES_LIST_MAX_COUNT: usize = 100;
+const BROWSER_IMAGES_LIST_DEFAULT_DOM_BYTES: u64 = 128 * 1024;
+const BROWSER_RESCUE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.browser_rescue";
+const BROWSER_VISION_UNSUPPORTED_ERROR: &str = "vision_not_available";
 /// Env var listing extra OS roots (split like `PATH`) approved for browser
 /// file IO outside agent workspaces.
 const PALYRA_OS_FILE_ROOTS_ENV: &str = "PALYRA_OS_FILE_ROOTS";
@@ -182,6 +188,34 @@ fn browser_text_entry_action_name(tool_name: &str) -> &'static str {
     }
 }
 
+fn is_browser_rescue_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        BROWSER_VISION_TOOL_NAME
+            | BROWSER_IMAGES_LIST_TOOL_NAME
+            | BROWSER_DIALOG_TOOL_NAME
+            | BROWSER_CDP_INVOKE_TOOL_NAME
+    )
+}
+
+fn browser_rescue_rollout_disabled_output(tool_name: &str) -> Value {
+    json!({
+        "success": false,
+        "error": "browser_rescue_disabled",
+        "error_code": "browser_rescue_disabled",
+        "tool_name": tool_name,
+        "rollout": {
+            "enabled": false,
+            "config_path": BROWSER_RESCUE_ROLLOUT_CONFIG_PATH,
+        },
+        "next_action": "enable feature_rollouts.browser_rescue before using browser rescue tools",
+    })
+}
+
+fn browser_cdp_method_allowed(method: &str) -> bool {
+    matches!(method, "Page.getLayoutMetrics" | "DOM.getDocument" | "Accessibility.getFullAXTree")
+}
+
 /// Whether `tool_name` operates on an already-open browser session.
 ///
 /// `session.create` is exempt because it mints the session; `session.close`
@@ -206,6 +240,10 @@ fn browser_tool_requires_open_session(tool_name: &str) -> bool {
             | BROWSER_SCREENSHOT_TOOL_NAME
             | BROWSER_PDF_TOOL_NAME
             | BROWSER_OBSERVE_TOOL_NAME
+            | BROWSER_VISION_TOOL_NAME
+            | BROWSER_IMAGES_LIST_TOOL_NAME
+            | BROWSER_DIALOG_TOOL_NAME
+            | BROWSER_CDP_INVOKE_TOOL_NAME
             | BROWSER_STORAGE_TOOL_NAME
             | BROWSER_NETWORK_LOG_TOOL_NAME
             | BROWSER_CONSOLE_LOG_TOOL_NAME
@@ -1307,6 +1345,19 @@ pub(crate) async fn execute_browser_tool(
         }
     };
 
+    if is_browser_rescue_tool(tool_name)
+        && !runtime_state.config.feature_rollouts.browser_rescue.enabled
+    {
+        let output = browser_rescue_rollout_disabled_output(tool_name);
+        return browser_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+            format!("{tool_name} requires {BROWSER_RESCUE_ROLLOUT_CONFIG_PATH}=true"),
+        );
+    }
+
     // The daemon keeps its own ledger of sessions it saw close so calls on a
     // dead session fail fast with a stable `browser_session_closed` error
     // instead of a backend-specific one (and without an RPC round trip).
@@ -1988,9 +2039,12 @@ pub(crate) async fn execute_browser_tool(
                         "success": response.success,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2078,9 +2132,12 @@ pub(crate) async fn execute_browser_tool(
                         "typed_bytes": response.typed_bytes,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2200,9 +2257,12 @@ pub(crate) async fn execute_browser_tool(
                         "uploaded_file_bytes": response.uploaded_file_bytes,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         success,
@@ -2283,9 +2343,12 @@ pub(crate) async fn execute_browser_tool(
                         "key": response.key,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2385,9 +2448,12 @@ pub(crate) async fn execute_browser_tool(
                         "selected_value": response.selected_value,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2584,9 +2650,12 @@ pub(crate) async fn execute_browser_tool(
                         "selector": response.selector,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2649,9 +2718,12 @@ pub(crate) async fn execute_browser_tool(
                         "scroll_y": response.scroll_y,
                         "error": response.error,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -2724,9 +2796,12 @@ pub(crate) async fn execute_browser_tool(
                         "matched_selector": response.matched_selector,
                         "matched_text": response.matched_text,
                         "action_log": response.action_log.map(browser_action_log_to_json),
+                        "failure_screenshot": browser_failure_screenshot_metadata(
+                            response.failure_screenshot_mime_type.as_str(),
+                            response.failure_screenshot_bytes.as_slice(),
+                        ),
                         "failure_screenshot_mime_type": response.failure_screenshot_mime_type,
-                        "failure_screenshot_base64": STANDARD
-                            .encode(response.failure_screenshot_bytes.as_slice()),
+                        "failure_screenshot_base64_omitted": true,
                     });
                     (
                         response.success,
@@ -3134,6 +3209,296 @@ pub(crate) async fn execute_browser_tool(
                     format!("palyra.browser.observe failed: {}", sanitize_status_message(&error)),
                 ),
             }
+        }
+        BROWSER_VISION_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let Some(question) = payload.get("question").and_then(Value::as_str).map(str::trim)
+            else {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_VISION_TOOL_NAME} requires non-empty string field 'question'"
+                    ),
+                );
+            };
+            if question.is_empty() {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_VISION_TOOL_NAME} requires non-empty string field 'question'"
+                    ),
+                );
+            }
+            let mut request = Request::new(browser_v1::ScreenshotRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id.clone() }),
+                max_bytes: payload
+                    .get("max_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(runtime_state.config.browser_service.max_screenshot_bytes as u64),
+                format: "png".to_owned(),
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.screenshot(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let screenshot_metadata = browser_image_bytes_metadata(
+                        response.mime_type.as_str(),
+                        response.image_bytes.as_slice(),
+                    );
+                    let error_code = if response.success {
+                        BROWSER_VISION_UNSUPPORTED_ERROR
+                    } else {
+                        "browser_screenshot_failed"
+                    };
+                    let error = if response.success {
+                        "browser screenshot captured, but no OCR/vision bridge is configured"
+                            .to_owned()
+                    } else {
+                        response.error.clone()
+                    };
+                    let output = json!({
+                        "success": false,
+                        "session_id": session_id,
+                        "error": error_code,
+                        "error_code": error_code,
+                        "question_sha256": hex::encode(Sha256::digest(question.as_bytes())),
+                        "screenshot": screenshot_metadata,
+                        "layout_metrics": response.layout_metrics.map(browser_layout_metrics_to_json),
+                        "vision_status": "unsupported",
+                        "provider_handoff_available": false,
+                        "raw_image_bytes_model_visible": false,
+                        "image_base64_omitted": true,
+                        "next_action": "save a screenshot with palyra.browser.screenshot output_path and use a configured OCR/vision runtime before claiming visual facts",
+                    });
+                    (
+                        false,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        format!("{BROWSER_VISION_TOOL_NAME} failed: {error}"),
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!("palyra.browser.vision failed: {}", sanitize_status_message(&error)),
+                ),
+            }
+        }
+        BROWSER_IMAGES_LIST_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let max_count = browser_images_list_max_count(&payload);
+            let mut request = Request::new(browser_v1::ObserveRequest {
+                v: CANONICAL_PROTOCOL_MAJOR,
+                session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+                include_dom_snapshot: true,
+                include_accessibility_tree: false,
+                include_visible_text: false,
+                max_dom_snapshot_bytes: payload
+                    .get("max_dom_snapshot_bytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(BROWSER_IMAGES_LIST_DEFAULT_DOM_BYTES),
+                max_accessibility_tree_bytes: 0,
+                max_visible_text_bytes: 0,
+                capture_selectors: Vec::new(),
+                computed_style_properties: Vec::new(),
+                max_capture_text_bytes: 0,
+            });
+            if let Err(error) = attach_browser_auth_metadata(
+                &mut request,
+                runtime_state.config.browser_service.auth_token.as_deref(),
+            ) {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    error,
+                );
+            }
+            match client.observe(request).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    let (images, image_count_truncated) = browser_image_tags_from_dom_snapshot(
+                        response.dom_snapshot.as_str(),
+                        max_count,
+                    );
+                    let image_count = images.len();
+                    let output = json!({
+                        "success": response.success,
+                        "source": "browser.observe.dom_snapshot",
+                        "page_url": redact_url(response.page_url.as_str()),
+                        "images": images,
+                        "image_count": image_count,
+                        "image_count_truncated": image_count_truncated,
+                        "dom_truncated": response.dom_truncated,
+                        "artifact_refs_available": false,
+                        "raw_image_bytes_model_visible": false,
+                        "image_base64_omitted": true,
+                        "error": response.error,
+                    });
+                    (
+                        response.success,
+                        serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                        if response.success { String::new() } else { response.error },
+                    )
+                }
+                Err(error) => (
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "palyra.browser.images.list failed: {}",
+                        sanitize_status_message(&error)
+                    ),
+                ),
+            }
+        }
+        BROWSER_DIALOG_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("inspect");
+            if !matches!(action, "inspect" | "accept" | "dismiss" | "respond") {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!("{BROWSER_DIALOG_TOOL_NAME} action must be inspect, accept, dismiss, or respond"),
+                );
+            }
+            let output = json!({
+                "success": false,
+                "session_id": session_id,
+                "action": action,
+                "error": "dialog_backend_unavailable",
+                "error_code": "dialog_backend_unavailable",
+                "dialog_state": "unknown",
+                "blocking_status": "unknown",
+                "backend_support": false,
+                "mutated_page": false,
+                "next_action": "retry with browserd dialog RPC support before claiming a dialog was accepted, dismissed, or absent",
+            });
+            (
+                false,
+                serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                format!("{BROWSER_DIALOG_TOOL_NAME} failed: browserd dialog RPC unavailable"),
+            )
+        }
+        BROWSER_CDP_INVOKE_TOOL_NAME => {
+            let session_id = match parse_browser_tool_session_id(&payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return browser_tool_execution_outcome(
+                        proposal_id,
+                        input_json,
+                        false,
+                        b"{}".to_vec(),
+                        error,
+                    );
+                }
+            };
+            let Some(method) = payload.get("method").and_then(Value::as_str).map(str::trim) else {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_CDP_INVOKE_TOOL_NAME} requires non-empty string field 'method'"
+                    ),
+                );
+            };
+            if method.is_empty() {
+                return browser_tool_execution_outcome(
+                    proposal_id,
+                    input_json,
+                    false,
+                    b"{}".to_vec(),
+                    format!(
+                        "{BROWSER_CDP_INVOKE_TOOL_NAME} requires non-empty string field 'method'"
+                    ),
+                );
+            }
+            let (error_code, next_action) = if browser_cdp_method_allowed(method) {
+                (
+                    "cdp_backend_unavailable",
+                    "retry only after browserd exposes a bounded CDP invoke RPC for this read-only method",
+                )
+            } else {
+                (
+                    "cdp_method_denied",
+                    "use palyra.browser.observe or another first-class browser tool instead of requesting a non-allowlisted CDP method",
+                )
+            };
+            let output = json!({
+                "success": false,
+                "session_id": session_id,
+                "method": method,
+                "error": error_code,
+                "error_code": error_code,
+                "allowlisted": browser_cdp_method_allowed(method),
+                "backend_support": false,
+                "raw_protocol_result_model_visible": false,
+                "next_action": next_action,
+            });
+            (
+                false,
+                serde_json::to_vec(&output).unwrap_or_else(|_| b"{}".to_vec()),
+                format!("{BROWSER_CDP_INVOKE_TOOL_NAME} failed: {error_code}"),
+            )
         }
         BROWSER_STORAGE_TOOL_NAME => {
             let session_id = match parse_browser_tool_session_id(&payload) {
@@ -4575,6 +4940,183 @@ fn browser_action_log_to_json(entry: browser_v1::BrowserActionLogEntry) -> Value
     })
 }
 
+fn browser_image_bytes_metadata(mime_type: &str, bytes: &[u8]) -> Value {
+    json!({
+        "available": !bytes.is_empty(),
+        "mime_type": if mime_type.trim().is_empty() { Value::Null } else { json!(mime_type) },
+        "size_bytes": bytes.len(),
+        "sha256": if bytes.is_empty() {
+            Value::Null
+        } else {
+            json!(hex::encode(Sha256::digest(bytes)))
+        },
+        "image_base64_omitted": true,
+        "model_visible_bytes": false,
+    })
+}
+
+fn browser_failure_screenshot_metadata(mime_type: &str, bytes: &[u8]) -> Value {
+    let mut metadata = browser_image_bytes_metadata(mime_type, bytes);
+    metadata["kind"] = json!("failure_screenshot");
+    metadata
+}
+
+fn browser_images_list_max_count(payload: &serde_json::Map<String, Value>) -> usize {
+    payload
+        .get("max_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BROWSER_IMAGES_LIST_DEFAULT_MAX_COUNT)
+        .min(BROWSER_IMAGES_LIST_MAX_COUNT)
+}
+
+fn browser_image_tags_from_dom_snapshot(
+    dom_snapshot: &str,
+    max_count: usize,
+) -> (Vec<Value>, bool) {
+    let max_count = max_count.max(1);
+    let lowered = dom_snapshot.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    let mut images = Vec::new();
+    let mut truncated = false;
+
+    while let Some(relative_start) = lowered[cursor..].find("<img") {
+        let start = cursor + relative_start;
+        let after_tag_name = lowered.as_bytes().get(start + 4).copied();
+        if after_tag_name.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            cursor = start.saturating_add(4);
+            continue;
+        }
+        let Some(relative_end) = lowered[start..].find('>') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        if images.len() >= max_count {
+            truncated = true;
+            break;
+        }
+        images.push(browser_image_tag_metadata(&dom_snapshot[start..end], images.len()));
+        cursor = end;
+    }
+
+    (images, truncated)
+}
+
+fn browser_image_tag_metadata(tag: &str, index: usize) -> Value {
+    let src = browser_img_attr(tag, "src")
+        .map(|value| browser_safe_image_src(value.as_str()))
+        .unwrap_or(Value::Null);
+    let srcset_present = browser_img_attr(tag, "srcset").is_some();
+    json!({
+        "index": index,
+        "tag_name": "img",
+        "src": src,
+        "src_present": browser_img_attr(tag, "src").is_some(),
+        "srcset": if srcset_present {
+            json!({"present": true, "content_omitted": true})
+        } else {
+            Value::Null
+        },
+        "alt": browser_img_text_attr(tag, "alt"),
+        "title": browser_img_text_attr(tag, "title"),
+        "width_attr": browser_img_numeric_attr(tag, "width"),
+        "height_attr": browser_img_numeric_attr(tag, "height"),
+        "loading": browser_img_text_attr(tag, "loading"),
+        "decoding": browser_img_text_attr(tag, "decoding"),
+        "artifact_ref": Value::Null,
+        "visibility": "unknown",
+        "raw_bytes_model_visible": false,
+    })
+}
+
+fn browser_img_attr(tag: &str, name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_alphabetic() {
+            cursor = cursor.saturating_add(1);
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric()
+                || matches!(bytes[cursor], b'-' | b'_' | b':'))
+        {
+            cursor = cursor.saturating_add(1);
+        }
+        if name_start == cursor {
+            cursor = cursor.saturating_add(1);
+            continue;
+        }
+        let attr_name = &tag[name_start..cursor];
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor = cursor.saturating_add(1);
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor = cursor.saturating_add(1);
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor = cursor.saturating_add(1);
+        }
+        let value = if matches!(bytes.get(cursor), Some(b'"' | b'\'')) {
+            let quote = bytes[cursor];
+            cursor = cursor.saturating_add(1);
+            let value_start = cursor;
+            while cursor < bytes.len() && bytes[cursor] != quote {
+                cursor = cursor.saturating_add(1);
+            }
+            tag[value_start..cursor].to_owned()
+        } else {
+            let value_start = cursor;
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && bytes[cursor] != b'>'
+            {
+                cursor = cursor.saturating_add(1);
+            }
+            tag[value_start..cursor].to_owned()
+        };
+        if attr_name.eq_ignore_ascii_case(name) {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+    }
+    None
+}
+
+fn browser_img_text_attr(tag: &str, name: &str) -> Value {
+    browser_img_attr(tag, name)
+        .map(|value| {
+            let exported =
+                export_browser_text(value.as_str(), SafetyContentKind::BrowserObservation);
+            json!(truncate_with_ellipsis(exported.redacted_text, 512))
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn browser_img_numeric_attr(tag: &str, name: &str) -> Value {
+    browser_img_attr(tag, name)
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map_or(Value::Null, |value| json!(value))
+}
+
+fn browser_safe_image_src(src: &str) -> Value {
+    let trimmed = src.trim();
+    if trimmed.to_ascii_lowercase().starts_with("data:") {
+        let metadata = trimmed.split_once(',').map(|(metadata, _)| metadata).unwrap_or("data:");
+        return json!({
+            "kind": "data_uri",
+            "metadata": truncate_with_ellipsis(metadata.to_owned(), 128),
+            "content_omitted": true,
+        });
+    }
+    json!({
+        "kind": "url",
+        "value": truncate_with_ellipsis(redact_url(trimmed), 512),
+    })
+}
+
 fn browser_layout_metrics_to_json(metrics: browser_v1::BrowserLayoutMetrics) -> Value {
     json!({
         "viewport_width": metrics.viewport_width,
@@ -5290,30 +5832,34 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::{
-        attach_browser_caller_principal_metadata, browser_console_entry_to_json,
-        browser_cookie_domain_to_json, browser_element_captures_to_json, browser_file_url_to_path,
+        attach_browser_caller_principal_metadata, browser_cdp_method_allowed,
+        browser_console_entry_to_json, browser_cookie_domain_to_json,
+        browser_element_captures_to_json, browser_failure_screenshot_metadata,
+        browser_file_url_to_path, browser_image_tags_from_dom_snapshot,
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
-        browser_reload_expected_url_from_payload, browser_screenshot_image_observation_hint,
-        browser_session_closed_error_message, browser_session_closed_output_json,
-        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
-        browser_storage_origin_to_json, browser_tool_execution_outcome,
-        browser_tool_reports_missing_session, browser_tool_requires_open_session,
-        browser_url_targets_loopback, browser_user_owned_os_roots,
-        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
-        default_browser_session_persistence_id, filter_browser_network_log_entries_since,
-        normalize_browser_press_key_input, parse_browser_download_artifact_id,
-        parse_browser_observe_string_array, resolve_browser_output_path,
-        resolve_browser_upload_path, validate_browser_file_url_path_scope,
-        validate_browser_workspace_relative_path, write_browser_output_file,
-        BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
-        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
+        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
+        browser_session_closed_output_json, browser_session_persistence_from_payload,
+        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
+        browser_tool_execution_outcome, browser_tool_reports_missing_session,
+        browser_tool_requires_open_session, browser_url_targets_loopback,
+        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
+        canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
+        filter_browser_network_log_entries_since, normalize_browser_press_key_input,
+        parse_browser_download_artifact_id, parse_browser_observe_string_array,
+        resolve_browser_output_path, resolve_browser_upload_path,
+        validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
+        write_browser_output_file, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
+        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
-        BROWSER_CLICK_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME,
-        BROWSER_OBSERVE_TOOL_NAME, BROWSER_RELOAD_TOOL_NAME, BROWSER_SESSION_CLOSE_TOOL_NAME,
-        BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME, IMAGE_OBSERVE_TOOL_NAME,
+        BROWSER_CDP_INVOKE_TOOL_NAME, BROWSER_CLICK_TOOL_NAME, BROWSER_DOWNLOADS_GET_TOOL_NAME,
+        BROWSER_IMAGES_LIST_TOOL_NAME, BROWSER_NAVIGATE_TOOL_NAME, BROWSER_OBSERVE_TOOL_NAME,
+        BROWSER_RELOAD_TOOL_NAME, BROWSER_SESSION_CLOSE_TOOL_NAME,
+        BROWSER_SESSION_CREATE_TOOL_NAME, BROWSER_TABS_CLOSE_TOOL_NAME, BROWSER_VISION_TOOL_NAME,
+        IMAGE_OBSERVE_TOOL_NAME,
     };
     use crate::transport::grpc::proto::palyra::browser::v1 as browser_v1;
     use palyra_common::CANONICAL_PROTOCOL_MAJOR;
@@ -5323,6 +5869,60 @@ mod tests {
     // Process env vars are global; tests that mutate them serialize here so
     // parallel test threads cannot observe each other's overrides.
     static BROWSER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn failure_screenshot_metadata_omits_base64_bytes() {
+        let metadata = browser_failure_screenshot_metadata("image/png", b"abc");
+        let serialized =
+            serde_json::to_string(&metadata).expect("failure screenshot metadata should serialize");
+
+        assert_eq!(metadata["available"], true);
+        assert_eq!(metadata["size_bytes"], 3);
+        assert_eq!(metadata["image_base64_omitted"], true);
+        assert_eq!(metadata["model_visible_bytes"], false);
+        assert!(metadata["sha256"].as_str().is_some_and(|hash| !hash.is_empty()));
+        assert!(!serialized.contains("YWJj"));
+        assert!(!serialized.contains("failure_screenshot_base64"));
+    }
+
+    #[test]
+    fn image_list_metadata_redacts_urls_and_omits_data_uri_content() {
+        let dom = r#"
+            <main>
+              <img src="https://example.test/a.png?token=secret-token" alt="Product">
+              <IMG SRC='data:image/png;base64,QUJDREVGRw==' width="20" height="10" srcset="https://cdn.example.test/a 1x">
+              <img src="/later.png">
+            </main>
+        "#;
+        let (images, truncated) = browser_image_tags_from_dom_snapshot(dom, 2);
+        let serialized = serde_json::to_string(&images).expect("image metadata should serialize");
+
+        assert_eq!(images.len(), 2);
+        assert!(truncated);
+        assert_eq!(images[0]["alt"], "Product");
+        assert_eq!(images[0]["src"]["kind"], "url");
+        assert!(!images[0]["src"]["value"].as_str().unwrap_or_default().contains("secret-token"));
+        assert_eq!(images[1]["src"]["kind"], "data_uri");
+        assert_eq!(images[1]["src"]["content_omitted"], true);
+        assert_eq!(images[1]["width_attr"], 20);
+        assert_eq!(images[1]["height_attr"], 10);
+        assert_eq!(images[1]["srcset"]["content_omitted"], true);
+        assert!(!serialized.contains("QUJDREVGRw"));
+    }
+
+    #[test]
+    fn browser_rescue_tools_fail_closed_behind_rollout_and_cdp_allowlist() {
+        let output = browser_rescue_rollout_disabled_output(BROWSER_VISION_TOOL_NAME);
+
+        assert_eq!(output["success"], false);
+        assert_eq!(output["error_code"], "browser_rescue_disabled");
+        assert_eq!(output["rollout"]["config_path"], "feature_rollouts.browser_rescue");
+        assert!(browser_cdp_method_allowed("Page.getLayoutMetrics"));
+        assert!(!browser_cdp_method_allowed("Runtime.evaluate"));
+        assert!(browser_tool_requires_open_session(BROWSER_VISION_TOOL_NAME));
+        assert!(browser_tool_requires_open_session(BROWSER_IMAGES_LIST_TOOL_NAME));
+        assert!(browser_tool_requires_open_session(BROWSER_CDP_INVOKE_TOOL_NAME));
+    }
 
     /// Sets an env var for the test's lifetime and restores the previous
     /// value (or removes the var) on drop.

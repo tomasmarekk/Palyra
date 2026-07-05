@@ -318,6 +318,11 @@ fn image_observe_capabilities() -> Value {
         "vision_available": false,
         "provider_handoff_available": false,
         "runtime_mode": "metadata_only_unsupported",
+        "routing_mode": "metadata_only",
+        "route_label": "metadata_only_unavailable",
+        "visual_interpretation_performed": false,
+        "can_feed_multimodal_recovery": true,
+        "repair_hint": "use returned metadata as a textual fallback only; do not infer image content without a configured OCR/vision runtime",
         "provider_vision_bridge": {
             "available": false,
             "reason": "provider/model vision capability is not wired to palyra.image.observe in this runtime",
@@ -467,7 +472,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        capability_error_for_file, image_dimensions, image_mime_type,
+        capability_error_for_file, image_dimensions, image_mime_type, image_observe_capabilities,
         read_image_metadata_from_roots, strip_workspace_alias, ImageFileMetadata,
     };
 
@@ -544,6 +549,9 @@ mod tests {
             .expect("runtime contract should be model-visible")
             .contains("provider/model vision capability"));
         assert_eq!(output["capabilities"]["runtime_mode"], "metadata_only_unsupported");
+        assert_eq!(output["capabilities"]["routing_mode"], "metadata_only");
+        assert_eq!(output["capabilities"]["visual_interpretation_performed"], false);
+        assert_eq!(output["capabilities"]["can_feed_multimodal_recovery"], true);
         assert_eq!(output["capabilities"]["provider_vision_bridge"]["available"], false);
         assert!(output["next_action"]
             .as_str()
@@ -553,5 +561,19 @@ mod tests {
             output["capabilities"]["unsupported_capability"]["oracle_workaround_allowed"],
             false
         );
+    }
+
+    #[test]
+    fn image_observe_capabilities_expose_metadata_only_routing() {
+        let capabilities = image_observe_capabilities();
+
+        assert_eq!(capabilities["routing_mode"], "metadata_only");
+        assert_eq!(capabilities["route_label"], "metadata_only_unavailable");
+        assert_eq!(capabilities["visual_interpretation_performed"], false);
+        assert_eq!(capabilities["provider_handoff_available"], false);
+        assert!(capabilities["repair_hint"]
+            .as_str()
+            .expect("repair hint should be present")
+            .contains("textual fallback"));
     }
 }

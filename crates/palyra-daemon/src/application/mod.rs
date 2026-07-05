@@ -28,6 +28,7 @@ pub mod learning;
 pub mod mcp_broker;
 pub mod memory;
 pub mod memory_provider;
+pub mod multimodal_context;
 pub mod outbound_lifecycle;
 pub mod plan_state;
 pub mod progress_draft;

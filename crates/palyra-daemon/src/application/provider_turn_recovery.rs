@@ -26,6 +26,7 @@ pub(crate) const PROVIDER_CANCELLATION_CLOSURE_EVENT: &str = "provider.cancellat
 const DEFAULT_SINGLE_RETRY_BUDGET: u8 = 1;
 const DEFAULT_LENGTH_RETRY_BUDGET: u8 = 3;
 const DEFAULT_TIMEOUT_RETRY_BUDGET: u8 = 1;
+const DEFAULT_MULTIMODAL_RETRY_BUDGET: u8 = 3;
 const MIN_COMPACTION_TOKEN_SAVINGS: u64 = 512;
 
 /// Provider-neutral anomaly observed for one turn.
@@ -283,6 +284,25 @@ impl ProviderTurnRecoveryState {
                         Some("lower_max_output_tokens_or_reasoning_effort".to_owned());
                 }
             }
+            ProviderTurnAnomaly::MultimodalUnsupported if !exhausted => match attempt {
+                1 => {
+                    action = ProviderTurnRecoveryAction::ShrinkMultimodal;
+                    context_mutation_plan =
+                        Some("replace_non_current_images_with_metadata".to_owned());
+                }
+                2 => {
+                    action = ProviderTurnRecoveryAction::StripUnsupportedContent;
+                    context_mutation_plan =
+                        Some("strip_provider_unsupported_multimodal_parts".to_owned());
+                    prompt_mutation = None;
+                }
+                _ => {
+                    action = ProviderTurnRecoveryAction::RetryWithPrompt;
+                    prompt_mutation = Some("use_textual_image_metadata_fallback".to_owned());
+                    context_mutation_plan =
+                        Some("route_image_facts_through_metadata_only_tools".to_owned());
+                }
+            },
             ProviderTurnAnomaly::MaxOutputTokensTooLarge => {
                 action = ProviderTurnRecoveryAction::LowerReasoningEffort;
                 context_mutation_plan = Some("lower_max_output_tokens".to_owned());
@@ -581,10 +601,10 @@ fn retry_budget(anomaly: ProviderTurnAnomaly) -> u8 {
         | ProviderTurnAnomaly::DroppedToolCall
         | ProviderTurnAnomaly::PartialContentStream
         | ProviderTurnAnomaly::MalformedStream
-        | ProviderTurnAnomaly::MultimodalUnsupported
         | ProviderTurnAnomaly::InvalidEncryptedContent
         | ProviderTurnAnomaly::RateLimit
         | ProviderTurnAnomaly::UnicodeSurrogate => DEFAULT_SINGLE_RETRY_BUDGET,
+        ProviderTurnAnomaly::MultimodalUnsupported => DEFAULT_MULTIMODAL_RETRY_BUDGET,
         _ => 0,
     }
 }
@@ -783,6 +803,47 @@ mod tests {
         assert_eq!(first.action, ProviderTurnRecoveryAction::RetryWithPrompt);
         assert_eq!(second.action, ProviderTurnRecoveryAction::FailDeterministic);
         assert!(second.exhausted);
+    }
+
+    #[test]
+    fn multimodal_unsupported_uses_deterministic_recovery_ladder() {
+        let mut state = ProviderTurnRecoveryState::new();
+
+        let first = state.decide(
+            ProviderTurnAnomaly::MultimodalUnsupported,
+            ProviderTurnRecoveryInput::default(),
+        );
+        let second = state.decide(
+            ProviderTurnAnomaly::MultimodalUnsupported,
+            ProviderTurnRecoveryInput::default(),
+        );
+        let third = state.decide(
+            ProviderTurnAnomaly::MultimodalUnsupported,
+            ProviderTurnRecoveryInput::default(),
+        );
+        let fourth = state.decide(
+            ProviderTurnAnomaly::MultimodalUnsupported,
+            ProviderTurnRecoveryInput::default(),
+        );
+
+        assert_eq!(first.action, ProviderTurnRecoveryAction::ShrinkMultimodal);
+        assert_eq!(
+            first.context_mutation_plan.as_deref(),
+            Some("replace_non_current_images_with_metadata")
+        );
+        assert_eq!(second.action, ProviderTurnRecoveryAction::StripUnsupportedContent);
+        assert_eq!(
+            second.context_mutation_plan.as_deref(),
+            Some("strip_provider_unsupported_multimodal_parts")
+        );
+        assert_eq!(third.action, ProviderTurnRecoveryAction::RetryWithPrompt);
+        assert_eq!(third.prompt_mutation.as_deref(), Some("use_textual_image_metadata_fallback"));
+        assert_eq!(
+            third.context_mutation_plan.as_deref(),
+            Some("route_image_facts_through_metadata_only_tools")
+        );
+        assert_eq!(fourth.action, ProviderTurnRecoveryAction::FailDeterministic);
+        assert!(fourth.exhausted);
     }
 
     #[test]
