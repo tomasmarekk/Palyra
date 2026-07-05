@@ -8826,7 +8826,7 @@ mod tests {
         tier_c_plan_inner_path_index, user_owned_host_roots, validate_argument_workspace_scope,
         validate_cmd_invocation_shape, validate_host_argument_scope,
         validate_host_argument_scope_with_roots, validate_host_interpreter_argument_guardrails,
-        validate_host_interpreter_argument_guardrails_with_roots,
+        validate_host_interpreter_argument_guardrails_with_roots, validate_input_shape,
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
         validate_process_termination_scope, validate_runtime_egress_enforcement,
@@ -8839,8 +8839,7 @@ mod tests {
     };
     #[cfg(windows)]
     use super::{
-        validate_allowed_executable, validate_host_command_path_scope, validate_input_shape,
-        windows_program_files_path,
+        validate_allowed_executable, validate_host_command_path_scope, windows_program_files_path,
     };
 
     const BACKGROUND_TEST_EXECUTION_TIMEOUT_MS: u64 = 10_000;
