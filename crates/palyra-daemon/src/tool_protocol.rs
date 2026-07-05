@@ -295,6 +295,7 @@ const MAX_MEMORY_RETAIN_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_DELETE_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_MEMORY_REPLACE_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_REFLECT_TOOL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_CLARIFY_ASK_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES: usize = 64 * 1024;
@@ -940,6 +941,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "none".to_owned(),
             execution_manifest: None,
         },
+        "palyra.clarify.ask" => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: "palyra.clarify.ask requires gateway clarify runtime context".to_owned(),
+            timed_out: false,
+            executor: "gateway_runtime".to_owned(),
+            sandbox_enforcement: "none".to_owned(),
+            execution_manifest: None,
+        },
         "palyra.routines.query" | "palyra.routines.control" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1148,6 +1158,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
                 | "palyra.memory.delete"
                 | "palyra.memory.replace"
                 | "palyra.memory.reflect"
+                | "palyra.clarify.ask"
                 | "palyra.routines.query"
                 | "palyra.routines.control"
                 | "palyra.delegation.query"
@@ -1245,6 +1256,7 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
             | "palyra.memory.delete"
             | "palyra.memory.replace"
             | "palyra.memory.reflect"
+            | "palyra.clarify.ask"
     ) {
         "gateway_runtime".to_owned()
     } else if matches!(tool_name, "palyra.routines.query" | "palyra.routines.control") {
@@ -1286,6 +1298,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.memory.delete" => MAX_MEMORY_DELETE_TOOL_INPUT_BYTES,
         "palyra.memory.replace" => MAX_MEMORY_REPLACE_TOOL_INPUT_BYTES,
         "palyra.memory.reflect" => MAX_MEMORY_REFLECT_TOOL_INPUT_BYTES,
+        "palyra.clarify.ask" => MAX_CLARIFY_ASK_TOOL_INPUT_BYTES,
         "palyra.routines.query" => MAX_ROUTINES_QUERY_TOOL_INPUT_BYTES,
         "palyra.routines.control" => MAX_ROUTINES_CONTROL_TOOL_INPUT_BYTES,
         "palyra.delegation.query" => MAX_DELEGATION_QUERY_TOOL_INPUT_BYTES,

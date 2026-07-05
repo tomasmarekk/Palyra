@@ -376,6 +376,39 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.clarify.ask",
+            "Ask the user one structured clarification question when required information is missing. This is not an approval gate; provide bounded choices, optional free text, timeout, and an optional safe default.",
+            object_schema(
+                &["question"],
+                vec![
+                    (
+                        "question",
+                        json!({"type":"string","maxLength":1024,"description":"Single concise question to present to the user."}),
+                    ),
+                    (
+                        "choices",
+                        json!({"type":"array","maxItems":8,"items":{"type":"object","additionalProperties":false,"required":["choice_id","label"],"properties":{"choice_id":{"type":"string","maxLength":64},"label":{"type":"string","maxLength":160},"description":{"type":"string","maxLength":512}}}}),
+                    ),
+                    ("allow_free_text", json!({"type":"boolean"})),
+                    (
+                        "timeout_ms",
+                        json!({"type":"integer","minimum":1000,"maximum":900000,"description":"How long the runtime may wait before applying default behavior."}),
+                    ),
+                    (
+                        "default_choice_id",
+                        json!({"type":"string","maxLength":64,"description":"Optional choice id to use only when the user does not answer or no interactive channel is available."}),
+                    ),
+                    (
+                        "reason",
+                        json!({"type":"string","maxLength":512,"description":"Audit-safe reason why the run cannot proceed without clarification."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.plan.manage",
             "Read or update the current run's bounded agent plan state. Use read to inspect active plan items; use upsert, reorder, block, complete, cancel, or clear_active only for explicit planning state changes.",
             object_schema(

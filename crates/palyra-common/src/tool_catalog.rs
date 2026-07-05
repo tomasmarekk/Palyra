@@ -157,6 +157,7 @@ const SAFE_CHAT_PROFILE_TOOLS: &[&str] = &[
     "palyra.memory.session_search",
     "palyra.session_search",
     "palyra.memory.reflect",
+    "palyra.clarify.ask",
     "palyra.routines.query",
     "palyra.delegation.query",
     "palyra.artifact.read",
@@ -450,6 +451,9 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: true })
         }
         "palyra.memory.reflect" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.clarify.ask" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.routines.query" => {

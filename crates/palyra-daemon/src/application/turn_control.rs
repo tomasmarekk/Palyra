@@ -293,6 +293,329 @@ pub(crate) struct TurnControlApplyOutcome {
     pub effect: Value,
 }
 
+/// Surface that delivered an input while a run was already active.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveRunInputSurface {
+    Cli,
+    WebConsole,
+    Channel,
+    Automation,
+    Advisor,
+}
+
+#[allow(dead_code)]
+impl ActiveRunInputSurface {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::WebConsole => "web_console",
+            Self::Channel => "channel",
+            Self::Automation => "automation",
+            Self::Advisor => "advisor",
+        }
+    }
+}
+
+/// Operator intent inferred before active-run input routing.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveRunInputIntent {
+    Followup,
+    Steer,
+    Interrupt,
+    Cancel,
+    ApprovalResponse,
+    RoutineTick,
+    Unknown,
+}
+
+#[allow(dead_code)]
+impl ActiveRunInputIntent {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Followup => "followup",
+            Self::Steer => "steer",
+            Self::Interrupt => "interrupt",
+            Self::Cancel => "cancel",
+            Self::ApprovalResponse => "approval_response",
+            Self::RoutineTick => "routine_tick",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Deterministic route selected for input arriving during an active run.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveRunInputAction {
+    Queue,
+    Steer,
+    Interrupt,
+    Cancel,
+    Ignore,
+    Merge,
+}
+
+#[allow(dead_code)]
+impl ActiveRunInputAction {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+            Self::Interrupt => "interrupt",
+            Self::Cancel => "cancel",
+            Self::Ignore => "ignore",
+            Self::Merge => "merge",
+        }
+    }
+}
+
+/// Stable reason code for active-run input policy decisions.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveRunInputReasonCode {
+    UnauthorizedActor,
+    AdvisorNotAuthoritative,
+    UnknownIntent,
+    CancelRequested,
+    ApprovalResponseInterrupts,
+    ExplicitInterrupt,
+    SteeringAccepted,
+    SteeringQueuedAtBoundary,
+    MergeWindowOpen,
+    FollowupQueued,
+    RoutineQueued,
+    QueuePaused,
+}
+
+#[allow(dead_code)]
+impl ActiveRunInputReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnauthorizedActor => "active_input.unauthorized_actor",
+            Self::AdvisorNotAuthoritative => "active_input.advisor_not_authoritative",
+            Self::UnknownIntent => "active_input.unknown_intent",
+            Self::CancelRequested => "active_input.cancel_requested",
+            Self::ApprovalResponseInterrupts => "active_input.approval_response_interrupts",
+            Self::ExplicitInterrupt => "active_input.explicit_interrupt",
+            Self::SteeringAccepted => "active_input.steering_accepted",
+            Self::SteeringQueuedAtBoundary => "active_input.steering_queued_at_boundary",
+            Self::MergeWindowOpen => "active_input.merge_window_open",
+            Self::FollowupQueued => "active_input.followup_queued",
+            Self::RoutineQueued => "active_input.routine_queued",
+            Self::QueuePaused => "active_input.queue_paused",
+        }
+    }
+}
+
+/// Inputs needed to route a follow-up without touching runtime state.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ActiveRunInputPolicyRequest {
+    pub surface: ActiveRunInputSurface,
+    pub intent: ActiveRunInputIntent,
+    pub active_phase: ControlActivePhase,
+    pub actor_authorized: bool,
+    pub queue_paused: bool,
+    pub merge_window_open: bool,
+    pub tool_drain_active: bool,
+    pub approval_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Journal-ready projection for the active input decision.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ActiveRunInputPolicyDecision {
+    pub schema_version: i64,
+    pub action: ActiveRunInputAction,
+    pub reason_code: String,
+    pub accepted: bool,
+    pub active_phase: ControlActivePhase,
+    pub surface: ActiveRunInputSurface,
+    pub intent: ActiveRunInputIntent,
+    pub target_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub journal_payload_json: String,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn decide_active_run_input_policy(
+    request: &ActiveRunInputPolicyRequest,
+) -> ActiveRunInputPolicyDecision {
+    if !request.actor_authorized {
+        return active_input_decision(
+            request,
+            ActiveRunInputAction::Ignore,
+            ActiveRunInputReasonCode::UnauthorizedActor,
+            false,
+        );
+    }
+    if request.surface == ActiveRunInputSurface::Advisor {
+        return active_input_decision(
+            request,
+            ActiveRunInputAction::Ignore,
+            ActiveRunInputReasonCode::AdvisorNotAuthoritative,
+            false,
+        );
+    }
+    if request.queue_paused
+        && matches!(
+            request.intent,
+            ActiveRunInputIntent::Followup | ActiveRunInputIntent::RoutineTick
+        )
+    {
+        return active_input_decision(
+            request,
+            ActiveRunInputAction::Ignore,
+            ActiveRunInputReasonCode::QueuePaused,
+            false,
+        );
+    }
+
+    match request.intent {
+        ActiveRunInputIntent::Cancel => active_input_decision(
+            request,
+            ActiveRunInputAction::Cancel,
+            ActiveRunInputReasonCode::CancelRequested,
+            true,
+        ),
+        ActiveRunInputIntent::ApprovalResponse if request.approval_pending => {
+            active_input_decision(
+                request,
+                ActiveRunInputAction::Interrupt,
+                ActiveRunInputReasonCode::ApprovalResponseInterrupts,
+                true,
+            )
+        }
+        ActiveRunInputIntent::Interrupt => active_input_decision(
+            request,
+            ActiveRunInputAction::Interrupt,
+            ActiveRunInputReasonCode::ExplicitInterrupt,
+            true,
+        ),
+        ActiveRunInputIntent::Steer => {
+            if request.tool_drain_active
+                || matches!(
+                    request.active_phase,
+                    ControlActivePhase::ToolExecution | ControlActivePhase::ApprovalPending
+                )
+            {
+                active_input_decision(
+                    request,
+                    ActiveRunInputAction::Queue,
+                    ActiveRunInputReasonCode::SteeringQueuedAtBoundary,
+                    true,
+                )
+            } else {
+                active_input_decision(
+                    request,
+                    ActiveRunInputAction::Steer,
+                    ActiveRunInputReasonCode::SteeringAccepted,
+                    true,
+                )
+            }
+        }
+        ActiveRunInputIntent::Followup if request.merge_window_open => active_input_decision(
+            request,
+            ActiveRunInputAction::Merge,
+            ActiveRunInputReasonCode::MergeWindowOpen,
+            true,
+        ),
+        ActiveRunInputIntent::Followup => active_input_decision(
+            request,
+            ActiveRunInputAction::Queue,
+            ActiveRunInputReasonCode::FollowupQueued,
+            true,
+        ),
+        ActiveRunInputIntent::RoutineTick => active_input_decision(
+            request,
+            ActiveRunInputAction::Queue,
+            ActiveRunInputReasonCode::RoutineQueued,
+            true,
+        ),
+        ActiveRunInputIntent::ApprovalResponse | ActiveRunInputIntent::Unknown => {
+            active_input_decision(
+                request,
+                ActiveRunInputAction::Ignore,
+                ActiveRunInputReasonCode::UnknownIntent,
+                false,
+            )
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn active_input_decision(
+    request: &ActiveRunInputPolicyRequest,
+    action: ActiveRunInputAction,
+    reason_code: ActiveRunInputReasonCode,
+    accepted: bool,
+) -> ActiveRunInputPolicyDecision {
+    let (target_kind, target_id) = active_input_target(request);
+    let reason_code = reason_code.as_str().to_owned();
+    let payload = json!({
+        "schema_version": TURN_CONTROL_SCHEMA_VERSION,
+        "event_type": "active_run_input.policy_decision",
+        "action": action.as_str(),
+        "reason_code": reason_code.as_str(),
+        "accepted": accepted,
+        "active_phase": request.active_phase.as_str(),
+        "surface": request.surface.as_str(),
+        "intent": request.intent.as_str(),
+        "target_kind": target_kind,
+        "target_id": target_id.as_deref(),
+        "queue_paused": request.queue_paused,
+        "merge_window_open": request.merge_window_open,
+        "tool_drain_active": request.tool_drain_active,
+        "approval_pending": request.approval_pending,
+    });
+    ActiveRunInputPolicyDecision {
+        schema_version: TURN_CONTROL_SCHEMA_VERSION,
+        action,
+        reason_code,
+        accepted,
+        active_phase: request.active_phase,
+        surface: request.surface,
+        intent: request.intent,
+        target_kind,
+        target_id,
+        journal_payload_json: payload.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn active_input_target(request: &ActiveRunInputPolicyRequest) -> (String, Option<String>) {
+    request
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|run_id| ("run".to_owned(), Some(run_id.to_owned())))
+        .or_else(|| {
+            request
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|session_id| ("session".to_owned(), Some(session_id.to_owned())))
+        })
+        .unwrap_or_else(|| ("none".to_owned(), None))
+}
+
 #[must_use]
 pub(crate) fn decide_turn_control_request(request: &TurnControlRequest) -> TurnControlDecision {
     if request.actor_principal.trim().is_empty() {
@@ -632,5 +955,68 @@ mod tests {
         assert_eq!(decision.reason_code, TurnControlReasonCode::RunYieldSelected.as_str());
         assert_eq!(decision.target_id, None);
         assert_eq!(decision.journal_projection.terminal_event_type, "turn_control.yield.completed");
+    }
+
+    fn active_input_request(intent: ActiveRunInputIntent) -> ActiveRunInputPolicyRequest {
+        ActiveRunInputPolicyRequest {
+            surface: ActiveRunInputSurface::WebConsole,
+            intent,
+            active_phase: ControlActivePhase::ProviderStream,
+            actor_authorized: true,
+            queue_paused: false,
+            merge_window_open: false,
+            tool_drain_active: false,
+            approval_pending: false,
+            run_id: Some("run-1".to_owned()),
+            session_id: Some("session-1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn active_followup_merges_inside_open_merge_window() {
+        let mut request = active_input_request(ActiveRunInputIntent::Followup);
+        request.merge_window_open = true;
+
+        let decision = decide_active_run_input_policy(&request);
+
+        assert_eq!(decision.action, ActiveRunInputAction::Merge);
+        assert!(decision.accepted);
+        assert_eq!(decision.reason_code, ActiveRunInputReasonCode::MergeWindowOpen.as_str());
+        assert_eq!(decision.target_kind, "run");
+        assert!(decision.journal_payload_json.contains("active_run_input.policy_decision"));
+    }
+
+    #[test]
+    fn active_steer_queues_while_tool_drain_is_active() {
+        let mut request = active_input_request(ActiveRunInputIntent::Steer);
+        request.active_phase = ControlActivePhase::ToolExecution;
+        request.tool_drain_active = true;
+
+        let decision = decide_active_run_input_policy(&request);
+
+        assert_eq!(decision.action, ActiveRunInputAction::Queue);
+        assert_eq!(
+            decision.reason_code,
+            ActiveRunInputReasonCode::SteeringQueuedAtBoundary.as_str()
+        );
+        assert!(decision.accepted);
+    }
+
+    #[test]
+    fn active_policy_ignores_unauthorized_or_advisor_input() {
+        let mut unauthorized = active_input_request(ActiveRunInputIntent::Cancel);
+        unauthorized.actor_authorized = false;
+        let unauthorized_decision = decide_active_run_input_policy(&unauthorized);
+        assert_eq!(unauthorized_decision.action, ActiveRunInputAction::Ignore);
+        assert!(!unauthorized_decision.accepted);
+
+        let mut advisor = active_input_request(ActiveRunInputIntent::Steer);
+        advisor.surface = ActiveRunInputSurface::Advisor;
+        let advisor_decision = decide_active_run_input_policy(&advisor);
+        assert_eq!(advisor_decision.action, ActiveRunInputAction::Ignore);
+        assert_eq!(
+            advisor_decision.reason_code,
+            ActiveRunInputReasonCode::AdvisorNotAuthoritative.as_str()
+        );
     }
 }

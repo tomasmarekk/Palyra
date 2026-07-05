@@ -3,6 +3,7 @@
 //! runtime and journal. Submodules are grouped by capability; `route_message`
 //! and `run_stream` are the inbound and provider-turn entry points.
 
+pub mod advisor_fanout;
 pub mod agent_harness;
 pub mod agent_harness_callbacks;
 pub mod agent_harness_context;
@@ -14,6 +15,7 @@ pub mod auth;
 pub mod channel_commands;
 pub mod channel_turn;
 pub mod channels;
+pub mod clarify;
 pub mod code_intel_runtime;
 pub mod context_compression;
 pub mod context_engine;

@@ -222,6 +222,7 @@ pub(crate) const MEMORY_RETAIN_ALIAS_TOOL_NAME: &str = "palyra.retain";
 pub(crate) const MEMORY_DELETE_TOOL_NAME: &str = "palyra.memory.delete";
 pub(crate) const MEMORY_REPLACE_TOOL_NAME: &str = "palyra.memory.replace";
 pub(crate) const MEMORY_REFLECT_TOOL_NAME: &str = "palyra.memory.reflect";
+pub(crate) const CLARIFY_ASK_TOOL_NAME: &str = "palyra.clarify.ask";
 pub(crate) const ROUTINES_QUERY_TOOL_NAME: &str = "palyra.routines.query";
 pub(crate) const ROUTINES_CONTROL_TOOL_NAME: &str = "palyra.routines.control";
 pub(crate) const ARTIFACT_READ_TOOL_NAME: &str = "palyra.artifact.read";
@@ -955,6 +956,8 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
+    } else if tool_name == CLARIFY_ASK_TOOL_NAME {
+        execute_clarify_ask_tool(context, proposal_id, input_json)
     } else if matches!(tool_name, ROUTINES_QUERY_TOOL_NAME | ROUTINES_CONTROL_TOOL_NAME) {
         crate::application::tool_runtime::routines::execute_routines_tool(
             runtime_state,
@@ -1299,6 +1302,101 @@ fn record_run_cleanup_resource_from_tool_outcome(
         }
         _ => {}
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ClarifyAskToolChoiceInput {
+    choice_id: String,
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClarifyAskToolInput {
+    question: String,
+    #[serde(default)]
+    choices: Vec<ClarifyAskToolChoiceInput>,
+    #[serde(default)]
+    allow_free_text: bool,
+    #[serde(default)]
+    default_choice_id: Option<String>,
+    #[serde(default = "default_clarify_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_clarify_timeout_ms() -> u64 {
+    60_000
+}
+
+fn execute_clarify_ask_tool(
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let input = match serde_json::from_slice::<ClarifyAskToolInput>(input_json) {
+        Ok(input) => input,
+        Err(error) => {
+            return build_tool_execution_outcome(
+                proposal_id,
+                CLARIFY_ASK_TOOL_NAME,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                format!("invalid palyra.clarify.ask input: {error}"),
+                false,
+                "gateway_runtime".to_owned(),
+                "none".to_owned(),
+            );
+        }
+    };
+    let request = crate::application::clarify::StructuredClarifyRequest {
+        principal: context.principal.to_owned(),
+        session_id: Some(context.session_id.to_owned()),
+        run_id: Some(context.run_id.to_owned()),
+        question: input.question,
+        choices: input
+            .choices
+            .into_iter()
+            .map(|choice| crate::application::clarify::ClarifyChoice {
+                choice_id: choice.choice_id,
+                label: choice.label,
+                description: choice.description,
+            })
+            .collect(),
+        allow_free_text: input.allow_free_text,
+        default_choice_id: input.default_choice_id,
+        timeout_ms: input.timeout_ms,
+    };
+    let decision = crate::application::clarify::decide_structured_clarify_request(
+        &request,
+        crate::application::clarify::ClarifyQueueState {
+            interactive_channel_available: false,
+            pending_for_scope: false,
+            pending_count_for_principal: 0,
+            max_pending_per_principal: 4,
+        },
+    );
+    let output_json = serde_json::to_vec(&decision).unwrap_or_else(|error| {
+        json!({
+            "success": false,
+            "error": format!("failed to serialize clarify decision: {error}"),
+        })
+        .to_string()
+        .into_bytes()
+    });
+    let error = if decision.accepted { String::new() } else { decision.reason_code.clone() };
+    build_tool_execution_outcome(
+        proposal_id,
+        CLARIFY_ASK_TOOL_NAME,
+        input_json,
+        decision.accepted,
+        output_json,
+        error,
+        false,
+        "gateway_runtime".to_owned(),
+        "none".to_owned(),
+    )
 }
 
 async fn record_process_run_verification_classification(
