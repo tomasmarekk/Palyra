@@ -44,6 +44,13 @@ use crate::sandbox_runner::{
 };
 use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPluginRunnerPolicy};
 
+const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
+const PROCESS_RUNNER_ALIAS_TOOL_NAME: &str = "palyra.exec.run";
+
+fn is_process_runner_run_tool(tool_name: &str) -> bool {
+    matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
+}
+
 /// Tool execution policy: the allowlist, timeout, and the sandbox/wasm runner
 /// policies applied to every call in the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,9 +433,10 @@ pub fn decide_tool_call(
 /// Expands the configured allowlist with legacy aliases and implied tools so
 /// policy evaluation accepts every spelling the runtime executes.
 ///
-/// Allowlisting `palyra.process.run` deliberately implies the stop/status/
-/// list lifecycle tools: they only act on run-owned background processes and
-/// must stay available to clean up what `run` started.
+/// Allowlisting the process runner deliberately implies the stop/status/list
+/// lifecycle tools: they only act on run-owned background processes and must
+/// stay available to clean up what `run` started. `palyra.exec.run` is a
+/// compatibility facade for `palyra.process.run` and expands identically.
 fn allowlisted_tools_with_compat_aliases(allowed_tools: &[String]) -> Vec<String> {
     let mut names = BTreeSet::new();
     for tool_name in allowed_tools {
@@ -446,7 +454,9 @@ fn allowlisted_tools_with_compat_aliases(allowed_tools: &[String]) -> Vec<String
                 names.insert("palyra.memory.retain".to_owned());
                 names.insert("palyra.retain".to_owned());
             }
-            "palyra.process.run" => {
+            PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME => {
+                names.insert(PROCESS_RUNNER_TOOL_NAME.to_owned());
+                names.insert(PROCESS_RUNNER_ALIAS_TOOL_NAME.to_owned());
                 names.insert("palyra.process.stop".to_owned());
                 names.insert("palyra.process.status".to_owned());
                 names.insert("palyra.process.list".to_owned());
@@ -774,7 +784,11 @@ fn tool_failure_recovery_hint(tool_name: &str, error: &str, timed_out: bool) -> 
         "palyra.fs.apply_patch" => {
             "Inspect the patch error, read the current file when context is stale, and retry with a smaller complete patch.".to_owned()
         }
-        "palyra.process.run" | "palyra.process.stop" | "palyra.process.status" | "palyra.process.list" => {
+        "palyra.process.run"
+        | "palyra.exec.run"
+        | "palyra.process.stop"
+        | "palyra.process.status"
+        | "palyra.process.list" => {
             "Inspect command, args, cwd, allowlist, and resource limits; retry with a portable workspace-scoped process request.".to_owned()
         }
         "palyra.plugin.run" => {
@@ -957,7 +971,7 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "ssrf_guard".to_owned(),
             execution_manifest: None,
         },
-        "palyra.process.run" => {
+        PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME => {
             execute_process_runner_tool(
                 config,
                 input_json,
@@ -1112,6 +1126,7 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
             | "palyra.image.observe"
             | "palyra.http.fetch"
             | "palyra.process.run"
+            | "palyra.exec.run"
             | "palyra.process.stop"
             | "palyra.process.status"
             | "palyra.process.list"
@@ -1158,13 +1173,12 @@ fn is_runtime_supported_tool(tool_name: &str) -> bool {
 // Executor labels recorded in attestations; pinned by tests and security
 // fixtures. Must mirror the labels the dispatch arms emit.
 fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
-    if matches!(
-        tool_name,
-        "palyra.process.run"
-            | "palyra.process.stop"
-            | "palyra.process.status"
-            | "palyra.process.list"
-    ) {
+    if is_process_runner_run_tool(tool_name)
+        || matches!(
+            tool_name,
+            "palyra.process.stop" | "palyra.process.status" | "palyra.process.list"
+        )
+    {
         process_runner_executor_name(&config.process_runner)
     } else if tool_name == "palyra.tool_program.run" {
         "tool_program_runtime".to_owned()
@@ -1241,6 +1255,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run"
+        | "palyra.exec.run"
         | "palyra.process.stop"
         | "palyra.process.status"
         | "palyra.process.list" => MAX_PROCESS_RUNNER_TOOL_INPUT_BYTES,
@@ -1289,13 +1304,12 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
 // process tools the label reflects the live path posture when the runner may
 // leave workspace-only scoping, otherwise the egress mode.
 fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> String {
-    if matches!(
-        tool_name,
-        "palyra.process.run"
-            | "palyra.process.stop"
-            | "palyra.process.status"
-            | "palyra.process.list"
-    ) {
+    if is_process_runner_run_tool(tool_name)
+        || matches!(
+            tool_name,
+            "palyra.process.stop" | "palyra.process.status" | "palyra.process.list"
+        )
+    {
         process_runner_sandbox_enforcement_label(&config.process_runner)
     } else if tool_name == "palyra.tool_program.run" {
         "nested_tool_policy".to_owned()
@@ -1951,6 +1965,33 @@ mod tests {
                 decide_tool_call(&config, &mut budget, &request_context, tool_name, true);
             assert!(approved.allowed, "approved {tool_name} should be executable");
             assert_eq!(budget, 1, "approved lifecycle tool must not debit legacy budget");
+        }
+    }
+
+    #[test]
+    fn process_run_allowlist_exposes_exec_facade() {
+        for (allowed_tool, requested_tool) in
+            [("palyra.process.run", "palyra.exec.run"), ("palyra.exec.run", "palyra.process.run")]
+        {
+            let config = ToolCallConfig {
+                allowed_tools: vec![allowed_tool.to_owned()],
+                max_calls_per_run: 1,
+                execution_timeout_ms: 250,
+                process_runner: default_process_runner_policy(),
+                wasm_runtime: default_wasm_runtime_policy(),
+            };
+            let request_context = tool_request_context("user:ops");
+            let mut budget = 1;
+
+            let denied =
+                decide_tool_call(&config, &mut budget, &request_context, requested_tool, false);
+            assert!(!denied.allowed, "{requested_tool} should still require approval");
+            assert!(denied.approval_required, "{requested_tool} should preserve process approval");
+
+            let approved =
+                decide_tool_call(&config, &mut budget, &request_context, requested_tool, true);
+            assert!(approved.allowed, "approved {requested_tool} should be executable");
+            assert_eq!(budget, 1, "approved facade tool must not debit legacy budget");
         }
     }
 

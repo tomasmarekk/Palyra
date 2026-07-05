@@ -14,11 +14,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     future::Future,
+    io::Write,
     path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
     time::Instant,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use palyra_common::runtime_preview::RuntimePreviewMode;
 use palyra_common::{
@@ -30,6 +34,7 @@ use palyra_common::{
     process_risk::{classify_process_run, ProcessRiskContext},
     process_runner_input::{parse_process_runner_tool_input, ProcessRunnerToolInput},
     redaction::{is_sensitive_key, redact_diagnostic_text},
+    secret_refs::SecretRef,
     workspace_patch::{
         apply_workspace_patch, compute_patch_sha256, redact_patch_preview,
         WorkspacePatchFileAttestation, WorkspacePatchLimits, WorkspacePatchOutcome,
@@ -37,6 +42,7 @@ use palyra_common::{
     },
 };
 use palyra_sandbox::{current_backend_capabilities, current_backend_kind};
+use palyra_vault::{SecretResolver, Vault};
 use palyra_workerd::{
     WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
     WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -433,6 +439,37 @@ pub(crate) struct ExecutionBackendPreflightRecord {
     pub(crate) environment: ExecutionEnvironmentCapabilities,
 }
 
+/// Capability state combining inventory declarations with live runner support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendCapabilityStatus {
+    pub(crate) capability: String,
+    pub(crate) declared_by_inventory: bool,
+    pub(crate) supported_by_runner: bool,
+}
+
+/// Cleanup evidence surfaced for status pages and support bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendCleanupEvidenceReport {
+    pub(crate) cleanup_supported: bool,
+    pub(crate) cleanup_strategy: String,
+    pub(crate) evidence_kind: String,
+    pub(crate) reason_code: String,
+}
+
+/// Status report for one backend, including capability mismatch evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecutionBackendStatusReport {
+    pub(crate) backend_id: String,
+    pub(crate) state: ExecutionBackendState,
+    pub(crate) selectable: bool,
+    pub(crate) health_status: ExecutionBackendHealthStatus,
+    pub(crate) reason_code: String,
+    pub(crate) declared_capabilities: Vec<String>,
+    pub(crate) runner_capabilities: Vec<String>,
+    pub(crate) capability_status: Vec<ExecutionBackendCapabilityStatus>,
+    pub(crate) cleanup: ExecutionBackendCleanupEvidenceReport,
+}
+
 /// Recovery action recommended for a tool job whose heartbeat went stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -691,6 +728,7 @@ pub(crate) struct ExecutionBackendProcessRunRequest<'a> {
     pub(crate) proposal_id: &'a str,
     pub(crate) tool_name: &'a str,
     pub(crate) input_json: &'a [u8],
+    pub(crate) vault: Option<&'a Vault>,
     pub(crate) cancellation_requested: Option<Arc<AtomicBool>>,
     pub(crate) process_progress_sink: Option<ProcessProgressSink>,
 }
@@ -1104,6 +1142,122 @@ impl ExecutionBackendRunnerRegistry {
             Err(error) => error.selection_event(requested_backend),
         }
     }
+
+    fn runner_for_backend(
+        &self,
+        backend: ExecutionBackendPreference,
+    ) -> Option<&dyn ExecutionBackendRunner> {
+        match backend {
+            ExecutionBackendPreference::Automatic | ExecutionBackendPreference::LocalSandbox => {
+                Some(&self.local_sandbox)
+            }
+            ExecutionBackendPreference::Docker => self.docker.as_deref(),
+            ExecutionBackendPreference::SshTunnel => self.ssh_worker.as_deref(),
+            ExecutionBackendPreference::DesktopNode
+            | ExecutionBackendPreference::NetworkedWorker => None,
+        }
+    }
+}
+
+/// Builds status reports that join configured inventory with live runner
+/// capability and cleanup evidence.
+#[must_use]
+pub(crate) fn build_execution_backend_status_reports(
+    inventory: &[ExecutionBackendInventoryRecord],
+    runner_registry: &ExecutionBackendRunnerRegistry,
+) -> Vec<ExecutionBackendStatusReport> {
+    inventory
+        .iter()
+        .map(|record| execution_backend_status_report(record, runner_registry))
+        .collect()
+}
+
+fn execution_backend_status_report(
+    record: &ExecutionBackendInventoryRecord,
+    runner_registry: &ExecutionBackendRunnerRegistry,
+) -> ExecutionBackendStatusReport {
+    let preference = parse_execution_backend_preference(record.backend_id.as_str(), "backend_id")
+        .unwrap_or(ExecutionBackendPreference::Automatic);
+    let runner = runner_registry.runner_for_backend(preference);
+    let runner_capabilities =
+        runner.map(|runner| runner_capability_strings(runner.capabilities())).unwrap_or_default();
+    let capability_status = execution_backend_capability_status(
+        record.capabilities.as_slice(),
+        runner_capabilities.as_slice(),
+    );
+    let run_process_supported = runner_capabilities
+        .iter()
+        .any(|capability| capability == ExecutionBackendRunnerCapability::RunProcess.as_str());
+    let cleanup_supported = record.supports_cleanup
+        && runner_capabilities
+            .iter()
+            .any(|capability| capability == ExecutionBackendRunnerCapability::Cleanup.as_str());
+    let health_status = if record.state == ExecutionBackendState::Disabled
+        || (record.selectable && !run_process_supported)
+    {
+        ExecutionBackendHealthStatus::Unavailable
+    } else if record.state == ExecutionBackendState::Degraded {
+        ExecutionBackendHealthStatus::Degraded
+    } else {
+        runner
+            .map(|runner| runner.health_probe())
+            .map(|health| health.status)
+            .unwrap_or(ExecutionBackendHealthStatus::Unavailable)
+    };
+    let reason_code = if record.state == ExecutionBackendState::Disabled {
+        format!("backend.status.disabled.{}", record.backend_id)
+    } else if record.selectable && !run_process_supported {
+        format!("backend.status.runner_missing_run_process.{}", record.backend_id)
+    } else if !cleanup_supported {
+        format!("backend.status.cleanup_unverified.{}", record.backend_id)
+    } else {
+        format!("backend.status.ready.{}", record.backend_id)
+    };
+
+    ExecutionBackendStatusReport {
+        backend_id: record.backend_id.clone(),
+        state: record.state,
+        selectable: record.selectable,
+        health_status,
+        reason_code,
+        declared_capabilities: record.capabilities.clone(),
+        runner_capabilities,
+        capability_status,
+        cleanup: ExecutionBackendCleanupEvidenceReport {
+            cleanup_supported,
+            cleanup_strategy: record.cleanup_strategy.clone(),
+            evidence_kind: if cleanup_supported {
+                "runner_cleanup_capability"
+            } else {
+                "inventory_cleanup_only"
+            }
+            .to_owned(),
+            reason_code: if cleanup_supported {
+                "execution_backend.cleanup.supported"
+            } else {
+                "execution_backend.cleanup.unverified"
+            }
+            .to_owned(),
+        },
+    }
+}
+
+fn execution_backend_capability_status(
+    declared_capabilities: &[String],
+    runner_capabilities: &[String],
+) -> Vec<ExecutionBackendCapabilityStatus> {
+    let mut names = declared_capabilities.iter().cloned().collect::<BTreeSet<_>>();
+    names.extend(runner_capabilities.iter().cloned());
+    names
+        .into_iter()
+        .map(|capability| ExecutionBackendCapabilityStatus {
+            declared_by_inventory: declared_capabilities
+                .iter()
+                .any(|declared| declared == &capability),
+            supported_by_runner: runner_capabilities.iter().any(|runner| runner == &capability),
+            capability,
+        })
+        .collect()
 }
 
 fn enabled_profiles_for_backend(
@@ -1678,11 +1832,105 @@ fn container_env_source_kind_from_config(raw: &str) -> Result<ContainerEnvSource
     }
 }
 
+fn materialize_docker_vault_env_file(
+    profile_id: &str,
+    bindings: &[ContainerEnvBinding],
+    vault: Option<&Vault>,
+    working_dir: &Path,
+) -> Result<Option<DockerEnvFileMaterialization>, DockerEngineError> {
+    let vault_bindings = bindings
+        .iter()
+        .filter(|binding| matches!(binding.source_kind, ContainerEnvSourceKind::VaultRef))
+        .collect::<Vec<_>>();
+    if vault_bindings.is_empty() {
+        return Ok(None);
+    }
+    let Some(vault) = vault else {
+        return Err(DockerEngineError {
+            reason_code: "docker.env.vault_resolution_unavailable".to_owned(),
+            message: format!(
+                "Docker profile {profile_id} declares vault-backed env bindings but no vault runtime is available"
+            ),
+        });
+    };
+    let path = env::temp_dir().join(format!("palyra-docker-env-{}.env", Ulid::new()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path.as_path()).map_err(|error| DockerEngineError {
+        reason_code: "docker.env.env_file_create_failed".to_owned(),
+        message: format!("failed to create Docker env file for profile {profile_id}: {error}"),
+    })?;
+    let resolver = SecretResolver::with_working_dir(Some(vault), working_dir);
+    let mut env_names = Vec::new();
+    for binding in vault_bindings {
+        let vault_ref = normalize_docker_vault_ref(binding.value.as_str())?;
+        let secret_ref = SecretRef::from_legacy_vault_ref(vault_ref);
+        let value = resolver
+            .resolve(&secret_ref)
+            .and_then(|resolution| {
+                resolution.decode_utf8(format!("Docker env binding {}", binding.name).as_str())
+            })
+            .map_err(|error| DockerEngineError {
+                reason_code: "docker.env.vault_resolution_failed".to_owned(),
+                message: format!(
+                    "Docker profile {profile_id} could not resolve vault-backed env binding {}: {}",
+                    binding.name, error.message
+                ),
+            })?;
+        if value.contains(['\n', '\r', '\0']) {
+            return Err(DockerEngineError {
+                reason_code: "docker.env.value_shape_invalid".to_owned(),
+                message: format!(
+                    "Docker profile {profile_id} env binding {} resolved to a value that cannot be written to Docker env-file format",
+                    binding.name
+                ),
+            });
+        }
+        writeln!(file, "{}={}", binding.name, value).map_err(|error| DockerEngineError {
+            reason_code: "docker.env.env_file_write_failed".to_owned(),
+            message: format!("failed to write Docker env file for profile {profile_id}: {error}"),
+        })?;
+        env_names.push(binding.name.clone());
+    }
+    drop(file);
+    let cleanup_guard = Arc::new(DockerEnvFileCleanupGuard { path: path.clone() });
+    Ok(Some(DockerEnvFileMaterialization {
+        path,
+        env_names,
+        vault_ref_count: bindings
+            .iter()
+            .filter(|binding| matches!(binding.source_kind, ContainerEnvSourceKind::VaultRef))
+            .count(),
+        cleanup_guard,
+    }))
+}
+
+fn normalize_docker_vault_ref(raw: &str) -> Result<String, DockerEngineError> {
+    let trimmed = raw.trim();
+    let Some(vault_ref) = trimmed.strip_prefix("vault://") else {
+        return Err(DockerEngineError {
+            reason_code: "docker.env.vault_ref_invalid".to_owned(),
+            message: "Docker env vault references must use vault:// handles".to_owned(),
+        });
+    };
+    if vault_ref.trim().is_empty() {
+        return Err(DockerEngineError {
+            reason_code: "docker.env.vault_ref_invalid".to_owned(),
+            message: "Docker env vault reference handle is empty".to_owned(),
+        });
+    }
+    Ok(vault_ref.to_owned())
+}
+
 const DOCKER_WORKSPACE_ROOT: &str = "/workspace";
 const DOCKER_EGRESS_PROXY_NETWORK: &str = "palyra-egress-proxy";
 
 /// Runtime plan passed to a Docker engine implementation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct DockerRunPlan {
     pub(crate) profile_id: String,
     pub(crate) image: String,
@@ -1693,12 +1941,34 @@ pub(crate) struct DockerRunPlan {
     pub(crate) network: ContainerNetworkPolicy,
     pub(crate) mounts: Vec<ContainerMountPolicy>,
     pub(crate) env: Vec<ContainerEnvBinding>,
+    pub(crate) env_file: Option<DockerEnvFileMaterialization>,
+    pub(crate) background: bool,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
     pub(crate) working_dir: String,
     pub(crate) limits: ContainerResourceLimits,
     pub(crate) workspace_writeback: WorkspaceWritebackMode,
     pub(crate) cleanup_strategy: String,
+}
+
+/// Temporary env-file containing resolved vault-backed Docker env values.
+#[derive(Debug, Clone)]
+pub(crate) struct DockerEnvFileMaterialization {
+    pub(crate) path: PathBuf,
+    pub(crate) env_names: Vec<String>,
+    pub(crate) vault_ref_count: usize,
+    cleanup_guard: Arc<DockerEnvFileCleanupGuard>,
+}
+
+#[derive(Debug)]
+struct DockerEnvFileCleanupGuard {
+    path: PathBuf,
+}
+
+impl Drop for DockerEnvFileCleanupGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.as_path());
+    }
 }
 
 /// Container cleanup evidence emitted by a Docker engine.
@@ -1898,20 +2168,15 @@ impl DockerEngine for DockerCliEngine {
             for mount in &run_plan.mounts {
                 command.arg("--mount").arg(docker_mount_arg(mount));
             }
+            if let Some(env_file) = run_plan.env_file.as_ref() {
+                command.arg("--env-file").arg(env_file.path.as_os_str());
+            }
             for binding in &run_plan.env {
                 match binding.source_kind {
                     ContainerEnvSourceKind::LiteralSafeValue => {
                         command.arg("--env").arg(format!("{}={}", binding.name, binding.value));
                     }
-                    ContainerEnvSourceKind::VaultRef => {
-                        return Err(DockerEngineError {
-                            reason_code: "docker.env.vault_resolution_unavailable".to_owned(),
-                            message: format!(
-                                "Docker profile {} declares Vault env binding {}; vault resolution is not wired into DockerRunner yet",
-                                run_plan.profile_id, binding.name
-                            ),
-                        });
-                    }
+                    ContainerEnvSourceKind::VaultRef => {}
                 }
             }
             command.arg(run_plan.image.as_str());
@@ -2564,19 +2829,23 @@ impl<E: DockerEngine> ExecutionBackendRunner for DockerRunner<E> {
         request: ExecutionBackendProcessRunRequest<'a>,
     ) -> RunnerExecutionFuture<'a> {
         Box::pin(async move {
-            let plan =
-                match docker_process_run_plan(&self.profile, request.config, request.input_json) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        return docker_error_outcome(
-                            request.proposal_id,
-                            request.tool_name,
-                            request.input_json,
-                            error.reason_code.as_str(),
-                            error.message,
-                        );
-                    }
-                };
+            let plan = match docker_process_run_plan(
+                &self.profile,
+                request.config,
+                request.input_json,
+                request.vault,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return docker_error_outcome(
+                        request.proposal_id,
+                        request.tool_name,
+                        request.input_json,
+                        error.reason_code.as_str(),
+                        error.message,
+                    );
+                }
+            };
             match self.engine.run(plan.clone()).await {
                 Ok(report) => docker_process_run_outcome(
                     request.proposal_id,
@@ -2613,6 +2882,7 @@ fn docker_process_run_plan(
     profile: &ContainerBackendProfile,
     config: &ToolCallConfig,
     input_json: &[u8],
+    request_vault: Option<&Vault>,
 ) -> Result<DockerRunPlan, DockerEngineError> {
     profile.validate().map_err(|message| DockerEngineError {
         reason_code: "docker.profile.invalid".to_owned(),
@@ -2634,6 +2904,12 @@ fn docker_process_run_plan(
             message: "DockerRunner requires a workspace-scoped mount".to_owned(),
         });
     };
+    let env_file = materialize_docker_vault_env_file(
+        profile.profile_id.as_str(),
+        profile.env.as_slice(),
+        request_vault,
+        Path::new(workspace_mount.host_path.as_str()),
+    )?;
     Ok(DockerRunPlan {
         profile_id: profile.profile_id.clone(),
         image: profile.image.clone(),
@@ -2644,7 +2920,9 @@ fn docker_process_run_plan(
         readonly_rootfs: profile.readonly_rootfs,
         network: profile.network,
         mounts: vec![workspace_mount.clone()],
-        env: profile.env.clone(),
+        env: docker_plan_env_bindings(profile.env.as_slice()),
+        env_file,
+        background: input.background || input.keep_running_after_run,
         command: input.command,
         args: input.args,
         working_dir: docker_container_working_dir(input.cwd.as_deref())?,
@@ -2654,16 +2932,24 @@ fn docker_process_run_plan(
     })
 }
 
+fn docker_plan_env_bindings(bindings: &[ContainerEnvBinding]) -> Vec<ContainerEnvBinding> {
+    bindings
+        .iter()
+        .map(|binding| match binding.source_kind {
+            ContainerEnvSourceKind::LiteralSafeValue => binding.clone(),
+            ContainerEnvSourceKind::VaultRef => ContainerEnvBinding {
+                name: binding.name.clone(),
+                source_kind: ContainerEnvSourceKind::VaultRef,
+                value: format!("vault_ref_sha256:{}", sha256_hex(binding.value.as_bytes())),
+            },
+        })
+        .collect()
+}
+
 fn validate_docker_process_input(
     config: &ToolCallConfig,
     input: &ProcessRunnerToolInput,
 ) -> Result<(), DockerEngineError> {
-    if input.background || input.keep_running_after_run {
-        return Err(DockerEngineError {
-            reason_code: "docker.process.background_unsupported".to_owned(),
-            message: "DockerRunner does not support background process handles yet".to_owned(),
-        });
-    }
     if !input.prepend_path.is_empty() {
         return Err(DockerEngineError {
             reason_code: "docker.process.prepend_path_unsupported".to_owned(),
@@ -2727,6 +3013,22 @@ fn docker_process_run_outcome(
         "stdout_sha256": sha256_hex(report.stdout.as_slice()),
         "stderr_sha256": sha256_hex(report.stderr.as_slice()),
         "workspace_writeback": plan.workspace_writeback.as_str(),
+        "env_file": plan.env_file.as_ref().map(|env_file| json!({
+            "materialized": true,
+            "env_names": env_file.env_names.as_slice(),
+            "vault_ref_count": env_file.vault_ref_count,
+            "path_sha256": sha256_hex(env_file.path.to_string_lossy().as_bytes()),
+        })),
+        "background": {
+            "requested": plan.background,
+            "handle_kind": if plan.background { "docker_attached_run" } else { "none" },
+            "status": if plan.background { "completed_or_timed_out_with_tool_call" } else { "not_requested" },
+            "reason_code": if plan.background {
+                "docker.background.attached_handle"
+            } else {
+                "docker.background.not_requested"
+            },
+        },
         "cleanup_success": cleanup_success,
         "patch_bundle_sha256": patch_bundle.as_ref().map(|bundle| bundle.patch_sha256.as_str()),
         "patch_bundle": patch_bundle.as_ref().map(workspace_patch_bundle_manifest_projection),
@@ -2757,6 +3059,19 @@ fn docker_process_run_outcome(
             "mode": plan.workspace_writeback.as_str(),
             "authoritative_workspace_mutation": false,
             "patch_bundle": patch_bundle,
+        },
+        "background_handle": {
+            "requested": plan.background,
+            "handle_kind": if plan.background { "docker_attached_run" } else { "none" },
+            "status_command": if plan.background { Some("palyra.process.status") } else { None },
+            "tail_command": if plan.background { Some("palyra.process.status") } else { None },
+            "stop_command": if plan.background { Some("palyra.process.stop") } else { None },
+            "cleanup_registered": false,
+            "reason_code": if plan.background {
+                "docker.background.attached_handle"
+            } else {
+                "docker.background.not_requested"
+            },
         },
         "cleanup": cleanup,
         "output_manifest": output_manifest,
@@ -4629,6 +4944,9 @@ mod tests {
         apply_workspace_patch, WorkspacePatchLimits, WorkspacePatchRedactionPolicy,
         WorkspacePatchRequest,
     };
+    use palyra_vault::{
+        BackendPreference as VaultBackendPreference, Vault, VaultConfig, VaultScope,
+    };
     use palyra_workerd::{
         WorkerCleanupReport, WorkerFleetPolicy, WorkerFleetSnapshot, WorkerRemoteToolKind,
         WORKER_REMOTE_TOOL_PROTOCOL, WORKER_REMOTE_TOOL_SCHEMA_VERSION,
@@ -4652,13 +4970,14 @@ mod tests {
     use super::{
         apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
-        parse_execution_backend_preference, plan_stuck_tool_job_recovery, prepare_docker_run_plan,
-        resolve_execution_backend, resolve_execution_backend_for_request, sha256_hex,
-        validate_execution_backend_selection, ContainerBackendProfile, ContainerEnvBinding,
-        ContainerEnvSourceKind, ContainerMountPolicy, ContainerNetworkPolicy,
-        ContainerResourceLimits, ContainerRuntimeKind, DockerCleanupAttestation, DockerEngine,
-        DockerEngineError, DockerEngineFuture, DockerResourceUsage, DockerRunPlan, DockerRunReport,
-        DockerRunner, ExecutionBackend, ExecutionBackendHealthStatus, ExecutionBackendPreference,
+        build_execution_backend_status_reports, parse_execution_backend_preference,
+        plan_stuck_tool_job_recovery, prepare_docker_run_plan, resolve_execution_backend,
+        resolve_execution_backend_for_request, sha256_hex, validate_execution_backend_selection,
+        ContainerBackendProfile, ContainerEnvBinding, ContainerEnvSourceKind, ContainerMountPolicy,
+        ContainerNetworkPolicy, ContainerResourceLimits, ContainerRuntimeKind,
+        DockerCleanupAttestation, DockerEngine, DockerEngineError, DockerEngineFuture,
+        DockerResourceUsage, DockerRunPlan, DockerRunReport, DockerRunner, ExecutionBackend,
+        ExecutionBackendHealthStatus, ExecutionBackendPreference,
         ExecutionBackendProcessRunRequest, ExecutionBackendResolutionRequest,
         ExecutionBackendRunner, ExecutionBackendRunnerCapability, ExecutionBackendRunnerHealth,
         ExecutionBackendRunnerRegistry, ExecutionBackendState, FeatureRolloutSetting,
@@ -4742,6 +5061,23 @@ mod tests {
             env: Vec::new(),
             cleanup_strategy: "remove_container_and_volume".to_owned(),
         }
+    }
+
+    fn temp_vault_with_secret(
+        scope: VaultScope,
+        key: &str,
+        value: &[u8],
+    ) -> (tempfile::TempDir, Vault) {
+        let tempdir = tempfile::tempdir().expect("vault tempdir should be created");
+        let vault = Vault::open_with_config(VaultConfig {
+            root: Some(tempdir.path().join("vault")),
+            identity_store_root: Some(tempdir.path().join("identity")),
+            backend_preference: VaultBackendPreference::EncryptedFile,
+            max_secret_bytes: 64 * 1024,
+        })
+        .expect("test vault should open");
+        vault.put_secret(&scope, key, value).expect("test secret should be stored");
+        (tempdir, vault)
     }
 
     fn safe_container_profile_config(
@@ -5165,6 +5501,60 @@ mod tests {
         assert!(!patch_bundle.source_manifest.authoritative_workspace_mutation);
     }
 
+    #[test]
+    fn backend_status_reports_runner_capability_and_cleanup_evidence() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let default_registry = ExecutionBackendRunnerRegistry::default();
+        let reports = build_execution_backend_status_reports(&inventory, &default_registry);
+        let local = reports
+            .iter()
+            .find(|report| report.backend_id == ExecutionBackendPreference::LocalSandbox.as_str())
+            .expect("local sandbox status should exist");
+
+        assert_eq!(local.health_status, ExecutionBackendHealthStatus::Healthy);
+        assert!(local.cleanup.cleanup_supported);
+        assert!(local.runner_capabilities.iter().any(|capability| capability == "run_process"));
+
+        let docker_without_runner = reports
+            .iter()
+            .find(|report| report.backend_id == ExecutionBackendPreference::Docker.as_str())
+            .expect("docker status should exist");
+
+        assert_eq!(docker_without_runner.health_status, ExecutionBackendHealthStatus::Unavailable);
+        assert!(
+            docker_without_runner.reason_code.contains("runner_missing_run_process"),
+            "{}",
+            docker_without_runner.reason_code
+        );
+        assert!(!docker_without_runner.cleanup.cleanup_supported);
+
+        let (engine, _) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let docker_runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker runner should build");
+        let registry = ExecutionBackendRunnerRegistry::with_docker_runner(Box::new(docker_runner));
+        let reports = build_execution_backend_status_reports(&inventory, &registry);
+        let docker = reports
+            .iter()
+            .find(|report| report.backend_id == ExecutionBackendPreference::Docker.as_str())
+            .expect("docker status should exist");
+
+        assert!(docker.runner_capabilities.iter().any(|capability| capability == "cleanup"));
+        assert!(docker.cleanup.cleanup_supported);
+    }
+
     fn assert_runner_exposes(
         runner: &dyn ExecutionBackendRunner,
         required_capabilities: &[ExecutionBackendRunnerCapability],
@@ -5350,6 +5740,8 @@ mod tests {
             network: profile.network,
             mounts: profile.mounts,
             env: profile.env,
+            env_file: None,
+            background: false,
             command: "echo".to_owned(),
             args: vec!["runner-ok".to_owned()],
             working_dir: "/workspace".to_owned(),
@@ -5440,6 +5832,8 @@ mod tests {
             network: profile.network,
             mounts: profile.mounts,
             env: profile.env,
+            env_file: None,
+            background: false,
             command: "echo".to_owned(),
             args: vec!["runner-ok".to_owned()],
             working_dir: "/workspace".to_owned(),
@@ -5474,6 +5868,7 @@ mod tests {
                 proposal_id: "proposal-local-process",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5547,6 +5942,7 @@ mod tests {
                 proposal_id: "proposal-docker-process",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"],"cwd":"workspace/subdir"}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5593,6 +5989,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_runner_materializes_vault_env_file_without_leaking_secret() {
+        let (_vault_dir, vault) =
+            temp_vault_with_secret(VaultScope::Global, "api-token", b"secret-token");
+        let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let mut profile = safe_container_profile();
+        profile.env = vec![ContainerEnvBinding {
+            name: "API_TOKEN".to_owned(),
+            source_kind: ContainerEnvSourceKind::VaultRef,
+            value: "vault://global/api-token".to_owned(),
+        }];
+        let runner = DockerRunner::new(profile, engine).expect("safe Docker profile should build");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-vault-env",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: Some(&vault),
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let plans = plans.lock().expect("fake Docker plans");
+        let plan = plans.first().expect("Docker plan should be recorded");
+        let env_file = plan.env_file.as_ref().expect("vault env should materialize env-file");
+        assert_eq!(env_file.env_names, vec!["API_TOKEN"]);
+        assert_eq!(env_file.vault_ref_count, 1);
+        let env_file_content =
+            fs::read_to_string(env_file.path.as_path()).expect("env file should exist");
+        assert!(env_file_content.contains("API_TOKEN=secret-token"));
+
+        let debug_plan = format!("{plan:?}");
+        assert!(!debug_plan.contains("secret-token"));
+        assert!(!debug_plan.contains("vault://global/api-token"));
+        let output = String::from_utf8(outcome.output_json).expect("output JSON should be UTF-8");
+        assert!(!output.contains("secret-token"));
+        assert!(!output.contains("vault://global/api-token"));
+        assert!(output.contains("\"vault_ref_count\":1"));
+    }
+
+    #[tokio::test]
+    async fn docker_runner_fails_closed_when_vault_env_has_no_vault_runtime() {
+        let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let mut profile = safe_container_profile();
+        profile.env = vec![ContainerEnvBinding {
+            name: "API_TOKEN".to_owned(),
+            source_kind: ContainerEnvSourceKind::VaultRef,
+            value: "vault://global/api-token".to_owned(),
+        }];
+        let runner = DockerRunner::new(profile, engine).expect("safe Docker profile should build");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-vault-missing",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(!outcome.success);
+        assert_eq!(plans.lock().expect("fake Docker plans").len(), 0);
+        assert!(outcome.error.contains("no vault runtime is available"));
+        assert!(!outcome.error.contains("vault://global/api-token"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker error should be JSON");
+        assert_eq!(payload["reason_code"], "docker.env.vault_resolution_unavailable");
+    }
+
+    #[tokio::test]
+    async fn docker_runner_background_request_returns_attached_handle_metadata() {
+        let (engine, plans) = FakeDockerEngine::new(Ok(docker_report_success()));
+        let runner = DockerRunner::new(safe_container_profile(), engine)
+            .expect("safe Docker profile should build runner");
+        let mut policy = test_policy();
+        policy.allowed_executables = vec!["echo".to_owned()];
+        let config = test_tool_call_config(policy);
+
+        let outcome = runner
+            .run_process(ExecutionBackendProcessRunRequest {
+                config: &config,
+                proposal_id: "proposal-docker-background",
+                tool_name: "palyra.process.run",
+                input_json: br#"{"command":"echo","args":["runner-ok"],"background":true}"#,
+                vault: None,
+                cancellation_requested: None,
+                process_progress_sink: None,
+            })
+            .await;
+
+        assert!(outcome.success, "{}", outcome.error);
+        let plans = plans.lock().expect("fake Docker plans");
+        assert!(plans.first().expect("plan should be recorded").background);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&outcome.output_json).expect("Docker output should be JSON");
+        assert_eq!(payload["background_handle"]["requested"], true);
+        assert_eq!(payload["background_handle"]["handle_kind"], "docker_attached_run");
+        assert_eq!(payload["background_handle"]["cleanup_registered"], false);
+    }
+
+    #[tokio::test]
     async fn docker_runner_output_carries_reviewed_patch_bundle_writeback() {
         let mut report = docker_report_success();
         report.patch_bundle = Some(test_workspace_patch_bundle(
@@ -5612,6 +6121,7 @@ mod tests {
                 proposal_id: "proposal-docker-patch",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5661,6 +6171,7 @@ mod tests {
                 proposal_id: "proposal-docker-cleanup",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5699,6 +6210,7 @@ mod tests {
                 proposal_id: "proposal-ssh-process",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5765,6 +6277,7 @@ mod tests {
                 proposal_id: "proposal-ssh-patch",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5833,6 +6346,7 @@ mod tests {
                 proposal_id: "proposal-ssh-direct-mutation",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5861,6 +6375,7 @@ mod tests {
                 proposal_id: "proposal-ssh-unavailable",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"echo","args":["runner-ok"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })
@@ -5905,6 +6420,7 @@ mod tests {
                 proposal_id: "proposal-ssh-shell",
                 tool_name: "palyra.process.run",
                 input_json: br#"{"command":"bash","args":["-lc","echo unsafe"]}"#,
+                vault: None,
                 cancellation_requested: None,
                 process_progress_sink: None,
             })

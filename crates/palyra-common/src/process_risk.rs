@@ -995,6 +995,11 @@ mod tests {
             port_hints: Vec::new(),
             lifetime_mode: Default::default(),
             keep_running_after_run: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         }
     }
 

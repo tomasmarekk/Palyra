@@ -26,7 +26,8 @@ use crate::{
         AuthProfileListFilter, AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord,
         AuthProfileScope, AuthProfileSelectionCandidate, AuthProfileSelectionRequest,
         AuthProfileSelectionResult, AuthProfileSetRequest, AuthProfilesPage, AuthProvider,
-        AuthTokenExpiryState, OAuthRefreshRequest,
+        AuthRunCredentialCandidateReport, AuthRunCredentialReport, AuthTokenExpiryState,
+        OAuthRefreshRequest,
     },
     refresh::{
         compute_backoff_ms, evaluate_profile_health, load_secret_utf8, oauth_expires_at,
@@ -732,6 +733,46 @@ impl AuthProfileRegistry {
         now_unix_ms: i64,
     ) -> Result<AuthProfileSelectionResult, AuthProfileError> {
         self.select_auth_profile_with_runtime_materialization(vault, request, now_unix_ms, false)
+    }
+
+    /// Selects a profile and returns a redacted per-run credential report.
+    ///
+    /// The report intentionally contains credential posture only: provider/profile ids,
+    /// health, eligibility, cooldown, and doctor-action codes. Vault references, access
+    /// tokens, refresh tokens, and raw provider payloads are never serialized.
+    ///
+    /// # Errors
+    /// Returns normalization, lock, vault-health materialization, and persistence errors.
+    pub fn run_credential_report(
+        &self,
+        vault: &Vault,
+        run_id: &str,
+        request: AuthProfileSelectionRequest,
+    ) -> Result<AuthRunCredentialReport, AuthProfileError> {
+        self.run_credential_report_with_clock(vault, run_id, request, unix_ms_now()?)
+    }
+
+    /// Like [`Self::run_credential_report`] with an injected clock.
+    ///
+    /// # Errors
+    /// See [`Self::run_credential_report`].
+    pub fn run_credential_report_with_clock(
+        &self,
+        vault: &Vault,
+        run_id: &str,
+        request: AuthProfileSelectionRequest,
+        now_unix_ms: i64,
+    ) -> Result<AuthRunCredentialReport, AuthProfileError> {
+        let run_id = normalize_auth_run_id(run_id)?;
+        let agent_id = request.agent_id.clone();
+        let selection = self.select_auth_profile_with_clock(vault, request, now_unix_ms)?;
+        let runtime_records = self.runtime_records_for_agent_readonly_with_clock(
+            vault,
+            agent_id.as_deref(),
+            now_unix_ms,
+            DEFAULT_EXPIRING_WINDOW_MS,
+        )?;
+        Ok(run_credential_report_from_selection(run_id, selection, runtime_records.as_slice()))
     }
 
     fn select_auth_profile_with_runtime_materialization(
@@ -1510,6 +1551,77 @@ fn upsert_profile_order(records: &mut Vec<AuthProfileOrderRecord>, record: AuthP
 /// Normalizes a list of profile ids into a deduplicated set.
 fn normalize_profile_set(values: &[String]) -> Result<BTreeSet<String>, AuthProfileError> {
     values.iter().map(|value| normalize_profile_id(value.as_str())).collect()
+}
+
+fn normalize_auth_run_id(raw: &str) -> Result<String, AuthProfileError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AuthProfileError::InvalidField {
+            field: "run_id",
+            message: "run id must not be empty".to_owned(),
+        });
+    }
+    if trimmed.len() > 128 {
+        return Err(AuthProfileError::InvalidField {
+            field: "run_id",
+            message: "run id exceeds 128 bytes".to_owned(),
+        });
+    }
+    if !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return Err(AuthProfileError::InvalidField {
+            field: "run_id",
+            message: "run id contains unsupported characters".to_owned(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn run_credential_report_from_selection(
+    run_id: String,
+    selection: AuthProfileSelectionResult,
+    runtime_records: &[AuthProfileRuntimeRecord],
+) -> AuthRunCredentialReport {
+    let records = runtime_records
+        .iter()
+        .map(|record| (record.profile_id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let candidates = selection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let runtime = records.get(candidate.profile_id.as_str());
+            AuthRunCredentialCandidateReport {
+                profile_id: candidate.profile_id.clone(),
+                provider: candidate.provider.clone(),
+                scope: candidate.scope.clone(),
+                credential_type: candidate.credential_type,
+                health_state: runtime
+                    .map_or(candidate.token_expiry_state, |record| record.token_expiry_state),
+                eligibility: candidate.eligibility,
+                selected: candidate.selected,
+                reason_code: candidate.reason_code.clone(),
+                failure_count: candidate.failure_count,
+                cooldown_until_unix_ms: candidate.cooldown_until_unix_ms,
+                last_used_unix_ms: candidate.last_used_unix_ms,
+                doctor_action_code: runtime
+                    .and_then(|record| record.doctor_hint.as_ref())
+                    .map(|hint| hint.code.clone()),
+                doctor_action_severity: runtime
+                    .and_then(|record| record.doctor_hint.as_ref())
+                    .map(|hint| hint.severity),
+            }
+        })
+        .collect::<Vec<_>>();
+    AuthRunCredentialReport {
+        schema_version: 1,
+        run_id,
+        selected_profile_id: selection.selected_profile_id,
+        reason_code: selection.reason_code,
+        generated_at_unix_ms: selection.generated_at_unix_ms,
+        redaction_level: "credential_metadata_only".to_owned(),
+        candidates,
+    }
 }
 
 /// Maps exclusion checks (in precedence order) and eligibility to the candidate's

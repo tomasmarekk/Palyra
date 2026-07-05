@@ -1268,6 +1268,66 @@ fn selector_respects_explicit_order_cooldown_and_least_recently_used() {
 }
 
 #[test]
+fn run_credential_report_redacts_material_and_includes_doctor_action() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let identity_root = tempdir.path().join("identity");
+    let vault_root = tempdir.path().join("vault");
+    let registry =
+        AuthProfileRegistry::open(identity_root.as_path()).expect("registry should initialize");
+    let vault = open_test_vault(vault_root.as_path(), identity_root.as_path());
+    persist_secret_utf8(&vault, "global/openai_a", "raw-secret-a").expect("key-a should persist");
+    persist_secret_utf8(&vault, "global/openai_b", "raw-secret-b").expect("key-b should persist");
+    for (profile_id, vault_ref) in
+        [("openai-a", "global/openai_a"), ("openai-b", "global/openai_b")]
+    {
+        registry
+            .set_profile(AuthProfileSetRequest {
+                profile_id: profile_id.to_owned(),
+                provider: AuthProvider::known(AuthProviderKind::Openai),
+                profile_name: profile_id.to_owned(),
+                scope: AuthProfileScope::Global,
+                credential: AuthCredential::ApiKey { api_key_vault_ref: vault_ref.to_owned() },
+            })
+            .expect("api key profile should persist");
+    }
+    let now = 1_730_000_000_000_i64;
+    registry
+        .record_profile_failure_with_clock("openai-a", AuthProfileFailureKind::RateLimit, now)
+        .expect("cooldown state should persist");
+
+    let report = registry
+        .run_credential_report_with_clock(
+            &vault,
+            "run:credential-report-1",
+            AuthProfileSelectionRequest {
+                provider: Some(AuthProvider::known(AuthProviderKind::Openai)),
+                agent_id: None,
+                explicit_profile_order: vec!["openai-a".to_owned(), "openai-b".to_owned()],
+                allowed_credential_types: vec![AuthCredentialType::ApiKey],
+                policy_denied_profile_ids: Vec::new(),
+            },
+            now.saturating_add(1),
+        )
+        .expect("credential report should build");
+
+    assert_eq!(report.schema_version, 1);
+    assert_eq!(report.selected_profile_id.as_deref(), Some("openai-b"));
+    assert_eq!(report.redaction_level, "credential_metadata_only");
+    let cooled = report
+        .candidates
+        .iter()
+        .find(|candidate| candidate.profile_id == "openai-a")
+        .expect("cooled profile should be reported");
+    assert_eq!(cooled.reason_code, "cooldown_active");
+    assert_eq!(cooled.doctor_action_code.as_deref(), Some("rate_limit_cooldown"));
+    let encoded = serde_json::to_string(&report).expect("report should serialize");
+    assert!(!encoded.contains("raw-secret-a"));
+    assert!(!encoded.contains("raw-secret-b"));
+    assert!(!encoded.contains("global/openai_a"));
+    assert!(!encoded.contains("global/openai_b"));
+}
+
+#[test]
 fn persisted_profile_order_drives_selector_without_explicit_order() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let identity_root = tempdir.path().join("identity");

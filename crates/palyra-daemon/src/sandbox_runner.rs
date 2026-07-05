@@ -57,6 +57,7 @@ use palyra_common::{
     },
     process_runner_input::{
         parse_process_runner_tool_input, BackgroundLifetimeMode, ProcessRunnerToolInput,
+        ProcessWatchStream,
     },
     redaction::{redact_auth_error, redact_url_segments_in_text, REDACTED},
 };
@@ -81,6 +82,10 @@ const MAX_ENV_KEY_LENGTH: usize = 128;
 const MAX_ENV_VALUE_LENGTH: usize = 4_096;
 const MAX_PREPEND_PATH_COUNT: usize = 16;
 const MAX_PREPEND_PATH_LENGTH: usize = 1_024;
+const MAX_ENV_PROFILE_ID_LENGTH: usize = 128;
+const MAX_WATCH_PATTERNS: usize = 8;
+const MAX_WATCH_PATTERN_NAME_LENGTH: usize = 64;
+const MAX_WATCH_PATTERN_LENGTH: usize = 256;
 const BUILTIN_LIST_MAX_ENTRIES: usize = 512;
 const BUILTIN_READ_FILE_MAX_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL_MS: u64 = 5;
@@ -1360,19 +1365,20 @@ pub fn run_constrained_process_with_cancellation_and_progress(
         });
     }
 
-    let output_json = process_success_output_json(
-        capture.exit_status.code().unwrap_or(0),
-        &capture.stdout,
-        &capture.stderr,
-        capture.duration_ms,
-        policy.tier.as_str(),
-        if matches!(policy.tier, SandboxProcessRunnerTier::C) {
+    let output_json = process_success_output_json(ProcessSuccessOutputJsonInput {
+        exit_code: capture.exit_status.code().unwrap_or(0),
+        stdout: &capture.stdout,
+        stderr: &capture.stderr,
+        duration_ms: capture.duration_ms,
+        tier: policy.tier.as_str(),
+        sandbox_backend: if matches!(policy.tier, SandboxProcessRunnerTier::C) {
             current_backend_kind().as_str()
         } else {
             "tier_b_in_process"
         },
-        &process_risk,
-    )
+        process_risk: &process_risk,
+        input: Some(&input),
+    })
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox process output JSON: {error}"),
@@ -1491,37 +1497,221 @@ struct ProcessStreamOutputView {
     metadata: Value,
 }
 
-fn process_success_output_json(
+struct ProcessSuccessOutputJsonInput<'a> {
     exit_code: i32,
-    stdout: &StreamCapture,
-    stderr: &StreamCapture,
+    stdout: &'a StreamCapture,
+    stderr: &'a StreamCapture,
     duration_ms: u64,
-    tier: &str,
-    sandbox_backend: &str,
-    process_risk: &ProcessRiskReport,
+    tier: &'a str,
+    sandbox_backend: &'a str,
+    process_risk: &'a ProcessRiskReport,
+    input: Option<&'a ProcessRunnerInput>,
+}
+
+fn process_success_output_json(
+    request: ProcessSuccessOutputJsonInput<'_>,
 ) -> serde_json::Result<Vec<u8>> {
-    let stdout_view = process_stream_output_view("stdout", stdout);
-    let stderr_view = process_stream_output_view("stderr", stderr);
+    let stdout_view = process_stream_output_view("stdout", request.stdout);
+    let stderr_view = process_stream_output_view("stderr", request.stderr);
     serde_json::to_vec(&json!({
         "schema_version": 2,
-        "exit_code": exit_code,
+        "exit_code": request.exit_code,
         "stdout": stdout_view.model_text,
         "stderr": stderr_view.model_text,
-        "stdout_truncated": stdout.truncated,
-        "stderr_truncated": stderr.truncated,
+        "stdout_truncated": request.stdout.truncated,
+        "stderr_truncated": request.stderr.truncated,
         "stdout_redacted": stdout_view.redacted,
         "stderr_redacted": stderr_view.redacted,
-        "stdout_bytes": stdout.bytes.len(),
-        "stderr_bytes": stderr.bytes.len(),
-        "duration_ms": duration_ms,
-        "tier": tier,
-        "sandbox_backend": sandbox_backend,
-        "process_risk": process_risk,
+        "stdout_bytes": request.stdout.bytes.len(),
+        "stderr_bytes": request.stderr.bytes.len(),
+        "duration_ms": request.duration_ms,
+        "tier": request.tier,
+        "sandbox_backend": request.sandbox_backend,
+        "process_risk": request.process_risk,
         "streams": {
             "stdout": stdout_view.metadata,
             "stderr": stderr_view.metadata,
         },
+        "runtime_request": process_runtime_request_projection(request.input),
+        "notification": process_completion_notification_projection(
+            request.input,
+            ProcessCompletionState::Delivered,
+            None,
+            stdout_view.model_text.as_str(),
+            stderr_view.model_text.as_str(),
+        ),
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessCompletionState {
+    Disabled,
+    Subscribed,
+    Delivered,
+}
+
+impl ProcessCompletionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Subscribed => "subscribed",
+            Self::Delivered => "delivered",
+        }
+    }
+}
+
+fn process_runtime_request_projection(input: Option<&ProcessRunnerInput>) -> Value {
+    let Some(input) = input else {
+        return Value::Null;
+    };
+    json!({
+        "schema_version": 1,
+        "notify_on_complete": input.notify_on_complete,
+        "watch_pattern_count": input.watch_patterns.len(),
+        "env_profile": input.env_profile_id.as_ref().map(|profile_id| json!({
+            "profile_id": profile_id,
+            "profile_id_sha256": sha256_hex(profile_id.as_bytes()),
+            "daemon_env_inherited": false,
+        })),
+        "provided_env_key_count": input.env.len(),
+        "elevated_intent": input.elevated_intent,
+        "elevated_intent_detected": process_input_has_elevated_intent(input),
+        "facade_mapping": input.facade_mapping.as_ref().map(|mapping| json!({
+            "original_tool_name": mapping.original_tool_name.as_str(),
+            "canonical_tool_name": mapping.canonical_tool_name.as_str(),
+        })),
+        "reason_code": "process.runtime_request.accepted",
+    })
+}
+
+fn process_completion_notification_projection(
+    input: Option<&ProcessRunnerInput>,
+    state: ProcessCompletionState,
+    pid: Option<u32>,
+    stdout: &str,
+    stderr: &str,
+) -> Value {
+    let Some(input) = input else {
+        return Value::Null;
+    };
+    let watch = process_watch_events_projection(input, stdout, stderr);
+    let completion_requested = input.notify_on_complete || !input.watch_patterns.is_empty();
+    let completion_state =
+        if completion_requested { state } else { ProcessCompletionState::Disabled };
+    json!({
+        "schema_version": 1,
+        "requested": completion_requested,
+        "completion": {
+            "state": completion_state.as_str(),
+            "delivery": if completion_state == ProcessCompletionState::Delivered {
+                "synthetic_system_input_ready"
+            } else if completion_state == ProcessCompletionState::Subscribed {
+                "background_subscription_pending"
+            } else {
+                "not_requested"
+            },
+            "exactly_once": completion_requested,
+            "sequence": if completion_state == ProcessCompletionState::Delivered { Some(1_u8) } else { None },
+            "subscription_key_sha256": completion_requested.then(|| {
+                process_notification_subscription_key(input, pid)
+            }),
+            "reason_code": match completion_state {
+                ProcessCompletionState::Disabled => "process.notification.not_requested",
+                ProcessCompletionState::Subscribed => "process.notification.subscribed",
+                ProcessCompletionState::Delivered => "process.notification.delivered",
+            },
+        },
+        "watch": watch,
+    })
+}
+
+fn process_notification_subscription_key(input: &ProcessRunnerInput, pid: Option<u32>) -> String {
+    let payload = json!({
+        "command": input.command,
+        "args": input.args,
+        "cwd": input.cwd,
+        "pid": pid,
+        "notify_on_complete": input.notify_on_complete,
+        "watch_patterns": input.watch_patterns.iter().map(|pattern| {
+            json!({
+                "name": pattern.name,
+                "pattern_sha256": sha256_hex(pattern.pattern.as_bytes()),
+                "stream": pattern.stream.as_str(),
+                "notify_once": pattern.notify_once,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    sha256_hex(serde_json::to_vec(&payload).unwrap_or_default().as_slice())
+}
+
+fn process_watch_events_projection(
+    input: &ProcessRunnerInput,
+    stdout: &str,
+    stderr: &str,
+) -> Value {
+    let mut events = Vec::new();
+    let mut suppressed = 0_u64;
+    let mut degraded = false;
+    for pattern in &input.watch_patterns {
+        let occurrence_count = process_watch_pattern_occurrences(
+            pattern.stream,
+            stdout,
+            stderr,
+            pattern.pattern.as_str(),
+        );
+        if occurrence_count > 16 {
+            degraded = true;
+            suppressed = suppressed.saturating_add(occurrence_count);
+            continue;
+        }
+        if occurrence_count > 0 {
+            events.push(json!({
+                "name": pattern.name,
+                "stream": pattern.stream.as_str(),
+                "pattern_sha256": sha256_hex(pattern.pattern.as_bytes()),
+                "occurrences": occurrence_count,
+                "notify_once": pattern.notify_once,
+                "delivery_state": "ready",
+                "reason_code": "process.watch_pattern.matched",
+            }));
+        }
+    }
+    json!({
+        "requested": !input.watch_patterns.is_empty(),
+        "state": if degraded { "degraded_completion_only" } else { "ready" },
+        "event_count": events.len(),
+        "suppressed_occurrences": suppressed,
+        "rate_limited": degraded,
+        "reason_code": if degraded {
+            "process.watch_pattern.spam_degraded"
+        } else if events.is_empty() {
+            "process.watch_pattern.no_match"
+        } else {
+            "process.watch_pattern.ready"
+        },
+        "events": if degraded { Vec::<Value>::new() } else { events },
+    })
+}
+
+fn process_watch_pattern_occurrences(
+    stream: ProcessWatchStream,
+    stdout: &str,
+    stderr: &str,
+    pattern: &str,
+) -> u64 {
+    match stream {
+        ProcessWatchStream::Both => count_non_overlapping_occurrences(stdout, pattern)
+            .saturating_add(count_non_overlapping_occurrences(stderr, pattern)),
+        ProcessWatchStream::Stdout => count_non_overlapping_occurrences(stdout, pattern),
+        ProcessWatchStream::Stderr => count_non_overlapping_occurrences(stderr, pattern),
+    }
+}
+
+fn count_non_overlapping_occurrences(haystack: &str, needle: &str) -> u64 {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack.matches(needle).count().try_into().unwrap_or(u64::MAX)
 }
 
 fn process_stream_output_view(
@@ -1996,15 +2186,16 @@ fn execute_builtin_process_command(
         _ => return Ok(None),
     };
     let stderr = StreamCapture::default();
-    let output_json = process_success_output_json(
-        0,
-        &stdout,
-        &stderr,
-        0,
-        policy.tier.as_str(),
-        "builtin_portable",
+    let output_json = process_success_output_json(ProcessSuccessOutputJsonInput {
+        exit_code: 0,
+        stdout: &stdout,
+        stderr: &stderr,
+        duration_ms: 0,
+        tier: policy.tier.as_str(),
+        sandbox_backend: "builtin_portable",
         process_risk,
-    )
+        input: Some(input),
+    })
     .map_err(|error| SandboxProcessRunError {
         kind: SandboxProcessRunErrorKind::RuntimeFailure,
         message: format!("failed to serialize sandbox builtin process output JSON: {error}"),
@@ -3168,7 +3359,126 @@ fn validate_input_shape(input: &ProcessRunnerInput) -> Result<(), SandboxProcess
             ),
         });
     }
+    validate_process_env_profile(input.env_profile_id.as_deref())?;
+    validate_process_watch_patterns(input.watch_patterns.as_slice())?;
+    validate_process_elevated_intent(input)?;
+    validate_process_facade_mapping(input)?;
     Ok(())
+}
+
+fn validate_process_env_profile(
+    env_profile_id: Option<&str>,
+) -> Result<(), SandboxProcessRunError> {
+    let Some(env_profile_id) = env_profile_id.map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if env_profile_id.len() > MAX_ENV_PROFILE_ID_LENGTH
+        || env_profile_id.contains('\0')
+        || !env_profile_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: "palyra.process.run env_profile_id must be a non-empty profile identifier using ASCII letters, digits, '.', '-', '_' or ':'"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_process_watch_patterns(
+    patterns: &[palyra_common::process_runner_input::ProcessWatchPattern],
+) -> Result<(), SandboxProcessRunError> {
+    if patterns.len() > MAX_WATCH_PATTERNS {
+        return Err(SandboxProcessRunError {
+            kind: SandboxProcessRunErrorKind::InvalidInput,
+            message: format!(
+                "palyra.process.run watch_patterns supports at most {MAX_WATCH_PATTERNS} entries"
+            ),
+        });
+    }
+    let mut names = BTreeSet::new();
+    for pattern in patterns {
+        let name = pattern.name.trim();
+        if name.is_empty()
+            || name.len() > MAX_WATCH_PATTERN_NAME_LENGTH
+            || name.contains('\0')
+            || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message:
+                    "palyra.process.run watch_patterns[].name must be a bounded ASCII identifier"
+                        .to_owned(),
+            });
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!("palyra.process.run watch pattern name '{name}' is duplicated"),
+            });
+        }
+        let value = pattern.pattern.trim();
+        if value.is_empty() || value.len() > MAX_WATCH_PATTERN_LENGTH || value.contains('\0') {
+            return Err(SandboxProcessRunError {
+                kind: SandboxProcessRunErrorKind::InvalidInput,
+                message: format!(
+                    "palyra.process.run watch pattern '{}' must be non-empty and at most {MAX_WATCH_PATTERN_LENGTH} bytes",
+                    name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_process_elevated_intent(
+    input: &ProcessRunnerInput,
+) -> Result<(), SandboxProcessRunError> {
+    if !process_input_has_elevated_intent(input) || input.elevated_intent {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: "palyra.process.run detected privilege escalation intent; set elevated_intent=true so the approval and audit path records the elevated posture"
+            .to_owned(),
+    })
+}
+
+fn validate_process_facade_mapping(
+    input: &ProcessRunnerInput,
+) -> Result<(), SandboxProcessRunError> {
+    let Some(mapping) = input.facade_mapping.as_ref() else {
+        return Ok(());
+    };
+    if mapping.original_tool_name == "palyra.exec.run"
+        && mapping.canonical_tool_name == "palyra.process.run"
+    {
+        return Ok(());
+    }
+    Err(SandboxProcessRunError {
+        kind: SandboxProcessRunErrorKind::InvalidInput,
+        message: "palyra.process.run facade_mapping must map palyra.exec.run to palyra.process.run"
+            .to_owned(),
+    })
+}
+
+fn process_input_has_elevated_intent(input: &ProcessRunnerInput) -> bool {
+    let command = Path::new(input.command.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(input.command.as_str())
+        .trim()
+        .to_ascii_lowercase();
+    matches!(command.as_str(), "sudo" | "su" | "doas" | "runas" | "pkexec")
+        || input.args.iter().any(|arg| {
+            let normalized = arg.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "sudo" | "su" | "doas" | "runas" | "pkexec")
+                || normalized.starts_with("sudo ")
+                || normalized.starts_with("doas ")
+        })
 }
 
 fn validate_background_lifetime_mode(
@@ -6092,6 +6402,13 @@ fn spawn_background_process(
     let background_lifetime_adjustment_note =
         background_lifetime_adjustment_note(background_lifetime_adjustment_reason);
     let auto_backgrounded = auto_background_reason.is_some();
+    let notification = process_completion_notification_projection(
+        Some(input),
+        ProcessCompletionState::Subscribed,
+        Some(pid),
+        stdout_text.as_str(),
+        stderr_text.as_str(),
+    );
     let output_json = serde_json::to_vec(&json!({
         "exit_code": Value::Null,
         "stdout": stdout_text,
@@ -6140,6 +6457,8 @@ fn spawn_background_process(
         },
         "cleanup": cleanup,
         "handoff": handoff,
+        "runtime_request": process_runtime_request_projection(Some(input)),
+        "notification": notification,
         "verification_hint": background_verification_hint(ports.as_slice(), durable_handoff),
         "tier": policy.tier.as_str(),
         "sandbox_backend": process_runner_executor_name(policy),
@@ -8484,7 +8803,9 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use palyra_common::process_runner_input::ProcessWatchStream;
     use palyra_sandbox::TierCCommandPlan;
+    use serde_json::Value;
 
     use super::unix_pid_i32_from_u32;
     use super::{
@@ -8492,12 +8813,13 @@ mod tests {
         canonical_workspace_root, collect_requested_egress_hosts, command_env_value_os,
         command_option_consumes_non_path_value, cpu_rlimit_seconds_from_usage_micros,
         host_access_roots, is_host_allowlisted, maybe_emit_process_progress,
-        process_failure_message, process_output_diagnostic_summary,
-        process_runner_command_with_args_message, process_success_output_json,
-        redacted_process_output_preview, redacted_process_output_text,
-        resolve_host_executable_path_with_roots, resolve_host_working_directory,
-        resolve_host_working_directory_with_roots, resolve_scoped_path,
-        resolve_unrestricted_working_directory, resolve_working_directory,
+        process_completion_notification_projection, process_failure_message,
+        process_output_diagnostic_summary, process_runner_command_with_args_message,
+        process_runtime_request_projection, process_success_output_json,
+        process_watch_events_projection, redacted_process_output_preview,
+        redacted_process_output_text, resolve_host_executable_path_with_roots,
+        resolve_host_working_directory, resolve_host_working_directory_with_roots,
+        resolve_scoped_path, resolve_unrestricted_working_directory, resolve_working_directory,
         rewrite_arguments_to_scoped_paths, rewrite_host_access_process_args,
         rewrite_host_virtual_workspace_args, run_constrained_process,
         run_constrained_process_with_cancellation, same_path_case_aware,
@@ -8508,10 +8830,11 @@ mod tests {
         validate_interpreter_argument_guardrails, validate_no_embedded_command_line_arg,
         validate_process_env_overrides, validate_process_prepend_path_shape,
         validate_process_termination_scope, validate_runtime_egress_enforcement,
-        BackgroundLifetimeMode, EgressEnforcementMode, PathAccessMode, ProcessProgressMonitor,
-        ProcessProgressSink, ProcessRunnerInput, SandboxProcessRunErrorKind,
-        SandboxProcessRunnerPolicy, SandboxProcessRunnerTier, StreamCapture,
-        BACKGROUND_MONITOR_POLL_MS, BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT,
+        BackgroundLifetimeMode, EgressEnforcementMode, PathAccessMode, ProcessCompletionState,
+        ProcessProgressMonitor, ProcessProgressSink, ProcessRunnerInput,
+        ProcessSuccessOutputJsonInput, SandboxProcessRunErrorKind, SandboxProcessRunnerPolicy,
+        SandboxProcessRunnerTier, StreamCapture, BACKGROUND_MONITOR_POLL_MS,
+        BACKGROUND_TERMINATION_WAIT_MS, MAX_PREPEND_PATH_COUNT, MAX_WATCH_PATTERNS,
         NODE_DISABLE_COMPILE_CACHE_ENV, PALYRA_OS_FILE_ROOTS_ENV, PROCESS_PROGRESS_MIN_ELAPSED_MS,
     };
     #[cfg(windows)]
@@ -8621,12 +8944,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         }
     }
 
@@ -9340,12 +9668,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let command = build_process_command(
@@ -9793,12 +10126,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let error = validate_no_embedded_command_line_arg(&input)
@@ -9841,12 +10179,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         validate_input_shape(&input)
@@ -9967,12 +10310,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
         let cwd =
             resolve_host_working_directory(canonical_workspace.as_path(), input.cwd.as_deref())
@@ -10023,6 +10371,125 @@ mod tests {
         let error = validate_process_prepend_path_shape(&[" tools/bin".to_owned()])
             .expect_err("whitespace-padded prepend_path should be rejected");
         assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn process_runner_notification_request_projects_watch_events() {
+        let mut input = process_runner_input("npm", &["run", "dev"], None);
+        input.background = true;
+        input.notify_on_complete = true;
+        input.watch_patterns.push(palyra_common::process_runner_input::ProcessWatchPattern {
+            name: "ready".to_owned(),
+            pattern: "Local:".to_owned(),
+            stream: ProcessWatchStream::Stdout,
+            notify_once: true,
+        });
+        input.env_profile_id = Some("web-dev".to_owned());
+
+        let notification = process_completion_notification_projection(
+            Some(&input),
+            ProcessCompletionState::Subscribed,
+            Some(42),
+            "VITE ready\nLocal: http://127.0.0.1:5173\n",
+            "",
+        );
+
+        assert_eq!(
+            notification.pointer("/completion/state").and_then(Value::as_str),
+            Some("subscribed")
+        );
+        assert_eq!(
+            notification.pointer("/watch/events/0/name").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert!(
+            notification
+                .pointer("/watch/events/0/pattern_sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() == 64),
+            "watch projection must carry only a pattern hash: {notification}"
+        );
+        let runtime_request = process_runtime_request_projection(Some(&input));
+        assert_eq!(
+            runtime_request.pointer("/env_profile/daemon_env_inherited").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn process_watch_pattern_spam_degrades_to_completion_only() {
+        let mut input = process_runner_input("node", &["server.js"], None);
+        input.watch_patterns.push(palyra_common::process_runner_input::ProcessWatchPattern {
+            name: "spam".to_owned(),
+            pattern: "ready".to_owned(),
+            stream: ProcessWatchStream::Both,
+            notify_once: true,
+        });
+        let stdout = "ready\n".repeat(32);
+
+        let watch = process_watch_events_projection(&input, stdout.as_str(), "");
+
+        assert_eq!(watch.get("state").and_then(Value::as_str), Some("degraded_completion_only"));
+        assert_eq!(watch.get("rate_limited").and_then(Value::as_bool), Some(true));
+        assert_eq!(watch.get("events").and_then(Value::as_array).map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn process_runner_input_rejects_implicit_elevated_intent() {
+        let input = process_runner_input("sudo", &["id"], None);
+        let error =
+            validate_input_shape(&input).expect_err("sudo must require explicit elevated_intent");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("elevated_intent=true"), "{}", error.message);
+    }
+
+    #[test]
+    fn process_runner_watch_pattern_limits_are_enforced() {
+        let mut input = process_runner_input("node", &["server.js"], None);
+        input.watch_patterns = (0..=MAX_WATCH_PATTERNS)
+            .map(|index| palyra_common::process_runner_input::ProcessWatchPattern {
+                name: format!("ready{index}"),
+                pattern: "ready".to_owned(),
+                stream: ProcessWatchStream::Both,
+                notify_once: true,
+            })
+            .collect();
+
+        let error = validate_input_shape(&input)
+            .expect_err("too many watch patterns should fail before spawn");
+
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("watch_patterns supports at most"), "{}", error.message);
+    }
+
+    #[test]
+    fn process_runner_facade_mapping_is_validated_and_projected() {
+        let mut input = process_runner_input("pwd", &[], None);
+        input.facade_mapping =
+            Some(palyra_common::process_runner_input::ProcessRunnerFacadeMapping {
+                original_tool_name: "palyra.exec.run".to_owned(),
+                canonical_tool_name: "palyra.process.run".to_owned(),
+            });
+
+        validate_input_shape(&input).expect("canonical facade mapping should be accepted");
+        let projection = process_runtime_request_projection(Some(&input));
+
+        assert_eq!(
+            projection.pointer("/facade_mapping/original_tool_name").and_then(Value::as_str),
+            Some("palyra.exec.run")
+        );
+        assert_eq!(
+            projection.pointer("/facade_mapping/canonical_tool_name").and_then(Value::as_str),
+            Some("palyra.process.run")
+        );
+
+        input.facade_mapping.as_mut().expect("facade mapping should exist").canonical_tool_name =
+            "palyra.tool_program.run".to_owned();
+        let error = validate_input_shape(&input)
+            .expect_err("facade mapping must not target a different execution path");
+        assert_eq!(error.kind, SandboxProcessRunErrorKind::InvalidInput);
+        assert!(error.message.contains("facade_mapping"), "{}", error.message);
     }
 
     #[test]
@@ -10097,12 +10564,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let error = build_process_command(
@@ -10145,12 +10617,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let command = build_process_command(
@@ -10195,12 +10672,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let error = build_process_command(
@@ -10260,6 +10742,11 @@ mod tests {
                 port_hints: Vec::new(),
                 lifetime_mode: BackgroundLifetimeMode::RunOwned,
                 keep_running_after_run: false,
+                notify_on_complete: false,
+                watch_patterns: Vec::new(),
+                env_profile_id: None,
+                elevated_intent: false,
+                facade_mapping: None,
             };
 
             let command =
@@ -10329,12 +10816,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let command =
@@ -10467,12 +10959,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let command = build_process_command(
@@ -10517,12 +11014,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let error = build_process_command(
@@ -11641,12 +12143,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: true,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: true,
             stdin: false,
             pty: false,
             port_hints: vec![5173],
             lifetime_mode: BackgroundLifetimeMode::UntilVerifier,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
         let capabilities = super::BackgroundProcessHandleCapabilities::from_input(&input);
 
@@ -13412,12 +13919,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let hosts = collect_requested_egress_hosts(&input)
@@ -13445,12 +13957,17 @@ mod tests {
             requested_egress_hosts: Vec::new(),
             timeout_ms: None,
             background: false,
+            notify_on_complete: false,
+            watch_patterns: Vec::new(),
             interactive: false,
             stdin: false,
             pty: false,
             port_hints: Vec::new(),
             lifetime_mode: BackgroundLifetimeMode::RunOwned,
             keep_running_after_run: false,
+            env_profile_id: None,
+            elevated_intent: false,
+            facade_mapping: None,
         };
 
         let hosts = collect_requested_egress_hosts(&input)
@@ -13593,15 +14110,16 @@ mod tests {
         };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(
-            0,
-            &stdout,
-            &stderr,
-            42,
-            "b",
-            "tier_b_in_process",
-            &empty_process_risk_report(),
-        )
+        let output = process_success_output_json(ProcessSuccessOutputJsonInput {
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: 42,
+            tier: "b",
+            sandbox_backend: "tier_b_in_process",
+            process_risk: &empty_process_risk_report(),
+            input: None,
+        })
         .expect("process output should serialize");
         let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
         let parsed: serde_json::Value =
@@ -13640,15 +14158,16 @@ mod tests {
         let stdout = StreamCapture { bytes: binary, truncated: false, read_error: None };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(
-            0,
-            &stdout,
-            &stderr,
-            7,
-            "b",
-            "tier_b_in_process",
-            &empty_process_risk_report(),
-        )
+        let output = process_success_output_json(ProcessSuccessOutputJsonInput {
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: 7,
+            tier: "b",
+            sandbox_backend: "tier_b_in_process",
+            process_risk: &empty_process_risk_report(),
+            input: None,
+        })
         .expect("process output should serialize");
         let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
         let parsed: serde_json::Value =
@@ -13679,15 +14198,16 @@ mod tests {
             StreamCapture { bytes: ansi_table.into_bytes(), truncated: false, read_error: None };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(
-            0,
-            &stdout,
-            &stderr,
-            11,
-            "b",
-            "tier_b_in_process",
-            &empty_process_risk_report(),
-        )
+        let output = process_success_output_json(ProcessSuccessOutputJsonInput {
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: 11,
+            tier: "b",
+            sandbox_backend: "tier_b_in_process",
+            process_risk: &empty_process_risk_report(),
+            input: None,
+        })
         .expect("process output should serialize");
         let rendered = String::from_utf8(output.clone()).expect("output should be utf-8 JSON");
         let parsed: serde_json::Value =
@@ -13716,15 +14236,16 @@ mod tests {
         };
         let stderr = StreamCapture::default();
 
-        let output = process_success_output_json(
-            0,
-            &stdout,
-            &stderr,
-            3,
-            "b",
-            "tier_b_in_process",
-            &empty_process_risk_report(),
-        )
+        let output = process_success_output_json(ProcessSuccessOutputJsonInput {
+            exit_code: 0,
+            stdout: &stdout,
+            stderr: &stderr,
+            duration_ms: 3,
+            tier: "b",
+            sandbox_backend: "tier_b_in_process",
+            process_risk: &empty_process_risk_report(),
+            input: None,
+        })
         .expect("process output should serialize");
         let parsed: serde_json::Value =
             serde_json::from_slice(output.as_slice()).expect("output should parse");

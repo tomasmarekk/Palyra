@@ -20,7 +20,8 @@ pub use models::{
     AuthProfileFailureKind, AuthProfileHealthRecord, AuthProfileHealthState, AuthProfileListFilter,
     AuthProfileOrderRecord, AuthProfileRecord, AuthProfileRuntimeRecord, AuthProfileScope,
     AuthProfileSelectionCandidate, AuthProfileSelectionRequest, AuthProfileSelectionResult,
-    AuthProfileSetRequest, AuthProfilesPage, AuthProvider, AuthProviderKind, AuthScopeFilter,
+    AuthProfileSetRequest, AuthProfilesPage, AuthProvider, AuthProviderKind,
+    AuthRunCredentialCandidateReport, AuthRunCredentialReport, AuthScopeFilter,
     AuthTokenExpiryState, OAuthRefreshError, OAuthRefreshRequest, OAuthRefreshResponse,
     OAuthRefreshState,
 };

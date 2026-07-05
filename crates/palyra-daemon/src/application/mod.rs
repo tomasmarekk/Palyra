@@ -44,6 +44,7 @@ pub mod service_authorization;
 pub mod session_compaction;
 pub mod session_pruning;
 pub mod session_queue;
+pub mod terminal_sessions;
 pub mod tool_governance;
 pub mod tool_jobs;
 pub mod tool_registry;

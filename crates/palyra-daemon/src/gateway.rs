@@ -36,8 +36,10 @@ use palyra_auth::{
     OAuthRefreshOutcome,
 };
 use palyra_common::{
-    build_metadata, process_runner_input::parse_process_runner_tool_input,
-    redaction::redact_diagnostic_text, validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
+    build_metadata,
+    process_runner_input::{parse_process_runner_tool_input, ProcessRunnerFacadeMapping},
+    redaction::redact_diagnostic_text,
+    validate_canonical_id, CANONICAL_PROTOCOL_MAJOR,
 };
 use palyra_policy::{evaluate_with_config, PolicyDecision, PolicyEvaluationConfig, PolicyRequest};
 #[cfg(test)]
@@ -234,6 +236,7 @@ pub(crate) const WORKSPACE_SEARCH_TOOL_NAME: &str = "palyra.fs.search";
 pub(crate) const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 pub(crate) const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
 pub(crate) const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
+pub(crate) const PROCESS_RUNNER_ALIAS_TOOL_NAME: &str = "palyra.exec.run";
 pub(crate) const PROCESS_INPUT_TOOL_NAME: &str = "palyra.process.input";
 pub(crate) const PROCESS_SEND_KEYS_TOOL_NAME: &str = "palyra.process.send_keys";
 pub(crate) const PROCESS_STOP_TOOL_NAME: &str = "palyra.process.stop";
@@ -272,6 +275,10 @@ pub(crate) const BROWSER_PERMISSIONS_GET_TOOL_NAME: &str = "palyra.browser.permi
 pub(crate) const BROWSER_PERMISSIONS_SET_TOOL_NAME: &str = "palyra.browser.permissions.set";
 pub(crate) const BROWSER_DOWNLOADS_LIST_TOOL_NAME: &str = "palyra.browser.downloads.list";
 pub(crate) const BROWSER_DOWNLOADS_GET_TOOL_NAME: &str = "palyra.browser.downloads.get";
+
+fn is_process_runner_run_tool(tool_name: &str) -> bool {
+    matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
+}
 
 mod approvals;
 mod canvas;
@@ -369,7 +376,8 @@ pub(crate) fn best_effort_memory_ingest_allowed(source: MemorySource, tags: &[St
 /// of dropping it: these tools spawn OS processes or nested tool programs
 /// whose teardown must finish, or they would leak past the cancelled run.
 pub(crate) fn tool_cancellation_requires_execution_drain(tool_name: &str) -> bool {
-    matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | TOOL_PROGRAM_RUN_TOOL_NAME | "palyra.plugin.run")
+    is_process_runner_run_tool(tool_name)
+        || matches!(tool_name, TOOL_PROGRAM_RUN_TOOL_NAME | "palyra.plugin.run")
 }
 
 /// Folds an approval outcome into a tool decision: a missing approval channel
@@ -830,7 +838,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
         )
         .await
     } else if context.execution_backend == ExecutionBackendPreference::Docker
-        && tool_name != PROCESS_RUNNER_TOOL_NAME
+        && !is_process_runner_run_tool(tool_name)
         && tool_name != TOOL_PROGRAM_RUN_TOOL_NAME
     {
         docker_execution_target_unavailable_outcome(proposal_id, tool_name, input_json)
@@ -1035,11 +1043,21 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             input_json,
         )
         .await
-    } else if tool_name == PROCESS_RUNNER_TOOL_NAME {
-        let config =
-            process_runner_tool_config_for_session(runtime_state, context, input_json).await;
-        let execution_input_json =
-            process_runner_input_with_launch_context_env(runtime_state, context, input_json).await;
+    } else if is_process_runner_run_tool(tool_name) {
+        let facade_input_json = process_runner_input_with_facade_mapping(tool_name, input_json)
+            .unwrap_or_else(|| input_json.to_vec());
+        let config = process_runner_tool_config_for_session(
+            runtime_state,
+            context,
+            facade_input_json.as_slice(),
+        )
+        .await;
+        let execution_input_json = process_runner_input_with_launch_context_env(
+            runtime_state,
+            context,
+            facade_input_json.as_slice(),
+        )
+        .await;
         let runner_registry = if matches!(
             context.execution_backend,
             ExecutionBackendPreference::Docker | ExecutionBackendPreference::SshTunnel
@@ -1075,6 +1093,7 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
                 proposal_id,
                 tool_name,
                 input_json: execution_input_json.as_slice(),
+                vault: Some(runtime_state.vault.as_ref()),
                 cancellation_requested: controls.cancellation_requested,
                 process_progress_sink: controls.process_progress_sink,
             })
@@ -1217,7 +1236,7 @@ fn record_run_cleanup_resource_from_tool_outcome(
     }
 
     match tool_name {
-        PROCESS_RUNNER_TOOL_NAME => {
+        name if is_process_runner_run_tool(name) => {
             if let Some(resource) =
                 detached_background_process_from_tool_output(outcome.output_json.as_slice())
             {
@@ -2111,6 +2130,18 @@ async fn process_runner_input_with_launch_context_env(
     process_runner_input_with_path_env(input_json, &path_env).unwrap_or_else(|| input_json.to_vec())
 }
 
+fn process_runner_input_with_facade_mapping(tool_name: &str, input_json: &[u8]) -> Option<Vec<u8>> {
+    if tool_name != PROCESS_RUNNER_ALIAS_TOOL_NAME {
+        return None;
+    }
+    let mut input = parse_process_runner_tool_input(input_json).ok()?;
+    input.facade_mapping = Some(ProcessRunnerFacadeMapping {
+        original_tool_name: PROCESS_RUNNER_ALIAS_TOOL_NAME.to_owned(),
+        canonical_tool_name: PROCESS_RUNNER_TOOL_NAME.to_owned(),
+    });
+    serde_json::to_vec(&input).ok()
+}
+
 fn process_runner_input_with_path_env(
     input_json: &[u8],
     path_env: &BTreeMap<String, PathBuf>,
@@ -2396,7 +2427,7 @@ pub(crate) fn record_tool_execution_outcome_metrics(
     if outcome.attestation.timed_out {
         runtime_state.counters.tool_execution_timeouts.fetch_add(1, Ordering::Relaxed);
     }
-    if trace.tool_name == PROCESS_RUNNER_TOOL_NAME {
+    if is_process_runner_run_tool(trace.tool_name) {
         record_process_runner_execution_metrics(&runtime_state.counters, decision_allowed, outcome);
     }
     if trace.tool_name == WORKSPACE_PATCH_TOOL_NAME {
@@ -2433,7 +2464,7 @@ pub(crate) fn record_tool_decision_metrics(
 
     runtime_state.counters.tool_decisions_denied.fetch_add(1, Ordering::Relaxed);
     runtime_state.record_denied();
-    if tool_name == PROCESS_RUNNER_TOOL_NAME {
+    if is_process_runner_run_tool(tool_name) {
         runtime_state.counters.sandbox_policy_denies.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -3560,7 +3591,7 @@ pub(crate) fn approval_risk_for_tool(
     input_json: &[u8],
     config: &ToolCallConfig,
 ) -> ApprovalRiskLevel {
-    if tool_name != PROCESS_RUNNER_TOOL_NAME {
+    if !is_process_runner_run_tool(tool_name) {
         return ApprovalRiskLevel::High;
     }
     if !matches!(config.process_runner.tier, crate::sandbox_runner::SandboxProcessRunnerTier::C) {

@@ -418,6 +418,41 @@ pub struct AuthProfileSelectionResult {
     pub generated_at_unix_ms: i64,
 }
 
+/// Redacted per-run credential-selection report for journals and support bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthRunCredentialReport {
+    pub schema_version: u32,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_profile_id: Option<String>,
+    pub reason_code: String,
+    pub generated_at_unix_ms: i64,
+    pub redaction_level: String,
+    pub candidates: Vec<AuthRunCredentialCandidateReport>,
+}
+
+/// One redacted candidate in a per-run credential report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthRunCredentialCandidateReport {
+    pub profile_id: String,
+    pub provider: String,
+    pub scope: String,
+    pub credential_type: AuthCredentialType,
+    pub health_state: AuthTokenExpiryState,
+    pub eligibility: AuthProfileEligibility,
+    pub selected: bool,
+    pub reason_code: String,
+    pub failure_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doctor_action_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doctor_action_severity: Option<AuthProfileDoctorSeverity>,
+}
+
 /// In-memory request handed to an [`OAuthRefreshAdapter`](crate::OAuthRefreshAdapter).
 ///
 /// `Debug` redacts raw token fields so adapter diagnostics cannot leak secrets.

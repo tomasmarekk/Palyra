@@ -95,7 +95,7 @@ pub mod proto {
 }
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     env,
     ffi::{OsStr, OsString},
     fs,
@@ -2960,6 +2960,7 @@ fn build_support_bundle_runtime_snapshot(
                 "note": "timeline subset is included when daemon diagnostics exposes it",
             })
         }),
+        runtime_logs: build_support_bundle_runtime_logs_snapshot(generated_at_unix_ms, journal),
         trace_export: support_json_value(
             admin_status,
             &["/observability/trace_export", "/runtime_diagnostics/trace_export"],
@@ -3019,6 +3020,132 @@ fn build_support_bundle_enabled_modules(
     modules.sort();
     modules.dedup();
     modules
+}
+
+const SUPPORT_BUNDLE_RUNTIME_LOG_TAIL_LINES: usize = 32;
+const SUPPORT_BUNDLE_RUNTIME_LOG_MAX_LINE_CHARS: usize = 512;
+
+fn build_support_bundle_runtime_logs_snapshot(
+    generated_at_unix_ms: i64,
+    journal: &SupportBundleJournalSnapshot,
+) -> Value {
+    let service_sources = support_bundle_service_log_sources();
+    let selected =
+        service_sources.iter().find(|source| source.path.as_path().is_file()).and_then(|source| {
+            read_support_bundle_runtime_log_tail(
+                source.source.as_str(),
+                source.path.as_path(),
+                SUPPORT_BUNDLE_RUNTIME_LOG_TAIL_LINES,
+            )
+            .ok()
+            .map(|tail| (source, tail))
+        });
+    let source_manifest = service_sources
+        .iter()
+        .map(|source| {
+            json!({
+                "source": source.source.as_str(),
+                "kind": "service_file",
+                "available": source.path.as_path().is_file(),
+                "path_sha256": sha256_hex(source.path.to_string_lossy().as_bytes()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (status, selected_source, tail) = if let Some((source, tail)) = selected {
+        (
+            "available",
+            json!({
+                "source": source.source.as_str(),
+                "kind": "service_file",
+                "path_sha256": sha256_hex(source.path.to_string_lossy().as_bytes()),
+            }),
+            tail,
+        )
+    } else {
+        ("journal_metadata_only", Value::Null, Vec::new())
+    };
+
+    json!({
+        "schema_version": 1,
+        "generated_at_unix_ms": generated_at_unix_ms,
+        "status": status,
+        "tail_command": "palyra logs --lines 50",
+        "jsonl_contract": {
+            "encoding": "jsonl",
+            "correlation_fields": ["run_id", "session_id", "tool_call_id", "trace_id"],
+            "redaction": "strict_before_write",
+            "support_bundle_tail_lines": SUPPORT_BUNDLE_RUNTIME_LOG_TAIL_LINES,
+        },
+        "rolling_policy": {
+            "mode": "bounded_tail_snapshot",
+            "rotation_owner": "journal_or_service_runtime",
+            "support_bundle_never_embeds_raw_paths": true,
+            "support_bundle_never_embeds_unredacted_lines": true,
+        },
+        "journal_source": {
+            "available": journal.available,
+            "hash_chain_enabled": journal.hash_chain_enabled,
+            "db_path_sha256": sha256_hex(journal.db_path.as_bytes()),
+            "latest_hash_present": journal.latest_hash.is_some(),
+        },
+        "service_sources": source_manifest,
+        "selected_source": selected_source,
+        "tail": tail,
+    })
+}
+
+struct SupportBundleRuntimeLogSource {
+    source: String,
+    path: PathBuf,
+}
+
+fn support_bundle_service_log_sources() -> Vec<SupportBundleRuntimeLogSource> {
+    let Some(root_context) = app::current_root_context() else {
+        return Vec::new();
+    };
+    let Ok(metadata) = support::service::load_service_metadata(root_context.state_root()) else {
+        return Vec::new();
+    };
+    let Some(metadata) = metadata else {
+        return Vec::new();
+    };
+    vec![
+        SupportBundleRuntimeLogSource {
+            source: "service.stdout".to_owned(),
+            path: PathBuf::from(metadata.stdout_log_path),
+        },
+        SupportBundleRuntimeLogSource {
+            source: "service.stderr".to_owned(),
+            path: PathBuf::from(metadata.stderr_log_path),
+        },
+    ]
+}
+
+fn read_support_bundle_runtime_log_tail(
+    source: &str,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<Value>> {
+    let limit = limit.clamp(1, SUPPORT_BUNDLE_RUNTIME_LOG_TAIL_LINES);
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut records = VecDeque::with_capacity(limit);
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed to read log file {}", path.display()))?;
+        if records.len() == limit {
+            records.pop_front();
+        }
+        records.push_back(json!({
+            "source": source,
+            "line_number": index + 1,
+            "message": truncate_utf8_chars(
+                sanitize_diagnostic_error(line.as_str()).as_str(),
+                SUPPORT_BUNDLE_RUNTIME_LOG_MAX_LINE_CHARS,
+            ),
+        }));
+    }
+    Ok(records.into_iter().collect())
 }
 
 fn support_json_u64(root: Option<&Value>, pointers: &[&str]) -> u64 {
@@ -12705,6 +12832,7 @@ struct SupportBundleRuntimeSnapshot {
     policy_health: Value,
     doctor_findings: Value,
     diagnostics_timeline: Value,
+    runtime_logs: Value,
     trace_export: Value,
     redaction: Value,
     truncation: Value,
@@ -14624,13 +14752,14 @@ mod diagnostics_bundle_tests {
         connector_db_path_from_journal_path, encode_support_bundle_with_cap,
         extract_support_bundle_error_message, read_recent_support_bundle_recall_artifacts,
         read_support_bundle_channel_delivery, read_support_bundle_flow_timeline,
-        redacted_config_summary, unavailable_support_bundle_channel_delivery,
-        unavailable_support_bundle_queue_state, unavailable_support_bundle_recall_artifacts,
-        DoctorAccessSnapshot, DoctorBrowserSnapshot, DoctorConfigSnapshot, DoctorConnectivityProbe,
-        DoctorConnectivitySnapshot, DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot,
-        DoctorFeatureRolloutsSnapshot, DoctorIdentitySnapshot, DoctorProviderAuthSnapshot,
-        DoctorReport, DoctorSandboxSnapshot, DoctorSummary, SkillsInventorySnapshot, SupportBundle,
-        SupportBundleBuildSnapshot, SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
+        read_support_bundle_runtime_log_tail, redacted_config_summary,
+        unavailable_support_bundle_channel_delivery, unavailable_support_bundle_queue_state,
+        unavailable_support_bundle_recall_artifacts, DoctorAccessSnapshot, DoctorBrowserSnapshot,
+        DoctorConfigSnapshot, DoctorConnectivityProbe, DoctorConnectivitySnapshot,
+        DoctorDeploymentBindSnapshot, DoctorDeploymentSnapshot, DoctorFeatureRolloutsSnapshot,
+        DoctorIdentitySnapshot, DoctorProviderAuthSnapshot, DoctorReport, DoctorSandboxSnapshot,
+        DoctorSummary, SkillsInventorySnapshot, SupportBundle, SupportBundleBuildSnapshot,
+        SupportBundleConfigSnapshot, SupportBundleDiagnosticsSnapshot,
         SupportBundleFlowTimelineSnapshot, SupportBundleJournalErrorRecord,
         SupportBundleJournalSnapshot, SupportBundleObservabilitySnapshot,
         SupportBundleReplaySnapshot, SupportBundleRuntimeSnapshot,
@@ -15003,6 +15132,11 @@ mod diagnostics_bundle_tests {
                     "state": "not_available",
                     "source": "PALYRA_DIAGNOSTICS_TIMELINE_PATH",
                 }),
+                runtime_logs: json!({
+                    "schema_version": 1,
+                    "status": "journal_metadata_only",
+                    "tail_command": "palyra logs --lines 50",
+                }),
                 trace_export: json!({
                     "state": "contract_only",
                     "default_exporter": "jsonl",
@@ -15123,6 +15257,27 @@ mod diagnostics_bundle_tests {
                 && !extracted.contains("qwerty"),
             "extracted error message must not leak raw secret values: {extracted}"
         );
+    }
+
+    #[test]
+    fn support_bundle_runtime_log_tail_is_bounded_and_redacted() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let log_path = tempdir.path().join("palyrad.service.stderr.log");
+        std::fs::write(
+            log_path.as_path(),
+            "first line\nsecond token=abc123\nthird authorization=Bearer raw\n",
+        )
+        .expect("log file should be writable");
+
+        let records = read_support_bundle_runtime_log_tail("service.stderr", log_path.as_path(), 2)
+            .expect("log tail should be readable");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["line_number"], json!(2));
+        let encoded = serde_json::to_string(&records).expect("tail records should serialize");
+        assert!(encoded.contains("service.stderr"));
+        assert!(!encoded.contains("abc123"));
+        assert!(!encoded.contains("Bearer raw"));
+        assert!(encoded.contains("<redacted>"));
     }
 
     #[test]

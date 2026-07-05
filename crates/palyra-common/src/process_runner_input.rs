@@ -41,6 +41,51 @@ impl BackgroundLifetimeMode {
     }
 }
 
+/// Stream selector for process readiness/watch pattern matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessWatchStream {
+    /// Scan stdout and stderr tails.
+    #[default]
+    Both,
+    /// Scan stdout only.
+    Stdout,
+    /// Scan stderr only.
+    Stderr,
+}
+
+impl ProcessWatchStream {
+    /// Returns the stable JSON label used in audit payloads.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// Bounded readiness/completion watch pattern requested for a background process.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessWatchPattern {
+    pub name: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub stream: ProcessWatchStream,
+    #[serde(default)]
+    pub notify_once: bool,
+}
+
+/// Audit-safe mapping for model-facing process execution facades.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRunnerFacadeMapping {
+    pub original_tool_name: String,
+    pub canonical_tool_name: String,
+}
+
 /// Canonical input payload for `palyra.process.run`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +106,10 @@ pub struct ProcessRunnerToolInput {
     #[serde(default)]
     pub background: bool,
     #[serde(default)]
+    pub notify_on_complete: bool,
+    #[serde(default)]
+    pub watch_patterns: Vec<ProcessWatchPattern>,
+    #[serde(default)]
     pub interactive: bool,
     #[serde(default)]
     pub stdin: bool,
@@ -72,6 +121,12 @@ pub struct ProcessRunnerToolInput {
     pub lifetime_mode: BackgroundLifetimeMode,
     #[serde(default)]
     pub keep_running_after_run: bool,
+    #[serde(default)]
+    pub env_profile_id: Option<String>,
+    #[serde(default)]
+    pub elevated_intent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facade_mapping: Option<ProcessRunnerFacadeMapping>,
 }
 
 impl ProcessRunnerToolInput {
@@ -257,6 +312,31 @@ mod tests {
             .expect("valid background lifetime mode should parse");
 
         assert_eq!(parsed.effective_lifetime_mode(), BackgroundLifetimeMode::UntilVerifier);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_notifications_and_watch_patterns() {
+        let input = br#"{"command":"npm","args":["run","dev"],"background":true,"notify_on_complete":true,"watch_patterns":[{"name":"vite_ready","pattern":"Local:","stream":"stdout","notify_once":true}],"env_profile_id":"web-dev","elevated_intent":false}"#;
+        let parsed = parse_process_runner_tool_input(input)
+            .expect("valid notification payload should parse");
+
+        assert!(parsed.notify_on_complete);
+        assert_eq!(parsed.watch_patterns.len(), 1);
+        assert_eq!(parsed.watch_patterns[0].name, "vite_ready");
+        assert_eq!(parsed.watch_patterns[0].stream.as_str(), "stdout");
+        assert_eq!(parsed.env_profile_id.as_deref(), Some("web-dev"));
+        assert!(!parsed.elevated_intent);
+    }
+
+    #[test]
+    fn parse_process_runner_tool_input_accepts_facade_mapping() {
+        let input = br#"{"command":"pwd","facade_mapping":{"original_tool_name":"palyra.exec.run","canonical_tool_name":"palyra.process.run"}}"#;
+        let parsed =
+            parse_process_runner_tool_input(input).expect("valid facade mapping should parse");
+
+        let mapping = parsed.facade_mapping.expect("facade mapping should be preserved");
+        assert_eq!(mapping.original_tool_name, "palyra.exec.run");
+        assert_eq!(mapping.canonical_tool_name, "palyra.process.run");
     }
 
     #[test]

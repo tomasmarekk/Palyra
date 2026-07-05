@@ -65,15 +65,15 @@ use super::{
     has_windows_absolute_path_prefix, ingest_memory_best_effort,
     matching_tool_approval_response_id, process_run_verification_output_summary,
     process_runner_input_should_use_active_root, process_runner_input_should_use_launch_root,
-    process_runner_input_with_path_env, process_runner_tool_config_for_session,
-    process_runner_workspace_root_for_input, process_runner_workspace_roots_within_configured_root,
-    resolve_cron_job_channel_for_create, tool_approval_response_proposal_id,
-    verification_status_from_tool_outcome, workspace_patch_metrics_from_output,
-    CachedMemorySearchEntry, GatewayAuthConfig, GatewayJournalConfigSnapshot,
-    GatewayRuntimeConfigSnapshot, GatewayRuntimeState, MemoryRuntimeConfig, ProviderRequest,
-    RequestContext, ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS,
-    CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL,
-    MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
+    process_runner_input_with_facade_mapping, process_runner_input_with_path_env,
+    process_runner_tool_config_for_session, process_runner_workspace_root_for_input,
+    process_runner_workspace_roots_within_configured_root, resolve_cron_job_channel_for_create,
+    tool_approval_response_proposal_id, verification_status_from_tool_outcome,
+    workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
+    GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
+    MemoryRuntimeConfig, ProviderRequest, RequestContext, ToolApprovalOutcome,
+    APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL,
+    HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
     VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
 use crate::application::run_stream::orchestration::{
@@ -566,6 +566,30 @@ fn process_runner_input_inherits_launch_path_env_when_missing() {
     assert_eq!(
         parsed.env.get("PALYRA_E2E_OS_ROOT").map(String::as_str),
         Some(e2e_os_root.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn process_runner_exec_facade_adds_canonical_mapping() {
+    let normalized = process_runner_input_with_facade_mapping(
+        super::PROCESS_RUNNER_ALIAS_TOOL_NAME,
+        br#"{"command":"pwd"}"#,
+    )
+    .expect("exec facade should inject canonical mapping");
+    let parsed =
+        palyra_common::process_runner_input::parse_process_runner_tool_input(normalized.as_slice())
+            .expect("normalized process input should parse");
+
+    let mapping = parsed.facade_mapping.expect("facade mapping should be present");
+    assert_eq!(mapping.original_tool_name, super::PROCESS_RUNNER_ALIAS_TOOL_NAME);
+    assert_eq!(mapping.canonical_tool_name, super::PROCESS_RUNNER_TOOL_NAME);
+    assert!(
+        process_runner_input_with_facade_mapping(
+            super::PROCESS_RUNNER_TOOL_NAME,
+            br#"{"command":"pwd"}"#
+        )
+        .is_none(),
+        "canonical process runner input should not gain facade metadata"
     );
 }
 

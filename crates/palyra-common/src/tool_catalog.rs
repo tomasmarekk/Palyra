@@ -299,7 +299,8 @@ impl ToolCatalogExposureMode {
 /// `disabled_tools` is applied last and therefore wins over profile, explicit,
 /// and extra grants. `palyra.process.run` expands to its lifecycle/input
 /// companions before disables are applied so operators can still remove a
-/// companion by name.
+/// companion by name. `palyra.exec.run` is a model-facing compatibility
+/// facade for the same process runner and expands identically.
 ///
 /// # Errors
 /// Returns [`ToolsetProfileError`] when a profile name is not built in.
@@ -380,7 +381,13 @@ fn push_effective_tool(tool: &str, tools: &mut Vec<String>, seen: &mut BTreeSet<
     if tool.is_empty() {
         return;
     }
-    if tool == "palyra.process.run" {
+    if matches!(tool.as_str(), "palyra.process.run" | "palyra.exec.run") {
+        if seen.insert("palyra.process.run".to_owned()) {
+            tools.push("palyra.process.run".to_owned());
+        }
+        if seen.insert("palyra.exec.run".to_owned()) {
+            tools.push("palyra.exec.run".to_owned());
+        }
         for companion in [
             "palyra.process.input",
             "palyra.process.send_keys",
@@ -466,6 +473,7 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             default_sensitive: true,
         }),
         "palyra.process.run"
+        | "palyra.exec.run"
         | "palyra.process.input"
         | "palyra.process.send_keys"
         | "palyra.process.stop"
@@ -641,6 +649,8 @@ mod tests {
     fn process_runner_is_approval_required() {
         assert!(tool_requires_approval("palyra.process.run"));
         assert_eq!(tool_policy_capability_names("palyra.process.run"), vec!["process_exec"]);
+        assert!(tool_requires_approval("palyra.exec.run"));
+        assert_eq!(tool_policy_capability_names("palyra.exec.run"), vec!["process_exec"]);
         assert!(tool_requires_approval("palyra.process.input"));
         assert_eq!(tool_policy_capability_names("palyra.process.input"), vec!["process_exec"]);
         assert!(tool_requires_approval("palyra.process.send_keys"));
@@ -687,6 +697,7 @@ mod tests {
         assert_eq!(report.profiles, vec!["code"]);
         assert!(report.effective_allowed_tools.contains(&"palyra.fs.apply_patch".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.run".to_owned()));
+        assert!(report.effective_allowed_tools.contains(&"palyra.exec.run".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.input".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.send_keys".to_owned()));
         assert!(!report.effective_allowed_tools.contains(&"palyra.process.status".to_owned()));

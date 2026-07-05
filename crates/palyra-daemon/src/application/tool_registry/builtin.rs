@@ -983,6 +983,37 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
                         }),
                     ),
                     (
+                        "notify_on_complete",
+                        json!({"type":"boolean","description":"Request an exactly-once completion notification for this process. Background runs return a subscription state and foreground runs return delivered completion metadata; watch-pattern spam degrades to completion-only."}),
+                    ),
+                    (
+                        "watch_patterns",
+                        json!({
+                            "type":"array",
+                            "maxItems":8,
+                            "description":"Optional bounded readiness/completion watch patterns scanned against bounded stdout/stderr tails. Raw pattern values are not returned in tool output; audit payloads expose only pattern hashes and match counts.",
+                            "items":{
+                                "type":"object",
+                                "properties":{
+                                    "name":{"type":"string","maxLength":64,"description":"Stable ASCII identifier for the watch pattern."},
+                                    "pattern":{"type":"string","maxLength":256,"description":"Literal text to match in the selected process output stream."},
+                                    "stream":{"type":"string","enum":["both","stdout","stderr"],"description":"Output stream to scan; defaults to both."},
+                                    "notify_once":{"type":"boolean","description":"When true, the runtime reports at most one readiness notification for this pattern and suppresses spammy repeated matches."}
+                                },
+                                "required":["name","pattern"],
+                                "additionalProperties":false
+                            }
+                        }),
+                    ),
+                    (
+                        "env_profile_id",
+                        json!({"type":"string","maxLength":128,"description":"Optional explicit child-process environment profile identifier. The daemon process environment is not inherited as a profile; provide env values or vault refs through explicit runtime surfaces only."}),
+                    ),
+                    (
+                        "elevated_intent",
+                        json!({"type":"boolean","description":"Set true only when the user explicitly requested a privileged command. Known sudo/su/doas/runas/pkexec intent is rejected without this flag so approval and audit records show the elevated posture."}),
+                    ),
+                    (
                         "interactive",
                         json!({"type":"boolean","description":"Compatibility flag for requesting a stdin-capable background handle. Requires background=true and never implies PTY."}),
                     ),
@@ -1227,6 +1258,20 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
         ),
     ];
 
+    if let Some(process_run_schema) = entries
+        .iter()
+        .find(|entry| entry.name == "palyra.process.run")
+        .map(|entry| entry.input_schema.clone())
+    {
+        entries.push(entry(
+            "palyra.exec.run",
+            "Compatibility facade for palyra.process.run. Use the same input schema and execution path; audit output records the original facade and canonical process runner target.",
+            process_run_schema,
+            ToolParallelismPolicy::Exclusive,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ));
+    }
+
     for browser_tool in browser_tool_names() {
         // Session lifecycle results are tiny and safe to inline; every other
         // browser tool can return page-derived content, so results go through
@@ -1335,6 +1380,7 @@ fn has_external_side_effect_family(name: &str) -> bool {
             | "palyra.browser.tabs.open"
             | "palyra.browser.tabs.close"
             | "palyra.process.run"
+            | "palyra.exec.run"
             | "palyra.process.input"
             | "palyra.process.send_keys"
             | "palyra.process.stop"
@@ -1912,6 +1958,30 @@ mod tests {
         assert!(background_description.contains("startup stdout/stderr snapshots"));
         assert!(background_description.contains("selected dynamic port"));
         assert!(background_description.contains("operator-configured tool execution timeout"));
+
+        let notify_description = entry
+            .input_schema
+            .pointer("/properties/notify_on_complete/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("notify_on_complete description should be visible to models");
+        assert!(notify_description.contains("exactly-once completion"));
+        let watch_schema = entry
+            .input_schema
+            .pointer("/properties/watch_patterns/items/properties/pattern")
+            .expect("watch pattern schema should be visible to models");
+        assert_eq!(watch_schema.get("maxLength").and_then(serde_json::Value::as_u64), Some(256));
+        let elevated_description = entry
+            .input_schema
+            .pointer("/properties/elevated_intent/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("elevated_intent description should be visible to models");
+        assert!(elevated_description.contains("sudo"));
+        let exec = registry_entry("palyra.exec.run").expect("process facade entry exists");
+        assert_eq!(exec.input_schema, entry.input_schema);
+        assert_eq!(exec.schema_hash, entry.schema_hash);
+        assert_eq!(exec.capabilities, entry.capabilities);
+        assert_eq!(exec.approval_posture, entry.approval_posture);
+        assert_eq!(exec.replay_safety_class, entry.replay_safety_class);
 
         let pty_description = entry
             .input_schema
