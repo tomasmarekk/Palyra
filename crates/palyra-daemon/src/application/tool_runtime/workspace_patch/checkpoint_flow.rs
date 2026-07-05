@@ -404,6 +404,14 @@ pub(super) async fn execute_workspace_patch_mutation(
     .await;
     code_intel::append_diagnostics_output(&mut output_value, diagnostic_delta.clone());
     code_intel::append_runtime_output(&mut output_value, &code_intel_runtime.snapshot);
+    code_intel::append_patch_impact_output(
+        &mut output_value,
+        workspace_roots,
+        outcome.files_touched.as_slice(),
+        &diagnostic_baseline,
+        &diagnostic_after,
+        &diagnostic_delta,
+    );
     let mut project_facts_snapshot = None;
     let mut verification_states = Vec::new();
     if let Some(project_facts) = capture_project_facts_for_coding_posture(

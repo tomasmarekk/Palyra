@@ -234,6 +234,14 @@ pub(crate) const WORKSPACE_READ_FILE_TOOL_NAME: &str = "palyra.fs.read_file";
 pub(crate) const WORKSPACE_LIST_DIR_TOOL_NAME: &str = "palyra.fs.list_dir";
 pub(crate) const WORKSPACE_SEARCH_TOOL_NAME: &str = "palyra.fs.search";
 pub(crate) const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
+pub(crate) const CODE_DIAGNOSTICS_TOOL_NAME: &str = "palyra.code.diagnostics";
+pub(crate) const CODE_SYMBOLS_TOOL_NAME: &str = "palyra.code.symbols";
+pub(crate) const CODE_DEFINITION_TOOL_NAME: &str = "palyra.code.definition";
+pub(crate) const CODE_REFERENCES_TOOL_NAME: &str = "palyra.code.references";
+pub(crate) const CODE_HOVER_TOOL_NAME: &str = "palyra.code.hover";
+pub(crate) const CODE_WORKSPACE_SYMBOLS_TOOL_NAME: &str = "palyra.code.workspace_symbols";
+pub(crate) const CODE_OUTLINE_TOOL_NAME: &str = "palyra.code.outline";
+pub(crate) const CODE_HEALTH_TOOL_NAME: &str = "palyra.code.health";
 pub(crate) const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
 pub(crate) const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
 pub(crate) const PROCESS_RUNNER_ALIAS_TOOL_NAME: &str = "palyra.exec.run";
@@ -278,6 +286,20 @@ pub(crate) const BROWSER_DOWNLOADS_GET_TOOL_NAME: &str = "palyra.browser.downloa
 
 fn is_process_runner_run_tool(tool_name: &str) -> bool {
     matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
+}
+
+fn is_code_intel_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        CODE_DIAGNOSTICS_TOOL_NAME
+            | CODE_SYMBOLS_TOOL_NAME
+            | CODE_DEFINITION_TOOL_NAME
+            | CODE_REFERENCES_TOOL_NAME
+            | CODE_HOVER_TOOL_NAME
+            | CODE_WORKSPACE_SYMBOLS_TOOL_NAME
+            | CODE_OUTLINE_TOOL_NAME
+            | CODE_HEALTH_TOOL_NAME
+    )
 }
 
 mod approvals;
@@ -990,6 +1012,15 @@ pub(crate) async fn execute_tool_with_runtime_dispatch_with_cancellation_and_pro
             runtime_state,
             context,
             proposal_id,
+            input_json,
+        )
+        .await
+    } else if is_code_intel_tool(tool_name) {
+        crate::application::tool_runtime::code_intel::execute_code_intel_tool(
+            runtime_state,
+            context,
+            proposal_id,
+            tool_name,
             input_json,
         )
         .await

@@ -79,9 +79,11 @@ impl CodeIntelLanguage {
 pub(crate) enum CodeIntelProviderProbeStatus {
     Disabled,
     Skipped,
+    Restarting,
     Ready,
     MissingBinary,
     Degraded,
+    Failed,
     Unknown,
 }
 
@@ -90,9 +92,11 @@ impl CodeIntelProviderProbeStatus {
         match raw.trim().to_ascii_lowercase().as_str() {
             "disabled" => Self::Disabled,
             "skipped" => Self::Skipped,
+            "restarting" => Self::Restarting,
             "ready" => Self::Ready,
             "missing_binary" => Self::MissingBinary,
             "degraded" => Self::Degraded,
+            "failed" => Self::Failed,
             _ => Self::Unknown,
         }
     }
@@ -101,9 +105,11 @@ impl CodeIntelProviderProbeStatus {
         match self {
             Self::Disabled => LspClientLifecycleStatus::Disabled,
             Self::Skipped => LspClientLifecycleStatus::Skipped,
+            Self::Restarting => LspClientLifecycleStatus::Restarting,
             Self::Ready => LspClientLifecycleStatus::Ready,
             Self::MissingBinary => LspClientLifecycleStatus::MissingBinary,
             Self::Degraded | Self::Unknown => LspClientLifecycleStatus::Degraded,
+            Self::Failed => LspClientLifecycleStatus::Failed,
         }
     }
 }
@@ -168,17 +174,22 @@ pub(crate) enum LspClientLifecycleStatus {
     Ready,
     MissingBinary,
     Degraded,
+    Restarting,
+    Failed,
     BrokenCached,
     Stopped,
 }
 
 impl LspClientLifecycleStatus {
     const fn is_degraded(self) -> bool {
-        matches!(self, Self::MissingBinary | Self::Degraded | Self::BrokenCached)
+        matches!(self, Self::MissingBinary | Self::Degraded | Self::Failed | Self::BrokenCached)
     }
 
     const fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Ready | Self::Degraded | Self::BrokenCached)
+        matches!(
+            self,
+            Self::Starting | Self::Ready | Self::Degraded | Self::Restarting | Self::BrokenCached
+        )
     }
 }
 
@@ -197,6 +208,8 @@ pub(crate) struct LspServerHandle {
     pub(crate) started_at_unix_ms: Option<i64>,
     pub(crate) last_used_at_unix_ms: Option<i64>,
     pub(crate) degraded_at_unix_ms: Option<i64>,
+    pub(crate) crash_count: u32,
+    pub(crate) last_diagnostics_refresh_unix_ms: Option<i64>,
     pub(crate) timeout_ms: u64,
     pub(crate) idle_reap_ms: u64,
     pub(crate) redaction_level: String,
@@ -357,6 +370,8 @@ impl CodeIntelRuntime {
                 started_at_unix_ms: started_at(previous.as_ref(), status, request.now_unix_ms),
                 last_used_at_unix_ms: status.is_active().then_some(request.now_unix_ms),
                 degraded_at_unix_ms: status.is_degraded().then_some(request.now_unix_ms),
+                crash_count: crash_count(previous.as_ref(), observation, status),
+                last_diagnostics_refresh_unix_ms: Some(request.now_unix_ms),
                 timeout_ms: request.timeout_ms,
                 idle_reap_ms: request.idle_reap_ms,
                 redaction_level: CODE_INTEL_REDACTION_LEVEL.to_owned(),
@@ -563,6 +578,28 @@ fn started_at(
         .or_else(|| status.is_active().then_some(now_unix_ms))
 }
 
+fn crash_count(
+    previous: Option<&LspServerHandle>,
+    observation: &CodeIntelProviderObservation,
+    status: LspClientLifecycleStatus,
+) -> u32 {
+    let previous_count = previous.map(|handle| handle.crash_count).unwrap_or(0);
+    if status == LspClientLifecycleStatus::Failed || provider_status_looks_crash_like(observation) {
+        previous_count.saturating_add(1)
+    } else {
+        previous_count
+    }
+}
+
+fn provider_status_looks_crash_like(observation: &CodeIntelProviderObservation) -> bool {
+    matches!(
+        observation.status,
+        CodeIntelProviderProbeStatus::Failed | CodeIntelProviderProbeStatus::Restarting
+    ) || observation.reason_code.contains("spawn_failed")
+        || observation.reason_code.contains("pipe_failed")
+        || observation.reason_code.contains("timeout")
+}
+
 fn lifecycle_reason_code(
     key: &CodeIntelClientKey,
     observation: &CodeIntelProviderObservation,
@@ -717,6 +754,8 @@ mod tests {
         assert_eq!(decoded.status, CodeIntelRuntimeStatus::Healthy);
         assert_eq!(decoded.clients[0].status, LspClientLifecycleStatus::Ready);
         assert_eq!(decoded.clients[0].binary_label, "rust-analyzer");
+        assert_eq!(decoded.clients[0].crash_count, 0);
+        assert_eq!(decoded.clients[0].last_diagnostics_refresh_unix_ms, Some(100));
         assert_eq!(decoded.redaction_level, CODE_INTEL_REDACTION_LEVEL);
         assert!(decoded
             .journal_events
@@ -761,6 +800,29 @@ mod tests {
         assert_eq!(outcome.snapshot.status, CodeIntelRuntimeStatus::Degraded);
         assert_eq!(outcome.audit_events[0].event_type, CODE_INTEL_PROVIDER_DEGRADED_EVENT);
         assert_eq!(outcome.snapshot.clients[0].status, LspClientLifecycleStatus::MissingBinary);
+    }
+
+    #[test]
+    fn crash_like_provider_observation_increments_crash_count() {
+        let mut runtime = CodeIntelRuntime::new();
+        let observations = vec![observation(
+            CodeIntelLanguage::Rust,
+            "degraded",
+            "code_intel.rust.cargo_check_timeout",
+        )];
+        let outcome = runtime.observe(CodeIntelRuntimeObservationRequest {
+            enabled: true,
+            workspace_root: Some("workspace"),
+            observations: observations.as_slice(),
+            timeout_ms: 2_000,
+            idle_reap_ms: 60_000,
+            now_unix_ms: 100,
+            evidence_refs: &["mutation:1".to_owned()],
+        });
+
+        assert_eq!(outcome.snapshot.clients[0].status, LspClientLifecycleStatus::Degraded);
+        assert_eq!(outcome.snapshot.clients[0].crash_count, 1);
+        assert_eq!(outcome.snapshot.clients[0].last_diagnostics_refresh_unix_ms, Some(100));
     }
 
     #[test]

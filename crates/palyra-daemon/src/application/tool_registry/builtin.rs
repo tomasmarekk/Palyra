@@ -663,6 +663,138 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.code.health",
+            "Inspect read-only code-intelligence provider lifecycle, capabilities, degraded repair hints, and runtime cwd hints for the current workspace.",
+            object_schema(
+                &[],
+                vec![(
+                    "workspace_root",
+                    json!({"type":"string","description":"Optional existing workspace subdirectory to inspect. Omit for the active workspace root."}),
+                )],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.diagnostics",
+            "Return bounded code diagnostics and code-intelligence runtime status for a workspace file or the current workspace health scope.",
+            object_schema(
+                &[],
+                vec![
+                    (
+                        "path",
+                        json!({"type":"string","description":"Optional workspace-relative source file path. When omitted, provider health is returned without running file-specific diagnostics."}),
+                    ),
+                    (
+                        "workspace_root",
+                        json!({"type":"string","description":"Optional existing workspace subdirectory to treat as the diagnostics root."}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.symbols",
+            "List bounded lexical symbols for one Rust, TypeScript, JavaScript, or Python file; use this before edits that depend on code structure.",
+            object_schema(
+                &["path"],
+                vec![
+                    ("path", json!({"type":"string"})),
+                    ("workspace_root", json!({"type":"string"})),
+                    ("max_results", json!({"type":"integer","minimum":1,"maximum":200})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.definition",
+            "Find bounded symbol definitions by name, or by a source position when path, line, and column are provided.",
+            object_schema(
+                &[],
+                vec![
+                    ("symbol", json!({"type":"string","maxLength":256})),
+                    ("path", json!({"type":"string"})),
+                    ("line", json!({"type":"integer","minimum":1})),
+                    ("column", json!({"type":"integer","minimum":1})),
+                    ("workspace_root", json!({"type":"string"})),
+                    ("max_results", json!({"type":"integer","minimum":1,"maximum":200})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.references",
+            "Find bounded lexical references for a symbol across the current workspace root.",
+            object_schema(
+                &[],
+                vec![
+                    ("symbol", json!({"type":"string","maxLength":256})),
+                    ("path", json!({"type":"string"})),
+                    ("line", json!({"type":"integer","minimum":1})),
+                    ("column", json!({"type":"integer","minimum":1})),
+                    ("workspace_root", json!({"type":"string"})),
+                    ("max_results", json!({"type":"integer","minimum":1,"maximum":200})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.hover",
+            "Return a bounded symbol summary for one source file position or named symbol.",
+            object_schema(
+                &["path"],
+                vec![
+                    ("path", json!({"type":"string"})),
+                    ("symbol", json!({"type":"string","maxLength":256})),
+                    ("line", json!({"type":"integer","minimum":1})),
+                    ("column", json!({"type":"integer","minimum":1})),
+                    ("workspace_root", json!({"type":"string"})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.workspace_symbols",
+            "Search bounded lexical symbols by name across the current workspace root.",
+            object_schema(
+                &["query"],
+                vec![
+                    ("query", json!({"type":"string","maxLength":256})),
+                    ("workspace_root", json!({"type":"string"})),
+                    ("max_results", json!({"type":"integer","minimum":1,"maximum":200})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.code.outline",
+            "Return a bounded source outline for one Rust, TypeScript, JavaScript, or Python file.",
+            object_schema(
+                &["path"],
+                vec![
+                    ("path", json!({"type":"string"})),
+                    ("workspace_root", json!({"type":"string"})),
+                    ("max_results", json!({"type":"integer","minimum":1,"maximum":200})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
             "palyra.fs.os_file",
             "Perform an audited file operation on an absolute user-owned OS path. Use this for requested files outside the workspace, such as Downloads, user config files, configured local test harness OS roots, or user-cache cleanup. Protected system paths are denied, and paths are limited to workspace roots plus the runtime-approved OS roots. For small edits to files inside a workspace, prefer palyra.fs.apply_patch; os_file write is a full-file replacement surface.",
             object_schema(
@@ -1841,6 +1973,32 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("since_unix_ms should explain its boundary usage");
         assert!(description.contains("click/reload/action boundary"));
+    }
+
+    #[test]
+    fn code_intel_registry_exposes_read_only_symbol_tools() {
+        let health = registry_entry("palyra.code.health").expect("code health entry exists");
+        assert_eq!(health.approval_posture, ToolApprovalPosture::Safe);
+        assert_eq!(health.parallelism_policy, ToolParallelismPolicy::ReadOnly);
+        assert!(health.capabilities.iter().any(|capability| capability == "filesystem_read"));
+
+        let symbols = registry_entry("palyra.code.symbols").expect("code symbols entry exists");
+        assert_eq!(
+            symbols.input_schema.pointer("/required/0").and_then(serde_json::Value::as_str),
+            Some("path")
+        );
+        assert!(symbols.input_schema.pointer("/properties/max_results").is_some());
+
+        let workspace_symbols = registry_entry("palyra.code.workspace_symbols")
+            .expect("workspace symbols entry exists");
+        assert_eq!(
+            workspace_symbols
+                .input_schema
+                .pointer("/required/0")
+                .and_then(serde_json::Value::as_str),
+            Some("query")
+        );
+        assert_eq!(workspace_symbols.approval_posture, ToolApprovalPosture::Safe);
     }
 
     #[test]

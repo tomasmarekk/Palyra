@@ -173,6 +173,14 @@ const CODE_PROFILE_TOOLS: &[&str] = &[
     "palyra.fs.read_file",
     "palyra.fs.list_dir",
     "palyra.fs.search",
+    "palyra.code.health",
+    "palyra.code.diagnostics",
+    "palyra.code.symbols",
+    "palyra.code.definition",
+    "palyra.code.references",
+    "palyra.code.hover",
+    "palyra.code.workspace_symbols",
+    "palyra.code.outline",
     "palyra.fs.apply_patch",
     "palyra.process.run",
 ];
@@ -497,6 +505,17 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             capabilities: WORKSPACE_FILE_READ_CAPABILITIES,
             default_sensitive: false,
         }),
+        "palyra.code.health"
+        | "palyra.code.diagnostics"
+        | "palyra.code.symbols"
+        | "palyra.code.definition"
+        | "palyra.code.references"
+        | "palyra.code.hover"
+        | "palyra.code.workspace_symbols"
+        | "palyra.code.outline" => Some(ToolMetadata {
+            capabilities: WORKSPACE_FILE_READ_CAPABILITIES,
+            default_sensitive: false,
+        }),
         "palyra.fs.apply_patch" => Some(ToolMetadata {
             capabilities: WORKSPACE_PATCH_CAPABILITIES,
             default_sensitive: true,
@@ -696,6 +715,10 @@ mod tests {
 
         assert_eq!(report.profiles, vec!["code"]);
         assert!(report.effective_allowed_tools.contains(&"palyra.fs.apply_patch".to_owned()));
+        assert!(report.effective_allowed_tools.contains(&"palyra.code.health".to_owned()));
+        assert!(report
+            .effective_allowed_tools
+            .contains(&"palyra.code.workspace_symbols".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.run".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.exec.run".to_owned()));
         assert!(report.effective_allowed_tools.contains(&"palyra.process.input".to_owned()));
@@ -730,7 +753,19 @@ mod tests {
 
     #[test]
     fn workspace_read_tools_are_not_approval_required_by_default() {
-        for tool_name in ["palyra.fs.read_file", "palyra.fs.list_dir", "palyra.fs.search"] {
+        for tool_name in [
+            "palyra.fs.read_file",
+            "palyra.fs.list_dir",
+            "palyra.fs.search",
+            "palyra.code.health",
+            "palyra.code.diagnostics",
+            "palyra.code.symbols",
+            "palyra.code.definition",
+            "palyra.code.references",
+            "palyra.code.hover",
+            "palyra.code.workspace_symbols",
+            "palyra.code.outline",
+        ] {
             assert!(!tool_requires_approval(tool_name), "{tool_name} should be read-only");
             assert_eq!(tool_policy_capability_names(tool_name), vec!["filesystem_read"]);
         }

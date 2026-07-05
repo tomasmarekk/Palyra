@@ -46,9 +46,23 @@ use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPlu
 
 const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
 const PROCESS_RUNNER_ALIAS_TOOL_NAME: &str = "palyra.exec.run";
+const CODE_INTEL_TOOL_NAMES: &[&str] = &[
+    "palyra.code.diagnostics",
+    "palyra.code.symbols",
+    "palyra.code.definition",
+    "palyra.code.references",
+    "palyra.code.hover",
+    "palyra.code.workspace_symbols",
+    "palyra.code.outline",
+    "palyra.code.health",
+];
 
 fn is_process_runner_run_tool(tool_name: &str) -> bool {
     matches!(tool_name, PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME)
+}
+
+fn is_code_intel_tool(tool_name: &str) -> bool {
+    CODE_INTEL_TOOL_NAMES.contains(&tool_name)
 }
 
 /// Tool execution policy: the allowlist, timeout, and the sandbox/wasm runner
@@ -292,6 +306,7 @@ const MAX_WORKSPACE_READ_FILE_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACE_LIST_DIR_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACE_SEARCH_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_WORKSPACE_PATCH_TOOL_INPUT_BYTES: usize = 256 * 1024;
+const MAX_CODE_INTEL_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_OS_FILE_TOOL_INPUT_BYTES: usize = 384 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
@@ -784,6 +799,9 @@ fn tool_failure_recovery_hint(tool_name: &str, error: &str, timed_out: bool) -> 
         "palyra.fs.apply_patch" => {
             "Inspect the patch error, read the current file when context is stale, and retry with a smaller complete patch.".to_owned()
         }
+        tool_name if is_code_intel_tool(tool_name) => {
+            "Retry with a narrower workspace_root, path, query, or max_results; use palyra.code.health when provider status is degraded.".to_owned()
+        }
         "palyra.process.run"
         | "palyra.exec.run"
         | "palyra.process.stop"
@@ -1038,6 +1056,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "workspace_roots".to_owned(),
             execution_manifest: None,
         },
+        tool_name if is_code_intel_tool(tool_name) => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("{tool_name} requires gateway code-intelligence runtime context"),
+            timed_out: false,
+            executor: "code_intel_runtime".to_owned(),
+            sandbox_enforcement: "workspace_roots".to_owned(),
+            execution_manifest: None,
+        },
         "palyra.fs.os_file" => ToolExecutionRawResult {
             success: false,
             output_json: b"{}".to_vec(),
@@ -1102,72 +1129,73 @@ async fn run_allowlisted_tool_with_cancellation(
 // explicit delegation error). Keep in sync with the dispatch match above and
 // with `tool_input_limit_bytes`.
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "palyra.echo"
-            | "palyra.sleep"
-            | "palyra.memory.status"
-            | "palyra.memory.search"
-            | "palyra.memory.recall"
-            | "palyra.memory.session_search"
-            | "palyra.session_search"
-            | "palyra.memory.retain"
-            | "palyra.retain"
-            | "palyra.memory.delete"
-            | "palyra.memory.replace"
-            | "palyra.memory.reflect"
-            | "palyra.routines.query"
-            | "palyra.routines.control"
-            | "palyra.delegation.query"
-            | "palyra.delegation.control"
-            | "sessions_spawn"
-            | "sessions_yield"
-            | "palyra.artifact.read"
-            | "palyra.image.observe"
-            | "palyra.http.fetch"
-            | "palyra.process.run"
-            | "palyra.exec.run"
-            | "palyra.process.stop"
-            | "palyra.process.status"
-            | "palyra.process.list"
-            | "palyra.tool_program.run"
-            | "palyra.fs.read_file"
-            | "palyra.fs.list_dir"
-            | "palyra.fs.search"
-            | "palyra.fs.apply_patch"
-            | "palyra.fs.os_file"
-            | "palyra.browser.session.create"
-            | "palyra.browser.session.close"
-            | "palyra.browser.navigate"
-            | "palyra.browser.reload"
-            | "palyra.browser.click"
-            | "palyra.browser.type"
-            | "palyra.browser.fill"
-            | "palyra.browser.upload"
-            | "palyra.browser.press"
-            | "palyra.browser.select"
-            | "palyra.browser.viewport"
-            | "palyra.browser.highlight"
-            | "palyra.browser.scroll"
-            | "palyra.browser.wait_for"
-            | "palyra.browser.title"
-            | "palyra.browser.screenshot"
-            | "palyra.browser.pdf"
-            | "palyra.browser.observe"
-            | "palyra.browser.storage"
-            | "palyra.browser.network_log"
-            | "palyra.browser.console_log"
-            | "palyra.browser.reset_state"
-            | "palyra.browser.tabs.list"
-            | "palyra.browser.tabs.open"
-            | "palyra.browser.tabs.switch"
-            | "palyra.browser.tabs.close"
-            | "palyra.browser.permissions.get"
-            | "palyra.browser.permissions.set"
-            | "palyra.browser.downloads.list"
-            | "palyra.browser.downloads.get"
-            | "palyra.plugin.run"
-    )
+    is_code_intel_tool(tool_name)
+        || matches!(
+            tool_name,
+            "palyra.echo"
+                | "palyra.sleep"
+                | "palyra.memory.status"
+                | "palyra.memory.search"
+                | "palyra.memory.recall"
+                | "palyra.memory.session_search"
+                | "palyra.session_search"
+                | "palyra.memory.retain"
+                | "palyra.retain"
+                | "palyra.memory.delete"
+                | "palyra.memory.replace"
+                | "palyra.memory.reflect"
+                | "palyra.routines.query"
+                | "palyra.routines.control"
+                | "palyra.delegation.query"
+                | "palyra.delegation.control"
+                | "sessions_spawn"
+                | "sessions_yield"
+                | "palyra.artifact.read"
+                | "palyra.image.observe"
+                | "palyra.http.fetch"
+                | "palyra.process.run"
+                | "palyra.exec.run"
+                | "palyra.process.stop"
+                | "palyra.process.status"
+                | "palyra.process.list"
+                | "palyra.tool_program.run"
+                | "palyra.fs.read_file"
+                | "palyra.fs.list_dir"
+                | "palyra.fs.search"
+                | "palyra.fs.apply_patch"
+                | "palyra.fs.os_file"
+                | "palyra.browser.session.create"
+                | "palyra.browser.session.close"
+                | "palyra.browser.navigate"
+                | "palyra.browser.reload"
+                | "palyra.browser.click"
+                | "palyra.browser.type"
+                | "palyra.browser.fill"
+                | "palyra.browser.upload"
+                | "palyra.browser.press"
+                | "palyra.browser.select"
+                | "palyra.browser.viewport"
+                | "palyra.browser.highlight"
+                | "palyra.browser.scroll"
+                | "palyra.browser.wait_for"
+                | "palyra.browser.title"
+                | "palyra.browser.screenshot"
+                | "palyra.browser.pdf"
+                | "palyra.browser.observe"
+                | "palyra.browser.storage"
+                | "palyra.browser.network_log"
+                | "palyra.browser.console_log"
+                | "palyra.browser.reset_state"
+                | "palyra.browser.tabs.list"
+                | "palyra.browser.tabs.open"
+                | "palyra.browser.tabs.switch"
+                | "palyra.browser.tabs.close"
+                | "palyra.browser.permissions.get"
+                | "palyra.browser.permissions.set"
+                | "palyra.browser.downloads.list"
+                | "palyra.browser.downloads.get"
+                | "palyra.plugin.run"
+        )
 }
 
 // Executor labels recorded in attestations; pinned by tests and security
@@ -1185,6 +1213,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
     } else if matches!(tool_name, "palyra.fs.read_file" | "palyra.fs.list_dir" | "palyra.fs.search")
     {
         "workspace_file".to_owned()
+    } else if is_code_intel_tool(tool_name) {
+        "code_intel_runtime".to_owned()
     } else if tool_name == "palyra.fs.apply_patch" {
         "workspace_patch".to_owned()
     } else if tool_name == "palyra.fs.os_file" {
@@ -1232,6 +1262,9 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
 // payloads cannot reach a runner. Unknown tools fall back to the 64 KiB
 // memory-search limit as a conservative default.
 fn tool_input_limit_bytes(tool_name: &str) -> usize {
+    if is_code_intel_tool(tool_name) {
+        return MAX_CODE_INTEL_TOOL_INPUT_BYTES;
+    }
     match tool_name {
         "palyra.echo" => MAX_ECHO_TOOL_INPUT_BYTES,
         "palyra.sleep" => MAX_SLEEP_TOOL_INPUT_BYTES,
@@ -1316,7 +1349,8 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
     } else if matches!(
         tool_name,
         "palyra.fs.read_file" | "palyra.fs.list_dir" | "palyra.fs.search" | "palyra.fs.apply_patch"
-    ) {
+    ) || is_code_intel_tool(tool_name)
+    {
         "workspace_roots".to_owned()
     } else if tool_name == "palyra.fs.os_file" {
         "approved_os_paths".to_owned()
@@ -2191,6 +2225,8 @@ mod tests {
         assert!(!tool_requires_approval("palyra.fs.read_file"));
         assert!(!tool_requires_approval("palyra.fs.list_dir"));
         assert!(!tool_requires_approval("palyra.fs.search"));
+        assert!(!tool_requires_approval("palyra.code.health"));
+        assert!(!tool_requires_approval("palyra.code.workspace_symbols"));
         assert!(tool_requires_approval("palyra.routines.control"));
         assert!(tool_requires_approval("palyra.http.fetch"));
         assert!(tool_requires_approval("palyra.process.run"));
@@ -2435,6 +2471,7 @@ mod tests {
                 "palyra.fs.read_file".to_owned(),
                 "palyra.fs.list_dir".to_owned(),
                 "palyra.fs.search".to_owned(),
+                "palyra.code.workspace_symbols".to_owned(),
                 "palyra.fs.os_file".to_owned(),
             ],
             max_calls_per_run: 1,
@@ -2474,6 +2511,23 @@ mod tests {
             outcome.error
         );
         assert_eq!(outcome.attestation.executor, "workspace_file");
+        assert_eq!(outcome.attestation.sandbox_enforcement, "workspace_roots");
+
+        let outcome = execute_tool_call(
+            &config,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAF",
+            "palyra.code.workspace_symbols",
+            br#"{"query":"customerId"}"#,
+        )
+        .await;
+
+        assert!(!outcome.success, "generic tool executor should not run code intelligence");
+        assert!(
+            outcome.error.contains("requires gateway code-intelligence runtime context"),
+            "delegated executor error should be explicit: {}",
+            outcome.error
+        );
+        assert_eq!(outcome.attestation.executor, "code_intel_runtime");
         assert_eq!(outcome.attestation.sandbox_enforcement, "workspace_roots");
 
         let outcome = execute_tool_call(

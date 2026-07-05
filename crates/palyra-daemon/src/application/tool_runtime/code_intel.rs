@@ -8,16 +8,17 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
+    env, fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use palyra_common::{
     redaction::redact_diagnostic_text, workspace_patch::WorkspacePatchFileAttestation,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command as TokioCommand,
@@ -25,10 +26,24 @@ use tokio::{
 };
 
 use crate::{
+    agents::AgentResolveRequest,
     application::code_intel_runtime::{
         CodeIntelLanguage, CodeIntelProviderObservation, CodeIntelRuntimeSnapshot,
+        CODE_INTEL_REDACTION_LEVEL,
+    },
+    application::tool_runtime::workspace_scope::{
+        relative_path_should_use_active_root, session_active_workspace_root,
+        workspace_root_override_targets_active_root,
+        workspace_roots_with_run_launch_context_for_agent_source,
     },
     config::CodeIntelConfig,
+    gateway::{
+        GatewayRuntimeState, ToolRuntimeExecutionContext, CODE_DEFINITION_TOOL_NAME,
+        CODE_DIAGNOSTICS_TOOL_NAME, CODE_HEALTH_TOOL_NAME, CODE_HOVER_TOOL_NAME,
+        CODE_OUTLINE_TOOL_NAME, CODE_REFERENCES_TOOL_NAME, CODE_SYMBOLS_TOOL_NAME,
+        CODE_WORKSPACE_SYMBOLS_TOOL_NAME,
+    },
+    tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
 
 const CODE_INTEL_SCHEMA_VERSION: u32 = 1;
@@ -46,6 +61,17 @@ const PYRIGHT_SOURCE: &str = "pyright";
 const PYRIGHT_CLI_COMMAND: &str = "pyright";
 const PYRIGHT_ARGS: &[&str] = &["--outputjson"];
 const PYRIGHT_ERROR_HINT_CHARS: usize = 512;
+const CODE_INTEL_TOOL_INPUT_MAX_BYTES: usize = 16 * 1024;
+const CODE_INTEL_MAX_SOURCE_BYTES: u64 = 256 * 1024;
+const CODE_INTEL_MAX_SYMBOLS: usize = 200;
+const CODE_INTEL_MAX_WORKSPACE_FILES: usize = 1_000;
+const CODE_INTEL_MAX_WORKSPACE_DEPTH: usize = 24;
+const CODE_INTEL_MAX_WORKSPACE_RESULTS: usize = 200;
+const CODE_INTEL_CONTEXT_SYMBOL_LIMIT: usize = 24;
+const CODE_INTEL_SKIPPED_DIRS: &[&str] =
+    &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
+const CODE_INTEL_MANIFEST_NAMES: &[&str] =
+    &["Cargo.toml", "package.json", "pyproject.toml", "tsconfig.json", "jsconfig.json"];
 pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.rust.snapshot_captured";
 pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
@@ -91,8 +117,8 @@ impl LanguageServerRegistry {
                     provider: language.provider_name().to_owned(),
                     binary_label: diagnostic_binary_label(binary),
                     diagnostics_only: true,
-                    supports_symbols: false,
-                    supports_references: false,
+                    supports_symbols: true,
+                    supports_references: true,
                     timeout_ms: config.timeout_ms,
                     idle_reap_ms: config.idle_reap_ms,
                     redaction_level:
@@ -672,6 +698,1492 @@ pub(crate) fn append_runtime_output(
     if let Some(diagnostics) = payload.get_mut("diagnostics").and_then(Value::as_object_mut) {
         diagnostics.insert("runtime".to_owned(), runtime_value);
     }
+}
+
+/// Executes one read-only model-facing code-intelligence tool.
+pub(crate) async fn execute_code_intel_tool(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> ToolExecutionOutcome {
+    let input = match parse_code_intel_tool_input(tool_name, input_json) {
+        Ok(input) => input,
+        Err(error) => {
+            return code_intel_tool_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+    let workspace = match resolve_code_intel_workspace(
+        runtime_state,
+        context,
+        tool_name,
+        input.workspace_root.as_deref(),
+        input.path.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return code_intel_tool_outcome(
+                proposal_id,
+                tool_name,
+                input_json,
+                false,
+                b"{}".to_vec(),
+                error,
+            );
+        }
+    };
+
+    let result = match tool_name {
+        CODE_HEALTH_TOOL_NAME => code_intel_health_output(runtime_state, &workspace),
+        CODE_DIAGNOSTICS_TOOL_NAME => {
+            code_intel_diagnostics_output(runtime_state, &workspace, &input).await
+        }
+        CODE_SYMBOLS_TOOL_NAME | CODE_OUTLINE_TOOL_NAME => {
+            code_intel_symbols_output(tool_name, &workspace, &input)
+        }
+        CODE_DEFINITION_TOOL_NAME => code_intel_definition_output(&workspace, &input),
+        CODE_REFERENCES_TOOL_NAME => code_intel_references_output(&workspace, &input),
+        CODE_HOVER_TOOL_NAME => code_intel_hover_output(&workspace, &input),
+        CODE_WORKSPACE_SYMBOLS_TOOL_NAME => code_intel_workspace_symbols_output(&workspace, &input),
+        _ => Err(format!("{tool_name} is not a code-intelligence tool")),
+    };
+
+    match result.and_then(|value| {
+        serde_json::to_vec(&value)
+            .map_err(|error| format!("{tool_name} failed to serialize output: {error}"))
+    }) {
+        Ok(output_json) => code_intel_tool_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            true,
+            output_json,
+            String::new(),
+        ),
+        Err(error) => code_intel_tool_outcome(
+            proposal_id,
+            tool_name,
+            input_json,
+            false,
+            b"{}".to_vec(),
+            error,
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodeIntelToolInput {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    column: Option<u32>,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct CodeIntelWorkspace {
+    roots: Vec<(usize, PathBuf)>,
+    primary_root_index: usize,
+    primary_root: PathBuf,
+    display_root: String,
+    provider_status: Vec<CodeIntelProviderStatus>,
+    runtime_cwd_hints: Vec<RuntimeCwdHint>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCodeIntelFile {
+    workspace_root_index: usize,
+    canonical_path: PathBuf,
+    display_path: String,
+    language: Option<CodeIntelLanguage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CodeSymbol {
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) language: CodeIntelLanguage,
+    pub(crate) path: String,
+    pub(crate) line: u32,
+    pub(crate) column: u32,
+    pub(crate) signature: String,
+    pub(crate) visibility: String,
+    pub(crate) source_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuntimeCwdHint {
+    pub(crate) cwd: String,
+    pub(crate) manifest_path: String,
+    pub(crate) project_kind: String,
+    pub(crate) confidence: String,
+    pub(crate) reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CodeSemanticContext {
+    pub(crate) schema_version: u32,
+    pub(crate) provider: String,
+    pub(crate) source: String,
+    pub(crate) symbols: Vec<CodeSymbol>,
+    pub(crate) source_refs: Vec<String>,
+    pub(crate) truncated: bool,
+    pub(crate) cache_policy: String,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+/// Builds bounded symbol context for prompt assembly or tool outputs.
+pub(crate) struct CodeSemanticContextProvider;
+
+impl CodeSemanticContextProvider {
+    #[must_use]
+    pub(crate) fn from_symbols(symbols: &[CodeSymbol], truncated: bool) -> CodeSemanticContext {
+        let mut selected =
+            symbols.iter().take(CODE_INTEL_CONTEXT_SYMBOL_LIMIT).cloned().collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line.cmp(&right.line))
+                .then(left.name.cmp(&right.name))
+        });
+        let source_refs = selected.iter().map(|symbol| symbol.source_ref.clone()).collect();
+        CodeSemanticContext {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            provider: "palyra.code.semantic_context".to_owned(),
+            source: "bounded_lexical_index".to_owned(),
+            symbols: selected,
+            source_refs,
+            truncated: truncated || symbols.len() > CODE_INTEL_CONTEXT_SYMBOL_LIMIT,
+            cache_policy: "volatile_workspace_snapshot".to_owned(),
+            reason_codes: vec!["code_intel.semantic_context.lexical_fallback".to_owned()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PatchImpactAnalysis {
+    pub(crate) schema_version: u32,
+    pub(crate) files: Vec<String>,
+    pub(crate) languages: Vec<CodeIntelLanguage>,
+    pub(crate) touched_symbols: Vec<CodeSymbol>,
+    pub(crate) diagnostics_before_count: usize,
+    pub(crate) diagnostics_after_count: usize,
+    pub(crate) new_errors: usize,
+    pub(crate) new_warnings: usize,
+    pub(crate) risk_level: String,
+    pub(crate) verification_guidance: Vec<String>,
+    pub(crate) runtime_cwd_hints: Vec<RuntimeCwdHint>,
+    pub(crate) truncated: bool,
+    pub(crate) reason_codes: Vec<String>,
+}
+
+/// Inserts semantic patch-impact evidence into a successful apply-patch output.
+pub(crate) fn append_patch_impact_output(
+    output_value: &mut Value,
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+    diagnostic_before: &DiagnosticSnapshot,
+    diagnostic_after: &DiagnosticSnapshot,
+    diagnostic_delta: &DiagnosticDelta,
+) {
+    let Some(payload) = output_value.as_object_mut() else {
+        return;
+    };
+    let impact = patch_impact_analysis(
+        workspace_roots,
+        files_touched,
+        diagnostic_before,
+        diagnostic_after,
+        diagnostic_delta,
+    );
+    let value = serde_json::to_value(impact).unwrap_or_else(|error| {
+        json!({
+            "schema_version": CODE_INTEL_SCHEMA_VERSION,
+            "files": [],
+            "languages": [],
+            "touched_symbols": [],
+            "diagnostics_before_count": 0,
+            "diagnostics_after_count": 0,
+            "new_errors": 0,
+            "new_warnings": 0,
+            "risk_level": "unknown",
+            "verification_guidance": ["Inspect diagnostics manually because patch impact serialization failed."],
+            "runtime_cwd_hints": [],
+            "truncated": false,
+            "reason_codes": ["code_intel.patch_impact.serialize_failed"],
+            "error": error.to_string(),
+        })
+    });
+    payload.insert("patch_impact_analysis".to_owned(), value);
+}
+
+fn parse_code_intel_tool_input(
+    tool_name: &str,
+    input_json: &[u8],
+) -> Result<CodeIntelToolInput, String> {
+    if input_json.len() > CODE_INTEL_TOOL_INPUT_MAX_BYTES {
+        return Err(format!("{tool_name} input exceeds {CODE_INTEL_TOOL_INPUT_MAX_BYTES} bytes"));
+    }
+    let mut input = if input_json.trim_ascii().is_empty() {
+        CodeIntelToolInput {
+            path: None,
+            workspace_root: None,
+            symbol: None,
+            query: None,
+            line: None,
+            column: None,
+            max_results: None,
+        }
+    } else {
+        serde_json::from_slice::<CodeIntelToolInput>(input_json).map_err(|error| {
+            format!("{tool_name} input must match code-intelligence schema: {error}")
+        })?
+    };
+    input.path = input
+        .path
+        .map(|path| normalize_code_intel_path_input(path.as_str()))
+        .filter(|path| !path.is_empty());
+    input.workspace_root = input
+        .workspace_root
+        .map(|path| normalize_code_intel_path_input(path.as_str()))
+        .filter(|path| !path.is_empty());
+    input.symbol =
+        input.symbol.map(|symbol| symbol.trim().to_owned()).filter(|symbol| !symbol.is_empty());
+    input.query =
+        input.query.map(|query| query.trim().to_owned()).filter(|query| !query.is_empty());
+    if let Some(path) = input.path.as_deref() {
+        validate_code_intel_path_syntax(path, tool_name)?;
+    }
+    if let Some(root) = input.workspace_root.as_deref() {
+        validate_code_intel_path_syntax(root, tool_name)?;
+    }
+    if matches!(tool_name, CODE_SYMBOLS_TOOL_NAME | CODE_OUTLINE_TOOL_NAME | CODE_HOVER_TOOL_NAME)
+        && input.path.is_none()
+    {
+        return Err(format!("{tool_name} requires non-empty string field 'path'"));
+    }
+    if matches!(
+        tool_name,
+        CODE_DEFINITION_TOOL_NAME | CODE_REFERENCES_TOOL_NAME | CODE_HOVER_TOOL_NAME
+    ) && input.symbol.is_none()
+        && (input.line.is_none() || input.column.is_none())
+    {
+        return Err(format!("{tool_name} requires 'symbol' or both 'line' and 'column'"));
+    }
+    if tool_name == CODE_WORKSPACE_SYMBOLS_TOOL_NAME && input.query.is_none() {
+        return Err(format!("{tool_name} requires non-empty string field 'query'"));
+    }
+    Ok(input)
+}
+
+async fn resolve_code_intel_workspace(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    tool_name: &str,
+    workspace_root: Option<&str>,
+    requested_path: &str,
+) -> Result<CodeIntelWorkspace, String> {
+    let agent_outcome = runtime_state
+        .resolve_agent_for_context(AgentResolveRequest {
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            session_id: Some(context.session_id.to_owned()),
+            preferred_agent_id: None,
+            persist_session_binding: false,
+        })
+        .await
+        .map_err(|error| {
+            format!("{tool_name} failed to resolve agent workspace: {}", error.message())
+        })?;
+    let agent_roots =
+        agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let agent_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        agent_roots.as_slice(),
+        agent_outcome.source,
+    )
+    .await;
+    let roots = resolve_code_intel_roots(
+        runtime_state,
+        context.session_id,
+        tool_name,
+        agent_roots.as_slice(),
+        workspace_root,
+        requested_path,
+    )
+    .await?;
+    let canonical_roots = canonicalize_code_intel_roots(roots.as_slice(), tool_name)?;
+    let Some((primary_root_index, primary_root)) = canonical_roots.first().cloned() else {
+        return Err(format!("{tool_name} agent has no accessible workspace roots"));
+    };
+    let provider_status =
+        code_intel_provider_health(&runtime_state.config.code_intel, roots.as_slice());
+    let runtime_cwd_hints = detect_runtime_cwd_hints(canonical_roots.as_slice());
+    Ok(CodeIntelWorkspace {
+        roots: canonical_roots,
+        primary_root_index,
+        display_root: format!("workspace_root:{primary_root_index}"),
+        primary_root,
+        provider_status,
+        runtime_cwd_hints,
+    })
+}
+
+async fn resolve_code_intel_roots(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    session_id: &str,
+    tool_name: &str,
+    agent_roots: &[PathBuf],
+    workspace_root: Option<&str>,
+    requested_path: &str,
+) -> Result<Vec<PathBuf>, String> {
+    if let Some(workspace_root) = workspace_root.map(str::trim).filter(|root| !root.is_empty()) {
+        if let Some(active_root) =
+            session_active_workspace_root(runtime_state, session_id, agent_roots).await?
+        {
+            if workspace_root_override_targets_active_root(workspace_root, &active_root) {
+                return Ok(vec![active_root.root]);
+            }
+        }
+        return resolve_code_intel_root_override(tool_name, agent_roots, workspace_root)
+            .map(|root| vec![root]);
+    }
+    if let Some(active_root) =
+        session_active_workspace_root(runtime_state, session_id, agent_roots).await?
+    {
+        if relative_path_should_use_active_root(requested_path, &active_root) {
+            return Ok(code_intel_roots_with_active_first(active_root.root, agent_roots));
+        }
+    }
+    Ok(agent_roots.to_vec())
+}
+
+fn code_intel_health_output(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    workspace: &CodeIntelWorkspace,
+) -> Result<Value, String> {
+    let runtime = runtime_state.code_intel_runtime_snapshot();
+    let descriptors = LanguageServerRegistry::from_config(&runtime_state.config.code_intel)
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            json!({
+                "language": descriptor.language,
+                "provider": descriptor.provider,
+                "binary_label": descriptor.binary_label,
+                "diagnostics_only": descriptor.diagnostics_only,
+                "supports_symbols": descriptor.supports_symbols,
+                "supports_references": descriptor.supports_references,
+                "timeout_ms": descriptor.timeout_ms,
+                "idle_reap_ms": descriptor.idle_reap_ms,
+                "redaction_level": descriptor.redaction_level,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "enabled": runtime_state.config.code_intel.enabled,
+        "workspace_root": workspace.display_root.as_str(),
+        "workspace_root_index": workspace.primary_root_index,
+        "status": runtime.status,
+        "mode": runtime.mode,
+        "runtime": runtime,
+        "provider_status": &workspace.provider_status,
+        "descriptors": descriptors,
+        "capabilities": {
+            "diagnostics": true,
+            "symbols": true,
+            "definition": true,
+            "references": true,
+            "hover": true,
+            "outline": true,
+            "workspace_symbols": true,
+            "patch_impact": true,
+            "runtime_cwd_hints": true
+        },
+        "runtime_cwd_hints": &workspace.runtime_cwd_hints,
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+async fn code_intel_diagnostics_output(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let touched_files = if let Some(path) = input.path.as_deref() {
+        let file = resolve_code_intel_file(workspace, path, CODE_DIAGNOSTICS_TOOL_NAME)?;
+        vec![WorkspacePatchFileAttestation {
+            path: file.display_path,
+            workspace_root_index: file.workspace_root_index,
+            operation: "inspect".to_owned(),
+            moved_from: None,
+            before_sha256: None,
+            before_size_bytes: None,
+            after_sha256: None,
+            after_size_bytes: None,
+        }]
+    } else {
+        Vec::new()
+    };
+    let snapshot = capture_diagnostic_snapshot_with_providers(
+        &runtime_state.config.code_intel,
+        std::slice::from_ref(&workspace.primary_root),
+        touched_files.as_slice(),
+    )
+    .await;
+    let observations = provider_runtime_observations(&snapshot);
+    let runtime = runtime_state.observe_code_intel_runtime(
+        snapshot.workspace_root.as_deref(),
+        observations.as_slice(),
+        &["tool:palyra.code.diagnostics".to_owned()],
+    );
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "snapshot": snapshot,
+        "runtime": runtime.snapshot,
+        "runtime_cwd_hints": &workspace.runtime_cwd_hints,
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_symbols_output(
+    tool_name: &str,
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let path = input.path.as_deref().unwrap_or_default();
+    let file = resolve_code_intel_file(workspace, path, tool_name)?;
+    let source = read_code_intel_source(file.canonical_path.as_path(), tool_name)?;
+    let (symbols, truncated) = extract_symbols_from_source(
+        file.language,
+        file.display_path.as_str(),
+        source.as_str(),
+        input_limit(input),
+    );
+    let semantic_context = CodeSemanticContextProvider::from_symbols(symbols.as_slice(), truncated);
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "path": file.display_path,
+        "workspace_root_index": file.workspace_root_index,
+        "language": file.language,
+        "symbols": symbols,
+        "semantic_context": semantic_context,
+        "provider_status": &workspace.provider_status,
+        "truncated": truncated,
+        "source": "bounded_lexical_index",
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_definition_output(
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let query = code_intel_query_symbol(workspace, input, CODE_DEFINITION_TOOL_NAME)?;
+    let (definitions, truncated) =
+        collect_workspace_symbols(workspace, Some(query.as_str()), true, input_limit(input))?;
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "symbol": query,
+        "definitions": definitions,
+        "provider_status": &workspace.provider_status,
+        "truncated": truncated,
+        "source": "bounded_lexical_index",
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_references_output(
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let query = code_intel_query_symbol(workspace, input, CODE_REFERENCES_TOOL_NAME)?;
+    let (references, truncated) =
+        collect_symbol_references(workspace, query.as_str(), input_limit(input))?;
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "symbol": query,
+        "references": references,
+        "provider_status": &workspace.provider_status,
+        "truncated": truncated,
+        "source": "bounded_lexical_index",
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_hover_output(
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let path = input.path.as_deref().unwrap_or_default();
+    let file = resolve_code_intel_file(workspace, path, CODE_HOVER_TOOL_NAME)?;
+    let source = read_code_intel_source(file.canonical_path.as_path(), CODE_HOVER_TOOL_NAME)?;
+    let (symbols, truncated) = extract_symbols_from_source(
+        file.language,
+        file.display_path.as_str(),
+        source.as_str(),
+        CODE_INTEL_MAX_SYMBOLS,
+    );
+    let query = code_intel_query_symbol_in_file(input, symbols.as_slice())?;
+    let symbol = symbols.iter().find(|symbol| symbol.name == query).cloned();
+    let hover = symbol.as_ref().map(|symbol| {
+        json!({
+            "name": symbol.name,
+            "kind": symbol.kind,
+            "signature": symbol.signature,
+            "location": {
+                "path": symbol.path,
+                "line": symbol.line,
+                "column": symbol.column,
+            },
+            "visibility": symbol.visibility,
+            "source_ref": symbol.source_ref,
+        })
+    });
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "symbol": query,
+        "hover": hover,
+        "provider_status": &workspace.provider_status,
+        "truncated": truncated,
+        "source": "bounded_lexical_index",
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_workspace_symbols_output(
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+) -> Result<Value, String> {
+    let query = input.query.as_deref().unwrap_or_default();
+    let (symbols, truncated) =
+        collect_workspace_symbols(workspace, Some(query), false, input_limit(input))?;
+    let semantic_context = CodeSemanticContextProvider::from_symbols(symbols.as_slice(), truncated);
+    Ok(json!({
+        "schema_version": CODE_INTEL_SCHEMA_VERSION,
+        "query": query,
+        "symbols": symbols,
+        "semantic_context": semantic_context,
+        "provider_status": &workspace.provider_status,
+        "runtime_cwd_hints": &workspace.runtime_cwd_hints,
+        "truncated": truncated,
+        "source": "bounded_lexical_index",
+        "redaction_level": CODE_INTEL_REDACTION_LEVEL,
+    }))
+}
+
+fn code_intel_query_symbol(
+    workspace: &CodeIntelWorkspace,
+    input: &CodeIntelToolInput,
+    tool_name: &str,
+) -> Result<String, String> {
+    if let Some(symbol) = input.symbol.as_deref() {
+        return Ok(symbol.to_owned());
+    }
+    let path = input
+        .path
+        .as_deref()
+        .ok_or_else(|| format!("{tool_name} requires 'path' when resolving a position"))?;
+    let file = resolve_code_intel_file(workspace, path, tool_name)?;
+    let source = read_code_intel_source(file.canonical_path.as_path(), tool_name)?;
+    let (symbols, _) = extract_symbols_from_source(
+        file.language,
+        file.display_path.as_str(),
+        source.as_str(),
+        CODE_INTEL_MAX_SYMBOLS,
+    );
+    code_intel_query_symbol_in_file(input, symbols.as_slice())
+}
+
+fn code_intel_query_symbol_in_file(
+    input: &CodeIntelToolInput,
+    symbols: &[CodeSymbol],
+) -> Result<String, String> {
+    if let Some(symbol) = input.symbol.as_deref() {
+        return Ok(symbol.to_owned());
+    }
+    let line = input.line.unwrap_or_default();
+    let column = input.column.unwrap_or_default();
+    symbols
+        .iter()
+        .filter(|symbol| symbol.line <= line)
+        .min_by_key(|symbol| {
+            let line_distance = line.saturating_sub(symbol.line);
+            let column_distance = column.abs_diff(symbol.column);
+            (line_distance, column_distance)
+        })
+        .map(|symbol| symbol.name.clone())
+        .ok_or_else(|| "no symbol found near requested line/column".to_owned())
+}
+
+fn input_limit(input: &CodeIntelToolInput) -> usize {
+    input
+        .max_results
+        .filter(|limit| *limit > 0)
+        .unwrap_or(CODE_INTEL_MAX_WORKSPACE_RESULTS)
+        .min(CODE_INTEL_MAX_WORKSPACE_RESULTS)
+}
+
+fn extract_symbols_from_source(
+    language: Option<CodeIntelLanguage>,
+    path: &str,
+    source: &str,
+    max_symbols: usize,
+) -> (Vec<CodeSymbol>, bool) {
+    let Some(language) = language else {
+        return (Vec::new(), false);
+    };
+    let mut symbols = Vec::new();
+    let mut truncated = false;
+    for (index, line) in source.lines().enumerate() {
+        if symbols.len() >= max_symbols {
+            truncated = true;
+            break;
+        }
+        if let Some(symbol) = parse_symbol_line(language, path, index.saturating_add(1), line) {
+            symbols.push(symbol);
+        }
+    }
+    symbols.sort_by(|left, right| left.line.cmp(&right.line).then(left.name.cmp(&right.name)));
+    (symbols, truncated)
+}
+
+fn parse_symbol_line(
+    language: CodeIntelLanguage,
+    path: &str,
+    line_number: usize,
+    line: &str,
+) -> Option<CodeSymbol> {
+    match language {
+        CodeIntelLanguage::Rust => parse_rust_symbol_line(path, line_number, line),
+        CodeIntelLanguage::TypeScript => parse_typescript_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Python => parse_python_symbol_line(path, line_number, line),
+    }
+}
+
+fn parse_rust_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    let visibility = if trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+        "public"
+    } else {
+        "private"
+    };
+    let without_visibility = trimmed
+        .strip_prefix("pub(crate) ")
+        .or_else(|| trimmed.strip_prefix("pub(super) "))
+        .or_else(|| trimmed.strip_prefix("pub "))
+        .unwrap_or(trimmed);
+    for (keyword, kind) in [
+        ("async fn ", "function"),
+        ("fn ", "function"),
+        ("struct ", "struct"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("impl ", "impl"),
+        ("const ", "constant"),
+        ("static ", "static"),
+    ] {
+        if let Some(rest) = without_visibility.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                CodeIntelLanguage::Rust,
+                path,
+                line_number,
+                line,
+                name,
+                kind,
+                visibility,
+            ));
+        }
+    }
+    None
+}
+
+fn parse_typescript_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    let visibility = if trimmed.starts_with("export ") { "public" } else { "module_private" };
+    let without_export = trimmed
+        .strip_prefix("export default ")
+        .or_else(|| trimmed.strip_prefix("export "))
+        .unwrap_or(trimmed);
+    let without_async = without_export.strip_prefix("async ").unwrap_or(without_export);
+    for (keyword, kind) in [
+        ("function ", "function"),
+        ("class ", "class"),
+        ("interface ", "interface"),
+        ("type ", "type"),
+        ("const ", "constant"),
+        ("let ", "variable"),
+        ("var ", "variable"),
+    ] {
+        if let Some(rest) = without_async.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                CodeIntelLanguage::TypeScript,
+                path,
+                line_number,
+                line,
+                name,
+                kind,
+                visibility,
+            ));
+        }
+    }
+    None
+}
+
+fn parse_python_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    let (rest, kind) = trimmed
+        .strip_prefix("async def ")
+        .map(|rest| (rest, "function"))
+        .or_else(|| trimmed.strip_prefix("def ").map(|rest| (rest, "function")))
+        .or_else(|| trimmed.strip_prefix("class ").map(|rest| (rest, "class")))?;
+    let name = take_identifier(rest)?;
+    let visibility = if name.starts_with('_') { "private" } else { "public" };
+    Some(code_symbol(CodeIntelLanguage::Python, path, line_number, line, name, kind, visibility))
+}
+
+fn code_symbol(
+    language: CodeIntelLanguage,
+    path: &str,
+    line_number: usize,
+    source_line: &str,
+    name: &str,
+    kind: &str,
+    visibility: &str,
+) -> CodeSymbol {
+    let column = source_line.find(name).map(|index| index.saturating_add(1)).unwrap_or(1);
+    let line = u32::try_from(line_number).unwrap_or(u32::MAX);
+    let column = u32::try_from(column).unwrap_or(u32::MAX);
+    CodeSymbol {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        language,
+        path: path.to_owned(),
+        line,
+        column,
+        signature: bound_message_with_limit(source_line.trim(), 180),
+        visibility: visibility.to_owned(),
+        source_ref: format!("{path}:{line}:{column}"),
+    }
+}
+
+fn take_identifier(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim_start();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(index, ch)| (!is_identifier_char(ch)).then_some(index))
+        .unwrap_or(trimmed.len());
+    (end > 0).then_some(&trimmed[..end])
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn collect_workspace_symbols(
+    workspace: &CodeIntelWorkspace,
+    query: Option<&str>,
+    exact: bool,
+    max_results: usize,
+) -> Result<(Vec<CodeSymbol>, bool), String> {
+    let mut state = CodeIntelWorkspaceScanState::new(max_results);
+    scan_code_intel_workspace(workspace.primary_root.as_path(), &mut state)?;
+    let query_lower = query.map(str::to_ascii_lowercase);
+    let mut symbols = Vec::new();
+    for file in state.files {
+        let Some(language) = CodeIntelLanguage::from_path(file.display_path.as_str()) else {
+            continue;
+        };
+        let source = read_code_intel_source(
+            file.canonical_path.as_path(),
+            CODE_WORKSPACE_SYMBOLS_TOOL_NAME,
+        )?;
+        let (file_symbols, truncated) = extract_symbols_from_source(
+            Some(language),
+            file.display_path.as_str(),
+            source.as_str(),
+            max_results,
+        );
+        state.truncated |= truncated;
+        for symbol in file_symbols {
+            let matched = match query_lower.as_deref() {
+                Some(query) if exact => symbol.name.eq_ignore_ascii_case(query),
+                Some(query) => symbol.name.to_ascii_lowercase().contains(query),
+                None => true,
+            };
+            if matched {
+                symbols.push(symbol);
+                if symbols.len() >= max_results {
+                    return Ok((symbols, true));
+                }
+            }
+        }
+    }
+    symbols.sort_by(|left, right| {
+        left.name.cmp(&right.name).then(left.path.cmp(&right.path)).then(left.line.cmp(&right.line))
+    });
+    Ok((symbols, state.truncated))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodeReference {
+    path: String,
+    line: u32,
+    column: u32,
+    line_text: String,
+    source_ref: String,
+}
+
+fn collect_symbol_references(
+    workspace: &CodeIntelWorkspace,
+    symbol: &str,
+    max_results: usize,
+) -> Result<(Vec<CodeReference>, bool), String> {
+    let mut state = CodeIntelWorkspaceScanState::new(max_results);
+    scan_code_intel_workspace(workspace.primary_root.as_path(), &mut state)?;
+    let mut references = Vec::new();
+    for file in state.files {
+        let source =
+            read_code_intel_source(file.canonical_path.as_path(), CODE_REFERENCES_TOOL_NAME)?;
+        for (line_index, line) in source.lines().enumerate() {
+            for column in identifier_match_columns(line, symbol) {
+                let line_number = u32::try_from(line_index.saturating_add(1)).unwrap_or(u32::MAX);
+                let column = u32::try_from(column).unwrap_or(u32::MAX);
+                references.push(CodeReference {
+                    path: file.display_path.clone(),
+                    line: line_number,
+                    column,
+                    line_text: bound_message_with_limit(line, 240),
+                    source_ref: format!("{}:{line_number}:{column}", file.display_path),
+                });
+                if references.len() >= max_results {
+                    return Ok((references, true));
+                }
+            }
+        }
+    }
+    Ok((references, state.truncated))
+}
+
+fn identifier_match_columns(line: &str, symbol: &str) -> Vec<usize> {
+    line.match_indices(symbol)
+        .filter_map(|(index, _)| {
+            let before = line[..index].chars().next_back();
+            let after = line[index.saturating_add(symbol.len())..].chars().next();
+            let before_boundary = before.is_none_or(|ch| !is_identifier_char(ch));
+            let after_boundary = after.is_none_or(|ch| !is_identifier_char(ch));
+            (before_boundary && after_boundary).then_some(index.saturating_add(1))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct CodeIntelWorkspaceFile {
+    canonical_path: PathBuf,
+    display_path: String,
+}
+
+#[derive(Debug)]
+struct CodeIntelWorkspaceScanState {
+    files: Vec<CodeIntelWorkspaceFile>,
+    files_seen: usize,
+    truncated: bool,
+    max_results: usize,
+}
+
+impl CodeIntelWorkspaceScanState {
+    fn new(max_results: usize) -> Self {
+        Self { files: Vec::new(), files_seen: 0, truncated: false, max_results }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.files_seen < CODE_INTEL_MAX_WORKSPACE_FILES
+            && self.files.len() < self.max_results.saturating_mul(8).max(32)
+    }
+}
+
+fn scan_code_intel_workspace(
+    root: &Path,
+    state: &mut CodeIntelWorkspaceScanState,
+) -> Result<(), String> {
+    scan_code_intel_workspace_recursive(root, root, state, 0)
+}
+
+fn scan_code_intel_workspace_recursive(
+    root: &Path,
+    path: &Path,
+    state: &mut CodeIntelWorkspaceScanState,
+    depth: usize,
+) -> Result<(), String> {
+    if !state.has_capacity() || depth > CODE_INTEL_MAX_WORKSPACE_DEPTH {
+        state.truncated = true;
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("failed to read code-intelligence workspace directory: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read code-intelligence workspace entry: {error}"))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if !state.has_capacity() {
+            state.truncated = true;
+            break;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!("failed to inspect code-intelligence workspace entry: {error}")
+        })?;
+        if file_type.is_dir() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| CODE_INTEL_SKIPPED_DIRS.iter().any(|skip| skip == &name))
+            {
+                continue;
+            }
+            scan_code_intel_workspace_recursive(
+                root,
+                path.as_path(),
+                state,
+                depth.saturating_add(1),
+            )?;
+        } else if file_type.is_file()
+            && CodeIntelLanguage::from_path(normalize_path_for_output(path.as_path()).as_str())
+                .is_some()
+        {
+            state.files_seen = state.files_seen.saturating_add(1);
+            let metadata = entry.metadata().map_err(|error| {
+                format!("failed to inspect code-intelligence workspace file: {error}")
+            })?;
+            if metadata.len() > CODE_INTEL_MAX_SOURCE_BYTES {
+                state.truncated = true;
+                continue;
+            }
+            let display_path = path
+                .strip_prefix(root)
+                .map(normalize_path_for_output)
+                .unwrap_or_else(|_| normalize_path_for_output(path.as_path()));
+            state.files.push(CodeIntelWorkspaceFile { canonical_path: path, display_path });
+        }
+    }
+    Ok(())
+}
+
+fn resolve_code_intel_file(
+    workspace: &CodeIntelWorkspace,
+    path: &str,
+    tool_name: &str,
+) -> Result<ResolvedCodeIntelFile, String> {
+    let requested = Path::new(path);
+    if requested.is_absolute() {
+        if requested.components().any(|component| matches!(component, Component::ParentDir)) {
+            return Err(format!("{tool_name} path escapes agent workspace roots"));
+        }
+        let canonical_path = fs::canonicalize(requested).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{tool_name} file not found in agent workspace roots: {path}")
+            } else {
+                format!("{tool_name} failed to resolve path: {error}")
+            }
+        })?;
+        let (workspace_root_index, canonical_root) = workspace
+            .roots
+            .iter()
+            .find(|(_, root)| path_is_within_root(canonical_path.as_path(), root))
+            .ok_or_else(|| format!("{tool_name} path escapes agent workspace roots"))?;
+        return resolved_code_intel_file(
+            *workspace_root_index,
+            canonical_root,
+            canonical_path,
+            path,
+            tool_name,
+        );
+    }
+
+    for (workspace_root_index, canonical_root) in &workspace.roots {
+        let candidate = canonical_root.join(requested);
+        let canonical_path = match fs::canonicalize(candidate.as_path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "{tool_name} failed to resolve path in workspace root: {error}"
+                ));
+            }
+        };
+        if !path_is_within_root(canonical_path.as_path(), canonical_root) {
+            return Err(format!("{tool_name} path escapes agent workspace roots"));
+        }
+        return resolved_code_intel_file(
+            *workspace_root_index,
+            canonical_root,
+            canonical_path,
+            path,
+            tool_name,
+        );
+    }
+    Err(format!("{tool_name} file not found in agent workspace roots: {path}"))
+}
+
+fn resolved_code_intel_file(
+    workspace_root_index: usize,
+    canonical_root: &Path,
+    canonical_path: PathBuf,
+    requested_path: &str,
+    tool_name: &str,
+) -> Result<ResolvedCodeIntelFile, String> {
+    if !canonical_path.is_file() {
+        return Err(format!("{tool_name} target is not a regular file: {requested_path}"));
+    }
+    let display_path = canonical_path
+        .strip_prefix(canonical_root)
+        .map(normalize_path_for_output)
+        .unwrap_or_else(|_| requested_path.to_owned());
+    Ok(ResolvedCodeIntelFile {
+        workspace_root_index,
+        language: CodeIntelLanguage::from_path(display_path.as_str()),
+        canonical_path,
+        display_path,
+    })
+}
+
+fn read_code_intel_source(path: &Path, tool_name: &str) -> Result<String, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("{tool_name} failed to inspect source file: {error}"))?;
+    if metadata.len() > CODE_INTEL_MAX_SOURCE_BYTES {
+        return Err(format!(
+            "{tool_name} source file exceeds {} bytes",
+            CODE_INTEL_MAX_SOURCE_BYTES
+        ));
+    }
+    fs::read_to_string(path)
+        .map_err(|error| format!("{tool_name} failed to read source file: {error}"))
+}
+
+fn code_intel_provider_health(
+    config: &CodeIntelConfig,
+    workspace_roots: &[PathBuf],
+) -> Vec<CodeIntelProviderStatus> {
+    let manager = LspProcessManager::from_config(config);
+    if !config.enabled {
+        return manager.disabled_provider_statuses();
+    }
+    let languages =
+        [CodeIntelLanguage::Rust, CodeIntelLanguage::TypeScript, CodeIntelLanguage::Python]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+    let mut statuses = manager.provider_statuses(&languages);
+    if workspace_roots.is_empty() {
+        for status in &mut statuses {
+            status.status = "degraded".to_owned();
+            status.reason_code = "code_intel.workspace_root_missing".to_owned();
+            status.repair_hint =
+                "Configure at least one workspace root for code intelligence.".to_owned();
+        }
+    }
+    statuses
+}
+
+fn patch_impact_analysis(
+    workspace_roots: &[PathBuf],
+    files_touched: &[WorkspacePatchFileAttestation],
+    diagnostic_before: &DiagnosticSnapshot,
+    diagnostic_after: &DiagnosticSnapshot,
+    diagnostic_delta: &DiagnosticDelta,
+) -> PatchImpactAnalysis {
+    let mut files = files_touched
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    files.sort();
+    let languages = files
+        .iter()
+        .filter_map(|path| CodeIntelLanguage::from_path(path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut touched_symbols = Vec::new();
+    let mut truncated = false;
+    for file in files_touched {
+        if touched_symbols.len() >= CODE_INTEL_CONTEXT_SYMBOL_LIMIT {
+            truncated = true;
+            break;
+        }
+        if let Some(root) = workspace_roots.get(file.workspace_root_index) {
+            let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let candidate = canonical_root.join(file.path.as_str());
+            let Ok(canonical) = fs::canonicalize(candidate.as_path()) else {
+                continue;
+            };
+            if !path_is_within_root(canonical.as_path(), canonical_root.as_path())
+                || !canonical.is_file()
+            {
+                continue;
+            }
+            let Ok(source) = read_code_intel_source(canonical.as_path(), "palyra.fs.apply_patch")
+            else {
+                continue;
+            };
+            let (symbols, symbols_truncated) = extract_symbols_from_source(
+                CodeIntelLanguage::from_path(file.path.as_str()),
+                file.path.as_str(),
+                source.as_str(),
+                CODE_INTEL_CONTEXT_SYMBOL_LIMIT.saturating_sub(touched_symbols.len()),
+            );
+            truncated |= symbols_truncated;
+            touched_symbols.extend(symbols);
+        }
+    }
+    let risk_level = patch_impact_risk_level(
+        touched_symbols.as_slice(),
+        files_touched,
+        diagnostic_delta,
+        diagnostic_after.degraded,
+    );
+    let verification_guidance = patch_impact_verification_guidance(
+        risk_level.as_str(),
+        languages.as_slice(),
+        diagnostic_delta,
+    );
+    let canonical_roots =
+        canonicalize_code_intel_roots(workspace_roots, "palyra.fs.apply_patch").unwrap_or_default();
+    PatchImpactAnalysis {
+        schema_version: CODE_INTEL_SCHEMA_VERSION,
+        files,
+        languages,
+        touched_symbols,
+        diagnostics_before_count: diagnostic_before.items.len(),
+        diagnostics_after_count: diagnostic_after.items.len(),
+        new_errors: diagnostic_delta.new_errors,
+        new_warnings: diagnostic_delta.new_warnings,
+        risk_level,
+        verification_guidance,
+        runtime_cwd_hints: detect_runtime_cwd_hints(canonical_roots.as_slice()),
+        truncated,
+        reason_codes: vec!["code_intel.patch_impact.lexical_analysis".to_owned()],
+    }
+}
+
+fn patch_impact_risk_level(
+    symbols: &[CodeSymbol],
+    files_touched: &[WorkspacePatchFileAttestation],
+    diagnostic_delta: &DiagnosticDelta,
+    diagnostics_degraded: bool,
+) -> String {
+    if diagnostic_delta.new_errors > 0 {
+        return "high".to_owned();
+    }
+    if diagnostics_degraded
+        || diagnostic_delta.new_warnings > 0
+        || files_touched.len() > 3
+        || symbols.iter().any(|symbol| symbol.visibility == "public")
+    {
+        return "medium".to_owned();
+    }
+    "low".to_owned()
+}
+
+fn patch_impact_verification_guidance(
+    risk_level: &str,
+    languages: &[CodeIntelLanguage],
+    diagnostic_delta: &DiagnosticDelta,
+) -> Vec<String> {
+    let mut guidance = Vec::new();
+    if diagnostic_delta.new_errors > 0 {
+        guidance.push(
+            "Fix new code-intelligence errors before treating the patch as verified.".to_owned(),
+        );
+    }
+    if languages.contains(&CodeIntelLanguage::Rust) {
+        guidance.push("Run targeted Rust tests or cargo check for touched crates.".to_owned());
+    }
+    if languages.contains(&CodeIntelLanguage::TypeScript) {
+        guidance.push("Run the relevant TypeScript or web check for touched packages.".to_owned());
+    }
+    if languages.contains(&CodeIntelLanguage::Python) {
+        guidance
+            .push("Run the relevant Python type or unit checks for touched modules.".to_owned());
+    }
+    if risk_level == "medium" || risk_level == "high" {
+        guidance.push("Inspect references for public or multi-file symbol changes.".to_owned());
+    }
+    if guidance.is_empty() {
+        guidance.push(
+            "Run the narrowest meaningful local verification for the touched files.".to_owned(),
+        );
+    }
+    guidance
+}
+
+fn detect_runtime_cwd_hints(canonical_roots: &[(usize, PathBuf)]) -> Vec<RuntimeCwdHint> {
+    let mut hints = Vec::new();
+    for (_, root) in canonical_roots {
+        detect_runtime_cwd_hints_recursive(root, root, &mut hints, 0);
+        if hints.len() >= 24 {
+            break;
+        }
+    }
+    hints.sort_by(|left, right| {
+        left.cwd
+            .cmp(&right.cwd)
+            .then(left.manifest_path.cmp(&right.manifest_path))
+            .then(left.project_kind.cmp(&right.project_kind))
+    });
+    hints
+        .dedup_by(|left, right| left.cwd == right.cwd && left.manifest_path == right.manifest_path);
+    hints.truncate(24);
+    hints
+}
+
+fn detect_runtime_cwd_hints_recursive(
+    root: &Path,
+    directory: &Path,
+    hints: &mut Vec<RuntimeCwdHint>,
+    depth: usize,
+) {
+    if depth > 4 || hints.len() >= 24 {
+        return;
+    }
+    for manifest in CODE_INTEL_MANIFEST_NAMES {
+        let manifest_path = directory.join(manifest);
+        if manifest_path.is_file() {
+            let cwd = directory
+                .strip_prefix(root)
+                .map(normalize_path_for_output)
+                .unwrap_or_else(|_| normalize_path_for_output(directory));
+            let manifest_path = manifest_path
+                .strip_prefix(root)
+                .map(normalize_path_for_output)
+                .unwrap_or_else(|_| normalize_path_for_output(manifest_path.as_path()));
+            hints.push(RuntimeCwdHint {
+                cwd: if cwd.is_empty() { ".".to_owned() } else { cwd },
+                manifest_path,
+                project_kind: project_kind_for_manifest(manifest).to_owned(),
+                confidence: "manifest_detected".to_owned(),
+                reason_code: "code_intel.runtime_cwd.manifest_detected".to_owned(),
+            });
+        }
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if hints.len() >= 24 {
+            break;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| CODE_INTEL_SKIPPED_DIRS.iter().any(|skip| skip == &name))
+        {
+            continue;
+        }
+        detect_runtime_cwd_hints_recursive(
+            root,
+            entry.path().as_path(),
+            hints,
+            depth.saturating_add(1),
+        );
+    }
+}
+
+fn project_kind_for_manifest(manifest: &str) -> &'static str {
+    match manifest {
+        "Cargo.toml" => "rust",
+        "package.json" | "tsconfig.json" | "jsconfig.json" => "javascript",
+        "pyproject.toml" => "python",
+        _ => "unknown",
+    }
+}
+
+fn code_intel_roots_with_active_first(active_root: PathBuf, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ordered = vec![active_root];
+    for root in roots {
+        if !ordered.iter().any(|existing| same_code_intel_root(existing, root)) {
+            ordered.push(root.clone());
+        }
+    }
+    ordered
+}
+
+fn same_code_intel_root(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('\\', "/")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn resolve_code_intel_root_override(
+    tool_name: &str,
+    agent_roots: &[PathBuf],
+    workspace_root: &str,
+) -> Result<PathBuf, String> {
+    let canonical_roots = canonicalize_code_intel_roots(agent_roots, tool_name)?;
+    if canonical_roots.is_empty() {
+        return Err(format!("{tool_name} agent has no accessible workspace roots"));
+    }
+    let requested = Path::new(workspace_root);
+    if requested.is_absolute() {
+        let canonical = fs::canonicalize(requested).map_err(|error| {
+            format!("{tool_name} failed to resolve workspace_root {workspace_root}: {error}")
+        })?;
+        if !canonical.is_dir() {
+            return Err(format!("{tool_name} workspace_root is not a directory: {workspace_root}"));
+        }
+        if canonical_roots.iter().any(|(_, root)| path_is_within_root(canonical.as_path(), root)) {
+            return Ok(canonical);
+        }
+        return Err(format!(
+            "{tool_name} workspace_root escapes agent workspace roots: {workspace_root}"
+        ));
+    }
+    for (_, root) in &canonical_roots {
+        if root.file_name().is_some_and(|name| path_component_eq_str(name, workspace_root)) {
+            return Ok(root.clone());
+        }
+        let candidate = root.join(requested);
+        let Ok(canonical) = fs::canonicalize(candidate.as_path()) else {
+            continue;
+        };
+        if canonical.is_dir() && path_is_within_root(canonical.as_path(), root) {
+            return Ok(canonical);
+        }
+    }
+    Err(format!(
+        "{tool_name} workspace_root does not exist inside agent workspace roots: {workspace_root}"
+    ))
+}
+
+fn canonicalize_code_intel_roots(
+    roots: &[PathBuf],
+    tool_name: &str,
+) -> Result<Vec<(usize, PathBuf)>, String> {
+    let mut canonical = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        match fs::canonicalize(root) {
+            Ok(path) if path.is_dir() => canonical.push((index, path)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "{tool_name} failed to resolve workspace root {index}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+fn normalize_code_intel_path_input(path: &str) -> String {
+    let normalized = path.trim().replace('\\', "/");
+    let without_current = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
+    match without_current {
+        "." | "/workspace" | "/workspace/" | "workspace" | "workspace/" => String::new(),
+        _ => without_current
+            .strip_prefix("/workspace/")
+            .or_else(|| without_current.strip_prefix("workspace/"))
+            .unwrap_or(without_current)
+            .to_owned(),
+    }
+}
+
+fn validate_code_intel_path_syntax(path: &str, tool_name: &str) -> Result<(), String> {
+    if path.chars().any(char::is_control) {
+        return Err(format!("{tool_name} path contains unsupported characters"));
+    }
+    if path.contains(':') && !looks_like_windows_drive_path(path) {
+        return Err(format!("{tool_name} path contains unsupported characters"));
+    }
+    if path.is_empty() || Path::new(path).is_absolute() {
+        return Ok(());
+    }
+    if !Path::new(path).components().all(|component| matches!(component, Component::Normal(_))) {
+        return Err(format!(
+            "{tool_name} path must not contain root, prefix, '.', or '..' components"
+        ));
+    }
+    Ok(())
+}
+
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn path_component_eq_str(component: &std::ffi::OsStr, value: &str) -> bool {
+    #[cfg(windows)]
+    {
+        component.to_string_lossy().eq_ignore_ascii_case(value)
+    }
+    #[cfg(not(windows))]
+    {
+        component == std::ffi::OsStr::new(value)
+    }
+}
+
+fn code_intel_tool_outcome(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    success: bool,
+    output_json: Vec<u8>,
+    error: String,
+) -> ToolExecutionOutcome {
+    build_tool_execution_outcome(
+        proposal_id,
+        tool_name,
+        input_json,
+        success,
+        output_json,
+        error,
+        false,
+        "code_intel_runtime".to_owned(),
+        "workspace_roots".to_owned(),
+    )
 }
 
 /// Rust diagnostics provider backed by the rust-analyzer check pipeline.
@@ -2106,11 +3618,132 @@ mod tests {
             .expect("rust status should exist");
 
         assert!(rust.diagnostics_only);
-        assert!(!rust.supports_symbols);
-        assert!(!rust.supports_references);
         assert_eq!(rust.binary_label, "rust-analyzer");
         assert_eq!(rust_status.binary, "rust-analyzer");
+        assert!(rust.supports_symbols);
+        assert!(rust.supports_references);
         assert!(!rust_status.repair_hint.contains("tools/"));
+    }
+
+    #[test]
+    fn lexical_symbol_extractor_supports_rust_typescript_and_python() {
+        let rust_fixture = include_str!("../../../../../fixtures/code-intel/rust/src/lib.rs");
+        let typescript_fixture =
+            include_str!("../../../../../fixtures/code-intel/typescript/src/widget.ts");
+        let python_fixture =
+            include_str!("../../../../../fixtures/code-intel/python/src/widget.py");
+
+        let (rust_symbols, rust_truncated) = extract_symbols_from_source(
+            Some(CodeIntelLanguage::Rust),
+            "src/lib.rs",
+            rust_fixture,
+            16,
+        );
+        let (typescript_symbols, typescript_truncated) = extract_symbols_from_source(
+            Some(CodeIntelLanguage::TypeScript),
+            "src/widget.ts",
+            typescript_fixture,
+            16,
+        );
+        let (python_symbols, python_truncated) = extract_symbols_from_source(
+            Some(CodeIntelLanguage::Python),
+            "src/widget.py",
+            python_fixture,
+            16,
+        );
+
+        assert!(!rust_truncated);
+        assert!(!typescript_truncated);
+        assert!(!python_truncated);
+        assert!(rust_symbols.iter().any(|symbol| symbol.name == "build_widget"));
+        assert!(typescript_symbols.iter().any(|symbol| symbol.name == "buildWidget"));
+        assert!(python_symbols.iter().any(|symbol| symbol.name == "build_widget"));
+    }
+
+    #[test]
+    fn semantic_context_bounds_symbol_segments_with_refs() {
+        let symbols = (0..40)
+            .map(|index| CodeSymbol {
+                name: format!("symbol_{index}"),
+                kind: "function".to_owned(),
+                language: CodeIntelLanguage::Rust,
+                path: "src/lib.rs".to_owned(),
+                line: index + 1,
+                column: 1,
+                signature: format!("fn symbol_{index}()"),
+                visibility: "private".to_owned(),
+                source_ref: format!("src/lib.rs:{}:1", index + 1),
+            })
+            .collect::<Vec<_>>();
+
+        let context = CodeSemanticContextProvider::from_symbols(symbols.as_slice(), false);
+
+        assert_eq!(context.symbols.len(), CODE_INTEL_CONTEXT_SYMBOL_LIMIT);
+        assert!(context.truncated);
+        assert_eq!(context.source_refs.len(), CODE_INTEL_CONTEXT_SYMBOL_LIMIT);
+        assert_eq!(context.cache_policy, "volatile_workspace_snapshot");
+    }
+
+    #[test]
+    fn runtime_cwd_hints_detect_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::create_dir_all(temp.path().join("crates/example"))
+            .expect("fixture directory should be created");
+        std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n")
+            .expect("root manifest should be written");
+        std::fs::write(temp.path().join("crates/example/Cargo.toml"), "[package]\n")
+            .expect("crate manifest should be written");
+        let roots = vec![(0, temp.path().to_path_buf())];
+
+        let hints = detect_runtime_cwd_hints(roots.as_slice());
+
+        assert!(hints.iter().any(|hint| hint.manifest_path == "Cargo.toml"));
+        assert!(hints.iter().any(|hint| hint.cwd == "crates/example"));
+    }
+
+    #[test]
+    fn patch_impact_marks_public_symbol_changes_medium_risk() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::create_dir_all(temp.path().join("src"))
+            .expect("source directory should be created");
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn build_widget() {}\n")
+            .expect("source file should be written");
+        let files = vec![touched("src/lib.rs")];
+        let before = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/lib.rs".to_owned()],
+            provider_status: Vec::new(),
+            items: Vec::new(),
+            truncated: false,
+            degraded: false,
+            reason_codes: Vec::new(),
+        };
+        let after = before.clone();
+        let delta = DiagnosticDelta {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            new_errors: 0,
+            new_warnings: 0,
+            items: Vec::new(),
+            truncated: false,
+            provider_status: Vec::new(),
+            degraded: false,
+            reason_codes: Vec::new(),
+        };
+
+        let impact = patch_impact_analysis(
+            &[temp.path().to_path_buf()],
+            files.as_slice(),
+            &before,
+            &after,
+            &delta,
+        );
+
+        assert_eq!(impact.risk_level, "medium");
+        assert!(impact.touched_symbols.iter().any(|symbol| symbol.name == "build_widget"));
+        assert!(impact.verification_guidance.iter().any(|guidance| guidance.contains("Rust")));
     }
 
     #[test]
