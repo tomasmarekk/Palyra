@@ -183,6 +183,178 @@ pub struct DispatchOutcome {
     pub session_label: Option<String>,
 }
 
+#[allow(dead_code)]
+pub(crate) const CRON_RECONCILIATION_SCHEMA_VERSION: u64 = 1;
+
+/// Scheduler-start reconciliation input for one persisted cron job.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CronReconciliationInput {
+    pub job_id: String,
+    pub enabled: bool,
+    pub now_unix_ms: i64,
+    pub next_run_at_unix_ms: Option<i64>,
+    pub grace_ms: i64,
+    pub stagger_jitter_ms: u64,
+    pub active_run_count: usize,
+    pub stale_active_run_count: usize,
+    pub durable_history_count: usize,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub isolated_cleanup_succeeded: bool,
+}
+
+/// Reconciliation action selected before dispatch resumes.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CronReconciliationDecision {
+    Healthy,
+    RescheduleWithGrace,
+    RepairLostRun,
+    CleanupRequired,
+    Disabled,
+}
+
+/// Stable reason code for scheduler reconciliation evidence.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CronReconciliationReasonCode {
+    #[serde(rename = "cron_reconciliation.disabled")]
+    Disabled,
+    #[serde(rename = "cron_reconciliation.healthy")]
+    Healthy,
+    #[serde(rename = "cron_reconciliation.grace_window_applied")]
+    GraceWindowApplied,
+    #[serde(rename = "cron_reconciliation.stagger_jitter_recorded")]
+    StaggerJitterRecorded,
+    #[serde(rename = "cron_reconciliation.active_run_preserved")]
+    ActiveRunPreserved,
+    #[serde(rename = "cron_reconciliation.stale_run_cleanup_required")]
+    StaleRunCleanupRequired,
+    #[serde(rename = "cron_reconciliation.durable_history_recorded")]
+    DurableHistoryRecorded,
+    #[serde(rename = "cron_reconciliation.output_bounds_recorded")]
+    OutputBoundsRecorded,
+    #[serde(rename = "cron_reconciliation.isolated_cleanup_verified")]
+    IsolatedCleanupVerified,
+}
+
+#[allow(dead_code)]
+impl CronReconciliationReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "cron_reconciliation.disabled",
+            Self::Healthy => "cron_reconciliation.healthy",
+            Self::GraceWindowApplied => "cron_reconciliation.grace_window_applied",
+            Self::StaggerJitterRecorded => "cron_reconciliation.stagger_jitter_recorded",
+            Self::ActiveRunPreserved => "cron_reconciliation.active_run_preserved",
+            Self::StaleRunCleanupRequired => "cron_reconciliation.stale_run_cleanup_required",
+            Self::DurableHistoryRecorded => "cron_reconciliation.durable_history_recorded",
+            Self::OutputBoundsRecorded => "cron_reconciliation.output_bounds_recorded",
+            Self::IsolatedCleanupVerified => "cron_reconciliation.isolated_cleanup_verified",
+        }
+    }
+}
+
+/// Metadata-only reconciliation projection recorded before scheduler dispatch.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CronReconciliationProjection {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: CronReconciliationDecision,
+    pub reason_codes: Vec<CronReconciliationReasonCode>,
+    pub job_id_hash: String,
+    pub grace_ms: i64,
+    pub stagger_jitter_ms: u64,
+    pub active_run_count: usize,
+    pub stale_active_run_count: usize,
+    pub durable_history_count: usize,
+    pub stdout_redacted: bool,
+    pub stderr_redacted: bool,
+    pub isolated_cleanup_succeeded: bool,
+    pub trace_json: String,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn cron_reconciliation_projection(
+    input: &CronReconciliationInput,
+) -> CronReconciliationProjection {
+    let mut reason_codes = Vec::new();
+    let decision = if !input.enabled {
+        reason_codes.push(CronReconciliationReasonCode::Disabled);
+        CronReconciliationDecision::Disabled
+    } else if input.stale_active_run_count > 0 {
+        reason_codes.push(CronReconciliationReasonCode::StaleRunCleanupRequired);
+        CronReconciliationDecision::CleanupRequired
+    } else if input.active_run_count > 0 {
+        reason_codes.push(CronReconciliationReasonCode::ActiveRunPreserved);
+        CronReconciliationDecision::RepairLostRun
+    } else if input
+        .next_run_at_unix_ms
+        .is_some_and(|next_run| next_run.saturating_add(input.grace_ms) < input.now_unix_ms)
+    {
+        reason_codes.push(CronReconciliationReasonCode::GraceWindowApplied);
+        CronReconciliationDecision::RescheduleWithGrace
+    } else {
+        reason_codes.push(CronReconciliationReasonCode::Healthy);
+        CronReconciliationDecision::Healthy
+    };
+    if input.stagger_jitter_ms > 0 {
+        reason_codes.push(CronReconciliationReasonCode::StaggerJitterRecorded);
+    }
+    if input.durable_history_count > 0 {
+        reason_codes.push(CronReconciliationReasonCode::DurableHistoryRecorded);
+    }
+    if input.stdout_bytes > 0 || input.stderr_bytes > 0 {
+        reason_codes.push(CronReconciliationReasonCode::OutputBoundsRecorded);
+    }
+    if input.isolated_cleanup_succeeded {
+        reason_codes.push(CronReconciliationReasonCode::IsolatedCleanupVerified);
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
+
+    let job_id_hash = crate::sha256_hex(input.job_id.as_bytes());
+    let stdout_redacted = input.stdout_bytes > 0;
+    let stderr_redacted = input.stderr_bytes > 0;
+    let trace = json!({
+        "schema_version": CRON_RECONCILIATION_SCHEMA_VERSION,
+        "event_type": "cron.reconciliation",
+        "decision": decision,
+        "reason_codes": reason_codes.iter().map(|code| code.as_str()).collect::<Vec<_>>(),
+        "job_id_hash": job_id_hash,
+        "grace_ms": input.grace_ms,
+        "stagger_jitter_ms": input.stagger_jitter_ms,
+        "active_run_count": input.active_run_count,
+        "stale_active_run_count": input.stale_active_run_count,
+        "durable_history_count": input.durable_history_count,
+        "stdout_redacted": stdout_redacted,
+        "stderr_redacted": stderr_redacted,
+        "isolated_cleanup_succeeded": input.isolated_cleanup_succeeded,
+    });
+
+    CronReconciliationProjection {
+        schema_version: CRON_RECONCILIATION_SCHEMA_VERSION,
+        event_type: "cron.reconciliation".to_owned(),
+        decision,
+        reason_codes,
+        job_id_hash,
+        grace_ms: input.grace_ms,
+        stagger_jitter_ms: input.stagger_jitter_ms,
+        active_run_count: input.active_run_count,
+        stale_active_run_count: input.stale_active_run_count,
+        durable_history_count: input.durable_history_count,
+        stdout_redacted,
+        stderr_redacted,
+        isolated_cleanup_succeeded: input.isolated_cleanup_succeeded,
+        trace_json: trace.to_string(),
+    }
+}
+
 /// How the scheduler recovers a job whose due tick was missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronMisfireRecoveryAction {
@@ -4221,17 +4393,19 @@ mod tests {
         build_scheduler_health_snapshot, compute_misfire_recovery_plan, compute_next_run_after,
         cron_completion_candidate_for_tool_proposal, cron_job_allows_read_only_noop_success,
         cron_job_requires_completion_tool, cron_misfire_audit_payload,
-        cron_terminal_status_from_stream, decide_concurrency_policy, effective_cron_session_key,
-        effective_cron_session_label, load_periodic_reaudit_skills_index, max_runs_for_job,
-        merged_parameter_delta_json, normalize_schedule, now_unix_ms_or_fallback,
-        panicked_cron_run_finalize_request, parse_skill_reaudit_interval, periodic_reaudit_targets,
-        reserved_cron_run_slot_count, routine_approval_subject_id, routine_gate_error_kind,
-        routine_parameter_delta_json, routines_automation_enabled,
-        scheduled_routine_approval_matches, scheduled_routine_requires_first_run_approval,
-        scheduled_routine_run_metadata_upsert, scheduler_attempt_failure,
-        scheduler_retry_backoff_delay_ms, should_disable_exhausted_scheduled_one_shot,
+        cron_reconciliation_projection, cron_terminal_status_from_stream,
+        decide_concurrency_policy, effective_cron_session_key, effective_cron_session_label,
+        load_periodic_reaudit_skills_index, max_runs_for_job, merged_parameter_delta_json,
+        normalize_schedule, now_unix_ms_or_fallback, panicked_cron_run_finalize_request,
+        parse_skill_reaudit_interval, periodic_reaudit_targets, reserved_cron_run_slot_count,
+        routine_approval_subject_id, routine_gate_error_kind, routine_parameter_delta_json,
+        routines_automation_enabled, scheduled_routine_approval_matches,
+        scheduled_routine_requires_first_run_approval, scheduled_routine_run_metadata_upsert,
+        scheduler_attempt_failure, scheduler_retry_backoff_delay_ms,
+        should_disable_exhausted_scheduled_one_shot,
         should_pause_recurring_cron_after_policy_denied, should_repair_stale_cron_run,
         visible_cron_job_enabled, ConcurrencyDecision, CronMatcher, CronMisfireRecoveryAction,
+        CronReconciliationDecision, CronReconciliationInput, CronReconciliationReasonCode,
         CronTimezoneMode, InstalledSkillRecord, InstalledSkillsIndex, SchedulerHealthInput,
         TriggerJobOptions, CRON_MAX_RUNS_EXHAUSTED_ERROR_KIND, MAX_RETRY_BACKOFF_MS,
         OBJECTIVE_BUDGET_EXHAUSTED_ERROR_KIND, ROUTINE_APPROVAL_POLICY_ID,
@@ -4301,6 +4475,59 @@ mod tests {
             created_at_unix_ms: 0,
             updated_at_unix_ms,
         }
+    }
+
+    #[test]
+    fn cron_reconciliation_projects_grace_reschedule_with_history() {
+        let projection = cron_reconciliation_projection(&CronReconciliationInput {
+            job_id: "job-1".to_owned(),
+            enabled: true,
+            now_unix_ms: 20_000,
+            next_run_at_unix_ms: Some(10_000),
+            grace_ms: 1_000,
+            stagger_jitter_ms: 250,
+            active_run_count: 0,
+            stale_active_run_count: 0,
+            durable_history_count: 3,
+            stdout_bytes: 128,
+            stderr_bytes: 0,
+            isolated_cleanup_succeeded: true,
+        });
+
+        assert_eq!(projection.decision, CronReconciliationDecision::RescheduleWithGrace);
+        assert!(projection
+            .reason_codes
+            .contains(&CronReconciliationReasonCode::GraceWindowApplied));
+        assert!(projection
+            .reason_codes
+            .contains(&CronReconciliationReasonCode::StaggerJitterRecorded));
+        assert!(projection.stdout_redacted);
+        assert!(!projection.trace_json.contains("job-1"));
+    }
+
+    #[test]
+    fn cron_reconciliation_requires_cleanup_for_stale_active_runs() {
+        let projection = cron_reconciliation_projection(&CronReconciliationInput {
+            job_id: "job-2".to_owned(),
+            enabled: true,
+            now_unix_ms: 20_000,
+            next_run_at_unix_ms: Some(30_000),
+            grace_ms: 1_000,
+            stagger_jitter_ms: 0,
+            active_run_count: 1,
+            stale_active_run_count: 1,
+            durable_history_count: 1,
+            stdout_bytes: 0,
+            stderr_bytes: 64,
+            isolated_cleanup_succeeded: false,
+        });
+
+        assert_eq!(projection.decision, CronReconciliationDecision::CleanupRequired);
+        assert!(projection
+            .reason_codes
+            .contains(&CronReconciliationReasonCode::StaleRunCleanupRequired));
+        assert!(projection.stderr_redacted);
+        assert!(!projection.isolated_cleanup_succeeded);
     }
 
     fn sample_scheduled_routine_approval(

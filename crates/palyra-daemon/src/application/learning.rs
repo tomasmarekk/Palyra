@@ -1404,6 +1404,227 @@ fn learning_candidate_requires_eval(candidate: &LearningCandidateRecord) -> bool
     )
 }
 
+/// Input for the observe-only learning lifecycle gate projection.
+#[allow(dead_code)]
+pub(crate) struct LearningLifecycleGateInput<'a> {
+    pub candidate_id: &'a str,
+    pub candidate_kind: &'a str,
+    pub status: &'a str,
+    pub risk_level: &'a str,
+    pub content: &'a Value,
+    pub eval_passed: bool,
+    pub operator_approved: bool,
+    pub rollback_requested: bool,
+    pub activation_scope_kind: Option<&'a str>,
+    pub activation_scope_id: Option<&'a str>,
+}
+
+/// Lifecycle decision for a learning candidate before it can influence memory or skills.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LearningLifecycleGateDecision {
+    PendingReview,
+    EvalRequired,
+    ReadyForActivation,
+    Rollback,
+    Rejected,
+}
+
+/// Stable lifecycle reason code for learning candidate governance.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LearningLifecycleGateReasonCode {
+    #[serde(rename = "learning_lifecycle.operator_review_required")]
+    OperatorReviewRequired,
+    #[serde(rename = "learning_lifecycle.eval_required")]
+    EvalRequired,
+    #[serde(rename = "learning_lifecycle.eval_passed")]
+    EvalPassed,
+    #[serde(rename = "learning_lifecycle.scope_bound")]
+    ScopeBound,
+    #[serde(rename = "learning_lifecycle.rollback_requested")]
+    RollbackRequested,
+    #[serde(rename = "learning_lifecycle.secret_exposure_rejected")]
+    SecretExposureRejected,
+    #[serde(rename = "learning_lifecycle.policy_widening_rejected")]
+    PolicyWideningRejected,
+    #[serde(rename = "learning_lifecycle.out_of_scope_rejected")]
+    OutOfScopeRejected,
+}
+
+#[allow(dead_code)]
+impl LearningLifecycleGateReasonCode {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OperatorReviewRequired => "learning_lifecycle.operator_review_required",
+            Self::EvalRequired => "learning_lifecycle.eval_required",
+            Self::EvalPassed => "learning_lifecycle.eval_passed",
+            Self::ScopeBound => "learning_lifecycle.scope_bound",
+            Self::RollbackRequested => "learning_lifecycle.rollback_requested",
+            Self::SecretExposureRejected => "learning_lifecycle.secret_exposure_rejected",
+            Self::PolicyWideningRejected => "learning_lifecycle.policy_widening_rejected",
+            Self::OutOfScopeRejected => "learning_lifecycle.out_of_scope_rejected",
+        }
+    }
+}
+
+/// Metadata-only lifecycle projection; it never applies or rolls back memory.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LearningLifecycleGateProjection {
+    pub schema_version: u64,
+    pub event_type: String,
+    pub decision: LearningLifecycleGateDecision,
+    pub reason_codes: Vec<LearningLifecycleGateReasonCode>,
+    pub candidate_id_hash: String,
+    pub candidate_kind: String,
+    pub status: String,
+    pub risk_level: String,
+    pub activation_scope_kind: Option<String>,
+    pub activation_scope_id_hash: Option<String>,
+    pub eval_passed: bool,
+    pub operator_approved: bool,
+    pub rollback_requested: bool,
+    pub active_memory_activation: bool,
+    pub redaction_level: String,
+    pub trace_json: String,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn learning_lifecycle_gate_projection(
+    input: LearningLifecycleGateInput<'_>,
+) -> LearningLifecycleGateProjection {
+    let mut reason_codes = BTreeSet::new();
+    let requires_eval = learning_kind_or_risk_requires_eval(input.candidate_kind, input.risk_level);
+    let mut rejected = learning_lifecycle_rejection(input.content, &mut reason_codes);
+    if learning_scope_mismatch(
+        input.content,
+        input.activation_scope_kind,
+        input.activation_scope_id,
+    )
+    .is_some()
+    {
+        reason_codes.insert(LearningLifecycleGateReasonCode::OutOfScopeRejected);
+        rejected = true;
+    }
+
+    if input.rollback_requested {
+        reason_codes.insert(LearningLifecycleGateReasonCode::RollbackRequested);
+    }
+    if !input.operator_approved {
+        reason_codes.insert(LearningLifecycleGateReasonCode::OperatorReviewRequired);
+    }
+    if requires_eval {
+        if input.eval_passed {
+            reason_codes.insert(LearningLifecycleGateReasonCode::EvalPassed);
+        } else {
+            reason_codes.insert(LearningLifecycleGateReasonCode::EvalRequired);
+        }
+    }
+    if input.activation_scope_kind.is_some() && input.activation_scope_id.is_some() {
+        reason_codes.insert(LearningLifecycleGateReasonCode::ScopeBound);
+    }
+
+    let decision = if rejected {
+        LearningLifecycleGateDecision::Rejected
+    } else if input.rollback_requested {
+        LearningLifecycleGateDecision::Rollback
+    } else if !input.operator_approved {
+        LearningLifecycleGateDecision::PendingReview
+    } else if requires_eval && !input.eval_passed {
+        LearningLifecycleGateDecision::EvalRequired
+    } else {
+        LearningLifecycleGateDecision::ReadyForActivation
+    };
+    let active_memory_activation = decision == LearningLifecycleGateDecision::ReadyForActivation;
+    let candidate_id_hash = crate::sha256_hex(input.candidate_id.as_bytes());
+    let activation_scope_id_hash =
+        input.activation_scope_id.map(|scope_id| crate::sha256_hex(scope_id.as_bytes()));
+    let trace = json!({
+        "schema_version": LEARNING_CURATOR_SCHEMA_VERSION,
+        "event_type": "learning.lifecycle_gate",
+        "candidate_id_hash": candidate_id_hash,
+        "decision": decision,
+        "reason_codes": reason_codes.iter().map(|code| code.as_str()).collect::<Vec<_>>(),
+        "candidate_kind": input.candidate_kind,
+        "status": input.status,
+        "risk_level": input.risk_level,
+        "activation_scope_kind": input.activation_scope_kind,
+        "activation_scope_id_hash": activation_scope_id_hash,
+        "active_memory_activation": active_memory_activation,
+        "redaction_level": LEARNING_AUDIT_METADATA_REDACTION_LEVEL,
+    });
+
+    LearningLifecycleGateProjection {
+        schema_version: LEARNING_CURATOR_SCHEMA_VERSION,
+        event_type: "learning.lifecycle_gate".to_owned(),
+        decision,
+        reason_codes: reason_codes.into_iter().collect(),
+        candidate_id_hash,
+        candidate_kind: input.candidate_kind.to_owned(),
+        status: input.status.to_owned(),
+        risk_level: input.risk_level.to_owned(),
+        activation_scope_kind: input.activation_scope_kind.map(ToOwned::to_owned),
+        activation_scope_id_hash,
+        eval_passed: input.eval_passed,
+        operator_approved: input.operator_approved,
+        rollback_requested: input.rollback_requested,
+        active_memory_activation,
+        redaction_level: LEARNING_AUDIT_METADATA_REDACTION_LEVEL.to_owned(),
+        trace_json: trace.to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn learning_kind_or_risk_requires_eval(candidate_kind: &str, risk_level: &str) -> bool {
+    matches!(
+        candidate_kind,
+        PATCH_SKILL_CANDIDATE_KIND
+            | PATCH_PROCEDURE_CANDIDATE_KIND
+            | PATCH_SUPPORT_FILE_CANDIDATE_KIND
+    ) || matches!(
+        risk_level.trim().to_ascii_lowercase().as_str(),
+        "high" | "review" | "sensitive" | "poisoned" | "blocked_sensitive" | "blocked_poisoned"
+    )
+}
+
+#[allow(dead_code)]
+fn learning_lifecycle_rejection(
+    content: &Value,
+    reason_codes: &mut BTreeSet<LearningLifecycleGateReasonCode>,
+) -> bool {
+    let mut rejected = false;
+    if content.pointer("/safety/secret_exposure").and_then(Value::as_bool).unwrap_or(false)
+        || !json_pointer_string_array(content, "/safety/secret_refs").is_empty()
+    {
+        reason_codes.insert(LearningLifecycleGateReasonCode::SecretExposureRejected);
+        rejected = true;
+    }
+    if content.pointer("/safety/policy_widening").and_then(Value::as_bool).unwrap_or(false)
+        || !json_pointer_string_array(content, "/safety/policy_widening_signals").is_empty()
+    {
+        reason_codes.insert(LearningLifecycleGateReasonCode::PolicyWideningRejected);
+        rejected = true;
+    }
+    rejected
+}
+
+#[allow(dead_code)]
+fn learning_scope_mismatch(
+    content: &Value,
+    activation_scope_kind: Option<&str>,
+    activation_scope_id: Option<&str>,
+) -> Option<()> {
+    let expected_kind = content.pointer("/scope/kind").and_then(Value::as_str)?;
+    let expected_id = content.pointer("/scope/id").and_then(Value::as_str)?;
+    let actual_kind = activation_scope_kind?;
+    let actual_id = activation_scope_id?;
+    (expected_kind != actual_kind || expected_id != actual_id).then_some(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn record_learning_rollout(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -4435,6 +4656,96 @@ mod tests {
         assert!(decoded
             .reason_codes
             .contains(&SkillInvocationHygieneReasonCode::MissingWorkspacePatchValidation));
+    }
+
+    #[test]
+    fn learning_lifecycle_gate_requires_review_and_eval_before_activation() {
+        let content = json!({
+            "scope": {
+                "kind": "workspace",
+                "id": "session-1",
+            },
+        });
+
+        let projection = learning_lifecycle_gate_projection(LearningLifecycleGateInput {
+            candidate_id: "candidate-1",
+            candidate_kind: "patch_procedure",
+            status: "pending",
+            risk_level: "review",
+            content: &content,
+            eval_passed: false,
+            operator_approved: false,
+            rollback_requested: false,
+            activation_scope_kind: Some("workspace"),
+            activation_scope_id: Some("session-1"),
+        });
+
+        assert_eq!(projection.decision, LearningLifecycleGateDecision::PendingReview);
+        assert!(projection
+            .reason_codes
+            .contains(&LearningLifecycleGateReasonCode::OperatorReviewRequired));
+        assert!(projection.reason_codes.contains(&LearningLifecycleGateReasonCode::EvalRequired));
+        assert!(!projection.active_memory_activation);
+        assert!(!projection.trace_json.contains("candidate-1"));
+    }
+
+    #[test]
+    fn learning_lifecycle_gate_rejects_secret_and_policy_widening() {
+        let content = json!({
+            "safety": {
+                "secret_exposure": true,
+                "policy_widening_signals": ["secret_scope_changed"],
+            },
+        });
+
+        let projection = learning_lifecycle_gate_projection(LearningLifecycleGateInput {
+            candidate_id: "candidate-2",
+            candidate_kind: "preference",
+            status: "approved",
+            risk_level: "normal",
+            content: &content,
+            eval_passed: true,
+            operator_approved: true,
+            rollback_requested: false,
+            activation_scope_kind: Some("profile"),
+            activation_scope_id: Some("user:ops"),
+        });
+
+        assert_eq!(projection.decision, LearningLifecycleGateDecision::Rejected);
+        assert!(projection
+            .reason_codes
+            .contains(&LearningLifecycleGateReasonCode::SecretExposureRejected));
+        assert!(projection
+            .reason_codes
+            .contains(&LearningLifecycleGateReasonCode::PolicyWideningRejected));
+    }
+
+    #[test]
+    fn learning_lifecycle_gate_allows_scoped_activation_after_eval() {
+        let content = json!({
+            "scope": {
+                "kind": "profile",
+                "id": "user:ops",
+            },
+        });
+
+        let projection = learning_lifecycle_gate_projection(LearningLifecycleGateInput {
+            candidate_id: "candidate-3",
+            candidate_kind: "patch_skill",
+            status: "approved",
+            risk_level: "review",
+            content: &content,
+            eval_passed: true,
+            operator_approved: true,
+            rollback_requested: false,
+            activation_scope_kind: Some("profile"),
+            activation_scope_id: Some("user:ops"),
+        });
+
+        assert_eq!(projection.decision, LearningLifecycleGateDecision::ReadyForActivation);
+        assert!(projection.active_memory_activation);
+        assert!(projection.reason_codes.contains(&LearningLifecycleGateReasonCode::EvalPassed));
+        assert!(projection.reason_codes.contains(&LearningLifecycleGateReasonCode::ScopeBound));
     }
 
     #[test]
