@@ -18,7 +18,8 @@ use palyra_common::feature_rollouts::DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV;
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 use palyra_common::runtime_roadmap::{
-    runtime_roadmap_capability_catalog, runtime_roadmap_phase0_harness_projection,
+    runtime_boundary_event_taxonomy, runtime_roadmap_capability_catalog,
+    runtime_roadmap_phase0_harness_projection, runtime_roadmap_phase1_trajectory_projection,
     RUNTIME_ROADMAP_SCHEMA_VERSION,
 };
 
@@ -1192,11 +1193,23 @@ fn collect_console_runtime_roadmap_diagnostics() -> Value {
             "error": error.to_string(),
         }),
     };
+    let phase1_trajectories = match runtime_roadmap_phase1_trajectory_projection() {
+        Ok(projection) => json!({
+            "valid": true,
+            "projection": projection,
+        }),
+        Err(error) => json!({
+            "valid": false,
+            "error": error.to_string(),
+        }),
+    };
 
     json!({
         "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
         "capabilities": runtime_roadmap_capability_catalog(),
+        "boundary_taxonomy": runtime_boundary_event_taxonomy(),
         "phase0_harness": phase0_harness,
+        "phase1_trajectories": phase1_trajectories,
     })
 }
 

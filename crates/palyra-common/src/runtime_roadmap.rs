@@ -8,18 +8,28 @@
 use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::feature_rollouts::{
-    AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH, AGENT_PLAN_STATE_ROLLOUT_ENV,
-    ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
-    CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH, CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
-    COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
+    ACP_RUNTIME_ROLLOUT_CONFIG_PATH, ACP_RUNTIME_ROLLOUT_ENV, ADVISOR_FANOUT_ROLLOUT_CONFIG_PATH,
+    ADVISOR_FANOUT_ROLLOUT_ENV, AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH,
+    AGENT_HARNESS_RUNTIME_ROLLOUT_ENV, AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH,
+    AGENT_PLAN_STATE_ROLLOUT_ENV, ATTACK_SURFACE_AUDIT_ROLLOUT_CONFIG_PATH,
+    ATTACK_SURFACE_AUDIT_ROLLOUT_ENV, BROWSER_RESCUE_ROLLOUT_CONFIG_PATH,
+    BROWSER_RESCUE_ROLLOUT_ENV, CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH,
+    CHANNEL_TURN_KERNEL_ROLLOUT_ENV, COMPACTION_SAFEGUARD_ROLLOUT_CONFIG_PATH,
+    COMPACTION_SAFEGUARD_ROLLOUT_ENV, INLINE_RUNTIME_HOOKS_ROLLOUT_CONFIG_PATH,
+    INLINE_RUNTIME_HOOKS_ROLLOUT_ENV, LSP_SERVICE_ROLLOUT_CONFIG_PATH, LSP_SERVICE_ROLLOUT_ENV,
     OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH, OBJECTIVE_JUDGE_ROLLOUT_ENV,
     PROGRESS_DRAFTS_ROLLOUT_CONFIG_PATH, PROGRESS_DRAFTS_ROLLOUT_ENV,
+    PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH, PROVIDER_RECOVERY_ROLLOUT_ENV,
     PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH, PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
+    TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH, TERMINAL_SESSIONS_ROLLOUT_ENV,
     TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV,
+    TOOL_RESULT_MIDDLEWARE_ROLLOUT_CONFIG_PATH, TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV,
     VERIFICATION_RUNTIME_ROLLOUT_CONFIG_PATH, VERIFICATION_RUNTIME_ROLLOUT_ENV,
 };
+use crate::redaction::{is_sensitive_key, redact_diagnostic_text};
 
 /// Schema version stamped on runtime-roadmap journal payloads and catalog snapshots.
 pub const RUNTIME_ROADMAP_SCHEMA_VERSION: u32 = 1;
@@ -86,8 +96,17 @@ runtime_roadmap_enum! {
         ReplayRegressionHarness => "replay_regression_harness",
         MilestoneImplementationStyle => "milestone_implementation_style",
         IntegrationSmokeValidation => "integration_smoke_validation",
+        AgentHarnessRuntime => "agent_harness_runtime",
+        InlineRuntimeHooks => "inline_runtime_hooks",
+        ToolResultMiddleware => "tool_result_middleware",
         ToolRepair => "tool_repair",
         ProviderStreamNormalizer => "provider_stream_normalizer",
+        ProviderRecovery => "provider_recovery",
+        TerminalSessions => "terminal_sessions",
+        BrowserRescue => "browser_rescue",
+        LspService => "lsp_service",
+        AdvisorFanout => "advisor_fanout",
+        AcpRuntime => "acp_runtime",
         ChannelTurnKernel => "channel_turn_kernel",
         AgentPlanState => "agent_plan_state",
         ObjectiveJudge => "objective_judge",
@@ -99,7 +118,7 @@ runtime_roadmap_enum! {
 }
 
 /// Every runtime-roadmap capability, in canonical display order.
-pub const ALL_RUNTIME_ROADMAP_CAPABILITIES: [RuntimeRoadmapCapability; 16] = [
+pub const ALL_RUNTIME_ROADMAP_CAPABILITIES: [RuntimeRoadmapCapability; 25] = [
     RuntimeRoadmapCapability::BaselineContracts,
     RuntimeRoadmapCapability::ReasonCodeTaxonomy,
     RuntimeRoadmapCapability::JournalSchemaExtension,
@@ -107,8 +126,17 @@ pub const ALL_RUNTIME_ROADMAP_CAPABILITIES: [RuntimeRoadmapCapability; 16] = [
     RuntimeRoadmapCapability::ReplayRegressionHarness,
     RuntimeRoadmapCapability::MilestoneImplementationStyle,
     RuntimeRoadmapCapability::IntegrationSmokeValidation,
+    RuntimeRoadmapCapability::AgentHarnessRuntime,
+    RuntimeRoadmapCapability::InlineRuntimeHooks,
+    RuntimeRoadmapCapability::ToolResultMiddleware,
     RuntimeRoadmapCapability::ToolRepair,
     RuntimeRoadmapCapability::ProviderStreamNormalizer,
+    RuntimeRoadmapCapability::ProviderRecovery,
+    RuntimeRoadmapCapability::TerminalSessions,
+    RuntimeRoadmapCapability::BrowserRescue,
+    RuntimeRoadmapCapability::LspService,
+    RuntimeRoadmapCapability::AdvisorFanout,
+    RuntimeRoadmapCapability::AcpRuntime,
     RuntimeRoadmapCapability::ChannelTurnKernel,
     RuntimeRoadmapCapability::AgentPlanState,
     RuntimeRoadmapCapability::ObjectiveJudge,
@@ -130,8 +158,17 @@ impl RuntimeRoadmapCapability {
             Self::ReplayRegressionHarness => "Replay regression harness",
             Self::MilestoneImplementationStyle => "Milestone implementation style",
             Self::IntegrationSmokeValidation => "Integration smoke validation",
+            Self::AgentHarnessRuntime => "Agent harness runtime",
+            Self::InlineRuntimeHooks => "Inline runtime hooks",
+            Self::ToolResultMiddleware => "Tool result middleware",
             Self::ToolRepair => "Tool repair",
             Self::ProviderStreamNormalizer => "Provider stream normalizer",
+            Self::ProviderRecovery => "Provider recovery",
+            Self::TerminalSessions => "Terminal sessions",
+            Self::BrowserRescue => "Browser rescue",
+            Self::LspService => "LSP service",
+            Self::AdvisorFanout => "Advisor fanout",
+            Self::AcpRuntime => "ACP runtime",
             Self::ChannelTurnKernel => "Channel turn kernel",
             Self::AgentPlanState => "Agent plan state",
             Self::ObjectiveJudge => "Objective judge",
@@ -167,9 +204,36 @@ impl RuntimeRoadmapCapability {
             Self::IntegrationSmokeValidation => {
                 "Pins smoke targets for journal, run-stream, fixture, and diagnostics integration points."
             }
+            Self::AgentHarnessRuntime => {
+                "Guards agent harness selection, lifecycle, callbacks, transcripts, and authority fences."
+            }
+            Self::InlineRuntimeHooks => {
+                "Guards inline hook invocation points before they enter the critical run loop."
+            }
+            Self::ToolResultMiddleware => {
+                "Guards tool-result middleware before model-visible projection changes."
+            }
             Self::ToolRepair => "Guards tool-call repair parsing and proposal recovery.",
             Self::ProviderStreamNormalizer => {
                 "Guards provider stream normalization before tool proposal flow."
+            }
+            Self::ProviderRecovery => {
+                "Guards bounded provider retry, repair, auth failover, and terminal recovery decisions."
+            }
+            Self::TerminalSessions => {
+                "Guards persistent terminal process handles, cwd/env state, and cleanup evidence."
+            }
+            Self::BrowserRescue => {
+                "Guards browser vision, dialog, CDP, and multimodal rescue boundaries."
+            }
+            Self::LspService => {
+                "Guards code-intelligence service lifecycle, diagnostics, and workspace scoping."
+            }
+            Self::AdvisorFanout => {
+                "Guards advisor fanout, trace attribution, budget governance, and non-authoritative reviews."
+            }
+            Self::AcpRuntime => {
+                "Guards ACP runtime actor queues, permissions, replay, and native handoff boundaries."
             }
             Self::ChannelTurnKernel => {
                 "Guards channel turn admission, debounce, history, and delivery lifecycle work."
@@ -200,6 +264,18 @@ impl RuntimeRoadmapCapability {
             | Self::ReplayRegressionHarness
             | Self::MilestoneImplementationStyle
             | Self::IntegrationSmokeValidation => None,
+            Self::AgentHarnessRuntime => Some(RuntimeRoadmapRolloutGate::new(
+                AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
+                AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::InlineRuntimeHooks => Some(RuntimeRoadmapRolloutGate::new(
+                INLINE_RUNTIME_HOOKS_ROLLOUT_ENV,
+                INLINE_RUNTIME_HOOKS_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::ToolResultMiddleware => Some(RuntimeRoadmapRolloutGate::new(
+                TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV,
+                TOOL_RESULT_MIDDLEWARE_ROLLOUT_CONFIG_PATH,
+            )),
             Self::ToolRepair => Some(RuntimeRoadmapRolloutGate::new(
                 TOOL_REPAIR_ROLLOUT_ENV,
                 TOOL_REPAIR_ROLLOUT_CONFIG_PATH,
@@ -207,6 +283,30 @@ impl RuntimeRoadmapCapability {
             Self::ProviderStreamNormalizer => Some(RuntimeRoadmapRolloutGate::new(
                 PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
                 PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::ProviderRecovery => Some(RuntimeRoadmapRolloutGate::new(
+                PROVIDER_RECOVERY_ROLLOUT_ENV,
+                PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::TerminalSessions => Some(RuntimeRoadmapRolloutGate::new(
+                TERMINAL_SESSIONS_ROLLOUT_ENV,
+                TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::BrowserRescue => Some(RuntimeRoadmapRolloutGate::new(
+                BROWSER_RESCUE_ROLLOUT_ENV,
+                BROWSER_RESCUE_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::LspService => Some(RuntimeRoadmapRolloutGate::new(
+                LSP_SERVICE_ROLLOUT_ENV,
+                LSP_SERVICE_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::AdvisorFanout => Some(RuntimeRoadmapRolloutGate::new(
+                ADVISOR_FANOUT_ROLLOUT_ENV,
+                ADVISOR_FANOUT_ROLLOUT_CONFIG_PATH,
+            )),
+            Self::AcpRuntime => Some(RuntimeRoadmapRolloutGate::new(
+                ACP_RUNTIME_ROLLOUT_ENV,
+                ACP_RUNTIME_ROLLOUT_CONFIG_PATH,
             )),
             Self::ChannelTurnKernel => Some(RuntimeRoadmapRolloutGate::new(
                 CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
@@ -300,6 +400,10 @@ runtime_roadmap_enum! {
         ImplementationStyleDocumented => "runtime_roadmap.implementation_style.documented",
         IntegrationSmokeTargetVerified => "runtime_roadmap.integration_smoke.target_verified",
         FixtureValidationFailed => "runtime_roadmap.fixture.validation_failed",
+        GoldenTrajectoryAccepted => "runtime_roadmap.trajectory.golden_fixture_accepted",
+        SecurityInvariantAccepted => "runtime_roadmap.security.invariant_fixture_accepted",
+        BoundaryTaxonomyCatalogued => "runtime_roadmap.boundary_taxonomy.catalogued",
+        BoundaryMetadataRedacted => "runtime_roadmap.boundary_taxonomy.metadata_redacted",
         InvalidContractRejected => "runtime_roadmap.contract.invalid"
     }
 }
@@ -369,6 +473,631 @@ pub fn runtime_roadmap_capability_catalog() -> Vec<RuntimeRoadmapCapabilityDescr
         .into_iter()
         .map(RuntimeRoadmapCapabilityDescriptor::from_capability)
         .collect()
+}
+
+runtime_roadmap_enum! {
+    /// Runtime boundary families that must share stable reason-code and diagnostics names.
+    pub enum RuntimeBoundaryFamily {
+        Harness => "harness",
+        Hook => "hook",
+        Middleware => "middleware",
+        ProviderStream => "provider_stream",
+        TurnRecovery => "turn_recovery",
+        Terminal => "terminal",
+        BrowserRescue => "browser_rescue",
+        Lsp => "lsp",
+        Acp => "acp",
+        Learning => "learning"
+    }
+}
+
+runtime_roadmap_enum! {
+    /// Operator-facing severity attached to a boundary event family.
+    pub enum RuntimeBoundarySeverity {
+        Info => "info",
+        Warning => "warning",
+        Error => "error"
+    }
+}
+
+runtime_roadmap_enum! {
+    /// Whether a runtime boundary event can be retried automatically.
+    pub enum RuntimeBoundaryRetryability {
+        Retryable => "retryable",
+        NonRetryable => "non_retryable",
+        OperatorActionRequired => "operator_action_required"
+    }
+}
+
+runtime_roadmap_enum! {
+    /// Where a boundary event may be surfaced after redaction.
+    pub enum RuntimeBoundaryVisibilityPolicy {
+        InternalDiagnostics => "internal_diagnostics",
+        OperatorDiagnostics => "operator_diagnostics",
+        AuditAndReplay => "audit_and_replay",
+        ModelVisibleSummary => "model_visible_summary"
+    }
+}
+
+/// Stable diagnostics/audit descriptor for one runtime boundary event family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBoundaryEventDescriptor {
+    pub schema_version: u32,
+    pub family: RuntimeBoundaryFamily,
+    pub event_name: String,
+    pub severity: RuntimeBoundarySeverity,
+    pub retryability: RuntimeBoundaryRetryability,
+    pub visibility_policy: RuntimeBoundaryVisibilityPolicy,
+    pub redaction_boundary: RuntimeRoadmapRedactionBoundary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollout_capability: Option<RuntimeRoadmapCapability>,
+    pub metadata_keys: Vec<String>,
+}
+
+const RUNTIME_BOUNDARY_METADATA_LIMIT_BYTES: usize = 2_048;
+
+fn boundary_event_descriptor(
+    family: RuntimeBoundaryFamily,
+    event_name: &str,
+    severity: RuntimeBoundarySeverity,
+    retryability: RuntimeBoundaryRetryability,
+    visibility_policy: RuntimeBoundaryVisibilityPolicy,
+    rollout_capability: Option<RuntimeRoadmapCapability>,
+    metadata_keys: &[&str],
+) -> RuntimeBoundaryEventDescriptor {
+    RuntimeBoundaryEventDescriptor {
+        schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+        family,
+        event_name: event_name.to_owned(),
+        severity,
+        retryability,
+        visibility_policy,
+        redaction_boundary: RuntimeRoadmapRedactionBoundary::MetadataOnly,
+        rollout_capability,
+        metadata_keys: metadata_keys.iter().map(|value| (*value).to_owned()).collect(),
+    }
+}
+
+/// Builds the canonical boundary event taxonomy for upcoming runtime milestones.
+#[must_use]
+pub fn runtime_boundary_event_taxonomy() -> Vec<RuntimeBoundaryEventDescriptor> {
+    vec![
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Harness,
+            "harness.selection.decision",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::NonRetryable,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::AgentHarnessRuntime),
+            &["harness_id", "selection_mode", "support_outcome"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Hook,
+            "hook.lifecycle.observed",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::OperatorActionRequired,
+            RuntimeBoundaryVisibilityPolicy::OperatorDiagnostics,
+            Some(RuntimeRoadmapCapability::InlineRuntimeHooks),
+            &["hook_id", "phase", "decision_kind"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Middleware,
+            "tool.middleware.projected",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::NonRetryable,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::ToolResultMiddleware),
+            &["tool_name", "middleware_id", "visibility"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Middleware,
+            "tool.middleware.failed",
+            RuntimeBoundarySeverity::Warning,
+            RuntimeBoundaryRetryability::NonRetryable,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::ToolResultMiddleware),
+            &["tool_name", "middleware_id", "failure_code"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::ProviderStream,
+            "provider.stream.normalized",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::Retryable,
+            RuntimeBoundaryVisibilityPolicy::InternalDiagnostics,
+            Some(RuntimeRoadmapCapability::ProviderStreamNormalizer),
+            &["provider_kind", "chunk_count", "repair_count"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::TurnRecovery,
+            "turn.recovery.retry_planned",
+            RuntimeBoundarySeverity::Warning,
+            RuntimeBoundaryRetryability::Retryable,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::ProviderRecovery),
+            &["provider_kind", "recovery_recipe", "attempt_index"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Terminal,
+            "terminal.session.lifecycle",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::OperatorActionRequired,
+            RuntimeBoundaryVisibilityPolicy::OperatorDiagnostics,
+            Some(RuntimeRoadmapCapability::TerminalSessions),
+            &["session_handle", "state", "cleanup_evidence"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::BrowserRescue,
+            "browser.rescue.requested",
+            RuntimeBoundarySeverity::Warning,
+            RuntimeBoundaryRetryability::OperatorActionRequired,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::BrowserRescue),
+            &["profile_id", "rescue_kind", "policy_decision"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Lsp,
+            "lsp.lifecycle.changed",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::Retryable,
+            RuntimeBoundaryVisibilityPolicy::OperatorDiagnostics,
+            Some(RuntimeRoadmapCapability::LspService),
+            &["workspace_root", "language_id", "state"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Acp,
+            "acp.runtime.actor_queued",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::Retryable,
+            RuntimeBoundaryVisibilityPolicy::AuditAndReplay,
+            Some(RuntimeRoadmapCapability::AcpRuntime),
+            &["session_id", "actor_id", "permission_state"],
+        ),
+        boundary_event_descriptor(
+            RuntimeBoundaryFamily::Learning,
+            "learning.candidate.reviewed",
+            RuntimeBoundarySeverity::Info,
+            RuntimeBoundaryRetryability::NonRetryable,
+            RuntimeBoundaryVisibilityPolicy::OperatorDiagnostics,
+            None,
+            &["candidate_kind", "scope", "decision"],
+        ),
+    ]
+}
+
+/// Redacts and bounds free-form boundary metadata before diagnostics serialization.
+#[must_use]
+pub fn sanitize_runtime_boundary_metadata(mut metadata: Value) -> Value {
+    redact_runtime_boundary_value(&mut metadata, None);
+    match serde_json::to_vec(&metadata) {
+        Ok(encoded) if encoded.len() <= RUNTIME_BOUNDARY_METADATA_LIMIT_BYTES => metadata,
+        Ok(encoded) => serde_json::json!({
+            "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
+            "truncated": true,
+            "original_bytes": encoded.len(),
+            "limit_bytes": RUNTIME_BOUNDARY_METADATA_LIMIT_BYTES,
+            "redaction_boundary": RuntimeRoadmapRedactionBoundary::MetadataOnly,
+            "reason_code": RuntimeRoadmapReasonCode::BoundaryMetadataRedacted,
+        }),
+        Err(_) => serde_json::json!({
+            "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
+            "truncated": true,
+            "reason_code": RuntimeRoadmapReasonCode::BoundaryMetadataRedacted,
+        }),
+    }
+}
+
+fn redact_runtime_boundary_value(value: &mut Value, key_context: Option<&str>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                redact_runtime_boundary_value(child, Some(key.as_str()));
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_runtime_boundary_value(child, key_context);
+            }
+        }
+        Value::String(raw) => {
+            *raw = sanitize_runtime_boundary_string(raw.as_str(), key_context);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn sanitize_runtime_boundary_string(raw: &str, key_context: Option<&str>) -> String {
+    if key_context.is_some_and(is_sensitive_key) {
+        return crate::redaction::REDACTED.to_owned();
+    }
+    let redacted = redact_diagnostic_text(raw);
+    if redacted.contains("vault://") || redacted.contains("vault:") {
+        "<vault_ref:redacted>".to_owned()
+    } else {
+        redacted
+    }
+}
+
+runtime_roadmap_enum! {
+    /// Visibility partition for expected trajectory events.
+    pub enum RuntimeTrajectoryEventVisibility {
+        UserVisible => "user_visible",
+        ModelVisible => "model_visible",
+        InternalAudit => "internal_audit"
+    }
+}
+
+/// One provider stream item consumed by a golden trajectory fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrajectoryProviderChunk {
+    pub seq: u32,
+    pub kind: String,
+    pub body: String,
+    pub malformed: bool,
+}
+
+/// One tool call declared by a golden trajectory fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrajectoryToolCall {
+    pub call_id: String,
+    pub tool_name: String,
+    pub read_only: bool,
+    pub requires_gate: bool,
+}
+
+/// One tool result projection declared by a golden trajectory fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrajectoryToolResult {
+    pub call_id: String,
+    pub visibility: RuntimeTrajectoryEventVisibility,
+    pub body: String,
+}
+
+/// One canonical event expected from a trajectory fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTrajectoryExpectedEvent {
+    pub event_name: String,
+    pub visibility: RuntimeTrajectoryEventVisibility,
+    pub reason_code: RuntimeRoadmapReasonCode,
+}
+
+/// Golden provider/tool trajectory fixture contract for agent-loop smoke tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGoldenTrajectoryFixture {
+    pub schema_version: u32,
+    pub fixture_id: String,
+    pub enabled_capabilities: Vec<RuntimeRoadmapCapability>,
+    pub provider_chunks: Vec<RuntimeTrajectoryProviderChunk>,
+    pub assistant_turns: Vec<String>,
+    pub tool_calls: Vec<RuntimeTrajectoryToolCall>,
+    pub tool_results: Vec<RuntimeTrajectoryToolResult>,
+    pub user_steering_events: Vec<String>,
+    pub expected_events: Vec<RuntimeTrajectoryExpectedEvent>,
+}
+
+impl RuntimeGoldenTrajectoryFixture {
+    /// Validates trajectory fixture invariants used by smoke and replay tests.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeRoadmapHarnessValidationError`] when the fixture uses an
+    /// unsupported schema, unsafe id, or empty provider/event sequence.
+    pub fn validate(&self) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+        if self.schema_version != RUNTIME_ROADMAP_SCHEMA_VERSION {
+            return Err(RuntimeRoadmapHarnessValidationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            });
+        }
+        validate_slug("trajectory fixture id", self.fixture_id.as_str())?;
+        if self.provider_chunks.is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingTrajectoryProviderChunk {
+                fixture_id: self.fixture_id.clone(),
+            });
+        }
+        if self.expected_events.is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingTrajectoryExpectedEvent {
+                fixture_id: self.fixture_id.clone(),
+            });
+        }
+        for event in &self.expected_events {
+            validate_event_name(event.event_name.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+/// Compact diagnostics projection for the golden trajectory catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeGoldenTrajectoryProjection {
+    pub schema_version: u32,
+    pub fixtures_total: usize,
+    pub provider_chunks_total: usize,
+    pub tool_calls_total: usize,
+    pub malformed_provider_fixtures: usize,
+    pub event_names: Vec<String>,
+    pub enabled_capabilities: Vec<RuntimeRoadmapCapability>,
+}
+
+/// Returns the canonical Phase 1 golden trajectory fixture catalog.
+#[must_use]
+pub fn runtime_roadmap_phase1_trajectory_fixtures() -> Vec<RuntimeGoldenTrajectoryFixture> {
+    vec![
+        RuntimeGoldenTrajectoryFixture {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            fixture_id: "phase1_smoke_no_tool".to_owned(),
+            enabled_capabilities: vec![RuntimeRoadmapCapability::AgentHarnessRuntime],
+            provider_chunks: vec![RuntimeTrajectoryProviderChunk {
+                seq: 1,
+                kind: "assistant_message".to_owned(),
+                body: "ready".to_owned(),
+                malformed: false,
+            }],
+            assistant_turns: vec!["ready".to_owned()],
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            user_steering_events: Vec::new(),
+            expected_events: vec![RuntimeTrajectoryExpectedEvent {
+                event_name: "harness.selection.decision".to_owned(),
+                visibility: RuntimeTrajectoryEventVisibility::InternalAudit,
+                reason_code: RuntimeRoadmapReasonCode::GoldenTrajectoryAccepted,
+            }],
+        },
+        RuntimeGoldenTrajectoryFixture {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            fixture_id: "phase1_read_only_tool_call".to_owned(),
+            enabled_capabilities: vec![
+                RuntimeRoadmapCapability::AgentHarnessRuntime,
+                RuntimeRoadmapCapability::ToolResultMiddleware,
+            ],
+            provider_chunks: vec![
+                RuntimeTrajectoryProviderChunk {
+                    seq: 1,
+                    kind: "tool_call".to_owned(),
+                    body: "palyra.fs.read_file".to_owned(),
+                    malformed: false,
+                },
+                RuntimeTrajectoryProviderChunk {
+                    seq: 2,
+                    kind: "assistant_message".to_owned(),
+                    body: "file summarized".to_owned(),
+                    malformed: false,
+                },
+            ],
+            assistant_turns: vec!["file summarized".to_owned()],
+            tool_calls: vec![RuntimeTrajectoryToolCall {
+                call_id: "call_read_1".to_owned(),
+                tool_name: "palyra.fs.read_file".to_owned(),
+                read_only: true,
+                requires_gate: true,
+            }],
+            tool_results: vec![RuntimeTrajectoryToolResult {
+                call_id: "call_read_1".to_owned(),
+                visibility: RuntimeTrajectoryEventVisibility::ModelVisible,
+                body: "redacted file summary".to_owned(),
+            }],
+            user_steering_events: Vec::new(),
+            expected_events: vec![
+                RuntimeTrajectoryExpectedEvent {
+                    event_name: "harness.selection.decision".to_owned(),
+                    visibility: RuntimeTrajectoryEventVisibility::InternalAudit,
+                    reason_code: RuntimeRoadmapReasonCode::GoldenTrajectoryAccepted,
+                },
+                RuntimeTrajectoryExpectedEvent {
+                    event_name: "tool.middleware.projected".to_owned(),
+                    visibility: RuntimeTrajectoryEventVisibility::InternalAudit,
+                    reason_code: RuntimeRoadmapReasonCode::GoldenTrajectoryAccepted,
+                },
+            ],
+        },
+        RuntimeGoldenTrajectoryFixture {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            fixture_id: "phase1_malformed_provider_output".to_owned(),
+            enabled_capabilities: vec![
+                RuntimeRoadmapCapability::ProviderStreamNormalizer,
+                RuntimeRoadmapCapability::ProviderRecovery,
+            ],
+            provider_chunks: vec![RuntimeTrajectoryProviderChunk {
+                seq: 1,
+                kind: "malformed_tool_call".to_owned(),
+                body: "{\"arguments\":".to_owned(),
+                malformed: true,
+            }],
+            assistant_turns: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            user_steering_events: vec!["operator_requested_retry".to_owned()],
+            expected_events: vec![
+                RuntimeTrajectoryExpectedEvent {
+                    event_name: "provider.stream.normalized".to_owned(),
+                    visibility: RuntimeTrajectoryEventVisibility::InternalAudit,
+                    reason_code: RuntimeRoadmapReasonCode::GoldenTrajectoryAccepted,
+                },
+                RuntimeTrajectoryExpectedEvent {
+                    event_name: "turn.recovery.retry_planned".to_owned(),
+                    visibility: RuntimeTrajectoryEventVisibility::InternalAudit,
+                    reason_code: RuntimeRoadmapReasonCode::GoldenTrajectoryAccepted,
+                },
+            ],
+        },
+    ]
+}
+
+/// Projects golden trajectory fixtures into a diagnostics/read-model summary.
+///
+/// # Errors
+/// Returns [`RuntimeRoadmapHarnessValidationError`] when any built-in fixture drifts.
+pub fn runtime_roadmap_phase1_trajectory_projection(
+) -> Result<RuntimeGoldenTrajectoryProjection, RuntimeRoadmapHarnessValidationError> {
+    let fixtures = runtime_roadmap_phase1_trajectory_fixtures();
+    let mut event_names = BTreeSet::new();
+    let mut enabled_capabilities = BTreeSet::new();
+    let mut provider_chunks_total = 0;
+    let mut tool_calls_total = 0;
+    let mut malformed_provider_fixtures = 0;
+
+    for fixture in &fixtures {
+        fixture.validate()?;
+        provider_chunks_total += fixture.provider_chunks.len();
+        tool_calls_total += fixture.tool_calls.len();
+        if fixture.provider_chunks.iter().any(|chunk| chunk.malformed) {
+            malformed_provider_fixtures += 1;
+        }
+        for capability in &fixture.enabled_capabilities {
+            enabled_capabilities.insert(*capability);
+        }
+        for event in &fixture.expected_events {
+            event_names.insert(event.event_name.clone());
+        }
+    }
+
+    Ok(RuntimeGoldenTrajectoryProjection {
+        schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+        fixtures_total: fixtures.len(),
+        provider_chunks_total,
+        tool_calls_total,
+        malformed_provider_fixtures,
+        event_names: event_names.into_iter().collect(),
+        enabled_capabilities: enabled_capabilities.into_iter().collect(),
+    })
+}
+
+/// Fixture describing the tool-gate posture required for one tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToolGateFixture {
+    pub tool_name: String,
+    pub mutating: bool,
+    pub gate_required: bool,
+    pub reason_code: String,
+}
+
+/// Fixture describing one harness authority request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHarnessAuthorityFixture {
+    pub authority: String,
+    pub allowed: bool,
+}
+
+/// Fixture describing the terminal outcome of a denied mutating operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMutationApprovalFixture {
+    pub tool_name: String,
+    pub mutating: bool,
+    pub approval_denied: bool,
+    pub terminal_state: String,
+    pub reason_code: String,
+}
+
+/// Validation failure for security invariant helper fixtures.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeSecurityInvariantError {
+    #[error("raw secret leaked into {surface}")]
+    RawSecretLeaked { surface: String },
+    #[error("{tool_name} must require the execution gate")]
+    ToolGateMissing { tool_name: String },
+    #[error("direct journal write authority must stay denied: {authority}")]
+    DirectJournalWriteAuthority { authority: String },
+    #[error("{tool_name} approval denial must be terminal for mutation")]
+    ApprovalDenialNotTerminal { tool_name: String },
+    #[error("{field} must be non-empty")]
+    EmptyField { field: &'static str },
+}
+
+/// Asserts that a fake secret is absent from every serialized model/audit surface.
+///
+/// # Errors
+/// Returns [`RuntimeSecurityInvariantError::RawSecretLeaked`] naming the first
+/// surface that still contains the raw secret.
+pub fn assert_no_raw_secret_in_tape(
+    raw_secret: &str,
+    serialized_surfaces: &[(&str, &str)],
+) -> Result<(), RuntimeSecurityInvariantError> {
+    if raw_secret.is_empty() {
+        return Err(RuntimeSecurityInvariantError::EmptyField { field: "raw_secret" });
+    }
+    for (surface, serialized) in serialized_surfaces {
+        if serialized.contains(raw_secret) {
+            return Err(RuntimeSecurityInvariantError::RawSecretLeaked {
+                surface: (*surface).to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Asserts that the execution gate remains mandatory for a tool fixture.
+///
+/// # Errors
+/// Returns [`RuntimeSecurityInvariantError::ToolGateMissing`] when the fixture
+/// would let a tool call bypass the gate.
+pub fn assert_tool_requires_gate(
+    fixture: &RuntimeToolGateFixture,
+) -> Result<(), RuntimeSecurityInvariantError> {
+    if fixture.tool_name.trim().is_empty() {
+        return Err(RuntimeSecurityInvariantError::EmptyField { field: "tool_name" });
+    }
+    if !fixture.gate_required {
+        return Err(RuntimeSecurityInvariantError::ToolGateMissing {
+            tool_name: fixture.tool_name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Asserts that harnesses never receive direct journal write authority.
+///
+/// # Errors
+/// Returns [`RuntimeSecurityInvariantError::DirectJournalWriteAuthority`] when
+/// any fixture grants direct journal writes.
+pub fn assert_no_direct_journal_write_authority(
+    authorities: &[RuntimeHarnessAuthorityFixture],
+) -> Result<(), RuntimeSecurityInvariantError> {
+    for authority in authorities {
+        if authority.allowed && authority.authority == "journal.write.direct" {
+            return Err(RuntimeSecurityInvariantError::DirectJournalWriteAuthority {
+                authority: authority.authority.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Asserts that approval denial terminates a mutating operation.
+///
+/// # Errors
+/// Returns [`RuntimeSecurityInvariantError::ApprovalDenialNotTerminal`] when a
+/// denied mutating fixture can still continue.
+pub fn assert_approval_denial_is_terminal_for_mutation(
+    fixture: &RuntimeMutationApprovalFixture,
+) -> Result<(), RuntimeSecurityInvariantError> {
+    let terminal = matches!(
+        fixture.terminal_state.as_str(),
+        "blocked" | "denied" | "failed_closed" | "cancelled"
+    );
+    if fixture.mutating && fixture.approval_denied && !terminal {
+        return Err(RuntimeSecurityInvariantError::ApprovalDenialNotTerminal {
+            tool_name: fixture.tool_name.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_event_name(value: &str) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+    let valid = !value.is_empty()
+        && value.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeRoadmapHarnessValidationError::InvalidEventName { value: value.to_owned() })
+    }
 }
 
 /// One source-level smoke target required by a Phase 0 roadmap fixture.
@@ -806,6 +1535,12 @@ pub enum RuntimeRoadmapHarnessValidationError {
     MissingEvidenceRef { fixture_id: String },
     #[error("smoke target {target_id} must name a required symbol")]
     MissingRequiredSymbol { target_id: String },
+    #[error("{fixture_id} must include at least one provider chunk")]
+    MissingTrajectoryProviderChunk { fixture_id: String },
+    #[error("{fixture_id} must include at least one expected trajectory event")]
+    MissingTrajectoryExpectedEvent { fixture_id: String },
+    #[error("runtime trajectory event name must be dotted lowercase ASCII: {value}")]
+    InvalidEventName { value: String },
     #[error("harness fixture cannot be represented as a valid journal event: {0}")]
     JournalEventInvalid(RuntimeRoadmapValidationError),
 }
@@ -850,19 +1585,30 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        project_runtime_roadmap_harness, runtime_roadmap_capability_catalog,
+        assert_approval_denial_is_terminal_for_mutation, assert_no_direct_journal_write_authority,
+        assert_no_raw_secret_in_tape, assert_tool_requires_gate, project_runtime_roadmap_harness,
+        runtime_boundary_event_taxonomy, runtime_roadmap_capability_catalog,
         runtime_roadmap_phase0_harness_fixtures, runtime_roadmap_phase0_harness_projection,
-        RuntimeRoadmapCapability, RuntimeRoadmapDecision, RuntimeRoadmapEventType,
-        RuntimeRoadmapHarnessFixture, RuntimeRoadmapHarnessValidationError,
-        RuntimeRoadmapJournalEvent, RuntimeRoadmapReasonCode, RuntimeRoadmapRedactionBoundary,
-        RuntimeRoadmapValidationError, ALL_RUNTIME_ROADMAP_CAPABILITIES,
-        RUNTIME_ROADMAP_SCHEMA_VERSION,
+        runtime_roadmap_phase1_trajectory_fixtures, runtime_roadmap_phase1_trajectory_projection,
+        sanitize_runtime_boundary_metadata, RuntimeBoundaryFamily, RuntimeGoldenTrajectoryFixture,
+        RuntimeHarnessAuthorityFixture, RuntimeMutationApprovalFixture, RuntimeRoadmapCapability,
+        RuntimeRoadmapDecision, RuntimeRoadmapEventType, RuntimeRoadmapHarnessFixture,
+        RuntimeRoadmapHarnessValidationError, RuntimeRoadmapJournalEvent, RuntimeRoadmapReasonCode,
+        RuntimeRoadmapRedactionBoundary, RuntimeRoadmapValidationError, RuntimeToolGateFixture,
+        ALL_RUNTIME_ROADMAP_CAPABILITIES, RUNTIME_ROADMAP_SCHEMA_VERSION,
     };
-    use crate::feature_rollouts::{TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV};
+    use crate::feature_rollouts::{
+        AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH, AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
+        TOOL_REPAIR_ROLLOUT_CONFIG_PATH, TOOL_REPAIR_ROLLOUT_ENV,
+    };
 
     const PHASE0_HARNESS_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../fixtures/golden/runtime_roadmap_phase0_harness.json"
+    );
+    const PHASE1_TRAJECTORY_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/golden/runtime_roadmap_phase1_trajectories.json"
     );
 
     #[test]
@@ -881,6 +1627,20 @@ mod tests {
             Some(TOOL_REPAIR_ROLLOUT_CONFIG_PATH)
         );
         assert!(!tool_repair.default_enabled);
+
+        let agent_harness = catalog
+            .iter()
+            .find(|entry| entry.capability == RuntimeRoadmapCapability::AgentHarnessRuntime)
+            .expect("agent harness runtime capability should be in the catalog");
+        assert_eq!(
+            agent_harness.rollout_env_var.as_deref(),
+            Some(AGENT_HARNESS_RUNTIME_ROLLOUT_ENV)
+        );
+        assert_eq!(
+            agent_harness.rollout_config_path.as_deref(),
+            Some(AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH)
+        );
+        assert!(!agent_harness.default_enabled);
 
         let baseline = catalog
             .iter()
@@ -1015,6 +1775,139 @@ mod tests {
         assert!(projection
             .evidence_refs
             .contains(&"fixtures/golden/release_eval_inventory.json".to_owned()));
+    }
+
+    #[test]
+    fn boundary_taxonomy_covers_new_runtime_families_and_redacts_metadata() {
+        let taxonomy = runtime_boundary_event_taxonomy();
+
+        assert_eq!(taxonomy.len(), 11);
+        assert!(taxonomy.iter().any(|entry| {
+            entry.family == RuntimeBoundaryFamily::Harness
+                && entry.event_name == "harness.selection.decision"
+                && entry.rollout_capability == Some(RuntimeRoadmapCapability::AgentHarnessRuntime)
+        }));
+        assert!(taxonomy.iter().any(|entry| entry.event_name == "tool.middleware.failed"));
+        assert!(taxonomy.iter().any(|entry| entry.event_name == "turn.recovery.retry_planned"));
+
+        let sanitized = sanitize_runtime_boundary_metadata(json!({
+            "provider": "openai-compatible",
+            "authorization": "Bearer raw-secret",
+            "message": "callback failed token=abc mode=retry",
+            "vault_ref": "vault://global/openai_api_key",
+        }));
+
+        let rendered = serde_json::to_string(&sanitized).expect("metadata should serialize");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("raw-secret"));
+        assert!(!rendered.contains("token=abc"));
+        assert!(!rendered.contains("vault://global/openai_api_key"));
+    }
+
+    #[test]
+    fn phase1_trajectory_projection_covers_smoke_tool_and_malformed_provider_paths() {
+        let projection =
+            runtime_roadmap_phase1_trajectory_projection().expect("projection should validate");
+
+        assert_eq!(projection.schema_version, RUNTIME_ROADMAP_SCHEMA_VERSION);
+        assert_eq!(projection.fixtures_total, 3);
+        assert_eq!(projection.provider_chunks_total, 4);
+        assert_eq!(projection.tool_calls_total, 1);
+        assert_eq!(projection.malformed_provider_fixtures, 1);
+        assert!(projection.event_names.contains(&"harness.selection.decision".to_owned()));
+        assert!(projection.event_names.contains(&"turn.recovery.retry_planned".to_owned()));
+        assert!(projection
+            .enabled_capabilities
+            .contains(&RuntimeRoadmapCapability::ProviderRecovery));
+    }
+
+    #[test]
+    fn phase1_trajectory_golden_fixture_matches_generated_catalog() {
+        let fixture_bytes = std::fs::read(PHASE1_TRAJECTORY_FIXTURE)
+            .expect("golden trajectory fixture should exist");
+        let from_disk: Vec<RuntimeGoldenTrajectoryFixture> =
+            serde_json::from_slice(fixture_bytes.as_slice())
+                .expect("golden trajectory fixture should deserialize");
+        let generated = runtime_roadmap_phase1_trajectory_fixtures();
+
+        assert_eq!(from_disk, generated);
+        for fixture in from_disk {
+            fixture.validate().expect("golden trajectory fixture should validate");
+        }
+    }
+
+    #[test]
+    fn phase1_trajectory_rejects_invalid_event_names() {
+        let mut fixture = runtime_roadmap_phase1_trajectory_fixtures()
+            .into_iter()
+            .next()
+            .expect("built-in fixtures should not be empty");
+        fixture.expected_events[0].event_name = "Provider Stream".to_owned();
+
+        let error = fixture.validate().expect_err("invalid event name should fail");
+        assert_eq!(
+            error,
+            RuntimeRoadmapHarnessValidationError::InvalidEventName {
+                value: "Provider Stream".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn security_invariant_helpers_reject_secret_and_authority_bypasses() {
+        let raw_secret = "secret_should_not_appear";
+        let stdout = "tool completed with <redacted>";
+        let stderr = "provider token=<redacted>";
+        let tape = "{\"event\":\"tool.completed\",\"payload\":\"<redacted>\"}";
+        assert_no_raw_secret_in_tape(
+            raw_secret,
+            &[("stdout", stdout), ("stderr", stderr), ("tape", tape)],
+        )
+        .expect("redacted surfaces should pass");
+
+        let leaked = assert_no_raw_secret_in_tape(raw_secret, &[("diagnostics", raw_secret)])
+            .expect_err("raw secret should fail");
+        assert_eq!(
+            leaked,
+            super::RuntimeSecurityInvariantError::RawSecretLeaked {
+                surface: "diagnostics".to_owned(),
+            }
+        );
+
+        assert_tool_requires_gate(&RuntimeToolGateFixture {
+            tool_name: "palyra.fs.write_file".to_owned(),
+            mutating: true,
+            gate_required: true,
+            reason_code: "execution_gate.required".to_owned(),
+        })
+        .expect("mutating tool should require gate");
+
+        assert_no_direct_journal_write_authority(&[RuntimeHarnessAuthorityFixture {
+            authority: "journal.write.callback".to_owned(),
+            allowed: true,
+        }])
+        .expect("callback-mediated journal authority should be allowed");
+
+        let direct = assert_no_direct_journal_write_authority(&[RuntimeHarnessAuthorityFixture {
+            authority: "journal.write.direct".to_owned(),
+            allowed: true,
+        }])
+        .expect_err("direct journal authority should fail");
+        assert_eq!(
+            direct,
+            super::RuntimeSecurityInvariantError::DirectJournalWriteAuthority {
+                authority: "journal.write.direct".to_owned(),
+            }
+        );
+
+        assert_approval_denial_is_terminal_for_mutation(&RuntimeMutationApprovalFixture {
+            tool_name: "palyra.fs.write_file".to_owned(),
+            mutating: true,
+            approval_denied: true,
+            terminal_state: "blocked".to_owned(),
+            reason_code: "approval.denied".to_owned(),
+        })
+        .expect("approval denial should terminate mutation");
     }
 
     #[test]

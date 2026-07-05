@@ -91,6 +91,9 @@ enum FeatureRolloutFlag {
     ExecutionBackendSshTunnel,
     SafetyBoundary,
     ExecutionGatePipelineV2,
+    AgentHarnessRuntime,
+    InlineRuntimeHooks,
+    ToolResultMiddleware,
     SessionQueuePolicy,
     PruningPolicyMatrix,
     RetrievalDualPath,
@@ -101,6 +104,12 @@ enum FeatureRolloutFlag {
     NetworkedWorkers,
     ToolRepair,
     ProviderStreamNormalizer,
+    ProviderRecovery,
+    TerminalSessions,
+    BrowserRescue,
+    LspService,
+    AdvisorFanout,
+    AcpRuntime,
     ChannelTurnKernel,
     AgentPlanState,
     ObjectiveJudge,
@@ -122,6 +131,9 @@ impl FeatureRolloutFlag {
             Self::ExecutionBackendSshTunnel => "execution_backend_ssh_tunnel",
             Self::SafetyBoundary => "safety_boundary",
             Self::ExecutionGatePipelineV2 => "execution_gate_pipeline_v2",
+            Self::AgentHarnessRuntime => "agent_harness_runtime",
+            Self::InlineRuntimeHooks => "inline_runtime_hooks",
+            Self::ToolResultMiddleware => "tool_result_middleware",
             Self::SessionQueuePolicy => "session_queue_policy",
             Self::PruningPolicyMatrix => "pruning_policy_matrix",
             Self::RetrievalDualPath => "retrieval_dual_path",
@@ -132,6 +144,12 @@ impl FeatureRolloutFlag {
             Self::NetworkedWorkers => "networked_workers",
             Self::ToolRepair => "tool_repair",
             Self::ProviderStreamNormalizer => "provider_stream_normalizer",
+            Self::ProviderRecovery => "provider_recovery",
+            Self::TerminalSessions => "terminal_sessions",
+            Self::BrowserRescue => "browser_rescue",
+            Self::LspService => "lsp_service",
+            Self::AdvisorFanout => "advisor_fanout",
+            Self::AcpRuntime => "acp_runtime",
             Self::ChannelTurnKernel => "channel_turn_kernel",
             Self::AgentPlanState => "agent_plan_state",
             Self::ObjectiveJudge => "objective_judge",
@@ -163,6 +181,13 @@ impl FeatureRolloutFlag {
             Self::ExecutionGatePipelineV2 => {
                 feature_rollouts::EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH
             }
+            Self::AgentHarnessRuntime => {
+                feature_rollouts::AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH
+            }
+            Self::InlineRuntimeHooks => feature_rollouts::INLINE_RUNTIME_HOOKS_ROLLOUT_CONFIG_PATH,
+            Self::ToolResultMiddleware => {
+                feature_rollouts::TOOL_RESULT_MIDDLEWARE_ROLLOUT_CONFIG_PATH
+            }
             Self::SessionQueuePolicy => feature_rollouts::SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH,
             Self::PruningPolicyMatrix => {
                 feature_rollouts::PRUNING_POLICY_MATRIX_ROLLOUT_CONFIG_PATH
@@ -177,6 +202,12 @@ impl FeatureRolloutFlag {
             Self::ProviderStreamNormalizer => {
                 feature_rollouts::PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH
             }
+            Self::ProviderRecovery => feature_rollouts::PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH,
+            Self::TerminalSessions => feature_rollouts::TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH,
+            Self::BrowserRescue => feature_rollouts::BROWSER_RESCUE_ROLLOUT_CONFIG_PATH,
+            Self::LspService => feature_rollouts::LSP_SERVICE_ROLLOUT_CONFIG_PATH,
+            Self::AdvisorFanout => feature_rollouts::ADVISOR_FANOUT_ROLLOUT_CONFIG_PATH,
+            Self::AcpRuntime => feature_rollouts::ACP_RUNTIME_ROLLOUT_CONFIG_PATH,
             Self::ChannelTurnKernel => feature_rollouts::CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH,
             Self::AgentPlanState => feature_rollouts::AGENT_PLAN_STATE_ROLLOUT_CONFIG_PATH,
             Self::ObjectiveJudge => feature_rollouts::OBJECTIVE_JUDGE_ROLLOUT_CONFIG_PATH,
@@ -208,6 +239,9 @@ impl FeatureRolloutFlag {
             Self::ExecutionGatePipelineV2 => {
                 feature_rollouts::EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV
             }
+            Self::AgentHarnessRuntime => feature_rollouts::AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
+            Self::InlineRuntimeHooks => feature_rollouts::INLINE_RUNTIME_HOOKS_ROLLOUT_ENV,
+            Self::ToolResultMiddleware => feature_rollouts::TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV,
             Self::SessionQueuePolicy => feature_rollouts::SESSION_QUEUE_POLICY_ROLLOUT_ENV,
             Self::PruningPolicyMatrix => feature_rollouts::PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
             Self::RetrievalDualPath => feature_rollouts::RETRIEVAL_DUAL_PATH_ROLLOUT_ENV,
@@ -220,6 +254,12 @@ impl FeatureRolloutFlag {
             Self::ProviderStreamNormalizer => {
                 feature_rollouts::PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV
             }
+            Self::ProviderRecovery => feature_rollouts::PROVIDER_RECOVERY_ROLLOUT_ENV,
+            Self::TerminalSessions => feature_rollouts::TERMINAL_SESSIONS_ROLLOUT_ENV,
+            Self::BrowserRescue => feature_rollouts::BROWSER_RESCUE_ROLLOUT_ENV,
+            Self::LspService => feature_rollouts::LSP_SERVICE_ROLLOUT_ENV,
+            Self::AdvisorFanout => feature_rollouts::ADVISOR_FANOUT_ROLLOUT_ENV,
+            Self::AcpRuntime => feature_rollouts::ACP_RUNTIME_ROLLOUT_ENV,
             Self::ChannelTurnKernel => feature_rollouts::CHANNEL_TURN_KERNEL_ROLLOUT_ENV,
             Self::AgentPlanState => feature_rollouts::AGENT_PLAN_STATE_ROLLOUT_ENV,
             Self::ObjectiveJudge => feature_rollouts::OBJECTIVE_JUDGE_ROLLOUT_ENV,
@@ -243,6 +283,9 @@ impl FeatureRolloutFlag {
             Self::ExecutionBackendSshTunnel => config.execution_backend_ssh_tunnel,
             Self::SafetyBoundary => config.safety_boundary,
             Self::ExecutionGatePipelineV2 => config.execution_gate_pipeline_v2,
+            Self::AgentHarnessRuntime => config.agent_harness_runtime,
+            Self::InlineRuntimeHooks => config.inline_runtime_hooks,
+            Self::ToolResultMiddleware => config.tool_result_middleware,
             Self::SessionQueuePolicy => config.session_queue_policy,
             Self::PruningPolicyMatrix => config.pruning_policy_matrix,
             Self::RetrievalDualPath => config.retrieval_dual_path,
@@ -253,6 +296,12 @@ impl FeatureRolloutFlag {
             Self::NetworkedWorkers => config.networked_workers,
             Self::ToolRepair => config.tool_repair,
             Self::ProviderStreamNormalizer => config.provider_stream_normalizer,
+            Self::ProviderRecovery => config.provider_recovery,
+            Self::TerminalSessions => config.terminal_sessions,
+            Self::BrowserRescue => config.browser_rescue,
+            Self::LspService => config.lsp_service,
+            Self::AdvisorFanout => config.advisor_fanout,
+            Self::AcpRuntime => config.acp_runtime,
             Self::ChannelTurnKernel => config.channel_turn_kernel,
             Self::AgentPlanState => config.agent_plan_state,
             Self::ObjectiveJudge => config.objective_judge,
@@ -512,6 +561,48 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
         stable_dependencies: NO_STABLE_DEPENDENCIES,
     },
     FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::AgentHarnessRuntime,
+        owner_component: "application/agent_harness",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::InlineRuntimeHooks,
+        owner_component: "hooks/runtime loop",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "inline hook invocation must preserve timeout, panic, policy, approval, and audit fail-closed behavior",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::ToolResultMiddleware,
+        owner_component: "tool runtime",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "middleware may only preserve or downgrade model-visible tool results and must retain audit artifacts under host ownership",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
         flag: FeatureRolloutFlag::SessionQueuePolicy,
         owner_component: "session lifecycle",
         maturity: FeatureRolloutMaturity::PreviewOnly,
@@ -643,6 +734,94 @@ const FEATURE_ROLLOUT_DESCRIPTORS: &[FeatureRolloutDescriptor] = &[
             "unrecoverable provider streams emit one terminal failed event on public SSE APIs",
             "diagnostics expose the rollout maturity and activation blockers",
         ],
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::ProviderRecovery,
+        owner_component: "model provider recovery",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: MODEL_PROVIDER_TESTS,
+        public_api_exposure: INTERNAL_EXPOSURE,
+        activation_blockers: &[
+            "recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes",
+        ],
+        acceptance_criteria: &[
+            "provider recovery diagnostics expose retryability and terminal failure reasons",
+            "auth failover and malformed-output recovery stay bounded by provider policy",
+            "raw provider payloads are redacted before diagnostics and support bundle export",
+        ],
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: &[FeatureRolloutFlag::ProviderStreamNormalizer],
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::TerminalSessions,
+        owner_component: "process runtime",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: EXECUTION_BACKEND_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "persistent terminal sessions must keep process handles, cwd, env, sudo posture, and cleanup evidence bounded",
+        ],
+        acceptance_criteria: EXECUTION_BACKEND_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::BrowserRescue,
+        owner_component: "browserd/browser rescue",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "browser rescue must stay policy-gated and must not export raw screenshots or CDP payloads without redaction",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::LspService,
+        owner_component: "code intelligence",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::AdvisorFanout,
+        owner_component: "advisors",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
+        deprecated_aliases: NO_DEPRECATED_ALIASES,
+        migration_note: DEFAULT_MIGRATION_NOTE,
+        stable_dependencies: NO_STABLE_DEPENDENCIES,
+    },
+    FeatureRolloutDescriptor {
+        flag: FeatureRolloutFlag::AcpRuntime,
+        owner_component: "acp runtime",
+        maturity: FeatureRolloutMaturity::PreviewOnly,
+        required_tests: CORE_VISIBILITY_TESTS,
+        public_api_exposure: OBSERVABILITY_EXPOSURE,
+        activation_blockers: &[
+            "ACP actors must route permission, session, replay, and compaction handoff through host-owned control-plane boundaries",
+        ],
+        acceptance_criteria: DIAGNOSTICS_ACCEPTANCE,
         deprecated_aliases: NO_DEPRECATED_ALIASES,
         migration_note: DEFAULT_MIGRATION_NOTE,
         stable_dependencies: NO_STABLE_DEPENDENCIES,
@@ -923,7 +1102,7 @@ mod tests {
     fn builtin_maturity_matrix_has_one_descriptor_per_rollout_flag() {
         validate_feature_rollout_maturity_descriptors(FEATURE_ROLLOUT_DESCRIPTORS)
             .expect("builtin feature rollout maturity matrix should validate");
-        assert_eq!(FEATURE_ROLLOUT_DESCRIPTORS.len(), 26);
+        assert_eq!(FEATURE_ROLLOUT_DESCRIPTORS.len(), 35);
     }
 
     #[test]

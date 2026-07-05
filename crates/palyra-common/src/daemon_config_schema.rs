@@ -805,6 +805,9 @@ pub struct FileFeatureRolloutsConfig {
     pub execution_backend_ssh_tunnel: Option<bool>,
     pub safety_boundary: Option<bool>,
     pub execution_gate_pipeline_v2: Option<bool>,
+    pub agent_harness_runtime: Option<bool>,
+    pub inline_runtime_hooks: Option<bool>,
+    pub tool_result_middleware: Option<bool>,
     pub session_queue_policy: Option<bool>,
     pub pruning_policy_matrix: Option<bool>,
     pub retrieval_dual_path: Option<bool>,
@@ -815,6 +818,12 @@ pub struct FileFeatureRolloutsConfig {
     pub networked_workers: Option<bool>,
     pub tool_repair: Option<bool>,
     pub provider_stream_normalizer: Option<bool>,
+    pub provider_recovery: Option<bool>,
+    pub terminal_sessions: Option<bool>,
+    pub browser_rescue: Option<bool>,
+    pub lsp_service: Option<bool>,
+    pub advisor_fanout: Option<bool>,
+    pub acp_runtime: Option<bool>,
     pub channel_turn_kernel: Option<bool>,
     pub agent_plan_state: Option<bool>,
     pub objective_judge: Option<bool>,
@@ -1773,6 +1782,9 @@ mod tests {
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
+            agent_harness_runtime = true
+            inline_runtime_hooks = false
+            tool_result_middleware = true
             session_queue_policy = true
             pruning_policy_matrix = false
             retrieval_dual_path = true
@@ -1783,6 +1795,12 @@ mod tests {
             networked_workers = false
             tool_repair = true
             provider_stream_normalizer = false
+            provider_recovery = true
+            terminal_sessions = false
+            browser_rescue = true
+            lsp_service = false
+            advisor_fanout = true
+            acp_runtime = false
             channel_turn_kernel = true
             agent_plan_state = false
             objective_judge = true
@@ -1805,6 +1823,9 @@ mod tests {
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
+        assert_eq!(feature_rollouts.agent_harness_runtime, Some(true));
+        assert_eq!(feature_rollouts.inline_runtime_hooks, Some(false));
+        assert_eq!(feature_rollouts.tool_result_middleware, Some(true));
         assert_eq!(feature_rollouts.session_queue_policy, Some(true));
         assert_eq!(feature_rollouts.pruning_policy_matrix, Some(false));
         assert_eq!(feature_rollouts.retrieval_dual_path, Some(true));
@@ -1815,6 +1836,12 @@ mod tests {
         assert_eq!(feature_rollouts.networked_workers, Some(false));
         assert_eq!(feature_rollouts.tool_repair, Some(true));
         assert_eq!(feature_rollouts.provider_stream_normalizer, Some(false));
+        assert_eq!(feature_rollouts.provider_recovery, Some(true));
+        assert_eq!(feature_rollouts.terminal_sessions, Some(false));
+        assert_eq!(feature_rollouts.browser_rescue, Some(true));
+        assert_eq!(feature_rollouts.lsp_service, Some(false));
+        assert_eq!(feature_rollouts.advisor_fanout, Some(true));
+        assert_eq!(feature_rollouts.acp_runtime, Some(false));
         assert_eq!(feature_rollouts.channel_turn_kernel, Some(true));
         assert_eq!(feature_rollouts.agent_plan_state, Some(false));
         assert_eq!(feature_rollouts.objective_judge, Some(true));

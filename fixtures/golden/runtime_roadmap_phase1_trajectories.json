@@ -1,0 +1,117 @@
+[
+  {
+    "schema_version": 1,
+    "fixture_id": "phase1_smoke_no_tool",
+    "enabled_capabilities": [
+      "agent_harness_runtime"
+    ],
+    "provider_chunks": [
+      {
+        "seq": 1,
+        "kind": "assistant_message",
+        "body": "ready",
+        "malformed": false
+      }
+    ],
+    "assistant_turns": [
+      "ready"
+    ],
+    "tool_calls": [],
+    "tool_results": [],
+    "user_steering_events": [],
+    "expected_events": [
+      {
+        "event_name": "harness.selection.decision",
+        "visibility": "internal_audit",
+        "reason_code": "runtime_roadmap.trajectory.golden_fixture_accepted"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "phase1_read_only_tool_call",
+    "enabled_capabilities": [
+      "agent_harness_runtime",
+      "tool_result_middleware"
+    ],
+    "provider_chunks": [
+      {
+        "seq": 1,
+        "kind": "tool_call",
+        "body": "palyra.fs.read_file",
+        "malformed": false
+      },
+      {
+        "seq": 2,
+        "kind": "assistant_message",
+        "body": "file summarized",
+        "malformed": false
+      }
+    ],
+    "assistant_turns": [
+      "file summarized"
+    ],
+    "tool_calls": [
+      {
+        "call_id": "call_read_1",
+        "tool_name": "palyra.fs.read_file",
+        "read_only": true,
+        "requires_gate": true
+      }
+    ],
+    "tool_results": [
+      {
+        "call_id": "call_read_1",
+        "visibility": "model_visible",
+        "body": "redacted file summary"
+      }
+    ],
+    "user_steering_events": [],
+    "expected_events": [
+      {
+        "event_name": "harness.selection.decision",
+        "visibility": "internal_audit",
+        "reason_code": "runtime_roadmap.trajectory.golden_fixture_accepted"
+      },
+      {
+        "event_name": "tool.middleware.projected",
+        "visibility": "internal_audit",
+        "reason_code": "runtime_roadmap.trajectory.golden_fixture_accepted"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "phase1_malformed_provider_output",
+    "enabled_capabilities": [
+      "provider_stream_normalizer",
+      "provider_recovery"
+    ],
+    "provider_chunks": [
+      {
+        "seq": 1,
+        "kind": "malformed_tool_call",
+        "body": "{\"arguments\":",
+        "malformed": true
+      }
+    ],
+    "assistant_turns": [],
+    "tool_calls": [],
+    "tool_results": [],
+    "user_steering_events": [
+      "operator_requested_retry"
+    ],
+    "expected_events": [
+      {
+        "event_name": "provider.stream.normalized",
+        "visibility": "internal_audit",
+        "reason_code": "runtime_roadmap.trajectory.golden_fixture_accepted"
+      },
+      {
+        "event_name": "turn.recovery.retry_planned",
+        "visibility": "internal_audit",
+        "reason_code": "runtime_roadmap.trajectory.golden_fixture_accepted"
+      }
+    ]
+  }
+]

@@ -38,19 +38,22 @@ use palyra_common::{
     },
     default_config_search_paths, default_state_root,
     feature_rollouts::{
-        parse_boolish_feature_rollout, FeatureRolloutSetting, AGENT_PLAN_STATE_ROLLOUT_ENV,
-        ATTACK_SURFACE_AUDIT_ROLLOUT_ENV, AUXILIARY_EXECUTOR_ROLLOUT_ENV,
+        parse_boolish_feature_rollout, FeatureRolloutSetting, ACP_RUNTIME_ROLLOUT_ENV,
+        ADVISOR_FANOUT_ROLLOUT_ENV, AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
+        AGENT_PLAN_STATE_ROLLOUT_ENV, ATTACK_SURFACE_AUDIT_ROLLOUT_ENV,
+        AUXILIARY_EXECUTOR_ROLLOUT_ENV, BROWSER_RESCUE_ROLLOUT_ENV,
         CHANNEL_TURN_KERNEL_ROLLOUT_ENV, COMPACTION_SAFEGUARD_ROLLOUT_ENV,
         CONTEXT_ENGINE_ROLLOUT_ENV, DELIVERY_ARBITRATION_ROLLOUT_ENV,
         DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV, EXECUTION_BACKEND_DOCKER_ROLLOUT_ENV,
         EXECUTION_BACKEND_NETWORKED_WORKER_ROLLOUT_ENV, EXECUTION_BACKEND_REMOTE_NODE_ROLLOUT_ENV,
         EXECUTION_BACKEND_SSH_TUNNEL_ROLLOUT_ENV, EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
-        FLOW_ORCHESTRATION_ROLLOUT_ENV, NETWORKED_WORKERS_ROLLOUT_ENV, OBJECTIVE_JUDGE_ROLLOUT_ENV,
-        PROGRESS_DRAFTS_ROLLOUT_ENV, PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV,
+        FLOW_ORCHESTRATION_ROLLOUT_ENV, INLINE_RUNTIME_HOOKS_ROLLOUT_ENV, LSP_SERVICE_ROLLOUT_ENV,
+        NETWORKED_WORKERS_ROLLOUT_ENV, OBJECTIVE_JUDGE_ROLLOUT_ENV, PROGRESS_DRAFTS_ROLLOUT_ENV,
+        PROVIDER_BACKED_EVIDENCE_COMPACTION_ROLLOUT_ENV, PROVIDER_RECOVERY_ROLLOUT_ENV,
         PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV, PRUNING_POLICY_MATRIX_ROLLOUT_ENV,
         REPLAY_CAPTURE_ROLLOUT_ENV, RETRIEVAL_DUAL_PATH_ROLLOUT_ENV, SAFETY_BOUNDARY_ROLLOUT_ENV,
-        SESSION_QUEUE_POLICY_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV,
-        VERIFICATION_RUNTIME_ROLLOUT_ENV,
+        SESSION_QUEUE_POLICY_ROLLOUT_ENV, TERMINAL_SESSIONS_ROLLOUT_ENV, TOOL_REPAIR_ROLLOUT_ENV,
+        TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV, VERIFICATION_RUNTIME_ROLLOUT_ENV,
     },
     parse_config_path,
     runtime_preview::{parse_runtime_preview_mode, RuntimePreviewMode},
@@ -266,6 +269,17 @@ pub fn load_config() -> Result<LoadedConfig> {
                 feature_rollouts.execution_gate_pipeline_v2 =
                     FeatureRolloutSetting::from_config(enabled);
             }
+            if let Some(enabled) = file_feature_rollouts.agent_harness_runtime {
+                feature_rollouts.agent_harness_runtime =
+                    FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.inline_runtime_hooks {
+                feature_rollouts.inline_runtime_hooks = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.tool_result_middleware {
+                feature_rollouts.tool_result_middleware =
+                    FeatureRolloutSetting::from_config(enabled);
+            }
             if let Some(enabled) = file_feature_rollouts.session_queue_policy {
                 feature_rollouts.session_queue_policy = FeatureRolloutSetting::from_config(enabled);
             }
@@ -297,6 +311,24 @@ pub fn load_config() -> Result<LoadedConfig> {
             if let Some(enabled) = file_feature_rollouts.provider_stream_normalizer {
                 feature_rollouts.provider_stream_normalizer =
                     FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.provider_recovery {
+                feature_rollouts.provider_recovery = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.terminal_sessions {
+                feature_rollouts.terminal_sessions = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.browser_rescue {
+                feature_rollouts.browser_rescue = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.lsp_service {
+                feature_rollouts.lsp_service = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.advisor_fanout {
+                feature_rollouts.advisor_fanout = FeatureRolloutSetting::from_config(enabled);
+            }
+            if let Some(enabled) = file_feature_rollouts.acp_runtime {
+                feature_rollouts.acp_runtime = FeatureRolloutSetting::from_config(enabled);
             }
             if let Some(enabled) = file_feature_rollouts.channel_turn_kernel {
                 feature_rollouts.channel_turn_kernel = FeatureRolloutSetting::from_config(enabled);
@@ -2351,6 +2383,21 @@ pub fn load_config() -> Result<LoadedConfig> {
         EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV,
         &mut source,
     )?;
+    feature_rollouts.agent_harness_runtime = apply_feature_rollout_env_override(
+        feature_rollouts.agent_harness_runtime,
+        AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.inline_runtime_hooks = apply_feature_rollout_env_override(
+        feature_rollouts.inline_runtime_hooks,
+        INLINE_RUNTIME_HOOKS_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.tool_result_middleware = apply_feature_rollout_env_override(
+        feature_rollouts.tool_result_middleware,
+        TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV,
+        &mut source,
+    )?;
     feature_rollouts.session_queue_policy = apply_feature_rollout_env_override(
         feature_rollouts.session_queue_policy,
         SESSION_QUEUE_POLICY_ROLLOUT_ENV,
@@ -2399,6 +2446,36 @@ pub fn load_config() -> Result<LoadedConfig> {
     feature_rollouts.provider_stream_normalizer = apply_feature_rollout_env_override(
         feature_rollouts.provider_stream_normalizer,
         PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.provider_recovery = apply_feature_rollout_env_override(
+        feature_rollouts.provider_recovery,
+        PROVIDER_RECOVERY_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.terminal_sessions = apply_feature_rollout_env_override(
+        feature_rollouts.terminal_sessions,
+        TERMINAL_SESSIONS_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.browser_rescue = apply_feature_rollout_env_override(
+        feature_rollouts.browser_rescue,
+        BROWSER_RESCUE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.lsp_service = apply_feature_rollout_env_override(
+        feature_rollouts.lsp_service,
+        LSP_SERVICE_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.advisor_fanout = apply_feature_rollout_env_override(
+        feature_rollouts.advisor_fanout,
+        ADVISOR_FANOUT_ROLLOUT_ENV,
+        &mut source,
+    )?;
+    feature_rollouts.acp_runtime = apply_feature_rollout_env_override(
+        feature_rollouts.acp_runtime,
+        ACP_RUNTIME_ROLLOUT_ENV,
         &mut source,
     )?;
     feature_rollouts.channel_turn_kernel = apply_feature_rollout_env_override(
@@ -5546,6 +5623,9 @@ mod tests {
             execution_backend_ssh_tunnel = true
             safety_boundary = true
             execution_gate_pipeline_v2 = false
+            agent_harness_runtime = true
+            inline_runtime_hooks = false
+            tool_result_middleware = true
             session_queue_policy = true
             pruning_policy_matrix = false
             retrieval_dual_path = true
@@ -5556,6 +5636,12 @@ mod tests {
             networked_workers = false
             tool_repair = true
             provider_stream_normalizer = false
+            provider_recovery = true
+            terminal_sessions = false
+            browser_rescue = true
+            lsp_service = false
+            advisor_fanout = true
+            acp_runtime = false
             channel_turn_kernel = true
             agent_plan_state = false
             objective_judge = true
@@ -5577,6 +5663,9 @@ mod tests {
         assert_eq!(feature_rollouts.execution_backend_ssh_tunnel, Some(true));
         assert_eq!(feature_rollouts.safety_boundary, Some(true));
         assert_eq!(feature_rollouts.execution_gate_pipeline_v2, Some(false));
+        assert_eq!(feature_rollouts.agent_harness_runtime, Some(true));
+        assert_eq!(feature_rollouts.inline_runtime_hooks, Some(false));
+        assert_eq!(feature_rollouts.tool_result_middleware, Some(true));
         assert_eq!(feature_rollouts.session_queue_policy, Some(true));
         assert_eq!(feature_rollouts.pruning_policy_matrix, Some(false));
         assert_eq!(feature_rollouts.retrieval_dual_path, Some(true));
@@ -5587,6 +5676,12 @@ mod tests {
         assert_eq!(feature_rollouts.networked_workers, Some(false));
         assert_eq!(feature_rollouts.tool_repair, Some(true));
         assert_eq!(feature_rollouts.provider_stream_normalizer, Some(false));
+        assert_eq!(feature_rollouts.provider_recovery, Some(true));
+        assert_eq!(feature_rollouts.terminal_sessions, Some(false));
+        assert_eq!(feature_rollouts.browser_rescue, Some(true));
+        assert_eq!(feature_rollouts.lsp_service, Some(false));
+        assert_eq!(feature_rollouts.advisor_fanout, Some(true));
+        assert_eq!(feature_rollouts.acp_runtime, Some(false));
         assert_eq!(feature_rollouts.channel_turn_kernel, Some(true));
         assert_eq!(feature_rollouts.agent_plan_state, Some(false));
         assert_eq!(feature_rollouts.objective_judge, Some(true));

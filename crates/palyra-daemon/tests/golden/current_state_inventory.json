@@ -940,6 +940,81 @@
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_gate_pipeline_v2 is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
+    "agent_harness_runtime": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.agent_harness_runtime",
+      "env_var": "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME",
+      "maturity": "preview_only",
+      "owner_component": "application/agent_harness",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.agent_harness_runtime or PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME after required tests and owner acceptance pass.",
+        "harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "agent_harness_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "inline_runtime_hooks": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.inline_runtime_hooks",
+      "env_var": "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS",
+      "maturity": "preview_only",
+      "owner_component": "hooks/runtime loop",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.inline_runtime_hooks or PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS after required tests and owner acceptance pass.",
+        "inline hook invocation must preserve timeout, panic, policy, approval, and audit fail-closed behavior"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "inline_runtime_hooks is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "tool_result_middleware": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.tool_result_middleware",
+      "env_var": "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE",
+      "maturity": "preview_only",
+      "owner_component": "tool runtime",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.tool_result_middleware or PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE after required tests and owner acceptance pass.",
+        "middleware may only preserve or downgrade model-visible tool results and must retain audit artifacts under host ownership"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "tool_result_middleware is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
     "session_queue_policy": {
       "enabled": false,
       "source": "default",
@@ -1194,6 +1269,160 @@
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "provider_stream_normalizer is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
     },
+    "provider_recovery": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.provider_recovery",
+      "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY",
+      "maturity": "preview_only",
+      "owner_component": "model provider recovery",
+      "required_tests": [
+        "cargo test -p palyra-model-providers --locked",
+        "cargo test -p palyra-daemon provider_stream --locked",
+        "cargo test -p palyra-daemon responses_failed_stream_event --locked"
+      ],
+      "public_api_exposure": "internal runtime flag; externally visible only through diagnostics and doctor",
+      "activation_blockers": [
+        "Enable feature_rollouts.provider_recovery or PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY after required tests and owner acceptance pass.",
+        "recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes"
+      ],
+      "acceptance_criteria": [
+        "provider recovery diagnostics expose retryability and terminal failure reasons",
+        "auth failover and malformed-output recovery stay bounded by provider policy",
+        "raw provider payloads are redacted before diagnostics and support bundle export"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "provider_recovery is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "terminal_sessions": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.terminal_sessions",
+      "env_var": "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS",
+      "maturity": "preview_only",
+      "owner_component": "process runtime",
+      "required_tests": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "palyra qa validate --path qa/scenarios/execution_backends --json",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.terminal_sessions or PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS after required tests and owner acceptance pass.",
+        "persistent terminal sessions must keep process handles, cwd, env, sudo posture, and cleanup evidence bounded"
+      ],
+      "acceptance_criteria": [
+        "scenario pack covers process, filesystem, patch, artifact, tool-program, cancellation, cleanup, and unavailable-backend fallback cases",
+        "backend advertises degraded outcome when disabled",
+        "policy, attestation, and cleanup evidence are covered before production enablement"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "terminal_sessions is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "browser_rescue": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.browser_rescue",
+      "env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESCUE",
+      "maturity": "preview_only",
+      "owner_component": "browserd/browser rescue",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.browser_rescue or PALYRA_EXPERIMENTAL_BROWSER_RESCUE after required tests and owner acceptance pass.",
+        "browser rescue must stay policy-gated and must not export raw screenshots or CDP payloads without redaction"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "browser_rescue is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "lsp_service": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.lsp_service",
+      "env_var": "PALYRA_EXPERIMENTAL_LSP_SERVICE",
+      "maturity": "preview_only",
+      "owner_component": "code intelligence",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.lsp_service or PALYRA_EXPERIMENTAL_LSP_SERVICE after required tests and owner acceptance pass.",
+        "LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "lsp_service is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "advisor_fanout": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.advisor_fanout",
+      "env_var": "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT",
+      "maturity": "preview_only",
+      "owner_component": "advisors",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.advisor_fanout or PALYRA_EXPERIMENTAL_ADVISOR_FANOUT after required tests and owner acceptance pass.",
+        "advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "advisor_fanout is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
+    "acp_runtime": {
+      "enabled": false,
+      "source": "default",
+      "config_path": "feature_rollouts.acp_runtime",
+      "env_var": "PALYRA_EXPERIMENTAL_ACP_RUNTIME",
+      "maturity": "preview_only",
+      "owner_component": "acp runtime",
+      "required_tests": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "public_api_exposure": "operator diagnostics: /console/v1/diagnostics, /admin/v1/status, palyra doctor --json",
+      "activation_blockers": [
+        "Enable feature_rollouts.acp_runtime or PALYRA_EXPERIMENTAL_ACP_RUNTIME after required tests and owner acceptance pass.",
+        "ACP actors must route permission, session, replay, and compaction handoff through host-owned control-plane boundaries"
+      ],
+      "acceptance_criteria": [
+        "rollout appears in /console/v1/diagnostics with maturity metadata",
+        "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+        "current_state_inventory golden records maturity changes"
+      ],
+      "deprecated_aliases": [],
+      "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
+      "inactive_reason": "acp_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
+    },
     "channel_turn_kernel": {
       "enabled": false,
       "source": "default",
@@ -1417,15 +1646,15 @@
   },
   "feature_rollout_maturity": {
     "schema_version": 1,
-    "flag_count": 26,
+    "flag_count": 35,
     "enabled_flags": 0,
-    "inactive_flags": 26,
+    "inactive_flags": 35,
     "blocked_flags": 5,
     "maturity_counts": {
       "blocked": 5,
       "deprecated": 0,
       "gated_production": 4,
-      "preview_only": 16,
+      "preview_only": 25,
       "scaffold": 1,
       "stable": 0
     },
@@ -8714,6 +8943,33 @@
       },
       {
         "schema_version": 1,
+        "capability": "agent_harness_runtime",
+        "label": "Agent harness runtime",
+        "summary": "Guards agent harness selection, lifecycle, callbacks, transcripts, and authority fences.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME",
+        "rollout_config_path": "feature_rollouts.agent_harness_runtime",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "inline_runtime_hooks",
+        "label": "Inline runtime hooks",
+        "summary": "Guards inline hook invocation points before they enter the critical run loop.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS",
+        "rollout_config_path": "feature_rollouts.inline_runtime_hooks",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "tool_result_middleware",
+        "label": "Tool result middleware",
+        "summary": "Guards tool-result middleware before model-visible projection changes.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE",
+        "rollout_config_path": "feature_rollouts.tool_result_middleware",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
         "capability": "tool_repair",
         "label": "Tool repair",
         "summary": "Guards tool-call repair parsing and proposal recovery.",
@@ -8728,6 +8984,60 @@
         "summary": "Guards provider stream normalization before tool proposal flow.",
         "rollout_env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
         "rollout_config_path": "feature_rollouts.provider_stream_normalizer",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "provider_recovery",
+        "label": "Provider recovery",
+        "summary": "Guards bounded provider retry, repair, auth failover, and terminal recovery decisions.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY",
+        "rollout_config_path": "feature_rollouts.provider_recovery",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "terminal_sessions",
+        "label": "Terminal sessions",
+        "summary": "Guards persistent terminal process handles, cwd/env state, and cleanup evidence.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS",
+        "rollout_config_path": "feature_rollouts.terminal_sessions",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "browser_rescue",
+        "label": "Browser rescue",
+        "summary": "Guards browser vision, dialog, CDP, and multimodal rescue boundaries.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESCUE",
+        "rollout_config_path": "feature_rollouts.browser_rescue",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "lsp_service",
+        "label": "LSP service",
+        "summary": "Guards code-intelligence service lifecycle, diagnostics, and workspace scoping.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_LSP_SERVICE",
+        "rollout_config_path": "feature_rollouts.lsp_service",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "advisor_fanout",
+        "label": "Advisor fanout",
+        "summary": "Guards advisor fanout, trace attribution, budget governance, and non-authoritative reviews.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT",
+        "rollout_config_path": "feature_rollouts.advisor_fanout",
+        "default_enabled": false
+      },
+      {
+        "schema_version": 1,
+        "capability": "acp_runtime",
+        "label": "ACP runtime",
+        "summary": "Guards ACP runtime actor queues, permissions, replay, and native handoff boundaries.",
+        "rollout_env_var": "PALYRA_EXPERIMENTAL_ACP_RUNTIME",
+        "rollout_config_path": "feature_rollouts.acp_runtime",
         "default_enabled": false
       },
       {
@@ -8794,6 +9104,172 @@
         "default_enabled": false
       }
     ],
+    "boundary_taxonomy": [
+      {
+        "schema_version": 1,
+        "family": "harness",
+        "event_name": "harness.selection.decision",
+        "severity": "info",
+        "retryability": "non_retryable",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "agent_harness_runtime",
+        "metadata_keys": [
+          "harness_id",
+          "selection_mode",
+          "support_outcome"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "hook",
+        "event_name": "hook.lifecycle.observed",
+        "severity": "info",
+        "retryability": "operator_action_required",
+        "visibility_policy": "operator_diagnostics",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "inline_runtime_hooks",
+        "metadata_keys": [
+          "hook_id",
+          "phase",
+          "decision_kind"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "middleware",
+        "event_name": "tool.middleware.projected",
+        "severity": "info",
+        "retryability": "non_retryable",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "tool_result_middleware",
+        "metadata_keys": [
+          "tool_name",
+          "middleware_id",
+          "visibility"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "middleware",
+        "event_name": "tool.middleware.failed",
+        "severity": "warning",
+        "retryability": "non_retryable",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "tool_result_middleware",
+        "metadata_keys": [
+          "tool_name",
+          "middleware_id",
+          "failure_code"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "provider_stream",
+        "event_name": "provider.stream.normalized",
+        "severity": "info",
+        "retryability": "retryable",
+        "visibility_policy": "internal_diagnostics",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "provider_stream_normalizer",
+        "metadata_keys": [
+          "provider_kind",
+          "chunk_count",
+          "repair_count"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "turn_recovery",
+        "event_name": "turn.recovery.retry_planned",
+        "severity": "warning",
+        "retryability": "retryable",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "provider_recovery",
+        "metadata_keys": [
+          "provider_kind",
+          "recovery_recipe",
+          "attempt_index"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "terminal",
+        "event_name": "terminal.session.lifecycle",
+        "severity": "info",
+        "retryability": "operator_action_required",
+        "visibility_policy": "operator_diagnostics",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "terminal_sessions",
+        "metadata_keys": [
+          "session_handle",
+          "state",
+          "cleanup_evidence"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "browser_rescue",
+        "event_name": "browser.rescue.requested",
+        "severity": "warning",
+        "retryability": "operator_action_required",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "browser_rescue",
+        "metadata_keys": [
+          "profile_id",
+          "rescue_kind",
+          "policy_decision"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "lsp",
+        "event_name": "lsp.lifecycle.changed",
+        "severity": "info",
+        "retryability": "retryable",
+        "visibility_policy": "operator_diagnostics",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "lsp_service",
+        "metadata_keys": [
+          "workspace_root",
+          "language_id",
+          "state"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "acp",
+        "event_name": "acp.runtime.actor_queued",
+        "severity": "info",
+        "retryability": "retryable",
+        "visibility_policy": "audit_and_replay",
+        "redaction_boundary": "metadata_only",
+        "rollout_capability": "acp_runtime",
+        "metadata_keys": [
+          "session_id",
+          "actor_id",
+          "permission_state"
+        ]
+      },
+      {
+        "schema_version": 1,
+        "family": "learning",
+        "event_name": "learning.candidate.reviewed",
+        "severity": "info",
+        "retryability": "non_retryable",
+        "visibility_policy": "operator_diagnostics",
+        "redaction_boundary": "metadata_only",
+        "metadata_keys": [
+          "candidate_kind",
+          "scope",
+          "decision"
+        ]
+      }
+    ],
     "phase0_harness": {
       "valid": true,
       "projection": {
@@ -8821,6 +9297,28 @@
           "crates/palyra-daemon/src/journal.rs",
           "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
           "fixtures/golden/release_eval_inventory.json"
+        ]
+      }
+    },
+    "phase1_trajectories": {
+      "valid": true,
+      "projection": {
+        "schema_version": 1,
+        "fixtures_total": 3,
+        "provider_chunks_total": 4,
+        "tool_calls_total": 1,
+        "malformed_provider_fixtures": 1,
+        "event_names": [
+          "harness.selection.decision",
+          "provider.stream.normalized",
+          "tool.middleware.projected",
+          "turn.recovery.retry_planned"
+        ],
+        "enabled_capabilities": [
+          "agent_harness_runtime",
+          "tool_result_middleware",
+          "provider_stream_normalizer",
+          "provider_recovery"
         ]
       }
     }
@@ -9301,7 +9799,7 @@
       "registered_compat_routes": 16,
       "diagnostics_sections": 50,
       "execution_backends": 5,
-      "feature_rollout_flags": 26,
+      "feature_rollout_flags": 35,
       "method_registry_methods": 507,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
@@ -9312,14 +9810,14 @@
       "scaffold": 3
     },
     "feature_rollout_counts": {
-      "disabled": 26
+      "disabled": 35
     },
     "feature_rollout_maturity": {
       "schema_version": 1,
       "maturity_counts": {
         "blocked": 5,
         "gated_production": 4,
-        "preview_only": 16,
+        "preview_only": 25,
         "scaffold": 1
       },
       "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"

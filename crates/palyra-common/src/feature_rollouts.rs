@@ -29,6 +29,12 @@ pub const SAFETY_BOUNDARY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_SAFETY_BOUNDA
 /// Env toggle for the experimental execution gate pipeline v2.
 pub const EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2";
+/// Env toggle for the experimental agent harness runtime boundary.
+pub const AGENT_HARNESS_RUNTIME_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME";
+/// Env toggle for the experimental inline runtime hook call sites.
+pub const INLINE_RUNTIME_HOOKS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS";
+/// Env toggle for the experimental tool-result middleware pipeline.
+pub const TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE";
 /// Env toggle for the experimental session queue policy.
 pub const SESSION_QUEUE_POLICY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY";
 /// Env toggle for the experimental pruning policy matrix.
@@ -50,6 +56,18 @@ pub const TOOL_REPAIR_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_TOOL_REPAIR";
 /// Env toggle for experimental provider stream normalization.
 pub const PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV: &str =
     "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER";
+/// Env toggle for the experimental provider turn recovery classifier.
+pub const PROVIDER_RECOVERY_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY";
+/// Env toggle for the experimental persistent terminal session model.
+pub const TERMINAL_SESSIONS_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS";
+/// Env toggle for the experimental browser rescue toolchain.
+pub const BROWSER_RESCUE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_BROWSER_RESCUE";
+/// Env toggle for the experimental LSP service lifecycle.
+pub const LSP_SERVICE_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_LSP_SERVICE";
+/// Env toggle for the experimental advisor fanout runtime.
+pub const ADVISOR_FANOUT_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT";
+/// Env toggle for the experimental ACP runtime manager.
+pub const ACP_RUNTIME_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_ACP_RUNTIME";
 /// Env toggle for the experimental channel turn kernel.
 pub const CHANNEL_TURN_KERNEL_ROLLOUT_ENV: &str = "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL";
 /// Env toggle for experimental model-visible agent plan state.
@@ -89,6 +107,14 @@ pub const SAFETY_BOUNDARY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.safety_b
 /// Config path for [`EXECUTION_GATE_PIPELINE_V2_ROLLOUT_ENV`].
 pub const EXECUTION_GATE_PIPELINE_V2_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.execution_gate_pipeline_v2";
+/// Config path for [`AGENT_HARNESS_RUNTIME_ROLLOUT_ENV`].
+pub const AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.agent_harness_runtime";
+/// Config path for [`INLINE_RUNTIME_HOOKS_ROLLOUT_ENV`].
+pub const INLINE_RUNTIME_HOOKS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.inline_runtime_hooks";
+/// Config path for [`TOOL_RESULT_MIDDLEWARE_ROLLOUT_ENV`].
+pub const TOOL_RESULT_MIDDLEWARE_ROLLOUT_CONFIG_PATH: &str =
+    "feature_rollouts.tool_result_middleware";
 /// Config path for [`SESSION_QUEUE_POLICY_ROLLOUT_ENV`].
 pub const SESSION_QUEUE_POLICY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.session_queue_policy";
 /// Config path for [`PRUNING_POLICY_MATRIX_ROLLOUT_ENV`].
@@ -111,6 +137,18 @@ pub const TOOL_REPAIR_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.tool_repair"
 /// Config path for [`PROVIDER_STREAM_NORMALIZER_ROLLOUT_ENV`].
 pub const PROVIDER_STREAM_NORMALIZER_ROLLOUT_CONFIG_PATH: &str =
     "feature_rollouts.provider_stream_normalizer";
+/// Config path for [`PROVIDER_RECOVERY_ROLLOUT_ENV`].
+pub const PROVIDER_RECOVERY_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.provider_recovery";
+/// Config path for [`TERMINAL_SESSIONS_ROLLOUT_ENV`].
+pub const TERMINAL_SESSIONS_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.terminal_sessions";
+/// Config path for [`BROWSER_RESCUE_ROLLOUT_ENV`].
+pub const BROWSER_RESCUE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.browser_rescue";
+/// Config path for [`LSP_SERVICE_ROLLOUT_ENV`].
+pub const LSP_SERVICE_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.lsp_service";
+/// Config path for [`ADVISOR_FANOUT_ROLLOUT_ENV`].
+pub const ADVISOR_FANOUT_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.advisor_fanout";
+/// Config path for [`ACP_RUNTIME_ROLLOUT_ENV`].
+pub const ACP_RUNTIME_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.acp_runtime";
 /// Config path for [`CHANNEL_TURN_KERNEL_ROLLOUT_ENV`].
 pub const CHANNEL_TURN_KERNEL_ROLLOUT_CONFIG_PATH: &str = "feature_rollouts.channel_turn_kernel";
 /// Config path for [`AGENT_PLAN_STATE_ROLLOUT_ENV`].
