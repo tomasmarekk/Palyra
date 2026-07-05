@@ -459,6 +459,115 @@
     "snapshot_version": "runtime-contracts.acp.v2"
   },
   "agent_harness": {
+    "attempt_classifications": {
+      "changelog_note": "Harness attempt classifications avoid generic provider/runtime error strings in diagnostics and replay.",
+      "name": "AgentHarnessAttemptClassification",
+      "snapshot_version": "runtime-contracts.agent_harness_attempt_classification.v1",
+      "values": [
+        {
+          "canonical": "ok",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "empty_response",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "reasoning_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "planning_only",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "policy_blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "hook_blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "malformed_provider_stream",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_loop_guardrail",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "side_effect_uncertain",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "native_runtime_error",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "attempt_replay_safety": {
+      "changelog_note": "Harness attempt replay-safety labels distinguish deterministic replay from side-effect-uncertain attempts.",
+      "name": "AgentHarnessAttemptReplaySafety",
+      "snapshot_version": "runtime-contracts.agent_harness_attempt_replay_safety.v1",
+      "values": [
+        {
+          "canonical": "replay_safe",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "not_replay_safe",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "side_effect_uncertain",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "unknown",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "attempt_terminal_statuses": {
+      "changelog_note": "Harness attempt terminal statuses are stable across embedded, plugin, and future native runtimes.",
+      "name": "AgentHarnessAttemptTerminalStatus",
+      "snapshot_version": "runtime-contracts.agent_harness_attempt_terminal_status.v1",
+      "values": [
+        {
+          "canonical": "completed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "failed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cancelled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "timed_out",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "yielded",
+          "deprecated_aliases": []
+        }
+      ]
+    },
     "callback_kinds": {
       "changelog_note": "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
       "name": "AgentHarnessCallbackKind",
@@ -482,7 +591,7 @@
         }
       ]
     },
-    "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, and journal writes host-owned.",
+    "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, journal writes, and structured attempt results host-owned.",
     "prepared_attempt_schema": {
       "callback_kinds": [
         "partial_reply",
@@ -525,14 +634,30 @@
     "selection_modes": {
       "changelog_note": "Harness selection modes are policy-visible and must not silently fall back for mutating attempts.",
       "name": "AgentHarnessSelectionMode",
-      "snapshot_version": "runtime-contracts.agent_harness_selection_mode.v1",
+      "snapshot_version": "runtime-contracts.agent_harness_selection_mode.v2",
       "values": [
+        {
+          "canonical": "embedded",
+          "deprecated_aliases": []
+        },
         {
           "canonical": "auto",
           "deprecated_aliases": []
         },
         {
           "canonical": "explicit",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "explicit_plugin",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "preferred_plugin",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "native_stub",
           "deprecated_aliases": []
         },
         {
@@ -545,7 +670,7 @@
         }
       ]
     },
-    "snapshot_version": "runtime-contracts.agent_harness.v1",
+    "snapshot_version": "runtime-contracts.agent_harness.v2",
     "support_outcomes": {
       "changelog_note": "Harness support outcomes are audited before an attempt is routed.",
       "name": "AgentHarnessSupportOutcome",
@@ -2644,7 +2769,7 @@
     }
   ],
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v4",
+  "snapshot_version": "runtime-contracts.v5",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

@@ -6,6 +6,7 @@
 //! the daemon and are exposed to harnesses only through callbacks.
 
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,10 +15,16 @@ use std::{
 };
 
 use palyra_common::runtime_contracts::{
+    AgentHarnessAttemptClassification, AgentHarnessAttemptFinalizerSummary,
+    AgentHarnessAttemptReplaySafety, AgentHarnessAttemptResult, AgentHarnessAttemptTerminalStatus,
     AgentHarnessCallbackKind, AgentHarnessSelectionMode, AgentHarnessSupportOutcome,
     PREPARED_AGENT_ATTEMPT_SCHEMA,
 };
+use serde::Serialize;
 use serde_json::Value;
+
+/// Stable id for the embedded Palyra harness.
+pub const EMBEDDED_PALYRA_HARNESS_ID: &str = "embedded_palyra";
 
 /// Stable descriptor for a native agent harness implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +35,39 @@ pub struct AgentHarnessDescriptor {
     pub label: String,
     /// Whether this harness is the embedded runtime path.
     pub embedded_default: bool,
+    /// Stable hash over descriptor fields used by diagnostics and replay fixtures.
+    pub descriptor_hash: String,
+}
+
+impl AgentHarnessDescriptor {
+    /// Builds a descriptor and computes its deterministic hash.
+    #[must_use]
+    pub fn new(id: impl Into<String>, label: impl Into<String>, embedded_default: bool) -> Self {
+        let id = id.into();
+        let label = label.into();
+        let descriptor_hash = descriptor_hash(id.as_str(), label.as_str(), embedded_default);
+        Self { id, label, embedded_default, descriptor_hash }
+    }
+
+    /// Builds the canonical embedded Palyra descriptor.
+    #[must_use]
+    pub fn embedded_palyra() -> Self {
+        Self::new(EMBEDDED_PALYRA_HARNESS_ID, "Palyra embedded runtime", true)
+    }
+}
+
+fn descriptor_hash(id: &str, label: &str, embedded_default: bool) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in
+        id.bytes().chain([0]).chain(label.bytes()).chain([0]).chain([u8::from(embedded_default)])
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 /// Host-owned routing inputs used when asking a harness whether it can serve an attempt.
@@ -41,10 +81,24 @@ pub struct AgentHarnessSupportRequest<'a> {
     pub provider_id: &'a str,
     /// Resolved model id.
     pub model_id: &'a str,
+    /// Runtime policy profile selected by host configuration.
+    pub runtime_policy: &'a str,
+    /// Channel family for the attempt.
+    pub channel_kind: &'a str,
+    /// Sandbox posture required by host policy.
+    pub sandbox_mode: &'a str,
+    /// Safe tool policy summary. Raw tool arguments are not included.
+    pub tool_policy_summary: &'a str,
+    /// Model capability labels relevant to harness compatibility.
+    pub model_capabilities: &'a [&'a str],
     /// Whether the attempt may perform side effects.
     pub mutating: bool,
     /// Whether the prepared attempt can be safely retried by the same harness.
     pub replay_safe: bool,
+    /// Whether policy permits fallback from a preferred plugin/native route.
+    pub fallback_allowed: bool,
+    /// Whether replayability is mandatory for the selected harness.
+    pub replay_required: bool,
 }
 
 /// Auditable answer returned by a harness support probe.
@@ -81,6 +135,114 @@ impl AgentHarnessSupportDecision {
             AgentHarnessSupportOutcome::Supported => 1,
             AgentHarnessSupportOutcome::Preferred => 2,
         }
+    }
+}
+
+/// Registry lifecycle failure with a stable reason code.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AgentHarnessRegistryError {
+    #[error("agent harness registry has been disposed")]
+    Disposed,
+    #[error("agent harness already registered: {harness_id}")]
+    AlreadyRegistered { harness_id: String },
+}
+
+/// Host-owned registry for native and plugin-backed harness descriptors.
+#[derive(Default)]
+pub struct AgentHarnessRegistry {
+    harnesses: BTreeMap<String, Arc<dyn AgentHarness>>,
+    disposed: bool,
+}
+
+impl AgentHarnessRegistry {
+    /// Builds a registry with the embedded Palyra harness installed as default.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessRegistryError`] if the embedded harness cannot be registered.
+    pub fn with_embedded_default() -> Result<Self, AgentHarnessRegistryError> {
+        let mut registry = Self::default();
+        registry.register(EmbeddedPalyraHarness::default())?;
+        Ok(registry)
+    }
+
+    /// Registers a harness implementation.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessRegistryError::Disposed`] after disposal or
+    /// [`AgentHarnessRegistryError::AlreadyRegistered`] for duplicate ids.
+    pub fn register<H>(&mut self, harness: H) -> Result<(), AgentHarnessRegistryError>
+    where
+        H: AgentHarness + 'static,
+    {
+        self.register_arc(Arc::new(harness))
+    }
+
+    /// Registers an already shared harness implementation.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessRegistryError::Disposed`] after disposal or
+    /// [`AgentHarnessRegistryError::AlreadyRegistered`] for duplicate ids.
+    pub fn register_arc(
+        &mut self,
+        harness: Arc<dyn AgentHarness>,
+    ) -> Result<(), AgentHarnessRegistryError> {
+        if self.disposed {
+            return Err(AgentHarnessRegistryError::Disposed);
+        }
+        let harness_id = harness.descriptor().id.clone();
+        if self.harnesses.contains_key(harness_id.as_str()) {
+            return Err(AgentHarnessRegistryError::AlreadyRegistered { harness_id });
+        }
+        self.harnesses.insert(harness_id, harness);
+        Ok(())
+    }
+
+    /// Removes a harness by id and returns its descriptor when present.
+    pub fn unregister(&mut self, harness_id: &str) -> Option<AgentHarnessDescriptor> {
+        self.harnesses.remove(harness_id).map(|harness| harness.descriptor().clone())
+    }
+
+    /// Returns descriptors in deterministic id order.
+    #[must_use]
+    pub fn list(&self) -> Vec<AgentHarnessDescriptor> {
+        self.harnesses.values().map(|harness| harness.descriptor().clone()).collect()
+    }
+
+    /// Looks up a registered harness.
+    #[must_use]
+    pub fn lookup(&self, harness_id: &str) -> Option<&dyn AgentHarness> {
+        self.harnesses.get(harness_id).map(Arc::as_ref)
+    }
+
+    /// Resets the registry to the embedded default harness.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessRegistryError::Disposed`] after disposal.
+    pub fn reset(&mut self) -> Result<(), AgentHarnessRegistryError> {
+        if self.disposed {
+            return Err(AgentHarnessRegistryError::Disposed);
+        }
+        self.harnesses.clear();
+        self.register(EmbeddedPalyraHarness::default())
+    }
+
+    /// Disposes the registry and drops all registered harness handles.
+    pub fn dispose(&mut self) {
+        self.harnesses.clear();
+        self.disposed = true;
+    }
+
+    /// Selects a harness from the registered set.
+    ///
+    /// # Errors
+    /// Returns [`AgentHarnessSelectionError`] when policy cannot select a safe harness.
+    pub fn select<'a>(
+        &'a self,
+        request: &AgentHarnessSupportRequest<'_>,
+    ) -> Result<SelectedAgentHarness<'a>, AgentHarnessSelectionError> {
+        let harnesses: Vec<&'a dyn AgentHarness> =
+            self.harnesses.values().map(Arc::as_ref).collect();
+        select_agent_harness(harnesses.as_slice(), request)
     }
 }
 
@@ -176,6 +338,49 @@ pub struct AgentHarnessRunOutcome {
     pub final_message: Option<String>,
 }
 
+impl AgentHarnessRunOutcome {
+    /// Converts the legacy minimal outcome into a structured attempt result.
+    #[must_use]
+    pub fn to_attempt_result(
+        &self,
+        replay_safe: bool,
+        diagnostic_trace_id: impl Into<String>,
+    ) -> AgentHarnessAttemptResult {
+        let terminal_status = AgentHarnessAttemptTerminalStatus::parse(self.status.as_str())
+            .unwrap_or(AgentHarnessAttemptTerminalStatus::Failed);
+        let classification = match terminal_status {
+            AgentHarnessAttemptTerminalStatus::Completed
+            | AgentHarnessAttemptTerminalStatus::Yielded => AgentHarnessAttemptClassification::Ok,
+            AgentHarnessAttemptTerminalStatus::Blocked => {
+                AgentHarnessAttemptClassification::PolicyBlocked
+            }
+            AgentHarnessAttemptTerminalStatus::Cancelled => AgentHarnessAttemptClassification::Ok,
+            AgentHarnessAttemptTerminalStatus::TimedOut
+            | AgentHarnessAttemptTerminalStatus::Failed => {
+                AgentHarnessAttemptClassification::NativeRuntimeError
+            }
+        };
+        let replay_safety = if replay_safe {
+            AgentHarnessAttemptReplaySafety::ReplaySafe
+        } else if terminal_status == AgentHarnessAttemptTerminalStatus::Completed {
+            AgentHarnessAttemptReplaySafety::Unknown
+        } else {
+            AgentHarnessAttemptReplaySafety::NotReplaySafe
+        };
+        let mut result = AgentHarnessAttemptResult::minimal(
+            terminal_status,
+            classification,
+            replay_safety,
+            diagnostic_trace_id,
+        );
+        result.finalizer_summary = Some(AgentHarnessAttemptFinalizerSummary {
+            final_message_present: self.final_message.is_some(),
+            finish_reason: Some(self.status.clone()),
+        });
+        result
+    }
+}
+
 /// Native harness abstraction. Implementations are selected only after host policy prepares the
 /// attempt and never receive direct authority over tools, approvals, or the journal.
 pub trait AgentHarness: Send + Sync {
@@ -195,6 +400,43 @@ pub struct SelectedAgentHarness<'a> {
     pub harness: &'a dyn AgentHarness,
     /// Support decision that justified the route.
     pub decision: AgentHarnessSupportDecision,
+    /// Whether selection used a policy-approved fallback from a preferred route.
+    pub fallback_used: bool,
+    /// Fallback policy summary applied to this selection.
+    pub fallback_policy: String,
+    /// Selection mode used for the decision.
+    pub selection_mode: AgentHarnessSelectionMode,
+}
+
+impl SelectedAgentHarness<'_> {
+    /// Builds a redacted diagnostics report for this selection decision.
+    #[must_use]
+    pub fn diagnostics(&self) -> AgentHarnessSelectionDiagnostics {
+        let descriptor = self.harness.descriptor();
+        AgentHarnessSelectionDiagnostics {
+            harness_id: descriptor.id.clone(),
+            descriptor_hash: descriptor.descriptor_hash.clone(),
+            selection_mode: self.selection_mode,
+            support_outcome: self.decision.outcome,
+            reason_code: self.decision.reason_code.clone(),
+            fallback_used: self.fallback_used,
+            fallback_policy: self.fallback_policy.clone(),
+            embedded_default: descriptor.embedded_default,
+        }
+    }
+}
+
+/// Redacted selection decision visible through diagnostics and replay fixtures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentHarnessSelectionDiagnostics {
+    pub harness_id: String,
+    pub descriptor_hash: String,
+    pub selection_mode: AgentHarnessSelectionMode,
+    pub support_outcome: AgentHarnessSupportOutcome,
+    pub reason_code: String,
+    pub fallback_used: bool,
+    pub fallback_policy: String,
+    pub embedded_default: bool,
 }
 
 /// Harness selection failure with a stable reason code.
@@ -219,29 +461,126 @@ impl AgentHarnessSelectionError {
 /// Returns `explicit_harness_not_found`, `explicit_harness_declined`, or
 /// `no_supported_harness` when the selection cannot be satisfied.
 pub fn select_agent_harness<'a>(
-    harnesses: &'a [&'a dyn AgentHarness],
+    harnesses: &[&'a dyn AgentHarness],
     request: &AgentHarnessSupportRequest<'_>,
 ) -> Result<SelectedAgentHarness<'a>, AgentHarnessSelectionError> {
-    if let Some(explicit_id) = request.explicit_harness_id {
-        let Some(harness) =
-            harnesses.iter().copied().find(|harness| harness.descriptor().id == explicit_id)
-        else {
-            return Err(AgentHarnessSelectionError::new(
-                "explicit_harness_not_found",
-                format!("explicit harness '{explicit_id}' is not registered"),
-            ));
-        };
-        let decision = harness.supports(request);
-        if decision.outcome == AgentHarnessSupportOutcome::Declined {
-            return Err(AgentHarnessSelectionError::new(
-                "explicit_harness_declined",
-                format!("explicit harness '{explicit_id}' declined the prepared attempt"),
-            ));
-        }
-        return Ok(SelectedAgentHarness { harness, decision });
+    if matches!(request.selection_mode, AgentHarnessSelectionMode::Embedded) {
+        return select_embedded_harness(harnesses, request);
     }
 
-    harnesses
+    let explicit_mode = matches!(
+        request.selection_mode,
+        AgentHarnessSelectionMode::Explicit | AgentHarnessSelectionMode::ExplicitPlugin
+    );
+    let preferred_mode = matches!(
+        request.selection_mode,
+        AgentHarnessSelectionMode::PreferredPlugin
+            | AgentHarnessSelectionMode::ModelScoped
+            | AgentHarnessSelectionMode::ProviderScoped
+    );
+
+    if let Some(requested_id) = request.explicit_harness_id {
+        if explicit_mode {
+            return select_requested_harness(harnesses, request, requested_id);
+        }
+        if preferred_mode {
+            if let Some(selected) = try_requested_harness(harnesses, request, requested_id)? {
+                return Ok(selected);
+            }
+            if request.mutating || !request.fallback_allowed {
+                return Err(AgentHarnessSelectionError::new(
+                    "preferred_harness_unavailable_for_mutation",
+                    format!("preferred harness '{requested_id}' cannot fall back for this route"),
+                ));
+            }
+            return select_best_harness(harnesses, request, true, "policy_allowed");
+        }
+    }
+
+    select_best_harness(harnesses, request, false, "not_applicable")
+}
+
+fn select_embedded_harness<'a>(
+    harnesses: &[&'a dyn AgentHarness],
+    request: &AgentHarnessSupportRequest<'_>,
+) -> Result<SelectedAgentHarness<'a>, AgentHarnessSelectionError> {
+    let Some(harness) =
+        harnesses.iter().copied().find(|harness| harness.descriptor().embedded_default)
+    else {
+        return Err(AgentHarnessSelectionError::new(
+            "embedded_harness_not_registered",
+            "embedded Palyra harness is not registered",
+        ));
+    };
+    let decision = harness.supports(request);
+    if decision.outcome == AgentHarnessSupportOutcome::Declined {
+        return Err(AgentHarnessSelectionError::new(
+            "embedded_harness_declined",
+            "embedded Palyra harness declined the prepared attempt",
+        ));
+    }
+    Ok(SelectedAgentHarness {
+        harness,
+        decision,
+        fallback_used: false,
+        fallback_policy: "not_applicable".to_owned(),
+        selection_mode: request.selection_mode,
+    })
+}
+
+fn select_requested_harness<'a>(
+    harnesses: &[&'a dyn AgentHarness],
+    request: &AgentHarnessSupportRequest<'_>,
+    requested_id: &str,
+) -> Result<SelectedAgentHarness<'a>, AgentHarnessSelectionError> {
+    let Some(selected) = try_requested_harness(harnesses, request, requested_id)? else {
+        return Err(AgentHarnessSelectionError::new(
+            "explicit_harness_not_found",
+            format!("explicit harness '{requested_id}' is not registered"),
+        ));
+    };
+    Ok(selected)
+}
+
+fn try_requested_harness<'a>(
+    harnesses: &[&'a dyn AgentHarness],
+    request: &AgentHarnessSupportRequest<'_>,
+    requested_id: &str,
+) -> Result<Option<SelectedAgentHarness<'a>>, AgentHarnessSelectionError> {
+    let Some(harness) =
+        harnesses.iter().copied().find(|harness| harness.descriptor().id == requested_id)
+    else {
+        return Ok(None);
+    };
+    let decision = harness.supports(request);
+    if decision.outcome == AgentHarnessSupportOutcome::Declined {
+        if matches!(
+            request.selection_mode,
+            AgentHarnessSelectionMode::Explicit | AgentHarnessSelectionMode::ExplicitPlugin
+        ) {
+            return Err(AgentHarnessSelectionError::new(
+                "explicit_harness_declined",
+                format!("explicit harness '{requested_id}' declined the prepared attempt"),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(SelectedAgentHarness {
+        harness,
+        decision,
+        fallback_used: false,
+        fallback_policy: "not_applicable".to_owned(),
+        selection_mode: request.selection_mode,
+    }))
+}
+
+fn select_best_harness<'a>(
+    harnesses: &[&'a dyn AgentHarness],
+    request: &AgentHarnessSupportRequest<'_>,
+    fallback_used: bool,
+    fallback_policy: &str,
+) -> Result<SelectedAgentHarness<'a>, AgentHarnessSelectionError> {
+    let mut candidates: Vec<(&'a dyn AgentHarness, AgentHarnessSupportDecision)> = harnesses
         .iter()
         .copied()
         .filter_map(|harness| {
@@ -249,19 +588,29 @@ pub fn select_agent_harness<'a>(
             (decision.outcome != AgentHarnessSupportOutcome::Declined)
                 .then_some((harness, decision))
         })
-        .max_by(|(left_harness, left_decision), (right_harness, right_decision)| {
-            left_decision
-                .selection_rank()
-                .cmp(&right_decision.selection_rank())
-                .then_with(|| right_harness.descriptor().id.cmp(&left_harness.descriptor().id))
-        })
-        .map(|(harness, decision)| SelectedAgentHarness { harness, decision })
-        .ok_or_else(|| {
-            AgentHarnessSelectionError::new(
-                "no_supported_harness",
-                "no registered harness supports the prepared attempt",
-            )
-        })
+        .collect();
+
+    candidates.sort_by(|(left_harness, left_decision), (right_harness, right_decision)| {
+        right_decision
+            .selection_rank()
+            .cmp(&left_decision.selection_rank())
+            .then_with(|| left_harness.descriptor().id.cmp(&right_harness.descriptor().id))
+    });
+
+    let Some((harness, decision)) = candidates.into_iter().next() else {
+        return Err(AgentHarnessSelectionError::new(
+            "no_supported_harness",
+            "no registered harness supports the prepared attempt",
+        ));
+    };
+
+    Ok(SelectedAgentHarness {
+        harness,
+        decision,
+        fallback_used,
+        fallback_policy: fallback_policy.to_owned(),
+        selection_mode: request.selection_mode,
+    })
 }
 
 /// Embedded Palyra harness used as the default execution route.
@@ -272,13 +621,7 @@ pub struct EmbeddedPalyraHarness {
 
 impl Default for EmbeddedPalyraHarness {
     fn default() -> Self {
-        Self {
-            descriptor: AgentHarnessDescriptor {
-                id: "palyra.embedded".to_owned(),
-                label: "Palyra embedded runtime".to_owned(),
-                embedded_default: true,
-            },
-        }
+        Self { descriptor: AgentHarnessDescriptor::embedded_palyra() }
     }
 }
 
@@ -288,8 +631,10 @@ impl AgentHarness for EmbeddedPalyraHarness {
     }
 
     fn supports(&self, request: &AgentHarnessSupportRequest<'_>) -> AgentHarnessSupportDecision {
-        if matches!(request.selection_mode, AgentHarnessSelectionMode::Explicit)
-            && request.explicit_harness_id != Some(self.descriptor.id.as_str())
+        if matches!(
+            request.selection_mode,
+            AgentHarnessSelectionMode::Explicit | AgentHarnessSelectionMode::ExplicitPlugin
+        ) && request.explicit_harness_id != Some(self.descriptor.id.as_str())
         {
             return AgentHarnessSupportDecision::declined("harness.explicit_id_mismatch");
         }
@@ -324,11 +669,7 @@ mod tests {
     impl DummyHarness {
         fn new(id: &str, preferred: bool, supports_mutating: bool) -> Self {
             Self {
-                descriptor: AgentHarnessDescriptor {
-                    id: id.to_owned(),
-                    label: id.to_owned(),
-                    embedded_default: false,
-                },
+                descriptor: AgentHarnessDescriptor::new(id, id, false),
                 preferred,
                 supports_mutating,
             }
@@ -379,9 +720,47 @@ mod tests {
             explicit_harness_id,
             provider_id: "openai",
             model_id: "gpt",
+            runtime_policy: "default",
+            channel_kind: "operator_cli",
+            sandbox_mode: "host_owned",
+            tool_policy_summary: "approval_required",
+            model_capabilities: &["text"],
             mutating,
             replay_safe: false,
+            fallback_allowed: true,
+            replay_required: false,
         }
+    }
+
+    #[test]
+    fn default_registry_exposes_embedded_harness_descriptor() {
+        let registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let descriptors = registry.list();
+
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].id, EMBEDDED_PALYRA_HARNESS_ID);
+        assert!(descriptors[0].embedded_default);
+        assert!(descriptors[0].descriptor_hash.starts_with("fnv1a64:"));
+        assert!(registry.lookup(EMBEDDED_PALYRA_HARNESS_ID).is_some());
+    }
+
+    #[test]
+    fn registry_reset_restores_embedded_harness_and_dispose_closes_registration() {
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+        registry.register(DummyHarness::new("zeta.harness", false, true)).unwrap();
+
+        registry.reset().expect("reset should restore embedded default");
+        assert_eq!(registry.list().len(), 1);
+        assert!(registry.lookup("zeta.harness").is_none());
+
+        registry.dispose();
+        let error = registry
+            .register(DummyHarness::new("new.harness", false, true))
+            .expect_err("disposed registry must not accept new harnesses");
+        assert_eq!(error, AgentHarnessRegistryError::Disposed);
     }
 
     #[test]
@@ -398,6 +777,7 @@ mod tests {
 
         assert_eq!(selected.harness.descriptor().id, "acme.harness");
         assert_eq!(selected.decision.outcome, AgentHarnessSupportOutcome::Preferred);
+        assert!(!selected.fallback_used);
     }
 
     #[test]
@@ -418,6 +798,83 @@ mod tests {
         };
 
         assert_eq!(error.code, "explicit_harness_declined");
+    }
+
+    #[test]
+    fn explicit_missing_harness_fails_closed() {
+        let registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let error = match registry.select(&support_request(
+            AgentHarnessSelectionMode::ExplicitPlugin,
+            Some("missing.plugin"),
+            false,
+        )) {
+            Ok(selected) => panic!(
+                "explicit missing harness must not select {}",
+                selected.harness.descriptor().id
+            ),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "explicit_harness_not_found");
+    }
+
+    #[test]
+    fn auto_selection_has_deterministic_tie_breaker() {
+        let embedded = EmbeddedPalyraHarness::default();
+        let alpha = DummyHarness::new("alpha.harness", false, true);
+        let beta = DummyHarness::new("beta.harness", false, true);
+        let harnesses: [&dyn AgentHarness; 3] = [&beta, &embedded, &alpha];
+
+        let selected = select_agent_harness(
+            &harnesses,
+            &support_request(AgentHarnessSelectionMode::Auto, None, false),
+        )
+        .expect("auto selection should find a harness");
+
+        assert_eq!(selected.harness.descriptor().id, "alpha.harness");
+        assert_eq!(selected.decision.reason_code, "harness.supported");
+    }
+
+    #[test]
+    fn preferred_plugin_missing_cannot_fallback_for_mutating_route() {
+        let registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let error = match registry.select(&support_request(
+            AgentHarnessSelectionMode::PreferredPlugin,
+            Some("missing.plugin"),
+            true,
+        )) {
+            Ok(selected) => panic!(
+                "mutating preferred route must not fallback to {}",
+                selected.harness.descriptor().id
+            ),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "preferred_harness_unavailable_for_mutation");
+    }
+
+    #[test]
+    fn preferred_plugin_missing_can_fallback_when_policy_allows_read_only_route() {
+        let registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let selected = registry
+            .select(&support_request(
+                AgentHarnessSelectionMode::PreferredPlugin,
+                Some("missing.plugin"),
+                false,
+            ))
+            .expect("read-only preferred route may fallback by policy");
+
+        let diagnostics = selected.diagnostics();
+        assert_eq!(diagnostics.harness_id, EMBEDDED_PALYRA_HARNESS_ID);
+        assert!(diagnostics.fallback_used);
+        assert_eq!(diagnostics.fallback_policy, "policy_allowed");
+        assert_eq!(diagnostics.reason_code, "harness.embedded_default");
     }
 
     #[test]
@@ -451,6 +908,16 @@ mod tests {
         assert_eq!(outcome.status, "completed");
         assert!(outcome.emitted_callbacks.contains(&AgentHarnessCallbackKind::FinalOutcome));
         assert_eq!(outcome.final_message.as_deref(), Some("openai:gpt"));
+
+        let structured = outcome.to_attempt_result(false, "trace?access_token=secret");
+        let serialized = serde_json::to_string(&structured).expect("result should serialize");
+        assert_eq!(structured.terminal_status, AgentHarnessAttemptTerminalStatus::Completed);
+        assert_eq!(structured.classification, AgentHarnessAttemptClassification::Ok);
+        assert!(structured
+            .finalizer_summary
+            .as_ref()
+            .is_some_and(|summary| summary.final_message_present));
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]

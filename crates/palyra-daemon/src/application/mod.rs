@@ -4,6 +4,11 @@
 //! and `run_stream` are the inbound and provider-turn entry points.
 
 pub mod agent_harness;
+pub mod agent_harness_callbacks;
+pub mod agent_harness_context;
+pub mod agent_harness_lifecycle;
+pub mod agent_harness_threads;
+pub mod agent_harness_tool_bridge;
 pub mod approvals;
 pub mod auth;
 pub mod channel_commands;

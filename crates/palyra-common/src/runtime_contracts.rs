@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v4";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v5";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -445,11 +445,11 @@ fn agent_hook_contract_snapshot() -> Value {
 
 fn agent_harness_contract_snapshot() -> Value {
     json!({
-        "snapshot_version": "runtime-contracts.agent_harness.v1",
-        "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, and journal writes host-owned.",
+        "snapshot_version": "runtime-contracts.agent_harness.v2",
+        "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, journal writes, and structured attempt results host-owned.",
         "selection_modes": enum_contract_snapshot(
             "AgentHarnessSelectionMode",
-            "runtime-contracts.agent_harness_selection_mode.v1",
+            "runtime-contracts.agent_harness_selection_mode.v2",
             "Harness selection modes are policy-visible and must not silently fall back for mutating attempts.",
             AgentHarnessSelectionMode::wire_contract_values(),
         ),
@@ -464,6 +464,24 @@ fn agent_harness_contract_snapshot() -> Value {
             "runtime-contracts.agent_harness_callback_kind.v1",
             "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
             AgentHarnessCallbackKind::wire_contract_values(),
+        ),
+        "attempt_terminal_statuses": enum_contract_snapshot(
+            "AgentHarnessAttemptTerminalStatus",
+            "runtime-contracts.agent_harness_attempt_terminal_status.v1",
+            "Harness attempt terminal statuses are stable across embedded, plugin, and future native runtimes.",
+            AgentHarnessAttemptTerminalStatus::wire_contract_values(),
+        ),
+        "attempt_classifications": enum_contract_snapshot(
+            "AgentHarnessAttemptClassification",
+            "runtime-contracts.agent_harness_attempt_classification.v1",
+            "Harness attempt classifications avoid generic provider/runtime error strings in diagnostics and replay.",
+            AgentHarnessAttemptClassification::wire_contract_values(),
+        ),
+        "attempt_replay_safety": enum_contract_snapshot(
+            "AgentHarnessAttemptReplaySafety",
+            "runtime-contracts.agent_harness_attempt_replay_safety.v1",
+            "Harness attempt replay-safety labels distinguish deterministic replay from side-effect-uncertain attempts.",
+            AgentHarnessAttemptReplaySafety::wire_contract_values(),
         ),
         "prepared_attempt_schema": PREPARED_AGENT_ATTEMPT_SCHEMA,
     })
@@ -1910,8 +1928,12 @@ pub fn agent_hook_descriptor(kind: AgentHookKind) -> Option<&'static AgentHookDe
 runtime_contract_enum! {
     /// Host-owned policy for routing a prepared attempt to an agent harness.
     pub enum AgentHarnessSelectionMode {
+        Embedded => "embedded",
         Auto => "auto",
         Explicit => "explicit",
+        ExplicitPlugin => "explicit_plugin",
+        PreferredPlugin => "preferred_plugin",
+        NativeStub => "native_stub",
         ModelScoped => "model_scoped",
         ProviderScoped => "provider_scoped"
     }
@@ -1933,6 +1955,201 @@ runtime_contract_enum! {
         ToolEvent => "tool_event",
         LifecycleEvent => "lifecycle_event",
         FinalOutcome => "final_outcome"
+    }
+}
+
+runtime_contract_enum! {
+    /// Terminal status returned by one harness attempt.
+    pub enum AgentHarnessAttemptTerminalStatus {
+        Completed => "completed",
+        Blocked => "blocked",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        TimedOut => "timed_out",
+        Yielded => "yielded"
+    }
+}
+
+runtime_contract_enum! {
+    /// Diagnostic classification for a harness attempt terminal outcome.
+    pub enum AgentHarnessAttemptClassification {
+        Ok => "ok",
+        EmptyResponse => "empty_response",
+        ReasoningOnly => "reasoning_only",
+        PlanningOnly => "planning_only",
+        PolicyBlocked => "policy_blocked",
+        HookBlocked => "hook_blocked",
+        ProviderError => "provider_error",
+        MalformedProviderStream => "malformed_provider_stream",
+        ToolError => "tool_error",
+        ToolLoopGuardrail => "tool_loop_guardrail",
+        SideEffectUncertain => "side_effect_uncertain",
+        NativeRuntimeError => "native_runtime_error"
+    }
+}
+
+runtime_contract_enum! {
+    /// Whether a completed or failed attempt can be replayed deterministically.
+    pub enum AgentHarnessAttemptReplaySafety {
+        ReplaySafe => "replay_safe",
+        NotReplaySafe => "not_replay_safe",
+        SideEffectUncertain => "side_effect_uncertain",
+        Unknown => "unknown"
+    }
+}
+
+/// Duration spent in one host-observed harness attempt phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptPhaseTiming {
+    /// Stable phase name such as `selection`, `context`, `provider`, or `tools`.
+    pub phase: String,
+    /// Monotonic elapsed milliseconds recorded by the host.
+    pub elapsed_ms: u64,
+}
+
+/// Typed source metadata for a harness attempt error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptErrorSummary {
+    /// Error source family, for example `provider`, `policy`, `tool`, or `native_runtime`.
+    pub source: String,
+    /// Stable safe error code.
+    pub code: String,
+    /// Redacted operator-safe detail. Raw provider payloads and secrets must not appear here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_message: Option<String>,
+}
+
+impl AgentHarnessAttemptErrorSummary {
+    /// Builds a redacted error summary.
+    #[must_use]
+    pub fn new(
+        source: impl Into<String>,
+        code: impl Into<String>,
+        safe_message: Option<&str>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            code: code.into(),
+            safe_message: safe_message.map(crate::redaction::redact_diagnostic_text),
+        }
+    }
+}
+
+/// Aggregate tool-call counters emitted by a harness attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptToolCallSummary {
+    /// Tool calls proposed by the harness or model stream.
+    pub proposed: u32,
+    /// Tool calls executed through the host-owned bridge.
+    pub executed: u32,
+    /// Tool calls denied by policy, approval, or execution gate.
+    pub denied: u32,
+    /// Tool calls that reached the executor and failed.
+    pub failed: u32,
+}
+
+/// Optional provider usage totals for an attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptUsageSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+/// Context shape observed by a prepared harness attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptContextSummary {
+    /// Context mode selected by the host, such as `palyra_owned` or `harness_provided`.
+    pub context_mode: String,
+    /// Maximum prompt/context budget made visible to the harness.
+    pub token_budget: u64,
+    /// Hash of the redacted context surface, if one was produced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface_hash: Option<String>,
+}
+
+/// Finalizer details safe for diagnostics and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptFinalizerSummary {
+    /// Whether a final user-visible answer was produced.
+    pub final_message_present: bool,
+    /// Stable finish reason, when the provider/runtime supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+/// Structured result returned by a host-owned harness attempt boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHarnessAttemptResult {
+    /// Schema version for this result envelope.
+    pub schema_version: u32,
+    /// Terminal attempt status.
+    pub terminal_status: AgentHarnessAttemptTerminalStatus,
+    /// Typed outcome classification.
+    pub classification: AgentHarnessAttemptClassification,
+    /// Replay-safety posture for this attempt.
+    pub replay_safety: AgentHarnessAttemptReplaySafety,
+    /// Optional phase timing summaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phase_timings: Vec<AgentHarnessAttemptPhaseTiming>,
+    /// Optional redacted error details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentHarnessAttemptErrorSummary>,
+    /// Optional timeout source such as `provider`, `tool`, or `harness`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_source: Option<String>,
+    /// Tool-call aggregate counts.
+    pub tool_call_summary: AgentHarnessAttemptToolCallSummary,
+    /// Optional provider usage counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_summary: Option<AgentHarnessAttemptUsageSummary>,
+    /// Optional context summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<AgentHarnessAttemptContextSummary>,
+    /// Optional finalizer summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalizer_summary: Option<AgentHarnessAttemptFinalizerSummary>,
+    /// Redacted trace id for diagnostics correlation.
+    pub diagnostic_trace_id: String,
+}
+
+impl AgentHarnessAttemptResult {
+    /// Current schema version emitted by the host.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// Builds a minimal result with typed status, classification, replay safety, and trace id.
+    #[must_use]
+    pub fn minimal(
+        terminal_status: AgentHarnessAttemptTerminalStatus,
+        classification: AgentHarnessAttemptClassification,
+        replay_safety: AgentHarnessAttemptReplaySafety,
+        diagnostic_trace_id: impl Into<String>,
+    ) -> Self {
+        let diagnostic_trace_id = diagnostic_trace_id.into();
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            terminal_status,
+            classification,
+            replay_safety,
+            phase_timings: Vec::new(),
+            error: None,
+            timeout_source: None,
+            tool_call_summary: AgentHarnessAttemptToolCallSummary::default(),
+            usage_summary: None,
+            context_summary: None,
+            finalizer_summary: None,
+            diagnostic_trace_id: crate::redaction::redact_diagnostic_text(&diagnostic_trace_id),
+        }
     }
 }
 
@@ -3437,22 +3654,25 @@ mod tests {
         validate_public_runtime_event_sequence, AcpBindingConflictKind, AcpBindingRepairActionKind,
         AcpCapability, AcpClientContext, AcpCommand, AcpCommandEnvelope, AcpProtocolVersionRange,
         AcpScope, AcpSessionBindingRecord, AcpSessionMode, AcpTransportKind,
-        AgentHarnessCallbackKind, AgentHookCapabilityGrant, AgentHookDecisionAuthority,
-        AgentHookDecisionKind, AgentHookKind, AgentHookRedactionPosture, ArtifactReadRequest,
-        ArtifactRetentionDisposition, ArtifactRetentionPolicy, AuxiliaryTaskKind,
-        AuxiliaryTaskState, DeliveryPolicy, FlowState, FlowStepState, IdempotencyReplayDecision,
-        PalyraErrorCategory, PalyraErrorEnvelope, PalyraValidationIssue, PruningPolicyClass,
-        PublicRuntimeEventCorrelation, PublicRuntimeEventEnvelope, PublicRuntimeEventName,
-        QueueDecision, QueueMode, QueuedInputState, RealtimeCapability, RealtimeCommand,
-        RealtimeCommandEnvelope, RealtimeEventSensitivity, RealtimeEventTopic,
-        RealtimeHandshakeRequest, RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope,
-        RealtimeSubscription, RunLifecycleHookDecision, RunLifecycleHookDecisionKind,
-        RunLifecycleHookPhase, RunLifecyclePhase, StableErrorEnvelope,
-        ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
-        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
-        ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION, ACP_PROTOCOL_MIN_VERSION,
-        AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA, PUBLIC_RUNTIME_EVENT_DESCRIPTORS,
-        REALTIME_PROTOCOL_MAX_VERSION, REALTIME_PROTOCOL_MIN_VERSION,
+        AgentHarnessAttemptClassification, AgentHarnessAttemptErrorSummary,
+        AgentHarnessAttemptReplaySafety, AgentHarnessAttemptResult,
+        AgentHarnessAttemptTerminalStatus, AgentHarnessCallbackKind, AgentHarnessSelectionMode,
+        AgentHookCapabilityGrant, AgentHookDecisionAuthority, AgentHookDecisionKind, AgentHookKind,
+        AgentHookRedactionPosture, ArtifactReadRequest, ArtifactRetentionDisposition,
+        ArtifactRetentionPolicy, AuxiliaryTaskKind, AuxiliaryTaskState, DeliveryPolicy, FlowState,
+        FlowStepState, IdempotencyReplayDecision, PalyraErrorCategory, PalyraErrorEnvelope,
+        PalyraValidationIssue, PruningPolicyClass, PublicRuntimeEventCorrelation,
+        PublicRuntimeEventEnvelope, PublicRuntimeEventName, QueueDecision, QueueMode,
+        QueuedInputState, RealtimeCapability, RealtimeCommand, RealtimeCommandEnvelope,
+        RealtimeEventSensitivity, RealtimeEventTopic, RealtimeHandshakeRequest,
+        RealtimeProtocolVersionRange, RealtimeRole, RealtimeScope, RealtimeSubscription,
+        RunLifecycleHookDecision, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        RunLifecyclePhase, StableErrorEnvelope, ToolResultProjectionAuditRecord,
+        ToolResultProjectionDecisionKind, ToolResultProjectionPolicyKind, ToolResultSensitivity,
+        ToolResultVisibility, ToolTurnBudget, WorkerLifecycleState, ACP_PROTOCOL_MAX_VERSION,
+        ACP_PROTOCOL_MIN_VERSION, AGENT_HOOK_DESCRIPTORS, PREPARED_AGENT_ATTEMPT_SCHEMA,
+        PUBLIC_RUNTIME_EVENT_DESCRIPTORS, REALTIME_PROTOCOL_MAX_VERSION,
+        REALTIME_PROTOCOL_MIN_VERSION,
     };
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
@@ -3935,12 +4155,42 @@ mod tests {
             serde_json::to_value(PREPARED_AGENT_ATTEMPT_SCHEMA).expect("schema should serialize");
         assert_eq!(schema["host_owns_tool_execution"], true);
         assert_eq!(schema["direct_journal_write_allowed"], false);
+        assert_eq!(
+            AgentHarnessSelectionMode::parse("explicit_plugin"),
+            Some(AgentHarnessSelectionMode::ExplicitPlugin)
+        );
+        assert_eq!(
+            AgentHarnessSelectionMode::parse("native_stub"),
+            Some(AgentHarnessSelectionMode::NativeStub)
+        );
         assert!(PREPARED_AGENT_ATTEMPT_SCHEMA
             .callback_kinds
             .contains(&AgentHarnessCallbackKind::PartialReply));
         assert!(PREPARED_AGENT_ATTEMPT_SCHEMA
             .host_owned_authorities
             .contains(&"approval_resolution"));
+    }
+
+    #[test]
+    fn agent_harness_attempt_result_redacts_error_and_trace_details() {
+        let mut result = AgentHarnessAttemptResult::minimal(
+            AgentHarnessAttemptTerminalStatus::Failed,
+            AgentHarnessAttemptClassification::ProviderError,
+            AgentHarnessAttemptReplaySafety::NotReplaySafe,
+            "trace?access_token=secret-token",
+        );
+        result.error = Some(AgentHarnessAttemptErrorSummary::new(
+            "provider",
+            "provider_failed",
+            Some("Authorization: Bearer secret-token"),
+        ));
+
+        let serialized = serde_json::to_string(&result).expect("result should serialize");
+
+        assert!(!serialized.contains("secret-token"));
+        assert!(serialized.contains("provider_failed"));
+        assert_eq!(result.terminal_status, AgentHarnessAttemptTerminalStatus::Failed);
+        assert_eq!(result.classification, AgentHarnessAttemptClassification::ProviderError);
     }
 
     #[test]
