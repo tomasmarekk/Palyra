@@ -330,6 +330,19 @@ fn backend_capability_label(capability: ToolCapability) -> &'static str {
     }
 }
 
+fn execution_gate_pipeline_enabled_for_tool(tool_name: &str, rollout_enabled: bool) -> bool {
+    rollout_enabled
+        || tool_metadata(tool_name).is_some_and(|metadata| {
+            !metadata.capabilities.is_empty()
+                && metadata.capabilities.iter().all(|capability| {
+                    matches!(
+                        capability,
+                        ToolCapability::FilesystemRead | ToolCapability::ArtifactsRead
+                    )
+                })
+        })
+}
+
 /// Denies tools that must not run on a networked worker.
 ///
 /// Process execution, secret reads, and filesystem access touch the local
@@ -743,8 +756,11 @@ pub(crate) fn resolve_tool_proposal_decision_for_context(
         approval_state.outcome,
         runtime_state,
     );
-    let rollout_enabled = runtime_state.config.feature_rollouts.execution_gate_pipeline_v2.enabled;
-    let (decision, gate_report, resulting_budget) = if rollout_enabled {
+    let pipeline_enabled = execution_gate_pipeline_enabled_for_tool(
+        tool_name,
+        runtime_state.config.feature_rollouts.execution_gate_pipeline_v2.enabled,
+    );
+    let (decision, gate_report, resulting_budget) = if pipeline_enabled {
         let mut pipeline_outcome = evaluate_execution_gate_pipeline(ExecutionGatePipelineInput {
             tool_call_config: &runtime_state.config.tool_call,
             request_context: &policy_request_context,
@@ -987,8 +1003,8 @@ mod tests {
 
     use super::{
         annotate_tool_decision_with_backend_context, evaluate_backend_capability_gate,
-        evaluate_delegation_scope_gate, tool_input_requires_proposal_approval,
-        ToolProposalBackendSelection,
+        evaluate_delegation_scope_gate, execution_gate_pipeline_enabled_for_tool,
+        tool_input_requires_proposal_approval, ToolProposalBackendSelection,
     };
 
     fn networked_worker_selection() -> ToolProposalBackendSelection {
@@ -1064,6 +1080,19 @@ mod tests {
             .expect("gateway-context tool should be blocked on networked workers");
         assert!(!decision.allowed);
         assert!(decision.reason.contains("backend.policy.tool_unsupported"));
+    }
+
+    #[test]
+    fn execution_gate_defaults_to_read_only_tools() {
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.read_file", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.artifact.read", false));
+    }
+
+    #[test]
+    fn execution_gate_default_keeps_sensitive_tools_on_legacy_path() {
+        assert!(!execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", false));
+        assert!(!execution_gate_pipeline_enabled_for_tool("palyra.process.run", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", true));
     }
 
     #[test]

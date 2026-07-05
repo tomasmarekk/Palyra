@@ -36,16 +36,19 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::{
-        relative_path_should_use_active_root, run_launch_context_read_file_grants,
-        session_active_workspace_root, workspace_root_override_targets_active_root,
-        workspace_roots_with_run_launch_context_for_agent_source,
+    application::{
+        file_view_registry::build_workspace_file_view_record,
+        tool_runtime::workspace_scope::{
+            relative_path_should_use_active_root, run_launch_context_read_file_grants,
+            session_active_workspace_root, workspace_root_override_targets_active_root,
+            workspace_roots_with_run_launch_context_for_agent_source,
+        },
     },
     gateway::{
-        GatewayRuntimeState, ToolRuntimeExecutionContext, MAX_WORKSPACE_LIST_DIR_TOOL_INPUT_BYTES,
-        MAX_WORKSPACE_READ_FILE_BYTES, MAX_WORKSPACE_READ_FILE_TOOL_INPUT_BYTES,
-        MAX_WORKSPACE_SEARCH_TOOL_INPUT_BYTES, WORKSPACE_LIST_DIR_TOOL_NAME,
-        WORKSPACE_READ_FILE_TOOL_NAME, WORKSPACE_SEARCH_TOOL_NAME,
+        current_unix_ms, GatewayRuntimeState, ToolRuntimeExecutionContext,
+        MAX_WORKSPACE_LIST_DIR_TOOL_INPUT_BYTES, MAX_WORKSPACE_READ_FILE_BYTES,
+        MAX_WORKSPACE_READ_FILE_TOOL_INPUT_BYTES, MAX_WORKSPACE_SEARCH_TOOL_INPUT_BYTES,
+        WORKSPACE_LIST_DIR_TOOL_NAME, WORKSPACE_READ_FILE_TOOL_NAME, WORKSPACE_SEARCH_TOOL_NAME,
     },
     tool_protocol::{build_tool_execution_outcome, ToolExecutionOutcome},
 };
@@ -205,6 +208,12 @@ struct ResolvedWorkspaceFile {
     display_path: String,
 }
 
+#[derive(Debug)]
+struct WorkspaceReadFileResult {
+    output: WorkspaceReadFileOutput,
+    resolved_path: PathBuf,
+}
+
 /// Executes the workspace read-file tool: resolves the scoped roots, reads a
 /// bounded chunk, and returns UTF-8 text (secret-redacted) or base64 binary.
 ///
@@ -313,8 +322,17 @@ pub(crate) async fn execute_workspace_read_file_tool(
         }
     };
 
-    match serde_json::to_vec(&read) {
+    match serde_json::to_vec(&read.output) {
         Ok(output_json) => {
+            if let Some(record) = build_workspace_file_view_record(
+                context.run_id,
+                proposal_id,
+                read.resolved_path.as_path(),
+                output_json.as_slice(),
+                current_unix_ms(),
+            ) {
+                runtime_state.record_workspace_file_view(record);
+            }
             workspace_read_file_outcome(proposal_id, input_json, true, output_json, String::new())
         }
         Err(error) => workspace_read_file_outcome(
@@ -980,13 +998,14 @@ fn read_workspace_file_from_roots(
     input: &WorkspaceReadFileInput,
 ) -> Result<WorkspaceReadFileOutput, String> {
     read_workspace_file_from_roots_and_file_grants(workspace_roots, &[], input)
+        .map(|read| read.output)
 }
 
 fn read_workspace_file_from_roots_and_file_grants(
     workspace_roots: &[PathBuf],
     file_grants: &[PathBuf],
     input: &WorkspaceReadFileInput,
-) -> Result<WorkspaceReadFileOutput, String> {
+) -> Result<WorkspaceReadFileResult, String> {
     let canonical_roots =
         canonicalize_workspace_roots(workspace_roots, WORKSPACE_READ_FILE_TOOL_NAME)?;
     let canonical_file_grants = canonicalize_workspace_file_grants(
@@ -2023,7 +2042,7 @@ fn read_workspace_file_chunk(
     path: PathBuf,
     display_path: String,
     input: &WorkspaceReadFileInput,
-) -> Result<WorkspaceReadFileOutput, String> {
+) -> Result<WorkspaceReadFileResult, String> {
     let mut file = File::open(path.as_path()).map_err(|error| {
         format!(
             "{WORKSPACE_READ_FILE_TOOL_NAME} failed to open workspace file {}: {error}",
@@ -2119,25 +2138,28 @@ fn read_workspace_file_chunk(
         "text contains redacted secret placeholders; use it for structure only and do not write the redacted text back verbatim".to_owned()
     });
 
-    Ok(WorkspaceReadFileOutput {
-        path: display_path,
-        workspace_root_index,
-        offset_bytes: read_window.offset_bytes,
-        line_start: read_window.line_start,
-        line_end: read_window.line_end,
-        returned_bytes,
-        size_bytes,
-        eof,
-        chunk_sha256,
-        text,
-        bytes_base64,
-        bytes_base64_prefix,
-        binary,
-        binary_output_omitted,
-        redacted,
-        text_authoritative,
-        redaction_notice,
-        redaction_reasons: redacted.then_some(redaction_reasons),
+    Ok(WorkspaceReadFileResult {
+        output: WorkspaceReadFileOutput {
+            path: display_path,
+            workspace_root_index,
+            offset_bytes: read_window.offset_bytes,
+            line_start: read_window.line_start,
+            line_end: read_window.line_end,
+            returned_bytes,
+            size_bytes,
+            eof,
+            chunk_sha256,
+            text,
+            bytes_base64,
+            bytes_base64_prefix,
+            binary,
+            binary_output_omitted,
+            redacted,
+            text_authoritative,
+            redaction_notice,
+            redaction_reasons: redacted.then_some(redaction_reasons),
+        },
+        resolved_path: opened_path,
     })
 }
 
@@ -3483,8 +3505,8 @@ mod tests {
         )
         .expect("exact file grant should allow watched file read");
 
-        assert_eq!(watched_output.path, "watched.md");
-        assert_eq!(watched_output.text.as_deref(), Some("watched\n"));
+        assert_eq!(watched_output.output.path, "watched.md");
+        assert_eq!(watched_output.output.text.as_deref(), Some("watched\n"));
 
         let sibling_input = WorkspaceReadFileInput {
             path: sibling_file.to_string_lossy().into_owned(),

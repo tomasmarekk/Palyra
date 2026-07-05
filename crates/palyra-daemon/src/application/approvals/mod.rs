@@ -9,6 +9,7 @@
 use std::{sync::Arc, time::Duration};
 
 use palyra_common::process_runner_input::parse_process_runner_tool_input;
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tonic::Status;
@@ -16,6 +17,7 @@ use tracing::info;
 use ulid::Ulid;
 
 use crate::{
+    application::tool_governance::build_tool_call_signature,
     gateway::{
         current_unix_ms, truncate_with_ellipsis, GatewayRuntimeState, ToolApprovalOutcome,
         ToolSkillContext, APPROVAL_CHANNEL_UNAVAILABLE_REASON, APPROVAL_DENIED_REASON,
@@ -33,6 +35,7 @@ use crate::{
 
 const WORKSPACE_PATCH_TOOL_NAME: &str = "palyra.fs.apply_patch";
 const OS_FILE_TOOL_NAME: &str = "palyra.fs.os_file";
+const PERMISSION_REQUEST_SCHEMA_VERSION: u32 = 1;
 
 /// Fully built approval request ready to be journaled and surfaced to the
 /// approval channel; `approval_id` is freshly generated per request.
@@ -54,6 +57,42 @@ pub(crate) struct ApprovalExecutionContext {
     pub(crate) approval_required: bool,
     pub(crate) reason: String,
     pub(crate) agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PermissionRequestEnvelope {
+    schema_version: u32,
+    source: &'static str,
+    tool_name: String,
+    subject_id: String,
+    normalized_args_sha256: String,
+    mutability_class: String,
+    risk_posture: String,
+    requested_scope: &'static str,
+    ttl_seconds: u64,
+    idempotency_key: String,
+    requester: PermissionRequestRequester,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_backend: Option<PermissionRequestExecutionBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PermissionRequestRequester {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PermissionRequestExecutionBackend {
+    requested: String,
+    resolved: String,
+    reason_code: String,
+    approval_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
 }
 
 /// Folds an operator approval outcome into a tool decision.
@@ -150,6 +189,17 @@ pub(crate) fn build_pending_tool_approval(
     let subject_id = build_tool_approval_subject_id(tool_name, skill_context, input_json);
     let policy_snapshot = build_tool_policy_snapshot(config, tool_name);
     let mut details = approval_input_details(tool_name, input_json, config);
+    let risk_level = approval_risk_for_tool(tool_name, input_json, config);
+    let permission_request = build_permission_request_envelope(
+        tool_name,
+        skill_context,
+        input_json,
+        subject_id.as_str(),
+        risk_level,
+        execution_context,
+    );
+    details["permission_request"] =
+        serde_json::to_value(&permission_request).unwrap_or_else(|_| json!({}));
     let request_summary =
         build_tool_request_summary(tool_name, skill_context, &details, execution_context);
     if let Some(execution_context) = execution_context {
@@ -167,7 +217,7 @@ pub(crate) fn build_pending_tool_approval(
     }
     let prompt = ApprovalPromptRecord {
         title: format!("Approve {}", tool_name),
-        risk_level: approval_risk_for_tool(tool_name, input_json, config),
+        risk_level,
         subject_id: subject_id.clone(),
         summary: execution_context.map_or_else(
             || format!("Tool `{tool_name}` requested explicit approval"),
@@ -205,6 +255,56 @@ pub(crate) fn build_pending_tool_approval(
         request_summary,
         policy_snapshot,
         prompt,
+    }
+}
+
+fn build_permission_request_envelope(
+    tool_name: &str,
+    skill_context: Option<&ToolSkillContext>,
+    input_json: &[u8],
+    subject_id: &str,
+    risk_level: ApprovalRiskLevel,
+    execution_context: Option<&ApprovalExecutionContext>,
+) -> PermissionRequestEnvelope {
+    let signature = build_tool_call_signature(tool_name, input_json);
+    let normalized_args_sha256 = signature.normalized_args_hash.clone();
+    let skill_id = skill_context.map(ToolSkillContext::skill_id).map(str::to_owned);
+    let skill_version = skill_context.and_then(ToolSkillContext::version).map(str::to_owned);
+    let idempotency_payload = json!({
+        "tool_name": tool_name,
+        "subject_id": subject_id,
+        "normalized_args_sha256": normalized_args_sha256,
+        "risk_posture": risk_level.as_str(),
+        "skill_id": skill_id.as_deref(),
+        "skill_version": skill_version.as_deref(),
+    });
+    let idempotency_key = serde_json::to_vec(&idempotency_payload)
+        .map(|bytes| sha256_hex(bytes.as_slice()))
+        .unwrap_or_else(|_| sha256_hex(input_json));
+
+    PermissionRequestEnvelope {
+        schema_version: PERMISSION_REQUEST_SCHEMA_VERSION,
+        source: "tool_proposal",
+        tool_name: tool_name.to_owned(),
+        subject_id: subject_id.to_owned(),
+        normalized_args_sha256,
+        mutability_class: signature.mutability_class,
+        risk_posture: risk_level.as_str().to_owned(),
+        requested_scope: "single_tool_call",
+        ttl_seconds: u64::from(APPROVAL_PROMPT_TIMEOUT_SECONDS),
+        idempotency_key,
+        requester: PermissionRequestRequester {
+            kind: "host_approval_relay",
+            skill_id,
+            skill_version,
+        },
+        execution_backend: execution_context.map(|context| PermissionRequestExecutionBackend {
+            requested: context.requested_backend.clone(),
+            resolved: context.resolved_backend.clone(),
+            reason_code: context.reason_code.clone(),
+            approval_required: context.approval_required,
+            agent_id: context.agent_id.clone(),
+        }),
     }
 }
 
@@ -1104,6 +1204,86 @@ mod tests {
                 .find(|option| option.option_id == "deny_once")
                 .map(|option| option.default_selected),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn pending_tool_approval_embeds_permission_request_envelope() {
+        let config = test_tool_call_config(PROCESS_RUNNER_TOOL_NAME);
+        let pending = build_pending_tool_approval(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"cargo","args":["test"]}"#,
+            &config,
+            None,
+        );
+        let details_json: Value = serde_json::from_str(pending.prompt.details_json.as_str())
+            .expect("approval prompt details should remain valid JSON");
+        let permission_request = details_json
+            .pointer("/input_json/permission_request")
+            .expect("permission request should be embedded");
+
+        assert_eq!(permission_request.get("schema_version").and_then(Value::as_u64), Some(1));
+        assert_eq!(permission_request.get("source").and_then(Value::as_str), Some("tool_proposal"));
+        assert_eq!(
+            permission_request.get("tool_name").and_then(Value::as_str),
+            Some(PROCESS_RUNNER_TOOL_NAME)
+        );
+        assert_eq!(
+            permission_request.get("subject_id").and_then(Value::as_str),
+            Some("tool:palyra.process.run")
+        );
+        assert_eq!(
+            permission_request.get("requested_scope").and_then(Value::as_str),
+            Some("single_tool_call")
+        );
+        assert_eq!(
+            permission_request.get("ttl_seconds").and_then(Value::as_u64),
+            Some(u64::from(APPROVAL_PROMPT_TIMEOUT_SECONDS))
+        );
+        assert_eq!(
+            permission_request.get("normalized_args_sha256").and_then(Value::as_str).map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            permission_request.get("idempotency_key").and_then(Value::as_str).map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            permission_request.pointer("/requester/kind").and_then(Value::as_str),
+            Some("host_approval_relay")
+        );
+    }
+
+    #[test]
+    fn permission_request_digest_is_stable_for_reordered_json_object_keys() {
+        let config = test_tool_call_config(PROCESS_RUNNER_TOOL_NAME);
+        let first = build_pending_tool_approval(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"command":"cargo","args":["test"]}"#,
+            &config,
+            None,
+        );
+        let second = build_pending_tool_approval(
+            PROCESS_RUNNER_TOOL_NAME,
+            None,
+            br#"{"args":["test"],"command":"cargo"}"#,
+            &config,
+            None,
+        );
+        let first_details: Value = serde_json::from_str(first.prompt.details_json.as_str())
+            .expect("first details should parse");
+        let second_details: Value = serde_json::from_str(second.prompt.details_json.as_str())
+            .expect("second details should parse");
+
+        assert_eq!(
+            first_details.pointer("/input_json/permission_request/normalized_args_sha256"),
+            second_details.pointer("/input_json/permission_request/normalized_args_sha256")
+        );
+        assert_eq!(
+            first_details.pointer("/input_json/permission_request/idempotency_key"),
+            second_details.pointer("/input_json/permission_request/idempotency_key")
         );
     }
 

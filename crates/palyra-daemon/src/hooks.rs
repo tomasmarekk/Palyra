@@ -166,6 +166,13 @@ pub(crate) struct HookDispatchOutcome {
     pub(crate) output_json: Value,
 }
 
+/// Hook dispatch report used by inline run-stream call sites.
+#[derive(Debug, Clone)]
+pub(crate) struct HookDispatchReport {
+    pub(crate) outcomes: Vec<HookDispatchOutcome>,
+    pub(crate) lifecycle_resolution: Option<RunLifecycleHookResolution>,
+}
+
 /// Redacted event envelope passed to constrained plugin hooks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -591,6 +598,27 @@ pub(crate) async fn dispatch_named_event(
     event: &str,
     event_payload: Value,
 ) -> Result<Vec<HookDispatchOutcome>> {
+    let report =
+        dispatch_named_event_with_report(runtime, policy, execution_timeout, event, event_payload)
+            .await?;
+    if let Some(resolution) = report.lifecycle_resolution.as_ref() {
+        enforce_run_lifecycle_resolution(event, resolution)?;
+    }
+    Ok(report.outcomes)
+}
+
+/// Executes an event and returns lifecycle resolution without enforcing it.
+///
+/// Inline run-stream call sites use this to distinguish non-terminal
+/// annotations from host-interpreted decisions such as `request_approval` and
+/// `block` while preserving the existing event dispatch/audit behavior.
+pub(crate) async fn dispatch_named_event_with_report(
+    runtime: Arc<GatewayRuntimeState>,
+    policy: &crate::wasm_plugin_runner::WasmPluginRunnerPolicy,
+    execution_timeout: Duration,
+    event: &str,
+    event_payload: Value,
+) -> Result<HookDispatchReport> {
     let lifecycle_phase = RunLifecycleHookPhase::parse_hook_event(event);
     let event_envelope =
         serde_json::to_value(build_redacted_hook_event_envelope(event, event_payload.clone())?)
@@ -860,6 +888,7 @@ pub(crate) async fn dispatch_named_event(
         }
     }
 
+    let mut lifecycle_resolution = None;
     if let Some(phase) = lifecycle_phase {
         let resolution = resolve_run_lifecycle_hook_decisions(phase, lifecycle_decisions)
             .map_err(|error| anyhow!("invalid lifecycle hook decision: {}", error.message))?;
@@ -880,10 +909,10 @@ pub(crate) async fn dispatch_named_event(
             )
             .await;
         }
-        enforce_run_lifecycle_resolution(event, &resolution)?;
+        lifecycle_resolution = Some(resolution);
     }
 
-    Ok(outcomes)
+    Ok(HookDispatchReport { outcomes, lifecycle_resolution })
 }
 
 fn enforce_run_lifecycle_resolution(

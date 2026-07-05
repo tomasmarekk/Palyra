@@ -48,6 +48,10 @@ use crate::{
         build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
         PrepareModelProviderInputRequest,
     },
+    application::tool_governance::{
+        project_harness_tool_surface, BeforeFinalizeBudget, BeforeFinalizeDecision,
+        BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
+    },
     application::tool_registry::{
         build_model_visible_tool_catalog_snapshot, canonical_json_bytes,
         snapshot_to_provider_request_value, tool_catalog_tape_payload,
@@ -105,6 +109,8 @@ use super::{
 
 const PROVIDER_PROGRESS_HEARTBEAT_MS: u64 = 20_000;
 const PROVIDER_FAILOVER_DEADLINE_GRACE_MS: u64 = 5_000;
+const BEFORE_FINALIZE_EVENT: &str = "run.before_finalize";
+const HARNESS_TOOL_SURFACE_PROJECTION_EVENT: &str = "harness.tool_surface_projection";
 // Turns directly after browser tool results get a much shorter deadline than
 // the general provider timeout: a model that stalls on browser evidence
 // should fail fast into the follow-up recovery path instead of pinning the
@@ -1119,6 +1125,47 @@ async fn record_run_stream_tool_catalog_snapshot(
             seq: *tape_seq,
             event_type: "tool_catalog_snapshot".to_owned(),
             payload_json: tool_catalog_tape_payload(snapshot),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    record_harness_tool_surface_projection(runtime_state, run_id, tape_seq, snapshot).await?;
+    Ok(())
+}
+
+async fn record_harness_tool_surface_projection(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> Result<(), Status> {
+    let tool_names = snapshot.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+    let runtime = HarnessToolSurfaceRuntime {
+        harness_id: "run_stream".to_owned(),
+        provider_id: snapshot.provider_kind.clone(),
+        model_id: snapshot.provider_model_id.clone().unwrap_or_else(|| "unknown".to_owned()),
+        context_budget_tokens: 16_000,
+        runtime_policy: "default".to_owned(),
+        tool_policy: format!("catalog_hash={}", snapshot.catalog_hash),
+        sandbox_posture: "gateway_policy".to_owned(),
+    };
+    let projection = project_harness_tool_surface(&runtime, tool_names.as_slice());
+    let payload_json = serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event_type": HARNESS_TOOL_SURFACE_PROJECTION_EVENT,
+        "catalog_snapshot_id": snapshot.snapshot_id.as_str(),
+        "catalog_hash": snapshot.catalog_hash.as_str(),
+        "projection": projection,
+        "redaction_level": "metadata_only",
+    }))
+    .map_err(|error| {
+        Status::internal(format!("failed to serialize harness tool surface projection: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: HARNESS_TOOL_SURFACE_PROJECTION_EVENT.to_owned(),
+            payload_json,
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
@@ -2201,6 +2248,7 @@ async fn process_run_stream_message_inner(
     let mut length_recovery_attempts = 0u8;
     let mut final_answer_recovery_attempted = false;
     let mut verification_finalizer_nudge_attempted = false;
+    let mut before_finalize_budget = BeforeFinalizeBudget::new(1);
     let mut followup_timeout_recovery_attempts = 0u8;
     let mut repeated_tool_failure_tracker = RepeatedToolFailureTracker::default();
     let mut run_progress_controller = RunProgressController::new(3);
@@ -2890,34 +2938,73 @@ async fn process_run_stream_message_inner(
                         );
                         if verification_guard.status
                             == FinalizationVerificationStatus::NudgeRequired
-                            && !verification_finalizer_nudge_attempted
                         {
-                            verification_finalizer_nudge_attempted = true;
-                            loop_state.append_user_guidance(
-                                verification_guard.nudge.clone().unwrap_or_else(|| {
-                                    "Verification is stale after code changes. Run matching verification or explicitly report verification_status=unverified with a reason.".to_owned()
-                                }),
+                            let instruction = verification_guard.nudge.clone().unwrap_or_else(|| {
+                                "Verification is stale after code changes. Run matching verification or explicitly report verification_status=unverified with a reason.".to_owned()
+                            });
+                            let before_finalize_event = BeforeFinalizeEvent::new(
+                                reply_text,
+                                0,
+                                "run_stream_final_answer_candidate",
+                                finalization_verification_status_label(verification_guard.status),
+                                verification_guard.reason_code.as_str(),
+                            );
+                            let before_finalize_decision = before_finalize_budget.decide(
+                                &before_finalize_event,
+                                verification_guard.reason_code.as_str(),
+                                instruction.as_str(),
                             );
                             append_agent_loop_tape_event(
                                 runtime_state,
                                 run_id.as_str(),
                                 tape_seq,
-                                VERIFICATION_FINALIZER_NUDGE_EVENT,
-                                verification_finalizer_payload(
-                                    VERIFICATION_FINALIZER_NUDGE_EVENT,
-                                    &verification_guard,
+                                BEFORE_FINALIZE_EVENT,
+                                before_finalize_payload(
+                                    &before_finalize_event,
+                                    &before_finalize_decision,
                                 ),
                             )
                             .await?;
-                            send_agent_loop_progress_status(
+                            if before_finalize_decision.kind
+                                == crate::application::tool_governance::BeforeFinalizeDecisionKind::Revise
+                                && !verification_finalizer_nudge_attempted
+                            {
+                                verification_finalizer_nudge_attempted = true;
+                                loop_state.append_user_guidance(instruction);
+                                append_agent_loop_tape_event(
+                                    runtime_state,
+                                    run_id.as_str(),
+                                    tape_seq,
+                                    VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                    verification_finalizer_payload(
+                                        VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                        &verification_guard,
+                                    ),
+                                )
+                                .await?;
+                                send_agent_loop_progress_status(
+                                    sender,
+                                    runtime_state,
+                                    run_id.as_str(),
+                                    tape_seq,
+                                    VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                )
+                                .await?;
+                                continue;
+                            }
+                            terminate_run_stream_with_agent_loop_reason(
                                 sender,
                                 runtime_state,
+                                run_state,
                                 run_id.as_str(),
                                 tape_seq,
-                                VERIFICATION_FINALIZER_NUDGE_EVENT,
+                                &loop_state,
+                                AgentLoopTerminationReason::IncompleteFinalAnswer,
+                                "before-finalize revise budget exhausted before final answer delivery",
+                                provider_trace_ref,
                             )
                             .await?;
-                            continue;
+                            return Ok(RunStreamMessageProcessingOutcome::Terminate);
                         }
                         if verification_guard.status
                             == FinalizationVerificationStatus::UnverifiedAllowed
@@ -3614,6 +3701,28 @@ fn tool_loop_intervention_payload(intervention: &RunProgressIntervention) -> Str
         "learning_observation": intervention.learning_observation,
     }))
     .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn before_finalize_payload(
+    event: &BeforeFinalizeEvent,
+    decision: &BeforeFinalizeDecision,
+) -> String {
+    serde_json::to_string(&json!({
+        "schema_version": 1,
+        "event_type": BEFORE_FINALIZE_EVENT,
+        "event": event,
+        "decision": decision,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn finalization_verification_status_label(status: FinalizationVerificationStatus) -> &'static str {
+    match status {
+        FinalizationVerificationStatus::NotRequired => "not_required",
+        FinalizationVerificationStatus::Verified => "verified",
+        FinalizationVerificationStatus::NudgeRequired => "nudge_required",
+        FinalizationVerificationStatus::UnverifiedAllowed => "unverified_allowed",
+    }
 }
 
 fn verification_finalizer_payload(

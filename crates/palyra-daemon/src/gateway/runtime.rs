@@ -29,6 +29,12 @@ use crate::agents::{
     AgentRecord, AgentResolveOutcome, AgentResolveRequest, AgentSetDefaultOutcome,
     AgentUnbindOutcome, AgentUnbindRequest, SessionAgentBinding,
 };
+use crate::application::file_view_registry::{
+    FileViewRegistry, WorkspaceFileViewRecord, WorkspacePatchFileViewReport,
+};
+use crate::application::tool_governance::{
+    ToolCallSignature, ToolGuardrailController, ToolGuardrailDecision,
+};
 use crate::application::tool_runtime::networked_worker::NetworkedWorkerRemoteDispatcher;
 use crate::application::{
     auth::map_auth_profile_error,
@@ -815,6 +821,8 @@ pub struct GatewayRuntimeState {
     code_intel_runtime: Mutex<CodeIntelRuntime>,
     recent_context_assembly_traces: Mutex<Vec<Value>>,
     tool_approval_cache: Mutex<ToolApprovalCacheState>,
+    file_view_registry: Mutex<FileViewRegistry>,
+    tool_guardrails: Mutex<HashMap<String, ToolGuardrailController>>,
     run_parameter_delta_cache: Mutex<RunParameterDeltaCache>,
     run_cleanup_resources: Mutex<HashMap<String, RunCleanupResources>>,
     run_detached_resources: Mutex<HashMap<String, RunDetachedResources>>,
@@ -1869,6 +1877,8 @@ impl GatewayRuntimeState {
             code_intel_runtime: Mutex::new(CodeIntelRuntime::new()),
             recent_context_assembly_traces: Mutex::new(Vec::new()),
             tool_approval_cache: Mutex::new(ToolApprovalCacheState::default()),
+            file_view_registry: Mutex::new(FileViewRegistry::default()),
+            tool_guardrails: Mutex::new(HashMap::new()),
             run_parameter_delta_cache: Mutex::new(RunParameterDeltaCache::default()),
             run_cleanup_resources: Mutex::new(HashMap::new()),
             run_detached_resources: Mutex::new(HashMap::new()),
@@ -10413,6 +10423,74 @@ impl GatewayRuntimeState {
     }
 
     // In-memory caches: memory search results and tool approval decisions.
+
+    /// Records metadata from a successful workspace read for stale-edit guards.
+    pub(crate) fn record_workspace_file_view(&self, record: WorkspaceFileViewRecord) {
+        match self.file_view_registry.lock() {
+            Ok(mut registry) => registry.record_read(record),
+            Err(poisoned) => {
+                warn!("file view registry lock poisoned while recording read");
+                let mut registry = poisoned.into_inner();
+                registry.record_read(record);
+            }
+        }
+    }
+
+    /// Evaluates a pending patch against the current per-run file view registry.
+    pub(crate) fn evaluate_workspace_patch_file_view_guard(
+        &self,
+        run_id: &str,
+        patch_text: &str,
+    ) -> WorkspacePatchFileViewReport {
+        match self.file_view_registry.lock() {
+            Ok(registry) => registry.evaluate_patch(run_id, patch_text),
+            Err(poisoned) => {
+                warn!("file view registry lock poisoned while evaluating patch");
+                let registry = poisoned.into_inner();
+                registry.evaluate_patch(run_id, patch_text)
+            }
+        }
+    }
+
+    /// Returns a host guardrail decision for a repeated failing tool call.
+    pub(crate) fn before_tool_guardrail_decision(
+        &self,
+        run_id: &str,
+        signature: &ToolCallSignature,
+    ) -> Option<ToolGuardrailDecision> {
+        match self.tool_guardrails.lock() {
+            Ok(registry) => {
+                registry.get(run_id).and_then(|controller| controller.before_tool(signature))
+            }
+            Err(poisoned) => {
+                warn!("tool guardrail registry lock poisoned while evaluating proposal");
+                let registry = poisoned.into_inner();
+                registry.get(run_id).and_then(|controller| controller.before_tool(signature))
+            }
+        }
+    }
+
+    /// Records one tool result for per-run repeated-failure guardrails.
+    pub(crate) fn record_tool_guardrail_result(
+        &self,
+        run_id: &str,
+        signature: &ToolCallSignature,
+        success: bool,
+        failure_reason: Option<&str>,
+    ) {
+        match self.tool_guardrails.lock() {
+            Ok(mut registry) => {
+                let controller = registry.entry(run_id.to_owned()).or_default();
+                controller.observe_tool_result(signature, success, failure_reason);
+            }
+            Err(poisoned) => {
+                warn!("tool guardrail registry lock poisoned while recording result");
+                let mut registry = poisoned.into_inner();
+                let controller = registry.entry(run_id.to_owned()).or_default();
+                controller.observe_tool_result(signature, success, failure_reason);
+            }
+        }
+    }
 
     /// Drops every cached memory search result. Called on any write that can
     /// change search outcomes (config changes, item mutations, maintenance).

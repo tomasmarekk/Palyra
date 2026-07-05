@@ -21,7 +21,8 @@ use std::{
 use palyra_common::{
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
-        ArtifactRetentionPolicy, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        ArtifactRetentionPolicy, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
+        ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget,
     },
@@ -43,6 +44,12 @@ use crate::{
         resolve_cached_tool_approval_for_proposal,
     },
     application::execution_gate::ToolProposalApprovalState,
+    application::tool_governance::{
+        apply_host_tool_result_middleware, build_tool_call_signature,
+        evaluate_before_tool_decision_pipeline, synthetic_tool_result_outcome,
+        BeforeToolDecisionInput, BeforeToolDecisionKind, BeforeToolDecisionReport,
+        ToolCallSignature, ToolResultMiddlewareReport,
+    },
     application::tool_registry::{
         describe_catalog_tool, normalization_audit_tape_payload, projection_policy_for_tool,
         rejection_tape_payload, resolve_catalog_invoke_target, search_tool_catalog_index,
@@ -93,6 +100,8 @@ use super::{
 const MAX_PARALLEL_TOOL_CALLS_PER_GROUP: usize = 4;
 const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
 const TOOL_RESULT_PROJECTION_POLICY_EVENT: &str = "tool.result.projection_policy";
+const TOOL_BEFORE_DECISION_EVENT: &str = "tool.before_decision";
+const TOOL_RESULT_MIDDLEWARE_EVENT: &str = "tool.result.middleware";
 
 /// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
@@ -100,6 +109,8 @@ pub(crate) struct RunStreamToolProposalPreparation {
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
     backend_selection: ToolProposalBackendSelection,
+    tool_signature: ToolCallSignature,
+    synthetic_outcome: Option<ToolExecutionOutcome>,
 }
 
 /// A fully gated tool proposal that is ready for runtime dispatch.
@@ -111,6 +122,7 @@ pub(crate) struct RunStreamPreparedToolExecution {
     proposal_id: String,
     tool_name: String,
     input_json: Vec<u8>,
+    tool_signature: ToolCallSignature,
     decision: crate::tool_protocol::ToolDecision,
     resolved_session_id: String,
     backend_selection: ToolProposalBackendSelection,
@@ -152,6 +164,7 @@ pub(crate) enum ToolParallelism {
 struct ProjectedToolExecutionOutcome {
     outcome: ToolExecutionOutcome,
     audit: Option<ToolResultProjectionAuditRecord>,
+    middleware_report: Option<ToolResultMiddlewareReport>,
 }
 
 impl ToolParallelism {
@@ -433,33 +446,54 @@ pub(crate) async fn prepare_run_stream_tool_proposal_event(
         (tool_name.to_owned(), normalized_input_json)
     };
 
-    let RunStreamToolProposalPreparation { decision, resolved_session_id, backend_selection } =
-        prepare_run_stream_tool_proposal_execution(
-            sender,
-            stream,
-            runtime_state,
-            request_context,
-            active_session_id,
-            session_id,
-            run_id,
-            proposal_id,
-            execution_tool_name.as_str(),
-            execution_input_json.as_slice(),
-            remaining_tool_budget,
-            allow_sensitive_tools,
-            approval_cache_generation,
-            tape_seq,
-        )
-        .await?;
-
-    Ok(RunStreamToolProposalPreparationOutcome::Prepared(RunStreamPreparedToolExecution {
-        proposal_id: proposal_id.to_owned(),
-        tool_name: execution_tool_name,
-        input_json: execution_input_json,
+    let RunStreamToolProposalPreparation {
         decision,
         resolved_session_id,
         backend_selection,
-    }))
+        tool_signature,
+        synthetic_outcome,
+    } = prepare_run_stream_tool_proposal_execution(
+        sender,
+        stream,
+        runtime_state,
+        request_context,
+        active_session_id,
+        session_id,
+        run_id,
+        proposal_id,
+        execution_tool_name.as_str(),
+        execution_input_json.as_slice(),
+        remaining_tool_budget,
+        allow_sensitive_tools,
+        approval_cache_generation,
+        tape_seq,
+    )
+    .await?;
+
+    let prepared = RunStreamPreparedToolExecution {
+        proposal_id: proposal_id.to_owned(),
+        tool_name: execution_tool_name,
+        input_json: execution_input_json,
+        tool_signature,
+        decision,
+        resolved_session_id,
+        backend_selection,
+    };
+    if let Some(outcome) = synthetic_outcome {
+        let completed = finalize_prepared_tool_execution_outcome(
+            sender,
+            runtime_state,
+            request_context,
+            run_id,
+            &prepared,
+            outcome,
+            tape_seq,
+        )
+        .await?;
+        return Ok(RunStreamToolProposalPreparationOutcome::Completed(completed));
+    }
+
+    Ok(RunStreamToolProposalPreparationOutcome::Prepared(prepared))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1260,9 +1294,9 @@ async fn prepare_run_stream_tool_proposal_execution(
     })?;
     let ToolProposalSecurityEvaluation {
         skill_context,
-        skill_gate_decision,
+        mut skill_gate_decision,
         approval_subject_id,
-        proposal_approval_required,
+        mut proposal_approval_required,
         effective_posture,
         backend_selection,
     } = evaluate_tool_proposal_security(
@@ -1287,6 +1321,73 @@ async fn prepare_run_stream_tool_proposal_execution(
         proposal_approval_required,
     )
     .await?;
+    let (hook_decision, hook_reason) = dispatch_before_tool_hook_if_enabled(
+        runtime_state,
+        run_id,
+        proposal_id,
+        tool_name,
+        input_json,
+    )
+    .await?;
+    let tool_signature = build_tool_call_signature(tool_name, input_json);
+    let guardrail_decision = runtime_state.before_tool_guardrail_decision(run_id, &tool_signature);
+    let before_tool_report = evaluate_before_tool_decision_pipeline(BeforeToolDecisionInput {
+        tool_name,
+        normalized_input_json: input_json,
+        hook_decision,
+        hook_reason: hook_reason.as_deref(),
+        guardrail_decision: guardrail_decision.clone(),
+    });
+    append_before_tool_decision_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        proposal_id,
+        &before_tool_report,
+    )
+    .await?;
+    let mut synthetic_outcome = None;
+    match before_tool_report.final_decision {
+        BeforeToolDecisionKind::RequireApproval => {
+            proposal_approval_required = true;
+        }
+        BeforeToolDecisionKind::Block | BeforeToolDecisionKind::FailRun => {
+            proposal_approval_required = false;
+            skill_gate_decision = Some(crate::tool_protocol::ToolDecision {
+                allowed: false,
+                reason: format!(
+                    "inline runtime hook blocked tool={tool_name}; reason_code={}; {}",
+                    before_tool_report.final_reason_code,
+                    hook_reason
+                        .as_deref()
+                        .unwrap_or("hook returned a terminal before-tool decision")
+                ),
+                approval_required: false,
+                policy_enforced: true,
+            });
+        }
+        BeforeToolDecisionKind::SynthesizeResult => {
+            proposal_approval_required = false;
+            let synthetic_result =
+                guardrail_decision.as_ref().and_then(|decision| decision.synthetic_result.as_ref());
+            if let Some(result) = synthetic_result {
+                synthetic_outcome =
+                    Some(synthetic_tool_result_outcome(proposal_id, tool_name, input_json, result));
+            }
+            skill_gate_decision = Some(crate::tool_protocol::ToolDecision {
+                allowed: false,
+                reason: format!(
+                    "tool guardrail synthesized host result for tool={tool_name}; reason_code={}",
+                    before_tool_report.final_reason_code
+                ),
+                approval_required: false,
+                policy_enforced: true,
+            });
+        }
+        BeforeToolDecisionKind::Allow
+        | BeforeToolDecisionKind::RequireReread
+        | BeforeToolDecisionKind::RequireSmallerPatch => {}
+    }
     let approval_outcome = resolve_run_stream_tool_approval_outcome(
         sender,
         stream,
@@ -1354,7 +1455,83 @@ async fn prepare_run_stream_tool_proposal_execution(
         decision,
         resolved_session_id: resolved_session_id.to_owned(),
         backend_selection,
+        tool_signature,
+        synthetic_outcome,
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn dispatch_before_tool_hook_if_enabled(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+) -> Result<(Option<BeforeToolDecisionKind>, Option<String>), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok((None, None));
+    }
+    let report = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        RunLifecycleHookPhase::BeforeTool.event_name(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "proposal_id": proposal_id,
+            "tool_name": tool_name,
+            "input_bytes": input_json.len(),
+            "input_sha256": crate::sha256_hex(input_json),
+            "redaction_level": "hash_only_tool_arguments",
+        }),
+    )
+    .await
+    .map_err(|error| {
+        Status::failed_precondition(format!("inline before-tool hook dispatch failed: {error}"))
+    })?;
+    let Some(resolution) = report.lifecycle_resolution else {
+        return Ok((None, None));
+    };
+    let decision = match resolution.selected.kind {
+        RunLifecycleHookDecisionKind::RequestApproval => BeforeToolDecisionKind::RequireApproval,
+        RunLifecycleHookDecisionKind::Block => BeforeToolDecisionKind::Block,
+        RunLifecycleHookDecisionKind::FailRun => BeforeToolDecisionKind::FailRun,
+        RunLifecycleHookDecisionKind::Continue
+        | RunLifecycleHookDecisionKind::Annotate
+        | RunLifecycleHookDecisionKind::TransformPreview => return Ok((None, None)),
+    };
+    let reason = resolution.selected.reason.clone().unwrap_or_else(|| {
+        format!("hook {} selected {}", resolution.selected.hook_id, decision.as_str())
+    });
+    Ok((Some(decision), Some(reason)))
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_before_tool_decision_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    proposal_id: &str,
+    report: &BeforeToolDecisionReport,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(&json!({
+        "proposal_id": proposal_id,
+        "report": report,
+    }))
+    .map_err(|error| {
+        Status::internal(format!("failed to serialize before-tool decision report: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: TOOL_BEFORE_DECISION_EVENT.to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -1883,6 +2060,8 @@ async fn finalize_prepared_tool_execution_outcome(
     execution_outcome: ToolExecutionOutcome,
     tape_seq: &mut i64,
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
+    dispatch_after_tool_hook_if_enabled(runtime_state, run_id, prepared, &execution_outcome)
+        .await?;
     let projected = project_tool_result_for_model(
         runtime_state,
         ToolRuntimeExecutionContext {
@@ -1899,11 +2078,22 @@ async fn finalize_prepared_tool_execution_outcome(
         execution_outcome,
     )
     .await?;
+    if let Some(report) = projected.middleware_report.as_ref() {
+        append_tool_result_middleware_tape_event(runtime_state, run_id, tape_seq, report).await?;
+    }
     if let Some(audit) = projected.audit.as_ref() {
         append_tool_result_projection_audit_tape_event(runtime_state, run_id, tape_seq, audit)
             .await?;
     }
     let execution_outcome = projected.outcome;
+    if prepared.decision.allowed {
+        runtime_state.record_tool_guardrail_result(
+            run_id,
+            &prepared.tool_signature,
+            execution_outcome.success,
+            (!execution_outcome.success).then_some(execution_outcome.error.as_str()),
+        );
+    }
 
     append_sessions_spawn_tape_event_if_needed(
         runtime_state,
@@ -1968,6 +2158,50 @@ async fn finalize_prepared_tool_execution_outcome(
     })
 }
 
+#[allow(clippy::result_large_err)]
+async fn dispatch_after_tool_hook_if_enabled(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    prepared: &RunStreamPreparedToolExecution,
+    outcome: &ToolExecutionOutcome,
+) -> Result<(), Status> {
+    if !runtime_state.config.feature_rollouts.inline_runtime_hooks.enabled {
+        return Ok(());
+    }
+    let report = crate::hooks::dispatch_named_event_with_report(
+        Arc::clone(runtime_state),
+        &runtime_state.config.tool_call.wasm_runtime,
+        Duration::from_millis(runtime_state.config.tool_call.execution_timeout_ms),
+        RunLifecycleHookPhase::AfterTool.event_name(),
+        json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "proposal_id": prepared.proposal_id.as_str(),
+            "tool_name": prepared.tool_name.as_str(),
+            "success": outcome.success,
+            "output_bytes": outcome.output_json.len(),
+            "output_sha256": crate::sha256_hex(outcome.output_json.as_slice()),
+            "error_sha256": crate::sha256_hex(outcome.error.as_bytes()),
+            "attestation_id": outcome.attestation.attestation_id.as_str(),
+            "redaction_level": "hash_only_tool_result",
+        }),
+    )
+    .await
+    .map_err(|error| {
+        Status::failed_precondition(format!("inline after-tool hook dispatch failed: {error}"))
+    })?;
+    if report
+        .lifecycle_resolution
+        .as_ref()
+        .is_some_and(|resolution| resolution.selected.kind == RunLifecycleHookDecisionKind::FailRun)
+    {
+        return Err(Status::failed_precondition(
+            "inline after-tool hook requested fail_run before result projection",
+        ));
+    }
+    Ok(())
+}
+
 async fn project_tool_result_for_model(
     runtime_state: &Arc<GatewayRuntimeState>,
     context: ToolRuntimeExecutionContext<'_>,
@@ -1976,9 +2210,26 @@ async fn project_tool_result_for_model(
     outcome: ToolExecutionOutcome,
 ) -> Result<ProjectedToolExecutionOutcome, Status> {
     let budget = ToolTurnBudget::default();
+    let middleware_report = if runtime_state.config.feature_rollouts.tool_result_middleware.enabled
+    {
+        Some(
+            apply_host_tool_result_middleware(
+                tool_name,
+                outcome.output_json.as_slice(),
+                ToolResultVisibility::ModelInline,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "tool_result_middleware.invalid_output: {error}"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
     let should_spill = should_project_tool_result_for_model(tool_name, &outcome, &budget);
     if !should_spill {
-        return Ok(ProjectedToolExecutionOutcome { outcome, audit: None });
+        return Ok(ProjectedToolExecutionOutcome { outcome, audit: None, middleware_report });
     }
 
     let projection_policy = projection_policy_for_tool(tool_name);
@@ -2078,7 +2329,33 @@ async fn project_tool_result_for_model(
         saved_model_visible_bytes,
         budget,
     };
-    Ok(ProjectedToolExecutionOutcome { outcome: projected_outcome, audit: Some(audit) })
+    Ok(ProjectedToolExecutionOutcome {
+        outcome: projected_outcome,
+        audit: Some(audit),
+        middleware_report,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_tool_result_middleware_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    report: &ToolResultMiddlewareReport,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(report).map_err(|error| {
+        Status::internal(format!("failed to serialize tool result middleware report: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: TOOL_RESULT_MIDDLEWARE_EVENT.to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

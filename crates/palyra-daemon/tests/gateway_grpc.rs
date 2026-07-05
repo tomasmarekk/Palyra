@@ -11083,7 +11083,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .get("tape_events")
             .and_then(Value::as_u64)
             .context("run snapshot missing tape_events")?,
-        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 6
+        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 7
     );
     assert!(
         run_snapshot.get("tape").is_none(),
@@ -11119,6 +11119,36 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .map(|value| !value.is_empty())
             .unwrap_or(false),
         "tool catalog snapshot should carry a catalog hash"
+    );
+    let tool_surface_projection_event = tape_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str)
+                == Some("harness.tool_surface_projection")
+        })
+        .context("run tape snapshot should include harness-aware tool surface projection")?;
+    let tool_surface_projection_payload = tool_surface_projection_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        .context("tool surface projection payload_json should be valid JSON")?;
+    assert_eq!(
+        tool_surface_projection_payload.get("schema_version").and_then(Value::as_u64),
+        Some(1),
+        "tool surface projection should carry schema version"
+    );
+    assert_eq!(
+        tool_surface_projection_payload.get("catalog_hash").and_then(Value::as_str),
+        catalog_snapshot_payload.get("catalog_hash").and_then(Value::as_str),
+        "projection should bind to the catalog hash it adapts"
+    );
+    assert!(
+        tool_surface_projection_payload
+            .pointer("/projection/tool_surface_hash")
+            .and_then(Value::as_str)
+            .map(|value| !value.is_empty())
+            .unwrap_or(false),
+        "tool surface projection should carry a deterministic surface hash"
     );
     let agent_loop_events = tape_events
         .iter()
@@ -11164,6 +11194,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         .filter(|event| {
             let event_type = event.get("event_type").and_then(Value::as_str);
             event_type != Some("tool_catalog_snapshot")
+                && event_type != Some("harness.tool_surface_projection")
                 && !event_type.map(|value| value.starts_with("agent_loop.")).unwrap_or(false)
         })
         .enumerate()

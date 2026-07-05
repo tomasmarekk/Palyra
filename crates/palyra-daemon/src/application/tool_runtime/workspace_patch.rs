@@ -32,10 +32,13 @@ use ulid::Ulid;
 
 use crate::{
     agents::AgentResolveRequest,
-    application::tool_runtime::workspace_scope::{
-        relative_path_should_use_active_root, session_active_workspace_root,
-        workspace_root_override_targets_active_root,
-        workspace_roots_with_run_launch_context_for_agent_source,
+    application::{
+        file_view_registry::{attach_file_view_report_to_output, file_view_report_output},
+        tool_runtime::workspace_scope::{
+            relative_path_should_use_active_root, session_active_workspace_root,
+            workspace_root_override_targets_active_root,
+            workspace_roots_with_run_launch_context_for_agent_source,
+        },
     },
     gateway::{
         current_unix_ms, GatewayRuntimeState, MAX_PATCH_TOOL_MARKER_BYTES,
@@ -337,7 +340,20 @@ pub(crate) async fn execute_workspace_patch_tool(
         );
     }
 
-    checkpoint_flow::execute_workspace_patch_mutation(
+    let file_view_report =
+        runtime_state.evaluate_workspace_patch_file_view_guard(run_id, patch.as_str());
+    if file_view_report.hard_block {
+        return workspace_patch_tool_execution_outcome(
+            proposal_id,
+            input_json,
+            false,
+            file_view_report_output(&file_view_report),
+            "palyra.fs.apply_patch blocked by stale file view guard; re-read current file before mutating"
+                .to_owned(),
+        );
+    }
+
+    let mut mutation_outcome = checkpoint_flow::execute_workspace_patch_mutation(
         runtime_state,
         WorkspacePatchMutationRequest {
             principal,
@@ -356,7 +372,12 @@ pub(crate) async fn execute_workspace_patch_tool(
             planned_outcome,
         },
     )
-    .await
+    .await;
+    if !file_view_report.diagnostics.is_empty() {
+        mutation_outcome.output_json =
+            attach_file_view_report_to_output(mutation_outcome.output_json, &file_view_report);
+    }
+    mutation_outcome
 }
 
 fn workspace_patch_planning_request(
