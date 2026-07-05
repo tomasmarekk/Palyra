@@ -11083,7 +11083,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             .get("tape_events")
             .and_then(Value::as_u64)
             .context("run snapshot missing tape_events")?,
-        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 7
+        expected_tape.as_array().context("golden tape must be a JSON array")?.len() as u64 + 8
     );
     assert!(
         run_snapshot.get("tape").is_none(),
@@ -11096,6 +11096,26 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
         .get("events")
         .and_then(Value::as_array)
         .context("run tape snapshot missing events array")?;
+    let context_pressure_event = tape_events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("provider.context_pressure")
+        })
+        .context("run tape snapshot should include provider context pressure diagnostics")?;
+    let context_pressure_payload = context_pressure_event
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .and_then(|payload| serde_json::from_str::<Value>(payload).ok())
+        .context("provider context pressure payload_json should be valid JSON")?;
+    assert_eq!(
+        context_pressure_payload.get("redaction_level").and_then(Value::as_str),
+        Some("bounded_aggregate_counts"),
+        "context pressure diagnostics must not persist raw prompt text"
+    );
+    assert!(
+        context_pressure_payload.get("tool_schema_bytes").and_then(Value::as_u64).is_some(),
+        "context pressure diagnostics should carry aggregate size estimates"
+    );
     let catalog_snapshot_event = tape_events
         .iter()
         .find(|event| {
@@ -11195,6 +11215,7 @@ async fn grpc_run_stream_persists_orchestrator_snapshot_and_matches_golden_tape(
             let event_type = event.get("event_type").and_then(Value::as_str);
             event_type != Some("tool_catalog_snapshot")
                 && event_type != Some("harness.tool_surface_projection")
+                && event_type != Some("provider.context_pressure")
                 && !event_type.map(|value| value.starts_with("agent_loop.")).unwrap_or(false)
         })
         .enumerate()

@@ -189,6 +189,9 @@ pub fn chat_completions_payload(
     if let Some(service_tier) = request.service_tier {
         body["service_tier"] = json!(service_tier.as_str());
     }
+    if let Some(prompt_cache_key) = openai_prompt_cache_key(request) {
+        body["prompt_cache_key"] = json!(prompt_cache_key);
+    }
     body
 }
 
@@ -237,7 +240,23 @@ pub fn responses_payload(
     if let Some(service_tier) = request.service_tier {
         body["service_tier"] = json!(service_tier.as_str());
     }
+    if let Some(prompt_cache_key) = openai_prompt_cache_key(request) {
+        body["prompt_cache_key"] = json!(prompt_cache_key);
+    }
     ResponsesPayload { body, tool_wire_names }
+}
+
+fn openai_prompt_cache_key(request: &ProviderRequest) -> Option<String> {
+    if !request.prompt_cache_policy.enabled {
+        return None;
+    }
+    let report = request.prompt_cache_report.as_ref()?;
+    if report.cacheable_tokens == 0 {
+        return None;
+    }
+    let hash_prefix =
+        report.provider_request_hash.get(..32).unwrap_or(report.provider_request_hash.as_str());
+    Some(format!("palyra:{hash_prefix}"))
 }
 
 fn openai_reasoning_effort_for_model(
@@ -554,6 +573,30 @@ mod tests {
         request
     }
 
+    fn prompt_cache_request() -> ProviderRequest {
+        let mut request = ProviderRequest::from_input_text(
+            "secret user prompt should not appear in cache key".to_owned(),
+            false,
+            Vec::new(),
+            None,
+        );
+        request.prompt_cache_policy.enabled = true;
+        request.prompt_cache_policy.strategy = crate::PromptCacheStrategy::StablePrefix;
+        request.prompt_cache_report = Some(crate::PromptCacheReport {
+            eligible_bytes: 128,
+            invalidated_bytes: 32,
+            invalidation_reasons: vec!["current_turn_changes".to_owned()],
+            provider_request_hash:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            requested_strategy: crate::PromptCacheStrategy::StablePrefix,
+            applied_strategy: "metadata_only".to_owned(),
+            breakpoint_count: 2,
+            cacheable_tokens: 32,
+            actual_cached_tokens: None,
+        });
+        request
+    }
+
     #[test]
     fn chat_completions_payload_adds_reasoning_effort_for_reasoning_model() {
         let payload = chat_completions_payload(
@@ -597,5 +640,30 @@ mod tests {
 
         assert_eq!(chat_payload["service_tier"], "priority");
         assert_eq!(responses_payload.body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn openai_payloads_emit_redacted_prompt_cache_key() {
+        let request = prompt_cache_request();
+
+        let chat_payload = chat_completions_payload(&request, "gpt-5.5", Vec::new());
+        let responses_payload = responses_payload(&request, "gpt-5.5", Vec::new());
+
+        assert_eq!(chat_payload["prompt_cache_key"], "palyra:0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            responses_payload.body["prompt_cache_key"],
+            "palyra:0123456789abcdef0123456789abcdef"
+        );
+        assert!(!chat_payload["prompt_cache_key"].as_str().unwrap().contains("secret user prompt"));
+    }
+
+    #[test]
+    fn openai_payloads_omit_prompt_cache_key_when_disabled() {
+        let mut request = prompt_cache_request();
+        request.prompt_cache_policy.enabled = false;
+
+        let payload = chat_completions_payload(&request, "gpt-5.5", Vec::new());
+
+        assert!(payload.get("prompt_cache_key").is_none());
     }
 }

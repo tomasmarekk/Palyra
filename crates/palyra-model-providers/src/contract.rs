@@ -363,13 +363,26 @@ pub struct ProviderPromptSegment {
 }
 
 /// Strategy for choosing provider cache breakpoints.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheStrategy {
+    #[default]
     ProviderDefault,
     StablePrefix,
     SystemAndTool,
     Disabled,
+}
+
+impl PromptCacheStrategy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderDefault => "provider_default",
+            Self::StablePrefix => "stable_prefix",
+            Self::SystemAndTool => "system_and_tool",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 /// Provider-neutral prompt cache policy carried alongside a request.
@@ -401,6 +414,16 @@ pub struct PromptCacheReport {
     pub invalidated_bytes: usize,
     pub invalidation_reasons: Vec<String>,
     pub provider_request_hash: String,
+    #[serde(default)]
+    pub requested_strategy: PromptCacheStrategy,
+    #[serde(default)]
+    pub applied_strategy: String,
+    #[serde(default)]
+    pub breakpoint_count: usize,
+    #[serde(default)]
+    pub cacheable_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_cached_tokens: Option<u64>,
 }
 
 impl ProviderRequest {

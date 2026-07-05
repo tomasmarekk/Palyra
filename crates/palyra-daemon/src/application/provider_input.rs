@@ -175,7 +175,7 @@ pub(crate) fn build_prompt_cache_metadata(
         max_breakpoints: 4,
         provider_compatibility: "metadata_only".to_owned(),
     };
-    let report = prompt_cache_report(provider_input_text, segments.as_slice());
+    let report = prompt_cache_report(provider_input_text, segments.as_slice(), &policy);
     (segments, policy, Some(report))
 }
 
@@ -199,6 +199,7 @@ fn prompt_segment(
 fn prompt_cache_report(
     provider_input_text: &str,
     segments: &[ProviderPromptSegment],
+    policy: &PromptCachePolicy,
 ) -> PromptCacheReport {
     let mut eligible_bytes = 0usize;
     let mut invalidated_bytes = 0usize;
@@ -220,11 +221,26 @@ fn prompt_cache_report(
     }
     invalidation_reasons.sort();
     invalidation_reasons.dedup();
+    let breakpoint_count = segments
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment.cache_hint,
+                ProviderPromptCacheHint::LongLived | ProviderPromptCacheHint::ShortLived
+            )
+        })
+        .count()
+        .min(policy.max_breakpoints);
     PromptCacheReport {
         eligible_bytes,
         invalidated_bytes,
         invalidation_reasons,
         provider_request_hash: crate::sha256_hex(provider_input_text.as_bytes()),
+        requested_strategy: policy.strategy,
+        applied_strategy: policy.provider_compatibility.clone(),
+        breakpoint_count,
+        cacheable_tokens: u64::try_from(eligible_bytes / 4).unwrap_or(u64::MAX),
+        actual_cached_tokens: None,
     }
 }
 

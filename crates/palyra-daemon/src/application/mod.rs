@@ -36,6 +36,7 @@ pub mod project_context_summary;
 pub mod project_facts;
 pub mod provider_events;
 pub mod provider_input;
+pub mod provider_turn_recovery;
 pub mod recall;
 pub mod replay_continuity;
 pub mod resume_classifier;

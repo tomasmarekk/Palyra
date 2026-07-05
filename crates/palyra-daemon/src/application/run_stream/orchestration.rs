@@ -19,7 +19,7 @@ use palyra_common::{
     redaction::REDACTED,
     runtime_contracts::{
         AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
-        AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode,
+        AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, QueuedInputState,
     },
     runtime_preview::RuntimePreviewMode,
 };
@@ -48,6 +48,12 @@ use crate::{
         build_provider_image_inputs, prepare_model_provider_input, MemoryPromptFailureMode,
         PrepareModelProviderInputRequest,
     },
+    application::provider_turn_recovery::{
+        anomaly_from_terminal_outcome, cancellation_closure, ContextPressureInput,
+        ContextPressureReport, ProviderCancellationPhase, ProviderTurnAnomaly,
+        ProviderTurnRecoveryInput, ProviderTurnRecoveryState, PROVIDER_CANCELLATION_CLOSURE_EVENT,
+        PROVIDER_CONTEXT_PRESSURE_EVENT, PROVIDER_TURN_RECOVERY_EVENT,
+    },
     application::tool_governance::{
         project_harness_tool_surface, BeforeFinalizeBudget, BeforeFinalizeDecision,
         BeforeFinalizeEvent, HarnessToolSurfaceRuntime,
@@ -64,19 +70,23 @@ use crate::{
         GatewayRuntimeConfigSnapshot, GatewayRuntimeState, CANCELLED_REASON,
     },
     journal::{
-        MemorySource, OrchestratorCancelRequest, OrchestratorRunMetadataUpdateRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputRecord,
+        OrchestratorQueuedInputUpdateRequest, OrchestratorRunMetadataUpdateRequest,
         OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta,
     },
     model_provider::{
-        bounded_provider_turn_output_for_persistence, classify_terminal_outcome,
-        decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,
-        provider_events_from_output, tool_repair_audit_events_for_decision, ProviderEvent,
-        ProviderFinishReason, ProviderMessage, ProviderMessageContentPart, ProviderMessageRole,
-        ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest, ProviderResponse,
-        ProviderRouteSelectionTrace, ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass,
-        TerminalOutcomeClassification, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
-        PROVIDER_RECOVERY_DECISION_EVENT,
+        assemble_canonical_tool_calls, bounded_provider_turn_output_for_persistence,
+        classify_terminal_outcome, decide_tool_repair_candidate,
+        normalize_assistant_output_for_tool_repair, provider_events_from_output,
+        tool_repair_audit_events_for_decision, validate_canonical_provider_stream,
+        ProviderCanonicalEvent, ProviderEvent, ProviderFinishReason, ProviderMessage,
+        ProviderMessageContentPart, ProviderMessageRole, ProviderOutputContentPart,
+        ProviderRawProviderRefs, ProviderRequest, ProviderResponse, ProviderRouteSelectionTrace,
+        ProviderTurnOutput, ProviderUsage, TerminalOutcomeClass, TerminalOutcomeClassification,
+        ToolCallAssemblyPolicy, DEFAULT_TOOL_REPAIR_ARGUMENT_LIMIT_BYTES,
+        PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
+        TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
     },
     orchestrator::{
         estimate_token_count, is_cancel_command, RunLifecycleState, RunStateMachine, RunTransition,
@@ -186,6 +196,40 @@ impl ProviderRequestTimeoutReason {
             Self::BrowserFollowup => "browser_followup",
             Self::ToolFollowup => "tool_followup",
         }
+    }
+}
+
+const fn provider_turn_anomaly_from_timeout(
+    reason: ProviderRequestTimeoutReason,
+) -> ProviderTurnAnomaly {
+    match reason {
+        ProviderRequestTimeoutReason::Provider => ProviderTurnAnomaly::ProviderTimeout,
+        ProviderRequestTimeoutReason::BrowserFollowup => {
+            ProviderTurnAnomaly::BrowserFollowupTimeout
+        }
+        ProviderRequestTimeoutReason::ToolFollowup => ProviderTurnAnomaly::ToolFollowupTimeout,
+    }
+}
+
+fn provider_turn_anomaly_from_response_failure(
+    reason: AgentLoopTerminationReason,
+    message: &str,
+) -> ProviderTurnAnomaly {
+    let message = message.to_ascii_lowercase();
+    if message.contains("finish_reason=tool_calls") || message.contains("without payload") {
+        return ProviderTurnAnomaly::ToolCallsFinishWithoutPayload;
+    }
+    if message.contains("raw tool-call markup") {
+        return ProviderTurnAnomaly::MalformedToolSequence;
+    }
+    if message.contains("truncated") && message.contains("tool") {
+        return ProviderTurnAnomaly::TruncatedToolArguments;
+    }
+    match reason {
+        AgentLoopTerminationReason::IncompleteFinalAnswer => ProviderTurnAnomaly::LengthFinalText,
+        AgentLoopTerminationReason::ProviderError => ProviderTurnAnomaly::MalformedToolSequence,
+        AgentLoopTerminationReason::ContextBudgetExhausted => ProviderTurnAnomaly::ContextOverflow,
+        _ => ProviderTurnAnomaly::MalformedStream,
     }
 }
 
@@ -1239,6 +1283,156 @@ async fn append_agent_loop_tape_event(
 }
 
 #[allow(clippy::result_large_err)]
+async fn drain_active_run_steering_before_provider_call(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    session_id: &str,
+    run_id: &str,
+    tape_seq: &mut i64,
+    loop_state: &mut AgentRunLoopState,
+) -> Result<(), Status> {
+    let mut targeted_inputs = runtime_state
+        .list_orchestrator_queued_inputs(session_id.to_owned())
+        .await?
+        .into_iter()
+        .filter(|queued| queued.state == QueuedInputState::Pending.as_str())
+        .filter(|queued| queued_targets_active_run(queued, run_id))
+        .collect::<Vec<_>>();
+    if targeted_inputs.is_empty() {
+        return Ok(());
+    }
+    targeted_inputs.sort_by(|left, right| {
+        queued_input_sort_key(left)
+            .cmp(&queued_input_sort_key(right))
+            .then_with(|| left.queued_input_id.cmp(&right.queued_input_id))
+    });
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        "turn_control.active_run_steering.received",
+        active_run_steering_payload(
+            "turn_control.active_run_steering.received",
+            run_id,
+            targeted_inputs.as_slice(),
+        )
+        .to_string(),
+    )
+    .await?;
+    let guidance = active_run_steering_guidance(targeted_inputs.as_slice());
+    loop_state.append_user_guidance(guidance);
+    for queued in &targeted_inputs {
+        runtime_state
+            .update_orchestrator_queued_input_state(OrchestratorQueuedInputUpdateRequest {
+                queued_input_id: queued.queued_input_id.clone(),
+                state: QueuedInputState::Forwarded.as_str().to_owned(),
+                overflow_summary_ref: None,
+                decision_reason: Some("turn_control.active_run_steering.injected".to_owned()),
+                explain_json: Some(
+                    json!({
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "queued_input_id": queued.queued_input_id.as_str(),
+                        "state": QueuedInputState::Forwarded.as_str(),
+                        "injected_before": "provider_request",
+                    })
+                    .to_string(),
+                ),
+            })
+            .await?;
+    }
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        "turn_control.active_run_steering.injected",
+        active_run_steering_payload(
+            "turn_control.active_run_steering.injected",
+            run_id,
+            targeted_inputs.as_slice(),
+        )
+        .to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn queued_targets_active_run(queued: &OrchestratorQueuedInputRecord, run_id: &str) -> bool {
+    queued.run_id == run_id || queued.origin_run_id.as_deref() == Some(run_id)
+}
+
+fn queued_input_sort_key(queued: &OrchestratorQueuedInputRecord) -> (i64, i64) {
+    (queued.accepted_at_unix_ms.unwrap_or(queued.created_at_unix_ms), queued.created_at_unix_ms)
+}
+
+fn active_run_steering_guidance(inputs: &[OrchestratorQueuedInputRecord]) -> String {
+    let mut block = String::from("<operator_steering>\n");
+    for (index, input) in inputs.iter().enumerate() {
+        let text = truncate_with_ellipsis(input.text.trim().to_owned(), 8_192);
+        block.push_str(format!("{}. {}\n", index + 1, text).as_str());
+    }
+    block.push_str("</operator_steering>");
+    block
+}
+
+fn active_run_steering_payload(
+    event: &str,
+    run_id: &str,
+    inputs: &[OrchestratorQueuedInputRecord],
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "event": event,
+        "run_id": run_id,
+        "redaction_level": "hash_only",
+        "queued_input_count": inputs.len(),
+        "queued_inputs": inputs.iter().map(|input| {
+            json!({
+                "queued_input_id": input.queued_input_id.as_str(),
+                "text_sha256": crate::sha256_hex(input.text.as_bytes()),
+                "text_bytes": input.text.len(),
+                "queue_mode": input.queue_mode.as_str(),
+                "priority_lane": input.priority_lane.as_str(),
+                "created_at_unix_ms": input.created_at_unix_ms,
+                "accepted_at_unix_ms": input.accepted_at_unix_ms,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn context_pressure_report_for_provider_request(
+    request: &ProviderRequest,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+    compaction_cooldown_active: bool,
+) -> ContextPressureReport {
+    let messages = request.effective_messages();
+    let transcript_text =
+        messages.iter().map(ProviderMessage::text_content).collect::<Vec<_>>().join("\n");
+    let session_tail_text = messages
+        .iter()
+        .rev()
+        .take(6)
+        .map(ProviderMessage::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let memory_segment_tokens = request
+        .prompt_segments
+        .iter()
+        .filter(|segment| segment.trust_label.contains("memory"))
+        .map(|segment| u64::try_from(segment.byte_len / 4).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+    ContextPressureReport::new(ContextPressureInput {
+        prompt_tokens_estimate: estimate_token_count(transcript_text.as_str()),
+        tool_schema_bytes: tool_catalog_snapshot.estimated_exposed_tool_bytes,
+        compact_catalog_savings_bytes: tool_catalog_snapshot.estimated_saved_bytes,
+        memory_segment_tokens,
+        attachment_count: request.vision_inputs.len(),
+        session_tail_tokens: estimate_token_count(session_tail_text.as_str()),
+        max_output_tokens: request.max_output_tokens,
+        compaction_cooldown_active,
+    })
+}
+
+#[allow(clippy::result_large_err)]
 async fn maybe_start_run_stream_harness_lifecycle(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -2254,10 +2448,21 @@ async fn process_run_stream_message_inner(
     let mut run_progress_controller = RunProgressController::new(3);
     let mut pending_browser_followup_deadline = false;
     let mut pending_tool_followup_deadline = false;
+    let mut provider_turn_recovery_state = ProviderTurnRecoveryState::new();
 
     loop {
         match runtime_state.is_orchestrator_cancel_requested(run_id.clone()).await {
             Ok(true) => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_CANCELLATION_CLOSURE_EVENT,
+                    cancellation_closure(ProviderCancellationPhase::DuringProvider)
+                        .tape_payload()
+                        .to_string(),
+                )
+                .await?;
                 transition_run_stream_to_cancelled(
                     sender,
                     runtime_state,
@@ -2472,6 +2677,14 @@ async fn process_run_stream_message_inner(
             "agent_loop.provider_request_preparing",
         )
         .await?;
+        drain_active_run_steering_before_provider_call(
+            runtime_state,
+            session_id_for_message.as_str(),
+            run_id.as_str(),
+            tape_seq,
+            &mut loop_state,
+        )
+        .await?;
         let mut provider_request = ProviderRequest::from_input_text(
             base_provider_request.input_text.clone(),
             base_provider_request.json_mode,
@@ -2526,6 +2739,19 @@ async fn process_run_stream_message_inner(
                 }
             }
         }
+        let context_pressure_report = context_pressure_report_for_provider_request(
+            &provider_request,
+            &tool_catalog_snapshot,
+            provider_turn_recovery_state.compaction_cooldown_active(),
+        );
+        append_agent_loop_tape_event(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            PROVIDER_CONTEXT_PRESSURE_EVENT,
+            context_pressure_report.tape_payload().to_string(),
+        )
+        .await?;
         // Follow-up deadlines apply to exactly one turn: the turn right after
         // a tool batch. Browser batches keep their shorter specialized guard;
         // other tools use the generic post-tool guard.
@@ -2588,6 +2814,21 @@ async fn process_run_stream_message_inner(
                         message.as_str(),
                         Some(reason),
                     ),
+                )
+                .await?;
+                let recovery_decision = provider_turn_recovery_state.decide(
+                    provider_turn_anomaly_from_timeout(reason),
+                    ProviderTurnRecoveryInput {
+                        context_pressure: Some(context_pressure_report.clone()),
+                        ..ProviderTurnRecoveryInput::default()
+                    },
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_TURN_RECOVERY_EVENT,
+                    recovery_decision.tape_payload().to_string(),
                 )
                 .await?;
                 // With tool evidence on the tape the run is worth resuming:
@@ -2685,6 +2926,16 @@ async fn process_run_stream_message_inner(
                 return Err(Status::deadline_exceeded(message));
             }
             Ok(RunStreamProviderRequestOutcome::Cancelled) => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_CANCELLATION_CLOSURE_EVENT,
+                    cancellation_closure(ProviderCancellationPhase::DuringProvider)
+                        .tape_payload()
+                        .to_string(),
+                )
+                .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             Err(error) => {
@@ -2778,6 +3029,22 @@ async fn process_run_stream_message_inner(
             }
         }
         let provider_output = provider_response.output.clone();
+        if let Err(error) = append_tool_call_assembly_audit_tape_event_if_relevant(
+            runtime_state,
+            run_id.as_str(),
+            tape_seq,
+            &provider_output,
+            &tool_catalog_snapshot,
+        )
+        .await
+        {
+            warn!(
+                run_id,
+                status_code = ?error.code(),
+                status_message = %error.message(),
+                "failed to append observe-only tool-call assembly audit tape event"
+            );
+        }
 
         let response_outcome = process_run_stream_provider_response(
             sender,
@@ -2819,6 +3086,23 @@ async fn process_run_stream_message_inner(
                         final_reply_text.as_deref(),
                         &loop_state,
                     ) {
+                        if let Some(anomaly) = anomaly_from_terminal_outcome(&terminal_outcome) {
+                            let recovery_decision = provider_turn_recovery_state.decide(
+                                anomaly,
+                                ProviderTurnRecoveryInput {
+                                    context_pressure: Some(context_pressure_report.clone()),
+                                    ..ProviderTurnRecoveryInput::default()
+                                },
+                            );
+                            append_agent_loop_tape_event(
+                                runtime_state,
+                                run_id.as_str(),
+                                tape_seq,
+                                PROVIDER_TURN_RECOVERY_EVENT,
+                                recovery_decision.tape_payload().to_string(),
+                            )
+                            .await?;
+                        }
                         if let Some(recovery_prompt) = final_answer_recovery_prompt(
                             message.as_str(),
                             &loop_state,
@@ -3200,6 +3484,21 @@ async fn process_run_stream_message_inner(
                 .await?;
             }
             RunStreamProviderResponseOutcome::Failed { message, provider_trace_ref, reason } => {
+                let recovery_decision = provider_turn_recovery_state.decide(
+                    provider_turn_anomaly_from_response_failure(reason, message.as_str()),
+                    ProviderTurnRecoveryInput {
+                        context_pressure: Some(context_pressure_report.clone()),
+                        ..ProviderTurnRecoveryInput::default()
+                    },
+                );
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_TURN_RECOVERY_EVENT,
+                    recovery_decision.tape_payload().to_string(),
+                )
+                .await?;
                 if should_stop_after_repeated_length_recovery(
                     reason,
                     message.as_str(),
@@ -3284,6 +3583,16 @@ async fn process_run_stream_message_inner(
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
             RunStreamProviderResponseOutcome::Cancelled => {
+                append_agent_loop_tape_event(
+                    runtime_state,
+                    run_id.as_str(),
+                    tape_seq,
+                    PROVIDER_CANCELLATION_CLOSURE_EVENT,
+                    cancellation_closure(ProviderCancellationPhase::Draining)
+                        .tape_payload()
+                        .to_string(),
+                )
+                .await?;
                 return Ok(RunStreamMessageProcessingOutcome::Terminate);
             }
         }
@@ -3532,6 +3841,118 @@ async fn append_tool_repair_audit_tape_events_if_relevant(
         *tape_seq = (*tape_seq).saturating_add(1);
     }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_tool_call_assembly_audit_tape_event_if_relevant(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    provider_output: &ProviderTurnOutput,
+    tool_catalog_snapshot: &ModelVisibleToolCatalogSnapshot,
+) -> Result<(), Status> {
+    if !provider_output_needs_tool_call_assembly_audit(provider_output) {
+        return Ok(());
+    }
+    let canonical_events = canonical_events_from_provider_output(provider_output);
+    let canonical_report = validate_canonical_provider_stream(canonical_events.as_slice());
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: PROVIDER_CANONICAL_STREAM_AUDIT_EVENT.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "event": PROVIDER_CANONICAL_STREAM_AUDIT_EVENT,
+                "runtime_mode": "observe_only",
+                "redaction_level": "canonical_events_no_raw_provider_chunks",
+                "tool_catalog_snapshot_id": tool_catalog_snapshot.snapshot_id,
+                "tool_catalog_hash": tool_catalog_snapshot.catalog_hash,
+                "report": canonical_report,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    let policy = ToolCallAssemblyPolicy::new(
+        tool_catalog_snapshot.tools.iter().map(|tool| tool.name.as_str()),
+    );
+    let assembly_report = assemble_canonical_tool_calls(canonical_events.as_slice(), &policy);
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: TOOL_CALL_ASSEMBLER_AUDIT_EVENT.to_owned(),
+            payload_json: json!({
+                "schema_version": 1,
+                "event": TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
+                "runtime_mode": "observe_only",
+                "redaction_level": "hash_only",
+                "tool_catalog_snapshot_id": tool_catalog_snapshot.snapshot_id,
+                "tool_catalog_hash": tool_catalog_snapshot.catalog_hash,
+                "report": assembly_report,
+            })
+            .to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+fn provider_output_needs_tool_call_assembly_audit(output: &ProviderTurnOutput) -> bool {
+    output
+        .content_parts
+        .iter()
+        .any(|part| matches!(part, ProviderOutputContentPart::ToolCall { .. }))
+        || matches!(output.finish_reason, ProviderFinishReason::ToolCalls)
+        || contains_raw_provider_tool_call_markup(output.full_text.as_str())
+}
+
+fn canonical_events_from_provider_output(
+    output: &ProviderTurnOutput,
+) -> Vec<ProviderCanonicalEvent> {
+    let model_id = output.raw_provider_refs.provider_model_id.as_deref().unwrap_or("unknown_model");
+    let provider_call_id = output
+        .raw_provider_refs
+        .provider_response_id
+        .as_deref()
+        .or(output.raw_provider_refs.provider_trace_ref.as_deref())
+        .unwrap_or("provider_turn_output");
+    let mut events = vec![ProviderCanonicalEvent::MessageStart {
+        provider_id: "palyra-runtime".to_owned(),
+        model_id: model_id.to_owned(),
+        provider_call_id: provider_call_id.to_owned(),
+    }];
+    let mut next_tool_index = 0_u32;
+    for part in &output.content_parts {
+        match part {
+            ProviderOutputContentPart::Text { text } => {
+                if !text.is_empty() {
+                    events.push(ProviderCanonicalEvent::ContentDelta { text: text.clone() });
+                }
+            }
+            ProviderOutputContentPart::ToolCall { proposal_id, tool_name, input_json } => {
+                let index = next_tool_index;
+                next_tool_index = next_tool_index.saturating_add(1);
+                events.push(ProviderCanonicalEvent::ToolCallStart {
+                    index,
+                    provider_call_id: Some(proposal_id.clone()),
+                });
+                events.push(ProviderCanonicalEvent::ToolCallNameDelta {
+                    index,
+                    name_delta: tool_name.clone(),
+                });
+                events.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                    index,
+                    arguments_delta: serde_json::to_string(input_json)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+                events.push(ProviderCanonicalEvent::ToolCallEnd { index });
+            }
+        }
+    }
+    events.push(ProviderCanonicalEvent::FinishReason { finish_reason: output.finish_reason });
+    events
 }
 
 fn provider_output_needs_tool_repair_audit(output: &ProviderTurnOutput) -> bool {
@@ -4920,9 +5341,10 @@ async fn persist_run_stream_provider_turn_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_loop_budget_exhausted_message, agent_loop_terminal_status_message,
-        apply_background_budget_guard, background_budget_overrun_message,
-        background_run_budget_tokens, browser_followup_timeout_partial_summary,
+        active_run_steering_guidance, agent_loop_budget_exhausted_message,
+        agent_loop_terminal_status_message, apply_background_budget_guard,
+        background_budget_overrun_message, background_run_budget_tokens,
+        browser_followup_timeout_partial_summary, canonical_events_from_provider_output,
         configured_run_stream_agent_harness_plugin_id, contains_raw_provider_tool_call_markup,
         effective_provider_request_deadline, final_answer_recovery_fallback_summary,
         final_answer_recovery_prompt, followup_timeout_recovery_prompt,
@@ -4961,6 +5383,7 @@ mod tests {
     };
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
     use crate::config::{AgentHarnessConfig, AgentHarnessRegistryConfig};
+    use crate::journal::OrchestratorQueuedInputRecord;
     use crate::model_provider::{
         ProviderFinishReason, ProviderMessage, ProviderMessageContentPart,
         ProviderOutputContentPart, ProviderRawProviderRefs, ProviderRequest,
@@ -4996,6 +5419,84 @@ mod tests {
             r#"{"success":true}"#,
         )]);
         state
+    }
+
+    fn queued_input(
+        queued_input_id: &str,
+        text: &str,
+        accepted_at_unix_ms: i64,
+    ) -> OrchestratorQueuedInputRecord {
+        OrchestratorQueuedInputRecord {
+            queued_input_id: queued_input_id.to_owned(),
+            run_id: "run_active".to_owned(),
+            session_id: "session".to_owned(),
+            state: "pending".to_owned(),
+            queue_mode: "interrupt".to_owned(),
+            priority_lane: "default".to_owned(),
+            coalescing_group: None,
+            overflow_summary_ref: None,
+            safe_boundary_flags_json: "{}".to_owned(),
+            decision_reason: "test".to_owned(),
+            text: text.to_owned(),
+            accepted_at_unix_ms: Some(accepted_at_unix_ms),
+            coalesced_at_unix_ms: None,
+            forwarded_at_unix_ms: None,
+            terminal_at_unix_ms: None,
+            policy_snapshot_json: "{}".to_owned(),
+            explain_json: "{}".to_owned(),
+            created_at_unix_ms: accepted_at_unix_ms,
+            updated_at_unix_ms: accepted_at_unix_ms,
+            origin_run_id: Some("run_active".to_owned()),
+        }
+    }
+
+    #[test]
+    fn active_run_steering_guidance_preserves_ordered_operator_text() {
+        let inputs = vec![
+            queued_input("queued_1", "first correction", 10),
+            queued_input("queued_2", "second correction", 20),
+        ];
+
+        let guidance = active_run_steering_guidance(inputs.as_slice());
+
+        assert!(guidance.starts_with("<operator_steering>"));
+        assert!(guidance.contains("1. first correction"));
+        assert!(guidance.contains("2. second correction"));
+        assert!(guidance.ends_with("</operator_steering>"));
+    }
+
+    #[test]
+    fn provider_output_projects_structured_tools_to_canonical_events() {
+        let output = ProviderTurnOutput {
+            full_text: String::new(),
+            content_parts: vec![ProviderOutputContentPart::ToolCall {
+                proposal_id: "call_1".to_owned(),
+                tool_name: "palyra.fs.read".to_owned(),
+                input_json: json!({"path": "Cargo.toml"}),
+            }],
+            finish_reason: ProviderFinishReason::ToolCalls,
+            usage: ProviderUsage::new(0, 0, "test"),
+            raw_provider_refs: ProviderRawProviderRefs::default(),
+            redaction_state: Default::default(),
+        };
+
+        let events = canonical_events_from_provider_output(&output);
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                crate::model_provider::ProviderCanonicalEvent::ToolCallNameDelta {
+                    name_delta,
+                    ..
+                } if name_delta == "palyra.fs.read"
+            )
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(crate::model_provider::ProviderCanonicalEvent::FinishReason {
+                finish_reason: ProviderFinishReason::ToolCalls
+            })
+        ));
     }
 
     fn route_selection_with_fallback(failover_enabled: bool) -> ProviderRouteSelectionTrace {

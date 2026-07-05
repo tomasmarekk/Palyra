@@ -14,6 +14,7 @@ pub mod providers;
 pub mod qa_mock;
 pub mod snapshots;
 pub mod streaming;
+pub mod tool_call_assembler;
 pub mod tool_repair;
 
 mod redaction;
@@ -114,10 +115,18 @@ pub use snapshots::{
     ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot,
 };
 pub use streaming::{
-    normalize_provider_sse_stream, normalize_provider_sse_stream_with_idle_timeout,
-    provider_output_from_text_and_tools, ProviderSseAuditEvent, ProviderSseAuditSeverity,
+    canonical_events_from_provider_stream_events, normalize_provider_sse_stream,
+    normalize_provider_sse_stream_with_idle_timeout, provider_output_from_text_and_tools,
+    validate_canonical_provider_stream, ProviderCanonicalEvent, ProviderCanonicalStreamDiagnostic,
+    ProviderCanonicalStreamReport, ProviderSseAuditEvent, ProviderSseAuditSeverity,
     ProviderSseNormalizationReport, ProviderStreamAccumulator, ProviderStreamEvent,
-    PROVIDER_SSE_NORMALIZER_AUDIT_EVENT,
+    PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_SSE_NORMALIZER_AUDIT_EVENT,
+};
+pub use tool_call_assembler::{
+    assemble_canonical_tool_calls, AssembledToolCall, AssembledToolCallStatus,
+    ToolCallAssemblyDiagnostic, ToolCallAssemblyPolicy, ToolCallAssemblyReport,
+    ToolCallRepairClass, ToolCallRepairStep, DEFAULT_ASSEMBLED_TOOL_ARGUMENT_LIMIT_BYTES,
+    TOOL_CALL_ASSEMBLER_AUDIT_EVENT, TOOL_CALL_ASSEMBLER_SCHEMA_VERSION,
 };
 pub use tool_repair::{
     decide_tool_repair_candidate, normalize_assistant_output_for_tool_repair,

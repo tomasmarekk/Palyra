@@ -93,9 +93,22 @@ pub fn messages_payload(request: &ProviderRequest, model_name: &str, tools: Vec<
         body["tools"] = Value::Array(tools);
     }
     if let Some(system) = system {
-        body["system"] = json!(system);
+        body["system"] = anthropic_system_payload(request, system);
     }
     body
+}
+
+fn anthropic_system_payload(request: &ProviderRequest, system: String) -> Value {
+    if !request.prompt_cache_policy.enabled
+        || request.prompt_cache_report.as_ref().is_none_or(|report| report.cacheable_tokens == 0)
+    {
+        return json!(system);
+    }
+    json!([{
+        "type": "text",
+        "text": system,
+        "cache_control": { "type": "ephemeral" },
+    }])
 }
 
 fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>, Option<String>) {
@@ -302,8 +315,43 @@ fn push_anthropic_expanded_multi_tool_exchange(
 mod tests {
     use super::{
         anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
+        messages_payload,
     };
     use crate::config::{ModelProviderAuthProviderKind, ModelProviderCredentialSource};
+    use crate::{
+        PromptCacheReport, PromptCacheStrategy, ProviderMessage, ProviderMessageContentPart,
+        ProviderMessageRole, ProviderRequest,
+    };
+
+    fn prompt_cache_request(enabled: bool) -> ProviderRequest {
+        let mut request =
+            ProviderRequest::from_input_text("hello".to_owned(), false, Vec::new(), None);
+        request.messages.insert(
+            0,
+            ProviderMessage {
+                role: ProviderMessageRole::System,
+                content: vec![ProviderMessageContentPart::text("stable system prompt")],
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        );
+        request.prompt_cache_policy.enabled = enabled;
+        request.prompt_cache_policy.strategy = PromptCacheStrategy::SystemAndTool;
+        request.prompt_cache_report = Some(PromptCacheReport {
+            eligible_bytes: 256,
+            invalidated_bytes: 0,
+            invalidation_reasons: Vec::new(),
+            provider_request_hash:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
+            requested_strategy: PromptCacheStrategy::SystemAndTool,
+            applied_strategy: "metadata_only".to_owned(),
+            breakpoint_count: 1,
+            cacheable_tokens: 64,
+            actual_cached_tokens: None,
+        });
+        request
+    }
 
     #[test]
     fn minimax_anthropic_compatible_transport_uses_bearer_auth() {
@@ -333,5 +381,21 @@ mod tests {
 
         assert!(!anthropic_compatible_uses_bearer_auth(kind, source));
         assert!(!anthropic_compatible_uses_anthropic_oauth_headers(kind, source));
+    }
+
+    #[test]
+    fn anthropic_payload_emits_cache_control_for_system_prompt() {
+        let payload = messages_payload(&prompt_cache_request(true), "claude-test", Vec::new());
+
+        assert_eq!(payload["system"][0]["type"], "text");
+        assert_eq!(payload["system"][0]["text"], "stable system prompt");
+        assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_payload_keeps_system_string_when_cache_disabled() {
+        let payload = messages_payload(&prompt_cache_request(false), "claude-test", Vec::new());
+
+        assert_eq!(payload["system"], "stable system prompt");
     }
 }

@@ -1,12 +1,16 @@
 //! Provider stream event model and accumulation.
 //!
-//! [`ProviderStreamEvent`] is the canonical incremental event vocabulary
-//! (started/delta/tool/usage/completed/failed/cancelled);
+//! [`ProviderStreamEvent`] is the legacy incremental event vocabulary
+//! (started/delta/tool/usage/completed/failed/cancelled). The finer-grained
+//! [`ProviderCanonicalEvent`] stream keeps provider chunk shapes out of tool
+//! assembly and recovery logic.
 //! [`ProviderStreamAccumulator`] folds those events into one size-bounded
 //! [`ProviderTurnOutput`], recording a spill reference when text exceeds the
 //! inline buffer cap. Non-streaming HTTP responses are funneled through the
 //! same accumulator (see [`provider_output_from_text_and_tools`]) so both
 //! paths share identical truncation and tool-call semantics.
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -15,15 +19,18 @@ use crate::errors::provider_failure_classification;
 use crate::{
     append_provider_text_with_hard_limit, ProviderError, ProviderErrorEnvelope, ProviderEvent,
     ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderOutputContentPart,
-    ProviderRawProviderRefs, ProviderRecoveryDecision, ProviderTurnOutput, ProviderUsage,
-    MAX_PROVIDER_TURN_TEXT_BYTES,
+    ProviderRawProviderRefs, ProviderRecoveryDecision, ProviderRecoveryDecisionKind,
+    ProviderTurnOutput, ProviderUsage, MAX_PROVIDER_TURN_TEXT_BYTES,
 };
 
 const DEFAULT_PROVIDER_STREAM_BUFFER_CAP_BYTES: usize = 256 * 1024;
 const PROVIDER_SSE_NORMALIZER_SCHEMA_VERSION: u16 = 1;
+const PROVIDER_CANONICAL_STREAM_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// Audit event emitted for provider SSE stream normalization decisions.
 pub const PROVIDER_SSE_NORMALIZER_AUDIT_EVENT: &str = "provider.stream.sse.normalized";
+/// Audit event emitted for canonical stream sequence validation.
+pub const PROVIDER_CANONICAL_STREAM_AUDIT_EVENT: &str = "provider.stream.canonical";
 
 /// Incremental event emitted while a provider turn is in flight.
 ///
@@ -40,6 +47,82 @@ pub enum ProviderStreamEvent {
     Completed { finish_reason: ProviderFinishReason, raw_provider_refs: ProviderRawProviderRefs },
     Failed { error: ProviderErrorEnvelope },
     Cancelled { reason: String },
+}
+
+/// Provider-neutral incremental stream event consumed by tool-call assembly.
+///
+/// The enum is intentionally more granular than [`ProviderStreamEvent`]:
+/// provider adapters can emit fragmented tool names and arguments without
+/// leaking the provider's raw SSE frame shape into later recovery logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderCanonicalEvent {
+    MessageStart {
+        provider_id: String,
+        model_id: String,
+        provider_call_id: String,
+    },
+    ContentDelta {
+        text: String,
+    },
+    /// Internal reasoning is retained as hash-only metadata, never raw text.
+    ReasoningDelta {
+        byte_len: usize,
+        payload_sha256: String,
+    },
+    ToolCallStart {
+        index: u32,
+        provider_call_id: Option<String>,
+    },
+    ToolCallNameDelta {
+        index: u32,
+        name_delta: String,
+    },
+    ToolCallArgumentsDelta {
+        index: u32,
+        arguments_delta: String,
+    },
+    ToolCallEnd {
+        index: u32,
+    },
+    UsageUpdate {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: Option<u64>,
+    },
+    FinishReason {
+        finish_reason: ProviderFinishReason,
+    },
+    ProviderWarning {
+        reason_code: String,
+        message: String,
+    },
+    StreamError {
+        reason_code: String,
+        recoverable: bool,
+    },
+}
+
+/// Hash-only validation diagnostic for a canonical stream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCanonicalStreamDiagnostic {
+    pub schema_version: u16,
+    pub event_type: String,
+    pub reason_code: String,
+    pub severity: ProviderSseAuditSeverity,
+    pub event_index: usize,
+    pub provider_call_id: Option<String>,
+}
+
+/// Validation report for canonical event ordering and terminal closure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCanonicalStreamReport {
+    pub schema_version: u16,
+    pub provider_call_id: Option<String>,
+    pub valid: bool,
+    pub terminal: bool,
+    pub tool_call_count: usize,
+    pub diagnostics: Vec<ProviderCanonicalStreamDiagnostic>,
 }
 
 /// Severity of one provider SSE normalizer audit event.
@@ -68,6 +151,7 @@ pub struct ProviderSseAuditEvent {
 pub struct ProviderSseNormalizationReport {
     pub schema_version: u16,
     pub events: Vec<ProviderStreamEvent>,
+    pub canonical_events: Vec<ProviderCanonicalEvent>,
     pub audit_events: Vec<ProviderSseAuditEvent>,
     pub recovery_decision: Option<ProviderRecoveryDecision>,
     pub terminal: bool,
@@ -112,6 +196,11 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
         events: vec![ProviderStreamEvent::Started {
             provider_id: provider_id.to_owned(),
             model_id: model_id.to_owned(),
+        }],
+        canonical_events: vec![ProviderCanonicalEvent::MessageStart {
+            provider_id: provider_id.to_owned(),
+            model_id: model_id.to_owned(),
+            provider_call_id: provider_call_id(provider_id, model_id),
         }],
         audit_events: Vec::new(),
         recovery_decision: None,
@@ -195,6 +284,11 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                 completion_tokens,
                 total_tokens,
             });
+            report.canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            });
         }
 
         if let Some(delta) = text_delta(&value) {
@@ -209,9 +303,21 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
                 ));
             } else {
                 last_delta_hash = Some(delta_hash);
-                report.events.push(ProviderStreamEvent::Delta { text: delta });
+                report.events.push(ProviderStreamEvent::Delta { text: delta.clone() });
+                report.canonical_events.push(ProviderCanonicalEvent::ContentDelta { text: delta });
             }
         }
+
+        if let Some(reasoning) = reasoning_delta(&value) {
+            report.canonical_events.push(ProviderCanonicalEvent::ReasoningDelta {
+                byte_len: reasoning.len(),
+                payload_sha256: stable_hash_text(reasoning.as_str()),
+            });
+        }
+
+        report
+            .canonical_events
+            .extend(tool_call_canonical_events(&value, frame.event_name.as_deref()));
 
         if let Some(finish_reason) = finish_reason(&value, frame.event_name.as_deref()) {
             if !usage_seen && frame_has_usage_json(frame.data.as_str()) {
@@ -308,6 +414,129 @@ fn text_delta(value: &Value) -> Option<String> {
         })
 }
 
+fn reasoning_delta(value: &Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/choices/0/delta/reasoning").and_then(Value::as_str))
+        .or_else(|| value.pointer("/delta/thinking").and_then(Value::as_str))
+        .or_else(|| value.get("reasoning_delta").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn tool_call_canonical_events(
+    value: &Value,
+    event_name: Option<&str>,
+) -> Vec<ProviderCanonicalEvent> {
+    let mut events = Vec::new();
+    if let Some(tool_calls) = value.pointer("/choices/0/delta/tool_calls").and_then(Value::as_array)
+    {
+        for (fallback_index, tool_call) in tool_calls.iter().enumerate() {
+            let index = tool_call
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_else(|| u32::try_from(fallback_index).unwrap_or(u32::MAX));
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                events.push(ProviderCanonicalEvent::ToolCallStart {
+                    index,
+                    provider_call_id: Some(id.to_owned()),
+                });
+            }
+            if let Some(name_delta) = tool_call.pointer("/function/name").and_then(Value::as_str) {
+                if !name_delta.is_empty() {
+                    events.push(ProviderCanonicalEvent::ToolCallNameDelta {
+                        index,
+                        name_delta: name_delta.to_owned(),
+                    });
+                }
+            }
+            if let Some(arguments_delta) =
+                tool_call.pointer("/function/arguments").and_then(Value::as_str)
+            {
+                if !arguments_delta.is_empty() {
+                    events.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                        index,
+                        arguments_delta: arguments_delta.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    let event_type = value.get("type").and_then(Value::as_str).or(event_name);
+    if matches!(event_type, Some("response.output_item.added" | "content_block_start")) {
+        if let Some((index, id, name)) = response_tool_start(value) {
+            events.push(ProviderCanonicalEvent::ToolCallStart { index, provider_call_id: id });
+            if let Some(name) = name {
+                events.push(ProviderCanonicalEvent::ToolCallNameDelta { index, name_delta: name });
+            }
+        }
+    }
+    if matches!(event_type, Some("response.function_call_arguments.delta" | "content_block_delta"))
+    {
+        if let Some((index, delta)) = response_tool_arguments_delta(value) {
+            events.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                index,
+                arguments_delta: delta,
+            });
+        }
+    }
+    if matches!(
+        event_type,
+        Some(
+            "response.function_call_arguments.done"
+                | "response.output_item.done"
+                | "content_block_stop"
+        )
+    ) {
+        let index = response_tool_index(value).unwrap_or(0);
+        events.push(ProviderCanonicalEvent::ToolCallEnd { index });
+    }
+    events
+}
+
+fn response_tool_start(value: &Value) -> Option<(u32, Option<String>, Option<String>)> {
+    let item = value.get("item").or_else(|| value.get("content_block")).unwrap_or(value);
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !matches!(kind, "function_call" | "tool_use") {
+        return None;
+    }
+    let index = response_tool_index(value).unwrap_or(0);
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned);
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned);
+    Some((index, id, name))
+}
+
+fn response_tool_arguments_delta(value: &Value) -> Option<(u32, String)> {
+    let delta = value
+        .get("delta")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("partial_json").and_then(Value::as_str))
+        .or_else(|| value.pointer("/delta/partial_json").and_then(Value::as_str))
+        .filter(|delta| !delta.is_empty())?;
+    Some((response_tool_index(value).unwrap_or(0), delta.to_owned()))
+}
+
+fn response_tool_index(value: &Value) -> Option<u32> {
+    value
+        .get("output_index")
+        .or_else(|| value.get("item_index"))
+        .or_else(|| value.get("index"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 fn usage_delta(value: &Value) -> Option<(u64, u64, Option<u64>)> {
     let usage = value.get("usage").or_else(|| value.pointer("/response/usage"))?;
     let prompt_tokens = usage
@@ -355,7 +584,200 @@ fn push_sse_completed(
         ..ProviderRawProviderRefs::default()
     };
     report.events.push(ProviderStreamEvent::Completed { finish_reason, raw_provider_refs });
+    report.canonical_events.push(ProviderCanonicalEvent::FinishReason { finish_reason });
     report.terminal = true;
+}
+
+/// Projects legacy provider stream events into canonical events.
+#[must_use]
+pub fn canonical_events_from_provider_stream_events(
+    events: &[ProviderStreamEvent],
+    provider_id: &str,
+    model_id: &str,
+) -> Vec<ProviderCanonicalEvent> {
+    let mut canonical_events = vec![ProviderCanonicalEvent::MessageStart {
+        provider_id: provider_id.to_owned(),
+        model_id: model_id.to_owned(),
+        provider_call_id: provider_call_id(provider_id, model_id),
+    }];
+    for event in events {
+        match event {
+            ProviderStreamEvent::Started { provider_id, model_id } => {
+                canonical_events.push(ProviderCanonicalEvent::MessageStart {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                    provider_call_id: provider_call_id(provider_id, model_id),
+                });
+            }
+            ProviderStreamEvent::Delta { text } => {
+                canonical_events.push(ProviderCanonicalEvent::ContentDelta { text: text.clone() });
+            }
+            ProviderStreamEvent::ToolDelta { proposal_id, tool_name, input_json } => {
+                let index = u32::try_from(canonical_events.len()).unwrap_or(u32::MAX);
+                canonical_events.push(ProviderCanonicalEvent::ToolCallStart {
+                    index,
+                    provider_call_id: Some(proposal_id.clone()),
+                });
+                canonical_events.push(ProviderCanonicalEvent::ToolCallNameDelta {
+                    index,
+                    name_delta: tool_name.clone(),
+                });
+                canonical_events.push(ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                    index,
+                    arguments_delta: serde_json::to_string(input_json)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                });
+                canonical_events.push(ProviderCanonicalEvent::ToolCallEnd { index });
+            }
+            ProviderStreamEvent::UsageDelta { prompt_tokens, completion_tokens, total_tokens } => {
+                canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
+                    prompt_tokens: *prompt_tokens,
+                    completion_tokens: *completion_tokens,
+                    total_tokens: *total_tokens,
+                })
+            }
+            ProviderStreamEvent::Completed { finish_reason, .. } => {
+                canonical_events
+                    .push(ProviderCanonicalEvent::FinishReason { finish_reason: *finish_reason });
+            }
+            ProviderStreamEvent::Failed { error } => {
+                canonical_events.push(ProviderCanonicalEvent::StreamError {
+                    reason_code: error.recovery_decision.reason_code.clone(),
+                    recoverable: provider_recovery_decision_is_recoverable(
+                        error.recovery_decision.decision,
+                    ),
+                });
+            }
+            ProviderStreamEvent::Cancelled { reason } => {
+                canonical_events.push(ProviderCanonicalEvent::StreamError {
+                    reason_code: format!("provider.stream.cancelled.{}", stable_hash_text(reason)),
+                    recoverable: false,
+                });
+            }
+        }
+    }
+    canonical_events
+}
+
+/// Validates canonical stream ordering before tool-call assembly.
+#[must_use]
+pub fn validate_canonical_provider_stream(
+    events: &[ProviderCanonicalEvent],
+) -> ProviderCanonicalStreamReport {
+    let mut open_tools = BTreeSet::<u32>::new();
+    let mut seen_tools = BTreeSet::<u32>::new();
+    let mut diagnostics = Vec::new();
+    let mut provider_call_ids = BTreeMap::<String, usize>::new();
+    let mut terminal = false;
+
+    for (event_index, event) in events.iter().enumerate() {
+        match event {
+            ProviderCanonicalEvent::MessageStart { provider_call_id, .. } => {
+                *provider_call_ids.entry(provider_call_id.clone()).or_default() += 1;
+            }
+            ProviderCanonicalEvent::ToolCallStart { index, provider_call_id } => {
+                if !seen_tools.insert(*index) {
+                    diagnostics.push(canonical_stream_diagnostic(
+                        "provider.stream.tool_call.duplicated_start",
+                        ProviderSseAuditSeverity::Failed,
+                        event_index,
+                        provider_call_id.clone(),
+                    ));
+                }
+                open_tools.insert(*index);
+            }
+            ProviderCanonicalEvent::ToolCallNameDelta { index, .. }
+            | ProviderCanonicalEvent::ToolCallArgumentsDelta { index, .. } => {
+                if !open_tools.contains(index) {
+                    diagnostics.push(canonical_stream_diagnostic(
+                        "provider.stream.tool_call.delta_without_start",
+                        ProviderSseAuditSeverity::Failed,
+                        event_index,
+                        None,
+                    ));
+                }
+            }
+            ProviderCanonicalEvent::ToolCallEnd { index } => {
+                if !open_tools.remove(index) {
+                    diagnostics.push(canonical_stream_diagnostic(
+                        "provider.stream.tool_call.end_without_start",
+                        ProviderSseAuditSeverity::Failed,
+                        event_index,
+                        None,
+                    ));
+                }
+            }
+            ProviderCanonicalEvent::FinishReason { .. }
+            | ProviderCanonicalEvent::StreamError { .. } => {
+                terminal = true;
+                if !open_tools.is_empty() {
+                    diagnostics.push(canonical_stream_diagnostic(
+                        "provider.stream.tool_call.incomplete_at_terminal",
+                        ProviderSseAuditSeverity::Failed,
+                        event_index,
+                        None,
+                    ));
+                }
+            }
+            ProviderCanonicalEvent::ContentDelta { .. }
+            | ProviderCanonicalEvent::ReasoningDelta { .. }
+            | ProviderCanonicalEvent::UsageUpdate { .. }
+            | ProviderCanonicalEvent::ProviderWarning { .. } => {}
+        }
+    }
+
+    if !terminal {
+        diagnostics.push(canonical_stream_diagnostic(
+            "provider.stream.missing_terminal_event",
+            ProviderSseAuditSeverity::Failed,
+            events.len(),
+            None,
+        ));
+    }
+
+    let provider_call_id = provider_call_ids.keys().next().cloned();
+    ProviderCanonicalStreamReport {
+        schema_version: PROVIDER_CANONICAL_STREAM_SCHEMA_VERSION,
+        provider_call_id,
+        valid: diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != ProviderSseAuditSeverity::Failed),
+        terminal,
+        tool_call_count: seen_tools.len(),
+        diagnostics,
+    }
+}
+
+fn canonical_stream_diagnostic(
+    reason_code: &str,
+    severity: ProviderSseAuditSeverity,
+    event_index: usize,
+    provider_call_id: Option<String>,
+) -> ProviderCanonicalStreamDiagnostic {
+    ProviderCanonicalStreamDiagnostic {
+        schema_version: PROVIDER_CANONICAL_STREAM_SCHEMA_VERSION,
+        event_type: PROVIDER_CANONICAL_STREAM_AUDIT_EVENT.to_owned(),
+        reason_code: reason_code.to_owned(),
+        severity,
+        event_index,
+        provider_call_id,
+    }
+}
+
+fn provider_call_id(provider_id: &str, model_id: &str) -> String {
+    format!("{}:{}", provider_id.trim(), model_id.trim())
+}
+
+const fn provider_recovery_decision_is_recoverable(decision: ProviderRecoveryDecisionKind) -> bool {
+    matches!(
+        decision,
+        ProviderRecoveryDecisionKind::RetrySameProvider
+            | ProviderRecoveryDecisionKind::RetryAfter
+            | ProviderRecoveryDecisionKind::RetryTransformed
+            | ProviderRecoveryDecisionKind::RefreshCredential
+            | ProviderRecoveryDecisionKind::FailoverProvider
+            | ProviderRecoveryDecisionKind::CompactAndRetry
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -705,5 +1127,68 @@ mod tests {
             .audit_events
             .iter()
             .any(|event| event.reason_code == "provider.stream.idle_timeout"));
+    }
+
+    #[test]
+    fn sse_normalizer_emits_canonical_fragmented_tool_arguments() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"palyra.fs.read\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"Cargo.toml\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-compatible", "gpt-test");
+
+        assert!(report.canonical_events.iter().any(|event| {
+            matches!(
+                event,
+                ProviderCanonicalEvent::ToolCallNameDelta { index: 0, name_delta }
+                    if name_delta == "palyra.fs.read"
+            )
+        }));
+        assert_eq!(
+            report
+                .canonical_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProviderCanonicalEvent::ToolCallArgumentsDelta { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            report.canonical_events.last(),
+            Some(ProviderCanonicalEvent::FinishReason {
+                finish_reason: ProviderFinishReason::ToolCalls
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_stream_validation_blocks_incomplete_tool_call() {
+        let events = vec![
+            ProviderCanonicalEvent::MessageStart {
+                provider_id: "openai-compatible".to_owned(),
+                model_id: "gpt-test".to_owned(),
+                provider_call_id: "call".to_owned(),
+            },
+            ProviderCanonicalEvent::ToolCallStart {
+                index: 0,
+                provider_call_id: Some("call_1".to_owned()),
+            },
+            ProviderCanonicalEvent::ToolCallArgumentsDelta {
+                index: 0,
+                arguments_delta: r#"{"path":"Cargo.toml"}"#.to_owned(),
+            },
+            ProviderCanonicalEvent::FinishReason { finish_reason: ProviderFinishReason::ToolCalls },
+        ];
+
+        let report = validate_canonical_provider_stream(events.as_slice());
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_code == "provider.stream.tool_call.incomplete_at_terminal"
+        }));
     }
 }

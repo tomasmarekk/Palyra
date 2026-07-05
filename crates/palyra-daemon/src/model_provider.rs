@@ -53,6 +53,17 @@ pub(crate) use palyra_model_providers::{
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{
+    assemble_canonical_tool_calls, validate_canonical_provider_stream, ProviderCanonicalEvent,
+    ProviderError, ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity,
+    ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
+    ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
+    ProviderRecoveryDecision, ProviderRecoveryDecisionKind, ProviderRecoveryPlanSnapshot,
+    ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent, ToolCallAssemblyPolicy,
+    PROVIDER_CANONICAL_STREAM_AUDIT_EVENT, PROVIDER_RECOVERY_DECISION_EVENT,
+    TOOL_CALL_ASSEMBLER_AUDIT_EVENT,
+};
+#[allow(unused_imports)]
+pub use palyra_model_providers::{
     capability_defaults_for_kind, capability_defaults_for_provider, configured_model_id,
     model_id_supports_reasoning_effort, validate_model_provider_config,
     validate_openai_base_url_network_policy, validate_openai_base_url_network_policy_with_resolver,
@@ -97,15 +108,6 @@ pub use palyra_model_providers::{
     ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
     ProviderRetryPolicySnapshot, ProviderRouteCandidateTrace, ProviderRouteSelectionTrace,
     ProviderRuntimeMetricsSnapshot, ProviderStatusSnapshot, QaMockProviderFixture,
-};
-#[allow(unused_imports)]
-pub use palyra_model_providers::{
-    ProviderError, ProviderErrorEnvelope, ProviderErrorKind, ProviderErrorSeverity,
-    ProviderFailureAction, ProviderFailureCategory, ProviderFailureClass,
-    ProviderFailureClassification, ProviderFailureSnapshot, ProviderRecoveryAction,
-    ProviderRecoveryDecision, ProviderRecoveryDecisionKind, ProviderRecoveryPlanSnapshot,
-    ProviderRetryability, ProviderStreamAccumulator, ProviderStreamEvent,
-    PROVIDER_RECOVERY_DECISION_EVENT,
 };
 
 const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
@@ -1115,6 +1117,10 @@ impl RegistryBackedModelProvider {
                 "eligible_bytes": report.eligible_bytes,
                 "invalidated_bytes": report.invalidated_bytes,
                 "invalidation_reasons": report.invalidation_reasons,
+                "requested_strategy": report.requested_strategy.as_str(),
+                "applied_strategy": report.applied_strategy.as_str(),
+                "breakpoint_count": report.breakpoint_count,
+                "cacheable_tokens": report.cacheable_tokens,
             })),
         });
         crate::sha256_hex(
