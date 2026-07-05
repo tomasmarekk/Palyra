@@ -1053,6 +1053,7 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
             replay_capture: crate::config::ReplayCaptureConfig::default(),
             networked_workers: crate::config::NetworkedWorkersConfig::default(),
             execution_backend_profiles: crate::config::ExecutionBackendProfilesConfig::default(),
+            agent_harness_registry: crate::config::AgentHarnessRegistryConfig::default(),
             channel_router: crate::channel_router::ChannelRouterConfig::default(),
             media: MediaRuntimeConfig::default(),
             code_intel: crate::config::CodeIntelConfig::default(),

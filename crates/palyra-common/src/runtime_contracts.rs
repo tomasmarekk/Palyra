@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, fmt};
 /// Schema version for the public runtime contract snapshot emitted by this crate.
 pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current public runtime contract snapshot.
-pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v5";
+pub const PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION: &str = "runtime-contracts.v6";
 
 /// One canonical runtime enum wire value plus deprecated aliases that must keep parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -445,7 +445,7 @@ fn agent_hook_contract_snapshot() -> Value {
 
 fn agent_harness_contract_snapshot() -> Value {
     json!({
-        "snapshot_version": "runtime-contracts.agent_harness.v2",
+        "snapshot_version": "runtime-contracts.agent_harness.v3",
         "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, journal writes, and structured attempt results host-owned.",
         "selection_modes": enum_contract_snapshot(
             "AgentHarnessSelectionMode",
@@ -461,8 +461,8 @@ fn agent_harness_contract_snapshot() -> Value {
         ),
         "callback_kinds": enum_contract_snapshot(
             "AgentHarnessCallbackKind",
-            "runtime-contracts.agent_harness_callback_kind.v1",
-            "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
+            "runtime-contracts.agent_harness_callback_kind.v2",
+            "Harness callbacks are the only supported path for reply, model, tool, approval, verification, lifecycle, and final outcome events.",
             AgentHarnessCallbackKind::wire_contract_values(),
         ),
         "attempt_terminal_statuses": enum_contract_snapshot(
@@ -1952,7 +1952,16 @@ runtime_contract_enum! {
     /// Callback channels a harness may use to emit host-owned attempt events.
     pub enum AgentHarnessCallbackKind {
         PartialReply => "partial_reply",
+        ModelTurnStarted => "model_turn_started",
+        ModelToken => "model_token",
+        ToolProposed => "tool_proposed",
+        ApprovalRequested => "approval_requested",
+        ToolStarted => "tool_started",
         ToolEvent => "tool_event",
+        Progress => "progress",
+        ToolResult => "tool_result",
+        VerificationState => "verification_state",
+        RecoveryPromptInjected => "recovery_prompt_injected",
         LifecycleEvent => "lifecycle_event",
         FinalOutcome => "final_outcome"
     }
@@ -2206,7 +2215,16 @@ pub const PREPARED_AGENT_ATTEMPT_SCHEMA: PreparedAgentAttemptSchemaDescriptor =
         ],
         callback_kinds: &[
             AgentHarnessCallbackKind::PartialReply,
+            AgentHarnessCallbackKind::ModelTurnStarted,
+            AgentHarnessCallbackKind::ModelToken,
+            AgentHarnessCallbackKind::ToolProposed,
+            AgentHarnessCallbackKind::ApprovalRequested,
+            AgentHarnessCallbackKind::ToolStarted,
             AgentHarnessCallbackKind::ToolEvent,
+            AgentHarnessCallbackKind::Progress,
+            AgentHarnessCallbackKind::ToolResult,
+            AgentHarnessCallbackKind::VerificationState,
+            AgentHarnessCallbackKind::RecoveryPromptInjected,
             AgentHarnessCallbackKind::LifecycleEvent,
             AgentHarnessCallbackKind::FinalOutcome,
         ],

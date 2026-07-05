@@ -36,9 +36,11 @@ pub struct HarnessToolReplayMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessToolBridgePolicy {
     visible_tools: BTreeSet<String>,
+    approval_denied_tool_call_ids: BTreeSet<String>,
     pub catalog_snapshot_id: String,
     pub approval_required_for_mutation: bool,
     pub execution_gate_required: bool,
+    pub harness_result_projection_limit_bytes: usize,
 }
 
 impl HarnessToolBridgePolicy {
@@ -50,10 +52,23 @@ impl HarnessToolBridgePolicy {
     ) -> Self {
         Self {
             visible_tools: visible_tools.into_iter().map(Into::into).collect(),
+            approval_denied_tool_call_ids: BTreeSet::new(),
             catalog_snapshot_id: catalog_snapshot_id.into(),
             approval_required_for_mutation: true,
             execution_gate_required: true,
+            harness_result_projection_limit_bytes: 4 * 1024,
         }
+    }
+
+    /// Marks a tool call id as denied by host approval.
+    pub fn deny_approval_for(&mut self, tool_call_id: impl Into<String>) {
+        self.approval_denied_tool_call_ids.insert(tool_call_id.into());
+    }
+
+    /// Sets the maximum summary size returned through harness-visible projection.
+    pub fn with_projection_limit(mut self, limit_bytes: usize) -> Self {
+        self.harness_result_projection_limit_bytes = limit_bytes;
+        self
     }
 }
 
@@ -121,6 +136,11 @@ pub fn evaluate_harness_tool_call(
             "harness_tool.mutating_approval_required",
         ));
     }
+    if approval_required
+        && policy.approval_denied_tool_call_ids.contains(request.tool_call_id.trim())
+    {
+        return Ok(denied_decision(normalized_tool_name, "harness_tool.approval_denied"));
+    }
 
     Ok(HarnessToolBridgeDecision {
         allowed: true,
@@ -144,6 +164,54 @@ fn denied_decision(normalized_tool_name: String, reason_code: &str) -> HarnessTo
             summary: "Tool call was denied by host policy before execution.".to_owned(),
         }),
     }
+}
+
+/// Projects a canonical tool result into the bounded view a harness may receive.
+#[must_use]
+pub fn project_harness_visible_tool_result(
+    canonical_result: &Value,
+    artifact_spill_required: bool,
+    projection_limit_bytes: usize,
+) -> HarnessVisibleToolResult {
+    if artifact_spill_required {
+        return HarnessVisibleToolResult {
+            status: "projected".to_owned(),
+            summary: "Tool result is available only through the host artifact projection."
+                .to_owned(),
+        };
+    }
+
+    let summary = canonical_result
+        .get("summary")
+        .and_then(Value::as_str)
+        .or_else(|| canonical_result.get("message").and_then(Value::as_str))
+        .unwrap_or("Tool completed.");
+    HarnessVisibleToolResult {
+        status: canonical_result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_owned(),
+        summary: bound_projection_summary(
+            palyra_common::redaction::redact_diagnostic_text(summary),
+            projection_limit_bytes,
+        ),
+    }
+}
+
+fn bound_projection_summary(summary: String, projection_limit_bytes: usize) -> String {
+    if summary.len() <= projection_limit_bytes {
+        return summary;
+    }
+    let mut bounded = String::new();
+    for ch in summary.chars() {
+        if bounded.len() + ch.len_utf8() > projection_limit_bytes.saturating_sub(15) {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded.push_str("<truncated>");
+    bounded
 }
 
 #[cfg(test)]
@@ -203,6 +271,53 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.reason_code, "harness_tool.execution_gate_required");
+    }
+
+    #[test]
+    fn bridge_returns_safe_denied_result_for_approval_deny() {
+        let mut policy = HarnessToolBridgePolicy::new(["palyra.fs.apply_patch"], "catalog-1");
+        policy.deny_approval_for("call-1");
+
+        let decision = evaluate_harness_tool_call(&request("palyra.fs.apply_patch", true), &policy)
+            .expect("mutating denied call should evaluate");
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason_code, "harness_tool.approval_denied");
+        assert_eq!(
+            decision.harness_visible_result.as_ref().map(|result| result.status.as_str()),
+            Some("denied")
+        );
+    }
+
+    #[test]
+    fn bridge_projection_bounds_and_redacts_harness_visible_result() {
+        let result = project_harness_visible_tool_result(
+            &json!({
+                "status": "completed",
+                "summary": "read api_key=secret-token with a very long result body",
+            }),
+            false,
+            32,
+        );
+
+        assert_eq!(result.status, "completed");
+        assert!(result.summary.contains("<truncated>"));
+        assert!(!result.summary.contains("secret-token"));
+    }
+
+    #[test]
+    fn bridge_projection_withholds_artifact_spill_content() {
+        let result = project_harness_visible_tool_result(
+            &json!({
+                "status": "completed",
+                "summary": "full file content should not be returned",
+            }),
+            true,
+            4096,
+        );
+
+        assert_eq!(result.status, "projected");
+        assert!(!result.summary.contains("full file content"));
     }
 
     #[test]

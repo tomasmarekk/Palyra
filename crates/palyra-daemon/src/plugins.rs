@@ -23,13 +23,20 @@ use palyra_common::versioned_json::{
 use palyra_plugins_runtime::{
     negotiate_typed_plugin_contracts, TypedPluginContractAdapterSupport,
     TypedPluginContractNegotiationInput, TypedPluginContractNegotiationReport,
+    TypedPluginContractStatus,
 };
 use palyra_plugins_sdk::{TypedPluginCapabilityClass, TypedPluginContractKind};
 use palyra_skills::{SkillConfigProperty, SkillConfigValueType, SkillManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
+use crate::{
+    application::agent_harness::{
+        AgentHarness, AgentHarnessDescriptor, AgentHarnessRegistry, AgentHarnessRegistryError,
+        AgentHarnessRunOutcome, AgentHarnessSupportDecision, AgentHarnessSupportRequest,
+    },
+    wasm_plugin_runner::WasmPluginRunnerPolicy,
+};
 
 use crate::*;
 
@@ -177,6 +184,46 @@ pub(crate) struct PluginDiscoverySnapshot {
     pub(crate) missing_paths: Vec<String>,
     #[serde(default)]
     pub(crate) filesystem: PluginFilesystemSafetySnapshot,
+}
+
+/// Request to activate plugin-owned agent harness descriptors before selection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AgentHarnessPluginActivationRequest<'a> {
+    pub(crate) requested_plugin_id: Option<&'a str>,
+    pub(crate) explicit: bool,
+}
+
+/// Activation diagnostics for one plugin-owned agent harness descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentHarnessPluginActivationRecord {
+    pub(crate) plugin_id: String,
+    pub(crate) descriptor_hash: String,
+    pub(crate) activated: bool,
+    pub(crate) reason_code: String,
+}
+
+/// Host-owned activation report retained before harness selection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentHarnessPluginActivationReport {
+    pub(crate) ready: bool,
+    pub(crate) records: Vec<AgentHarnessPluginActivationRecord>,
+}
+
+/// Fail-closed plugin activation error used before explicit harness selection.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AgentHarnessPluginActivationError {
+    #[error("explicit agent harness plugin is not registered: {plugin_id}")]
+    ExplicitPluginMissing { plugin_id: String },
+    #[error("explicit agent harness plugin is not activatable: {plugin_id}: {reason_code}")]
+    ExplicitPluginNotActivatable { plugin_id: String, reason_code: String },
+    #[error("agent harness registry rejected plugin descriptor: {plugin_id}: {source}")]
+    Registry {
+        plugin_id: String,
+        #[source]
+        source: AgentHarnessRegistryError,
+    },
 }
 
 /// Result class of validating a config instance against the manifest's
@@ -1302,6 +1349,167 @@ pub(crate) fn negotiate_plugin_typed_contracts(
     })
 }
 
+/// Activates plugin-owned agent harness descriptors before harness selection.
+///
+/// The activation step is deliberately descriptor-only: plugin code is not
+/// invoked here, and no capability profile is granted to the harness. Explicit
+/// requests fail closed when the target binding is missing or not activatable.
+///
+/// # Errors
+/// Returns [`AgentHarnessPluginActivationError`] for explicit missing or
+/// unactivatable plugins, or when the host registry rejects a descriptor.
+pub(crate) fn activate_agent_harness_plugins_before_selection(
+    bindings: &PluginBindingsIndex,
+    registry: &mut AgentHarnessRegistry,
+    request: AgentHarnessPluginActivationRequest<'_>,
+) -> std::result::Result<AgentHarnessPluginActivationReport, AgentHarnessPluginActivationError> {
+    let requested = request.requested_plugin_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut report = AgentHarnessPluginActivationReport { ready: true, records: Vec::new() };
+    let mut saw_requested = false;
+
+    for binding in &bindings.entries {
+        if requested.is_some_and(|requested_id| requested_id != binding.plugin_id) {
+            continue;
+        }
+        saw_requested |= requested == Some(binding.plugin_id.as_str());
+        let descriptor = AgentHarnessDescriptor::new(
+            binding.plugin_id.as_str(),
+            plugin_agent_harness_label(binding).as_str(),
+            false,
+        );
+        match agent_harness_plugin_activation_reason(binding) {
+            AgentHarnessPluginActivationReason::Activatable => {
+                registry
+                    .register(PluginAgentHarnessAdapter { descriptor: descriptor.clone() })
+                    .map_err(|source| AgentHarnessPluginActivationError::Registry {
+                        plugin_id: binding.plugin_id.clone(),
+                        source,
+                    })?;
+                report.records.push(AgentHarnessPluginActivationRecord {
+                    plugin_id: binding.plugin_id.clone(),
+                    descriptor_hash: descriptor.descriptor_hash,
+                    activated: true,
+                    reason_code: "agent_harness_plugin.activated".to_owned(),
+                });
+            }
+            AgentHarnessPluginActivationReason::Blocked(reason_code) => {
+                report.ready = false;
+                report.records.push(AgentHarnessPluginActivationRecord {
+                    plugin_id: binding.plugin_id.clone(),
+                    descriptor_hash: descriptor.descriptor_hash,
+                    activated: false,
+                    reason_code: reason_code.clone(),
+                });
+                if request.explicit {
+                    return Err(AgentHarnessPluginActivationError::ExplicitPluginNotActivatable {
+                        plugin_id: binding.plugin_id.clone(),
+                        reason_code,
+                    });
+                }
+            }
+        }
+    }
+
+    if request.explicit && requested.is_some() && !saw_requested {
+        return Err(AgentHarnessPluginActivationError::ExplicitPluginMissing {
+            plugin_id: requested.unwrap_or_default().to_owned(),
+        });
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentHarnessPluginActivationReason {
+    Activatable,
+    Blocked(String),
+}
+
+fn agent_harness_plugin_activation_reason(
+    binding: &PluginBindingRecord,
+) -> AgentHarnessPluginActivationReason {
+    if !binding.enabled {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.binding_disabled".to_owned(),
+        );
+    }
+    if binding.discovery.state != PluginDiscoveryState::Installed {
+        return AgentHarnessPluginActivationReason::Blocked(format!(
+            "agent_harness_plugin.discovery_{}",
+            plugin_discovery_state_label(binding.discovery.state)
+        ));
+    }
+    let Some(entry) = binding
+        .typed_contracts
+        .entries
+        .iter()
+        .find(|entry| entry.kind == TypedPluginContractKind::AgentHarness)
+    else {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.contract_missing".to_owned(),
+        );
+    };
+    if entry.status != TypedPluginContractStatus::Accepted {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.contract_rejected".to_owned(),
+        );
+    }
+    if !binding.typed_contracts.ready {
+        return AgentHarnessPluginActivationReason::Blocked(
+            "agent_harness_plugin.contract_report_not_ready".to_owned(),
+        );
+    }
+    AgentHarnessPluginActivationReason::Activatable
+}
+
+const fn plugin_discovery_state_label(state: PluginDiscoveryState) -> &'static str {
+    match state {
+        PluginDiscoveryState::Unknown => "unknown",
+        PluginDiscoveryState::Installed => "installed",
+        PluginDiscoveryState::Invalid => "invalid",
+        PluginDiscoveryState::RequiresMigration => "requires_migration",
+        PluginDiscoveryState::SignatureFailed => "signature_failed",
+        PluginDiscoveryState::MissingModule => "missing_module",
+        PluginDiscoveryState::FilesystemUnsafe => "filesystem_unsafe",
+    }
+}
+
+fn plugin_agent_harness_label(binding: &PluginBindingRecord) -> String {
+    binding
+        .operator
+        .display_name
+        .clone()
+        .unwrap_or_else(|| format!("Agent harness plugin {}", binding.plugin_id))
+}
+
+#[derive(Debug)]
+struct PluginAgentHarnessAdapter {
+    descriptor: AgentHarnessDescriptor,
+}
+
+impl AgentHarness for PluginAgentHarnessAdapter {
+    fn descriptor(&self) -> &AgentHarnessDescriptor {
+        &self.descriptor
+    }
+
+    fn supports(&self, request: &AgentHarnessSupportRequest<'_>) -> AgentHarnessSupportDecision {
+        if request.explicit_harness_id.is_some_and(|id| id != self.descriptor.id.as_str()) {
+            return AgentHarnessSupportDecision::declined("agent_harness_plugin.id_mismatch");
+        }
+        AgentHarnessSupportDecision::preferred("agent_harness_plugin.activated")
+    }
+
+    fn run_attempt(
+        &self,
+        _attempt: crate::application::agent_harness::PreparedAgentAttempt<'_>,
+    ) -> AgentHarnessRunOutcome {
+        AgentHarnessRunOutcome {
+            status: "blocked".to_owned(),
+            emitted_callbacks: Vec::new(),
+            final_message: None,
+        }
+    }
+}
+
 // Host-side adapter table: which contract kinds the daemon can bind and
 // which capability classes each may carry. Lifecycle hooks and policy signal
 // providers deliberately allow no capability classes (minimal-capability
@@ -1468,21 +1676,95 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        build_plugin_capability_diff, inspect_plugin_filesystem_safety, load_plugin_bindings_index,
+        activate_agent_harness_plugins_before_selection, build_plugin_capability_diff,
+        inspect_plugin_filesystem_safety, load_plugin_bindings_index,
         negotiate_plugin_typed_contracts, plugin_bindings_index_path, redact_plugin_config_values,
         save_plugin_bindings_index, supported_plugin_contract_adapters,
-        validate_plugin_config_instance, PluginBindingRecord, PluginBindingsIndex,
+        validate_plugin_config_instance, AgentHarnessPluginActivationError,
+        AgentHarnessPluginActivationRequest, PluginBindingRecord, PluginBindingsIndex,
         PluginCapabilityDiffCache, PluginCapabilityDiffCategory, PluginCapabilityDiffEntry,
         PluginCapabilityProfile, PluginConfigInstance, PluginConfigInstanceRef,
         PluginConfigValidationSnapshot, PluginConfigValidationState, PluginDiscoverySnapshot,
-        PluginDiscoveryState, PluginFilesystemSafetySnapshot, PLUGIN_BINDINGS_LAYOUT_VERSION,
+        PluginDiscoveryState, PluginFilesystemSafetySnapshot, PluginOperatorMetadata,
+        PLUGIN_BINDINGS_LAYOUT_VERSION,
     };
+    use crate::application::agent_harness::{AgentHarnessRegistry, AgentHarnessSupportRequest};
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
-    use palyra_plugins_runtime::{TypedPluginContractNegotiationReport, TypedPluginContractStatus};
+    use palyra_common::runtime_contracts::AgentHarnessSelectionMode;
+    use palyra_plugins_runtime::{
+        TypedPluginContractMode, TypedPluginContractNegotiationEntry,
+        TypedPluginContractNegotiationReport, TypedPluginContractStatus,
+    };
     use palyra_plugins_sdk::{
         all_typed_plugin_contract_kinds, TypedPluginCapabilityClass,
         TypedPluginContractDeclaration, TypedPluginContractKind,
     };
+
+    fn accepted_agent_harness_contract_report() -> TypedPluginContractNegotiationReport {
+        TypedPluginContractNegotiationReport {
+            mode: TypedPluginContractMode::Typed,
+            ready: true,
+            entries: vec![TypedPluginContractNegotiationEntry {
+                kind: TypedPluginContractKind::AgentHarness,
+                requested_version: 1,
+                status: TypedPluginContractStatus::Accepted,
+                adapter: Some("runtime.agent_harness".to_owned()),
+                descriptor: None,
+                reasons: Vec::new(),
+            }],
+        }
+    }
+
+    fn agent_harness_binding(
+        plugin_id: &str,
+        typed_contracts: TypedPluginContractNegotiationReport,
+    ) -> PluginBindingRecord {
+        PluginBindingRecord {
+            plugin_id: plugin_id.to_owned(),
+            enabled: true,
+            skill_id: format!("{plugin_id}.skill"),
+            skill_version: Some("1.0.0".to_owned()),
+            tool_id: None,
+            module_path: Some("modules/plugin.wasm".to_owned()),
+            entrypoint: Some("run".to_owned()),
+            capability_profile: PluginCapabilityProfile::default(),
+            operator: PluginOperatorMetadata {
+                display_name: Some(format!("{plugin_id} Harness")),
+                ..PluginOperatorMetadata::default()
+            },
+            discovery: PluginDiscoverySnapshot {
+                state: PluginDiscoveryState::Installed,
+                filesystem: PluginFilesystemSafetySnapshot { safe: true, issues: Vec::new() },
+                ..PluginDiscoverySnapshot::default()
+            },
+            config: None,
+            capability_diff: PluginCapabilityDiffCache::default(),
+            typed_contracts,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+        }
+    }
+
+    fn harness_selection_request<'a>(
+        explicit_harness_id: Option<&'a str>,
+        mutating: bool,
+    ) -> AgentHarnessSupportRequest<'a> {
+        AgentHarnessSupportRequest {
+            selection_mode: AgentHarnessSelectionMode::ExplicitPlugin,
+            explicit_harness_id,
+            provider_id: "openai",
+            model_id: "gpt-4o-mini",
+            runtime_policy: "run_stream_host_owned",
+            channel_kind: "operator_cli",
+            sandbox_mode: "host_owned",
+            tool_policy_summary: "approval_required",
+            model_capabilities: &["text"],
+            mutating,
+            replay_safe: false,
+            fallback_allowed: false,
+            replay_required: false,
+        }
+    }
 
     #[test]
     fn load_plugin_bindings_index_migrates_legacy_metadata() {
@@ -1666,6 +1948,101 @@ mod tests {
             model_auth.allowed_capability_classes,
             vec![TypedPluginCapabilityClass::Secrets]
         );
+
+        let agent_harness = adapters
+            .iter()
+            .find(|adapter| adapter.kind == TypedPluginContractKind::AgentHarness)
+            .expect("agent harness adapter must be present");
+        assert!(
+            agent_harness.allowed_capability_classes.is_empty(),
+            "agent harness plugins must route through host callbacks without direct capabilities"
+        );
+    }
+
+    #[test]
+    fn agent_harness_plugin_activation_registers_descriptor_before_selection() {
+        let index = PluginBindingsIndex {
+            entries: vec![agent_harness_binding(
+                "acme.agent_harness",
+                accepted_agent_harness_contract_report(),
+            )],
+            ..PluginBindingsIndex::default()
+        };
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let report = activate_agent_harness_plugins_before_selection(
+            &index,
+            &mut registry,
+            AgentHarnessPluginActivationRequest {
+                requested_plugin_id: Some("acme.agent_harness"),
+                explicit: true,
+            },
+        )
+        .expect("accepted agent harness plugin should activate");
+        let selected = registry
+            .select(&harness_selection_request(Some("acme.agent_harness"), false))
+            .expect("registered plugin harness should be selectable");
+
+        assert!(report.ready);
+        assert_eq!(report.records.len(), 1);
+        assert!(report.records[0].activated);
+        assert_eq!(report.records[0].reason_code, "agent_harness_plugin.activated");
+        assert_eq!(selected.harness.descriptor().id, "acme.agent_harness");
+    }
+
+    #[test]
+    fn agent_harness_plugin_activation_fails_closed_for_explicit_missing_plugin() {
+        let index = PluginBindingsIndex::default();
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let error = activate_agent_harness_plugins_before_selection(
+            &index,
+            &mut registry,
+            AgentHarnessPluginActivationRequest {
+                requested_plugin_id: Some("missing.agent_harness"),
+                explicit: true,
+            },
+        )
+        .expect_err("explicit missing plugin must fail closed");
+
+        assert_eq!(
+            error,
+            AgentHarnessPluginActivationError::ExplicitPluginMissing {
+                plugin_id: "missing.agent_harness".to_owned()
+            }
+        );
+        assert!(registry.lookup("missing.agent_harness").is_none());
+    }
+
+    #[test]
+    fn agent_harness_plugin_activation_reports_blocked_without_capability_material() {
+        let mut binding = agent_harness_binding(
+            "acme.agent_harness",
+            TypedPluginContractNegotiationReport::default(),
+        );
+        binding.capability_profile.secrets.push("provider-token".to_owned());
+        let index =
+            PluginBindingsIndex { entries: vec![binding], ..PluginBindingsIndex::default() };
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        let report = activate_agent_harness_plugins_before_selection(
+            &index,
+            &mut registry,
+            AgentHarnessPluginActivationRequest {
+                requested_plugin_id: Some("acme.agent_harness"),
+                explicit: false,
+            },
+        )
+        .expect("non-explicit activation reports blockers for safe fallback");
+        let serialized = serde_json::to_string(&report).expect("report should serialize");
+
+        assert!(!report.ready);
+        assert_eq!(report.records[0].reason_code, "agent_harness_plugin.contract_missing");
+        assert!(!serialized.contains("provider-token"));
+        assert!(registry.lookup("acme.agent_harness").is_none());
     }
 
     #[test]
@@ -1709,6 +2086,32 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("does not allow capability classes http_hosts")));
+    }
+
+    #[test]
+    fn typed_plugin_negotiation_rejects_agent_harness_capability_grants() {
+        let mut manifest =
+            plugin_manifest_with_operator_config(minimal_operator_config_properties());
+        manifest.operator.plugin.contracts = vec![TypedPluginContractDeclaration {
+            kind: TypedPluginContractKind::AgentHarness,
+            version: 1,
+        }];
+        let report = negotiate_plugin_typed_contracts(
+            &manifest,
+            &PluginCapabilityProfile {
+                secrets: vec!["provider-token".to_owned()],
+                storage_prefixes: vec!["journal/".to_owned()],
+                ..PluginCapabilityProfile::default()
+            },
+        );
+
+        assert!(!report.ready, "agent harness contract must stay callback-only");
+        assert_eq!(report.entries[0].status, TypedPluginContractStatus::Rejected);
+        assert!(report.entries[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("does not allow capability classes secrets")));
+        assert!(report.entries[0].reasons.iter().any(|reason| reason.contains("storage_prefixes")));
     }
 
     #[test]

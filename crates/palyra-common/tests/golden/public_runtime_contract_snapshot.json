@@ -569,16 +569,52 @@
       ]
     },
     "callback_kinds": {
-      "changelog_note": "Harness callbacks are the only supported path for reply, tool, lifecycle, and final outcome events.",
+      "changelog_note": "Harness callbacks are the only supported path for reply, model, tool, approval, verification, lifecycle, and final outcome events.",
       "name": "AgentHarnessCallbackKind",
-      "snapshot_version": "runtime-contracts.agent_harness_callback_kind.v1",
+      "snapshot_version": "runtime-contracts.agent_harness_callback_kind.v2",
       "values": [
         {
           "canonical": "partial_reply",
           "deprecated_aliases": []
         },
         {
+          "canonical": "model_turn_started",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "model_token",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_proposed",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval_requested",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_started",
+          "deprecated_aliases": []
+        },
+        {
           "canonical": "tool_event",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "progress",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_result",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "verification_state",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "recovery_prompt_injected",
           "deprecated_aliases": []
         },
         {
@@ -595,7 +631,16 @@
     "prepared_attempt_schema": {
       "callback_kinds": [
         "partial_reply",
+        "model_turn_started",
+        "model_token",
+        "tool_proposed",
+        "approval_requested",
+        "tool_started",
         "tool_event",
+        "progress",
+        "tool_result",
+        "verification_state",
+        "recovery_prompt_injected",
         "lifecycle_event",
         "final_outcome"
       ],
@@ -670,7 +715,7 @@
         }
       ]
     },
-    "snapshot_version": "runtime-contracts.agent_harness.v2",
+    "snapshot_version": "runtime-contracts.agent_harness.v3",
     "support_outcomes": {
       "changelog_note": "Harness support outcomes are audited before an attempt is routed.",
       "name": "AgentHarnessSupportOutcome",
@@ -2769,7 +2814,7 @@
     }
   ],
   "schema_version": 1,
-  "snapshot_version": "runtime-contracts.v5",
+  "snapshot_version": "runtime-contracts.v6",
   "tool_result_projection": {
     "changelog_note": "Tool result projection wire names pin visibility, policy, decision, sensitivity, and retention output.",
     "enums": [

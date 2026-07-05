@@ -13,8 +13,8 @@ use palyra_daemon::application::{
     },
     agent_harness_lifecycle::run_selected_harness_attempt,
     agent_harness_tool_bridge::{
-        evaluate_harness_tool_call, HarnessToolBridgePolicy, HarnessToolCallRequest,
-        HarnessToolReplayMetadata,
+        evaluate_harness_tool_call, project_harness_visible_tool_result, HarnessToolBridgePolicy,
+        HarnessToolCallRequest, HarnessToolReplayMetadata,
     },
 };
 use serde_json::{json, Value};
@@ -195,6 +195,43 @@ fn conformance_routes_tool_and_callback_through_host_boundaries() {
     assert!(decision.execution_gate_required);
     assert!(!serialized.contains("secret-token"));
     assert_eq!(callbacks.records().len(), 1);
+}
+
+#[test]
+fn conformance_returns_safe_projection_for_approval_denial() {
+    let mut policy = HarnessToolBridgePolicy::new(["palyra.fs.apply_patch"], "catalog-1");
+    policy.deny_approval_for("call-1");
+
+    let decision = evaluate_harness_tool_call(
+        &HarnessToolCallRequest {
+            harness_id: "embedded_palyra".to_owned(),
+            run_id: "run-1".to_owned(),
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "palyra.fs.apply_patch".to_owned(),
+            raw_args: json!({"patch":"*** Begin Patch"}),
+            catalog_snapshot_id: "catalog-1".to_owned(),
+            replay_metadata: HarnessToolReplayMetadata {
+                replay_safe: false,
+                tool_surface_hash: "sha256:tools".to_owned(),
+            },
+            mutating: true,
+        },
+        &policy,
+    )
+    .expect("approval denial should evaluate");
+    let projected = project_harness_visible_tool_result(
+        &json!({"status":"completed","summary":"api_key=secret-token should be hidden"}),
+        false,
+        128,
+    );
+
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason_code, "harness_tool.approval_denied");
+    assert_eq!(
+        decision.harness_visible_result.as_ref().map(|result| result.status.as_str()),
+        Some("denied")
+    );
+    assert!(!projected.summary.contains("secret-token"));
 }
 
 #[test]
