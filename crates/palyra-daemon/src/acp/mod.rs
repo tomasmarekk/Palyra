@@ -2148,6 +2148,10 @@ fn conflict_kinds_for_conversation(
     kinds.into_iter().collect()
 }
 
+mod permission_relay;
+mod replay_translator;
+mod runtime_registry;
+mod session_actor_queue;
 #[cfg(test)]
 mod tests;
 mod validation;
