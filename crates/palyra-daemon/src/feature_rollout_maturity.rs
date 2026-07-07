@@ -67,6 +67,8 @@ const SECURITY_ACCEPTANCE: &[&str] = &[
     "security audit output remains redacted",
     "high-risk pattern scan covers new public posture fields",
 ];
+const ROLLOUT_PROMOTION_GATE: &str =
+    "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update";
 
 const NO_DEPRECATED_ALIASES: &[&str] = &[];
 const NO_STABLE_DEPENDENCIES: &[FeatureRolloutFlag] = &[];
@@ -348,6 +350,27 @@ impl FeatureRolloutMaturity {
             _ => Err(FeatureRolloutMaturityParseError { value: raw.trim().to_owned() }),
         }
     }
+
+    const fn default_enable_allowed(self) -> bool {
+        matches!(self, Self::Stable)
+    }
+
+    const fn transition_criteria(self) -> &'static str {
+        match self {
+            Self::Scaffold => {
+                "keep default-off; add diagnostics, fixtures, owner, rollback, and required tests before preview"
+            }
+            Self::PreviewOnly => {
+                "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests"
+            }
+            Self::GatedProduction => {
+                "keep explicit gate; require green release hardening evidence before stable promotion"
+            }
+            Self::Stable => "eligible for default-on only after release hardening and inventory drift review",
+            Self::Deprecated => "keep disabled by default and document replacement or removal path",
+            Self::Blocked => "cannot be enabled by default until listed blockers are cleared",
+        }
+    }
 }
 
 impl serde::Serialize for FeatureRolloutMaturity {
@@ -418,12 +441,34 @@ impl FeatureRolloutDescriptor {
             "source": setting.source,
             "config_path": self.flag.config_path(),
             "env_var": self.flag.env_var(),
+            "default_posture": rollout_default_posture(setting),
+            "rollback_knob": {
+                "env_var": self.flag.env_var(),
+                "config_path": self.flag.config_path(),
+                "safe_default": "disabled",
+                "operator_action": format!(
+                    "unset {} and remove or set {} = false",
+                    self.flag.env_var(),
+                    self.flag.config_path()
+                ),
+            },
             "maturity": self.maturity,
             "owner_component": self.owner_component,
             "required_tests": self.required_tests,
             "public_api_exposure": self.public_api_exposure,
             "activation_blockers": activation_blockers,
             "acceptance_criteria": self.acceptance_criteria,
+            "promotion_gate": {
+                "default_enable_allowed": self.maturity.default_enable_allowed(),
+                "default_enable_blockers": self.default_enable_blockers(),
+                "transition_criteria": self.maturity.transition_criteria(),
+                "test_coverage_marker": if self.required_tests.is_empty() || self.acceptance_criteria.is_empty() {
+                    "missing_required_test_or_acceptance_criteria"
+                } else {
+                    "required_tests_and_acceptance_criteria_present"
+                },
+                "release_gate": ROLLOUT_PROMOTION_GATE,
+            },
             "deprecated_aliases": self.deprecated_aliases,
             "migration_note": self.migration_note,
             "inactive_reason": if setting.enabled {
@@ -436,6 +481,31 @@ impl FeatureRolloutDescriptor {
                 ))
             },
         })
+    }
+
+    fn default_enable_blockers(self) -> Vec<&'static str> {
+        let mut blockers = Vec::new();
+        if !self.maturity.default_enable_allowed() {
+            blockers.push("maturity state does not allow default-on production rollout");
+        }
+        if self.required_tests.is_empty() {
+            blockers.push("required_tests must be populated before promotion");
+        }
+        if self.acceptance_criteria.is_empty() {
+            blockers.push("acceptance_criteria must be populated before promotion");
+        }
+        blockers
+    }
+}
+
+const fn rollout_default_posture(setting: FeatureRolloutSetting) -> &'static str {
+    match (setting.source, setting.enabled) {
+        (FeatureRolloutSource::Default, false) => "default_off",
+        (FeatureRolloutSource::Default, true) => "default_on",
+        (FeatureRolloutSource::Config, false) => "disabled_by_config",
+        (FeatureRolloutSource::Config, true) => "enabled_by_config",
+        (FeatureRolloutSource::Env, false) => "disabled_by_env",
+        (FeatureRolloutSource::Env, true) => "enabled_by_env",
     }
 }
 
@@ -958,12 +1028,19 @@ fn validate_feature_rollout_maturity_descriptors(
                 flag: descriptor.flag.as_str(),
             });
         }
+        if descriptor.maturity == FeatureRolloutMaturity::Stable
+            && descriptor.acceptance_criteria.is_empty()
+        {
+            return Err(FeatureRolloutMaturityValidationError::StableWithoutAcceptance {
+                flag: descriptor.flag.as_str(),
+            });
+        }
+        if descriptor.acceptance_criteria.is_empty() {
+            return Err(FeatureRolloutMaturityValidationError::MissingAcceptanceCriteria {
+                flag: descriptor.flag.as_str(),
+            });
+        }
         if descriptor.maturity == FeatureRolloutMaturity::Stable {
-            if descriptor.acceptance_criteria.is_empty() {
-                return Err(FeatureRolloutMaturityValidationError::StableWithoutAcceptance {
-                    flag: descriptor.flag.as_str(),
-                });
-            }
             for dependency in descriptor.stable_dependencies {
                 let dependency_path = dependency.config_path();
                 let blocker_mentions_dependency = descriptor
@@ -990,6 +1067,7 @@ pub(crate) enum FeatureRolloutMaturityValidationError {
     DuplicateFlag(&'static str),
     MissingRequiredTests { flag: &'static str },
     MissingActivationBlockers { flag: &'static str },
+    MissingAcceptanceCriteria { flag: &'static str },
     StableWithoutAcceptance { flag: &'static str },
     StableDependencyWithoutBlocker { flag: &'static str, dependency: &'static str },
 }
@@ -1006,6 +1084,9 @@ impl fmt::Display for FeatureRolloutMaturityValidationError {
             }
             Self::MissingActivationBlockers { flag } => {
                 write!(f, "feature rollout {flag} must define activation blockers")
+            }
+            Self::MissingAcceptanceCriteria { flag } => {
+                write!(f, "feature rollout {flag} must define acceptance criteria")
             }
             Self::StableWithoutAcceptance { flag } => {
                 write!(f, "feature rollout {flag} cannot be stable without acceptance criteria")
@@ -1065,11 +1146,13 @@ pub(crate) fn build_feature_rollout_maturity_summary(config: &FeatureRolloutsCon
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_feature_rollout_maturity_descriptors, FeatureRolloutDescriptor,
-        FeatureRolloutFlag, FeatureRolloutMaturity, FeatureRolloutMaturityValidationError,
-        DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS, NO_DEPRECATED_ALIASES,
-        NO_STABLE_DEPENDENCIES,
+        build_feature_rollout_diagnostics, validate_feature_rollout_maturity_descriptors,
+        FeatureRolloutDescriptor, FeatureRolloutFlag, FeatureRolloutMaturity,
+        FeatureRolloutMaturityValidationError, DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS,
+        NO_DEPRECATED_ALIASES, NO_STABLE_DEPENDENCIES,
     };
+    use crate::config::FeatureRolloutsConfig;
+    use serde_json::Value;
 
     #[test]
     fn maturity_parser_accepts_canonical_states_and_alias_separators() {
@@ -1126,6 +1209,58 @@ mod tests {
         assert_eq!(
             error,
             FeatureRolloutMaturityValidationError::StableWithoutAcceptance { flag: "tool_repair" }
+        );
+    }
+
+    #[test]
+    fn preview_rollout_without_acceptance_criteria_is_rejected() {
+        let descriptors = [FeatureRolloutDescriptor {
+            flag: FeatureRolloutFlag::ContextEngine,
+            owner_component: "application/context_engine",
+            maturity: FeatureRolloutMaturity::PreviewOnly,
+            required_tests: &["cargo test -p palyra-daemon --locked"],
+            public_api_exposure: "operator diagnostics",
+            activation_blockers: &["redacted context traces must be present"],
+            acceptance_criteria: &[],
+            deprecated_aliases: NO_DEPRECATED_ALIASES,
+            migration_note: "test descriptor",
+            stable_dependencies: NO_STABLE_DEPENDENCIES,
+        }];
+
+        let error = validate_feature_rollout_maturity_descriptors(&descriptors)
+            .expect_err("preview rollout without acceptance criteria must fail");
+
+        assert_eq!(
+            error,
+            FeatureRolloutMaturityValidationError::MissingAcceptanceCriteria {
+                flag: "context_engine"
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostics_expose_default_posture_and_promotion_gate() {
+        let diagnostics = build_feature_rollout_diagnostics(&FeatureRolloutsConfig::default());
+        let context_engine =
+            diagnostics.get("context_engine").expect("context engine rollout should be present");
+
+        assert_eq!(
+            context_engine.get("default_posture").and_then(Value::as_str),
+            Some("default_off")
+        );
+        assert_eq!(
+            context_engine.pointer("/rollback_knob/safe_default").and_then(Value::as_str),
+            Some("disabled")
+        );
+        assert_eq!(
+            context_engine
+                .pointer("/promotion_gate/default_enable_allowed")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            context_engine.pointer("/promotion_gate/test_coverage_marker").and_then(Value::as_str),
+            Some("required_tests_and_acceptance_criteria_present")
         );
     }
 

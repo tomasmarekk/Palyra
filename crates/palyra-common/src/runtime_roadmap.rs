@@ -519,6 +519,31 @@ runtime_roadmap_enum! {
     }
 }
 
+runtime_roadmap_enum! {
+    /// Host-facing integration interfaces that must not own critical runtime authority.
+    pub enum RuntimeHostAuthorityInterface {
+        Harness => "harness",
+        Hooks => "hooks",
+        Mcp => "mcp",
+        CodexAdapter => "codex_adapter",
+        Terminal => "terminal",
+        RemoteWorker => "remote_worker",
+        AdvisorFanout => "advisor_fanout"
+    }
+}
+
+runtime_roadmap_enum! {
+    /// Backend runtime fixture areas used by synthetic replay and smoke tests.
+    pub enum BackendRuntimeFixtureArea {
+        RunLoop => "run_loop",
+        ProviderStream => "provider_stream",
+        ToolCall => "tool_call",
+        FilePatch => "file_patch",
+        Lsp => "lsp",
+        Compaction => "compaction"
+    }
+}
+
 /// Stable diagnostics/audit descriptor for one runtime boundary event family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -716,6 +741,329 @@ fn sanitize_runtime_boundary_string(raw: &str, key_context: Option<&str>) -> Str
     } else {
         redacted
     }
+}
+
+const HOST_OWNED_RUNTIME_AUTHORITIES: &[&str] =
+    &["credentials", "approvals", "transcript", "sandbox", "journal", "tool_execution"];
+
+/// Checklist entry for one interface that delegates runtime work to the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeHostAuthorityChecklistEntry {
+    pub schema_version: u32,
+    pub interface: RuntimeHostAuthorityInterface,
+    pub integration_boundary: String,
+    pub denied_authorities: Vec<String>,
+    pub host_owned_authorities: Vec<String>,
+    pub audit_event_samples: Vec<String>,
+}
+
+impl RuntimeHostAuthorityChecklistEntry {
+    /// Validates that the interface does not claim host-owned runtime authority.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeSecurityInvariantError`] when a critical authority is
+    /// not explicitly denied and retained by the host, or when an audit event
+    /// sample uses an invalid dotted event name.
+    pub fn validate(&self) -> Result<(), RuntimeSecurityInvariantError> {
+        if self.schema_version != RUNTIME_ROADMAP_SCHEMA_VERSION {
+            return Err(RuntimeSecurityInvariantError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            });
+        }
+        for authority in HOST_OWNED_RUNTIME_AUTHORITIES {
+            if !self.denied_authorities.iter().any(|value| value == authority)
+                || !self.host_owned_authorities.iter().any(|value| value == authority)
+            {
+                return Err(RuntimeSecurityInvariantError::HostAuthorityGranted {
+                    interface: self.interface.as_str().to_owned(),
+                    authority: (*authority).to_owned(),
+                });
+            }
+        }
+        for event_name in &self.audit_event_samples {
+            validate_event_name(event_name).map_err(|_| {
+                RuntimeSecurityInvariantError::InvalidAuditEventName {
+                    interface: self.interface.as_str().to_owned(),
+                    event_name: event_name.clone(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns the host-owned authority checklist for external runtime interfaces.
+#[must_use]
+pub fn runtime_host_authority_checklist() -> Vec<RuntimeHostAuthorityChecklistEntry> {
+    [
+        (
+            RuntimeHostAuthorityInterface::Harness,
+            "harness callbacks report decisions; host owns run state, transcript, gate, and journal writes",
+            &["harness.selection.decision", "harness.lifecycle.completed"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::Hooks,
+            "hooks observe or request bounded changes; host owns policy, approvals, and side effects",
+            &["hook.lifecycle.observed", "hook.policy.denied"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::Mcp,
+            "MCP tool servers expose descriptors; host owns credential binding, approval, sandbox, and tape",
+            &["mcp.tool.requested", "mcp.tool.denied"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::CodexAdapter,
+            "Codex adapter bridges protocol messages; host owns transcript persistence and execution gates",
+            &["codex.adapter.requested", "codex.adapter.rejected"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::Terminal,
+            "terminal sessions expose bounded process handles; host owns cwd/env validation, sandbox, and cleanup",
+            &["terminal.session.lifecycle", "terminal.command.denied"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::RemoteWorker,
+            "remote workers execute leased work only; host owns policy, attestation, credentials, and journal commits",
+            &["worker.lease.issued", "worker.execution.denied"][..],
+        ),
+        (
+            RuntimeHostAuthorityInterface::AdvisorFanout,
+            "advisors return non-authoritative reviews; host owns approvals, final transcript, and mutation execution",
+            &["advisor.fanout.requested", "advisor.finding.recorded"][..],
+        ),
+    ]
+    .into_iter()
+    .map(|(interface, integration_boundary, audit_event_samples)| {
+        RuntimeHostAuthorityChecklistEntry {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            interface,
+            integration_boundary: integration_boundary.to_owned(),
+            denied_authorities: HOST_OWNED_RUNTIME_AUTHORITIES
+                .iter()
+                .map(|authority| (*authority).to_owned())
+                .collect(),
+            host_owned_authorities: HOST_OWNED_RUNTIME_AUTHORITIES
+                .iter()
+                .map(|authority| (*authority).to_owned())
+                .collect(),
+            audit_event_samples: audit_event_samples
+                .iter()
+                .map(|event_name| (*event_name).to_owned())
+                .collect(),
+        }
+    })
+    .collect()
+}
+
+/// Asserts that every host-authority interface preserves the critical host fences.
+///
+/// # Errors
+/// Returns [`RuntimeSecurityInvariantError`] when any checklist entry is invalid.
+pub fn assert_host_authority_checklist_denies_direct_runtime_authority(
+    entries: &[RuntimeHostAuthorityChecklistEntry],
+) -> Result<(), RuntimeSecurityInvariantError> {
+    for entry in entries {
+        entry.validate()?;
+    }
+    Ok(())
+}
+
+/// Metadata for one backend runtime smoke fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendRuntimeFixture {
+    pub schema_version: u32,
+    pub fixture_id: String,
+    pub area: BackendRuntimeFixtureArea,
+    pub source_path: String,
+    pub risk_classification: String,
+    pub expected_runtime_path: String,
+    pub expected_terminal_state: String,
+    pub expected_journal_events: Vec<String>,
+    pub redaction_boundary: RuntimeRoadmapRedactionBoundary,
+    pub evidence_refs: Vec<String>,
+}
+
+impl BackendRuntimeFixture {
+    /// Validates a backend runtime fixture taxonomy entry.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeRoadmapHarnessValidationError`] when schema, slug,
+    /// repo path, event name, runtime path, or evidence metadata is invalid.
+    pub fn validate(&self) -> Result<(), RuntimeRoadmapHarnessValidationError> {
+        if self.schema_version != RUNTIME_ROADMAP_SCHEMA_VERSION {
+            return Err(RuntimeRoadmapHarnessValidationError::UnsupportedSchemaVersion {
+                actual: self.schema_version,
+                expected: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            });
+        }
+        validate_slug("backend runtime fixture id", self.fixture_id.as_str())?;
+        validate_repo_relative_path(
+            "backend runtime fixture source path",
+            self.source_path.as_str(),
+        )?;
+        if self.expected_runtime_path.trim().is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingRequiredSymbol {
+                target_id: self.fixture_id.clone(),
+            });
+        }
+        if self.expected_journal_events.is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingTrajectoryExpectedEvent {
+                fixture_id: self.fixture_id.clone(),
+            });
+        }
+        for event_name in &self.expected_journal_events {
+            validate_event_name(event_name)?;
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(RuntimeRoadmapHarnessValidationError::MissingEvidenceRef {
+                fixture_id: self.fixture_id.clone(),
+            });
+        }
+        for evidence_ref in &self.evidence_refs {
+            validate_repo_relative_path("backend runtime fixture evidence ref", evidence_ref)?;
+        }
+        Ok(())
+    }
+}
+
+struct BackendRuntimeFixtureInput<'a> {
+    fixture_id: &'a str,
+    area: BackendRuntimeFixtureArea,
+    source_path: &'a str,
+    risk_classification: &'a str,
+    expected_runtime_path: &'a str,
+    expected_terminal_state: &'a str,
+    expected_journal_events: &'a [&'a str],
+    evidence_refs: &'a [&'a str],
+}
+
+fn backend_runtime_fixture(input: BackendRuntimeFixtureInput<'_>) -> BackendRuntimeFixture {
+    BackendRuntimeFixture {
+        schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+        fixture_id: input.fixture_id.to_owned(),
+        area: input.area,
+        source_path: input.source_path.to_owned(),
+        risk_classification: input.risk_classification.to_owned(),
+        expected_runtime_path: input.expected_runtime_path.to_owned(),
+        expected_terminal_state: input.expected_terminal_state.to_owned(),
+        expected_journal_events: input
+            .expected_journal_events
+            .iter()
+            .map(|event_name| (*event_name).to_owned())
+            .collect(),
+        redaction_boundary: RuntimeRoadmapRedactionBoundary::MetadataOnly,
+        evidence_refs: input.evidence_refs.iter().map(|path| (*path).to_owned()).collect(),
+    }
+}
+
+/// Returns the canonical backend runtime fixture taxonomy.
+#[must_use]
+pub fn backend_runtime_fixture_taxonomy() -> Vec<BackendRuntimeFixture> {
+    vec![
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "run_loop_terminal_summary",
+            area: BackendRuntimeFixtureArea::RunLoop,
+            source_path: "fixtures/golden/runtime_roadmap_phase1_trajectories.json",
+            risk_classification: "p0_host_owned_runtime",
+            expected_runtime_path: "run_runtime_path_summary",
+            expected_terminal_state: "done",
+            expected_journal_events: &["run.runtime_path_summary", "harness.selection.decision"],
+            evidence_refs: &["fixtures/golden/runtime_roadmap_phase1_trajectories.json"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "provider_stream_malformed_chunk",
+            area: BackendRuntimeFixtureArea::ProviderStream,
+            source_path: "qa/scenarios/provider/malformed_sse_chunk.yaml",
+            risk_classification: "p0_provider_recovery",
+            expected_runtime_path: "provider_stream_normalizer",
+            expected_terminal_state: "failed",
+            expected_journal_events: &["provider.stream.normalized", "turn.recovery.retry_planned"],
+            evidence_refs: &["fixtures/provider_compat/p0_provider_compat_pack.yaml"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "tool_call_approval_followthrough",
+            area: BackendRuntimeFixtureArea::ToolCall,
+            source_path: "qa/scenarios/approval_turn_tool_followthrough.yaml",
+            risk_classification: "p0_mutating_tool_gate",
+            expected_runtime_path: "tool_gate",
+            expected_terminal_state: "done",
+            expected_journal_events: &["tool.gate.decision", "tool.call.completed"],
+            evidence_refs: &["qa/scenarios/tool_result_redaction.yaml"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "file_patch_premature_final",
+            area: BackendRuntimeFixtureArea::FilePatch,
+            source_path: "qa/scenarios/provider/premature_final_after_patch.yaml",
+            risk_classification: "p0_file_mutation_recovery",
+            expected_runtime_path: "file_patch_verification",
+            expected_terminal_state: "failed",
+            expected_journal_events: &["file.patch.intent", "verification.evidence.recorded"],
+            evidence_refs: &["qa/scenarios/process_background_verification.yaml"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "lsp_rust_workspace_scope",
+            area: BackendRuntimeFixtureArea::Lsp,
+            source_path: "fixtures/code-intel/rust/src/lib.rs",
+            risk_classification: "p1_workspace_scoped_code_intel",
+            expected_runtime_path: "lsp_service",
+            expected_terminal_state: "done",
+            expected_journal_events: &["lsp.lifecycle.changed", "lsp.diagnostics.delta"],
+            evidence_refs: &["fixtures/code-intel/rust/src/lib.rs"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "compaction_retry_mutating_tool",
+            area: BackendRuntimeFixtureArea::Compaction,
+            source_path: "qa/scenarios/compaction_retry_mutating_tool.yaml",
+            risk_classification: "p0_replay_safe_compaction",
+            expected_runtime_path: "compaction_safeguard",
+            expected_terminal_state: "done",
+            expected_journal_events: &["compaction.safeguard.recorded", "tool.gate.decision"],
+            evidence_refs: &["qa/scenarios/compaction_retry_mutating_tool.yaml"],
+        }),
+    ]
+}
+
+/// Projection for the backend runtime fixture taxonomy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendRuntimeFixtureTaxonomyProjection {
+    pub schema_version: u32,
+    pub fixtures_total: usize,
+    pub areas: Vec<BackendRuntimeFixtureArea>,
+    pub expected_runtime_paths: Vec<String>,
+    pub expected_journal_events: Vec<String>,
+}
+
+/// Projects backend runtime fixtures into a compact taxonomy summary.
+///
+/// # Errors
+/// Returns [`RuntimeRoadmapHarnessValidationError`] when any fixture is invalid.
+pub fn project_backend_runtime_fixture_taxonomy(
+    fixtures: &[BackendRuntimeFixture],
+) -> Result<BackendRuntimeFixtureTaxonomyProjection, RuntimeRoadmapHarnessValidationError> {
+    let mut areas = BTreeSet::new();
+    let mut expected_runtime_paths = BTreeSet::new();
+    let mut expected_journal_events = BTreeSet::new();
+
+    for fixture in fixtures {
+        fixture.validate()?;
+        areas.insert(fixture.area);
+        expected_runtime_paths.insert(fixture.expected_runtime_path.clone());
+        for event_name in &fixture.expected_journal_events {
+            expected_journal_events.insert(event_name.clone());
+        }
+    }
+
+    Ok(BackendRuntimeFixtureTaxonomyProjection {
+        schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+        fixtures_total: fixtures.len(),
+        areas: areas.into_iter().collect(),
+        expected_runtime_paths: expected_runtime_paths.into_iter().collect(),
+        expected_journal_events: expected_journal_events.into_iter().collect(),
+    })
 }
 
 runtime_roadmap_enum! {
@@ -996,12 +1344,20 @@ pub struct RuntimeMutationApprovalFixture {
 /// Validation failure for security invariant helper fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeSecurityInvariantError {
+    #[error(
+        "runtime security invariant schema version {actual} is not supported; expected {expected}"
+    )]
+    UnsupportedSchemaVersion { actual: u32, expected: u32 },
     #[error("raw secret leaked into {surface}")]
     RawSecretLeaked { surface: String },
     #[error("{tool_name} must require the execution gate")]
     ToolGateMissing { tool_name: String },
     #[error("direct journal write authority must stay denied: {authority}")]
     DirectJournalWriteAuthority { authority: String },
+    #[error("{interface} must not own host authority {authority}")]
+    HostAuthorityGranted { interface: String, authority: String },
+    #[error("{interface} audit event name must be dotted lowercase ASCII: {event_name}")]
+    InvalidAuditEventName { interface: String, event_name: String },
     #[error("{tool_name} approval denial must be terminal for mutation")]
     ApprovalDenialNotTerminal { tool_name: String },
     #[error("{field} must be non-empty")]
@@ -1585,17 +1941,24 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        assert_approval_denial_is_terminal_for_mutation, assert_no_direct_journal_write_authority,
-        assert_no_raw_secret_in_tape, assert_tool_requires_gate, project_runtime_roadmap_harness,
-        runtime_boundary_event_taxonomy, runtime_roadmap_capability_catalog,
-        runtime_roadmap_phase0_harness_fixtures, runtime_roadmap_phase0_harness_projection,
-        runtime_roadmap_phase1_trajectory_fixtures, runtime_roadmap_phase1_trajectory_projection,
-        sanitize_runtime_boundary_metadata, RuntimeBoundaryFamily, RuntimeGoldenTrajectoryFixture,
-        RuntimeHarnessAuthorityFixture, RuntimeMutationApprovalFixture, RuntimeRoadmapCapability,
-        RuntimeRoadmapDecision, RuntimeRoadmapEventType, RuntimeRoadmapHarnessFixture,
+        assert_approval_denial_is_terminal_for_mutation,
+        assert_host_authority_checklist_denies_direct_runtime_authority,
+        assert_no_direct_journal_write_authority, assert_no_raw_secret_in_tape,
+        assert_tool_requires_gate, backend_runtime_fixture_taxonomy,
+        project_backend_runtime_fixture_taxonomy, project_runtime_roadmap_harness,
+        runtime_boundary_event_taxonomy, runtime_host_authority_checklist,
+        runtime_roadmap_capability_catalog, runtime_roadmap_phase0_harness_fixtures,
+        runtime_roadmap_phase0_harness_projection, runtime_roadmap_phase1_trajectory_fixtures,
+        runtime_roadmap_phase1_trajectory_projection, sanitize_runtime_boundary_metadata,
+        BackendRuntimeFixture, BackendRuntimeFixtureArea, RuntimeBoundaryFamily,
+        RuntimeGoldenTrajectoryFixture, RuntimeHarnessAuthorityFixture,
+        RuntimeHostAuthorityChecklistEntry, RuntimeHostAuthorityInterface,
+        RuntimeMutationApprovalFixture, RuntimeRoadmapCapability, RuntimeRoadmapDecision,
+        RuntimeRoadmapEventType, RuntimeRoadmapHarnessFixture,
         RuntimeRoadmapHarnessValidationError, RuntimeRoadmapJournalEvent, RuntimeRoadmapReasonCode,
-        RuntimeRoadmapRedactionBoundary, RuntimeRoadmapValidationError, RuntimeToolGateFixture,
-        ALL_RUNTIME_ROADMAP_CAPABILITIES, RUNTIME_ROADMAP_SCHEMA_VERSION,
+        RuntimeRoadmapRedactionBoundary, RuntimeRoadmapValidationError,
+        RuntimeSecurityInvariantError, RuntimeToolGateFixture, ALL_RUNTIME_ROADMAP_CAPABILITIES,
+        HOST_OWNED_RUNTIME_AUTHORITIES, RUNTIME_ROADMAP_SCHEMA_VERSION,
     };
     use crate::feature_rollouts::{
         AGENT_HARNESS_RUNTIME_ROLLOUT_CONFIG_PATH, AGENT_HARNESS_RUNTIME_ROLLOUT_ENV,
@@ -1609,6 +1972,10 @@ mod tests {
     const PHASE1_TRAJECTORY_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../fixtures/golden/runtime_roadmap_phase1_trajectories.json"
+    );
+    const BACKEND_RUNTIME_FIXTURE_TAXONOMY: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/golden/backend_runtime_fixture_taxonomy.json"
     );
 
     #[test]
@@ -1802,6 +2169,78 @@ mod tests {
         assert!(!rendered.contains("raw-secret"));
         assert!(!rendered.contains("token=abc"));
         assert!(!rendered.contains("vault://global/openai_api_key"));
+    }
+
+    #[test]
+    fn host_authority_checklist_denies_direct_runtime_authority() {
+        let checklist = runtime_host_authority_checklist();
+
+        assert_eq!(checklist.len(), 7);
+        assert_host_authority_checklist_denies_direct_runtime_authority(checklist.as_slice())
+            .expect("built-in authority checklist should preserve host fences");
+        let harness = checklist
+            .iter()
+            .find(|entry| entry.interface == RuntimeHostAuthorityInterface::Harness)
+            .expect("harness checklist entry should exist");
+        assert!(harness.denied_authorities.iter().any(|authority| authority == "journal"));
+        assert!(harness.denied_authorities.iter().any(|authority| authority == "tool_execution"));
+
+        let mut leaked = RuntimeHostAuthorityChecklistEntry {
+            schema_version: RUNTIME_ROADMAP_SCHEMA_VERSION,
+            interface: RuntimeHostAuthorityInterface::Terminal,
+            integration_boundary: "test".to_owned(),
+            denied_authorities: vec!["credentials".to_owned()],
+            host_owned_authorities: vec!["credentials".to_owned()],
+            audit_event_samples: vec!["terminal.session.lifecycle".to_owned()],
+        };
+        let error = leaked.validate().expect_err("missing host-owned authority fences should fail");
+        assert_eq!(
+            error,
+            RuntimeSecurityInvariantError::HostAuthorityGranted {
+                interface: "terminal".to_owned(),
+                authority: "approvals".to_owned(),
+            }
+        );
+
+        leaked.denied_authorities = HOST_OWNED_RUNTIME_AUTHORITIES
+            .iter()
+            .map(|authority| (*authority).to_owned())
+            .collect();
+        leaked.host_owned_authorities = leaked.denied_authorities.clone();
+        leaked.audit_event_samples = vec!["Terminal Session".to_owned()];
+        assert!(matches!(
+            leaked.validate(),
+            Err(RuntimeSecurityInvariantError::InvalidAuditEventName { .. })
+        ));
+    }
+
+    #[test]
+    fn backend_runtime_fixture_taxonomy_matches_golden() {
+        let fixture_bytes = std::fs::read(BACKEND_RUNTIME_FIXTURE_TAXONOMY)
+            .expect("backend runtime fixture taxonomy should exist");
+        let from_disk: Vec<BackendRuntimeFixture> =
+            serde_json::from_slice(fixture_bytes.as_slice())
+                .expect("backend runtime fixture taxonomy should deserialize");
+        let generated = backend_runtime_fixture_taxonomy();
+
+        assert_eq!(from_disk, generated);
+        let projection = project_backend_runtime_fixture_taxonomy(from_disk.as_slice())
+            .expect("backend runtime fixture taxonomy should project");
+        assert_eq!(projection.fixtures_total, 6);
+        assert_eq!(
+            projection.areas,
+            vec![
+                BackendRuntimeFixtureArea::RunLoop,
+                BackendRuntimeFixtureArea::ProviderStream,
+                BackendRuntimeFixtureArea::ToolCall,
+                BackendRuntimeFixtureArea::FilePatch,
+                BackendRuntimeFixtureArea::Lsp,
+                BackendRuntimeFixtureArea::Compaction,
+            ]
+        );
+        assert!(projection
+            .expected_journal_events
+            .contains(&"run.runtime_path_summary".to_owned()));
     }
 
     #[test]

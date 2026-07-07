@@ -1,0 +1,104 @@
+[
+  {
+    "schema_version": 1,
+    "fixture_id": "run_loop_terminal_summary",
+    "area": "run_loop",
+    "source_path": "fixtures/golden/runtime_roadmap_phase1_trajectories.json",
+    "risk_classification": "p0_host_owned_runtime",
+    "expected_runtime_path": "run_runtime_path_summary",
+    "expected_terminal_state": "done",
+    "expected_journal_events": [
+      "run.runtime_path_summary",
+      "harness.selection.decision"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "fixtures/golden/runtime_roadmap_phase1_trajectories.json"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "provider_stream_malformed_chunk",
+    "area": "provider_stream",
+    "source_path": "qa/scenarios/provider/malformed_sse_chunk.yaml",
+    "risk_classification": "p0_provider_recovery",
+    "expected_runtime_path": "provider_stream_normalizer",
+    "expected_terminal_state": "failed",
+    "expected_journal_events": [
+      "provider.stream.normalized",
+      "turn.recovery.retry_planned"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "fixtures/provider_compat/p0_provider_compat_pack.yaml"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "tool_call_approval_followthrough",
+    "area": "tool_call",
+    "source_path": "qa/scenarios/approval_turn_tool_followthrough.yaml",
+    "risk_classification": "p0_mutating_tool_gate",
+    "expected_runtime_path": "tool_gate",
+    "expected_terminal_state": "done",
+    "expected_journal_events": [
+      "tool.gate.decision",
+      "tool.call.completed"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "qa/scenarios/tool_result_redaction.yaml"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "file_patch_premature_final",
+    "area": "file_patch",
+    "source_path": "qa/scenarios/provider/premature_final_after_patch.yaml",
+    "risk_classification": "p0_file_mutation_recovery",
+    "expected_runtime_path": "file_patch_verification",
+    "expected_terminal_state": "failed",
+    "expected_journal_events": [
+      "file.patch.intent",
+      "verification.evidence.recorded"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "qa/scenarios/process_background_verification.yaml"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "lsp_rust_workspace_scope",
+    "area": "lsp",
+    "source_path": "fixtures/code-intel/rust/src/lib.rs",
+    "risk_classification": "p1_workspace_scoped_code_intel",
+    "expected_runtime_path": "lsp_service",
+    "expected_terminal_state": "done",
+    "expected_journal_events": [
+      "lsp.lifecycle.changed",
+      "lsp.diagnostics.delta"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "fixtures/code-intel/rust/src/lib.rs"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "compaction_retry_mutating_tool",
+    "area": "compaction",
+    "source_path": "qa/scenarios/compaction_retry_mutating_tool.yaml",
+    "risk_classification": "p0_replay_safe_compaction",
+    "expected_runtime_path": "compaction_safeguard",
+    "expected_terminal_state": "done",
+    "expected_journal_events": [
+      "compaction.safeguard.recorded",
+      "tool.gate.decision"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "qa/scenarios/compaction_retry_mutating_tool.yaml"
+    ]
+  }
+]

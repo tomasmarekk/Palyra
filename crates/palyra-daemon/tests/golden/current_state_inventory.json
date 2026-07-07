@@ -41,6 +41,7 @@
     "rate_limits",
     "replay_continuity",
     "routine_capability_profile",
+    "run_runtime_path",
     "runtime_controls",
     "runtime_diagnostics",
     "runtime_health",
@@ -731,6 +732,13 @@
       "source": "default",
       "config_path": "feature_rollouts.dynamic_tool_builder",
       "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER",
+        "config_path": "feature_rollouts.dynamic_tool_builder",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_DYNAMIC_TOOL_BUILDER and remove or set feature_rollouts.dynamic_tool_builder = false"
+      },
       "maturity": "scaffold",
       "owner_component": "skills/tool runtime",
       "required_tests": [
@@ -747,6 +755,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; add diagnostics, fixtures, owner, rollback, and required tests before preview",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "dynamic_tool_builder is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -756,6 +773,13 @@
       "source": "default",
       "config_path": "feature_rollouts.context_engine",
       "env_var": "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_CONTEXT_ENGINE",
+        "config_path": "feature_rollouts.context_engine",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_CONTEXT_ENGINE and remove or set feature_rollouts.context_engine = false"
+      },
       "maturity": "preview_only",
       "owner_component": "application/context_engine",
       "required_tests": [
@@ -772,6 +796,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "context_engine is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
@@ -784,6 +817,13 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_remote_node",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE",
+        "config_path": "feature_rollouts.execution_backend_remote_node",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_REMOTE_NODE and remove or set feature_rollouts.execution_backend_remote_node = false"
+      },
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
@@ -803,6 +843,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_backend_remote_node is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -812,6 +861,13 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_networked_worker",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER",
+        "config_path": "feature_rollouts.execution_backend_networked_worker",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_NETWORKED_WORKER and remove or set feature_rollouts.execution_backend_networked_worker = false"
+      },
       "maturity": "blocked",
       "owner_component": "workerd/execution backends",
       "required_tests": [
@@ -831,6 +887,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_backend_networked_worker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -840,6 +905,13 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_docker",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER",
+        "config_path": "feature_rollouts.execution_backend_docker",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_DOCKER and remove or set feature_rollouts.execution_backend_docker = false"
+      },
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
@@ -859,6 +931,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_backend_docker is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -868,6 +949,13 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL",
+        "config_path": "feature_rollouts.execution_backend_ssh_tunnel",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_BACKEND_SSH_TUNNEL and remove or set feature_rollouts.execution_backend_ssh_tunnel = false"
+      },
       "maturity": "blocked",
       "owner_component": "execution backends",
       "required_tests": [
@@ -887,6 +975,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_backend_ssh_tunnel is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -896,6 +993,13 @@
       "source": "default",
       "config_path": "feature_rollouts.safety_boundary",
       "env_var": "PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY",
+        "config_path": "feature_rollouts.safety_boundary",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_SAFETY_BOUNDARY and remove or set feature_rollouts.safety_boundary = false"
+      },
       "maturity": "preview_only",
       "owner_component": "safety",
       "required_tests": [
@@ -911,6 +1015,15 @@
         "security audit output remains redacted",
         "high-risk pattern scan covers new public posture fields"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "safety_boundary is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -920,6 +1033,13 @@
       "source": "default",
       "config_path": "feature_rollouts.execution_gate_pipeline_v2",
       "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2",
+        "config_path": "feature_rollouts.execution_gate_pipeline_v2",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_EXECUTION_GATE_PIPELINE_V2 and remove or set feature_rollouts.execution_gate_pipeline_v2 = false"
+      },
       "maturity": "preview_only",
       "owner_component": "execution gate",
       "required_tests": [
@@ -936,6 +1056,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "execution_gate_pipeline_v2 is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -945,6 +1074,13 @@
       "source": "default",
       "config_path": "feature_rollouts.agent_harness_runtime",
       "env_var": "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME",
+        "config_path": "feature_rollouts.agent_harness_runtime",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_AGENT_HARNESS_RUNTIME and remove or set feature_rollouts.agent_harness_runtime = false"
+      },
       "maturity": "preview_only",
       "owner_component": "application/agent_harness",
       "required_tests": [
@@ -961,6 +1097,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "agent_harness_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -970,6 +1115,13 @@
       "source": "default",
       "config_path": "feature_rollouts.inline_runtime_hooks",
       "env_var": "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS",
+        "config_path": "feature_rollouts.inline_runtime_hooks",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_INLINE_RUNTIME_HOOKS and remove or set feature_rollouts.inline_runtime_hooks = false"
+      },
       "maturity": "preview_only",
       "owner_component": "hooks/runtime loop",
       "required_tests": [
@@ -986,6 +1138,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "inline_runtime_hooks is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -995,6 +1156,13 @@
       "source": "default",
       "config_path": "feature_rollouts.tool_result_middleware",
       "env_var": "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE",
+        "config_path": "feature_rollouts.tool_result_middleware",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_TOOL_RESULT_MIDDLEWARE and remove or set feature_rollouts.tool_result_middleware = false"
+      },
       "maturity": "preview_only",
       "owner_component": "tool runtime",
       "required_tests": [
@@ -1011,6 +1179,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "tool_result_middleware is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1020,6 +1197,13 @@
       "source": "default",
       "config_path": "feature_rollouts.session_queue_policy",
       "env_var": "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY",
+        "config_path": "feature_rollouts.session_queue_policy",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_SESSION_QUEUE_POLICY and remove or set feature_rollouts.session_queue_policy = false"
+      },
       "maturity": "preview_only",
       "owner_component": "session lifecycle",
       "required_tests": [
@@ -1036,6 +1220,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "session_queue_policy is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1045,6 +1238,13 @@
       "source": "default",
       "config_path": "feature_rollouts.pruning_policy_matrix",
       "env_var": "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX",
+        "config_path": "feature_rollouts.pruning_policy_matrix",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_PRUNING_POLICY_MATRIX and remove or set feature_rollouts.pruning_policy_matrix = false"
+      },
       "maturity": "preview_only",
       "owner_component": "memory/context pruning",
       "required_tests": [
@@ -1061,6 +1261,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "pruning_policy_matrix is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1070,6 +1279,13 @@
       "source": "default",
       "config_path": "feature_rollouts.retrieval_dual_path",
       "env_var": "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH",
+        "config_path": "feature_rollouts.retrieval_dual_path",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_RETRIEVAL_DUAL_PATH and remove or set feature_rollouts.retrieval_dual_path = false"
+      },
       "maturity": "preview_only",
       "owner_component": "memory/retrieval",
       "required_tests": [
@@ -1086,6 +1302,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "retrieval_dual_path is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1095,6 +1320,13 @@
       "source": "default",
       "config_path": "feature_rollouts.auxiliary_executor",
       "env_var": "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR",
+        "config_path": "feature_rollouts.auxiliary_executor",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_AUXILIARY_EXECUTOR and remove or set feature_rollouts.auxiliary_executor = false"
+      },
       "maturity": "preview_only",
       "owner_component": "agent delegation",
       "required_tests": [
@@ -1111,6 +1343,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "auxiliary_executor is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1120,6 +1361,13 @@
       "source": "default",
       "config_path": "feature_rollouts.flow_orchestration",
       "env_var": "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION",
+        "config_path": "feature_rollouts.flow_orchestration",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_FLOW_ORCHESTRATION and remove or set feature_rollouts.flow_orchestration = false"
+      },
       "maturity": "preview_only",
       "owner_component": "flow orchestration",
       "required_tests": [
@@ -1136,6 +1384,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "flow_orchestration is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1145,6 +1402,13 @@
       "source": "default",
       "config_path": "feature_rollouts.delivery_arbitration",
       "env_var": "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION",
+        "config_path": "feature_rollouts.delivery_arbitration",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_DELIVERY_ARBITRATION and remove or set feature_rollouts.delivery_arbitration = false"
+      },
       "maturity": "preview_only",
       "owner_component": "channel delivery",
       "required_tests": [
@@ -1161,6 +1425,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "delivery_arbitration is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1170,6 +1443,13 @@
       "source": "default",
       "config_path": "feature_rollouts.replay_capture",
       "env_var": "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_REPLAY_CAPTURE",
+        "config_path": "feature_rollouts.replay_capture",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_REPLAY_CAPTURE and remove or set feature_rollouts.replay_capture = false"
+      },
       "maturity": "preview_only",
       "owner_component": "replay",
       "required_tests": [
@@ -1186,6 +1466,15 @@
         "enabled mode requires the matching rollout flag",
         "golden inventory records the effective state"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "replay_capture is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1195,6 +1484,13 @@
       "source": "default",
       "config_path": "feature_rollouts.networked_workers",
       "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_NETWORKED_WORKERS",
+        "config_path": "feature_rollouts.networked_workers",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_NETWORKED_WORKERS and remove or set feature_rollouts.networked_workers = false"
+      },
       "maturity": "blocked",
       "owner_component": "workerd/execution backends",
       "required_tests": [
@@ -1214,6 +1510,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "cannot be enabled by default until listed blockers are cleared",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "networked_workers is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1223,6 +1528,13 @@
       "source": "default",
       "config_path": "feature_rollouts.tool_repair",
       "env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_TOOL_REPAIR",
+        "config_path": "feature_rollouts.tool_repair",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_TOOL_REPAIR and remove or set feature_rollouts.tool_repair = false"
+      },
       "maturity": "gated_production",
       "owner_component": "run stream/tool repair",
       "required_tests": [
@@ -1239,6 +1551,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep explicit gate; require green release hardening evidence before stable promotion",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "tool_repair is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1248,6 +1569,13 @@
       "source": "default",
       "config_path": "feature_rollouts.provider_stream_normalizer",
       "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER",
+        "config_path": "feature_rollouts.provider_stream_normalizer",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_PROVIDER_STREAM_NORMALIZER and remove or set feature_rollouts.provider_stream_normalizer = false"
+      },
       "maturity": "preview_only",
       "owner_component": "model provider streaming",
       "required_tests": [
@@ -1265,6 +1593,15 @@
         "unrecoverable provider streams emit one terminal failed event on public SSE APIs",
         "diagnostics expose the rollout maturity and activation blockers"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "provider_stream_normalizer is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1274,6 +1611,13 @@
       "source": "default",
       "config_path": "feature_rollouts.provider_recovery",
       "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY",
+        "config_path": "feature_rollouts.provider_recovery",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_PROVIDER_RECOVERY and remove or set feature_rollouts.provider_recovery = false"
+      },
       "maturity": "preview_only",
       "owner_component": "model provider recovery",
       "required_tests": [
@@ -1291,6 +1635,15 @@
         "auth failover and malformed-output recovery stay bounded by provider policy",
         "raw provider payloads are redacted before diagnostics and support bundle export"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "provider_recovery is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1300,6 +1653,13 @@
       "source": "default",
       "config_path": "feature_rollouts.terminal_sessions",
       "env_var": "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS",
+        "config_path": "feature_rollouts.terminal_sessions",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_TERMINAL_SESSIONS and remove or set feature_rollouts.terminal_sessions = false"
+      },
       "maturity": "preview_only",
       "owner_component": "process runtime",
       "required_tests": [
@@ -1319,6 +1679,15 @@
         "backend advertises degraded outcome when disabled",
         "policy, attestation, and cleanup evidence are covered before production enablement"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "terminal_sessions is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1328,6 +1697,13 @@
       "source": "default",
       "config_path": "feature_rollouts.browser_rescue",
       "env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESCUE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_BROWSER_RESCUE",
+        "config_path": "feature_rollouts.browser_rescue",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_BROWSER_RESCUE and remove or set feature_rollouts.browser_rescue = false"
+      },
       "maturity": "preview_only",
       "owner_component": "browserd/browser rescue",
       "required_tests": [
@@ -1344,6 +1720,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "browser_rescue is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1353,6 +1738,13 @@
       "source": "default",
       "config_path": "feature_rollouts.lsp_service",
       "env_var": "PALYRA_EXPERIMENTAL_LSP_SERVICE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_LSP_SERVICE",
+        "config_path": "feature_rollouts.lsp_service",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_LSP_SERVICE and remove or set feature_rollouts.lsp_service = false"
+      },
       "maturity": "preview_only",
       "owner_component": "code intelligence",
       "required_tests": [
@@ -1369,6 +1761,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "lsp_service is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1378,6 +1779,13 @@
       "source": "default",
       "config_path": "feature_rollouts.advisor_fanout",
       "env_var": "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_ADVISOR_FANOUT",
+        "config_path": "feature_rollouts.advisor_fanout",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_ADVISOR_FANOUT and remove or set feature_rollouts.advisor_fanout = false"
+      },
       "maturity": "preview_only",
       "owner_component": "advisors",
       "required_tests": [
@@ -1394,6 +1802,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "advisor_fanout is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1403,6 +1820,13 @@
       "source": "default",
       "config_path": "feature_rollouts.acp_runtime",
       "env_var": "PALYRA_EXPERIMENTAL_ACP_RUNTIME",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_ACP_RUNTIME",
+        "config_path": "feature_rollouts.acp_runtime",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_ACP_RUNTIME and remove or set feature_rollouts.acp_runtime = false"
+      },
       "maturity": "preview_only",
       "owner_component": "acp runtime",
       "required_tests": [
@@ -1419,6 +1843,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "acp_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1428,6 +1861,13 @@
       "source": "default",
       "config_path": "feature_rollouts.channel_turn_kernel",
       "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL",
+        "config_path": "feature_rollouts.channel_turn_kernel",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_CHANNEL_TURN_KERNEL and remove or set feature_rollouts.channel_turn_kernel = false"
+      },
       "maturity": "gated_production",
       "owner_component": "channel router",
       "required_tests": [
@@ -1444,6 +1884,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep explicit gate; require green release hardening evidence before stable promotion",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "channel_turn_kernel is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
@@ -1456,6 +1905,13 @@
       "source": "default",
       "config_path": "feature_rollouts.agent_plan_state",
       "env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE",
+        "config_path": "feature_rollouts.agent_plan_state",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_AGENT_PLAN_STATE and remove or set feature_rollouts.agent_plan_state = false"
+      },
       "maturity": "preview_only",
       "owner_component": "agent plan state",
       "required_tests": [
@@ -1472,6 +1928,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "agent_plan_state is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1481,6 +1946,13 @@
       "source": "default",
       "config_path": "feature_rollouts.objective_judge",
       "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE",
+        "config_path": "feature_rollouts.objective_judge",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_OBJECTIVE_JUDGE and remove or set feature_rollouts.objective_judge = false"
+      },
       "maturity": "preview_only",
       "owner_component": "objective judge",
       "required_tests": [
@@ -1497,6 +1969,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "objective_judge is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass",
@@ -1526,6 +2007,13 @@
       "source": "default",
       "config_path": "feature_rollouts.verification_runtime",
       "env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME",
+        "config_path": "feature_rollouts.verification_runtime",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_VERIFICATION_RUNTIME and remove or set feature_rollouts.verification_runtime = false"
+      },
       "maturity": "gated_production",
       "owner_component": "verification runtime",
       "required_tests": [
@@ -1542,6 +2030,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep explicit gate; require green release hardening evidence before stable promotion",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "verification_runtime is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1551,6 +2048,13 @@
       "source": "default",
       "config_path": "feature_rollouts.progress_drafts",
       "env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS",
+        "config_path": "feature_rollouts.progress_drafts",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_PROGRESS_DRAFTS and remove or set feature_rollouts.progress_drafts = false"
+      },
       "maturity": "preview_only",
       "owner_component": "progress drafts",
       "required_tests": [
@@ -1567,6 +2071,15 @@
         "rollout appears in palyra doctor --json when admin diagnostics are reachable",
         "current_state_inventory golden records maturity changes"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "progress_drafts is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1576,6 +2089,13 @@
       "source": "default",
       "config_path": "feature_rollouts.compaction_safeguard",
       "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD",
+        "config_path": "feature_rollouts.compaction_safeguard",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_COMPACTION_SAFEGUARD and remove or set feature_rollouts.compaction_safeguard = false"
+      },
       "maturity": "gated_production",
       "owner_component": "session compaction",
       "required_tests": [
@@ -1591,6 +2111,15 @@
         "compaction path records replay-safe evidence",
         "provider-backed work degrades to local evidence when rollout is disabled"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep explicit gate; require green release hardening evidence before stable promotion",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "compaction_safeguard is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1600,6 +2129,13 @@
       "source": "default",
       "config_path": "feature_rollouts.provider_backed_evidence_compaction",
       "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION",
+        "config_path": "feature_rollouts.provider_backed_evidence_compaction",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_PROVIDER_BACKED_EVIDENCE_COMPACTION and remove or set feature_rollouts.provider_backed_evidence_compaction = false"
+      },
       "maturity": "preview_only",
       "owner_component": "session compaction",
       "required_tests": [
@@ -1615,6 +2151,15 @@
         "compaction path records replay-safe evidence",
         "provider-backed work degrades to local evidence when rollout is disabled"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "provider_backed_evidence_compaction is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -1624,6 +2169,13 @@
       "source": "default",
       "config_path": "feature_rollouts.attack_surface_audit",
       "env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT",
+      "default_posture": "default_off",
+      "rollback_knob": {
+        "env_var": "PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT",
+        "config_path": "feature_rollouts.attack_surface_audit",
+        "safe_default": "disabled",
+        "operator_action": "unset PALYRA_EXPERIMENTAL_ATTACK_SURFACE_AUDIT and remove or set feature_rollouts.attack_surface_audit = false"
+      },
       "maturity": "preview_only",
       "owner_component": "security audit",
       "required_tests": [
@@ -1639,6 +2191,15 @@
         "security audit output remains redacted",
         "high-risk pattern scan covers new public posture fields"
       ],
+      "promotion_gate": {
+        "default_enable_allowed": false,
+        "default_enable_blockers": [
+          "maturity state does not allow default-on production rollout"
+        ],
+        "transition_criteria": "keep default-off; require explicit rollout flag, owner acceptance, and targeted acceptance tests",
+        "test_coverage_marker": "required_tests_and_acceptance_criteria_present",
+        "release_gate": "default-on promotion requires owner acceptance, required tests, rollback metadata, and inventory golden update"
+      },
       "deprecated_aliases": [],
       "migration_note": "canonical flag only; no deprecated aliases are accepted for this rollout",
       "inactive_reason": "attack_surface_audit is disabled from \"default\"; activation remains blocked until the listed tests and owner acceptance pass"
@@ -9270,6 +9831,326 @@
         ]
       }
     ],
+    "host_authority": {
+      "valid": true,
+      "checklist": [
+        {
+          "schema_version": 1,
+          "interface": "harness",
+          "integration_boundary": "harness callbacks report decisions; host owns run state, transcript, gate, and journal writes",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "harness.selection.decision",
+            "harness.lifecycle.completed"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "hooks",
+          "integration_boundary": "hooks observe or request bounded changes; host owns policy, approvals, and side effects",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "hook.lifecycle.observed",
+            "hook.policy.denied"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "mcp",
+          "integration_boundary": "MCP tool servers expose descriptors; host owns credential binding, approval, sandbox, and tape",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "mcp.tool.requested",
+            "mcp.tool.denied"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "codex_adapter",
+          "integration_boundary": "Codex adapter bridges protocol messages; host owns transcript persistence and execution gates",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "codex.adapter.requested",
+            "codex.adapter.rejected"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "terminal",
+          "integration_boundary": "terminal sessions expose bounded process handles; host owns cwd/env validation, sandbox, and cleanup",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "terminal.session.lifecycle",
+            "terminal.command.denied"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "remote_worker",
+          "integration_boundary": "remote workers execute leased work only; host owns policy, attestation, credentials, and journal commits",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "worker.lease.issued",
+            "worker.execution.denied"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "interface": "advisor_fanout",
+          "integration_boundary": "advisors return non-authoritative reviews; host owns approvals, final transcript, and mutation execution",
+          "denied_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "host_owned_authorities": [
+            "credentials",
+            "approvals",
+            "transcript",
+            "sandbox",
+            "journal",
+            "tool_execution"
+          ],
+          "audit_event_samples": [
+            "advisor.fanout.requested",
+            "advisor.finding.recorded"
+          ]
+        }
+      ]
+    },
+    "backend_runtime_fixtures": {
+      "valid": true,
+      "projection": {
+        "schema_version": 1,
+        "fixtures_total": 6,
+        "areas": [
+          "run_loop",
+          "provider_stream",
+          "tool_call",
+          "file_patch",
+          "lsp",
+          "compaction"
+        ],
+        "expected_runtime_paths": [
+          "compaction_safeguard",
+          "file_patch_verification",
+          "lsp_service",
+          "provider_stream_normalizer",
+          "run_runtime_path_summary",
+          "tool_gate"
+        ],
+        "expected_journal_events": [
+          "compaction.safeguard.recorded",
+          "file.patch.intent",
+          "harness.selection.decision",
+          "lsp.diagnostics.delta",
+          "lsp.lifecycle.changed",
+          "provider.stream.normalized",
+          "run.runtime_path_summary",
+          "tool.call.completed",
+          "tool.gate.decision",
+          "turn.recovery.retry_planned",
+          "verification.evidence.recorded"
+        ]
+      },
+      "fixtures": [
+        {
+          "schema_version": 1,
+          "fixture_id": "run_loop_terminal_summary",
+          "area": "run_loop",
+          "source_path": "fixtures/golden/runtime_roadmap_phase1_trajectories.json",
+          "risk_classification": "p0_host_owned_runtime",
+          "expected_runtime_path": "run_runtime_path_summary",
+          "expected_terminal_state": "done",
+          "expected_journal_events": [
+            "run.runtime_path_summary",
+            "harness.selection.decision"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "fixtures/golden/runtime_roadmap_phase1_trajectories.json"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "fixture_id": "provider_stream_malformed_chunk",
+          "area": "provider_stream",
+          "source_path": "qa/scenarios/provider/malformed_sse_chunk.yaml",
+          "risk_classification": "p0_provider_recovery",
+          "expected_runtime_path": "provider_stream_normalizer",
+          "expected_terminal_state": "failed",
+          "expected_journal_events": [
+            "provider.stream.normalized",
+            "turn.recovery.retry_planned"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "fixtures/provider_compat/p0_provider_compat_pack.yaml"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "fixture_id": "tool_call_approval_followthrough",
+          "area": "tool_call",
+          "source_path": "qa/scenarios/approval_turn_tool_followthrough.yaml",
+          "risk_classification": "p0_mutating_tool_gate",
+          "expected_runtime_path": "tool_gate",
+          "expected_terminal_state": "done",
+          "expected_journal_events": [
+            "tool.gate.decision",
+            "tool.call.completed"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "qa/scenarios/tool_result_redaction.yaml"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "fixture_id": "file_patch_premature_final",
+          "area": "file_patch",
+          "source_path": "qa/scenarios/provider/premature_final_after_patch.yaml",
+          "risk_classification": "p0_file_mutation_recovery",
+          "expected_runtime_path": "file_patch_verification",
+          "expected_terminal_state": "failed",
+          "expected_journal_events": [
+            "file.patch.intent",
+            "verification.evidence.recorded"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "qa/scenarios/process_background_verification.yaml"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "fixture_id": "lsp_rust_workspace_scope",
+          "area": "lsp",
+          "source_path": "fixtures/code-intel/rust/src/lib.rs",
+          "risk_classification": "p1_workspace_scoped_code_intel",
+          "expected_runtime_path": "lsp_service",
+          "expected_terminal_state": "done",
+          "expected_journal_events": [
+            "lsp.lifecycle.changed",
+            "lsp.diagnostics.delta"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "fixtures/code-intel/rust/src/lib.rs"
+          ]
+        },
+        {
+          "schema_version": 1,
+          "fixture_id": "compaction_retry_mutating_tool",
+          "area": "compaction",
+          "source_path": "qa/scenarios/compaction_retry_mutating_tool.yaml",
+          "risk_classification": "p0_replay_safe_compaction",
+          "expected_runtime_path": "compaction_safeguard",
+          "expected_terminal_state": "done",
+          "expected_journal_events": [
+            "compaction.safeguard.recorded",
+            "tool.gate.decision"
+          ],
+          "redaction_boundary": "metadata_only",
+          "evidence_refs": [
+            "qa/scenarios/compaction_retry_mutating_tool.yaml"
+          ]
+        }
+      ]
+    },
     "phase0_harness": {
       "valid": true,
       "projection": {
@@ -9797,7 +10678,7 @@
       "cli_families": 60,
       "compat_routes": 16,
       "registered_compat_routes": 16,
-      "diagnostics_sections": 50,
+      "diagnostics_sections": 51,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
       "method_registry_methods": 507,
@@ -9810,15 +10691,18 @@
       "scaffold": 3
     },
     "feature_rollout_counts": {
-      "disabled": 35
+      "disabled": 35,
+      "enabled": 0
     },
     "feature_rollout_maturity": {
       "schema_version": 1,
       "maturity_counts": {
         "blocked": 5,
+        "deprecated": 0,
         "gated_production": 4,
         "preview_only": 25,
-        "scaffold": 1
+        "scaffold": 1,
+        "stable": 0
       },
       "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
     },
@@ -9835,7 +10719,9 @@
       }
     },
     "runtime_control_state_counts": {
+      "blocked": 0,
       "disabled": 2,
+      "enabled": 0,
       "preview_only": 6
     },
     "runtime_controls_summary": {

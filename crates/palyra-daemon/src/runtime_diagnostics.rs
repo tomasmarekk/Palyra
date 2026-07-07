@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+use palyra_common::feature_rollouts::{FeatureRolloutSetting, FeatureRolloutSource};
 use palyra_common::redaction::{
     is_sensitive_key, redact_diagnostic_text, redact_internal_runtime_paths,
 };
@@ -27,6 +28,7 @@ use crate::{
     tool_protocol::ToolRequestContext,
 };
 use crate::{
+    config::FeatureRolloutsConfig,
     gateway::GatewayStatusSnapshot,
     journal::{ToolJobRecord, ToolJobState},
     model_provider::ProviderRuntimeMetricsSnapshot,
@@ -56,6 +58,10 @@ pub(crate) const RUNTIME_TIMELINE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const METRICS_CATALOG_SCHEMA_VERSION: u32 = 1;
 /// Schema version for redacted local trace export records.
 pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
+/// Schema version for per-run runtime path summaries.
+pub(crate) const RUN_RUNTIME_PATH_SCHEMA_VERSION: u32 = 1;
+/// Journal/tape event name for terminal runtime path summaries.
+pub(crate) const RUN_RUNTIME_PATH_SUMMARY_EVENT: &str = "run.runtime_path_summary";
 /// Schema version for the test-only ABI contract snapshot suite.
 #[cfg(test)]
 pub(crate) const CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -81,6 +87,119 @@ const FORBIDDEN_METRIC_LABEL_KEYS: &[&str] =
     &["run_id", "session_id", "tool_call_id", "path", "principal", "raw_user", "prompt"];
 const BOUNDED_METRIC_LABEL_KEYS: &[&str] =
     &["component", "provider_kind", "state", "stat", "status", "token_type"];
+
+/// Run-time path posture for one subsystem in the agent loop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunRuntimePathSubsystem {
+    pub(crate) state: String,
+    pub(crate) reason_code: String,
+    pub(crate) rollout_flag: String,
+    pub(crate) rollout_source: String,
+    pub(crate) default_posture: String,
+}
+
+/// Redacted summary of which host-owned runtime paths a terminal run used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunRuntimePathSummary {
+    pub(crate) schema_version: u32,
+    pub(crate) event_name: String,
+    pub(crate) redaction_level: String,
+    pub(crate) journal_surface: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_reason: Option<String>,
+    pub(crate) preserved_for_terminal_states: Vec<String>,
+    pub(crate) preserved_for_failure_modes: Vec<String>,
+    pub(crate) subsystems: BTreeMap<String, RunRuntimePathSubsystem>,
+}
+
+/// Builds a redacted runtime-path summary from resolved daemon rollout config.
+#[must_use]
+pub(crate) fn build_run_runtime_path_summary(
+    config: &FeatureRolloutsConfig,
+    terminal_state: Option<&str>,
+    terminal_reason: Option<&str>,
+) -> RunRuntimePathSummary {
+    let subsystems = [
+        ("harness", "feature_rollouts.agent_harness_runtime", config.agent_harness_runtime),
+        ("context_engine", "feature_rollouts.context_engine", config.context_engine),
+        (
+            "tool_gate",
+            "feature_rollouts.execution_gate_pipeline_v2",
+            config.execution_gate_pipeline_v2,
+        ),
+        ("hooks", "feature_rollouts.inline_runtime_hooks", config.inline_runtime_hooks),
+        ("provider_recovery", "feature_rollouts.provider_recovery", config.provider_recovery),
+        ("compaction", "feature_rollouts.compaction_safeguard", config.compaction_safeguard),
+        ("lsp", "feature_rollouts.lsp_service", config.lsp_service),
+        ("verification", "feature_rollouts.verification_runtime", config.verification_runtime),
+        ("delivery", "feature_rollouts.delivery_arbitration", config.delivery_arbitration),
+    ]
+    .into_iter()
+    .map(|(name, rollout_flag, setting)| {
+        (name.to_owned(), runtime_path_subsystem(rollout_flag, setting))
+    })
+    .collect();
+
+    RunRuntimePathSummary {
+        schema_version: RUN_RUNTIME_PATH_SCHEMA_VERSION,
+        event_name: RUN_RUNTIME_PATH_SUMMARY_EVENT.to_owned(),
+        redaction_level: "metadata_only".to_owned(),
+        journal_surface: "orchestrator_tape_events".to_owned(),
+        terminal_state: terminal_state.map(ToOwned::to_owned),
+        terminal_reason: terminal_reason
+            .map(|reason| sanitize_diagnostics_string(reason, Some("terminal_reason"))),
+        preserved_for_terminal_states: vec![
+            "done".to_owned(),
+            "failed".to_owned(),
+            "cancelled".to_owned(),
+        ],
+        preserved_for_failure_modes: vec![
+            "cancel".to_owned(),
+            "timeout".to_owned(),
+            "policy_denial".to_owned(),
+            "provider_failure".to_owned(),
+            "pre_provider_failure".to_owned(),
+        ],
+        subsystems,
+    }
+}
+
+fn runtime_path_subsystem(
+    rollout_flag: &str,
+    setting: FeatureRolloutSetting,
+) -> RunRuntimePathSubsystem {
+    let state = if setting.enabled { "enabled" } else { "disabled" };
+    RunRuntimePathSubsystem {
+        state: state.to_owned(),
+        reason_code: format!("runtime_path.rollout.{state}"),
+        rollout_flag: rollout_flag.to_owned(),
+        rollout_source: feature_rollout_source_as_str(setting.source).to_owned(),
+        default_posture: rollout_default_posture(setting).to_owned(),
+    }
+}
+
+const fn feature_rollout_source_as_str(source: FeatureRolloutSource) -> &'static str {
+    match source {
+        FeatureRolloutSource::Default => "default",
+        FeatureRolloutSource::Config => "config",
+        FeatureRolloutSource::Env => "env",
+    }
+}
+
+const fn rollout_default_posture(setting: FeatureRolloutSetting) -> &'static str {
+    match (setting.source, setting.enabled) {
+        (FeatureRolloutSource::Default, false) => "default_off",
+        (FeatureRolloutSource::Default, true) => "default_on",
+        (FeatureRolloutSource::Config, false) => "disabled_by_config",
+        (FeatureRolloutSource::Config, true) => "enabled_by_config",
+        (FeatureRolloutSource::Env, false) => "disabled_by_env",
+        (FeatureRolloutSource::Env, true) => "enabled_by_env",
+    }
+}
 
 /// Coarse process lifecycle state surfaced by drain/restart diagnostics.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1979,10 +2098,38 @@ fn sanitize_diagnostics_string(raw: &str, key_context: Option<&str>) -> String {
     }
     let redacted = redact_diagnostic_text(raw);
     let redacted = redact_internal_runtime_paths(redacted.as_str());
+    let redacted = redact_absolute_path_tokens(redacted.as_str());
     if redacted.contains("vault://") || redacted.contains("vault:") {
         return "<vault_ref:redacted>".to_owned();
     }
     redacted
+}
+
+fn redact_absolute_path_tokens(raw: &str) -> String {
+    raw.split_inclusive(char::is_whitespace)
+        .map(|token| {
+            let content = token.trim_end_matches(char::is_whitespace);
+            let separator = &token[content.len()..];
+            if token_contains_absolute_path(content) {
+                format!("<redacted>{separator}")
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect()
+}
+
+fn token_contains_absolute_path(raw: &str) -> bool {
+    let trimmed = raw.trim_matches(|ch: char| {
+        !ch.is_ascii_alphanumeric() && !matches!(ch, ':' | '\\' | '/' | '_' | '-' | '.')
+    });
+    looks_like_absolute_path(trimmed)
+        || trimmed.as_bytes().windows(3).any(|window| {
+            window[0].is_ascii_alphabetic()
+                && window[1] == b':'
+                && matches!(window[2], b'\\' | b'/')
+        })
+        || trimmed.starts_with("\\\\")
 }
 
 fn sanitize_low_cardinality_value(raw: &str, label_name: &str) -> String {
@@ -2130,6 +2277,38 @@ mod tests {
             active_ref_count: 0,
             lease_expires_at_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn run_runtime_path_summary_exposes_redacted_rollout_posture() {
+        let config = FeatureRolloutsConfig {
+            provider_recovery: FeatureRolloutSetting::from_config(true),
+            ..FeatureRolloutsConfig::default()
+        };
+
+        let summary = build_run_runtime_path_summary(
+            &config,
+            Some("failed"),
+            Some("provider token=abc failed in C:\\Users\\Palo\\repo"),
+        );
+
+        assert_eq!(summary.schema_version, RUN_RUNTIME_PATH_SCHEMA_VERSION);
+        assert_eq!(summary.event_name, RUN_RUNTIME_PATH_SUMMARY_EVENT);
+        assert_eq!(summary.redaction_level, "metadata_only");
+        assert_eq!(summary.terminal_state.as_deref(), Some("failed"));
+        assert_eq!(summary.subsystems.len(), 9);
+        assert_eq!(
+            summary.subsystems.get("provider_recovery").map(|subsystem| subsystem.state.as_str()),
+            Some("enabled")
+        );
+        assert_eq!(
+            summary.subsystems.get("harness").map(|subsystem| subsystem.state.as_str()),
+            Some("disabled")
+        );
+        let rendered = serde_json::to_string(&summary).expect("summary should serialize");
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("token=abc"));
+        assert!(!rendered.contains("C:\\\\Users\\\\Palo"));
     }
 
     #[test]

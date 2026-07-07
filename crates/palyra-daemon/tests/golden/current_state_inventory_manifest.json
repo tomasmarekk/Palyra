@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "manifest_id": "runtime_audit_manifest.v1",
+  "baseline_schema_version": 1,
+  "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for roadmap drift review",
+  "goldens": {
+    "snapshot": "crates/palyra-daemon/tests/golden/current_state_inventory.json",
+    "human_report": "crates/palyra-daemon/tests/golden/current_state_inventory_report.md",
+    "manifest": "crates/palyra-daemon/tests/golden/current_state_inventory_manifest.json"
+  },
+  "generation_commands": [
+    "pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1",
+    "bash scripts/dev/generate-runtime-audit-baseline.sh"
+  ],
+  "drift_buckets": {
+    "feature_rollouts": {
+      "disabled": 35,
+      "enabled": 0
+    },
+    "feature_rollout_maturity": {
+      "blocked": 5,
+      "deprecated": 0,
+      "gated_production": 4,
+      "preview_only": 25,
+      "scaffold": 1,
+      "stable": 0
+    },
+    "runtime_controls": {
+      "blocked": 0,
+      "disabled": 2,
+      "enabled": 0,
+      "preview_only": 6
+    },
+    "roadmap_area_status": {
+      "preview": 3,
+      "production": 2,
+      "scaffold": 3
+    }
+  },
+  "source_of_truth": [
+    {
+      "surface": "capability_catalog",
+      "source_paths": [
+        "crates/palyra-daemon/src/transport/http/handlers/console/auth.rs",
+        "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+        "crates/palyra-control-plane/src/models.rs"
+      ],
+      "reason": "public capability ids, surfaces, mutation classes, and contract paths"
+    },
+    {
+      "surface": "runtime_diagnostics",
+      "source_paths": [
+        "crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs",
+        "crates/palyra-daemon/src/runtime_diagnostics.rs"
+      ],
+      "reason": "runtime sections, health, metrics, roadmap, observability, and feature rollout payloads"
+    },
+    {
+      "surface": "runtime_preview_controls",
+      "source_paths": [
+        "crates/palyra-daemon/src/runtime_preview_controls.rs",
+        "crates/palyra-common/src/runtime_preview.rs",
+        "crates/palyra-daemon/src/config/schema.rs"
+      ],
+      "reason": "preview capability modes, rollout gates, activation blockers, and shared wire names"
+    },
+    {
+      "surface": "feature_rollout_maturity",
+      "source_paths": [
+        "crates/palyra-daemon/src/feature_rollout_maturity.rs",
+        "crates/palyra-daemon/src/config/schema.rs",
+        "crates/palyra-daemon/tests/current_state_inventory.rs"
+      ],
+      "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
+    },
+    {
+      "surface": "method_registry",
+      "source_paths": [
+        "crates/palyra-daemon/src/method_registry.rs",
+        "crates/palyra-daemon/src/transport/http/router.rs",
+        "crates/palyra-daemon/src/access_control.rs"
+      ],
+      "reason": "public method descriptors, route scopes, schema hashes, streaming flags, and idempotency support"
+    },
+    {
+      "surface": "compat_routes",
+      "source_paths": [
+        "crates/palyra-daemon/src/transport/http/router.rs",
+        "crates/palyra-daemon/tests/current_state_inventory.rs"
+      ],
+      "reason": "registered OpenAI-compatible route surface probed by the live daemon harness"
+    },
+    {
+      "surface": "cli_families",
+      "source_paths": [
+        "crates/palyra-cli/tests/cli_parity_matrix.toml",
+        "crates/palyra-cli/tests/cli_parity_report.md"
+      ],
+      "reason": "top-level CLI families and parity status used by operator handoff surfaces"
+    },
+    {
+      "surface": "execution_backends",
+      "source_paths": [
+        "crates/palyra-daemon/src/execution_backends.rs",
+        "crates/palyra-daemon/src/application/tool_runtime"
+      ],
+      "reason": "local, desktop, Docker, networked worker, and SSH backend posture"
+    }
+  ],
+  "priority_areas": [
+    {
+      "priority": "P0",
+      "areas": [
+        "agent_harness",
+        "run_stream_and_tape",
+        "execution_gate",
+        "hook_runtime",
+        "provider_stream",
+        "tool_result_middleware"
+      ]
+    },
+    {
+      "priority": "P1",
+      "areas": [
+        "terminal_sessions",
+        "lsp_code_intelligence",
+        "browser_rescue",
+        "acp_runtime"
+      ]
+    },
+    {
+      "priority": "P2",
+      "areas": [
+        "learning_lifecycle"
+      ]
+    }
+  ],
+  "non_goal_metrics": [
+    {
+      "metric": "connector_count",
+      "reason": "connector inventory growth is outside this backend runtime maturity phase"
+    },
+    {
+      "metric": "skill_count",
+      "reason": "skill inventory growth is outside this backend runtime maturity phase"
+    },
+    {
+      "metric": "provider_count",
+      "reason": "provider inventory growth is outside this backend runtime maturity phase"
+    }
+  ],
+  "verification": {
+    "drift_check": "cargo test -p palyra-daemon --test current_state_inventory --locked",
+    "update_goldens": [
+      "pwsh -NoLogo -File scripts/dev/generate-runtime-audit-baseline.ps1",
+      "bash scripts/dev/generate-runtime-audit-baseline.sh"
+    ],
+    "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as phase success criteria"
+  }
+}

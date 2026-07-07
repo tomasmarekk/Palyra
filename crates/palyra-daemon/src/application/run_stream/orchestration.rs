@@ -2069,7 +2069,7 @@ pub(crate) async fn process_run_stream_message(
 ) -> Result<RunStreamMessageProcessingOutcome, Status> {
     if !runtime_state.config.feature_rollouts.agent_harness_runtime.enabled {
         let mut lifecycle = None;
-        return process_run_stream_message_inner(
+        let outcome = process_run_stream_message_inner(
             sender,
             stream,
             runtime_state,
@@ -2090,9 +2090,25 @@ pub(crate) async fn process_run_stream_message(
             message,
         )
         .await;
+        let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+            runtime_state,
+            active_run_id.as_deref(),
+            run_state.state(),
+            tape_seq,
+            &outcome,
+        )
+        .await;
+        let run_id_for_summary = active_run_id.as_deref().unwrap_or("unaccepted_run");
+        return merge_run_stream_audit_result(
+            outcome,
+            summary_result,
+            run_id_for_summary,
+            "runtime path summary",
+        );
     }
 
     let run_id_for_harness = canonical_id(message.run_id.clone(), "run_id")?;
+    let run_id_for_summary = run_id_for_harness.clone();
     let mut lifecycle = None;
     let outcome = process_run_stream_message_inner(
         sender,
@@ -2125,17 +2141,107 @@ pub(crate) async fn process_run_stream_message(
     )
     .await;
     match finish_result {
-        Ok(()) => outcome,
+        Ok(()) => {
+            let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+                runtime_state,
+                active_run_id.as_deref(),
+                run_state.state(),
+                tape_seq,
+                &outcome,
+            )
+            .await;
+            merge_run_stream_audit_result(
+                outcome,
+                summary_result,
+                run_id_for_summary.as_str(),
+                "runtime path summary",
+            )
+        }
         Err(error) if outcome.is_err() => {
             warn!(
                 run_id = run_id_for_harness,
                 error = %error,
                 "failed to append terminal harness lifecycle event after run-stream error"
             );
-            outcome
+            let summary_result = append_run_runtime_path_summary_tape_event_if_terminal(
+                runtime_state,
+                active_run_id.as_deref(),
+                run_state.state(),
+                tape_seq,
+                &outcome,
+            )
+            .await;
+            merge_run_stream_audit_result(
+                outcome,
+                summary_result,
+                run_id_for_summary.as_str(),
+                "runtime path summary",
+            )
         }
         Err(error) => Err(error),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn merge_run_stream_audit_result(
+    outcome: Result<RunStreamMessageProcessingOutcome, Status>,
+    audit_result: Result<(), Status>,
+    run_id: &str,
+    event_label: &str,
+) -> Result<RunStreamMessageProcessingOutcome, Status> {
+    match (outcome, audit_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(audit_error)) => {
+            warn!(
+                run_id = %run_id,
+                error = %audit_error,
+                "failed to append {event_label} after run-stream error"
+            );
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_run_runtime_path_summary_tape_event_if_terminal(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: Option<&str>,
+    terminal_state: RunLifecycleState,
+    tape_seq: &mut i64,
+    outcome: &Result<RunStreamMessageProcessingOutcome, Status>,
+) -> Result<(), Status> {
+    if !terminal_state.is_terminal() && outcome.is_ok() {
+        return Ok(());
+    }
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let terminal_reason = outcome
+        .as_ref()
+        .err()
+        .map(|error| format!("{:?}", error.code()))
+        .unwrap_or_else(|| "terminal_state".to_owned());
+    let summary = crate::runtime_diagnostics::build_run_runtime_path_summary(
+        &runtime_state.config.feature_rollouts,
+        Some(terminal_state.as_str()),
+        Some(terminal_reason.as_str()),
+    );
+    let payload_json = serde_json::to_string(&summary).map_err(|error| {
+        Status::internal(format!("failed to serialize run runtime path summary: {error}"))
+    })?;
+
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: crate::runtime_diagnostics::RUN_RUNTIME_PATH_SUMMARY_EVENT.to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = tape_seq.saturating_add(1);
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

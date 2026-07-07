@@ -18,9 +18,11 @@ use palyra_common::feature_rollouts::DYNAMIC_TOOL_BUILDER_ROLLOUT_ENV;
 use palyra_common::replay_bundle::replay_contract_snapshot;
 use palyra_common::runtime_contracts::{FlowState, FlowStepState};
 use palyra_common::runtime_roadmap::{
-    runtime_boundary_event_taxonomy, runtime_roadmap_capability_catalog,
-    runtime_roadmap_phase0_harness_projection, runtime_roadmap_phase1_trajectory_projection,
-    RUNTIME_ROADMAP_SCHEMA_VERSION,
+    assert_host_authority_checklist_denies_direct_runtime_authority,
+    backend_runtime_fixture_taxonomy, project_backend_runtime_fixture_taxonomy,
+    runtime_boundary_event_taxonomy, runtime_host_authority_checklist,
+    runtime_roadmap_capability_catalog, runtime_roadmap_phase0_harness_projection,
+    runtime_roadmap_phase1_trajectory_projection, RUNTIME_ROADMAP_SCHEMA_VERSION,
 };
 
 // Keeps CLI helper subprocesses (doctor, support-bundle export) from flashing
@@ -266,6 +268,11 @@ pub(crate) async fn console_diagnostics_handler(
     let trace_export = crate::runtime_diagnostics::build_trace_exporter_contract();
     let diagnostics_timeline =
         crate::runtime_diagnostics::build_diagnostics_timeline_contract(generated_at_unix_ms);
+    let run_runtime_path = crate::runtime_diagnostics::build_run_runtime_path_summary(
+        &state.runtime.config.feature_rollouts,
+        None,
+        Some("diagnostics_snapshot"),
+    );
     let active_tool_jobs = json!({
         "total": tool_jobs.len(),
         "active": tool_jobs.iter().filter(|job| job.state.is_active()).count(),
@@ -295,6 +302,7 @@ pub(crate) async fn console_diagnostics_handler(
             "metrics_catalog": metrics_catalog.clone(),
             "timeline": diagnostics_timeline.clone(),
             "trace_export": trace_export.clone(),
+            "run_runtime_path": run_runtime_path.clone(),
         }),
     );
 
@@ -310,9 +318,11 @@ pub(crate) async fn console_diagnostics_handler(
         "runtime_diagnostics": {
             "timeline": diagnostics_timeline,
             "trace_export": trace_export,
+            "run_runtime_path": run_runtime_path.clone(),
             "shutdown_forensics": shutdown_forensics,
             "support_runtime": support_runtime,
         },
+        "run_runtime_path": run_runtime_path,
         "connector_delivery": connector_delivery,
         "runtime_watchdog": runtime_watchdog,
         "budget_gates": budget_gates,
@@ -1203,11 +1213,41 @@ fn collect_console_runtime_roadmap_diagnostics() -> Value {
             "error": error.to_string(),
         }),
     };
+    let authority_checklist = runtime_host_authority_checklist();
+    let host_authority = match assert_host_authority_checklist_denies_direct_runtime_authority(
+        authority_checklist.as_slice(),
+    ) {
+        Ok(()) => json!({
+            "valid": true,
+            "checklist": authority_checklist,
+        }),
+        Err(error) => json!({
+            "valid": false,
+            "error": error.to_string(),
+            "checklist": authority_checklist,
+        }),
+    };
+    let backend_fixtures = backend_runtime_fixture_taxonomy();
+    let backend_runtime_fixtures =
+        match project_backend_runtime_fixture_taxonomy(backend_fixtures.as_slice()) {
+            Ok(projection) => json!({
+                "valid": true,
+                "projection": projection,
+                "fixtures": backend_fixtures,
+            }),
+            Err(error) => json!({
+                "valid": false,
+                "error": error.to_string(),
+                "fixtures": backend_fixtures,
+            }),
+        };
 
     json!({
         "schema_version": RUNTIME_ROADMAP_SCHEMA_VERSION,
         "capabilities": runtime_roadmap_capability_catalog(),
         "boundary_taxonomy": runtime_boundary_event_taxonomy(),
+        "host_authority": host_authority,
+        "backend_runtime_fixtures": backend_runtime_fixtures,
         "phase0_harness": phase0_harness,
         "phase1_trajectories": phase1_trajectories,
     })

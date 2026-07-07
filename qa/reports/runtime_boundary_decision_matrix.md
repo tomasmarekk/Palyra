@@ -46,3 +46,116 @@ this roadmap wave. They do not unblock the backend runtime boundaries below.
 - Maturity diagnostics: `crates/palyra-daemon/src/feature_rollout_maturity.rs`
 - Runtime roadmap contracts: `crates/palyra-common/src/runtime_roadmap.rs`
 - Operator diagnostics: `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`
+
+## Baseline drift contract
+
+- Machine-readable manifest: `crates/palyra-daemon/tests/golden/current_state_inventory_manifest.json`
+- Detailed JSON snapshot: `crates/palyra-daemon/tests/golden/current_state_inventory.json`
+- Human report: `crates/palyra-daemon/tests/golden/current_state_inventory_report.md`
+- Drift check: `cargo test -p palyra-daemon --test current_state_inventory --locked`
+- Script entrypoints: `scripts/test/check-runtime-audit-baseline.ps1` and `scripts/test/check-runtime-audit-baseline.sh`
+
+Bucket changes in rollout maturity, runtime controls, and roadmap-area status
+must be reviewed against source anchors. Connector count, skill count, and
+provider count are explicitly non-goal metrics for this roadmap wave.
+
+## Release promotion rules
+
+Feature rollout maturity diagnostics must expose, per flag:
+
+- owner component
+- required tests
+- acceptance criteria
+- default posture
+- rollback knob
+- activation blockers
+- promotion gate
+
+Preview, scaffold, blocked, deprecated, and gated-production flags remain
+default-off. A default-on promotion is only valid after the maturity entry has
+owner acceptance, required tests, rollback metadata, diagnostics coverage, and
+an updated inventory golden. Runtime preview controls must keep a two-key gate:
+the runtime mode and matching rollout flag both have to allow activation.
+
+Suggested changelog entry for a maturity transition:
+
+```markdown
+### Runtime maturity
+
+- `<flag>` moved from `<old_maturity>` to `<new_maturity>`.
+- Owner: `<component>`.
+- Required tests: `<commands>`.
+- Rollback: unset `<env_var>` and set `<config_path> = false`.
+- Baseline diff: `<current_state_inventory_manifest.json change>`.
+```
+
+## Run runtime path diagnostics
+
+Terminal runs emit the metadata-only `run.runtime_path_summary` tape event
+after an active run id exists. `/console/v1/diagnostics` also exposes the
+current rollout-derived runtime path posture under `run_runtime_path` and
+`runtime_diagnostics.run_runtime_path`.
+
+The summary covers the harness, context engine, tool gate, hooks, provider
+recovery, compaction, LSP, verification, and delivery paths. It preserves
+terminal-state evidence for done, failed, and cancelled runs while redacting
+terminal reasons and excluding prompts, tool arguments, credentials, provider
+payloads, and local paths.
+
+## Host authority checklist
+
+The canonical checklist lives in
+`crates/palyra-common/src/runtime_roadmap.rs` as
+`runtime_host_authority_checklist()`. It covers:
+
+| Interface | Authority it lacks |
+| --- | --- |
+| Harness | credentials, approvals, transcript, sandbox, journal, tool execution |
+| Hooks | credentials, approvals, transcript, sandbox, journal, tool execution |
+| MCP | credentials, approvals, transcript, sandbox, journal, tool execution |
+| Codex adapter | credentials, approvals, transcript, sandbox, journal, tool execution |
+| Terminal | credentials, approvals, transcript, sandbox, journal, tool execution |
+| Remote worker | credentials, approvals, transcript, sandbox, journal, tool execution |
+| Advisor fanout | credentials, approvals, transcript, sandbox, journal, tool execution |
+
+Static guard scripts:
+
+- `scripts/test/check-host-authority-boundaries.ps1`
+- `scripts/test/check-host-authority-boundaries.sh`
+
+These scripts reject direct authority bypass markers and run the focused
+authority checklist test.
+
+## Backend runtime fixture taxonomy
+
+The canonical taxonomy lives in
+`fixtures/golden/backend_runtime_fixture_taxonomy.json` and is generated from
+`backend_runtime_fixture_taxonomy()` in
+`crates/palyra-common/src/runtime_roadmap.rs`.
+
+| Area | Minimal fixture | Expected runtime path |
+| --- | --- | --- |
+| Run loop | `fixtures/golden/runtime_roadmap_phase1_trajectories.json` | `run_runtime_path_summary` |
+| Provider stream | `qa/scenarios/provider/malformed_sse_chunk.yaml` | `provider_stream_normalizer` |
+| Tool call | `qa/scenarios/approval_turn_tool_followthrough.yaml` | `tool_gate` |
+| File patch | `qa/scenarios/provider/premature_final_after_patch.yaml` | `file_patch_verification` |
+| LSP | `fixtures/code-intel/rust/src/lib.rs` | `lsp_service` |
+| Compaction | `qa/scenarios/compaction_retry_mutating_tool.yaml` | `compaction_safeguard` |
+
+Every fixture declares risk classification, expected terminal state, expected
+journal events, metadata-only redaction, and evidence references.
+
+## Codex roadmap working protocol
+
+The ignored local roadmap is validated by:
+
+- `scripts/dev/check-roadmap-protocol.ps1`
+- `scripts/dev/check-roadmap-protocol.sh`
+
+Protocol summary:
+
+1. Read `roadmap/new_roadmap/summary.md` and the detail milestone before editing.
+2. Respect milestone order unless a detail file states a dependency exception.
+3. Keep implementation notes tied to source, diagnostics, tests, and known risk.
+4. Mark a summary checkbox only after acceptance criteria and verification pass.
+5. If roadmap text conflicts with repository architecture, follow the codebase and document the reason.

@@ -69,11 +69,13 @@ fn current_state_inventory_snapshot_covers_capabilities_cli_and_compat_surface()
     );
 
     let report = render_runtime_audit_report(&snapshot)?;
+    let manifest = build_runtime_audit_manifest(&snapshot)?;
     assert!(
         report.contains("## Runtime Controls"),
         "runtime audit report should expose runtime-control state"
     );
     assert_text_golden("current_state_inventory_report.md", report.as_str())?;
+    assert_json_golden("current_state_inventory_manifest.json", &manifest)?;
     assert_json_golden("current_state_inventory.json", &snapshot)?;
     Ok(())
 }
@@ -262,6 +264,16 @@ enum RuntimeControlState {
     Blocked,
 }
 
+const RUNTIME_CONTROL_STATES: &[RuntimeControlState] = &[
+    RuntimeControlState::Enabled,
+    RuntimeControlState::PreviewOnly,
+    RuntimeControlState::Disabled,
+    RuntimeControlState::Blocked,
+];
+
+const FEATURE_ROLLOUT_MATURITY_STATES: &[&str] =
+    &["scaffold", "preview_only", "gated_production", "stable", "deprecated", "blocked"];
+
 impl RuntimeControlState {
     const fn as_str(self) -> &'static str {
         match self {
@@ -345,6 +357,75 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
             "enabled_capabilities": runtime_controls.get("enabled_capabilities").cloned().unwrap_or(Value::Null),
             "blocked_capabilities": runtime_controls.get("blocked_capabilities").cloned().unwrap_or(Value::Null),
             "disabled_capabilities": runtime_controls.get("disabled_capabilities").cloned().unwrap_or(Value::Null),
+        }
+    }))
+}
+
+fn build_runtime_audit_manifest(snapshot: &Value) -> Result<Value> {
+    let baseline = snapshot
+        .get("runtime_audit_baseline")
+        .context("runtime inventory should include runtime_audit_baseline")?;
+
+    Ok(json!({
+        "schema_version": 1,
+        "manifest_id": "runtime_audit_manifest.v1",
+        "baseline_schema_version": baseline.get("schema_version").cloned().unwrap_or(Value::Null),
+        "purpose": "pin current backend runtime maturity buckets and source-of-truth boundaries for roadmap drift review",
+        "goldens": {
+            "snapshot": baseline.get("golden_snapshot").cloned().unwrap_or(Value::Null),
+            "human_report": baseline.get("human_report").cloned().unwrap_or(Value::Null),
+            "manifest": "crates/palyra-daemon/tests/golden/current_state_inventory_manifest.json",
+        },
+        "generation_commands": baseline.get("generation_commands").cloned().unwrap_or(Value::Null),
+        "drift_buckets": {
+            "feature_rollouts": baseline.get("feature_rollout_counts").cloned().unwrap_or(Value::Null),
+            "feature_rollout_maturity": baseline
+                .pointer("/feature_rollout_maturity/maturity_counts")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "runtime_controls": baseline.get("runtime_control_state_counts").cloned().unwrap_or(Value::Null),
+            "roadmap_area_status": baseline.get("roadmap_area_status_counts").cloned().unwrap_or(Value::Null),
+        },
+        "source_of_truth": baseline.get("source_of_truth").cloned().unwrap_or(Value::Null),
+        "priority_areas": [
+            {
+                "priority": "P0",
+                "areas": [
+                    "agent_harness",
+                    "run_stream_and_tape",
+                    "execution_gate",
+                    "hook_runtime",
+                    "provider_stream",
+                    "tool_result_middleware"
+                ]
+            },
+            {
+                "priority": "P1",
+                "areas": ["terminal_sessions", "lsp_code_intelligence", "browser_rescue", "acp_runtime"]
+            },
+            {
+                "priority": "P2",
+                "areas": ["learning_lifecycle"]
+            }
+        ],
+        "non_goal_metrics": [
+            {
+                "metric": "connector_count",
+                "reason": "connector inventory growth is outside this backend runtime maturity phase"
+            },
+            {
+                "metric": "skill_count",
+                "reason": "skill inventory growth is outside this backend runtime maturity phase"
+            },
+            {
+                "metric": "provider_count",
+                "reason": "provider inventory growth is outside this backend runtime maturity phase"
+            }
+        ],
+        "verification": {
+            "drift_check": "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "update_goldens": baseline.get("generation_commands").cloned().unwrap_or(Value::Null),
+            "policy": "bucket changes must be reviewed with source-of-truth anchors and non-goal metrics must not be used as phase success criteria"
         }
     }))
 }
@@ -479,6 +560,8 @@ fn count_feature_rollouts(
     feature_rollouts: &serde_json::Map<String, Value>,
 ) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
+    counts.insert("disabled".to_owned(), 0);
+    counts.insert("enabled".to_owned(), 0);
     for (name, entry) in feature_rollouts {
         let enabled = entry
             .get("enabled")
@@ -494,6 +577,9 @@ fn count_feature_rollout_maturity(
     feature_rollouts: &serde_json::Map<String, Value>,
 ) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
+    for maturity in FEATURE_ROLLOUT_MATURITY_STATES {
+        counts.insert((*maturity).to_owned(), 0);
+    }
     for (name, entry) in feature_rollouts {
         let maturity = entry
             .get("maturity")
@@ -546,6 +632,9 @@ fn count_method_registry_surfaces(methods: &[Value]) -> Result<BTreeMap<String, 
 
 fn count_runtime_control_states(capabilities: &[Value]) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
+    for state in RUNTIME_CONTROL_STATES {
+        counts.insert(state.as_str().to_owned(), 0);
+    }
     for entry in capabilities {
         let state = entry
             .get("effective_state")
