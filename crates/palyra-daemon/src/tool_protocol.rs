@@ -46,6 +46,12 @@ use crate::wasm_plugin_runner::{run_wasm_plugin, WasmPluginRunErrorKind, WasmPlu
 
 const PROCESS_RUNNER_TOOL_NAME: &str = "palyra.process.run";
 const PROCESS_RUNNER_ALIAS_TOOL_NAME: &str = "palyra.exec.run";
+const MCP_UTILITY_TOOL_NAMES: &[&str] = &[
+    "palyra.mcp.resources.list",
+    "palyra.mcp.resources.read",
+    "palyra.mcp.prompts.list",
+    "palyra.mcp.prompts.get",
+];
 const CODE_INTEL_TOOL_NAMES: &[&str] = &[
     "palyra.code.diagnostics",
     "palyra.code.symbols",
@@ -63,6 +69,10 @@ fn is_process_runner_run_tool(tool_name: &str) -> bool {
 
 fn is_code_intel_tool(tool_name: &str) -> bool {
     CODE_INTEL_TOOL_NAMES.contains(&tool_name)
+}
+
+fn is_mcp_utility_tool(tool_name: &str) -> bool {
+    MCP_UTILITY_TOOL_NAMES.contains(&tool_name)
 }
 
 /// Tool execution policy: the allowlist, timeout, and the sandbox/wasm runner
@@ -312,6 +322,7 @@ const MAX_OS_FILE_TOOL_INPUT_BYTES: usize = 384 * 1024;
 const MAX_BROWSER_TOOL_INPUT_BYTES: usize = 128 * 1024;
 const MAX_ARTIFACT_READ_TOOL_INPUT_BYTES: usize = 16 * 1024;
 const MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES: usize = 16 * 1024;
+const MAX_MCP_UTILITY_TOOL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WASM_PLUGIN_TOOL_INPUT_BYTES: usize = 448 * 1024;
 
 /// Builds the serializable policy snapshot exposed on console/status APIs.
@@ -999,6 +1010,15 @@ async fn run_allowlisted_tool_with_cancellation(
             sandbox_enforcement: "ssrf_guard".to_owned(),
             execution_manifest: None,
         },
+        tool_name if is_mcp_utility_tool(tool_name) => ToolExecutionRawResult {
+            success: false,
+            output_json: b"{}".to_vec(),
+            error: format!("{tool_name} requires gateway MCP broker runtime context"),
+            timed_out: false,
+            executor: "mcp_broker".to_owned(),
+            sandbox_enforcement: "mcp_host_mediated".to_owned(),
+            execution_manifest: None,
+        },
         PROCESS_RUNNER_TOOL_NAME | PROCESS_RUNNER_ALIAS_TOOL_NAME => {
             execute_process_runner_tool(
                 config,
@@ -1143,6 +1163,9 @@ async fn run_allowlisted_tool_with_cancellation(
 // explicit delegation error). Keep in sync with the dispatch match above and
 // with `tool_input_limit_bytes`.
 fn is_runtime_supported_tool(tool_name: &str) -> bool {
+    if is_mcp_utility_tool(tool_name) {
+        return true;
+    }
     is_code_intel_tool(tool_name)
         || matches!(
             tool_name,
@@ -1240,6 +1263,8 @@ fn tool_executor_name(config: &ToolCallConfig, tool_name: &str) -> String {
         "os_file".to_owned()
     } else if tool_name == "palyra.http.fetch" {
         "gateway_http_fetch".to_owned()
+    } else if is_mcp_utility_tool(tool_name) {
+        "mcp_broker".to_owned()
     } else if tool_name == "palyra.image.observe" {
         "image_observe".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
@@ -1307,6 +1332,7 @@ fn tool_input_limit_bytes(tool_name: &str) -> usize {
         }
         "palyra.artifact.read" => MAX_ARTIFACT_READ_TOOL_INPUT_BYTES,
         "palyra.image.observe" => MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
+        tool_name if is_mcp_utility_tool(tool_name) => MAX_MCP_UTILITY_TOOL_INPUT_BYTES,
         "palyra.http.fetch" => MAX_HTTP_FETCH_TOOL_INPUT_BYTES,
         "palyra.process.run"
         | "palyra.exec.run"
@@ -1381,6 +1407,8 @@ fn sandbox_enforcement_for_tool(config: &ToolCallConfig, tool_name: &str) -> Str
         "approved_os_paths".to_owned()
     } else if tool_name == "palyra.http.fetch" {
         "ssrf_guard".to_owned()
+    } else if is_mcp_utility_tool(tool_name) {
+        "mcp_host_mediated".to_owned()
     } else if tool_name.starts_with("palyra.browser.") {
         "browser_service".to_owned()
     } else if tool_name == "palyra.artifact.read" {
@@ -1741,6 +1769,7 @@ mod tests {
         decide_tool_call, denied_execution_outcome, execute_tool_call, is_runtime_supported_tool,
         tool_input_limit_bytes, tool_metadata, tool_policy_snapshot, tool_requires_approval,
         ToolCallConfig, ToolCapability, ToolRequestContext, MAX_IMAGE_OBSERVE_TOOL_INPUT_BYTES,
+        MAX_MCP_UTILITY_TOOL_INPUT_BYTES, MCP_UTILITY_TOOL_NAMES,
     };
     use crate::sandbox_runner::{
         EgressEnforcementMode, PathAccessMode, SandboxProcessRunnerPolicy, SandboxProcessRunnerTier,
@@ -2324,6 +2353,34 @@ mod tests {
         assert_eq!(metadata.capabilities, &[ToolCapability::Network, ToolCapability::SecretsRead]);
         assert!(metadata.default_sensitive);
         assert!(tool_requires_approval("palyra.http.fetch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_utility_tools_require_gateway_broker_context() {
+        for tool_name in MCP_UTILITY_TOOL_NAMES {
+            let metadata = tool_metadata(tool_name).expect("MCP utility metadata");
+            assert!(metadata.capabilities.is_empty());
+            assert!(!metadata.default_sensitive);
+            assert!(!tool_requires_approval(tool_name));
+            assert!(is_runtime_supported_tool(tool_name));
+            assert_eq!(tool_input_limit_bytes(tool_name), MAX_MCP_UTILITY_TOOL_INPUT_BYTES);
+
+            let config = ToolCallConfig {
+                allowed_tools: vec![(*tool_name).to_owned()],
+                max_calls_per_run: 1,
+                execution_timeout_ms: 250,
+                process_runner: default_process_runner_policy(),
+                wasm_runtime: default_wasm_runtime_policy(),
+            };
+            let outcome =
+                execute_tool_call(&config, "proposal-mcp", tool_name, br#"{"server_name":"docs"}"#)
+                    .await;
+
+            assert!(!outcome.success);
+            assert!(outcome.error.contains("requires gateway MCP broker runtime context"));
+            assert_eq!(outcome.attestation.executor, "mcp_broker");
+            assert_eq!(outcome.attestation.sandbox_enforcement, "mcp_host_mediated");
+        }
     }
 
     #[test]

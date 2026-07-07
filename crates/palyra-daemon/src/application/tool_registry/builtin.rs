@@ -95,6 +95,63 @@ pub(crate) fn registry_entries() -> Vec<ToolRegistryEntry> {
             ToolResultProjectionPolicy::InlineUnlessLarge,
         ),
         entry(
+            "palyra.mcp.resources.list",
+            "List host-reviewed resources exposed by one healthy MCP server. Results include schema hashes, size caps, approval posture, and filtered resource diagnostics.",
+            object_schema(
+                &["server_name"],
+                vec![("server_name", json!({"type":"string","maxLength":128}))],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.mcp.resources.read",
+            "Read one host-reviewed MCP resource by URI and manifest schema hash through broker redaction, byte caps, and artifact projection.",
+            object_schema(
+                &["server_name", "uri", "schema_hash"],
+                vec![
+                    ("server_name", json!({"type":"string","maxLength":128})),
+                    ("uri", json!({"type":"string","maxLength":2048})),
+                    ("schema_hash", json!({"type":"string","maxLength":256})),
+                    ("max_bytes", json!({"type":"integer","minimum":1,"maximum":131072})),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
+            "palyra.mcp.prompts.list",
+            "List host-reviewed prompts exposed by one healthy MCP server. Results include schema hashes, argument schema digests, and filtered prompt diagnostics.",
+            object_schema(
+                &["server_name"],
+                vec![("server_name", json!({"type":"string","maxLength":128}))],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::InlineUnlessLarge,
+        ),
+        entry(
+            "palyra.mcp.prompts.get",
+            "Resolve one host-reviewed MCP prompt by name and manifest schema hash through broker redaction, byte caps, and artifact projection.",
+            object_schema(
+                &["server_name", "name", "schema_hash"],
+                vec![
+                    ("server_name", json!({"type":"string","maxLength":128})),
+                    ("name", json!({"type":"string","maxLength":128})),
+                    ("schema_hash", json!({"type":"string","maxLength":256})),
+                    (
+                        "arguments",
+                        json!({"type":"object","properties":{},"additionalProperties":true,"maxProperties":64}),
+                    ),
+                ],
+                false,
+            ),
+            ToolParallelismPolicy::ReadOnly,
+            ToolResultProjectionPolicy::RedactedPreviewAndArtifact,
+        ),
+        entry(
             "palyra.memory.status",
             "Inspect read-only memory usage, retention limits, maintenance timing, and capacity_state; use this before deciding whether memory is full or needs consolidation.",
             object_schema(&[], Vec::new(), false),

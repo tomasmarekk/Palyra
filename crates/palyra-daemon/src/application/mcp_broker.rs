@@ -20,6 +20,9 @@ use std::{
 
 use palyra_common::{redaction::redact_diagnostic_text, runtime_preview::RuntimePreviewMode};
 use palyra_egress_proxy::{EgressProxyPolicyService, EgressProxyRequest};
+use palyra_safety::{
+    transform_text_for_prompt, SafetyAction, SafetyContentKind, SafetySourceKind, TrustLabel,
+};
 use reqwest::{blocking::Response, redirect::Policy, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -34,11 +37,31 @@ use super::tool_registry::{
     ToolReplaySafetyClass, ToolResultProjectionPolicy, ToolSchemaDialect,
 };
 
+mod host_policy;
+mod host_surfaces;
+mod host_transport;
+mod host_types;
+
+pub use host_surfaces::mcp_prompt_cache_epoch;
+pub use host_types::{
+    McpDiscoveredPrompt, McpDiscoveredResource, McpElicitationHostResponse, McpElicitationOutcome,
+    McpElicitationPolicy, McpElicitationRequest, McpElicitationRoute, McpHostSamplingPolicy,
+    McpPromptGetRequest, McpPromptManifest, McpPromptPayload, McpResourceManifest,
+    McpResourceReadPayload, McpResourceReadRequest, McpSamplingCreateMessageRequest,
+    McpSamplingMode, McpSamplingOutcome, McpSamplingPolicy, McpUtilityAuditRecord,
+    McpUtilityListRequest, McpUtilityOutcome,
+};
+
 const MCP_SCHEMA_VERSION: u32 = 1;
 const MCP_RUNTIME_SUPERVISOR_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_START_TIMEOUT_MS: u64 = 2_500;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_RESOURCE_READ_BYTES: usize = 128 * 1024;
+const DEFAULT_MAX_PROMPT_BYTES: usize = 64 * 1024;
+const DEFAULT_MAX_SAMPLING_PROMPT_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_ELICITATION_SCHEMA_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_ELICITATION_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_IDENTIFIER_LEN: usize = 64;
 const QUARANTINE_AFTER_VIOLATIONS: u32 = 3;
 const DEFAULT_SUPERVISOR_MAX_RETRIES: u32 = 3;
@@ -51,6 +74,9 @@ const MCP_STDIO_MAX_HEADER_BYTES: usize = 8 * 1024;
 const MCP_STDIO_STDERR_TAIL_BYTES: usize = 4 * 1024;
 const MCP_STDIO_INHERITED_ENV_ALLOWLIST: &[&str] =
     &["PATH", "Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "TMP", "TEMP"];
+const MCP_UTILITY_AUDIT_SCHEMA_VERSION: u32 = 1;
+const MCP_SAMPLING_SCHEMA_VERSION: u32 = 1;
+const MCP_ELICITATION_SCHEMA_VERSION: u32 = 1;
 
 /// Broker-wide policy that is not trusted from server-authored manifests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +130,10 @@ pub struct McpServerManifest {
     pub oauth_grant: Option<McpOAuthGrant>,
     #[serde(default)]
     pub sampling_policy: McpSamplingPolicy,
+    #[serde(default)]
+    pub resources: Vec<McpResourceManifest>,
+    #[serde(default)]
+    pub prompts: Vec<McpPromptManifest>,
 }
 
 /// Vault-backed OAuth grant descriptor for one MCP server.
@@ -125,30 +155,6 @@ pub struct McpOAuthGrant {
     pub updated_at_unix_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at_unix_ms: Option<i64>,
-}
-
-/// Host-owned sampling policy for one MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct McpSamplingPolicy {
-    pub mode: McpSamplingMode,
-    #[serde(default)]
-    pub allowed_model_capabilities: Vec<String>,
-}
-
-impl Default for McpSamplingPolicy {
-    fn default() -> Self {
-        Self { mode: McpSamplingMode::Deny, allowed_model_capabilities: Vec::new() }
-    }
-}
-
-/// Sampling decision mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum McpSamplingMode {
-    #[default]
-    Deny,
-    Allowlist,
 }
 
 /// Transport declaration for an MCP server.
@@ -1004,6 +1010,48 @@ pub trait McpTransport {
         manifest: &McpServerManifest,
     ) -> Result<Vec<McpDiscoveredTool>, McpBrokerError>;
 
+    fn list_resources(
+        &self,
+        _manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredResource>, McpBrokerError> {
+        Err(McpBrokerError::new(
+            "mcp.resources_unsupported",
+            "MCP transport does not support resources/list",
+        ))
+    }
+
+    fn read_resource(
+        &self,
+        _manifest: &McpServerManifest,
+        _request: &McpResourceReadRequest,
+    ) -> Result<McpResourceReadPayload, McpBrokerError> {
+        Err(McpBrokerError::new(
+            "mcp.resources_unsupported",
+            "MCP transport does not support resources/read",
+        ))
+    }
+
+    fn list_prompts(
+        &self,
+        _manifest: &McpServerManifest,
+    ) -> Result<Vec<McpDiscoveredPrompt>, McpBrokerError> {
+        Err(McpBrokerError::new(
+            "mcp.prompts_unsupported",
+            "MCP transport does not support prompts/list",
+        ))
+    }
+
+    fn get_prompt(
+        &self,
+        _manifest: &McpServerManifest,
+        _request: &McpPromptGetRequest,
+    ) -> Result<McpPromptPayload, McpBrokerError> {
+        Err(McpBrokerError::new(
+            "mcp.prompts_unsupported",
+            "MCP transport does not support prompts/get",
+        ))
+    }
+
     fn call_tool(
         &self,
         manifest: &McpServerManifest,
@@ -1036,78 +1084,6 @@ impl fmt::Display for McpTransportError {
 }
 
 impl std::error::Error for McpTransportError {}
-
-impl From<McpTransportError> for McpBrokerError {
-    fn from(error: McpTransportError) -> Self {
-        Self::new(error.reason_code, error.message)
-    }
-}
-
-/// Default real MCP transport implementation for stdio, HTTP, streamable HTTP, and SSE.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct McpRuntimeTransport;
-
-impl McpTransport for McpRuntimeTransport {
-    fn start(&self, manifest: &McpServerManifest) -> Result<(), McpBrokerError> {
-        match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => {
-                execute_stdio_jsonrpc(manifest, None, manifest.start_timeout_ms).map(|_| ())
-            }
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(
-                    manifest,
-                    "initialize",
-                    mcp_initialize_params(),
-                    manifest.start_timeout_ms,
-                )
-                .map(|_| ())
-            }
-        }
-        .map_err(Into::into)
-    }
-
-    fn list_tools(
-        &self,
-        manifest: &McpServerManifest,
-    ) -> Result<Vec<McpDiscoveredTool>, McpBrokerError> {
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => execute_stdio_jsonrpc(
-                manifest,
-                Some(("tools/list", json!({}))),
-                manifest.timeout_ms,
-            ),
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "tools/list", json!({}), manifest.timeout_ms)
-            }
-        }?;
-        tools_from_mcp_result(&result).map_err(Into::into)
-    }
-
-    fn call_tool(
-        &self,
-        manifest: &McpServerManifest,
-        request: &McpToolCallRequest,
-    ) -> Result<McpToolResponse, McpBrokerError> {
-        let params = json!({
-            "name": request.tool_name,
-            "arguments": request.input,
-        });
-        let result = match &manifest.transport {
-            McpTransportManifest::Stdio { .. } => {
-                execute_stdio_jsonrpc(manifest, Some(("tools/call", params)), manifest.timeout_ms)
-            }
-            McpTransportManifest::Http { .. } | McpTransportManifest::Sse { .. } => {
-                execute_remote_jsonrpc(manifest, "tools/call", params, manifest.timeout_ms)
-            }
-        }?;
-        Ok(McpToolResponse {
-            output: result,
-            sampling_requested: false,
-            sampling_model_capability: None,
-            egress_host_requested: None,
-        })
-    }
-}
 
 /// Fail-closed broker error with safe operator-facing context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1144,6 +1120,16 @@ pub struct McpBroker {
     policy: McpBrokerPolicy,
     servers: BTreeMap<String, McpServerRecord>,
 }
+
+impl From<McpTransportError> for McpBrokerError {
+    fn from(error: McpTransportError) -> Self {
+        Self::new(error.reason_code, error.message)
+    }
+}
+
+/// Default real MCP transport implementation for stdio, HTTP, streamable HTTP, and SSE.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct McpRuntimeTransport;
 
 impl McpBroker {
     /// Creates an empty broker with host-owned policy.
@@ -1396,7 +1382,7 @@ impl McpBroker {
         };
         if response.sampling_requested {
             audit_context.sampling_model_capability = response.sampling_model_capability.clone();
-            if !sampling_allowed_by_manifest(
+            if !host_policy::sampling_allowed_by_manifest(
                 &record.manifest,
                 response.sampling_model_capability.as_deref(),
             ) {
@@ -1520,6 +1506,8 @@ pub fn validate_mcp_server_manifest(
     validate_vault_refs(manifest.vault_refs.as_slice(), &mut findings);
     validate_oauth_grant(manifest, &mut findings);
     validate_tool_filters(manifest, &mut findings);
+    host_policy::validate_resource_manifests(manifest, &mut findings);
+    host_policy::validate_prompt_manifests(manifest, &mut findings);
     validate_egress_allowlist(manifest.egress_allowlist.as_slice(), &mut findings);
     if manifest.sampling_enabled {
         findings.push(finding(
@@ -1529,7 +1517,7 @@ pub fn validate_mcp_server_manifest(
             "use sampling_policy.mode=allowlist with explicit model capabilities",
         ));
     }
-    validate_sampling_policy(&manifest.sampling_policy, &mut findings);
+    host_policy::validate_sampling_policy(&manifest.sampling_policy, &mut findings);
     let valid = !findings.iter().any(|finding| finding.severity == McpFindingSeverity::Error);
     McpManifestValidationReport {
         schema_version: MCP_SCHEMA_VERSION,
@@ -1703,6 +1691,15 @@ fn execute_remote_jsonrpc(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED && manifest.oauth_required {
+        return Err(McpTransportError::new(
+            "mcp.oauth_recovery_required",
+            format!(
+                "MCP remote transport returned HTTP 401; run `palyra mcp login {}` or refresh the vault-backed OAuth grant",
+                manifest.name
+            ),
+        ));
+    }
     if !response.status().is_success() {
         return Err(McpTransportError::new(
             "mcp.transport_http_status",
@@ -1828,12 +1825,23 @@ fn parse_mcp_remote_body(
         })?;
         return parse_mcp_sse_response(body);
     }
+    if !mcp_json_content_type_allowed(content_type.as_str()) {
+        return Err(McpTransportError::new(
+            "mcp.transport_content_type_rejected",
+            format!("MCP remote transport returned unsupported content-type '{content_type}'"),
+        ));
+    }
     serde_json::from_slice::<Value>(body).map_err(|error| {
         McpTransportError::new(
             "mcp.transport_invalid_response",
             format!("MCP JSON-RPC response was not valid JSON: {error}"),
         )
     })
+}
+
+fn mcp_json_content_type_allowed(content_type: &str) -> bool {
+    matches!(content_type, "application/json" | "application/mcp+json")
+        || content_type.ends_with("+json")
 }
 
 fn parse_mcp_sse_response(body: &str) -> Result<Value, McpTransportError> {
@@ -2592,31 +2600,6 @@ fn validate_oauth_grant(manifest: &McpServerManifest, findings: &mut Vec<McpVali
     }
 }
 
-fn validate_sampling_policy(policy: &McpSamplingPolicy, findings: &mut Vec<McpValidationFinding>) {
-    match policy.mode {
-        McpSamplingMode::Deny => {
-            if !policy.allowed_model_capabilities.is_empty() {
-                findings.push(finding(
-                    McpFindingSeverity::Error,
-                    "mcp.sampling_allowlist_unused",
-                    "sampling allowlist entries cannot be set while sampling mode is deny",
-                    "remove allowed_model_capabilities or set sampling_policy.mode=allowlist",
-                ));
-            }
-        }
-        McpSamplingMode::Allowlist => {
-            if policy.allowed_model_capabilities.is_empty() {
-                findings.push(finding(
-                    McpFindingSeverity::Error,
-                    "mcp.sampling_allowlist_empty",
-                    "sampling allowlist mode requires at least one model capability",
-                    "add allowed_model_capabilities for the specific model capability",
-                ));
-            }
-        }
-    }
-}
-
 fn validate_tool_filters(manifest: &McpServerManifest, findings: &mut Vec<McpValidationFinding>) {
     for tool in manifest.tool_allowlist.iter().chain(manifest.tool_denylist.iter()) {
         if normalize_mcp_identifier(tool.as_str(), "tool_filter").is_err() {
@@ -2739,45 +2722,6 @@ pub fn mcp_oauth_grant_doctor_findings(
             })
         })
         .collect()
-}
-
-fn sampling_allowed_by_manifest(
-    manifest: &McpServerManifest,
-    requested_model_capability: Option<&str>,
-) -> bool {
-    if manifest.sampling_enabled {
-        return false;
-    }
-    if !matches!(manifest.sampling_policy.mode, McpSamplingMode::Allowlist) {
-        return false;
-    }
-    let Some(requested) = requested_model_capability
-        .and_then(|value| normalize_sampling_model_capability(value).ok())
-    else {
-        return false;
-    };
-    manifest
-        .sampling_policy
-        .allowed_model_capabilities
-        .iter()
-        .filter_map(|capability| normalize_sampling_model_capability(capability).ok())
-        .any(|allowed| allowed == requested)
-}
-
-fn normalize_sampling_model_capability(raw: &str) -> Result<String, McpBrokerError> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    if normalized.is_empty()
-        || normalized.len() > 128
-        || !normalized
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/'))
-    {
-        return Err(McpBrokerError::new(
-            "mcp.sampling_capability_invalid",
-            "sampling model capability must use bounded ASCII label syntax",
-        ));
-    }
-    Ok(normalized)
 }
 
 fn host_allowed_by_manifest(host: &str, allowlist: &[String]) -> bool {
@@ -3175,6 +3119,16 @@ fn valid_host(host: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-'))
 }
 
+fn valid_mcp_schema_hash_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 256
+        && trimmed == value
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':' | '/' | '+'))
+}
+
 fn looks_secretish(key: &str) -> bool {
     let normalized = key
         .chars()
@@ -3265,8 +3219,14 @@ mod tests {
     #[derive(Default)]
     struct FakeTransport {
         tools: Vec<McpDiscoveredTool>,
+        resources: Vec<McpDiscoveredResource>,
+        prompts: Vec<McpDiscoveredPrompt>,
+        resource_payload: Option<McpResourceReadPayload>,
+        prompt_payload: Option<McpPromptPayload>,
         response: Option<McpToolResponse>,
         start_error: Option<McpBrokerError>,
+        resource_read_count: Cell<u32>,
+        prompt_get_count: Cell<u32>,
         call_count: Cell<u32>,
     }
 
@@ -3283,6 +3243,46 @@ mod tests {
             _manifest: &McpServerManifest,
         ) -> Result<Vec<McpDiscoveredTool>, McpBrokerError> {
             Ok(self.tools.clone())
+        }
+
+        fn list_resources(
+            &self,
+            _manifest: &McpServerManifest,
+        ) -> Result<Vec<McpDiscoveredResource>, McpBrokerError> {
+            Ok(self.resources.clone())
+        }
+
+        fn read_resource(
+            &self,
+            _manifest: &McpServerManifest,
+            request: &McpResourceReadRequest,
+        ) -> Result<McpResourceReadPayload, McpBrokerError> {
+            self.resource_read_count.set(self.resource_read_count.get().saturating_add(1));
+            Ok(self.resource_payload.clone().unwrap_or(McpResourceReadPayload {
+                uri: request.uri.clone(),
+                mime_type: "text/plain".to_owned(),
+                content: json!("resource body"),
+                egress_host_requested: None,
+            }))
+        }
+
+        fn list_prompts(
+            &self,
+            _manifest: &McpServerManifest,
+        ) -> Result<Vec<McpDiscoveredPrompt>, McpBrokerError> {
+            Ok(self.prompts.clone())
+        }
+
+        fn get_prompt(
+            &self,
+            _manifest: &McpServerManifest,
+            request: &McpPromptGetRequest,
+        ) -> Result<McpPromptPayload, McpBrokerError> {
+            self.prompt_get_count.set(self.prompt_get_count.get().saturating_add(1));
+            Ok(self.prompt_payload.clone().unwrap_or(McpPromptPayload {
+                name: request.name.clone(),
+                messages: json!([{"role": "user", "content": "summarize docs"}]),
+            }))
         }
 
         fn call_tool(
@@ -3335,6 +3335,31 @@ mod tests {
             oauth_required: false,
             oauth_grant: None,
             sampling_policy: McpSamplingPolicy::default(),
+            resources: vec![McpResourceManifest {
+                uri: "docs://guide".to_owned(),
+                name: "Guide".to_owned(),
+                description: "Operator guide".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                schema_hash: "resource.schema.v1".to_owned(),
+                max_read_bytes: 64,
+                sensitivity: McpToolSensitivity::Internal,
+                approval_policy: McpApprovalPolicy::Safe,
+                egress_host: None,
+            }],
+            prompts: vec![McpPromptManifest {
+                name: "summarize".to_owned(),
+                description: "Summarize docs".to_owned(),
+                schema_hash: "prompt.schema.v1".to_owned(),
+                argument_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "topic": { "type": "string" }
+                    }
+                }),
+                max_prompt_bytes: 512,
+                sensitivity: McpToolSensitivity::Internal,
+                approval_policy: McpApprovalPolicy::Safe,
+            }],
         }
     }
 
@@ -3392,17 +3417,45 @@ mod tests {
         broker
     }
 
+    fn allow_policy() -> McpInvocationPolicyDecision {
+        McpInvocationPolicyDecision {
+            allowed: true,
+            approval_required: false,
+            reason: "allowlisted".to_owned(),
+        }
+    }
+
+    fn resource_read_request(schema_hash: &str) -> McpResourceReadRequest {
+        McpResourceReadRequest {
+            server_name: "docs".to_owned(),
+            uri: "docs://guide".to_owned(),
+            schema_hash: schema_hash.to_owned(),
+            policy: allow_policy(),
+            approval_granted: false,
+            approval_id: None,
+            max_bytes: None,
+        }
+    }
+
+    fn prompt_get_request(schema_hash: &str) -> McpPromptGetRequest {
+        McpPromptGetRequest {
+            server_name: "docs".to_owned(),
+            name: "summarize".to_owned(),
+            schema_hash: schema_hash.to_owned(),
+            arguments: json!({"topic": "runtime"}),
+            policy: allow_policy(),
+            approval_granted: false,
+            approval_id: None,
+        }
+    }
+
     fn invocation_request() -> McpToolCallRequest {
         McpToolCallRequest {
             server_name: "docs".to_owned(),
             tool_name: "search".to_owned(),
             input: json!({"query": "rust"}),
             schema_hash: stable_hash_value(&search_tool_schema()),
-            policy: McpInvocationPolicyDecision {
-                allowed: true,
-                approval_required: false,
-                reason: "allowlisted".to_owned(),
-            },
+            policy: allow_policy(),
             approval_granted: false,
             approval_id: None,
             vault_refs_requested: vec!["api_token".to_owned()],
@@ -3726,6 +3779,340 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == "mcp.stdio_command_not_allowlisted"));
+    }
+
+    #[test]
+    fn manifest_validation_rejects_bad_resource_and_prompt_descriptors() {
+        let mut manifest = manifest();
+        manifest.resources[0].uri = "docs guide".to_owned();
+        manifest.resources[0].schema_hash = "bad hash".to_owned();
+        manifest.resources[0].max_read_bytes = manifest.max_response_bytes + 1;
+        manifest.resources[0].egress_host = Some("evil.example".to_owned());
+        manifest.prompts[0].name = "Bad Prompt".to_owned();
+        manifest.prompts[0].argument_schema = json!({"type": "array"});
+        manifest.prompts.push(manifest.prompts[0].clone());
+
+        let report = validate_mcp_server_manifest(&manifest, &policy());
+
+        assert!(!report.valid);
+        for expected in [
+            "mcp.resource_uri_invalid",
+            "mcp.resource_schema_hash_invalid",
+            "mcp.resource_read_cap_invalid",
+            "mcp.resource_egress_host_invalid",
+            "mcp.prompt_name_invalid",
+            "mcp.prompt_duplicate",
+            "mcp.prompt_argument_schema_invalid",
+        ] {
+            assert!(
+                report.findings.iter().any(|finding| finding.code == expected),
+                "missing finding {expected}: {:#?}",
+                report.findings
+            );
+        }
+    }
+
+    #[test]
+    fn resources_list_filters_to_manifest_and_tracks_prompt_epoch() {
+        let transport = FakeTransport {
+            resources: vec![
+                McpDiscoveredResource {
+                    uri: "docs://guide".to_owned(),
+                    name: String::new(),
+                    description: String::new(),
+                    mime_type: String::new(),
+                    schema_hash: "resource.schema.v1".to_owned(),
+                    size_bytes: Some(32),
+                    egress_host: None,
+                },
+                McpDiscoveredResource {
+                    uri: "docs://missing".to_owned(),
+                    name: "Missing".to_owned(),
+                    description: String::new(),
+                    mime_type: "text/plain".to_owned(),
+                    schema_hash: "resource.schema.v1".to_owned(),
+                    size_bytes: None,
+                    egress_host: None,
+                },
+                McpDiscoveredResource {
+                    uri: "docs://guide".to_owned(),
+                    name: "Guide".to_owned(),
+                    description: String::new(),
+                    mime_type: "text/plain".to_owned(),
+                    schema_hash: "stale".to_owned(),
+                    size_bytes: None,
+                    egress_host: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut broker = broker_with_ready_manifest(&transport);
+
+        let outcome = broker
+            .list_resources(
+                McpUtilityListRequest { server_name: "docs".to_owned(), policy: allow_policy() },
+                &transport,
+            )
+            .expect("resource list should be mediated");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.audit.operation, "resources.list");
+        assert_eq!(outcome.audit.prompt_cache_epoch, mcp_prompt_cache_epoch(&manifest(), 0));
+        let resources = outcome.output_json["resources"].as_array().expect("resources array");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "docs://guide");
+        let filtered =
+            outcome.output_json["filtered_resources"].as_array().expect("filtered resources");
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|entry| entry["reason_code"] == "mcp.resource_not_manifested"));
+        assert!(filtered.iter().any(|entry| entry["reason_code"] == "mcp.schema_hash_mismatch"));
+    }
+
+    #[test]
+    fn resource_read_rejects_schema_mismatch_before_transport() {
+        let transport = FakeTransport::default();
+        let mut broker = broker_with_ready_manifest(&transport);
+
+        let outcome = broker
+            .read_resource(resource_read_request("stale.schema"), &transport)
+            .expect("schema mismatch should produce a denied outcome");
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.audit.policy_outcome, "mcp.schema_hash_mismatch");
+        assert_eq!(transport.resource_read_count.get(), 0);
+    }
+
+    #[test]
+    fn resource_read_projects_large_payload_without_raw_secrets() {
+        let transport = FakeTransport {
+            resource_payload: Some(McpResourceReadPayload {
+                uri: "docs://guide".to_owned(),
+                mime_type: "text/plain".to_owned(),
+                content: json!({
+                    "body": format!("{} vault://global/secret-token", "external ".repeat(32))
+                }),
+                egress_host_requested: None,
+            }),
+            ..Default::default()
+        };
+        let mut broker = broker_with_ready_manifest(&transport);
+
+        let outcome = broker
+            .read_resource(resource_read_request("resource.schema.v1"), &transport)
+            .expect("resource should be mediated");
+
+        assert!(outcome.success);
+        assert!(outcome.audit.artifact_required);
+        assert_eq!(transport.resource_read_count.get(), 1);
+        assert_eq!(outcome.output_json["artifact_required"], true);
+        let preview = outcome.output_json["redacted_preview"]
+            .as_str()
+            .expect("redacted preview should be present");
+        assert!(!preview.contains("vault://global/secret-token"));
+        assert!(outcome.audit.output_hash.len() >= 16);
+    }
+
+    #[test]
+    fn prompts_list_and_get_are_manifest_filtered_and_audited() {
+        let transport = FakeTransport {
+            prompts: vec![
+                McpDiscoveredPrompt {
+                    name: "summarize".to_owned(),
+                    description: String::new(),
+                    schema_hash: "prompt.schema.v1".to_owned(),
+                    argument_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "topic": { "type": "string" }
+                        }
+                    }),
+                },
+                McpDiscoveredPrompt {
+                    name: "hidden".to_owned(),
+                    description: String::new(),
+                    schema_hash: "prompt.schema.v1".to_owned(),
+                    argument_schema: json!({"type": "object", "properties": {}}),
+                },
+            ],
+            prompt_payload: Some(McpPromptPayload {
+                name: "summarize".to_owned(),
+                messages: json!([{"role": "user", "content": "Summarize vault://global/prompt"}]),
+            }),
+            ..Default::default()
+        };
+        let mut broker = broker_with_ready_manifest(&transport);
+
+        let list = broker
+            .list_prompts(
+                McpUtilityListRequest { server_name: "docs".to_owned(), policy: allow_policy() },
+                &transport,
+            )
+            .expect("prompt list should be mediated");
+        assert!(list.success);
+        assert_eq!(list.output_json["prompts"].as_array().expect("prompts").len(), 1);
+        assert!(list.output_json["filtered_prompts"]
+            .as_array()
+            .expect("filtered prompts")
+            .iter()
+            .any(|entry| entry["reason_code"] == "mcp.prompt_not_manifested"));
+
+        let get = broker
+            .get_prompt(prompt_get_request("prompt.schema.v1"), &transport)
+            .expect("prompt get should be mediated");
+        assert!(get.success);
+        assert_eq!(get.audit.operation, "prompts.get");
+        assert_eq!(transport.prompt_get_count.get(), 1);
+        let preview =
+            get.output_json["redacted_preview"].as_str().expect("prompt preview should be present");
+        assert!(!preview.contains("vault://global/prompt"));
+    }
+
+    #[test]
+    fn sampling_create_message_is_host_owned_and_budgeted() {
+        let transport = FakeTransport::default();
+        let mut manifest = manifest();
+        manifest.sampling_policy = McpSamplingPolicy {
+            mode: McpSamplingMode::Allowlist,
+            allowed_model_capabilities: vec!["model:gpt-5".to_owned()],
+        };
+        let mut broker = McpBroker::new(policy());
+        broker.register_manifest(manifest).expect("manifest should register");
+        broker.start_server("docs", &transport).expect("server should start");
+        let host_policy = McpHostSamplingPolicy {
+            allowed_model_capabilities: vec!["model:gpt-5".to_owned()],
+            provider_id: "openai".to_owned(),
+            model_id: "gpt-5".to_owned(),
+            max_output_tokens: 256,
+            remaining_budget_tokens: 128,
+            max_prompt_bytes: 512,
+        };
+        let mut request = McpSamplingCreateMessageRequest {
+            server_name: "docs".to_owned(),
+            requested_model_capability: Some("model:gpt-5".to_owned()),
+            requested_provider_id: Some("openai".to_owned()),
+            requested_model_id: Some("gpt-5".to_owned()),
+            prompt: "Use context from vault://global/system-secret".to_owned(),
+            max_output_tokens: 64,
+            policy: allow_policy(),
+        };
+
+        let allowed = broker
+            .handle_sampling_create_message(request.clone(), &host_policy)
+            .expect("sampling should be mediated");
+
+        assert!(allowed.success);
+        assert_eq!(allowed.reason_code, "mcp.sampling_allowed");
+        assert_eq!(allowed.provider_id, "openai");
+        assert_eq!(allowed.model_id, "gpt-5");
+        assert!(!allowed.redacted_prompt_preview.contains("vault://global/system-secret"));
+
+        request.max_output_tokens = 512;
+        let denied = broker
+            .handle_sampling_create_message(request, &host_policy)
+            .expect("budget denial should be synthetic");
+
+        assert!(!denied.success);
+        assert_eq!(denied.reason_code, "mcp.sampling_budget_exceeded");
+        assert!(denied.output_text.contains("MCP sampling denied"));
+    }
+
+    #[test]
+    fn elicitation_validates_schema_route_refusal_and_response_size() {
+        let transport = FakeTransport::default();
+        let broker = broker_with_ready_manifest(&transport);
+        let request = McpElicitationRequest {
+            server_name: "docs".to_owned(),
+            prompt: "Choose a deployment target".to_owned(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string" }
+                }
+            }),
+            purpose: "deployment_target_selection".to_owned(),
+            data_sensitivity: McpToolSensitivity::Sensitive,
+            policy: Some(allow_policy()),
+        };
+        let user_policy = McpElicitationPolicy {
+            route: McpElicitationRoute::User,
+            timeout_ms: 1_000,
+            approval_required_for_sensitive: true,
+            max_schema_bytes: 4096,
+            max_response_bytes: 512,
+        };
+
+        let denied = broker
+            .handle_elicitation(request.clone(), &user_policy, None)
+            .expect("sensitive user route should be denied without approval queue");
+        assert!(!denied.success);
+        assert_eq!(denied.reason_code, "mcp.elicitation_sensitive_requires_approval");
+        assert!(denied.approval_required);
+
+        let approval_policy =
+            McpElicitationPolicy { route: McpElicitationRoute::ApprovalQueue, ..user_policy };
+        let refused = broker
+            .handle_elicitation(
+                request.clone(),
+                &approval_policy,
+                Some(McpElicitationHostResponse {
+                    accepted: false,
+                    response: Value::Null,
+                    refusal_reason: Some("operator refused".to_owned()),
+                }),
+            )
+            .expect("refusal should be deterministic");
+        assert!(!refused.success);
+        assert_eq!(refused.reason_code, "mcp.elicitation_refused");
+
+        let oversized = broker
+            .handle_elicitation(
+                request,
+                &approval_policy,
+                Some(McpElicitationHostResponse {
+                    accepted: true,
+                    response: json!({"target": "x".repeat(1024)}),
+                    refusal_reason: None,
+                }),
+            )
+            .expect("oversized response should be denied");
+        assert!(!oversized.success);
+        assert_eq!(oversized.reason_code, "mcp.elicitation_response_too_large");
+    }
+
+    #[test]
+    fn remote_body_parser_rejects_non_json_content_type_before_parse() {
+        let error = parse_mcp_remote_body(br#"{"result": {}}"#, "text/plain", false)
+            .expect_err("non-json content type should be rejected");
+        assert_eq!(error.reason_code, "mcp.transport_content_type_rejected");
+
+        let parsed =
+            parse_mcp_remote_body(br#"{"result": {"ok": true}}"#, "application/json", false)
+                .expect("application/json should parse");
+        assert_eq!(parsed["result"]["ok"], true);
+    }
+
+    #[test]
+    fn mcp_security_fixture_covers_required_abuse_cases() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/security/mcp_broker_security_cases.json"
+        ))
+        .expect("MCP security fixture must parse");
+        let case_ids = fixture["cases"]
+            .as_array()
+            .expect("fixture cases")
+            .iter()
+            .filter_map(|case| case["id"].as_str())
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            "mcp-schema-hash-mismatch",
+            "mcp-egress-denied",
+            "mcp-unauthorized-vault-grant",
+            "mcp-repeated-protocol-violations",
+            "mcp-malicious-resource-prompt-injection",
+        ] {
+            assert!(case_ids.contains(expected), "missing fixture case {expected}");
+        }
     }
 
     #[test]

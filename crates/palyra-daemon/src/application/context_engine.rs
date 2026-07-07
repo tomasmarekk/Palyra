@@ -52,6 +52,7 @@ use crate::{
             PrepareModelProviderInputRequest, PreparedModelProviderInput,
             PromptCacheSessionMetadata,
         },
+        runtime_resource_manifest::RuntimeResourceManifest,
         session_pruning::{
             apply_tool_result_pruning, classify_pruning_task, context_engine_pruning_outcome,
             detect_pruning_risk, pruning_decision_from_config, ToolResultPruningExplain,
@@ -167,6 +168,7 @@ pub(crate) enum ContextSegmentKind {
     ExplicitRecall,
     MemoryRecall,
     AgentPlanState,
+    RuntimeResourceManifest,
     ChannelAmbientContext,
     SessionTail,
     ToolExchange,
@@ -187,6 +189,7 @@ impl ContextSegmentKind {
             Self::ExplicitRecall => "explicit_recall",
             Self::MemoryRecall => "memory_recall",
             Self::AgentPlanState => "agent_plan_state",
+            Self::RuntimeResourceManifest => "runtime_resource_manifest",
             Self::ChannelAmbientContext => "channel_ambient_context",
             Self::SessionTail => "session_tail",
             Self::ToolExchange => "tool_exchange",
@@ -2210,7 +2213,9 @@ fn context_inspector_category_for_kind(kind: ContextSegmentKind) -> &'static str
             "workspace_context"
         }
         ContextSegmentKind::AttachmentRecall => "attachments",
-        ContextSegmentKind::AgentPlanState => "runtime_state",
+        ContextSegmentKind::AgentPlanState | ContextSegmentKind::RuntimeResourceManifest => {
+            "runtime_state"
+        }
         ContextSegmentKind::ChannelAmbientContext => "channel_history",
         ContextSegmentKind::ToolExchange => "tool_results",
         ContextSegmentKind::UserInput => "current_turn",
@@ -3080,6 +3085,29 @@ fn push_segment(segments: &mut Vec<ContextSegment>, segment: ContextSegment) {
     segments.push(segment);
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "runtime resource host adapters will call this when supplying per-run manifests"
+    )
+)]
+fn runtime_resource_manifest_segment(manifest: &RuntimeResourceManifest) -> ContextSegment {
+    ContextSegment::trusted(
+        ContextSegmentKind::RuntimeResourceManifest,
+        "runtime resource manifest",
+        manifest.prompt_segment_text(),
+        74,
+        true,
+        false,
+        Some(format!("runtime_resource_manifest:{}", manifest.manifest_hash)),
+    )
+    .with_source_refs(vec![
+        format!("runtime_resource_manifest_hash:{}", manifest.manifest_hash),
+        format!("runtime_resource_count:{}", manifest.items.len()),
+    ])
+}
+
 fn clean_segment_content(raw: String) -> Option<String> {
     let trimmed = raw.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -3235,7 +3263,9 @@ fn assembly_step_for_kind(kind: ContextSegmentKind) -> &'static str {
             "session_state"
         }
         ContextSegmentKind::ContextReferences => "active_task",
-        ContextSegmentKind::AgentPlanState => "runtime_state",
+        ContextSegmentKind::AgentPlanState | ContextSegmentKind::RuntimeResourceManifest => {
+            "runtime_state"
+        }
         ContextSegmentKind::MemoryRecall => "memory",
         ContextSegmentKind::ChannelAmbientContext => "channel_history",
         ContextSegmentKind::ToolExchange => "tool_previews",
@@ -3254,7 +3284,9 @@ fn source_kind_for_segment(segment: &ContextSegment) -> ContextSourceKind {
             ContextSourceKind::Developer
         }
         ContextSegmentKind::ProjectContext => ContextSourceKind::Workspace,
-        ContextSegmentKind::AgentPlanState => ContextSourceKind::RuntimeState,
+        ContextSegmentKind::AgentPlanState | ContextSegmentKind::RuntimeResourceManifest => {
+            ContextSourceKind::RuntimeState
+        }
         ContextSegmentKind::MemoryRecall
         | ContextSegmentKind::SessionCompactionSummary
         | ContextSegmentKind::CheckpointSummary => ContextSourceKind::Memory,
@@ -3358,8 +3390,9 @@ mod tests {
         apply_prompt_cache_session_metadata, assemble_segments,
         context_assembly_diagnostics_payload, context_inspector_snapshot,
         context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
-        render_agent_plan_context_block, resolve_provider_context_budget, select_strategy,
-        ContextEngine, ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
+        render_agent_plan_context_block, resolve_provider_context_budget,
+        runtime_resource_manifest_segment, select_strategy, ContextEngine,
+        ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
         ContextEngineAfterTurnOutcome, ContextEngineCompactFuture,
         ContextEngineCompactionDisposition, ContextEngineCompactionOutcome,
         ContextEngineCompactionRequest, ContextEngineDescriptor, ContextEnginePrepareFuture,
@@ -3371,6 +3404,10 @@ mod tests {
     };
     use crate::application::plan_state::{
         AgentPlanItem, AgentPlanStatus, AGENT_PLAN_SCHEMA_VERSION,
+    };
+    use crate::application::runtime_resource_manifest::{
+        build_runtime_resource_manifest, RuntimeResourceCollisionBehavior, RuntimeResourceKind,
+        RuntimeResourceManifestItem, RuntimeResourceScope,
     };
     use crate::application::session_compaction::render_compaction_prompt_block;
     use crate::application::tool_registry::ModelVisibleToolCatalogSnapshot;
@@ -3804,6 +3841,55 @@ mod tests {
             .expect("plan segment should be selected");
         assert_eq!(segment.source_kind, ContextSourceKind::RuntimeState);
         assert_eq!(segment.include_reason, "active_agent_plan_state");
+    }
+
+    #[test]
+    fn runtime_resource_manifest_segment_is_hash_only_runtime_state() {
+        let manifest = build_runtime_resource_manifest([RuntimeResourceManifestItem {
+            resource_id: "docs".to_owned(),
+            kind: RuntimeResourceKind::ContextSnippet,
+            scope: RuntimeResourceScope::Project,
+            source_scope: "project:docs".to_owned(),
+            provenance: "mcp://docs".to_owned(),
+            snapshot_hash: "sha256:project-docs".to_owned(),
+            required_scopes: vec!["project".to_owned()],
+            collision_behavior: RuntimeResourceCollisionBehavior::Reject,
+        }]);
+        let context = RequestContext {
+            principal: "principal-1".to_owned(),
+            device_id: "01HZ0000000000000000000000".to_owned(),
+            channel: Some("console".to_owned()),
+        };
+
+        let assembled = assemble_segments(
+            &[runtime_resource_manifest_segment(&manifest)],
+            ContextEngineStrategy::Noop,
+            budget(16_000, 1_000, 256, 128, false),
+            &context,
+            "session-1",
+            None,
+        );
+
+        assert!(assembled.prompt_text.contains("<runtime_resource_manifest"));
+        assert!(assembled.prompt_text.contains("sha256:project-docs"));
+        assert!(!assembled.prompt_text.contains("raw document body"));
+        let segment = assembled
+            .explain
+            .selected_segments
+            .iter()
+            .find(|segment| segment.kind == ContextSegmentKind::RuntimeResourceManifest)
+            .expect("runtime manifest segment should be selected");
+        assert_eq!(segment.source_kind, ContextSourceKind::RuntimeState);
+        assert_eq!(segment.include_reason, "stable_context_prefix");
+        assert!(segment
+            .source_refs
+            .iter()
+            .any(|source_ref| source_ref.starts_with("runtime_resource_manifest_hash:")));
+        assert!(assembled
+            .explain
+            .assembly_steps
+            .iter()
+            .any(|step| step.step == "runtime_state" && step.included));
     }
 
     #[test]

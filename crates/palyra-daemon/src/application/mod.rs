@@ -49,6 +49,7 @@ pub mod release_hardening;
 pub mod replay_continuity;
 pub mod resume_classifier;
 pub mod runtime_boundary_metrics;
+pub mod runtime_resource_manifest;
 pub mod service_authorization;
 pub mod session_compaction;
 pub mod session_pruning;

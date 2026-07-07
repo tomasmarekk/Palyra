@@ -53,7 +53,7 @@ pub const DEFAULT_TYPED_PLUGIN_CONTRACT_TIMEOUT_MS: u64 = 2_000;
 /// Schema version for the public plugin SDK contract snapshot.
 pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Version identifier for the current plugin SDK contract snapshot.
-pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION: &str = "plugin-sdk-contracts.v2";
+pub const PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION: &str = "plugin-sdk-contracts.v3";
 
 /// Typed plugin extension points the host can negotiate.
 ///
@@ -141,6 +141,8 @@ pub enum HostCapabilityServiceKind {
     MemoryProposeCandidate,
     BoundedLlmComplete,
     VaultSecretLeaseRequest,
+    AgentHarnessCallback,
+    AgentHarnessDisposeCleanup,
 }
 
 impl HostCapabilityServiceKind {
@@ -158,6 +160,8 @@ impl HostCapabilityServiceKind {
             Self::MemoryProposeCandidate => "memory_propose_candidate",
             Self::BoundedLlmComplete => "bounded_llm_complete",
             Self::VaultSecretLeaseRequest => "vault_secret_lease_request",
+            Self::AgentHarnessCallback => "agent_harness_callback",
+            Self::AgentHarnessDisposeCleanup => "agent_harness_dispose_cleanup",
         }
     }
 }
@@ -314,8 +318,10 @@ pub enum TypedPluginContractOperation {
     ConnectorInbound,
     ConnectorOutbound,
     ConnectorRateLimit,
+    SupportsAgentAttempt,
     ClaimAgentAttempt,
     RunAgentAttempt,
+    DisposeAgentHarness,
     TransformToolResult,
     OnInstall,
     OnEnable,
@@ -347,8 +353,10 @@ impl TypedPluginContractOperation {
             Self::ConnectorInbound => "connector_inbound",
             Self::ConnectorOutbound => "connector_outbound",
             Self::ConnectorRateLimit => "connector_rate_limit",
+            Self::SupportsAgentAttempt => "supports_agent_attempt",
             Self::ClaimAgentAttempt => "claim_agent_attempt",
             Self::RunAgentAttempt => "run_agent_attempt",
+            Self::DisposeAgentHarness => "dispose_agent_harness",
             Self::TransformToolResult => "transform_tool_result",
             Self::OnInstall => "on_install",
             Self::OnEnable => "on_enable",
@@ -826,8 +834,10 @@ pub fn typed_plugin_contract_descriptor(
             "palyra.plugin.agent_harness.outcome.v1",
             TypedPluginDataSensitivity::Sensitive,
             vec![
+                TypedPluginContractOperation::SupportsAgentAttempt,
                 TypedPluginContractOperation::ClaimAgentAttempt,
                 TypedPluginContractOperation::RunAgentAttempt,
+                TypedPluginContractOperation::DisposeAgentHarness,
             ],
             Vec::new(),
             vec![
@@ -835,17 +845,29 @@ pub fn typed_plugin_contract_descriptor(
                 "harness_claim_declined".to_owned(),
                 "harness_attempt_timeout".to_owned(),
                 "harness_callback_denied".to_owned(),
+                "harness_resource_scope_denied".to_owned(),
+                "harness_dispose_failed".to_owned(),
             ],
             vec![
+                "attempt.callback_payload".to_owned(),
+                "attempt.resource_manifest".to_owned(),
                 "attempt.sanitized_transcript_view".to_owned(),
                 "attempt.auth_state_metadata".to_owned(),
             ],
             vec![
+                "agent_harness.supports".to_owned(),
                 "agent_harness.claim".to_owned(),
                 "agent_harness.started".to_owned(),
+                "agent_harness.callback".to_owned(),
                 "agent_harness.completed".to_owned(),
+                "agent_harness.disposed".to_owned(),
             ],
-            vec!["agent_harness.claim_latency".to_owned(), "agent_harness.run_latency".to_owned()],
+            vec![
+                "agent_harness.supports_latency".to_owned(),
+                "agent_harness.claim_latency".to_owned(),
+                "agent_harness.run_latency".to_owned(),
+                "agent_harness.dispose_latency".to_owned(),
+            ],
         ),
         TypedPluginContractKind::ToolResultMiddleware => build_descriptor(
             kind,
@@ -1045,6 +1067,8 @@ pub fn supported_host_capability_services() -> Vec<HostCapabilityServiceDescript
         HostCapabilityServiceKind::MemoryProposeCandidate,
         HostCapabilityServiceKind::BoundedLlmComplete,
         HostCapabilityServiceKind::VaultSecretLeaseRequest,
+        HostCapabilityServiceKind::AgentHarnessCallback,
+        HostCapabilityServiceKind::AgentHarnessDisposeCleanup,
     ]
     .into_iter()
     .map(host_capability_service_descriptor)
@@ -1058,7 +1082,7 @@ pub fn plugin_sdk_contract_snapshot() -> PluginSdkContractSnapshot {
         schema_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_SCHEMA_VERSION,
         snapshot_version: PLUGIN_SDK_CONTRACT_SNAPSHOT_VERSION.to_owned(),
         changelog_note:
-            "Adds agent harness, tool-result middleware, plugin lifecycle, and capability manifest descriptors."
+            "Adds explicit agent harness supports/dispose operations, callback cleanup services, and least-privilege manifest fields for sensitivity, tools, and resource needs."
                 .to_owned(),
         compatibility_policy: PluginSdkCompatibilityPolicy {
             breaking_change_requires_version_bump: true,
@@ -1088,6 +1112,9 @@ pub fn plugin_capability_manifest_descriptor() -> PluginCapabilityManifestDescri
             "operator.plugin.default_module_path".to_owned(),
             "operator.plugin.contracts".to_owned(),
             "operator.plugin.required_capabilities".to_owned(),
+            "operator.plugin.sensitivity".to_owned(),
+            "operator.plugin.tools_posture".to_owned(),
+            "operator.plugin.resource_needs".to_owned(),
         ],
         lifecycle_hooks: vec![
             TypedPluginContractOperation::OnInstall,
@@ -1102,6 +1129,9 @@ pub fn plugin_capability_manifest_descriptor() -> PluginCapabilityManifestDescri
             "resource_permissions".to_owned(),
             "egress_policy".to_owned(),
             "secret_redaction".to_owned(),
+            "agent_harness_fake_host".to_owned(),
+            "agent_harness_dispose_cleanup".to_owned(),
+            "no_raw_vault_access".to_owned(),
             "hook_timeout".to_owned(),
             "invalid_manifest".to_owned(),
             "invalid_signature".to_owned(),
@@ -1180,6 +1210,15 @@ pub fn host_capability_service_descriptor(
                 8 * 1024,
                 vec!["secret.ref".to_owned(), "lease.metadata".to_owned()],
             ),
+            HostCapabilityServiceKind::AgentHarnessCallback => (
+                None,
+                1_000,
+                16 * 1024,
+                vec!["callback.payload".to_owned(), "callback.transcript_view".to_owned()],
+            ),
+            HostCapabilityServiceKind::AgentHarnessDisposeCleanup => {
+                (None, 1_000, 8 * 1024, vec!["cleanup.resource_refs".to_owned()])
+            }
         };
     HostCapabilityServiceDescriptor {
         service,
@@ -1427,7 +1466,13 @@ mod tests {
         }));
         assert!(supported.iter().any(|descriptor| {
             descriptor.kind == TypedPluginContractKind::AgentHarness
+                && descriptor
+                    .operations
+                    .contains(&TypedPluginContractOperation::SupportsAgentAttempt)
                 && descriptor.operations.contains(&TypedPluginContractOperation::RunAgentAttempt)
+                && descriptor
+                    .operations
+                    .contains(&TypedPluginContractOperation::DisposeAgentHarness)
                 && descriptor.allowed_capability_classes.is_empty()
         }));
         assert!(supported.iter().any(|descriptor| {
@@ -1493,6 +1538,17 @@ mod tests {
             "vault host service may return lease metadata, never raw secret material"
         );
         assert_eq!(vault.audit_event, "plugin.host_call.invoked");
+
+        let callback =
+            host_capability_service_descriptor(HostCapabilityServiceKind::AgentHarnessCallback);
+        assert_eq!(callback.required_capability_class, None);
+        assert!(callback.redacted_fields.contains(&"callback.payload".to_owned()));
+
+        let dispose = host_capability_service_descriptor(
+            HostCapabilityServiceKind::AgentHarnessDisposeCleanup,
+        );
+        assert_eq!(dispose.required_capability_class, None);
+        assert!(!dispose.returns_secret_material);
     }
 
     #[test]
@@ -1504,14 +1560,25 @@ mod tests {
         assert!(descriptor
             .required_manifest_fields
             .contains(&"operator.plugin.contracts".to_owned()));
+        assert!(descriptor
+            .required_manifest_fields
+            .contains(&"operator.plugin.sensitivity".to_owned()));
+        assert!(descriptor
+            .required_manifest_fields
+            .contains(&"operator.plugin.tools_posture".to_owned()));
+        assert!(descriptor
+            .required_manifest_fields
+            .contains(&"operator.plugin.resource_needs".to_owned()));
         assert!(descriptor.lifecycle_hooks.contains(&TypedPluginContractOperation::OnInstall));
+        assert!(descriptor.conformance_fixtures.contains(&"agent_harness_fake_host".to_owned()));
+        assert!(descriptor.conformance_fixtures.contains(&"no_raw_vault_access".to_owned()));
         assert!(descriptor.conformance_fixtures.contains(&"hook_timeout".to_owned()));
         assert!(descriptor.conformance_fixtures.contains(&"output_too_large".to_owned()));
     }
 
     #[test]
     fn typed_contract_abi_fingerprint_matches_golden() {
-        const EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT: u64 = 0xb9d0_eb2a_e2b8_4caf;
+        const EXPECTED_TYPED_CONTRACT_ABI_FINGERPRINT: u64 = 0x7fb8_7270_30a9_d282;
         let snapshot = typed_contract_abi_snapshot();
         assert_eq!(
             typed_contract_abi_fingerprint(),
@@ -1525,7 +1592,7 @@ mod tests {
         let snapshot = serde_json::to_value(plugin_sdk_contract_snapshot())
             .expect("plugin SDK snapshot should serialize");
         assert_eq!(snapshot["schema_version"], 1);
-        assert_eq!(snapshot["snapshot_version"], "plugin-sdk-contracts.v2");
+        assert_eq!(snapshot["snapshot_version"], "plugin-sdk-contracts.v3");
         assert!(snapshot["compatibility_policy"]["breaking_change_requires_migration_note"]
             .as_bool()
             .unwrap_or_default());

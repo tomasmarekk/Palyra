@@ -5,6 +5,9 @@
       "resource_permissions",
       "egress_policy",
       "secret_redaction",
+      "agent_harness_fake_host",
+      "agent_harness_dispose_cleanup",
+      "no_raw_vault_access",
       "hook_timeout",
       "invalid_manifest",
       "invalid_signature",
@@ -25,12 +28,15 @@
       "operator.plugin.abi_major",
       "operator.plugin.default_module_path",
       "operator.plugin.contracts",
-      "operator.plugin.required_capabilities"
+      "operator.plugin.required_capabilities",
+      "operator.plugin.sensitivity",
+      "operator.plugin.tools_posture",
+      "operator.plugin.resource_needs"
     ],
     "schema_id": "palyra.plugin.capability_manifest.v1",
     "schema_version": 1
   },
-  "changelog_note": "Adds agent harness, tool-result middleware, plugin lifecycle, and capability manifest descriptors.",
+  "changelog_note": "Adds explicit agent harness supports/dispose operations, callback cleanup services, and least-privilege manifest fields for sensitivity, tools, and resource needs.",
   "compatibility_policy": {
     "breaking_change_requires_migration_note": true,
     "breaking_change_requires_version_bump": true,
@@ -140,6 +146,27 @@
       "required_capability_class": "secrets",
       "returns_secret_material": false,
       "service": "vault_secret_lease_request"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 16384,
+      "redacted_fields": [
+        "callback.payload",
+        "callback.transcript_view"
+      ],
+      "returns_secret_material": false,
+      "service": "agent_harness_callback"
+    },
+    {
+      "audit_event": "plugin.host_call.invoked",
+      "default_timeout_ms": 1000,
+      "max_payload_bytes": 8192,
+      "redacted_fields": [
+        "cleanup.resource_refs"
+      ],
+      "returns_secret_material": false,
+      "service": "agent_harness_dispose_cleanup"
     }
   ],
   "schema_version": 1,
@@ -147,7 +174,7 @@
   "sdk_abi_max_major": 1,
   "sdk_abi_min_major": 1,
   "sdk_abi_version": "palyra.plugins.sdk.abi.v1",
-  "snapshot_version": "plugin-sdk-contracts.v2",
+  "snapshot_version": "plugin-sdk-contracts.v3",
   "typed_contracts": [
     {
       "allowed_capability_classes": [
@@ -634,16 +661,21 @@
     {
       "allowed_capability_classes": [],
       "audit_hooks": [
+        "agent_harness.supports",
         "agent_harness.claim",
         "agent_harness.started",
-        "agent_harness.completed"
+        "agent_harness.callback",
+        "agent_harness.completed",
+        "agent_harness.disposed"
       ],
       "default_timeout_ms": 2000,
       "error_codes": [
         "contract_negotiation_failed",
         "harness_claim_declined",
         "harness_attempt_timeout",
-        "harness_callback_denied"
+        "harness_callback_denied",
+        "harness_resource_scope_denied",
+        "harness_dispose_failed"
       ],
       "input_schema": "palyra.plugin.agent_harness.prepared_attempt.v1",
       "kind": "agent_harness",
@@ -655,15 +687,21 @@
         "audit"
       ],
       "observability_hooks": [
+        "agent_harness.supports_latency",
         "agent_harness.claim_latency",
-        "agent_harness.run_latency"
+        "agent_harness.run_latency",
+        "agent_harness.dispose_latency"
       ],
       "operations": [
+        "supports_agent_attempt",
         "claim_agent_attempt",
-        "run_agent_attempt"
+        "run_agent_attempt",
+        "dispose_agent_harness"
       ],
       "output_schema": "palyra.plugin.agent_harness.outcome.v1",
       "redacted_fields": [
+        "attempt.callback_payload",
+        "attempt.resource_manifest",
         "attempt.sanitized_transcript_view",
         "attempt.auth_state_metadata"
       ],

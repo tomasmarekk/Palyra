@@ -334,9 +334,10 @@ pub(crate) struct FilteredToolCatalogEntry {
 
 /// Immutable per-provider-turn tool catalog.
 ///
-/// `catalog_hash` covers every model-visible field (see
-/// `hashing::catalog_hash_payload`) and `snapshot_id` is derived from it, so
-/// identical build inputs always produce identical ids.
+/// `catalog_hash` covers the model-visible catalog and stable runtime
+/// availability decisions (see `hashing::catalog_hash_payload`), and
+/// `snapshot_id` is derived from it, so identical build inputs always produce
+/// identical ids.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ModelVisibleToolCatalogSnapshot {
     pub(crate) schema_version: u32,

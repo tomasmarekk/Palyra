@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::types::ModelVisibleToolCatalogSnapshot;
+use super::types::{AvailabilityProbeResult, ModelVisibleToolCatalogSnapshot};
 
 /// Builds the JSON payload hashed into `catalog_hash`.
 ///
@@ -35,11 +35,26 @@ pub(super) fn catalog_hash_payload(snapshot: &ModelVisibleToolCatalogSnapshot) -
         "estimated_direct_tool_bytes": snapshot.estimated_direct_tool_bytes,
         "estimated_exposed_tool_bytes": snapshot.estimated_exposed_tool_bytes,
         "estimated_saved_bytes": snapshot.estimated_saved_bytes,
-        "availability_probes": snapshot.availability_probes,
+        "availability_probes": snapshot
+            .availability_probes
+            .iter()
+            .map(catalog_hash_availability_probe_payload)
+            .collect::<Vec<_>>(),
         "index": snapshot.index,
         "indexed_tools": snapshot.indexed_tools,
         "tools": snapshot.tools,
         "filtered_tools": snapshot.filtered_tools,
+    })
+}
+
+fn catalog_hash_availability_probe_payload(probe: &AvailabilityProbeResult) -> Value {
+    json!({
+        "runtime": probe.runtime,
+        "status": probe.status,
+        "reason_code": probe.reason_code,
+        "cache_key_hash": probe.cache_key_hash,
+        "config_hash": probe.config_hash,
+        "grace_allowed": probe.grace_allowed,
     })
 }
 

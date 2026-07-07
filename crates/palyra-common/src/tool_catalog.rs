@@ -251,6 +251,10 @@ const OPS_PROFILE_TOOLS: &[&str] = &[
     "palyra.fs.apply_patch",
     "palyra.fs.os_file",
     "palyra.http.fetch",
+    "palyra.mcp.resources.list",
+    "palyra.mcp.resources.read",
+    "palyra.mcp.prompts.list",
+    "palyra.mcp.prompts.get",
     "palyra.process.run",
     "palyra.tool_program.run",
     "palyra.plugin.run",
@@ -427,6 +431,12 @@ pub fn tool_metadata(tool_name: &str) -> Option<ToolMetadata> {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.tools.search" | "palyra.tools.describe" | "palyra.tools.invoke" => {
+            Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
+        }
+        "palyra.mcp.resources.list"
+        | "palyra.mcp.resources.read"
+        | "palyra.mcp.prompts.list"
+        | "palyra.mcp.prompts.get" => {
             Some(ToolMetadata { capabilities: EMPTY_TOOL_CAPABILITIES, default_sensitive: false })
         }
         "palyra.memory.status" => {
@@ -758,6 +768,22 @@ mod tests {
     #[test]
     fn tool_catalog_bridge_tools_do_not_require_approval() {
         for tool_name in ["palyra.tools.search", "palyra.tools.describe", "palyra.tools.invoke"] {
+            assert!(!tool_requires_approval(tool_name));
+            assert!(tool_policy_capability_names(tool_name).is_empty());
+        }
+    }
+
+    #[test]
+    fn mcp_utility_tools_are_ops_profile_read_only() {
+        let report =
+            expand_toolset_profiles(&[String::from("ops")], &[], &[], &[]).expect("ops profile");
+        for tool_name in [
+            "palyra.mcp.resources.list",
+            "palyra.mcp.resources.read",
+            "palyra.mcp.prompts.list",
+            "palyra.mcp.prompts.get",
+        ] {
+            assert!(report.effective_allowed_tools.contains(&tool_name.to_owned()));
             assert!(!tool_requires_approval(tool_name));
             assert!(tool_policy_capability_names(tool_name).is_empty());
         }

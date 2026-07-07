@@ -360,7 +360,7 @@ export function SupportSection({ app }: SupportSectionProps) {
         <WorkspaceMetricCard
           label="Config ref health"
           value={readNumber(configRefSummary ?? {}, "blocking_refs") ?? 0}
-          detail={`${readNumber(configRefSummary ?? {}, "warning_refs") ?? 0} warnings Â· ${configRefState}`}
+          detail={`${readNumber(configRefSummary ?? {}, "warning_refs") ?? 0} warnings - ${configRefState}`}
           tone={configRefState === "ok" ? "success" : "warning"}
         />
         <WorkspaceMetricCard
