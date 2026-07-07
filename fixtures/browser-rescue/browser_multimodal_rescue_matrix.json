@@ -38,6 +38,22 @@
         "retry_with_prompt",
         "fail_deterministic"
       ]
+    },
+    {
+      "id": "corrupted_browser_session_explicit_rescue",
+      "trigger": "browser_state_corruption",
+      "rollout_maturity": "preview",
+      "expected_trace_event": "browser.rescue.requested",
+      "expected_reason_code": "browser_rescue.explicit_trigger",
+      "raw_browser_payload_visible": false,
+      "deterministic_outcomes": ["session_recovered", "deterministic_fail"]
+    },
+    {
+      "id": "policy_denied_does_not_trigger_rescue",
+      "trigger": "policy_denied",
+      "expected_trace_event": "browser.rescue.skipped",
+      "expected_reason_code": "browser_rescue.policy_denied_no_rescue",
+      "attempt_rescue": false
     }
   ]
 }

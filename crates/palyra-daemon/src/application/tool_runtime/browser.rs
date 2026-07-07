@@ -212,6 +212,82 @@ fn browser_rescue_rollout_disabled_output(tool_name: &str) -> Value {
     })
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserRescueTriggerKind {
+    ExplicitBrowserToolFailure,
+    BrowserStateCorruption,
+    PolicyDenied,
+    NetworkEgressDenied,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserRescueTriggerDecision {
+    attempt_rescue: bool,
+    reason_code: &'static str,
+    trace_event: &'static str,
+    maturity: &'static str,
+}
+
+#[allow(dead_code)]
+fn evaluate_browser_rescue_trigger(
+    rollout_enabled: bool,
+    trigger: BrowserRescueTriggerKind,
+) -> BrowserRescueTriggerDecision {
+    if !rollout_enabled {
+        return BrowserRescueTriggerDecision {
+            attempt_rescue: false,
+            reason_code: "browser_rescue.rollout_disabled",
+            trace_event: "browser.rescue.skipped",
+            maturity: "preview",
+        };
+    }
+    match trigger {
+        BrowserRescueTriggerKind::ExplicitBrowserToolFailure
+        | BrowserRescueTriggerKind::BrowserStateCorruption => BrowserRescueTriggerDecision {
+            attempt_rescue: true,
+            reason_code: "browser_rescue.explicit_trigger",
+            trace_event: "browser.rescue.requested",
+            maturity: "preview",
+        },
+        BrowserRescueTriggerKind::PolicyDenied => BrowserRescueTriggerDecision {
+            attempt_rescue: false,
+            reason_code: "browser_rescue.policy_denied_no_rescue",
+            trace_event: "browser.rescue.skipped",
+            maturity: "preview",
+        },
+        BrowserRescueTriggerKind::NetworkEgressDenied => BrowserRescueTriggerDecision {
+            attempt_rescue: false,
+            reason_code: "browser_rescue.egress_denied_no_rescue",
+            trace_event: "browser.rescue.skipped",
+            maturity: "preview",
+        },
+    }
+}
+
+#[allow(dead_code)]
+fn browser_rescue_trace_payload(
+    profile_id: &str,
+    trigger: BrowserRescueTriggerKind,
+    decision: &BrowserRescueTriggerDecision,
+) -> Value {
+    json!({
+        "event_type": decision.trace_event,
+        "profile_id": crate::sha256_hex(profile_id.as_bytes()),
+        "rescue_kind": match trigger {
+            BrowserRescueTriggerKind::ExplicitBrowserToolFailure => "explicit_browser_tool_failure",
+            BrowserRescueTriggerKind::BrowserStateCorruption => "browser_state_corruption",
+            BrowserRescueTriggerKind::PolicyDenied => "policy_denied",
+            BrowserRescueTriggerKind::NetworkEgressDenied => "network_egress_denied",
+        },
+        "policy_decision": decision.reason_code,
+        "attempt_rescue": decision.attempt_rescue,
+        "maturity": decision.maturity,
+        "raw_browser_payload_visible": false,
+    })
+}
+
 fn browser_cdp_method_allowed(method: &str) -> bool {
     matches!(method, "Page.getLayoutMetrics" | "DOM.getDocument" | "Accessibility.getFullAXTree")
 }
@@ -5839,19 +5915,21 @@ mod tests {
         browser_max_redirects_from_payload, browser_network_log_entry_to_json,
         browser_observe_include_visible_text, browser_output_with_runtime_capabilities,
         browser_reload_expected_url_from_payload, browser_rescue_rollout_disabled_output,
-        browser_screenshot_image_observation_hint, browser_session_closed_error_message,
-        browser_session_closed_output_json, browser_session_persistence_from_payload,
-        browser_session_profile_id_from_payload, browser_storage_origin_to_json,
-        browser_tool_execution_outcome, browser_tool_reports_missing_session,
-        browser_tool_requires_open_session, browser_url_targets_loopback,
-        browser_user_owned_os_roots, browser_viewport_metric_mismatch_error,
-        canonical_file_path_is_inside_workspace_roots, default_browser_session_persistence_id,
+        browser_rescue_trace_payload, browser_screenshot_image_observation_hint,
+        browser_session_closed_error_message, browser_session_closed_output_json,
+        browser_session_persistence_from_payload, browser_session_profile_id_from_payload,
+        browser_storage_origin_to_json, browser_tool_execution_outcome,
+        browser_tool_reports_missing_session, browser_tool_requires_open_session,
+        browser_url_targets_loopback, browser_user_owned_os_roots,
+        browser_viewport_metric_mismatch_error, canonical_file_path_is_inside_workspace_roots,
+        default_browser_session_persistence_id, evaluate_browser_rescue_trigger,
         filter_browser_network_log_entries_since, normalize_browser_press_key_input,
         parse_browser_download_artifact_id, parse_browser_observe_string_array,
         resolve_browser_output_path, resolve_browser_upload_path,
         validate_browser_file_url_path_scope, validate_browser_workspace_relative_path,
-        write_browser_output_file, BrowserRuntimeCapabilities, BROWSER_CALLER_PRINCIPAL_HEADER,
-        BROWSER_COOKIE_VALUE_WITHHELD, BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
+        write_browser_output_file, BrowserRescueTriggerKind, BrowserRuntimeCapabilities,
+        BROWSER_CALLER_PRINCIPAL_HEADER, BROWSER_COOKIE_VALUE_WITHHELD,
+        BROWSER_STORAGE_VALUE_WITHHELD, PALYRA_OS_FILE_ROOTS_ENV,
     };
     use crate::application::tool_runtime::workspace_scope::ActiveWorkspaceRoot;
     use crate::gateway::{
@@ -5922,6 +6000,35 @@ mod tests {
         assert!(browser_tool_requires_open_session(BROWSER_VISION_TOOL_NAME));
         assert!(browser_tool_requires_open_session(BROWSER_IMAGES_LIST_TOOL_NAME));
         assert!(browser_tool_requires_open_session(BROWSER_CDP_INVOKE_TOOL_NAME));
+
+        let explicit = evaluate_browser_rescue_trigger(
+            true,
+            BrowserRescueTriggerKind::ExplicitBrowserToolFailure,
+        );
+        assert!(explicit.attempt_rescue);
+        assert_eq!(explicit.trace_event, "browser.rescue.requested");
+
+        let corruption =
+            evaluate_browser_rescue_trigger(true, BrowserRescueTriggerKind::BrowserStateCorruption);
+        let trace = browser_rescue_trace_payload(
+            "profile-1",
+            BrowserRescueTriggerKind::BrowserStateCorruption,
+            &corruption,
+        );
+        assert!(corruption.attempt_rescue);
+        assert_eq!(trace["rescue_kind"], "browser_state_corruption");
+        assert_eq!(trace["raw_browser_payload_visible"], false);
+        assert_ne!(trace["profile_id"], "profile-1");
+
+        let policy_denied =
+            evaluate_browser_rescue_trigger(true, BrowserRescueTriggerKind::PolicyDenied);
+        assert!(!policy_denied.attempt_rescue);
+        assert_eq!(policy_denied.reason_code, "browser_rescue.policy_denied_no_rescue");
+
+        let egress_denied =
+            evaluate_browser_rescue_trigger(true, BrowserRescueTriggerKind::NetworkEgressDenied);
+        assert!(!egress_denied.attempt_rescue);
+        assert_eq!(egress_denied.reason_code, "browser_rescue.egress_denied_no_rescue");
     }
 
     /// Sets an env var for the test's lifetime and restores the previous

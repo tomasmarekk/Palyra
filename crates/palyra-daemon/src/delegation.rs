@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tonic::Status;
 
+pub(crate) mod child_session;
+
 const DELEGATED_RUN_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_MAX_ATTEMPTS: u64 = 3;
 const DEFAULT_MAX_CONCURRENT_CHILDREN: u64 = 2;

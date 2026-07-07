@@ -116,6 +116,56 @@ pub(crate) struct ObjectiveJudgeOutput {
     pub redaction_level: String,
 }
 
+/// Non-authoritative finalization review decision derived from judge output.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ObjectiveFinalizationDecision {
+    Pass,
+    NeedsRevision,
+    NotApplicable,
+}
+
+#[allow(dead_code)]
+impl ObjectiveFinalizationDecision {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::NeedsRevision => "needs_revision",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// Inputs for building the final pre-answer objective review projection.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ObjectiveFinalizationReviewInput {
+    pub rollout_enabled: bool,
+    pub candidate_final_answer_present: bool,
+    pub completed_evidence_refs: Vec<String>,
+    pub advisor_summary_refs: Vec<String>,
+    pub revision_budget_tokens: u64,
+}
+
+/// Advisory finalization review consumed by host finalizer surfaces.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ObjectiveFinalizationReview {
+    pub schema_version: u32,
+    pub decision: ObjectiveFinalizationDecision,
+    pub decision_wire: String,
+    pub non_authoritative: bool,
+    pub can_mutate_final_answer: bool,
+    pub revision_budget_tokens: u64,
+    pub explanation: String,
+    pub evidence_refs: Vec<String>,
+    pub advisor_summary_refs: Vec<String>,
+    pub event_type: String,
+    pub reason_code: String,
+    pub redaction_level: String,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RawObjectiveJudgeOutput {
@@ -253,6 +303,84 @@ pub(crate) fn invalid_objective_judge_input_result(
         ),
         parse_failed: true,
         last_error: Some(message),
+    }
+}
+
+/// Builds the non-authoritative finalization review from an optional judge output.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn build_objective_finalization_review(
+    input: ObjectiveFinalizationReviewInput,
+    judge_output: Option<&ObjectiveJudgeOutput>,
+) -> ObjectiveFinalizationReview {
+    let (decision, explanation, reason_code) = if !input.rollout_enabled {
+        (
+            ObjectiveFinalizationDecision::NotApplicable,
+            "objective judge rollout is disabled".to_owned(),
+            "objective_finalization_review.rollout_disabled".to_owned(),
+        )
+    } else if !input.candidate_final_answer_present {
+        (
+            ObjectiveFinalizationDecision::NotApplicable,
+            "no candidate final answer is available for review".to_owned(),
+            "objective_finalization_review.no_candidate_final".to_owned(),
+        )
+    } else if let Some(output) = judge_output {
+        finalization_decision_from_judge(output)
+    } else {
+        (
+            ObjectiveFinalizationDecision::NotApplicable,
+            "objective judge output is unavailable".to_owned(),
+            "objective_finalization_review.judge_unavailable".to_owned(),
+        )
+    };
+    ObjectiveFinalizationReview {
+        schema_version: OBJECTIVE_JUDGE_SCHEMA_VERSION,
+        decision,
+        decision_wire: decision.as_str().to_owned(),
+        non_authoritative: true,
+        can_mutate_final_answer: false,
+        revision_budget_tokens: input.revision_budget_tokens.min(1_000),
+        explanation,
+        evidence_refs: normalize_refs(input.completed_evidence_refs),
+        advisor_summary_refs: normalize_refs(input.advisor_summary_refs),
+        event_type: "objective.finalization_review.completed".to_owned(),
+        reason_code,
+        redaction_level: default_objective_judge_redaction_level(),
+    }
+}
+
+#[allow(dead_code)]
+fn finalization_decision_from_judge(
+    output: &ObjectiveJudgeOutput,
+) -> (ObjectiveFinalizationDecision, String, String) {
+    if output.degraded {
+        return (
+            ObjectiveFinalizationDecision::NotApplicable,
+            "degraded objective judge output cannot block terminal failure".to_owned(),
+            "objective_finalization_review.degraded_not_applicable".to_owned(),
+        );
+    }
+    match output.status {
+        ObjectiveJudgeStatus::Done => (
+            ObjectiveFinalizationDecision::Pass,
+            output.summary.clone(),
+            "objective_finalization_review.pass".to_owned(),
+        ),
+        ObjectiveJudgeStatus::NotDone
+        | ObjectiveJudgeStatus::Blocked
+        | ObjectiveJudgeStatus::Wait => (
+            ObjectiveFinalizationDecision::NeedsRevision,
+            output.next_action.clone().unwrap_or_else(|| output.summary.clone()),
+            "objective_finalization_review.needs_revision".to_owned(),
+        ),
+        ObjectiveJudgeStatus::NeedsUser => (
+            ObjectiveFinalizationDecision::NeedsRevision,
+            output.blocked_reason.clone().unwrap_or_else(|| {
+                "objective judge needs user input before final answer".to_owned()
+            }),
+            "objective_finalization_review.needs_user".to_owned(),
+        ),
     }
 }
 
@@ -407,7 +535,9 @@ struct ObjectiveJudgeParseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_objective_judge_prompt, materialize_objective_judge_result, ObjectiveJudgeInput,
+        build_objective_finalization_review, build_objective_judge_prompt,
+        materialize_objective_judge_result, ObjectiveFinalizationDecision,
+        ObjectiveFinalizationReviewInput, ObjectiveJudgeInput, ObjectiveJudgeOutput,
         ObjectiveJudgeStatus, OBJECTIVE_JUDGE_FAILED_EVENT, OBJECTIVE_JUDGE_SCHEMA_VERSION,
     };
     use crate::objectives::{
@@ -514,5 +644,70 @@ mod tests {
         assert_eq!(ObjectiveJudgeStatus::Blocked.as_str(), "blocked");
         assert_eq!(ObjectiveJudgeStatus::NeedsUser.as_str(), "needs_user");
         assert_eq!(ObjectiveJudgeStatus::Wait.as_str(), "wait");
+    }
+
+    fn finalization_input() -> ObjectiveFinalizationReviewInput {
+        ObjectiveFinalizationReviewInput {
+            rollout_enabled: true,
+            candidate_final_answer_present: true,
+            completed_evidence_refs: vec!["cargo:test".to_owned()],
+            advisor_summary_refs: vec!["advisor:security".to_owned()],
+            revision_budget_tokens: 5_000,
+        }
+    }
+
+    fn judge_output(status: ObjectiveJudgeStatus, degraded: bool) -> ObjectiveJudgeOutput {
+        ObjectiveJudgeOutput {
+            schema_version: OBJECTIVE_JUDGE_SCHEMA_VERSION,
+            status,
+            summary: "review summary".to_owned(),
+            confidence_bps: 9_000,
+            evidence_refs: vec!["cargo:test".to_owned()],
+            missing_evidence: Vec::new(),
+            next_action: Some("run missing verification".to_owned()),
+            blocked_reason: Some("needs operator input".to_owned()),
+            degraded,
+            backoff_ms: degraded.then_some(30_000),
+            reason_code: "judge".to_owned(),
+            redaction_level: "metadata_only".to_owned(),
+        }
+    }
+
+    #[test]
+    fn finalization_review_passes_without_final_mutation_authority() {
+        let review = build_objective_finalization_review(
+            finalization_input(),
+            Some(&judge_output(ObjectiveJudgeStatus::Done, false)),
+        );
+
+        assert_eq!(review.decision, ObjectiveFinalizationDecision::Pass);
+        assert_eq!(review.decision_wire, "pass");
+        assert!(!review.can_mutate_final_answer);
+        assert!(review.non_authoritative);
+        assert_eq!(review.revision_budget_tokens, 1_000);
+        assert_eq!(review.event_type, "objective.finalization_review.completed");
+    }
+
+    #[test]
+    fn finalization_review_requests_bounded_revision() {
+        let review = build_objective_finalization_review(
+            finalization_input(),
+            Some(&judge_output(ObjectiveJudgeStatus::NotDone, false)),
+        );
+
+        assert_eq!(review.decision, ObjectiveFinalizationDecision::NeedsRevision);
+        assert_eq!(review.reason_code, "objective_finalization_review.needs_revision");
+        assert_eq!(review.explanation, "run missing verification");
+    }
+
+    #[test]
+    fn degraded_finalization_review_is_not_applicable() {
+        let review = build_objective_finalization_review(
+            finalization_input(),
+            Some(&judge_output(ObjectiveJudgeStatus::Wait, true)),
+        );
+
+        assert_eq!(review.decision, ObjectiveFinalizationDecision::NotApplicable);
+        assert_eq!(review.reason_code, "objective_finalization_review.degraded_not_applicable");
     }
 }

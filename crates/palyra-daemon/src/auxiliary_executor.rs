@@ -39,6 +39,7 @@ const CLASSIFICATION_DEFAULT_BUDGET_TOKENS: u64 = 600;
 const EXTRACTION_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
 const OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS: u64 = 900;
 const VISION_DEFAULT_BUDGET_TOKENS: u64 = 2_000;
+const AUXILIARY_OUTPUT_TEXT_LIMIT: usize = 4_000;
 
 /// Auxiliary task families this executor can run; a strict subset of
 /// `AuxiliaryTaskKind` (queue-only kinds are handled elsewhere).
@@ -51,6 +52,29 @@ pub(crate) enum AuxiliaryTaskType {
     Extraction,
     ObjectiveJudge,
     Vision,
+}
+
+/// Authority envelope enforced for an auxiliary task family.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuxiliaryAuthorityProfile {
+    ReadOnlyEvidence,
+    FinalizationReview,
+    BrowserRescuePreview,
+}
+
+impl AuxiliaryAuthorityProfile {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnlyEvidence => "read_only_evidence",
+            Self::FinalizationReview => "finalization_review",
+            Self::BrowserRescuePreview => "browser_rescue_preview",
+        }
+    }
+
+    const fn tool_execution_allowed(self) -> bool {
+        false
+    }
 }
 
 impl AuxiliaryTaskType {
@@ -93,6 +117,7 @@ impl AuxiliaryTaskType {
         match self {
             Self::Summary => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::ReadOnlyEvidence,
                 input_contract: "plain_text_context",
                 output_contract: "bounded_plain_text_summary",
                 default_budget_tokens: SUMMARY_DEFAULT_BUDGET_TOKENS,
@@ -104,6 +129,7 @@ impl AuxiliaryTaskType {
             },
             Self::RecallSearch => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::ReadOnlyEvidence,
                 input_contract: "query_plus_optional_context",
                 output_contract: "ranked_recall_evidence_json",
                 default_budget_tokens: RECALL_SEARCH_DEFAULT_BUDGET_TOKENS,
@@ -115,6 +141,7 @@ impl AuxiliaryTaskType {
             },
             Self::Classification => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::ReadOnlyEvidence,
                 input_contract: "plain_text_or_structured_payload",
                 output_contract: "single_label_json",
                 default_budget_tokens: CLASSIFICATION_DEFAULT_BUDGET_TOKENS,
@@ -126,6 +153,7 @@ impl AuxiliaryTaskType {
             },
             Self::Extraction => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::ReadOnlyEvidence,
                 input_contract: "plain_text_or_structured_payload",
                 output_contract: "bounded_extracted_fields_json",
                 default_budget_tokens: EXTRACTION_DEFAULT_BUDGET_TOKENS,
@@ -137,6 +165,7 @@ impl AuxiliaryTaskType {
             },
             Self::ObjectiveJudge => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::FinalizationReview,
                 input_contract: "objective_judge_input_json",
                 output_contract: "objective_judge_strict_json",
                 default_budget_tokens: OBJECTIVE_JUDGE_DEFAULT_BUDGET_TOKENS,
@@ -148,6 +177,7 @@ impl AuxiliaryTaskType {
             },
             Self::Vision => AuxiliaryTaskContract {
                 task_type: self,
+                authority_profile: AuxiliaryAuthorityProfile::BrowserRescuePreview,
                 input_contract: "prompt_plus_bounded_images",
                 output_contract: "bounded_visual_observation_json",
                 default_budget_tokens: VISION_DEFAULT_BUDGET_TOKENS,
@@ -206,6 +236,7 @@ impl AuxiliaryFallbackPolicy {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) struct AuxiliaryTaskContract {
     pub task_type: AuxiliaryTaskType,
+    pub authority_profile: AuxiliaryAuthorityProfile,
     pub input_contract: &'static str,
     pub output_contract: &'static str,
     pub default_budget_tokens: u64,
@@ -239,6 +270,7 @@ pub(crate) struct AuxiliaryExecutionResult {
     pub task_id: String,
     pub task_type: AuxiliaryTaskType,
     pub output_text: String,
+    pub output_truncated: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
@@ -249,17 +281,20 @@ pub(crate) struct AuxiliaryExecutionResult {
     pub failover_count: u32,
     pub contract: AuxiliaryTaskContract,
     pub routing: RoutingDecision,
+    pub lineage: Value,
 }
 
 impl AuxiliaryExecutionResult {
     /// Serializes the result into the stable JSON shape consumed by task
     /// records and lifecycle event details.
     pub(crate) fn to_result_json(&self) -> Value {
+        let output_text = bounded_output_text(self.output_text.as_str());
         json!({
             "status": "succeeded",
             "task_id": self.task_id,
             "task_type": self.task_type.as_str(),
-            "output_text": self.output_text,
+            "output_text": output_text,
+            "output_truncated": self.output_truncated,
             "usage": {
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
@@ -273,6 +308,12 @@ impl AuxiliaryExecutionResult {
                 "failover_count": self.failover_count,
             },
             "contract": self.contract,
+            "authority": {
+                "profile": self.contract.authority_profile.as_str(),
+                "tool_execution_allowed": self.contract.authority_profile.tool_execution_allowed(),
+                "output_projection": "bounded",
+            },
+            "lineage": self.lineage,
             "routing": self.routing,
         })
     }
@@ -343,6 +384,17 @@ pub(crate) async fn execute_auxiliary_task(
             token_budget: Some(effective_budget),
             details: json!({
                 "contract": contract,
+                "authority": {
+                    "profile": contract.authority_profile.as_str(),
+                    "tool_execution_allowed": contract.authority_profile.tool_execution_allowed(),
+                },
+                "lineage": auxiliary_lineage_projection(
+                    request.task_id.as_str(),
+                    request.session_id.as_str(),
+                    request.run_id.as_deref(),
+                    request.task_type,
+                    contract.authority_profile,
+                ),
                 "model_preference": contract.model_preference.as_str(),
                 "fallback_policy": contract.fallback_policy.as_str(),
                 "routing": routing.clone(),
@@ -390,6 +442,8 @@ pub(crate) async fn execute_auxiliary_task(
         Ok(response) => {
             let result = build_execution_result(
                 request.task_id,
+                request.session_id.clone(),
+                request.run_id.clone(),
                 request.task_type,
                 contract,
                 routing,
@@ -452,15 +506,26 @@ pub(crate) async fn execute_auxiliary_task(
 
 fn build_execution_result(
     task_id: String,
+    session_id: String,
+    run_id: Option<String>,
     task_type: AuxiliaryTaskType,
     contract: AuxiliaryTaskContract,
     routing: RoutingDecision,
     response: ProviderResponse,
 ) -> AuxiliaryExecutionResult {
+    let output_truncated = response.output.full_text.chars().count() > AUXILIARY_OUTPUT_TEXT_LIMIT;
+    let lineage = auxiliary_lineage_projection(
+        task_id.as_str(),
+        session_id.as_str(),
+        run_id.as_deref(),
+        task_type,
+        contract.authority_profile,
+    );
     AuxiliaryExecutionResult {
         task_id,
         task_type,
         output_text: response.output.full_text,
+        output_truncated,
         prompt_tokens: response.prompt_tokens,
         completion_tokens: response.completion_tokens,
         total_tokens: response.prompt_tokens.saturating_add(response.completion_tokens),
@@ -471,7 +536,33 @@ fn build_execution_result(
         failover_count: response.failover_count,
         contract,
         routing,
+        lineage,
     }
+}
+
+fn auxiliary_lineage_projection(
+    task_id: &str,
+    session_id: &str,
+    run_id: Option<&str>,
+    task_type: AuxiliaryTaskType,
+    authority_profile: AuxiliaryAuthorityProfile,
+) -> Value {
+    json!({
+        "task_id": task_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "task_type": task_type.as_str(),
+        "authority_profile": authority_profile.as_str(),
+        "result_kind": match authority_profile {
+            AuxiliaryAuthorityProfile::FinalizationReview => "finalization_review",
+            AuxiliaryAuthorityProfile::BrowserRescuePreview => "evidence_segment",
+            AuxiliaryAuthorityProfile::ReadOnlyEvidence => "evidence_segment",
+        },
+    })
+}
+
+fn bounded_output_text(value: &str) -> String {
+    value.chars().take(AUXILIARY_OUTPUT_TEXT_LIMIT).collect()
 }
 
 /// Borrowed inputs for one auxiliary lifecycle event
@@ -523,9 +614,66 @@ pub(crate) async fn record_auxiliary_lifecycle_event(
     runtime_state.record_runtime_decision_event(context, session_id, run_id, payload).await
 }
 
+/// Evidence sufficiency input for stopping auxiliary fanout early.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AuxiliaryStopConditionInput {
+    pub required_evidence_count: u64,
+    pub observed_evidence_count: u64,
+    pub required_safety_warning_count: u64,
+    pub observed_safety_warning_count: u64,
+    pub outstanding_child_count: u64,
+}
+
+/// Decision describing whether additional auxiliary work should stop.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AuxiliaryStopConditionDecision {
+    pub stop: bool,
+    pub reason_code: String,
+    pub bounded: bool,
+}
+
+/// Decides whether auxiliary fanout can stop because the parent has enough evidence.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn auxiliary_stop_condition(
+    input: AuxiliaryStopConditionInput,
+) -> AuxiliaryStopConditionDecision {
+    if input.observed_evidence_count < input.required_evidence_count {
+        return AuxiliaryStopConditionDecision {
+            stop: false,
+            reason_code: "auxiliary_stop_condition.insufficient_evidence".to_owned(),
+            bounded: true,
+        };
+    }
+    if input.observed_safety_warning_count < input.required_safety_warning_count {
+        return AuxiliaryStopConditionDecision {
+            stop: false,
+            reason_code: "auxiliary_stop_condition.safety_review_pending".to_owned(),
+            bounded: true,
+        };
+    }
+    if input.outstanding_child_count > 0 {
+        return AuxiliaryStopConditionDecision {
+            stop: false,
+            reason_code: "auxiliary_stop_condition.children_still_running".to_owned(),
+            bounded: true,
+        };
+    }
+    AuxiliaryStopConditionDecision {
+        stop: true,
+        reason_code: "auxiliary_stop_condition.evidence_satisfied".to_owned(),
+        bounded: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AuxiliaryFallbackPolicy, AuxiliaryModelPreference, AuxiliaryTaskType};
+    use super::{
+        auxiliary_stop_condition, AuxiliaryAuthorityProfile, AuxiliaryFallbackPolicy,
+        AuxiliaryModelPreference, AuxiliaryStopConditionInput, AuxiliaryTaskType,
+    };
 
     #[test]
     fn auxiliary_task_kind_aliases_resolve_to_executor_types() {
@@ -547,6 +695,7 @@ mod tests {
     #[test]
     fn auxiliary_contracts_define_budget_and_fallback_posture() {
         let summary = AuxiliaryTaskType::Summary.contract();
+        assert_eq!(summary.authority_profile, AuxiliaryAuthorityProfile::ReadOnlyEvidence);
         assert_eq!(summary.default_budget_tokens, 1_200);
         assert_eq!(summary.model_preference, AuxiliaryModelPreference::LowCost);
         assert_eq!(summary.fallback_policy, AuxiliaryFallbackPolicy::DegradeToDefaultModel);
@@ -559,6 +708,10 @@ mod tests {
         assert!(classification.json_mode);
 
         let objective_judge = AuxiliaryTaskType::ObjectiveJudge.contract();
+        assert_eq!(
+            objective_judge.authority_profile,
+            AuxiliaryAuthorityProfile::FinalizationReview
+        );
         assert_eq!(objective_judge.default_budget_tokens, 900);
         assert_eq!(objective_judge.model_preference, AuxiliaryModelPreference::LowLatency);
         assert_eq!(objective_judge.fallback_policy, AuxiliaryFallbackPolicy::FailClosed);
@@ -566,6 +719,40 @@ mod tests {
 
         let vision = AuxiliaryTaskType::Vision.contract();
         assert!(vision.accepts_vision);
+        assert_eq!(vision.authority_profile, AuxiliaryAuthorityProfile::BrowserRescuePreview);
         assert_eq!(vision.model_preference, AuxiliaryModelPreference::VisionCapable);
+    }
+
+    #[test]
+    fn auxiliary_stop_condition_waits_for_evidence_and_children() {
+        let insufficient = auxiliary_stop_condition(AuxiliaryStopConditionInput {
+            required_evidence_count: 2,
+            observed_evidence_count: 1,
+            required_safety_warning_count: 0,
+            observed_safety_warning_count: 0,
+            outstanding_child_count: 0,
+        });
+        assert!(!insufficient.stop);
+        assert_eq!(insufficient.reason_code, "auxiliary_stop_condition.insufficient_evidence");
+
+        let child_running = auxiliary_stop_condition(AuxiliaryStopConditionInput {
+            required_evidence_count: 2,
+            observed_evidence_count: 2,
+            required_safety_warning_count: 0,
+            observed_safety_warning_count: 0,
+            outstanding_child_count: 1,
+        });
+        assert!(!child_running.stop);
+        assert_eq!(child_running.reason_code, "auxiliary_stop_condition.children_still_running");
+
+        let satisfied = auxiliary_stop_condition(AuxiliaryStopConditionInput {
+            required_evidence_count: 2,
+            observed_evidence_count: 2,
+            required_safety_warning_count: 1,
+            observed_safety_warning_count: 1,
+            outstanding_child_count: 0,
+        });
+        assert!(satisfied.stop);
+        assert_eq!(satisfied.reason_code, "auxiliary_stop_condition.evidence_satisfied");
     }
 }
