@@ -100,5 +100,23 @@
     "evidence_refs": [
       "qa/scenarios/compaction_retry_mutating_tool.yaml"
     ]
+  },
+  {
+    "schema_version": 1,
+    "fixture_id": "execution_backend_security_matrix",
+    "area": "execution_backends",
+    "source_path": "fixtures/golden/execution_backend_security_matrix.json",
+    "risk_classification": "p0_execution_backend_security",
+    "expected_runtime_path": "execution_backend_security_matrix",
+    "expected_terminal_state": "blocked_until_suite_passed",
+    "expected_journal_events": [
+      "execution_backend.parity.cleanup_verified",
+      "execution_backend.parity.forbidden_fallback_checked"
+    ],
+    "redaction_boundary": "metadata_only",
+    "evidence_refs": [
+      "qa/scenarios/execution_backends/backend_parity.yaml",
+      "fixtures/golden/execution_backend_security_matrix.json"
+    ]
   }
 ]

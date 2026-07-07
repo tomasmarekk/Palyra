@@ -470,6 +470,26 @@ pub(crate) struct ExecutionBackendStatusReport {
     pub(crate) cleanup: ExecutionBackendCleanupEvidenceReport,
 }
 
+/// Redacted environment inventory exposed to models and operator diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EnvironmentInventoryRecord {
+    pub(crate) schema_version: u8,
+    pub(crate) backend_id: String,
+    pub(crate) backend_type: String,
+    pub(crate) state: ExecutionBackendState,
+    pub(crate) selected_by_default: bool,
+    pub(crate) workspace_root: String,
+    pub(crate) persistence: String,
+    pub(crate) writeback_mode: WorkspaceWritebackMode,
+    pub(crate) cleanup_strategy: String,
+    pub(crate) egress_posture: String,
+    pub(crate) env_posture: String,
+    pub(crate) environment_epoch: String,
+    pub(crate) model_guidance: String,
+    pub(crate) operator_detail: String,
+    pub(crate) redaction_level: String,
+}
+
 /// Recovery action recommended for a tool job whose heartbeat went stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4201,6 +4221,125 @@ pub(crate) fn build_execution_backend_inventory_with_worker_state(
     )
 }
 
+/// Projects backend inventory into model/operator environment guidance.
+#[must_use]
+pub(crate) fn build_environment_inventory(
+    inventory: &[ExecutionBackendInventoryRecord],
+    active_workspace_root: Option<&Path>,
+) -> Vec<EnvironmentInventoryRecord> {
+    inventory
+        .iter()
+        .map(|record| environment_inventory_record(record, active_workspace_root))
+        .collect()
+}
+
+fn environment_inventory_record(
+    record: &ExecutionBackendInventoryRecord,
+    active_workspace_root: Option<&Path>,
+) -> EnvironmentInventoryRecord {
+    let workspace_root = model_workspace_root_label(record, active_workspace_root);
+    let persistence = backend_workspace_persistence(&record.workspace_strategy);
+    let egress_posture = backend_egress_posture(record);
+    let env_posture = backend_env_posture(record);
+    let environment_epoch = environment_epoch(record, workspace_root.as_str());
+    EnvironmentInventoryRecord {
+        schema_version: 1,
+        backend_id: record.backend_id.clone(),
+        backend_type: record.workspace_strategy.kind.as_str().to_owned(),
+        state: record.state,
+        selected_by_default: record.selected_by_default,
+        workspace_root: workspace_root.clone(),
+        persistence: persistence.to_owned(),
+        writeback_mode: record.workspace_strategy.writeback,
+        cleanup_strategy: record.cleanup_strategy.clone(),
+        egress_posture: egress_posture.to_owned(),
+        env_posture: env_posture.to_owned(),
+        environment_epoch,
+        model_guidance: format!(
+            "Tools run on backend={} with workspace={} persistence={} writeback={} egress={} env={}.",
+            record.backend_id,
+            workspace_root,
+            persistence,
+            record.workspace_strategy.writeback.as_str(),
+            egress_posture,
+            env_posture,
+        ),
+        operator_detail: format!(
+            "backend={} state={} selectable={} cleanup={} artifact_transport={} workspace_strategy_sha256={}",
+            record.backend_id,
+            record.state.as_str(),
+            record.selectable,
+            record.cleanup_strategy,
+            record.artifact_transport,
+            record.workspace_strategy.attestation_digest_sha256(),
+        ),
+        redaction_level: "metadata_only".to_owned(),
+    }
+}
+
+fn model_workspace_root_label(
+    record: &ExecutionBackendInventoryRecord,
+    active_workspace_root: Option<&Path>,
+) -> String {
+    match record.workspace_strategy.kind {
+        WorkspaceStrategyKind::DaemonWorkspaceRoot => active_workspace_root
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(|name| format!("/workspace/{name}"))
+            .unwrap_or_else(|| "/workspace".to_owned()),
+        WorkspaceStrategyKind::GitWorktree => "/workspace/worktree".to_owned(),
+        WorkspaceStrategyKind::EphemeralCopy => "/workspace/ephemeral-copy".to_owned(),
+        WorkspaceStrategyKind::ContainerVolume => "/workspace".to_owned(),
+        WorkspaceStrategyKind::RemoteLeaseWorkspace => "remote://lease/workspace".to_owned(),
+        WorkspaceStrategyKind::OperatorManagedRemote => {
+            "remote://operator-managed/workspace".to_owned()
+        }
+    }
+}
+
+fn backend_workspace_persistence(strategy: &WorkspaceStrategyDescriptor) -> &'static str {
+    match strategy.kind {
+        WorkspaceStrategyKind::DaemonWorkspaceRoot => "persistent_host_workspace",
+        WorkspaceStrategyKind::GitWorktree => "persistent_until_worktree_cleanup",
+        WorkspaceStrategyKind::EphemeralCopy | WorkspaceStrategyKind::ContainerVolume => {
+            "ephemeral_with_patch_bundle_writeback"
+        }
+        WorkspaceStrategyKind::RemoteLeaseWorkspace => "lease_scoped_remote_workspace",
+        WorkspaceStrategyKind::OperatorManagedRemote => "operator_managed_remote_workspace",
+    }
+}
+
+fn backend_egress_posture(record: &ExecutionBackendInventoryRecord) -> &'static str {
+    if record.requires_egress_proxy {
+        "proxy_required"
+    } else if record.capabilities.iter().any(|capability| capability == "no_network") {
+        "blocked"
+    } else {
+        "backend_policy"
+    }
+}
+
+fn backend_env_posture(record: &ExecutionBackendInventoryRecord) -> &'static str {
+    if record.capabilities.iter().any(|capability| capability == "vault_scoped_secret_delivery") {
+        "vault_refs_only"
+    } else {
+        "no_secret_material"
+    }
+}
+
+fn environment_epoch(record: &ExecutionBackendInventoryRecord, workspace_root: &str) -> String {
+    let payload = json!({
+        "backend_id": record.backend_id,
+        "state": record.state.as_str(),
+        "workspace_root": workspace_root,
+        "workspace_strategy": &record.workspace_strategy,
+        "writeback": record.workspace_strategy.writeback.as_str(),
+        "cleanup": record.cleanup_strategy.as_str(),
+        "egress_proxy": record.requires_egress_proxy,
+    });
+    sha256_hex(serde_json::to_vec(&payload).unwrap_or_default().as_slice())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_execution_backend_inventory_with_rollout(
     policy: &SandboxProcessRunnerPolicy,
@@ -4968,7 +5107,8 @@ mod tests {
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
 
     use super::{
-        apply_docker_cli_preflight_probe, build_execution_backend_inventory_with_docker_rollout,
+        apply_docker_cli_preflight_probe, build_environment_inventory,
+        build_execution_backend_inventory_with_docker_rollout,
         build_execution_backend_inventory_with_rollout, build_execution_backend_preflight_report,
         build_execution_backend_status_reports, parse_execution_backend_preference,
         plan_stuck_tool_job_recovery, prepare_docker_run_plan, resolve_execution_backend,
@@ -6476,6 +6616,110 @@ mod tests {
             resolve_execution_backend(ExecutionBackendPreference::DesktopNode, &inventory);
         assert_eq!(resolution.resolved, ExecutionBackendPreference::LocalSandbox);
         assert!(resolution.fallback_used);
+    }
+
+    #[test]
+    fn environment_inventory_is_redacted_and_epoch_changes_with_backend_posture() {
+        let networked_workers = NetworkedWorkersConfig::default();
+        let disabled_inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(false),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+        let enabled_inventory = build_execution_backend_inventory_with_docker_rollout(
+            &test_policy(),
+            0,
+            &[],
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::from_config(true),
+            FeatureRolloutSetting::default(),
+            FeatureRolloutSetting::default(),
+            &networked_workers,
+            WorkerFleetSnapshot::default(),
+            &WorkerFleetPolicy::default(),
+        );
+
+        let active_root = PathBuf::from("/private/project");
+        let disabled =
+            build_environment_inventory(disabled_inventory.as_slice(), Some(active_root.as_path()));
+        let enabled =
+            build_environment_inventory(enabled_inventory.as_slice(), Some(active_root.as_path()));
+        let docker_disabled = disabled
+            .iter()
+            .find(|record| record.backend_id == "docker")
+            .expect("Docker environment inventory should exist");
+        let docker_enabled = enabled
+            .iter()
+            .find(|record| record.backend_id == "docker")
+            .expect("Docker environment inventory should exist");
+
+        assert_eq!(docker_disabled.workspace_root, "/workspace");
+        assert_eq!(docker_disabled.writeback_mode, WorkspaceWritebackMode::PatchBundle);
+        assert_eq!(docker_disabled.egress_posture, "proxy_required");
+        assert_eq!(docker_disabled.redaction_level, "metadata_only");
+        assert!(!docker_disabled.model_guidance.contains("/private/project"));
+        assert!(!docker_disabled.model_guidance.to_ascii_lowercase().contains("token"));
+        assert_ne!(docker_disabled.environment_epoch, docker_enabled.environment_epoch);
+
+        let local = disabled
+            .iter()
+            .find(|record| record.backend_id == "local_sandbox")
+            .expect("local environment inventory should exist");
+        assert_eq!(local.workspace_root, "/workspace/project");
+        assert_eq!(local.persistence, "persistent_host_workspace");
+    }
+
+    #[test]
+    fn execution_backend_security_matrix_pins_required_negative_cases() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/golden/execution_backend_security_matrix.json");
+        let raw = fs::read_to_string(path.as_path()).expect("security matrix fixture should load");
+        let matrix: serde_json::Value =
+            serde_json::from_str(raw.as_str()).expect("security matrix fixture should parse");
+
+        assert_eq!(matrix["production_gate"], "blocked_until_suite_passed");
+        let commands =
+            matrix["required_commands"].as_array().expect("required_commands should be an array");
+        assert!(commands.iter().any(|command| command.as_str()
+            == Some("palyra qa validate --path qa/scenarios/execution_backends --json")));
+
+        let backends = matrix["backends"].as_array().expect("backends should be an array");
+        for backend_id in ["local_sandbox", "docker", "networked_worker", "ssh_tunnel"] {
+            let record = backends
+                .iter()
+                .find(|record| record["backend_id"].as_str() == Some(backend_id))
+                .unwrap_or_else(|| panic!("backend {backend_id} should be covered"));
+            let cases = record["required_cases"]
+                .as_array()
+                .expect("required_cases should be an array")
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(
+                cases.contains(&"cleanup_failure_reported"),
+                "backend {backend_id} should cover cleanup failure reporting"
+            );
+            assert!(
+                cases.iter().any(|case| {
+                    matches!(
+                        *case,
+                        "egress_blocked_audited"
+                            | "egress_proxy_posture_audited"
+                            | "egress_proxy_attestation_required"
+                    )
+                }) || backend_id == "ssh_tunnel",
+                "backend {backend_id} should cover egress posture"
+            );
+        }
     }
 
     #[test]

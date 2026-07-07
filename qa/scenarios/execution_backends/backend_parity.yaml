@@ -16,7 +16,7 @@ requires:
     - workspace_context
   tools:
     - palyra.process.run
-    - palyra.process.cancel
+    - palyra.process.stop
     - palyra.fs.read_file
     - palyra.fs.list_dir
     - palyra.fs.search
@@ -54,7 +54,7 @@ expect:
   tool_calls:
     - name: palyra.process.run
       min_count: 1
-    - name: palyra.process.cancel
+    - name: palyra.process.stop
       min_count: 1
     - name: palyra.fs.read_file
       min_count: 1

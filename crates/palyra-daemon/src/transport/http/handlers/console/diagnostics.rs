@@ -140,8 +140,16 @@ pub(crate) async fn console_diagnostics_handler(
         .map_err(runtime_status_response)?;
     redact_console_diagnostics_value(&mut delegation_payload, None);
     let deployment_payload = collect_console_deployment_diagnostics(&state);
+    let execution_backend_inventory =
+        console_execution_backend_inventory(&state).map_err(runtime_status_response)?;
     let execution_backends_payload =
-        collect_console_execution_backend_diagnostics(&state).map_err(runtime_status_response)?;
+        collect_console_execution_backend_diagnostics(execution_backend_inventory.as_slice())
+            .map_err(runtime_status_response)?;
+    let execution_environment_inventory_payload = collect_console_execution_environment_inventory(
+        execution_backend_inventory.as_slice(),
+        state.runtime.config.tool_call.process_runner.workspace_root.as_path(),
+    )
+    .map_err(runtime_status_response)?;
     let networked_workers_payload = collect_console_networked_worker_diagnostics(&state);
     let runtime_controls_payload = serde_json::to_value(
         crate::runtime_preview_controls::build_runtime_preview_config_snapshot(
@@ -374,6 +382,7 @@ pub(crate) async fn console_diagnostics_handler(
         "runtime_controls": runtime_controls_payload,
         "deployment": deployment_payload,
         "execution_backends": execution_backends_payload,
+        "execution_environment_inventory": execution_environment_inventory_payload,
         "networked_workers": networked_workers_payload,
         "canvas_experiments": canvas_experiments_payload,
         "observability": observability_payload,
@@ -816,23 +825,43 @@ fn truncate_diagnostic_text(value: &str, max_chars: usize) -> String {
 
 /// Serializes the execution-backend inventory (local runner, remote nodes,
 /// networked workers) with current worker fleet state folded in.
-fn collect_console_execution_backend_diagnostics(state: &AppState) -> Result<Value, tonic::Status> {
-    let now_unix_ms = crate::gateway::current_unix_ms_status()?;
-    let nodes = state.node_runtime.nodes()?;
-    serde_json::to_value(
-        crate::execution_backends::build_execution_backend_inventory_with_worker_state(
-            &state.runtime.config.tool_call.process_runner,
-            nodes.as_slice(),
-            now_unix_ms,
-            &state.runtime.config.feature_rollouts,
-            &state.runtime.config.networked_workers,
-            state.runtime.worker_fleet_snapshot(),
-            &state.runtime.worker_fleet_policy(),
-        ),
-    )
-    .map_err(|error| {
+fn collect_console_execution_backend_diagnostics(
+    inventory: &[crate::execution_backends::ExecutionBackendInventoryRecord],
+) -> Result<Value, tonic::Status> {
+    serde_json::to_value(inventory).map_err(|error| {
         tonic::Status::internal(format!("failed to serialize execution backends: {error}"))
     })
+}
+
+fn collect_console_execution_environment_inventory(
+    inventory: &[crate::execution_backends::ExecutionBackendInventoryRecord],
+    active_workspace_root: &std::path::Path,
+) -> Result<Value, tonic::Status> {
+    serde_json::to_value(crate::execution_backends::build_environment_inventory(
+        inventory,
+        Some(active_workspace_root),
+    ))
+    .map_err(|error| {
+        tonic::Status::internal(format!(
+            "failed to serialize execution environment inventory: {error}"
+        ))
+    })
+}
+
+fn console_execution_backend_inventory(
+    state: &AppState,
+) -> Result<Vec<crate::execution_backends::ExecutionBackendInventoryRecord>, tonic::Status> {
+    let now_unix_ms = crate::gateway::current_unix_ms_status()?;
+    let nodes = state.node_runtime.nodes()?;
+    Ok(crate::execution_backends::build_execution_backend_inventory_with_worker_state(
+        &state.runtime.config.tool_call.process_runner,
+        nodes.as_slice(),
+        now_unix_ms,
+        &state.runtime.config.feature_rollouts,
+        &state.runtime.config.networked_workers,
+        state.runtime.worker_fleet_snapshot(),
+        &state.runtime.worker_fleet_policy(),
+    ))
 }
 
 async fn collect_console_verification_status(state: &AppState) -> Value {
@@ -3082,6 +3111,8 @@ fn build_runtime_support_observability(state: &AppState, networked_workers: &Val
                 crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_LONG_RUNNING,
                 crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_STALE,
                 crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_HEARTBEAT_MISSING,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_TIMEOUT_OVERALL,
+                crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_REASON_TIMEOUT_NO_OUTPUT,
             ],
             "redaction_level": crate::application::tool_runtime::process_registry::EXECUTION_ENVIRONMENT_HEALTH_REDACTION_LEVEL,
         },

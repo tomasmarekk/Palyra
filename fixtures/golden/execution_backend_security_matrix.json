@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "matrix_id": "execution_backend_security_matrix.v1",
+  "suite": "qa/scenarios/execution_backends",
+  "production_gate": "blocked_until_suite_passed",
+  "required_commands": [
+    "cargo test -p palyra-daemon execution_backend_parity --locked",
+    "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+    "palyra qa validate --path qa/scenarios/execution_backends --json"
+  ],
+  "backends": [
+    {
+      "backend_id": "local_sandbox",
+      "required_cases": [
+        "path_escape_denied",
+        "symlink_escape_denied",
+        "egress_blocked_audited",
+        "elevated_intent_requires_approval",
+        "binary_write_refused",
+        "generated_file_policy_enforced",
+        "cleanup_failure_reported"
+      ]
+    },
+    {
+      "backend_id": "docker",
+      "required_cases": [
+        "digest_pinned_image_required",
+        "non_root_user_required",
+        "readonly_rootfs_required",
+        "workspace_scoped_mount_required",
+        "secret_env_literal_denied",
+        "egress_proxy_posture_audited",
+        "patch_bundle_writeback_review_required",
+        "cleanup_failure_reported"
+      ]
+    },
+    {
+      "backend_id": "networked_worker",
+      "required_cases": [
+        "attestation_failure_denied",
+        "lease_expiry_denied",
+        "remote_file_parity_verified",
+        "remote_patch_bundle_review_required",
+        "egress_proxy_attestation_required",
+        "cleanup_failure_reported",
+        "forbidden_local_fallback_denied"
+      ]
+    },
+    {
+      "backend_id": "ssh_tunnel",
+      "required_cases": [
+        "worker_rpc_envelope_required",
+        "raw_shell_denied",
+        "vault_identity_handles_required",
+        "remote_patch_bundle_review_required",
+        "cleanup_failure_reported",
+        "forbidden_local_fallback_denied"
+      ]
+    }
+  ]
+}

@@ -45,9 +45,10 @@ use crate::{
 use super::artifacts::bounded_tool_result_artifact_content;
 use super::process_registry::{
     BackgroundTaskRecord, BackgroundTaskRegistry, CleanupPolicy, ProcessRegistry,
-    RuntimeProcessDiagnostic, RuntimeProcessRecord, RuntimeProcessState,
-    EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT, EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT,
-    EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION, EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
+    RuntimeProcessDiagnostic, RuntimeProcessEnvPosture, RuntimeProcessRecord, RuntimeProcessScope,
+    RuntimeProcessState, EXECUTION_ENVIRONMENT_HEALTH_COMPLETED_EVENT,
+    EXECUTION_ENVIRONMENT_HEALTH_FAILED_EVENT, EXECUTION_ENVIRONMENT_HEALTH_SCHEMA_VERSION,
+    EXECUTION_ENVIRONMENT_HEALTH_STARTED_EVENT,
 };
 use super::process_registry::{
     ExecutionEnvironmentHealthJournalProjection, ExecutionEnvironmentHealthLongCommandHeartbeat,
@@ -485,9 +486,13 @@ async fn execute_validated_program(
         background_registry.register(BackgroundTaskRecord {
             task_id: background_task_id.clone(),
             owner: context.run_id.to_owned(),
+            run_id: context.run_id.to_owned(),
+            session_id: Some(context.session_id.to_owned()),
+            scope: RuntimeProcessScope::Run,
             purpose: "palyra.tool_program.run".to_owned(),
             started_at_unix_ms: background_started_at_unix_ms,
             last_heartbeat_at_unix_ms: Some(background_started_at_unix_ms),
+            last_output_at_unix_ms: Some(background_started_at_unix_ms),
             cancellation_handle: format!("cancel:{proposal_id}"),
             cleanup_policy: cleanup_policy.clone(),
             state: RuntimeProcessState::Running,
@@ -524,6 +529,7 @@ async fn execute_validated_program(
                 .await
                 .map_err(|status| format!("cancellation check failed: {}", status.message()))?
             {
+                let _ = process_registry.cancel_run(context.run_id, elapsed_millis(started_at));
                 final_status = ToolProgramStatus::Cancelled;
                 final_error = "tool program cancelled before next step".to_owned();
                 for step_index in level {
@@ -535,6 +541,11 @@ async fn execute_validated_program(
                 break;
             }
             if started_at.elapsed() > Duration::from_millis(request.budgets.max_runtime_ms) {
+                let _ = process_registry.cancel_scope(
+                    context.run_id,
+                    RuntimeProcessScope::ToolCall,
+                    elapsed_millis(started_at),
+                );
                 final_status = ToolProgramStatus::Failed;
                 final_error = format!(
                     "tool program exceeded runtime budget max_runtime_ms={}",
@@ -564,9 +575,16 @@ async fn execute_validated_program(
                 process_registry.register(RuntimeProcessRecord {
                     process_id,
                     owner: context.run_id.to_owned(),
+                    run_id: context.run_id.to_owned(),
+                    session_id: Some(context.session_id.to_owned()),
+                    scope: RuntimeProcessScope::ToolCall,
+                    pid: None,
+                    cwd: None,
+                    env_posture: RuntimeProcessEnvPosture::default(),
                     purpose: format!("tool-program-step:{}", step.tool),
                     started_at_unix_ms: process_started_at_unix_ms,
                     last_heartbeat_at_unix_ms: Some(process_started_at_unix_ms),
+                    last_output_at_unix_ms: Some(process_started_at_unix_ms),
                     cancellation_handle: format!("cancel:{proposal_id}:{}", step.step_id),
                     cleanup_policy: cleanup_policy.clone(),
                     state: RuntimeProcessState::Running,
@@ -621,6 +639,7 @@ async fn execute_validated_program(
                 if let Some(attestation) = child_attestation {
                     child_attestations.push(attestation);
                 }
+                let output_observed_at = current_unix_ms();
                 let _ = runtime_state
                     .append_tool_job_tail(ToolJobTailAppendRequest {
                         job_id: job_id.clone(),
@@ -638,8 +657,30 @@ async fn execute_validated_program(
                         ),
                     })
                     .await;
-                process_registry.heartbeat(process_id.as_str(), current_unix_ms())?;
-                background_registry.heartbeat(background_task_id.as_str(), current_unix_ms())?;
+                process_registry.output_heartbeat(process_id.as_str(), output_observed_at)?;
+                process_registry.heartbeat(process_id.as_str(), output_observed_at)?;
+                background_registry.heartbeat(background_task_id.as_str(), output_observed_at)?;
+                if let Some(timeout) = process_registry.timeout_decision(
+                    process_id.as_str(),
+                    output_observed_at,
+                    i64::try_from(request.budgets.max_runtime_ms).unwrap_or(i64::MAX),
+                    None,
+                )? {
+                    process_registry.cancel(
+                        process_id.as_str(),
+                        u64::try_from(timeout.elapsed_ms).unwrap_or(u64::MAX),
+                    )?;
+                    final_status = ToolProgramStatus::Failed;
+                    final_error = format!(
+                        "tool program exceeded runtime budget max_runtime_ms={} reason_code={}",
+                        timeout.timeout_ms, timeout.reason_code
+                    );
+                    results.push(failed_step_result(step, final_error.as_str()));
+                    if request.safety_policy.stop_on_error {
+                        break 'program;
+                    }
+                    continue;
+                }
                 if step_result.status == ToolProgramStepStatus::Cancelled {
                     process_registry.cancel(process_id.as_str(), elapsed_millis(started_at))?;
                 } else {

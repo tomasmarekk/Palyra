@@ -50,7 +50,14 @@ fn current_state_inventory_snapshot_covers_capabilities_cli_and_compat_surface()
         .collect::<Vec<_>>();
     assert_eq!(
         execution_backend_preferences,
-        vec!["automatic", "local_sandbox", "desktop_node", "networked_worker", "ssh_tunnel",],
+        vec![
+            "automatic",
+            "local_sandbox",
+            "desktop_node",
+            "docker",
+            "networked_worker",
+            "ssh_tunnel",
+        ],
         "inventory should continue to advertise the current execution backend preference set"
     );
 
@@ -243,7 +250,7 @@ fn build_current_state_inventory_snapshot(
                 .unwrap_or(Value::Null),
             "capabilities": runtime_control_capabilities,
         },
-        "execution_backend_preferences": ["automatic", "local_sandbox", "desktop_node", "networked_worker", "ssh_tunnel"],
+        "execution_backend_preferences": ["automatic", "local_sandbox", "desktop_node", "docker", "networked_worker", "ssh_tunnel"],
         "execution_backends": execution_backends,
         "compat_routes": compat_routes,
         "cli_families": cli_families,

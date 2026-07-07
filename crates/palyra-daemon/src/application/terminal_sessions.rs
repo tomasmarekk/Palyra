@@ -182,6 +182,116 @@ pub struct TerminalSession {
     closed_at_unix_ms: Option<u64>,
     tail_limit_bytes: usize,
     tail: String,
+    tail_truncated: bool,
+}
+
+/// Redacted tail snapshot returned by terminal tail operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalTailSnapshot {
+    pub session_id: String,
+    pub tail: String,
+    pub limit_bytes: usize,
+    pub truncated: bool,
+}
+
+/// In-memory supervisor for persistent terminal session records.
+#[derive(Debug, Default)]
+pub struct TerminalSessionSupervisor {
+    sessions: BTreeMap<String, TerminalSession>,
+}
+
+impl TerminalSessionSupervisor {
+    /// Opens a new terminal session and returns its initial status snapshot.
+    ///
+    /// Returns [`TerminalSessionError`] when validation fails or the session
+    /// id is already registered.
+    pub fn open(
+        &mut self,
+        request: TerminalSessionCreateRequest,
+    ) -> Result<TerminalSessionStatus, TerminalSessionError> {
+        let session = TerminalSession::create(request)?;
+        let session_id = session.session_id.clone();
+        if self.sessions.contains_key(session_id.as_str()) {
+            return Err(TerminalSessionError::Duplicate { session_id });
+        }
+        let status = session.status();
+        self.sessions.insert(session_id, session);
+        Ok(status)
+    }
+
+    /// Plans an exec request inside an existing session.
+    pub fn exec(
+        &mut self,
+        session_id: &str,
+        request: TerminalCommandRequest,
+    ) -> Result<TerminalCommandPlan, TerminalSessionError> {
+        self.session_mut(session_id)?.plan_command(request)
+    }
+
+    /// Records input/output bytes against a session tail and returns status.
+    pub fn send_input(
+        &mut self,
+        session_id: &str,
+        input: &str,
+        now_unix_ms: u64,
+    ) -> Result<TerminalSessionStatus, TerminalSessionError> {
+        let session = self.session_mut(session_id)?;
+        session.append_tail(input, now_unix_ms)?;
+        Ok(session.status())
+    }
+
+    /// Returns the status for an existing session.
+    pub fn status(&self, session_id: &str) -> Result<TerminalSessionStatus, TerminalSessionError> {
+        Ok(self.session(session_id)?.status())
+    }
+
+    /// Returns the bounded, redacted session tail.
+    pub fn tail(&self, session_id: &str) -> Result<TerminalTailSnapshot, TerminalSessionError> {
+        let session = self.session(session_id)?;
+        Ok(TerminalTailSnapshot {
+            session_id: session.session_id.clone(),
+            tail: session.tail.clone(),
+            limit_bytes: session.tail_limit_bytes,
+            truncated: session.tail_truncated,
+        })
+    }
+
+    /// Closes an existing session and returns cleanup evidence.
+    pub fn close(
+        &mut self,
+        session_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<TerminalCleanupEvidence, TerminalSessionError> {
+        Ok(self.session_mut(session_id)?.close(now_unix_ms))
+    }
+
+    /// Marks idle active sessions stale and returns cleanup evidence.
+    #[must_use]
+    pub fn cleanup_stale(
+        &mut self,
+        now_unix_ms: u64,
+        max_idle_ms: u64,
+    ) -> Vec<TerminalCleanupEvidence> {
+        self.sessions
+            .values_mut()
+            .filter_map(|session| session.mark_stale_if_idle(now_unix_ms, max_idle_ms))
+            .collect()
+    }
+
+    fn session(&self, session_id: &str) -> Result<&TerminalSession, TerminalSessionError> {
+        self.sessions
+            .get(session_id)
+            .ok_or_else(|| TerminalSessionError::NotFound { session_id: session_id.to_owned() })
+    }
+
+    fn session_mut(
+        &mut self,
+        session_id: &str,
+    ) -> Result<&mut TerminalSession, TerminalSessionError> {
+        self.sessions
+            .get_mut(session_id)
+            .ok_or_else(|| TerminalSessionError::NotFound { session_id: session_id.to_owned() })
+    }
 }
 
 impl TerminalSession {
@@ -205,6 +315,7 @@ impl TerminalSession {
             closed_at_unix_ms: None,
             tail_limit_bytes: DEFAULT_TAIL_LIMIT_BYTES,
             tail: String::new(),
+            tail_truncated: false,
         })
     }
 
@@ -273,7 +384,8 @@ impl TerminalSession {
     ) -> Result<(), TerminalSessionError> {
         self.ensure_active()?;
         self.tail.push_str(redact_terminal_output(output).as_str());
-        truncate_tail_to_limit(&mut self.tail, self.tail_limit_bytes);
+        self.tail_truncated =
+            truncate_tail_to_limit(&mut self.tail, self.tail_limit_bytes) || self.tail_truncated;
         self.last_activity_unix_ms = now_unix_ms;
         Ok(())
     }
@@ -351,6 +463,8 @@ impl TerminalSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSessionError {
     InvalidInput { field: &'static str, message: String },
+    Duplicate { session_id: String },
+    NotFound { session_id: String },
     Closed { session_id: String, state: TerminalSessionState },
 }
 
@@ -358,6 +472,12 @@ impl std::fmt::Display for TerminalSessionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidInput { field, message } => write!(formatter, "{field}: {message}"),
+            Self::Duplicate { session_id } => {
+                write!(formatter, "terminal session {session_id} is already registered")
+            }
+            Self::NotFound { session_id } => {
+                write!(formatter, "terminal session {session_id} is not registered")
+            }
             Self::Closed { session_id, state } => {
                 write!(formatter, "terminal session {session_id} is {}", state.as_str())
             }
@@ -467,15 +587,16 @@ fn redact_terminal_line(line: &str) -> String {
         .join(" ")
 }
 
-fn truncate_tail_to_limit(tail: &mut String, limit_bytes: usize) {
+fn truncate_tail_to_limit(tail: &mut String, limit_bytes: usize) -> bool {
     if tail.len() <= limit_bytes {
-        return;
+        return false;
     }
     let mut keep_from = tail.len().saturating_sub(limit_bytes);
     while !tail.is_char_boundary(keep_from) {
         keep_from += 1;
     }
     tail.replace_range(..keep_from, "");
+    true
 }
 
 #[cfg(test)]
@@ -588,6 +709,7 @@ mod tests {
         assert!(!session.tail().contains("abc123"));
         assert!(!session.tail().contains("value"));
         assert!(session.tail().len() <= 32);
+        assert!(session.tail_truncated);
     }
 
     #[test]
@@ -602,5 +724,89 @@ mod tests {
         let close = session.close(2_100);
         assert_eq!(close.state, TerminalSessionState::Closed);
         assert_eq!(close.closed_at_unix_ms, Some(2_100));
+    }
+
+    #[test]
+    fn supervisor_exposes_terminal_lifecycle_operations() {
+        let mut supervisor = TerminalSessionSupervisor::default();
+        let opened = supervisor
+            .open(TerminalSessionCreateRequest {
+                session_id: "term_01".to_owned(),
+                owner_run_id: "run_01".to_owned(),
+                backend: TerminalBackendKind::Host,
+                cwd: "/workspace".to_owned(),
+                env_profile_id: Some("dev".to_owned()),
+                pty_requested: true,
+                pty_active: true,
+                now_unix_ms: 100,
+            })
+            .expect("session should open");
+
+        assert_eq!(opened.state, TerminalSessionState::Active);
+        assert!(opened.pty_active);
+
+        let plan = supervisor
+            .exec(
+                "term_01",
+                TerminalCommandRequest {
+                    command: "npm".to_owned(),
+                    args: vec!["test".to_owned()],
+                    cwd: Some("/workspace/app".to_owned()),
+                    env_profile_id: Some("test".to_owned()),
+                    explicit_env: BTreeMap::from([("CI".to_owned(), "1".to_owned())]),
+                    vault_env_refs: BTreeMap::new(),
+                    elevated_intent: false,
+                    disk_guard: None,
+                    now_unix_ms: 150,
+                },
+            )
+            .expect("command should plan");
+        assert_eq!(plan.status, TerminalCommandStatus::Planned);
+        assert_eq!(plan.cwd, "/workspace/app");
+
+        supervisor
+            .send_input("term_01", "token=secret-value\nok", 200)
+            .expect("input should update tail");
+        let tail = supervisor.tail("term_01").expect("tail should be visible");
+        assert!(!tail.tail.contains("secret-value"));
+        assert!(tail.tail.contains("[REDACTED]"));
+        assert!(!tail.truncated);
+
+        let cleanup = supervisor.close("term_01", 250).expect("session should close");
+        assert_eq!(cleanup.reason_code, "terminal.cleanup.closed");
+        let status = supervisor.status("term_01").expect("closed status remains visible");
+        assert_eq!(status.state, TerminalSessionState::Closed);
+    }
+
+    #[test]
+    fn supervisor_cleanup_stale_marks_only_idle_active_sessions() {
+        let mut supervisor = TerminalSessionSupervisor::default();
+        for (session_id, now) in [("active", 1_000), ("idle", 100)] {
+            supervisor
+                .open(TerminalSessionCreateRequest {
+                    session_id: session_id.to_owned(),
+                    owner_run_id: format!("run_{session_id}"),
+                    backend: TerminalBackendKind::Host,
+                    cwd: "/workspace".to_owned(),
+                    env_profile_id: None,
+                    pty_requested: false,
+                    pty_active: false,
+                    now_unix_ms: now,
+                })
+                .expect("session should open");
+        }
+
+        let cleanup = supervisor.cleanup_stale(1_200, 500);
+
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].owner_run_id, "run_idle");
+        assert_eq!(
+            supervisor.status("idle").expect("idle session should exist").state,
+            TerminalSessionState::Stale
+        );
+        assert_eq!(
+            supervisor.status("active").expect("active session should exist").state,
+            TerminalSessionState::Active
+        );
     }
 }
