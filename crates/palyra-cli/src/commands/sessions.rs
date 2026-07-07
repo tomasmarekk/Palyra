@@ -654,6 +654,7 @@ pub(crate) async fn run_sessions_async(
             session_key,
             trigger_reason,
             trigger_policy,
+            operator_instruction,
             json: _,
         } => {
             let session_id =
@@ -669,6 +670,7 @@ pub(crate) async fn run_sessions_async(
                     &json!({
                         "trigger_reason": trigger_reason,
                         "trigger_policy": trigger_policy,
+                        "operator_instruction": operator_instruction,
                     }),
                 )
                 .await?;
@@ -711,6 +713,7 @@ pub(crate) async fn run_sessions_async(
             session_id,
             trigger_reason,
             trigger_policy,
+            operator_instruction,
             accept_candidate_ids,
             reject_candidate_ids,
             json: _,
@@ -726,6 +729,7 @@ pub(crate) async fn run_sessions_async(
                     &json!({
                         "trigger_reason": trigger_reason,
                         "trigger_policy": trigger_policy,
+                        "operator_instruction": operator_instruction,
                         "accept_candidate_ids": accept_candidate_ids,
                         "reject_candidate_ids": reject_candidate_ids,
                     }),

@@ -1726,6 +1726,8 @@ struct ConsoleChatCompactionRequest {
     #[serde(default)]
     trigger_policy: Option<String>,
     #[serde(default)]
+    operator_instruction: Option<String>,
+    #[serde(default)]
     accept_candidate_ids: Vec<String>,
     #[serde(default)]
     reject_candidate_ids: Vec<String>,

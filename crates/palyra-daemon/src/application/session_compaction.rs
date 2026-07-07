@@ -74,6 +74,9 @@ pub(crate) const PROVIDER_BACKED_EVIDENCE_SCHEMA_VERSION: u64 = 1;
 pub(crate) const PROVIDER_BACKED_EVIDENCE_EVENT_PROPOSED: &str =
     "compaction.provider_summary.proposed";
 const PROVIDER_BACKED_EVIDENCE_REDACTION_LEVEL: &str = "metadata_only";
+pub(crate) const SUCCESSOR_TRANSCRIPT_PROJECTION_SCHEMA_VERSION: u64 = 1;
+pub(crate) const IDENTIFIER_EVIDENCE_PRESERVATION_SCHEMA_VERSION: u64 = 1;
+pub(crate) const COMPACTION_OPERATOR_INSTRUCTION_SCHEMA_VERSION: u64 = 1;
 // The newest text events always stay verbatim so the model keeps the live
 // conversational tail; compaction is skipped entirely unless at least
 // MIN_CONDENSED_EVENTS older events would actually be condensed.
@@ -165,6 +168,9 @@ pub(crate) struct SessionCompactionPlan {
     pub(crate) checkpoint_pair: PreAPostCompactionCheckpoints,
     pub(crate) safeguard: CompactionSafeguardProjection,
     pub(crate) provider_evidence: ProviderBackedEvidenceProjection,
+    pub(crate) successor_transcript: SuccessorTranscriptProjection,
+    pub(crate) identifier_evidence: IdentifierEvidencePreservationProjection,
+    pub(crate) operator_instruction: Option<CompactionOperatorInstruction>,
 }
 
 impl SessionCompactionPlan {
@@ -205,6 +211,9 @@ impl SessionCompactionPlan {
             "checkpoint_pair": self.checkpoint_pair,
             "compaction_safeguard": self.safeguard,
             "provider_evidence": self.provider_evidence,
+            "successor_transcript": self.successor_transcript,
+            "identifier_evidence": self.identifier_evidence,
+            "operator_instruction": self.operator_instruction,
         })
     }
 }
@@ -221,6 +230,7 @@ pub(crate) struct SessionCompactionApplyRequest<'a> {
     pub(crate) mode: &'a str,
     pub(crate) trigger_reason: Option<&'a str>,
     pub(crate) trigger_policy: Option<&'a str>,
+    pub(crate) operator_instruction: Option<&'a str>,
     /// Review-required candidates the operator explicitly approved.
     pub(crate) accept_candidate_ids: &'a [String],
     /// Review-required candidates the operator explicitly rejected.
@@ -514,6 +524,74 @@ pub(crate) struct ProviderBackedEvidenceProjection {
     pub summary_trust_label: String,
 }
 
+/// Operator-supplied manual compaction note, recorded as bounded metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CompactionOperatorInstruction {
+    pub schema_version: u64,
+    pub note_text: String,
+    pub note_hash: String,
+    pub instruction_authority: String,
+    pub safety_check: String,
+}
+
+/// Metadata for the active transcript view created by compaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SuccessorTranscriptProjection {
+    pub schema_version: u64,
+    pub materialization: String,
+    pub active_session_id: String,
+    pub parent_session_id: Option<String>,
+    pub parent_transcript_immutable: bool,
+    pub branch_state: String,
+    pub split_point: SuccessorTranscriptSplitPoint,
+    pub split_guard: SuccessorTranscriptSplitGuard,
+    pub summary_ref: Option<String>,
+    pub unsummarized_tail_refs: Vec<String>,
+    pub condensed_source_refs: Vec<String>,
+    pub restore_metadata: SuccessorTranscriptRestoreMetadata,
+    pub instruction_authority: String,
+}
+
+/// Boundary between condensed history and verbatim successor tail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SuccessorTranscriptSplitPoint {
+    pub last_condensed_ref: Option<String>,
+    pub first_unsummarized_ref: Option<String>,
+    pub condensed_event_count: u64,
+    pub unsummarized_tail_event_count: u64,
+}
+
+/// Guard that proves compaction did not split a tool call/result pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SuccessorTranscriptSplitGuard {
+    pub tool_pair_intact: bool,
+    pub reason_code: String,
+}
+
+/// Restore and branch lineage metadata carried with the successor view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SuccessorTranscriptRestoreMetadata {
+    pub pair_id: Option<String>,
+    pub pre_checkpoint_id: Option<String>,
+    pub post_checkpoint_id: Option<String>,
+    pub rollback_supported: bool,
+    pub restore_event_types: Vec<String>,
+}
+
+/// Strict metadata that pins identifiers and evidence refs across compaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct IdentifierEvidencePreservationProjection {
+    pub schema_version: u64,
+    pub mode: String,
+    pub preserved_source_ref_count: usize,
+    pub preserved_tool_event_refs: Vec<String>,
+    pub preserved_approval_refs: Vec<String>,
+    pub preserved_file_refs: Vec<String>,
+    pub uncertain_identifier_count: usize,
+    pub warnings: Vec<String>,
+    pub compaction_may_rewrite_identifiers: bool,
+}
+
 /// Structured "what was I doing" digest carried across the compaction cut.
 ///
 /// Rendered into the summary text inside an `<active_task_summary>` wrapper
@@ -643,6 +721,9 @@ struct CompactionSummaryJsonInput<'a> {
     checkpoint_pair: &'a PreAPostCompactionCheckpoints,
     safeguard: &'a CompactionSafeguardProjection,
     provider_evidence: &'a ProviderBackedEvidenceProjection,
+    successor_transcript: &'a SuccessorTranscriptProjection,
+    identifier_evidence: &'a IdentifierEvidencePreservationProjection,
+    operator_instruction: Option<&'a CompactionOperatorInstruction>,
     lifecycle_state: &'a str,
     review_candidate_count: usize,
     compressor_mode: Option<&'a str>,
@@ -689,6 +770,7 @@ pub(crate) struct SessionContextCompressionInput<'a> {
     pub(crate) trigger_reason: Option<&'a str>,
     pub(crate) trigger_policy: Option<&'a str>,
     pub(crate) mode: &'a str,
+    pub(crate) operator_instruction: Option<&'a str>,
     pub(crate) previous_compaction_count: usize,
 }
 
@@ -807,6 +889,7 @@ pub(crate) async fn preview_session_compaction(
     session: &OrchestratorSessionRecord,
     trigger_reason: Option<&str>,
     trigger_policy: Option<&str>,
+    operator_instruction: Option<&str>,
 ) -> Result<SessionCompactionPlan, Status> {
     let (transcript, pins, workspace_documents) =
         load_session_compaction_inputs(runtime_state, session).await?;
@@ -825,6 +908,7 @@ pub(crate) async fn preview_session_compaction(
         trigger_reason,
         trigger_policy,
         mode: "preview",
+        operator_instruction,
         previous_compaction_count,
     });
     refresh_compaction_safeguard_rollout(
@@ -869,6 +953,7 @@ pub(crate) async fn apply_session_compaction(
         trigger_reason: request.trigger_reason,
         trigger_policy: request.trigger_policy,
         mode: request.mode,
+        operator_instruction: request.operator_instruction,
         previous_compaction_count,
     });
     let safeguard_rollout_enabled =
@@ -1067,6 +1152,15 @@ pub(crate) async fn apply_session_compaction(
             .unwrap_or_else(|| "unknown".to_owned());
         return Err(Status::failed_precondition(format!("compaction safeguard failed: {reason}")));
     }
+    plan.checkpoint_pair = applied_checkpoint_pair.clone();
+    plan.safeguard = applied_safeguard.clone();
+    plan.successor_transcript.summary_ref = Some(format!("compaction_artifact:{artifact_id}"));
+    plan.successor_transcript.restore_metadata.pair_id = Some(pair_id.clone());
+    plan.successor_transcript.restore_metadata.pre_checkpoint_id =
+        Some(pre_checkpoint.checkpoint_id.clone());
+    plan.successor_transcript.restore_metadata.post_checkpoint_id =
+        Some(post_checkpoint_id.clone());
+    annotate_compaction_json(&mut plan);
     let artifact = request
         .runtime_state
         .create_orchestrator_compaction_artifact(OrchestratorCompactionArtifactCreateRequest {
@@ -1100,6 +1194,9 @@ pub(crate) async fn apply_session_compaction(
                 checkpoint_pair: &applied_checkpoint_pair,
                 safeguard: &applied_safeguard,
                 provider_evidence: &plan.provider_evidence,
+                successor_transcript: &plan.successor_transcript,
+                identifier_evidence: &plan.identifier_evidence,
+                operator_instruction: plan.operator_instruction.as_ref(),
                 lifecycle_state,
                 review_candidate_count: pending_review_count,
                 compressor_mode: Some(plan.compressor_mode.as_str()),
@@ -1162,6 +1259,7 @@ pub(crate) fn build_session_compaction_plan(
         trigger_reason,
         trigger_policy,
         mode: "manual",
+        operator_instruction: None,
         previous_compaction_count: 0,
     })
 }
@@ -1237,6 +1335,7 @@ fn build_session_compaction_plan_with_metadata(
         }
         condensed_records.push(record.clone());
     }
+    protect_split_tool_pairs(&mut condensed_records, &mut protected_records);
 
     let blocked_reason = detect_compaction_blocked_reason(transcript).or_else(|| {
         if condensed_records.len() < SESSION_COMPACTION_MIN_CONDENSED_EVENTS {
@@ -1374,6 +1473,21 @@ fn build_session_compaction_plan_with_metadata(
         "provider_summary_unavailable",
         evidence_refs.as_slice(),
     );
+    let successor_transcript = build_successor_transcript_projection(
+        session,
+        condensed_records.as_slice(),
+        protected_records.as_slice(),
+        &checkpoint_pair,
+        None,
+    );
+    let identifier_evidence = build_identifier_evidence_preservation_projection(
+        condensed_records.as_slice(),
+        protected_records.as_slice(),
+        candidates.as_slice(),
+        evidence_refs.as_slice(),
+    );
+    let operator_instruction =
+        input.operator_instruction.and_then(normalize_compaction_operator_instruction);
     let summary_json = build_compaction_summary_json(CompactionSummaryJsonInput {
         session,
         eligible,
@@ -1386,6 +1500,9 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_pair: &checkpoint_pair,
         safeguard: &safeguard,
         provider_evidence: &provider_evidence,
+        successor_transcript: &successor_transcript,
+        identifier_evidence: &identifier_evidence,
+        operator_instruction: operator_instruction.as_ref(),
         lifecycle_state: if eligible { "preview_ready" } else { "preview_blocked" },
         review_candidate_count,
         compressor_mode: Some("deterministic"),
@@ -1411,6 +1528,9 @@ fn build_session_compaction_plan_with_metadata(
         "checkpoint_pair": checkpoint_pair,
         "compaction_safeguard": safeguard,
         "provider_evidence": provider_evidence,
+        "successor_transcript": successor_transcript,
+        "identifier_evidence": identifier_evidence,
+        "operator_instruction": operator_instruction,
     })
     .to_string();
 
@@ -1441,6 +1561,9 @@ fn build_session_compaction_plan_with_metadata(
         checkpoint_pair,
         safeguard,
         provider_evidence,
+        successor_transcript,
+        identifier_evidence,
+        operator_instruction,
     }
 }
 
@@ -1481,6 +1604,206 @@ fn collect_plan_evidence_refs(plan: &SessionCompactionPlan) -> Vec<String> {
         }
     }
     refs
+}
+
+fn protect_split_tool_pairs(
+    condensed_records: &mut Vec<SessionCompactionRecordSnapshot>,
+    protected_records: &mut Vec<SessionCompactionRecordSnapshot>,
+) {
+    let split_divides_pair = condensed_records.last().zip(protected_records.first()).is_some_and(
+        |(last_condensed, first_protected)| {
+            record_is_tool_call(last_condensed)
+                && record_is_tool_result(first_protected)
+                && last_condensed.run_id == first_protected.run_id
+        },
+    );
+    if !split_divides_pair {
+        return;
+    }
+    if let Some(mut tool_call) = condensed_records.pop() {
+        tool_call.bucket = "protected";
+        tool_call.reason = Some("tool_pair_boundary");
+        protected_records.insert(0, tool_call);
+    }
+}
+
+fn build_successor_transcript_projection(
+    session: &OrchestratorSessionRecord,
+    condensed_records: &[SessionCompactionRecordSnapshot],
+    protected_records: &[SessionCompactionRecordSnapshot],
+    checkpoint_pair: &PreAPostCompactionCheckpoints,
+    summary_ref: Option<String>,
+) -> SuccessorTranscriptProjection {
+    let last_condensed_ref = condensed_records.last().map(compaction_record_evidence_ref);
+    let first_unsummarized_ref = protected_records.first().map(compaction_record_evidence_ref);
+    let tool_pair_intact = split_tool_pair_intact(condensed_records, protected_records);
+    SuccessorTranscriptProjection {
+        schema_version: SUCCESSOR_TRANSCRIPT_PROJECTION_SCHEMA_VERSION,
+        materialization: "compaction_artifact_successor".to_owned(),
+        active_session_id: session.session_id.clone(),
+        parent_session_id: session.parent_session_id.clone(),
+        parent_transcript_immutable: true,
+        branch_state: session.branch_state.clone(),
+        split_point: SuccessorTranscriptSplitPoint {
+            last_condensed_ref,
+            first_unsummarized_ref,
+            condensed_event_count: condensed_records.len() as u64,
+            unsummarized_tail_event_count: protected_records.len() as u64,
+        },
+        split_guard: SuccessorTranscriptSplitGuard {
+            tool_pair_intact,
+            reason_code: if tool_pair_intact {
+                "successor_transcript.tool_pair_boundary_intact"
+            } else {
+                "successor_transcript.tool_pair_boundary_split_detected"
+            }
+            .to_owned(),
+        },
+        summary_ref,
+        unsummarized_tail_refs: protected_records
+            .iter()
+            .map(compaction_record_evidence_ref)
+            .collect(),
+        condensed_source_refs: condensed_records
+            .iter()
+            .map(compaction_record_evidence_ref)
+            .collect(),
+        restore_metadata: SuccessorTranscriptRestoreMetadata {
+            pair_id: checkpoint_pair.journal_projection.pair_id.clone(),
+            pre_checkpoint_id: checkpoint_pair.journal_projection.pre_checkpoint_id.clone(),
+            post_checkpoint_id: checkpoint_pair.journal_projection.post_checkpoint_id.clone(),
+            rollback_supported: true,
+            restore_event_types: vec![
+                COMPACTION_SAFEGUARD_EVENT_ROLLED_BACK.to_owned(),
+                "checkpoint.restore".to_owned(),
+            ],
+        },
+        instruction_authority: "none".to_owned(),
+    }
+}
+
+fn split_tool_pair_intact(
+    condensed_records: &[SessionCompactionRecordSnapshot],
+    protected_records: &[SessionCompactionRecordSnapshot],
+) -> bool {
+    !condensed_records.last().zip(protected_records.first()).is_some_and(
+        |(last_condensed, first_protected)| {
+            record_is_tool_call(last_condensed)
+                && record_is_tool_result(first_protected)
+                && last_condensed.run_id == first_protected.run_id
+        },
+    )
+}
+
+fn record_is_tool_call(record: &SessionCompactionRecordSnapshot) -> bool {
+    record.event_type == "tool_call" || record.text.to_ascii_lowercase().contains("tool_call")
+}
+
+fn record_is_tool_result(record: &SessionCompactionRecordSnapshot) -> bool {
+    record.event_type == "tool_result" || record.text.to_ascii_lowercase().contains("tool_result")
+}
+
+fn build_identifier_evidence_preservation_projection(
+    condensed_records: &[SessionCompactionRecordSnapshot],
+    protected_records: &[SessionCompactionRecordSnapshot],
+    candidates: &[SessionCompactionCandidate],
+    evidence_refs: &[String],
+) -> IdentifierEvidencePreservationProjection {
+    let records = condensed_records.iter().chain(protected_records.iter()).collect::<Vec<_>>();
+    let mut preserved_tool_event_refs = records
+        .iter()
+        .filter(|record| record_is_tool_call(record) || record_is_tool_result(record))
+        .map(|record| compaction_record_evidence_ref(record))
+        .collect::<Vec<_>>();
+    preserved_tool_event_refs.sort();
+    preserved_tool_event_refs.dedup();
+
+    let mut preserved_approval_refs = records
+        .iter()
+        .filter(|record| {
+            record.event_type.contains("approval")
+                || record.text.to_ascii_lowercase().contains("approval")
+        })
+        .map(|record| compaction_record_evidence_ref(record))
+        .collect::<Vec<_>>();
+    preserved_approval_refs.sort();
+    preserved_approval_refs.dedup();
+
+    let mut file_refs = BTreeSet::new();
+    for record in &records {
+        collect_path_like_refs(record.text.as_str(), &mut file_refs);
+    }
+    for candidate in candidates {
+        collect_path_like_refs(candidate.target_path.as_str(), &mut file_refs);
+        collect_path_like_refs(candidate.content.as_str(), &mut file_refs);
+    }
+    let preserved_file_refs = file_refs.into_iter().take(24).collect::<Vec<_>>();
+    let uncertain_identifier_count = records
+        .iter()
+        .flat_map(|record| record.text.split_whitespace())
+        .filter(|token| looks_like_uncertain_identifier(token))
+        .count();
+    let warnings = if evidence_refs.is_empty() {
+        vec!["identifier_evidence.no_source_refs".to_owned()]
+    } else {
+        Vec::new()
+    };
+    IdentifierEvidencePreservationProjection {
+        schema_version: IDENTIFIER_EVIDENCE_PRESERVATION_SCHEMA_VERSION,
+        mode: "strict_identifier_evidence_preservation".to_owned(),
+        preserved_source_ref_count: evidence_refs.len(),
+        preserved_tool_event_refs,
+        preserved_approval_refs,
+        preserved_file_refs,
+        uncertain_identifier_count,
+        warnings,
+        compaction_may_rewrite_identifiers: false,
+    }
+}
+
+fn collect_path_like_refs(text: &str, refs: &mut BTreeSet<String>) {
+    for raw in text.split_whitespace() {
+        let token = raw
+            .trim_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | '`' | ',' | ';' | ':' | ')' | '(' | '[' | ']')
+            })
+            .trim();
+        if token.len() < 3 || token.starts_with("http://") || token.starts_with("https://") {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        let path_like = token.contains('/')
+            || token.contains('\\')
+            || [".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".ts", ".tsx", ".js"]
+                .iter()
+                .any(|suffix| lower.ends_with(suffix));
+        if path_like {
+            refs.insert(truncate_console_text(token, 180));
+        }
+    }
+}
+
+fn looks_like_uncertain_identifier(raw: &str) -> bool {
+    let token = raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    token.len() >= 16
+        && token.chars().any(|ch| ch.is_ascii_digit())
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn normalize_compaction_operator_instruction(raw: &str) -> Option<CompactionOperatorInstruction> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let redacted = redact_url_segments_in_text(redact_auth_error(trimmed).as_str());
+    let note_text = truncate_console_text(redacted.as_str(), 600);
+    Some(CompactionOperatorInstruction {
+        schema_version: COMPACTION_OPERATOR_INSTRUCTION_SCHEMA_VERSION,
+        note_hash: crate::sha256_hex(note_text.as_bytes()),
+        note_text,
+        instruction_authority: "operator_note_not_prompt_instruction".to_owned(),
+        safety_check: "bounded_redacted_metadata_only".to_owned(),
+    })
 }
 
 fn annotate_provider_backed_evidence_plan(
@@ -1695,6 +2018,16 @@ fn provider_backed_evidence_degraded_reason(
 fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
     plan.checkpoint_pair.journal_projection.evidence_refs = plan.evidence_refs.clone();
     plan.safeguard.pre_checkpoint.evidence_refs = plan.evidence_refs.clone();
+    plan.identifier_evidence.preserved_source_ref_count = plan.evidence_refs.len();
+    if plan.evidence_refs.is_empty()
+        && !plan
+            .identifier_evidence
+            .warnings
+            .iter()
+            .any(|warning| warning == "identifier_evidence.no_source_refs")
+    {
+        plan.identifier_evidence.warnings.push("identifier_evidence.no_source_refs".to_owned());
+    }
     let compression = json!({
         "compressor_mode": plan.compressor_mode,
         "fallback_used": plan.fallback_used,
@@ -1707,6 +2040,9 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
             object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
             object.insert("provider_evidence".to_owned(), json!(&plan.provider_evidence));
+            object.insert("successor_transcript".to_owned(), json!(&plan.successor_transcript));
+            object.insert("identifier_evidence".to_owned(), json!(&plan.identifier_evidence));
+            object.insert("operator_instruction".to_owned(), json!(&plan.operator_instruction));
         }
         plan.summary_json = summary.to_string();
     }
@@ -1717,6 +2053,9 @@ fn annotate_compaction_json(plan: &mut SessionCompactionPlan) {
             object.insert("checkpoint_pair".to_owned(), json!(&plan.checkpoint_pair));
             object.insert("compaction_safeguard".to_owned(), json!(&plan.safeguard));
             object.insert("provider_evidence".to_owned(), json!(&plan.provider_evidence));
+            object.insert("successor_transcript".to_owned(), json!(&plan.successor_transcript));
+            object.insert("identifier_evidence".to_owned(), json!(&plan.identifier_evidence));
+            object.insert("operator_instruction".to_owned(), json!(&plan.operator_instruction));
         }
         plan.trigger_inputs_json = trigger_inputs.to_string();
     }
@@ -2969,6 +3308,9 @@ fn build_compaction_summary_json(input: CompactionSummaryJsonInput<'_>) -> Strin
         "checkpoint_pair": input.checkpoint_pair,
         "compaction_safeguard": input.safeguard,
         "provider_evidence": input.provider_evidence,
+        "successor_transcript": input.successor_transcript,
+        "identifier_evidence": input.identifier_evidence,
+        "operator_instruction": input.operator_instruction,
         "quality_gates": quality_gates,
         "retry_safety_report": retry_safety_report,
         "compression": {
@@ -4168,6 +4510,173 @@ mod tests {
     }
 
     #[test]
+    fn successor_and_identifier_projection_are_serialized_with_summary() {
+        let transcript = (0..12)
+            .map(|seq| {
+                let payload = format!(
+                    r#"{{"text":"Decision: preserve file refs in MEMORY.md and crates/palyra-daemon/src/lib.rs for event {seq}."}}"#
+                );
+                transcript_record(seq, "message.received", payload.as_str())
+            })
+            .collect::<Vec<_>>();
+        let session = session_record();
+        let plan =
+            super::DeterministicSessionContextCompressor.compress(SessionContextCompressionInput {
+                session: &session,
+                transcript: transcript.as_slice(),
+                pins: &[],
+                workspace_documents: &[],
+                trigger_reason: Some("manual_compact"),
+                trigger_policy: Some("successor_projection_test"),
+                mode: "manual",
+                operator_instruction: Some("Preserve rollback and evidence refs."),
+                previous_compaction_count: 0,
+            });
+        let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
+            .expect("summary JSON should decode");
+
+        assert!(plan.successor_transcript.parent_transcript_immutable);
+        assert_eq!(plan.successor_transcript.parent_session_id, session.parent_session_id);
+        assert!(plan.successor_transcript.split_guard.tool_pair_intact);
+        assert_eq!(plan.successor_transcript.instruction_authority, "none");
+        assert!(!plan.successor_transcript.condensed_source_refs.is_empty());
+        assert!(!plan.successor_transcript.unsummarized_tail_refs.is_empty());
+        assert_eq!(
+            summary
+                .pointer("/successor_transcript/split_guard/tool_pair_intact")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .pointer("/identifier_evidence/compaction_may_rewrite_identifiers")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(plan
+            .identifier_evidence
+            .preserved_file_refs
+            .iter()
+            .any(|path| path == "MEMORY.md"));
+        let operator_instruction =
+            plan.operator_instruction.as_ref().expect("operator note should be recorded");
+        assert_eq!(
+            operator_instruction.instruction_authority,
+            "operator_note_not_prompt_instruction"
+        );
+        assert_eq!(operator_instruction.note_hash.len(), 64);
+        assert_eq!(
+            summary
+                .pointer("/operator_instruction/safety_check")
+                .and_then(serde_json::Value::as_str),
+            Some("bounded_redacted_metadata_only")
+        );
+    }
+
+    #[test]
+    fn successor_split_repair_keeps_tool_call_with_result_tail() {
+        let mut condensed_records = vec![super::SessionCompactionRecordSnapshot {
+            run_id: "run-tool".to_owned(),
+            seq: 1,
+            event_type: "tool_call".to_owned(),
+            created_at_unix_ms: 1,
+            text: "tool_call palyra.process.run".to_owned(),
+            bucket: "condensed",
+            reason: None,
+        }];
+        let mut protected_records = vec![super::SessionCompactionRecordSnapshot {
+            run_id: "run-tool".to_owned(),
+            seq: 2,
+            event_type: "tool_result".to_owned(),
+            created_at_unix_ms: 2,
+            text: "tool_result ok".to_owned(),
+            bucket: "protected",
+            reason: Some("recent_context"),
+        }];
+
+        super::protect_split_tool_pairs(&mut condensed_records, &mut protected_records);
+        let session = session_record();
+        let checkpoint_pair = super::build_pre_post_compaction_checkpoints(
+            super::PrePostCompactionCheckpointBuildInput {
+                session: &session,
+                run_id: Some("run-tool"),
+                mode: "manual",
+                trigger_reason: "unit",
+                trigger_policy: None,
+                workspace_paths: Vec::new(),
+                evidence_refs: &[],
+                decision: PreAPostCompactionDecision::Ready,
+                reason_code: PreAPostCompactionReasonCode::Ready,
+                pair_id: None,
+                artifact_id: None,
+                pre_checkpoint_id: None,
+                post_checkpoint_id: None,
+            },
+        );
+        let projection = super::build_successor_transcript_projection(
+            &session,
+            condensed_records.as_slice(),
+            protected_records.as_slice(),
+            &checkpoint_pair,
+            None,
+        );
+
+        assert!(condensed_records.is_empty());
+        assert_eq!(protected_records[0].reason, Some("tool_pair_boundary"));
+        assert!(projection.split_guard.tool_pair_intact);
+        assert_eq!(
+            projection.split_point.first_unsummarized_ref.as_deref(),
+            Some("run-tool:1:tool_call")
+        );
+    }
+
+    #[test]
+    fn compaction_golden_fixture_suite_contract_is_complete() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/golden/session_compaction_lifecycle_cases.json"
+        ));
+        let value = serde_json::from_str::<serde_json::Value>(fixture)
+            .expect("compaction lifecycle fixture should parse");
+        assert_eq!(value.pointer("/schema_version").and_then(serde_json::Value::as_u64), Some(1));
+        let cases = value
+            .pointer("/cases")
+            .and_then(serde_json::Value::as_array)
+            .expect("fixture should contain cases");
+        let case_ids = cases
+            .iter()
+            .filter_map(|case| case.get("case_id").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "split_inside_tool_block",
+            "opaque_id_preservation",
+            "provider_summary_failure_fallback",
+            "long_coding_session_with_verification",
+            "media_heavy_session_stripping_policy",
+        ] {
+            assert!(case_ids.contains(expected), "missing fixture case {expected}");
+        }
+        for case in cases {
+            assert!(
+                case.pointer("/expected_report").and_then(serde_json::Value::as_object).is_some(),
+                "each fixture case must pin an expected compaction report"
+            );
+        }
+        assert_eq!(
+            value
+                .pointer("/cases/0/expected_report/successor_transcript/tool_pair_intact")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            value
+                .pointer("/cases/1/expected_report/identifier_evidence/compaction_may_rewrite_identifiers")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn compaction_safeguard_projection_serializes_audit_contract() {
         let transcript = (0..12)
             .map(|seq| {
@@ -5156,6 +5665,7 @@ Open action items:
                 trigger_reason: Some("test_compaction"),
                 trigger_policy: Some("test_policy"),
                 mode: "manual",
+                operator_instruction: None,
                 previous_compaction_count: 0,
             });
         let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
@@ -5218,6 +5728,7 @@ Open action items:
                 trigger_reason: Some("test_compaction"),
                 trigger_policy: Some("test_policy"),
                 mode: "manual",
+                operator_instruction: None,
                 previous_compaction_count: 0,
             });
         let source_ref =
@@ -5243,6 +5754,7 @@ Open action items:
             trigger_reason: Some("test_compaction"),
             trigger_policy: Some("test_policy"),
             mode: "manual",
+            operator_instruction: None,
             previous_compaction_count: 0,
         });
         let summary = serde_json::from_str::<serde_json::Value>(plan.summary_json.as_str())
@@ -5305,6 +5817,7 @@ Open action items:
             trigger_reason: Some("test_compaction"),
             trigger_policy: Some("test_policy"),
             mode: "manual",
+            operator_instruction: None,
             previous_compaction_count: 0,
         });
 
@@ -5338,6 +5851,7 @@ Open action items:
                 trigger_reason: Some("test_compaction"),
                 trigger_policy: Some("test_policy"),
                 mode: "manual",
+                operator_instruction: None,
                 previous_compaction_count: 0,
             },
         );
@@ -5374,6 +5888,7 @@ Open action items:
                 trigger_reason: Some("test_compaction"),
                 trigger_policy: Some("test_policy"),
                 mode: "manual",
+                operator_instruction: None,
                 previous_compaction_count: 0,
             });
 

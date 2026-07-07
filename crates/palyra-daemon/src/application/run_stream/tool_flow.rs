@@ -11,6 +11,9 @@
 
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -22,7 +25,7 @@ use palyra_common::{
     redaction::{is_sensitive_key, redact_auth_error, redact_url_segments_in_text, REDACTED},
     runtime_contracts::{
         ArtifactRetentionPolicy, RunLifecycleHookDecisionKind, RunLifecycleHookPhase,
-        ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
+        ToolResultArtifactRef, ToolResultProjectionAuditRecord, ToolResultProjectionDecisionKind,
         ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolResultVisibility,
         ToolTurnBudget,
     },
@@ -38,6 +41,7 @@ use tracing::{info, Instrument};
 use ulid::Ulid;
 
 use crate::{
+    agents::AgentResolveRequest,
     application::approvals::{
         approval_subject_type_for_tool, build_pending_tool_approval,
         record_approval_requested_journal_event, record_approval_resolved_journal_event,
@@ -62,6 +66,9 @@ use crate::{
     application::tool_runtime::{
         artifacts::bounded_tool_result_artifact_content,
         workspace_patch::normalized_workspace_patch_approval_input_json,
+        workspace_scope::{
+            session_active_workspace_root, workspace_roots_with_run_launch_context_for_agent_source,
+        },
     },
     application::tool_security::{
         approval_execution_context_for_backend_selection, evaluate_tool_proposal_security,
@@ -2357,6 +2364,13 @@ async fn project_tool_result_for_model(
     } else {
         ToolResultVisibility::ModelSummary
     };
+    let workspace_spill = workspace_spill_projection_for_artifact(
+        runtime_state,
+        context,
+        &artifact,
+        artifact_content.content.as_slice(),
+    )
+    .await;
     let saved_model_visible_bytes =
         outcome.output_json.len().saturating_sub(summary.len()).try_into().unwrap_or(u64::MAX);
     let projected = json!({
@@ -2365,7 +2379,8 @@ async fn project_tool_result_for_model(
         "projection_policy": projection_policy.as_str(),
         "summary": summary,
         "redacted_preview": preview,
-        "artifact": artifact,
+        "artifact": &artifact,
+        "workspace_spill": workspace_spill,
         "budget": {
             "max_model_inline_bytes": budget.max_model_inline_bytes,
             "max_model_summary_bytes": budget.max_model_summary_bytes,
@@ -2417,6 +2432,179 @@ async fn project_tool_result_for_model(
         audit: Some(audit),
         middleware_report,
     })
+}
+
+async fn workspace_spill_projection_for_artifact(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    artifact: &ToolResultArtifactRef,
+    content: &[u8],
+) -> Value {
+    let full_read_requires_gate = artifact.sensitivity.requires_full_read_gate();
+    if full_read_requires_gate && !workspace_spill_policy_grants_sensitivity(artifact.sensitivity) {
+        return workspace_spill_unavailable_projection(
+            artifact,
+            "workspace_spill.sensitive_output_requires_policy_grant",
+        );
+    }
+
+    match create_workspace_spill_file(runtime_state, context, artifact, content).await {
+        Ok(spill) => json!({
+            "schema_version": 1,
+            "created": true,
+            "workspace_visible_path": spill.relative_path,
+            "workspace_root_index": spill.workspace_root_index,
+            "reason_code": "workspace_spill.created",
+            "canonical_source": "journal_tool_result_artifact",
+            "artifact_id": artifact.artifact_id.as_str(),
+            "digest_sha256": artifact.digest_sha256.as_str(),
+            "spill_digest_sha256": spill.digest_sha256,
+            "read_tools": ["palyra.fs.read_file", "palyra.artifact.read"],
+            "policy": {
+                "requires_run_owned_workspace_scope": true,
+                "requires_sensitive_output_grant": full_read_requires_gate,
+                "retention": &artifact.retention,
+            },
+        }),
+        Err(reason_code) => workspace_spill_unavailable_projection(artifact, reason_code.as_str()),
+    }
+}
+
+fn workspace_spill_policy_grants_sensitivity(sensitivity: ToolResultSensitivity) -> bool {
+    matches!(sensitivity, ToolResultSensitivity::Public | ToolResultSensitivity::StdoutStderr)
+}
+
+fn workspace_spill_unavailable_projection(
+    artifact: &ToolResultArtifactRef,
+    reason_code: &str,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "created": false,
+        "workspace_visible_path": null,
+        "reason_code": reason_code,
+        "canonical_source": "journal_tool_result_artifact",
+        "artifact_id": artifact.artifact_id.as_str(),
+        "digest_sha256": artifact.digest_sha256.as_str(),
+        "read_tools": ["palyra.artifact.read"],
+        "policy": {
+            "requires_run_owned_workspace_scope": true,
+            "requires_sensitive_output_grant": artifact.sensitivity.requires_full_read_gate(),
+            "retention": &artifact.retention,
+        },
+    })
+}
+
+struct WorkspaceSpillFile {
+    relative_path: String,
+    workspace_root_index: usize,
+    digest_sha256: String,
+}
+
+async fn create_workspace_spill_file(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+    artifact: &ToolResultArtifactRef,
+    content: &[u8],
+) -> Result<WorkspaceSpillFile, String> {
+    let (workspace_root_index, workspace_root) =
+        resolve_tool_result_spill_workspace_root(runtime_state, context).await?;
+    let spill_dir = workspace_root
+        .join(".palyra")
+        .join("tool-spills")
+        .join(safe_spill_path_component(context.run_id)?);
+    fs::create_dir_all(spill_dir.as_path())
+        .map_err(|_| "workspace_spill.create_dir_failed".to_owned())?;
+    let canonical_root = fs::canonicalize(workspace_root.as_path())
+        .map_err(|_| "workspace_spill.workspace_root_unavailable".to_owned())?;
+    let canonical_dir = fs::canonicalize(spill_dir.as_path())
+        .map_err(|_| "workspace_spill.create_dir_failed".to_owned())?;
+    if !canonical_dir.starts_with(canonical_root.as_path()) {
+        return Err("workspace_spill.scope_escape_detected".to_owned());
+    }
+
+    let file_name = format!("{}.json", safe_spill_path_component(artifact.artifact_id.as_str())?);
+    let spill_path = canonical_dir.join(file_name);
+    write_new_spill_file(spill_path.as_path(), content)?;
+    let stored = fs::read(spill_path.as_path())
+        .map_err(|_| "workspace_spill.digest_read_failed".to_owned())?;
+    let digest_sha256 = crate::sha256_hex(stored.as_slice());
+    if digest_sha256 != artifact.digest_sha256 {
+        let _ = fs::remove_file(spill_path.as_path());
+        return Err("workspace_spill.digest_mismatch".to_owned());
+    }
+    let relative_path =
+        format!(".palyra/tool-spills/{}/{}.json", context.run_id, artifact.artifact_id);
+    Ok(WorkspaceSpillFile { relative_path, workspace_root_index, digest_sha256 })
+}
+
+async fn resolve_tool_result_spill_workspace_root(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    context: ToolRuntimeExecutionContext<'_>,
+) -> Result<(usize, PathBuf), String> {
+    let agent_outcome = runtime_state
+        .resolve_agent_for_context(AgentResolveRequest {
+            principal: context.principal.to_owned(),
+            channel: context.channel.map(str::to_owned),
+            session_id: Some(context.session_id.to_owned()),
+            preferred_agent_id: None,
+            persist_session_binding: false,
+        })
+        .await
+        .map_err(|_| "workspace_spill.agent_workspace_unavailable".to_owned())?;
+    let agent_workspace_roots =
+        agent_outcome.agent.workspace_roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let workspace_roots = workspace_roots_with_run_launch_context_for_agent_source(
+        runtime_state,
+        context.run_id,
+        agent_workspace_roots.as_slice(),
+        agent_outcome.source,
+    )
+    .await;
+    if workspace_roots.is_empty() {
+        return Err("workspace_spill.workspace_scope_unavailable".to_owned());
+    }
+    if let Ok(Some(active_root)) =
+        session_active_workspace_root(runtime_state, context.session_id, workspace_roots.as_slice())
+            .await
+    {
+        if let Some((index, root)) = workspace_roots.iter().enumerate().find(|(_, root)| {
+            same_canonical_workspace_root(root.as_path(), active_root.root.as_path())
+        }) {
+            return Ok((index, root.clone()));
+        }
+        return Ok((0, active_root.root));
+    }
+    Ok((0, workspace_roots[0].clone()))
+}
+
+fn write_new_spill_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "workspace_spill.file_already_exists"
+        } else {
+            "workspace_spill.write_failed"
+        }
+        .to_owned()
+    })?;
+    file.write_all(content).map_err(|_| "workspace_spill.write_failed".to_owned())
+}
+
+fn same_canonical_workspace_root(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn safe_spill_path_component(value: &str) -> Result<&str, String> {
+    if !value.is_empty()
+        && value.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Ok(value)
+    } else {
+        Err("workspace_spill.invalid_path_component".to_owned())
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -2851,6 +3039,7 @@ mod tests {
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
         drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
         process_progress_status_message, projection_policy_contract, sessions_spawn_tape_payload,
+        workspace_spill_policy_grants_sensitivity, workspace_spill_unavailable_projection,
         ParallelToolExecutionTaskOutcome, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
     };
     use crate::application::tool_registry::ToolResultProjectionPolicy;
@@ -2858,7 +3047,8 @@ mod tests {
     use crate::sandbox_runner::ProcessProgressEvent;
     use crate::tool_protocol::{ToolAttestation, ToolExecutionOutcome};
     use palyra_common::runtime_contracts::{
-        ToolResultProjectionPolicyKind, ToolResultSensitivity, ToolTurnBudget,
+        ArtifactRetentionPolicy, ToolResultArtifactRef, ToolResultProjectionPolicyKind,
+        ToolResultSensitivity, ToolTurnBudget,
     };
     use palyra_common::validate_canonical_id;
     use serde_json::{json, Value};
@@ -3350,6 +3540,50 @@ mod tests {
                 &ToolTurnBudget::default()
             ),
             "small OS list_dir metadata must use RedactedPreviewAndArtifact projection"
+        );
+    }
+
+    #[test]
+    fn workspace_spill_projection_keeps_sensitive_artifacts_journal_scoped() {
+        let artifact = ToolResultArtifactRef {
+            artifact_id: "01ARZ3NDEKTSV4RRFFQ69G5FAE".to_owned(),
+            digest_sha256: "a".repeat(64),
+            mime_type: "application/json".to_owned(),
+            size_bytes: 1024,
+            sensitivity: ToolResultSensitivity::Secret,
+            retention: ArtifactRetentionPolicy::keep(),
+            origin_tool_call_id: "call-secret".to_owned(),
+            tool_name: "palyra.browser.click".to_owned(),
+            run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAF".to_owned(),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAG".to_owned(),
+            storage_backend: "journal".to_owned(),
+            redacted_preview: "{}".to_owned(),
+            created_at_unix_ms: 1,
+        };
+
+        let spill = workspace_spill_unavailable_projection(
+            &artifact,
+            "workspace_spill.sensitive_output_requires_policy_grant",
+        );
+
+        assert!(!workspace_spill_policy_grants_sensitivity(ToolResultSensitivity::Secret));
+        assert!(workspace_spill_policy_grants_sensitivity(ToolResultSensitivity::StdoutStderr));
+        assert_eq!(spill.pointer("/created").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            spill.pointer("/reason_code").and_then(Value::as_str),
+            Some("workspace_spill.sensitive_output_requires_policy_grant")
+        );
+        assert_eq!(
+            spill.pointer("/canonical_source").and_then(Value::as_str),
+            Some("journal_tool_result_artifact")
+        );
+        assert_eq!(
+            spill.pointer("/read_tools/0").and_then(Value::as_str),
+            Some("palyra.artifact.read")
+        );
+        assert_eq!(
+            spill.pointer("/policy/requires_sensitive_output_grant").and_then(Value::as_bool),
+            Some(true)
         );
     }
 

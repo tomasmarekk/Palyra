@@ -509,6 +509,7 @@ pub(crate) async fn compact_model_token_tape(
         &session,
         Some("token_tape_cap_reached"),
         Some("token_tape_cap_v1"),
+        None,
     )
     .await?;
     let payload_json = if preview.eligible {
@@ -520,6 +521,7 @@ pub(crate) async fn compact_model_token_tape(
             mode: "automatic",
             trigger_reason: Some("token_tape_cap_reached"),
             trigger_policy: Some("token_tape_cap_v1"),
+            operator_instruction: None,
             accept_candidate_ids: &[],
             reject_candidate_ids: &[],
         })
@@ -606,6 +608,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
         &session,
         Some(trigger_reason),
         Some(trigger_policy),
+        None,
     )
     .await?;
     *compaction_emitted = true;
@@ -618,6 +621,7 @@ pub(crate) async fn maybe_compact_context_after_tool_results(
             mode: "automatic",
             trigger_reason: Some(trigger_reason),
             trigger_policy: Some(trigger_policy),
+            operator_instruction: None,
             accept_candidate_ids: &[],
             reject_candidate_ids: &[],
         })

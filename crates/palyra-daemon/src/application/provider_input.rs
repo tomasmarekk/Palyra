@@ -1424,6 +1424,7 @@ async fn maybe_apply_automatic_session_compaction(
         &session,
         Some("automatic_compaction_policy"),
         Some("budget_guard_v1"),
+        None,
     )
     .await?;
     let token_delta = plan.estimated_input_tokens.saturating_sub(plan.estimated_output_tokens);
@@ -1485,6 +1486,7 @@ async fn maybe_apply_automatic_session_compaction(
         mode: "automatic",
         trigger_reason: Some("automatic_compaction_policy"),
         trigger_policy: Some("budget_guard_v1"),
+        operator_instruction: None,
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })

@@ -11,14 +11,25 @@
 //! `application::session_compaction`; this module is consumed by
 //! `application::provider_input` and `application::context_engine`.
 
+use std::collections::BTreeMap;
+
 use palyra_common::{runtime_contracts::PruningPolicyClass, runtime_preview::RuntimePreviewMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::PruningPolicyMatrixConfig;
 
 /// Policy identifier recorded in pruning decisions and explain payloads.
 pub(crate) const SESSION_PRUNING_POLICY_ID: &str = "session_pruning.v1";
+/// Policy identifier recorded when historical tool results are shortened for
+/// one provider request.
+pub(crate) const TOOL_RESULT_PRUNING_POLICY_ID: &str = "tool_result_pruning.v1";
+
+const TOOL_RESULT_PROTECTED_TAIL_RESULTS: usize = 1;
+const TOOL_RESULT_DEFAULT_SOFT_MAX_CHARS: usize = 12_000;
+const TOOL_RESULT_DEFAULT_HARD_MAX_CHARS: usize = 64_000;
+const TOOL_RESULT_DEFAULT_HEAD_CHARS: usize = 1_200;
+const TOOL_RESULT_DEFAULT_TAIL_CHARS: usize = 1_200;
 
 /// Kind of work the prompt serves; picks the default pruning aggressiveness.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -94,6 +105,118 @@ pub(crate) struct SessionPruningOutcome {
     pub(crate) eligible: bool,
     pub(crate) reason: String,
     pub(crate) explain_json: Value,
+}
+
+/// Per-tool limits for ephemeral tool-result pruning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolResultPruningToolConfig {
+    pub(crate) soft_max_chars: usize,
+    pub(crate) hard_max_chars: usize,
+    pub(crate) head_chars: usize,
+    pub(crate) tail_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_ttl_ms: Option<i64>,
+}
+
+impl Default for ToolResultPruningToolConfig {
+    fn default() -> Self {
+        Self {
+            soft_max_chars: TOOL_RESULT_DEFAULT_SOFT_MAX_CHARS,
+            hard_max_chars: TOOL_RESULT_DEFAULT_HARD_MAX_CHARS,
+            head_chars: TOOL_RESULT_DEFAULT_HEAD_CHARS,
+            tail_chars: TOOL_RESULT_DEFAULT_TAIL_CHARS,
+            cache_ttl_ms: None,
+        }
+    }
+}
+
+/// Resolved policy for historical tool-result pruning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolResultPruningPolicy {
+    pub(crate) policy_id: String,
+    pub(crate) apply_enabled: bool,
+    pub(crate) protected_tail_results: usize,
+    pub(crate) default_config: ToolResultPruningToolConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) per_tool: BTreeMap<String, ToolResultPruningToolConfig>,
+}
+
+impl Default for ToolResultPruningPolicy {
+    fn default() -> Self {
+        Self {
+            policy_id: TOOL_RESULT_PRUNING_POLICY_ID.to_owned(),
+            apply_enabled: true,
+            protected_tail_results: TOOL_RESULT_PROTECTED_TAIL_RESULTS,
+            default_config: ToolResultPruningToolConfig::default(),
+            per_tool: BTreeMap::new(),
+        }
+    }
+}
+
+impl ToolResultPruningPolicy {
+    fn config_for_tool(&self, tool_name: &str) -> &ToolResultPruningToolConfig {
+        self.per_tool
+            .get(tool_name)
+            .or_else(|| self.per_tool.get(tool_name.to_ascii_lowercase().as_str()))
+            .unwrap_or(&self.default_config)
+    }
+}
+
+/// One candidate tool-result segment to prune before model-provider dispatch.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolResultPruningInput<'a> {
+    pub(crate) tool_name: &'a str,
+    pub(crate) call_id: Option<&'a str>,
+    pub(crate) status: Option<&'a str>,
+    pub(crate) output_text: &'a str,
+    pub(crate) artifact_refs: &'a [String],
+    pub(crate) cache_expires_at_unix_ms: Option<i64>,
+    pub(crate) protected: bool,
+    pub(crate) current_turn: bool,
+    pub(crate) protected_tail: bool,
+}
+
+/// Explain record for a pruned tool-result segment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolResultPruningAffectedTool {
+    pub(crate) tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<String>,
+    pub(crate) mode: String,
+    pub(crate) reason_code: String,
+    pub(crate) source_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) tokens_saved: u64,
+    pub(crate) digest_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_ttl_ms: Option<i64>,
+}
+
+/// Explain payload for all tool-result pruning in one assembled prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolResultPruningExplain {
+    pub(crate) policy: ToolResultPruningPolicy,
+    pub(crate) source_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) tokens_saved: u64,
+    pub(crate) applied: bool,
+    pub(crate) eligible: bool,
+    pub(crate) protected_tail_results: usize,
+    pub(crate) affected_tools: Vec<ToolResultPruningAffectedTool>,
+    pub(crate) transcript_mutated: bool,
+}
+
+/// Result for a single tool-result pruning candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolResultPruningItem {
+    pub(crate) output_text: String,
+    pub(crate) source_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) affected_tool: Option<ToolResultPruningAffectedTool>,
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +472,64 @@ pub(crate) fn context_engine_pruning_outcome(
     })
 }
 
+/// Prunes a historical tool-result payload without mutating the transcript.
+///
+/// Protected segments, current-turn results, and the configured recent tail
+/// are returned unchanged. Oversized older results are replaced by a stable
+/// JSON envelope that preserves identity, status, digest, artifact refs, and
+/// either head/tail excerpts or a hard-clear placeholder.
+#[must_use]
+pub(crate) fn apply_tool_result_pruning(
+    input: ToolResultPruningInput<'_>,
+    policy: &ToolResultPruningPolicy,
+    now_unix_ms: i64,
+) -> ToolResultPruningItem {
+    let source_tokens = estimate_prompt_tokens(input.output_text);
+    if !policy.apply_enabled || input.protected || input.current_turn || input.protected_tail {
+        return unchanged_tool_result(input.output_text, source_tokens);
+    }
+    let config = policy.config_for_tool(input.tool_name);
+    let output_chars = input.output_text.chars().count();
+    if output_chars <= config.soft_max_chars {
+        return unchanged_tool_result(input.output_text, source_tokens);
+    }
+
+    let digest_sha256 = crate::sha256_hex(input.output_text.as_bytes());
+    let cache_expired =
+        input.cache_expires_at_unix_ms.is_some_and(|expires_at| expires_at <= now_unix_ms);
+    let hard_clear = output_chars > config.hard_max_chars && cache_expired;
+    let mode = if hard_clear { "hard_clear" } else { "soft_trim" };
+    let reason_code = if hard_clear {
+        "tool_result_hard_cleared_after_cache_ttl"
+    } else {
+        "tool_result_soft_trimmed"
+    };
+    let pruned_text = if hard_clear {
+        render_tool_result_hard_clear(&input, &digest_sha256)
+    } else {
+        render_tool_result_soft_trim(&input, config, &digest_sha256)
+    };
+    let output_tokens = estimate_prompt_tokens(pruned_text.as_str());
+    ToolResultPruningItem {
+        output_text: pruned_text,
+        source_tokens,
+        output_tokens,
+        affected_tool: Some(ToolResultPruningAffectedTool {
+            tool_name: input.tool_name.to_owned(),
+            call_id: input.call_id.map(ToOwned::to_owned),
+            status: input.status.map(ToOwned::to_owned),
+            mode: mode.to_owned(),
+            reason_code: reason_code.to_owned(),
+            source_tokens,
+            output_tokens,
+            tokens_saved: source_tokens.saturating_sub(output_tokens),
+            digest_sha256,
+            artifact_refs: input.artifact_refs.to_vec(),
+            cache_ttl_ms: config.cache_ttl_ms,
+        }),
+    }
+}
+
 /// Estimates token count with the ~4 chars/token heuristic used repo-wide.
 ///
 /// Deliberately cheap and provider-agnostic; budgets derived from it are
@@ -361,6 +542,65 @@ pub(crate) fn estimate_prompt_tokens(text: &str) -> u64 {
     } else {
         trimmed.chars().count().div_ceil(4) as u64
     }
+}
+
+fn unchanged_tool_result(output_text: &str, source_tokens: u64) -> ToolResultPruningItem {
+    ToolResultPruningItem {
+        output_text: output_text.to_owned(),
+        source_tokens,
+        output_tokens: source_tokens,
+        affected_tool: None,
+    }
+}
+
+fn render_tool_result_soft_trim(
+    input: &ToolResultPruningInput<'_>,
+    config: &ToolResultPruningToolConfig,
+    digest_sha256: &str,
+) -> String {
+    json!({
+        "schema_version": 1,
+        "pruned_by": TOOL_RESULT_PRUNING_POLICY_ID,
+        "mode": "soft_trim",
+        "tool_name": input.tool_name,
+        "call_id": input.call_id,
+        "status": input.status,
+        "digest_sha256": digest_sha256,
+        "artifact_refs": input.artifact_refs,
+        "head": take_first_chars(input.output_text, config.head_chars),
+        "tail": take_last_chars(input.output_text, config.tail_chars),
+        "transcript_mutated": false,
+    })
+    .to_string()
+}
+
+fn render_tool_result_hard_clear(
+    input: &ToolResultPruningInput<'_>,
+    digest_sha256: &str,
+) -> String {
+    json!({
+        "schema_version": 1,
+        "pruned_by": TOOL_RESULT_PRUNING_POLICY_ID,
+        "mode": "hard_clear",
+        "tool_name": input.tool_name,
+        "call_id": input.call_id,
+        "status": input.status,
+        "digest_sha256": digest_sha256,
+        "artifact_refs": input.artifact_refs,
+        "output_omitted": true,
+        "transcript_mutated": false,
+    })
+    .to_string()
+}
+
+fn take_first_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn take_last_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars().rev().take(max_chars).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 /// Renders the decision as the `policy` object embedded in explain payloads.
@@ -580,8 +820,9 @@ mod tests {
     use crate::config::PruningPolicyMatrixConfig;
 
     use super::{
-        apply_ephemeral_prompt_pruning, classify_pruning_task, detect_pruning_risk,
-        pruning_decision_from_config, PruningRiskLevel, PruningTaskClass,
+        apply_ephemeral_prompt_pruning, apply_tool_result_pruning, classify_pruning_task,
+        detect_pruning_risk, pruning_decision_from_config, PruningRiskLevel, PruningTaskClass,
+        ToolResultPruningInput, ToolResultPruningPolicy, ToolResultPruningToolConfig,
     };
 
     #[test]
@@ -654,5 +895,126 @@ mod tests {
         );
         assert!(outcome.provider_input_text.contains("<recent_conversation>"));
         assert!(outcome.provider_input_text.contains("final user request"));
+    }
+
+    #[test]
+    fn tool_result_pruning_keeps_protected_tail_result_unchanged() {
+        let policy = ToolResultPruningPolicy {
+            default_config: ToolResultPruningToolConfig {
+                soft_max_chars: 8,
+                ..ToolResultPruningToolConfig::default()
+            },
+            ..ToolResultPruningPolicy::default()
+        };
+        let output = "important current result ".repeat(16);
+
+        let item = apply_tool_result_pruning(
+            ToolResultPruningInput {
+                tool_name: "palyra.fs.read_file",
+                call_id: Some("call-1"),
+                status: Some("ok"),
+                output_text: output.as_str(),
+                artifact_refs: &[],
+                cache_expires_at_unix_ms: None,
+                protected: false,
+                current_turn: false,
+                protected_tail: true,
+            },
+            &policy,
+            100,
+        );
+
+        assert_eq!(item.output_text, output);
+        assert!(item.affected_tool.is_none());
+    }
+
+    #[test]
+    fn tool_result_pruning_soft_trims_old_output_with_identity_metadata() {
+        let artifact_refs = vec!["artifact:tool-result:01HOLD".to_owned()];
+        let policy = ToolResultPruningPolicy {
+            default_config: ToolResultPruningToolConfig {
+                soft_max_chars: 16,
+                hard_max_chars: 10_000,
+                head_chars: 10,
+                tail_chars: 10,
+                cache_ttl_ms: Some(60_000),
+            },
+            ..ToolResultPruningPolicy::default()
+        };
+        let output = format!("alpha-head {} omega-tail", "middle ".repeat(80));
+
+        let item = apply_tool_result_pruning(
+            ToolResultPruningInput {
+                tool_name: "palyra.process.run",
+                call_id: Some("call-tool-42"),
+                status: Some("ok"),
+                output_text: output.as_str(),
+                artifact_refs: artifact_refs.as_slice(),
+                cache_expires_at_unix_ms: Some(10_000),
+                protected: false,
+                current_turn: false,
+                protected_tail: false,
+            },
+            &policy,
+            100,
+        );
+
+        let affected = item.affected_tool.as_ref().expect("old output should be pruned");
+        assert_eq!(affected.mode, "soft_trim");
+        assert_eq!(affected.call_id.as_deref(), Some("call-tool-42"));
+        assert_eq!(affected.artifact_refs, artifact_refs);
+        assert!(affected.tokens_saved > 0);
+        let rendered: serde_json::Value =
+            serde_json::from_str(item.output_text.as_str()).expect("placeholder should be JSON");
+        assert_eq!(rendered["pruned_by"], super::TOOL_RESULT_PRUNING_POLICY_ID);
+        assert_eq!(rendered["mode"], "soft_trim");
+        assert_eq!(rendered["tool_name"], "palyra.process.run");
+        assert_eq!(rendered["call_id"], "call-tool-42");
+        assert_eq!(rendered["status"], "ok");
+        assert_eq!(rendered["artifact_refs"][0], "artifact:tool-result:01HOLD");
+        assert!(rendered["head"].as_str().unwrap_or_default().starts_with("alpha"));
+        assert!(rendered["tail"].as_str().unwrap_or_default().ends_with("omega-tail"));
+        assert_eq!(rendered["transcript_mutated"], false);
+    }
+
+    #[test]
+    fn tool_result_pruning_hard_clears_after_cache_ttl_expires() {
+        let policy = ToolResultPruningPolicy {
+            default_config: ToolResultPruningToolConfig {
+                soft_max_chars: 8,
+                hard_max_chars: 24,
+                head_chars: 4,
+                tail_chars: 4,
+                cache_ttl_ms: Some(1),
+            },
+            ..ToolResultPruningPolicy::default()
+        };
+        let output = "large cached body ".repeat(200);
+
+        let item = apply_tool_result_pruning(
+            ToolResultPruningInput {
+                tool_name: "palyra.http.fetch",
+                call_id: Some("call-fetch-1"),
+                status: Some("ok"),
+                output_text: output.as_str(),
+                artifact_refs: &[],
+                cache_expires_at_unix_ms: Some(10),
+                protected: false,
+                current_turn: false,
+                protected_tail: false,
+            },
+            &policy,
+            20,
+        );
+
+        let affected = item.affected_tool.as_ref().expect("expired output should be pruned");
+        assert_eq!(affected.mode, "hard_clear");
+        assert!(affected.tokens_saved > 0);
+        let rendered: serde_json::Value =
+            serde_json::from_str(item.output_text.as_str()).expect("placeholder should be JSON");
+        assert_eq!(rendered["mode"], "hard_clear");
+        assert_eq!(rendered["output_omitted"], true);
+        assert!(rendered["digest_sha256"].as_str().is_some_and(|value| value.len() == 64));
+        assert!(!item.output_text.contains("large cached body"));
     }
 }

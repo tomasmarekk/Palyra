@@ -10681,6 +10681,7 @@ async fn session_compaction_manual_apply_persists_durable_writes_and_quality_gat
         mode: "manual",
         trigger_reason: Some("test_quality_gate"),
         trigger_policy: Some("test_policy"),
+        operator_instruction: None,
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })
@@ -10819,6 +10820,7 @@ async fn session_compaction_automatic_apply_requires_review_before_durable_write
         mode: "automatic",
         trigger_reason: Some("test_automatic_review_gate"),
         trigger_policy: Some("test_policy"),
+        operator_instruction: None,
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })
@@ -10936,6 +10938,7 @@ async fn session_compaction_manual_apply_rolls_back_workspace_writes_on_partial_
         mode: "manual",
         trigger_reason: Some("test_rollback"),
         trigger_policy: Some("test_policy"),
+        operator_instruction: None,
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })
@@ -11032,6 +11035,7 @@ async fn session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_fa
         mode: "manual",
         trigger_reason: Some("test_safeguard_rollback"),
         trigger_policy: Some("test_policy"),
+        operator_instruction: None,
         accept_candidate_ids: &[],
         reject_candidate_ids: &[],
     })

@@ -12,6 +12,7 @@ use super::*;
 pub(super) struct TuiCompactionCommand {
     pub(super) apply: bool,
     pub(super) history: bool,
+    pub(super) operator_instruction: Option<String>,
     pub(super) accept_candidate_ids: Vec<String>,
     pub(super) reject_candidate_ids: Vec<String>,
 }
@@ -33,7 +34,7 @@ pub(super) fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<Tui
                 let candidate_id = arguments
                     .get(index + 1)
                     .cloned()
-                    .context("Usage: /compact [preview|apply|history] [--accept <candidate_id>] [--reject <candidate_id>]")?;
+                    .context("Usage: /compact [preview|apply|history] [--instruction <text>] [--accept <candidate_id>] [--reject <candidate_id>]")?;
                 command.accept_candidate_ids.push(candidate_id);
                 index += 1;
             }
@@ -41,12 +42,20 @@ pub(super) fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<Tui
                 let candidate_id = arguments
                     .get(index + 1)
                     .cloned()
-                    .context("Usage: /compact [preview|apply|history] [--accept <candidate_id>] [--reject <candidate_id>]")?;
+                    .context("Usage: /compact [preview|apply|history] [--instruction <text>] [--accept <candidate_id>] [--reject <candidate_id>]")?;
                 command.reject_candidate_ids.push(candidate_id);
                 index += 1;
             }
+            "--instruction" => {
+                let instruction = arguments
+                    .get(index + 1)
+                    .cloned()
+                    .context("Usage: /compact [preview|apply|history] [--instruction <text>] [--accept <candidate_id>] [--reject <candidate_id>]")?;
+                command.operator_instruction = Some(instruction);
+                index += 1;
+            }
             other => anyhow::bail!(
-                "unknown /compact argument `{other}`; use preview, apply, history, --accept, or --reject"
+                "unknown /compact argument `{other}`; use preview, apply, history, --instruction, --accept, or --reject"
             ),
         }
         index += 1;
@@ -54,9 +63,12 @@ pub(super) fn parse_tui_compaction_arguments(arguments: &[String]) -> Result<Tui
     if command.history
         && (command.apply
             || !command.accept_candidate_ids.is_empty()
-            || !command.reject_candidate_ids.is_empty())
+            || !command.reject_candidate_ids.is_empty()
+            || command.operator_instruction.is_some())
     {
-        anyhow::bail!("history cannot be combined with apply or candidate review flags");
+        anyhow::bail!(
+            "history cannot be combined with apply, instruction, or candidate review flags"
+        );
     }
     Ok(command)
 }

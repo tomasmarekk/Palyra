@@ -1223,6 +1223,7 @@ pub(crate) async fn process_post_run_reflection_task(
         &session,
         Some(REFLECTION_TASK_KIND),
         Some(REFLECTION_TRIGGER_POLICY),
+        None,
     )
     .await?;
     let transcript =

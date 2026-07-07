@@ -475,11 +475,13 @@ async fn session_compact_preview(
     let trigger_reason = optional_string(&envelope.params, "trigger_reason")
         .unwrap_or_else(|| "acp_preview".to_owned());
     let trigger_policy = optional_string(&envelope.params, "trigger_policy");
+    let operator_instruction = optional_string(&envelope.params, "operator_instruction");
     let plan = preview_session_compaction(
         &state.runtime,
         &session,
         Some(trigger_reason.as_str()),
         trigger_policy.as_deref(),
+        operator_instruction.as_deref(),
     )
     .await
     .map_err(AcpDispatchError::from_status)?;
@@ -502,6 +504,7 @@ async fn session_compact_apply(
         optional_string(&envelope.params, "mode").unwrap_or_else(|| "operator_review".to_owned());
     let trigger_reason = optional_string(&envelope.params, "trigger_reason");
     let trigger_policy = optional_string(&envelope.params, "trigger_policy");
+    let operator_instruction = optional_string(&envelope.params, "operator_instruction");
     let execution = apply_session_compaction(SessionCompactionApplyRequest {
         runtime_state: &state.runtime,
         session: &session,
@@ -510,6 +513,7 @@ async fn session_compact_apply(
         mode: mode.as_str(),
         trigger_reason: trigger_reason.as_deref(),
         trigger_policy: trigger_policy.as_deref(),
+        operator_instruction: operator_instruction.as_deref(),
         accept_candidate_ids: &accept_candidate_ids,
         reject_candidate_ids: &reject_candidate_ids,
     })

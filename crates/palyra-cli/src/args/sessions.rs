@@ -206,6 +206,8 @@ pub enum SessionsCommand {
         trigger_reason: Option<String>,
         #[arg(long)]
         trigger_policy: Option<String>,
+        #[arg(long = "instruction")]
+        operator_instruction: Option<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -216,6 +218,8 @@ pub enum SessionsCommand {
         trigger_reason: Option<String>,
         #[arg(long)]
         trigger_policy: Option<String>,
+        #[arg(long = "instruction")]
+        operator_instruction: Option<String>,
         #[arg(long = "accept-candidate")]
         accept_candidate_ids: Vec<String>,
         #[arg(long = "reject-candidate")]

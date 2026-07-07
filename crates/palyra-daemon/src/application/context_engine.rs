@@ -53,8 +53,9 @@ use crate::{
             PromptCacheSessionMetadata,
         },
         session_pruning::{
-            classify_pruning_task, context_engine_pruning_outcome, detect_pruning_risk,
-            pruning_decision_from_config,
+            apply_tool_result_pruning, classify_pruning_task, context_engine_pruning_outcome,
+            detect_pruning_risk, pruning_decision_from_config, ToolResultPruningExplain,
+            ToolResultPruningInput, ToolResultPruningPolicy,
         },
         tool_registry::{ModelVisibleToolCatalogSnapshot, ToolExposureSurface},
     },
@@ -363,6 +364,8 @@ pub(crate) struct ContextEngineExplain {
     pub(crate) engine_registry: Option<ContextEngineRegistrySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider_input_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_result_pruning: Option<ToolResultPruningExplain>,
     pub(crate) reason_codes: Vec<String>,
     pub(crate) assembly_steps: Vec<PromptAssemblyStepExplain>,
     pub(crate) selected_segments: Vec<ContextEngineSegmentExplain>,
@@ -1288,6 +1291,7 @@ fn assemble_segments(
         .enumerate()
         .map(|(order, segment)| IndexedContextSegment { order, segment })
         .collect::<Vec<_>>();
+    let tool_result_pruning = apply_context_tool_result_pruning(selected.as_mut_slice());
     let mut dropped = Vec::new();
     let mut selected_tokens =
         selected.iter().map(|entry| entry.segment.estimated_tokens).sum::<u64>();
@@ -1474,9 +1478,12 @@ fn assemble_segments(
     );
     if budget.profile.failover_budget_model_id.is_some() {
         reason_codes.push("failover_budget_constrained".to_owned());
-        reason_codes.sort();
-        reason_codes.dedup();
     }
+    if tool_result_pruning.as_ref().is_some_and(|pruning| pruning.applied) {
+        reason_codes.push("tool_result_pruning_applied".to_owned());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
 
     AssembledPrompt {
         prompt_text,
@@ -1519,12 +1526,123 @@ fn assemble_segments(
             instruction: None,
             engine_registry: None,
             provider_input_snapshot_hash: None,
+            tool_result_pruning,
             reason_codes,
             assembly_steps,
             selected_segments: selected_segment_explain,
             dropped_segments: dropped,
         },
     }
+}
+
+fn apply_context_tool_result_pruning(
+    selected: &mut [IndexedContextSegment],
+) -> Option<ToolResultPruningExplain> {
+    let policy = ToolResultPruningPolicy::default();
+    let result_indexes = selected
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| is_tool_result_segment(&entry.segment))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if result_indexes.is_empty() {
+        return None;
+    }
+
+    let now_unix_ms = crate::unix_ms_now().unwrap_or_default();
+    let protected_tail_results = policy.protected_tail_results;
+    let protected_tail_start = result_indexes.len().saturating_sub(protected_tail_results);
+    let mut source_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut affected_tools = Vec::new();
+    for (rank, index) in result_indexes.into_iter().enumerate() {
+        let segment = &mut selected[index].segment;
+        let artifact_refs = tool_result_artifact_refs(segment);
+        let tool_name = tool_result_tool_name(segment);
+        let call_id = tool_result_call_id(segment);
+        let status = tool_result_status(segment);
+        let item = apply_tool_result_pruning(
+            ToolResultPruningInput {
+                tool_name: tool_name.as_str(),
+                call_id: call_id.as_deref(),
+                status: status.as_deref(),
+                output_text: segment.content.as_str(),
+                artifact_refs: artifact_refs.as_slice(),
+                cache_expires_at_unix_ms: tool_result_cache_expires_at(segment),
+                protected: segment.protected,
+                current_turn: segment.kind == ContextSegmentKind::UserInput,
+                protected_tail: rank >= protected_tail_start,
+            },
+            &policy,
+            now_unix_ms,
+        );
+        source_tokens = source_tokens.saturating_add(item.source_tokens);
+        output_tokens = output_tokens.saturating_add(item.output_tokens);
+        if let Some(affected_tool) = item.affected_tool {
+            segment.content = item.output_text;
+            segment.estimated_tokens = item.output_tokens;
+            affected_tools.push(affected_tool);
+        }
+    }
+
+    if affected_tools.is_empty() {
+        return None;
+    }
+    Some(ToolResultPruningExplain {
+        policy,
+        source_tokens,
+        output_tokens,
+        tokens_saved: source_tokens.saturating_sub(output_tokens),
+        applied: true,
+        eligible: true,
+        protected_tail_results,
+        affected_tools,
+        transcript_mutated: false,
+    })
+}
+
+fn is_tool_result_segment(segment: &ContextSegment) -> bool {
+    segment.kind == ContextSegmentKind::ToolExchange
+        && segment.label.to_ascii_lowercase().contains("result")
+}
+
+fn tool_result_tool_name(segment: &ContextSegment) -> String {
+    prefixed_source_ref(segment, "tool_name:")
+        .or_else(|| prefixed_source_ref(segment, "tool:"))
+        .or_else(|| segment.label.split_once(':').map(|(_, suffix)| suffix.trim().to_owned()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown_tool".to_owned())
+}
+
+fn tool_result_call_id(segment: &ContextSegment) -> Option<String> {
+    prefixed_source_ref(segment, "call_id:").or_else(|| segment.group_id.clone())
+}
+
+fn tool_result_status(segment: &ContextSegment) -> Option<String> {
+    prefixed_source_ref(segment, "status:")
+}
+
+fn tool_result_cache_expires_at(segment: &ContextSegment) -> Option<i64> {
+    prefixed_source_ref(segment, "cache_expires_at_unix_ms:")?.parse().ok()
+}
+
+fn tool_result_artifact_refs(segment: &ContextSegment) -> Vec<String> {
+    segment
+        .source_refs
+        .iter()
+        .filter(|source_ref| source_ref.contains("artifact"))
+        .cloned()
+        .collect()
+}
+
+fn prefixed_source_ref(segment: &ContextSegment, prefix: &str) -> Option<String> {
+    segment.source_refs.iter().find_map(|source_ref| {
+        source_ref
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Derives the token budget for a turn from the provider registry snapshot.
@@ -4528,6 +4646,99 @@ mod tests {
                 .all(|segment| segment.reason == "dropped_by_budget_group"),
             "grouped drops should explain that the whole group was removed"
         );
+    }
+
+    #[test]
+    fn assembly_soft_trims_old_tool_results_before_budgeting() {
+        let old_output = format!(
+            "alpha-head {} ALWAYS_DROP_MARKER {} omega-tail",
+            "x".repeat(7_000),
+            "y".repeat(7_000)
+        );
+        let old_result = ContextSegment::trusted(
+            ContextSegmentKind::ToolExchange,
+            "tool_result:palyra.process.run",
+            old_output,
+            30,
+            false,
+            false,
+            Some("call-tool-1".to_owned()),
+        )
+        .with_source_refs(vec![
+            "tool_name:palyra.process.run".to_owned(),
+            "call_id:call-tool-1".to_owned(),
+            "status:ok".to_owned(),
+            "artifact:tool-result:01HOLD".to_owned(),
+        ]);
+        let recent_output = "recent result stays inline";
+        let recent_result = ContextSegment::trusted(
+            ContextSegmentKind::ToolExchange,
+            "tool_result:palyra.fs.read_file",
+            recent_output.to_owned(),
+            30,
+            false,
+            false,
+            Some("call-tool-2".to_owned()),
+        )
+        .with_source_refs(vec![
+            "tool_name:palyra.fs.read_file".to_owned(),
+            "call_id:call-tool-2".to_owned(),
+            "status:ok".to_owned(),
+        ]);
+
+        let assembled = assemble_segments(
+            &[
+                segment(
+                    ContextSegmentKind::ToolExchange,
+                    "tool_call:palyra.process.run",
+                    12,
+                    30,
+                    false,
+                    false,
+                    Some("call-tool-1"),
+                ),
+                old_result,
+                segment(
+                    ContextSegmentKind::ToolExchange,
+                    "tool_call:palyra.fs.read_file",
+                    12,
+                    30,
+                    false,
+                    false,
+                    Some("call-tool-2"),
+                ),
+                recent_result,
+                segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None),
+            ],
+            ContextEngineStrategy::CostAware,
+            budget(32_000, 512, 128, 128, false),
+            &RequestContext {
+                principal: "user:ops".to_owned(),
+                device_id: "device".to_owned(),
+                channel: Some("cli".to_owned()),
+            },
+            "session-2",
+            None,
+        );
+
+        assert!(assembled.prompt_text.contains("tool_result_pruning.v1"));
+        assert!(!assembled.prompt_text.contains("ALWAYS_DROP_MARKER"));
+        assert!(assembled.prompt_text.contains(recent_output));
+        assert!(assembled
+            .explain
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "tool_result_pruning_applied"));
+        let pruning = assembled
+            .explain
+            .tool_result_pruning
+            .as_ref()
+            .expect("tool-result pruning should be explained");
+        assert_eq!(pruning.affected_tools.len(), 1);
+        assert_eq!(pruning.affected_tools[0].tool_name, "palyra.process.run");
+        assert_eq!(pruning.affected_tools[0].call_id.as_deref(), Some("call-tool-1"));
+        assert_eq!(pruning.affected_tools[0].artifact_refs, vec!["artifact:tool-result:01HOLD"]);
+        assert!(!pruning.transcript_mutated);
     }
 
     #[test]

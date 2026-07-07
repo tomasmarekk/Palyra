@@ -1672,6 +1672,7 @@ pub(crate) async fn console_chat_compaction_preview_handler(
         &session_record,
         payload.trigger_reason.as_deref(),
         payload.trigger_policy.as_deref(),
+        payload.operator_instruction.as_deref(),
     )
     .await
     .map_err(runtime_status_response)?;
@@ -1710,6 +1711,7 @@ pub(crate) async fn console_chat_compaction_apply_handler(
         mode: "manual",
         trigger_reason: payload.trigger_reason.as_deref(),
         trigger_policy: payload.trigger_policy.as_deref(),
+        operator_instruction: payload.operator_instruction.as_deref(),
         accept_candidate_ids: payload.accept_candidate_ids.as_slice(),
         reject_candidate_ids: payload.reject_candidate_ids.as_slice(),
     })
@@ -1772,6 +1774,8 @@ pub(crate) async fn console_chat_compaction_apply_handler(
                 "artifact_id": execution.artifact.artifact_id,
                 "checkpoint_pair": execution.checkpoint_pair.journal_projection,
                 "compaction_safeguard": execution.safeguard,
+                "successor_transcript": &execution.plan.successor_transcript,
+                "identifier_evidence": &execution.plan.identifier_evidence,
                 "candidate_count": execution.plan.candidates.len(),
                 "write_count": execution.writes.len(),
                 "mode": "manual",

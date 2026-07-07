@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "suite_id": "session_compaction_lifecycle_v1",
+  "description": "Golden fixture contract for long-session compaction lifecycle regressions.",
+  "cases": [
+    {
+      "case_id": "split_inside_tool_block",
+      "input_kind": "tool_pair_boundary",
+      "expected_report": {
+        "successor_transcript": {
+          "tool_pair_intact": true,
+          "lineage_required": true
+        },
+        "identifier_evidence": {
+          "compaction_may_rewrite_identifiers": false
+        }
+      }
+    },
+    {
+      "case_id": "opaque_id_preservation",
+      "input_kind": "identifier_evidence",
+      "expected_report": {
+        "identifier_evidence": {
+          "preserved_source_ref_count_min": 1,
+          "compaction_may_rewrite_identifiers": false
+        }
+      }
+    },
+    {
+      "case_id": "provider_summary_failure_fallback",
+      "input_kind": "provider_backed_evidence",
+      "expected_report": {
+        "provider_evidence": {
+          "fallback_allowed": true,
+          "trust_label_may_upgrade": false
+        }
+      }
+    },
+    {
+      "case_id": "long_coding_session_with_verification",
+      "input_kind": "verification_evidence",
+      "expected_report": {
+        "successor_transcript": {
+          "lineage_required": true
+        },
+        "identifier_evidence": {
+          "preserved_file_refs_min": 1
+        }
+      }
+    },
+    {
+      "case_id": "media_heavy_session_stripping_policy",
+      "input_kind": "media_heavy",
+      "expected_report": {
+        "provider_evidence": {
+          "raw_media_stripped": true
+        },
+        "identifier_evidence": {
+          "compaction_may_rewrite_identifiers": false
+        }
+      }
+    }
+  ]
+}

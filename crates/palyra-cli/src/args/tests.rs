@@ -1990,6 +1990,7 @@ fn parse_sessions_compact_preview_with_session_key() {
                 session_key: Some("e2e-context".to_owned()),
                 trigger_reason: Some("manual_check".to_owned()),
                 trigger_policy: None,
+                operator_instruction: None,
                 json: true,
             }
         }

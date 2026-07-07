@@ -2897,6 +2897,7 @@ impl App {
             .post_json_value(
                 path,
                 &serde_json::json!({
+                    "operator_instruction": spec.operator_instruction,
                     "accept_candidate_ids": spec.accept_candidate_ids,
                     "reject_candidate_ids": spec.reject_candidate_ids,
                 }),
