@@ -203,8 +203,8 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
     .context("written provider compatibility report should parse")?;
     assert_eq!(stdout_payload, file_payload, "stdout and report file should match");
     assert_eq!(stdout_payload.pointer("/pack_count").and_then(Value::as_u64), Some(1));
-    assert_eq!(stdout_payload.pointer("/fixture_count").and_then(Value::as_u64), Some(12));
-    assert_eq!(stdout_payload.pointer("/category_count").and_then(Value::as_u64), Some(12));
+    assert_eq!(stdout_payload.pointer("/fixture_count").and_then(Value::as_u64), Some(15));
+    assert_eq!(stdout_payload.pointer("/category_count").and_then(Value::as_u64), Some(15));
 
     let fixtures = stdout_payload
         .pointer("/packs/0/fixtures")
