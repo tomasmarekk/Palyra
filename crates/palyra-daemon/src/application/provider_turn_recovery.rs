@@ -576,6 +576,7 @@ pub(crate) fn anomaly_from_provider_failure_class(
         ProviderFailureClass::PrematureFinal => ProviderTurnAnomaly::PartialContentStream,
         ProviderFailureClass::PayloadTooLarge => ProviderTurnAnomaly::MaxOutputTokensTooLarge,
         ProviderFailureClass::ProviderTimeout => ProviderTurnAnomaly::ProviderTimeout,
+        ProviderFailureClass::UnsupportedMultimodal => ProviderTurnAnomaly::MultimodalUnsupported,
         ProviderFailureClass::SchemaRejected
         | ProviderFailureClass::MalformedResponse
         | ProviderFailureClass::TransientUpstream
@@ -755,8 +756,79 @@ fn short_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const PROVIDER_RECOVERY_LIFECYCLE_GOLDEN: &str =
+        include_str!("../../../../fixtures/golden/provider_recovery_lifecycle_cases.json");
+
+    #[derive(serde::Deserialize)]
+    struct ProviderRecoveryLifecycleGolden {
+        cases: Vec<ProviderRecoveryLifecycleCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProviderRecoveryLifecycleCase {
+        id: String,
+        anomaly: String,
+        retry_after_ms: Option<u64>,
+        credential_id: Option<String>,
+        expected: ProviderRecoveryLifecycleExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProviderRecoveryLifecycleExpected {
+        event_type: String,
+        action: String,
+        reason_prefix: String,
+        attempt: u8,
+        exhausted: bool,
+    }
+
     fn decide_once(anomaly: ProviderTurnAnomaly) -> ProviderTurnRecoveryDecision {
         ProviderTurnRecoveryState::new().decide(anomaly, ProviderTurnRecoveryInput::default())
+    }
+
+    fn golden_anomaly(value: &str) -> ProviderTurnAnomaly {
+        match value {
+            "malformed_stream" => ProviderTurnAnomaly::MalformedStream,
+            "partial_tool_call" => ProviderTurnAnomaly::PartialToolCall,
+            "empty_final_answer" => ProviderTurnAnomaly::EmptyFinalAnswer,
+            "rate_limit" => ProviderTurnAnomaly::RateLimit,
+            "auth_expired" => ProviderTurnAnomaly::AuthExpired,
+            "unicode_surrogate" => ProviderTurnAnomaly::UnicodeSurrogate,
+            "multimodal_unsupported" => ProviderTurnAnomaly::MultimodalUnsupported,
+            other => panic!("unsupported provider recovery golden anomaly: {other}"),
+        }
+    }
+
+    #[test]
+    fn recovery_lifecycle_golden_matches_state_machine() {
+        let golden = serde_json::from_str::<ProviderRecoveryLifecycleGolden>(
+            PROVIDER_RECOVERY_LIFECYCLE_GOLDEN,
+        )
+        .expect("provider recovery lifecycle golden should parse");
+
+        for case in golden.cases {
+            let mut state = ProviderTurnRecoveryState::new();
+            let decision = state.decide(
+                golden_anomaly(case.anomaly.as_str()),
+                ProviderTurnRecoveryInput {
+                    credential_id: case.credential_id,
+                    retry_after_ms: case.retry_after_ms,
+                    context_pressure: None,
+                },
+            );
+
+            assert_eq!(decision.event_type, case.expected.event_type, "{}", case.id);
+            assert_eq!(decision.action.as_str(), case.expected.action, "{}", case.id);
+            assert_eq!(decision.attempt, case.expected.attempt, "{}", case.id);
+            assert_eq!(decision.exhausted, case.expected.exhausted, "{}", case.id);
+            assert!(
+                decision.reason_code.starts_with(case.expected.reason_prefix.as_str()),
+                "{} expected reason prefix {}, got {}",
+                case.id,
+                case.expected.reason_prefix,
+                decision.reason_code
+            );
+        }
     }
 
     #[test]

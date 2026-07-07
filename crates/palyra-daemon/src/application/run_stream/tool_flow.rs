@@ -30,6 +30,7 @@ use palyra_common::{
         ToolTurnBudget,
     },
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::{
     sync::mpsc,
@@ -107,6 +108,7 @@ use super::{
 const MAX_PARALLEL_TOOL_CALLS_PER_GROUP: usize = 4;
 const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
 const TOOL_RESULT_PROJECTION_POLICY_EVENT: &str = "tool.result.projection_policy";
+const TOOL_RESULT_REPLAY_SAFETY_EVENT: &str = "tool.result.replay_safety";
 const TOOL_BEFORE_DECISION_EVENT: &str = "tool.before_decision";
 const TOOL_RESULT_MIDDLEWARE_EVENT: &str = "tool.result.middleware";
 const TOOL_REPAIR_CANDIDATE_DETECTED_EVENT: &str = "tool.repair.candidate_detected";
@@ -168,6 +170,49 @@ pub(crate) enum ToolParallelism {
     PathScoped,
     /// Idempotent network fetches (GET/HEAD).
     IdempotentNetwork,
+}
+
+/// Provider retry posture for a completed tool result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolReplaySafety {
+    ReadOnly,
+    PathScopedRead,
+    IdempotentNetwork,
+    HostSyntheticResult,
+    DeniedNoReplay,
+    MutatingRequiresGuard,
+}
+
+impl ToolReplaySafety {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::PathScopedRead => "path_scoped_read",
+            Self::IdempotentNetwork => "idempotent_network",
+            Self::HostSyntheticResult => "host_synthetic_result",
+            Self::DeniedNoReplay => "denied_no_replay",
+            Self::MutatingRequiresGuard => "mutating_requires_guard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ToolResultReplaySafetyReport {
+    schema_version: u8,
+    event_type: String,
+    proposal_id: String,
+    tool_name: String,
+    replay_safety: String,
+    provider_retry_allowed: bool,
+    explicit_guard_required: bool,
+    synthetic_result_allowed: bool,
+    reason_code: String,
+    parallelism: String,
+    success: bool,
+    timed_out: bool,
+    output_sha256: String,
+    error_sha256: String,
+    attestation_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,6 +1122,103 @@ pub(crate) fn classify_tool_parallelism(tool_name: &str, input_json: &[u8]) -> T
         "palyra.fs.apply_patch" => ToolParallelism::Never,
         _ => ToolParallelism::Never,
     }
+}
+
+fn classify_tool_result_replay_safety(
+    proposal_id: &str,
+    tool_name: &str,
+    input_json: &[u8],
+    outcome: &ToolExecutionOutcome,
+) -> ToolResultReplaySafetyReport {
+    let parallelism = classify_tool_parallelism(tool_name, input_json);
+    let synthetic_result_allowed = is_host_synthetic_tool_result(outcome);
+    let replay_safety = if synthetic_result_allowed {
+        ToolReplaySafety::HostSyntheticResult
+    } else if is_policy_denial_outcome(outcome) {
+        ToolReplaySafety::DeniedNoReplay
+    } else {
+        match parallelism {
+            ToolParallelism::ReadOnlySafe => ToolReplaySafety::ReadOnly,
+            ToolParallelism::PathScoped => ToolReplaySafety::PathScopedRead,
+            ToolParallelism::IdempotentNetwork => ToolReplaySafety::IdempotentNetwork,
+            ToolParallelism::Never => ToolReplaySafety::MutatingRequiresGuard,
+        }
+    };
+    let provider_retry_allowed = matches!(
+        replay_safety,
+        ToolReplaySafety::ReadOnly
+            | ToolReplaySafety::PathScopedRead
+            | ToolReplaySafety::IdempotentNetwork
+            | ToolReplaySafety::HostSyntheticResult
+    );
+    let explicit_guard_required = matches!(replay_safety, ToolReplaySafety::MutatingRequiresGuard);
+    let reason_code = match replay_safety {
+        ToolReplaySafety::ReadOnly => "tool_replay.read_only_result_retry_allowed",
+        ToolReplaySafety::PathScopedRead => "tool_replay.path_scoped_result_retry_allowed",
+        ToolReplaySafety::IdempotentNetwork => "tool_replay.idempotent_network_retry_allowed",
+        ToolReplaySafety::HostSyntheticResult => "tool_replay.host_synthetic_result_allowed",
+        ToolReplaySafety::DeniedNoReplay => "tool_replay.policy_denial_no_replay",
+        ToolReplaySafety::MutatingRequiresGuard if outcome.attestation.timed_out => {
+            "tool_replay.mutating_timeout_requires_guard"
+        }
+        ToolReplaySafety::MutatingRequiresGuard => "tool_replay.mutating_result_requires_guard",
+    };
+
+    ToolResultReplaySafetyReport {
+        schema_version: 1,
+        event_type: TOOL_RESULT_REPLAY_SAFETY_EVENT.to_owned(),
+        proposal_id: proposal_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        replay_safety: replay_safety.as_str().to_owned(),
+        provider_retry_allowed,
+        explicit_guard_required,
+        synthetic_result_allowed,
+        reason_code: reason_code.to_owned(),
+        parallelism: parallelism.as_str().to_owned(),
+        success: outcome.success,
+        timed_out: outcome.attestation.timed_out,
+        output_sha256: crate::sha256_hex(outcome.output_json.as_slice()),
+        error_sha256: crate::sha256_hex(outcome.error.as_bytes()),
+        attestation_id: outcome.attestation.attestation_id.clone(),
+    }
+}
+
+fn is_host_synthetic_tool_result(outcome: &ToolExecutionOutcome) -> bool {
+    if outcome.success || outcome.attestation.timed_out {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(outcome.output_json.as_slice()) else {
+        return false;
+    };
+    value.get("host_generated").and_then(Value::as_bool) == Some(true)
+        && value.get("kind").and_then(Value::as_str) == Some("synthetic_tool_result")
+}
+
+fn is_policy_denial_outcome(outcome: &ToolExecutionOutcome) -> bool {
+    if outcome.success {
+        return false;
+    }
+    let normalized_error = outcome.error.to_ascii_lowercase();
+    if normalized_error.contains("denied")
+        || normalized_error.contains("not allowed")
+        || normalized_error.contains("approval")
+        || normalized_error.contains("policy")
+    {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(outcome.output_json.as_slice()) else {
+        return false;
+    };
+    let reason_code = value
+        .get("reason_code")
+        .or_else(|| value.pointer("/error/reason_code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    reason_code.contains("denied")
+        || reason_code.contains("not_allowed")
+        || reason_code.contains("approval")
+        || reason_code.contains("policy")
 }
 
 // Builds a normalized "command:path|path" key for read-only process runs so
@@ -2152,6 +2294,12 @@ async fn finalize_prepared_tool_execution_outcome(
 ) -> Result<RunStreamToolExecutionOutcome, Status> {
     dispatch_after_tool_hook_if_enabled(runtime_state, run_id, prepared, &execution_outcome)
         .await?;
+    let replay_safety = classify_tool_result_replay_safety(
+        prepared.proposal_id.as_str(),
+        prepared.tool_name.as_str(),
+        prepared.input_json.as_slice(),
+        &execution_outcome,
+    );
     let projected = project_tool_result_for_model(
         runtime_state,
         ToolRuntimeExecutionContext {
@@ -2168,6 +2316,8 @@ async fn finalize_prepared_tool_execution_outcome(
         execution_outcome,
     )
     .await?;
+    append_tool_result_replay_safety_tape_event(runtime_state, run_id, tape_seq, &replay_safety)
+        .await?;
     if let Some(report) = projected.middleware_report.as_ref() {
         append_tool_result_middleware_tape_event(runtime_state, run_id, tape_seq, report).await?;
     }
@@ -2652,6 +2802,28 @@ async fn append_tool_result_projection_audit_tape_event(
 }
 
 #[allow(clippy::result_large_err)]
+async fn append_tool_result_replay_safety_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    report: &ToolResultReplaySafetyReport,
+) -> Result<(), Status> {
+    let payload_json = serde_json::to_string(report).map_err(|error| {
+        Status::internal(format!("failed to serialize tool result replay safety: {error}"))
+    })?;
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: TOOL_RESULT_REPLAY_SAFETY_EVENT.to_owned(),
+            payload_json,
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 async fn append_sessions_spawn_tape_event_if_needed(
     runtime_state: &Arc<GatewayRuntimeState>,
     run_id: &str,
@@ -3037,10 +3209,12 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::{
         allow_sensitive_tools_approval_outcome, classify_tool_parallelism,
-        drain_parallel_tool_group_after_cancel, drain_parallel_tool_group_after_error,
-        process_progress_status_message, projection_policy_contract, sessions_spawn_tape_payload,
+        classify_tool_result_replay_safety, drain_parallel_tool_group_after_cancel,
+        drain_parallel_tool_group_after_error, process_progress_status_message,
+        projection_policy_contract, sessions_spawn_tape_payload,
         workspace_spill_policy_grants_sensitivity, workspace_spill_unavailable_projection,
         ParallelToolExecutionTaskOutcome, ToolParallelism, TOOL_RESULT_PROJECTION_POLICY_EVENT,
+        TOOL_RESULT_REPLAY_SAFETY_EVENT,
     };
     use crate::application::tool_registry::ToolResultProjectionPolicy;
     use crate::journal::{ApprovalDecision, ApprovalDecisionScope};
@@ -3061,6 +3235,28 @@ mod tests {
         time::{sleep, Duration},
     };
     use tonic::{Code, Status};
+
+    fn tool_outcome_for_replay_test(
+        success: bool,
+        output: Value,
+        error: &str,
+        timed_out: bool,
+    ) -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            success,
+            output_json: serde_json::to_vec(&output).expect("test output should serialize"),
+            error: error.to_owned(),
+            attestation: ToolAttestation {
+                attestation_id: "01ARZ3NDEKTSV4RRFFQ69G5RA1".to_owned(),
+                execution_sha256: "0".repeat(64),
+                executed_at_unix_ms: 0,
+                timed_out,
+                executor: "test".to_owned(),
+                sandbox_enforcement: "n/a".to_owned(),
+                execution_manifest: None,
+            },
+        }
+    }
 
     #[test]
     fn tool_parallelism_classifies_safe_and_unsafe_tools() {
@@ -3101,6 +3297,72 @@ mod tests {
             classify_tool_parallelism("palyra.fs.apply_patch", br#"{"patch":"..."}"#),
             ToolParallelism::Never
         );
+    }
+
+    #[test]
+    fn replay_safety_allows_read_only_tool_results() {
+        let outcome = tool_outcome_for_replay_test(true, json!({"text": "hello"}), "", false);
+
+        let report = classify_tool_result_replay_safety(
+            "proposal-1",
+            "palyra.fs.read_file",
+            br#"{"path":"README.md"}"#,
+            &outcome,
+        );
+
+        assert_eq!(report.event_type, TOOL_RESULT_REPLAY_SAFETY_EVENT);
+        assert_eq!(report.replay_safety, "read_only");
+        assert!(report.provider_retry_allowed);
+        assert!(!report.explicit_guard_required);
+    }
+
+    #[test]
+    fn replay_safety_requires_guard_for_mutating_timeouts() {
+        let outcome = tool_outcome_for_replay_test(
+            false,
+            json!({"error": "timed out while applying patch"}),
+            "timed out",
+            true,
+        );
+
+        let report = classify_tool_result_replay_safety(
+            "proposal-1",
+            "palyra.fs.apply_patch",
+            br#"{"patch":"diff --git a/a b/a"}"#,
+            &outcome,
+        );
+
+        assert_eq!(report.replay_safety, "mutating_requires_guard");
+        assert!(!report.provider_retry_allowed);
+        assert!(report.explicit_guard_required);
+        assert_eq!(report.reason_code, "tool_replay.mutating_timeout_requires_guard");
+    }
+
+    #[test]
+    fn replay_safety_allows_only_host_synthetic_results() {
+        let outcome = tool_outcome_for_replay_test(
+            false,
+            json!({
+                "schema_version": 1,
+                "host_generated": true,
+                "kind": "synthetic_tool_result",
+                "reason_code": "tool_guardrail.invalid_arguments"
+            }),
+            "invalid arguments",
+            false,
+        );
+
+        let report = classify_tool_result_replay_safety(
+            "proposal-1",
+            "palyra.fs.apply_patch",
+            br#"{"patch":"bad"}"#,
+            &outcome,
+        );
+
+        assert_eq!(report.replay_safety, "host_synthetic_result");
+        assert!(report.provider_retry_allowed);
+        assert!(report.synthetic_result_allowed);
+        assert!(!report.explicit_guard_required);
     }
 
     #[test]

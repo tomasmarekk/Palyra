@@ -1416,6 +1416,7 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
             "runtime_health_snapshot",
             "recent_journal_refs",
             "provider_trace_refs",
+            "provider_recovery_trace",
             "tool_job_states",
             "effective_tool_surface_report",
             "redacted_logs"
@@ -1433,6 +1434,10 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
         },
         "audit": {
             "operator_action": "support_bundle.export",
+            "recovery_decision_events": [
+                "provider.recovery.decision",
+                "provider.turn_recovery.decision"
+            ],
             "observability_counters": true,
         },
         "component_health_registry": build_component_health_registry_contract(),

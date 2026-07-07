@@ -96,8 +96,8 @@ impl ProviderError {
                 Some("missing_embeddings_model".to_owned()),
             ),
             Self::VisionUnsupported { .. } => ProviderFailureClassification::new(
-                ProviderFailureClass::PermanentUpstream,
-                ProviderFailureAction::ProviderFailover,
+                ProviderFailureClass::UnsupportedMultimodal,
+                ProviderFailureAction::Retry,
                 None,
                 Some("vision_unsupported".to_owned()),
             ),
@@ -183,6 +183,7 @@ pub enum ProviderFailureClass {
     ProviderUnavailable,
     NetworkUnavailable,
     ProviderTimeout,
+    UnsupportedMultimodal,
 }
 
 impl ProviderFailureClass {
@@ -213,6 +214,7 @@ impl ProviderFailureClass {
             Self::ProviderUnavailable => "provider_unavailable",
             Self::NetworkUnavailable => "network_unavailable",
             Self::ProviderTimeout => "provider_timeout",
+            Self::UnsupportedMultimodal => "unsupported_multimodal",
         }
     }
 }
@@ -519,6 +521,16 @@ impl ProviderFailureClassifier {
             "malformed_sse_chunk" => {
                 (ProviderFailureClass::MalformedStream, ProviderFailureAction::Retry)
             }
+            "partial_tool_call" => (
+                ProviderFailureClass::TruncatedToolArguments,
+                ProviderFailureAction::FailClosedNoRetry,
+            ),
+            "unicode_surrogate" => {
+                (ProviderFailureClass::MalformedStream, ProviderFailureAction::Retry)
+            }
+            "unsupported_multimodal" => {
+                (ProviderFailureClass::UnsupportedMultimodal, ProviderFailureAction::Retry)
+            }
             "tool_result_too_large" => {
                 (ProviderFailureClass::PayloadTooLarge, ProviderFailureAction::FailClosedNoRetry)
             }
@@ -561,6 +573,9 @@ fn provider_recovery_plan(
         }
         ProviderFailureClass::MalformedStream | ProviderFailureClass::EmptyOutput => {
             (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::RetrySame)
+        }
+        ProviderFailureClass::UnsupportedMultimodal => {
+            (ProviderFailureCategory::MalformedResponse, ProviderRecoveryAction::RetryTransformed)
         }
         ProviderFailureClass::ContentPolicyBlocked => {
             (ProviderFailureCategory::SafetyStop, ProviderRecoveryAction::Abort)
@@ -681,8 +696,7 @@ pub fn provider_probe_message_indicates_vault_unavailable(message: &str) -> bool
         || normalized.contains("failed to acquire metadata lock")
         || normalized.contains("timed out waiting for metadata lock")
         || normalized.contains("metadata.lock: access is denied")
-        || normalized.contains("metadata.lock: pristup byl odepren")
-        || normalized.contains("metadata.lock: stup byl odep")
+        || (normalized.contains("metadata.lock") && normalized.contains("os error 5"))
 }
 
 /// Classifies an HTTP provider failure by status and response body.
@@ -712,6 +726,10 @@ pub fn classify_http_provider_failure(
         (ProviderFailureClass::Quota, ProviderFailureAction::UserActionRequired)
     } else if status_code == 429 {
         (ProviderFailureClass::RateLimit, ProviderFailureAction::Retry)
+    } else if matches!(status_code, 400 | 422)
+        && provider_body_indicates_unsupported_multimodal(normalized_body.as_str())
+    {
+        (ProviderFailureClass::UnsupportedMultimodal, ProviderFailureAction::Retry)
     } else if matches!(status_code, 400 | 422)
         && (normalized_body.contains("json_schema")
             || normalized_body.contains("response_format")
@@ -753,6 +771,18 @@ pub fn classify_http_provider_failure(
         (ProviderFailureClass::PermanentUpstream, ProviderFailureAction::ProviderFailover)
     };
     provider_failure_classification(class, recommended_action, Some(status_code), provider_detail)
+}
+
+fn provider_body_indicates_unsupported_multimodal(normalized_body: &str) -> bool {
+    normalized_body.contains("vision_unsupported")
+        || normalized_body.contains("unsupported multimodal")
+        || normalized_body.contains("multimodal input is not supported")
+        || normalized_body.contains("image input is not supported")
+        || normalized_body.contains("images are not supported")
+        || (normalized_body.contains("unsupported")
+            && (normalized_body.contains("image")
+                || normalized_body.contains("vision")
+                || normalized_body.contains("multimodal")))
 }
 
 /// Classifies a transport failure as network-unavailable.
@@ -830,6 +860,9 @@ mod tests {
         assert!(provider_probe_message_indicates_vault_unavailable(
             "failed to acquire metadata lock C:\\state\\vault\\metadata.lock: access is denied"
         ));
+        assert!(provider_probe_message_indicates_vault_unavailable(
+            "failed to acquire metadata lock C:\\state\\vault\\metadata.lock (os error 5)"
+        ));
     }
 
     #[test]
@@ -838,5 +871,19 @@ mod tests {
         assert!(!provider_probe_message_indicates_vault_unavailable(
             "failed to load vault secret 'openai_access': secret not found"
         ));
+    }
+
+    #[test]
+    fn unsupported_multimodal_uses_transformed_recovery() {
+        let classification = classify_http_provider_failure(
+            400,
+            false,
+            "openai_chat_http",
+            r#"{"error":{"message":"image input is not supported by this model"}}"#,
+        );
+        let snapshot = classification.snapshot("image input is not supported".to_owned());
+
+        assert_eq!(classification.class, ProviderFailureClass::UnsupportedMultimodal);
+        assert_eq!(snapshot.recovery.action, "retry_transformed");
     }
 }

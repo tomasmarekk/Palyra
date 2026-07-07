@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "id": "provider_recovery.lifecycle.v1",
+  "redaction_level": "metadata_only",
+  "support_bundle_contract": {
+    "collector_input": "provider_recovery_trace",
+    "journal_event_type": "provider.turn_recovery.decision"
+  },
+  "cases": [
+    {
+      "id": "malformed_sse_chunk",
+      "source_fixture": "provider_compat.malformed_sse_chunk",
+      "anomaly": "malformed_stream",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "retry_same_provider",
+        "reason_prefix": "provider.turn_recovery.malformed_stream",
+        "attempt": 1,
+        "exhausted": false
+      }
+    },
+    {
+      "id": "partial_tool_call",
+      "source_fixture": "provider_compat.partial_tool_call",
+      "anomaly": "partial_tool_call",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "fail_deterministic",
+        "reason_prefix": "provider.turn_recovery.partial_tool_call",
+        "attempt": 1,
+        "exhausted": true
+      }
+    },
+    {
+      "id": "empty_final_answer",
+      "source_fixture": "provider_compat.empty_final_answer",
+      "anomaly": "empty_final_answer",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "retry_with_prompt",
+        "reason_prefix": "provider.turn_recovery.empty_final_answer",
+        "attempt": 1,
+        "exhausted": false
+      }
+    },
+    {
+      "id": "rate_limit",
+      "source_fixture": "provider_compat.rate_limit",
+      "anomaly": "rate_limit",
+      "retry_after_ms": 2000,
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "backoff_retry",
+        "reason_prefix": "provider.turn_recovery.rate_limit",
+        "attempt": 1,
+        "exhausted": false
+      }
+    },
+    {
+      "id": "auth_expired",
+      "source_fixture": "provider_compat.auth_expired",
+      "anomaly": "auth_expired",
+      "credential_id": "provider-credential-a",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "refresh_credential",
+        "reason_prefix": "provider.turn_recovery.auth_expired",
+        "attempt": 1,
+        "exhausted": false
+      }
+    },
+    {
+      "id": "unicode_surrogate",
+      "source_fixture": "provider_compat.unicode_surrogate",
+      "anomaly": "unicode_surrogate",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "retry_same_provider",
+        "reason_prefix": "provider.turn_recovery.unicode_surrogate",
+        "attempt": 1,
+        "exhausted": false
+      }
+    },
+    {
+      "id": "unsupported_multimodal",
+      "source_fixture": "provider_compat.unsupported_multimodal",
+      "anomaly": "multimodal_unsupported",
+      "expected": {
+        "event_type": "provider.turn_recovery.decision",
+        "action": "shrink_multimodal",
+        "reason_prefix": "provider.turn_recovery.multimodal_unsupported",
+        "attempt": 1,
+        "exhausted": false
+      }
+    }
+  ]
+}

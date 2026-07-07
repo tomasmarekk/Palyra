@@ -186,6 +186,58 @@ fixtures:
       recovery_decision: retry_same_provider
       fail_closed: false
       recovery_path: Discard the partial chunk, mark the stream malformed, and retry through the stream normalizer.
+  - id: partial_tool_call
+    category: partial_tool_call
+    title: Partial provider tool call
+    raw_payload:
+      kind: stream_chunk
+      content_type: text/event-stream
+      status_code: 200
+      body: 'data: {"id":"<provider_response_id>","choices":[{"delta":{"tool_calls":[{"id":"<tool_call_id>","function":{"name":"palyra.fs.write_file","arguments":"{\"path\":\"src/main.rs\""}}]}}]}'
+    mock_behavior:
+      kind: malformed_tool_args
+      finish_reason: tool_calls
+      error_message: Provider stream ended before completing the tool-call arguments.
+    expected:
+      verdict: fail_closed
+      failure_class: truncated_tool_arguments
+      recovery_decision: fail_closed
+      fail_closed: true
+      recovery_path: Reject the partial tool call and do not synthesize a mutating tool result.
+  - id: unicode_surrogate
+    category: unicode_surrogate
+    title: Unicode surrogate in stream
+    raw_payload:
+      kind: stream_chunk
+      content_type: text/event-stream
+      status_code: 200
+      body: 'data: {"id":"<provider_response_id>","choices":[{"delta":{"content":"broken \ud800 text"}}]}'
+    mock_behavior:
+      kind: stream_error
+      error_message: Provider stream emitted a malformed Unicode scalar.
+    expected:
+      verdict: recover
+      failure_class: malformed_stream
+      recovery_decision: retry_same_provider
+      fail_closed: false
+      recovery_path: Drop the malformed chunk, record the parser anomaly, and retry once without preserving raw payload text.
+  - id: unsupported_multimodal
+    category: unsupported_multimodal
+    title: Unsupported multimodal input
+    raw_payload:
+      kind: error
+      content_type: application/json
+      status_code: 400
+      body: '{"error":{"type":"invalid_request_error","code":"vision_unsupported","message":"image input is not supported by this model","request_id":"<provider_request_id>"}}'
+    mock_behavior:
+      kind: malformed_output
+      error_message: Provider rejected an image input for this model.
+    expected:
+      verdict: recover
+      failure_class: unsupported_multimodal
+      recovery_decision: retry_transformed
+      fail_closed: false
+      recovery_path: Transform the request by shrinking or stripping unsupported image parts before retrying.
   - id: tool_result_too_large
     category: tool_result_too_large
     title: Tool result too large for provider follow-up

@@ -37,6 +37,9 @@ const REQUIRED_CATEGORY_VALUES: &[&str] = &[
     "auth_expired",
     "unsupported_schema",
     "malformed_sse_chunk",
+    "partial_tool_call",
+    "unicode_surrogate",
+    "unsupported_multimodal",
     "tool_result_too_large",
     "premature_final_after_patch",
 ];
@@ -99,6 +102,9 @@ pub enum ProviderCompatCategory {
     AuthExpired,
     UnsupportedSchema,
     MalformedSseChunk,
+    PartialToolCall,
+    UnicodeSurrogate,
+    UnsupportedMultimodal,
     ToolResultTooLarge,
     PrematureFinalAfterPatch,
 }
@@ -118,6 +124,9 @@ impl ProviderCompatCategory {
             Self::AuthExpired => "auth_expired",
             Self::UnsupportedSchema => "unsupported_schema",
             Self::MalformedSseChunk => "malformed_sse_chunk",
+            Self::PartialToolCall => "partial_tool_call",
+            Self::UnicodeSurrogate => "unicode_surrogate",
+            Self::UnsupportedMultimodal => "unsupported_multimodal",
             Self::ToolResultTooLarge => "tool_result_too_large",
             Self::PrematureFinalAfterPatch => "premature_final_after_patch",
         }
@@ -135,6 +144,9 @@ impl ProviderCompatCategory {
             "auth_expired" => Some(Self::AuthExpired),
             "unsupported_schema" => Some(Self::UnsupportedSchema),
             "malformed_sse_chunk" => Some(Self::MalformedSseChunk),
+            "partial_tool_call" => Some(Self::PartialToolCall),
+            "unicode_surrogate" => Some(Self::UnicodeSurrogate),
+            "unsupported_multimodal" => Some(Self::UnsupportedMultimodal),
             "tool_result_too_large" => Some(Self::ToolResultTooLarge),
             "premature_final_after_patch" => Some(Self::PrematureFinalAfterPatch),
             _ => None,
@@ -1178,6 +1190,7 @@ fn parse_failure_class(value: &str) -> Option<ProviderFailureClass> {
         "provider_unavailable" => Some(ProviderFailureClass::ProviderUnavailable),
         "network_unavailable" => Some(ProviderFailureClass::NetworkUnavailable),
         "provider_timeout" => Some(ProviderFailureClass::ProviderTimeout),
+        "unsupported_multimodal" => Some(ProviderFailureClass::UnsupportedMultimodal),
         _ => None,
     }
 }
@@ -1341,6 +1354,26 @@ fixtures:
         assert_eq!(fixture.expected.failure_class, ProviderFailureClass::BadToolArguments);
         assert_eq!(fixture.expected.recovery_decision, ProviderRecoveryDecisionKind::FailClosed);
         assert!(fixture.expected.fail_closed);
+    }
+
+    #[test]
+    fn unsupported_multimodal_fixture_requires_transformed_retry() {
+        let pack = parse_provider_compat_fixture_pack_yaml(EXAMPLE_PACK)
+            .expect("provider compatibility fixture pack should parse");
+        let fixture = pack
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.category == ProviderCompatCategory::UnsupportedMultimodal)
+            .expect("unsupported multimodal fixture should be present");
+        let classification = provider_compat_fixture_classification(fixture);
+        let snapshot = classification.snapshot("unsupported multimodal".to_owned());
+
+        assert_eq!(fixture.expected.failure_class, ProviderFailureClass::UnsupportedMultimodal);
+        assert_eq!(
+            fixture.expected.recovery_decision,
+            ProviderRecoveryDecisionKind::RetryTransformed
+        );
+        assert_eq!(snapshot.recovery.action, "retry_transformed");
     }
 
     #[test]

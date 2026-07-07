@@ -126,6 +126,8 @@ impl ProviderErrorEnvelope {
         let retryability = provider_retryability(error, &classification);
         let malformed_failover_eligible =
             matches!(classification.class.as_str(), "malformed_response");
+        let transformed_retry_eligible =
+            matches!(classification.recovery.action.as_str(), "retry_transformed");
         let failover_eligible = matches!(
             kind,
             ProviderErrorKind::RateLimit
@@ -137,7 +139,10 @@ impl ProviderErrorEnvelope {
         // Severity is derived, not stored: anything retryable or failover
         // eligible is recoverable by definition; malformed/internal failures
         // degrade the run; everything else needs operator action.
-        let severity = if failover_eligible || retryability != ProviderRetryability::NotRetryable {
+        let severity = if failover_eligible
+            || transformed_retry_eligible
+            || retryability != ProviderRetryability::NotRetryable
+        {
             ProviderErrorSeverity::Recoverable
         } else if matches!(kind, ProviderErrorKind::MalformedResponse | ProviderErrorKind::Internal)
         {
@@ -259,6 +264,7 @@ fn provider_error_kind(
                 | "empty_output"
                 | "premature_final"
                 | "payload_too_large" => ProviderErrorKind::MalformedResponse,
+                "unsupported_multimodal" => ProviderErrorKind::UnsupportedFeature,
                 "context_window_exceeded" => ProviderErrorKind::MalformedResponse,
                 "content_policy_blocked" => ProviderErrorKind::ProviderPolicy,
                 "transient_upstream" => ProviderErrorKind::TransientNetwork,
@@ -281,6 +287,11 @@ fn provider_retryability(
             if matches!(classification.class, ProviderFailureClass::AuthExpired) =>
         {
             ProviderRetryability::RefreshCredential
+        }
+        ProviderError::RequestFailed { .. }
+            if classification.recovery.action.as_str() == "retry_transformed" =>
+        {
+            ProviderRetryability::NotRetryable
         }
         ProviderError::RequestFailed { retryable: true, .. } => {
             if classification.recovery.retry_after_ms.is_some()
@@ -372,5 +383,29 @@ mod tests {
         assert_eq!(snapshot.class, ProviderFailureClass::ContextOverflow.as_str());
         assert_eq!(decision.decision, ProviderRecoveryDecisionKind::CompactAndRetry);
         assert_eq!(decision.reason_code, "provider.recovery.compact_and_retry");
+    }
+
+    #[test]
+    fn recovery_decision_maps_multimodal_rejection_to_transform() {
+        let error = ProviderError::RequestFailed {
+            message: "image input is not supported by this model".to_owned(),
+            retryable: false,
+            retry_count: 0,
+            classification: classify_http_provider_failure(
+                400,
+                false,
+                "openai_chat_http",
+                r#"{"error":{"code":"vision_unsupported","message":"image input is not supported"}}"#,
+            ),
+        };
+
+        let envelope = ProviderErrorEnvelope::from_error(&error);
+
+        assert_eq!(envelope.kind, ProviderErrorKind::UnsupportedFeature);
+        assert_eq!(envelope.severity, ProviderErrorSeverity::Recoverable);
+        assert_eq!(
+            envelope.recovery_decision.decision,
+            ProviderRecoveryDecisionKind::RetryTransformed
+        );
     }
 }
