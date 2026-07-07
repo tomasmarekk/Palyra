@@ -111,6 +111,7 @@ pub(crate) struct RunRuntimePathSummary {
     pub(crate) terminal_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_reason: Option<String>,
+    pub(crate) attempt_owner: String,
     pub(crate) preserved_for_terminal_states: Vec<String>,
     pub(crate) preserved_for_failure_modes: Vec<String>,
     pub(crate) subsystems: BTreeMap<String, RunRuntimePathSubsystem>,
@@ -122,6 +123,7 @@ pub(crate) fn build_run_runtime_path_summary(
     config: &FeatureRolloutsConfig,
     terminal_state: Option<&str>,
     terminal_reason: Option<&str>,
+    attempt_owner: Option<&str>,
 ) -> RunRuntimePathSummary {
     let subsystems = [
         ("harness", "feature_rollouts.agent_harness_runtime", config.agent_harness_runtime),
@@ -152,6 +154,16 @@ pub(crate) fn build_run_runtime_path_summary(
         terminal_state: terminal_state.map(ToOwned::to_owned),
         terminal_reason: terminal_reason
             .map(|reason| sanitize_diagnostics_string(reason, Some("terminal_reason"))),
+        attempt_owner: sanitize_diagnostics_string(
+            attempt_owner.unwrap_or({
+                if config.agent_harness_runtime.enabled {
+                    "harness_runtime_v1"
+                } else {
+                    "embedded_run_stream"
+                }
+            }),
+            Some("attempt_owner"),
+        ),
         preserved_for_terminal_states: vec![
             "done".to_owned(),
             "failed".to_owned(),
@@ -2290,11 +2302,13 @@ mod tests {
             &config,
             Some("failed"),
             Some("provider token=abc failed in C:\\Users\\Palo\\repo"),
+            Some("embedded_palyra"),
         );
 
         assert_eq!(summary.schema_version, RUN_RUNTIME_PATH_SCHEMA_VERSION);
         assert_eq!(summary.event_name, RUN_RUNTIME_PATH_SUMMARY_EVENT);
         assert_eq!(summary.redaction_level, "metadata_only");
+        assert_eq!(summary.attempt_owner, "embedded_palyra");
         assert_eq!(summary.terminal_state.as_deref(), Some("failed"));
         assert_eq!(summary.subsystems.len(), 9);
         assert_eq!(

@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use palyra_common::runtime_contracts::AgentHarnessCallbackKind;
 use palyra_common::versioned_json::{
     migrate_updated_at_metadata_v0_to_v1, parse_versioned_json, JsonMigrationFn,
     VersionedJsonFormat,
@@ -48,6 +49,7 @@ const PLUGIN_CONFIG_INSTANCE_LAYOUT_VERSION: u32 = 1;
 const PLUGIN_CONFIG_INSTANCE_FILE_NAME: &str = "config.json";
 const PLUGIN_CONFIG_INSTANCE_FORMAT: VersionedJsonFormat =
     VersionedJsonFormat::new("plugin config instance", PLUGIN_CONFIG_INSTANCE_LAYOUT_VERSION);
+const AGENT_HARNESS_TEST_CONTRACT_TAG: &str = "agent_harness:test";
 
 /// Versioned on-disk index of all plugin bindings, sorted by plugin id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1380,7 +1382,10 @@ pub(crate) fn activate_agent_harness_plugins_before_selection(
         match agent_harness_plugin_activation_reason(binding) {
             AgentHarnessPluginActivationReason::Activatable => {
                 registry
-                    .register(PluginAgentHarnessAdapter { descriptor: descriptor.clone() })
+                    .register(PluginAgentHarnessAdapter {
+                        descriptor: descriptor.clone(),
+                        execution_mode: plugin_agent_harness_execution_mode(binding),
+                    })
                     .map_err(|source| AgentHarnessPluginActivationError::Registry {
                         plugin_id: binding.plugin_id.clone(),
                         source,
@@ -1481,9 +1486,37 @@ fn plugin_agent_harness_label(binding: &PluginBindingRecord) -> String {
         .unwrap_or_else(|| format!("Agent harness plugin {}", binding.plugin_id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginAgentHarnessExecutionMode {
+    HostTestContract,
+    ProductionUnsupported,
+}
+
+fn plugin_agent_harness_execution_mode(
+    binding: &PluginBindingRecord,
+) -> PluginAgentHarnessExecutionMode {
+    let tagged_test = binding
+        .operator
+        .tags
+        .iter()
+        .any(|tag| tag.trim().eq_ignore_ascii_case(AGENT_HARNESS_TEST_CONTRACT_TAG));
+    let test_module =
+        binding.module_path.as_deref().is_some_and(|path| path.trim().starts_with("test://"));
+    let test_entrypoint = binding
+        .entrypoint
+        .as_deref()
+        .is_some_and(|entrypoint| entrypoint.trim() == "palyra_agent_harness_test");
+    if tagged_test || test_module || test_entrypoint {
+        PluginAgentHarnessExecutionMode::HostTestContract
+    } else {
+        PluginAgentHarnessExecutionMode::ProductionUnsupported
+    }
+}
+
 #[derive(Debug)]
 struct PluginAgentHarnessAdapter {
     descriptor: AgentHarnessDescriptor,
+    execution_mode: PluginAgentHarnessExecutionMode,
 }
 
 impl AgentHarness for PluginAgentHarnessAdapter {
@@ -1500,12 +1533,29 @@ impl AgentHarness for PluginAgentHarnessAdapter {
 
     fn run_attempt(
         &self,
-        _attempt: crate::application::agent_harness::PreparedAgentAttempt<'_>,
+        attempt: crate::application::agent_harness::PreparedAgentAttempt<'_>,
     ) -> AgentHarnessRunOutcome {
-        AgentHarnessRunOutcome {
-            status: "blocked".to_owned(),
-            emitted_callbacks: Vec::new(),
-            final_message: None,
+        if attempt.cancellation.is_cancelled() {
+            return AgentHarnessRunOutcome {
+                status: "cancelled".to_owned(),
+                emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+                final_message: None,
+            };
+        }
+        match self.execution_mode {
+            PluginAgentHarnessExecutionMode::HostTestContract => AgentHarnessRunOutcome {
+                status: "completed".to_owned(),
+                emitted_callbacks: vec![
+                    AgentHarnessCallbackKind::PartialReply,
+                    AgentHarnessCallbackKind::FinalOutcome,
+                ],
+                final_message: Some("plugin harness test completed".to_owned()),
+            },
+            PluginAgentHarnessExecutionMode::ProductionUnsupported => AgentHarnessRunOutcome {
+                status: "internal_error".to_owned(),
+                emitted_callbacks: vec![AgentHarnessCallbackKind::LifecycleEvent],
+                final_message: None,
+            },
         }
     }
 }
@@ -1672,7 +1722,7 @@ mod tests {
     };
 
     use palyra_skills::parse_manifest_toml;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use tempfile::tempdir;
 
     use super::{
@@ -1686,9 +1736,12 @@ mod tests {
         PluginCapabilityProfile, PluginConfigInstance, PluginConfigInstanceRef,
         PluginConfigValidationSnapshot, PluginConfigValidationState, PluginDiscoverySnapshot,
         PluginDiscoveryState, PluginFilesystemSafetySnapshot, PluginOperatorMetadata,
-        PLUGIN_BINDINGS_LAYOUT_VERSION,
+        AGENT_HARNESS_TEST_CONTRACT_TAG, PLUGIN_BINDINGS_LAYOUT_VERSION,
     };
-    use crate::application::agent_harness::{AgentHarnessRegistry, AgentHarnessSupportRequest};
+    use crate::application::agent_harness::{
+        AgentHarnessCancellation, AgentHarnessRegistry, AgentHarnessSupportRequest,
+        PreparedAgentAttempt, PreparedAgentAttemptCallbacks,
+    };
     use crate::wasm_plugin_runner::WasmPluginRunnerPolicy;
     use palyra_common::runtime_contracts::AgentHarnessSelectionMode;
     use palyra_plugins_runtime::{
@@ -1763,6 +1816,31 @@ mod tests {
             replay_safe: false,
             fallback_allowed: false,
             replay_required: false,
+        }
+    }
+
+    fn prepared_attempt<'a>(
+        auth: &'a Value,
+        transcript: &'a [Value],
+        tools: &'a Value,
+        policy: &'a Value,
+    ) -> PreparedAgentAttempt<'a> {
+        PreparedAgentAttempt {
+            run_id: "run-1",
+            session_id: "session-1",
+            provider_id: "openai",
+            model_id: "gpt-4o-mini",
+            auth_state_metadata: auth,
+            context_token_budget: 4_096,
+            reasoning_policy: Some("standard"),
+            sanitized_transcript_view: transcript,
+            tool_surface: tools,
+            tool_policy: policy,
+            workspace_root: None,
+            sandbox: "host_owned",
+            trace_context: "trace-1",
+            callbacks: PreparedAgentAttemptCallbacks::host_controlled(),
+            cancellation: AgentHarnessCancellation::default(),
         }
     }
 
@@ -1989,6 +2067,84 @@ mod tests {
         assert!(report.records[0].activated);
         assert_eq!(report.records[0].reason_code, "agent_harness_plugin.activated");
         assert_eq!(selected.harness.descriptor().id, "acme.agent_harness");
+    }
+
+    #[test]
+    fn tagged_agent_harness_plugin_runs_test_contract() {
+        let mut binding =
+            agent_harness_binding("acme.agent_harness", accepted_agent_harness_contract_report());
+        binding.operator.tags.push(AGENT_HARNESS_TEST_CONTRACT_TAG.to_owned());
+        let index =
+            PluginBindingsIndex { entries: vec![binding], ..PluginBindingsIndex::default() };
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        activate_agent_harness_plugins_before_selection(
+            &index,
+            &mut registry,
+            AgentHarnessPluginActivationRequest {
+                requested_plugin_id: Some("acme.agent_harness"),
+                explicit: true,
+            },
+        )
+        .expect("test agent harness plugin should activate");
+        let selected = registry
+            .select(&harness_selection_request(Some("acme.agent_harness"), false))
+            .expect("registered plugin harness should be selectable");
+        let auth = json!({});
+        let transcript = Vec::new();
+        let tools = json!({});
+        let policy = json!({});
+
+        let outcome = selected.harness.run_attempt(prepared_attempt(
+            &auth,
+            transcript.as_slice(),
+            &tools,
+            &policy,
+        ));
+
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.final_message.as_deref(), Some("plugin harness test completed"));
+    }
+
+    #[test]
+    fn production_agent_harness_plugin_attempt_fails_closed() {
+        let index = PluginBindingsIndex {
+            entries: vec![agent_harness_binding(
+                "acme.agent_harness",
+                accepted_agent_harness_contract_report(),
+            )],
+            ..PluginBindingsIndex::default()
+        };
+        let mut registry =
+            AgentHarnessRegistry::with_embedded_default().expect("embedded registry should build");
+
+        activate_agent_harness_plugins_before_selection(
+            &index,
+            &mut registry,
+            AgentHarnessPluginActivationRequest {
+                requested_plugin_id: Some("acme.agent_harness"),
+                explicit: true,
+            },
+        )
+        .expect("accepted production harness plugin should activate");
+        let selected = registry
+            .select(&harness_selection_request(Some("acme.agent_harness"), false))
+            .expect("registered plugin harness should be selectable");
+        let auth = json!({});
+        let transcript = Vec::new();
+        let tools = json!({});
+        let policy = json!({});
+
+        let outcome = selected.harness.run_attempt(prepared_attempt(
+            &auth,
+            transcript.as_slice(),
+            &tools,
+            &policy,
+        ));
+
+        assert_eq!(outcome.status, "internal_error");
+        assert!(outcome.final_message.is_none());
     }
 
     #[test]

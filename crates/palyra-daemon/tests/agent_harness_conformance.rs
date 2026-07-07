@@ -1,5 +1,6 @@
 use palyra_common::runtime_contracts::{
     AgentHarnessAttemptTerminalStatus, AgentHarnessCallbackKind, AgentHarnessSelectionMode,
+    AgentHarnessTerminalClassification,
 };
 use palyra_daemon::application::{
     agent_harness::{
@@ -126,7 +127,7 @@ fn conformance_selects_embedded_and_records_lifecycle() {
     );
 
     assert_eq!(trace.result.terminal_status, AgentHarnessAttemptTerminalStatus::Completed);
-    assert_eq!(trace.events.len(), 2);
+    assert_eq!(trace.events.len(), 3);
     assert!(!trace.fallback_used);
 }
 
@@ -182,6 +183,9 @@ fn conformance_routes_tool_and_callback_through_host_boundaries() {
     let mut callbacks = HarnessCallbackProxy::new([AgentHarnessCallbackKind::ToolEvent], false);
     let record = callbacks
         .emit(HarnessCallbackRequest {
+            run_id: "run-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            sequence: 1,
             callback_kind: AgentHarnessCallbackKind::ToolEvent,
             capability_scope: HarnessCallbackCapabilityScope::ToolBridge,
             redaction_policy: HarnessCallbackRedactionPolicy::RedactedPayload,
@@ -255,4 +259,12 @@ fn conformance_distinguishes_cancellation_and_timeout_results() {
 
     assert_eq!(cancelled.terminal_status, AgentHarnessAttemptTerminalStatus::Cancelled);
     assert_eq!(timed_out.terminal_status, AgentHarnessAttemptTerminalStatus::TimedOut);
+    assert_eq!(
+        cancelled.terminal_classification,
+        Some(AgentHarnessTerminalClassification::Cancelled)
+    );
+    assert_eq!(
+        timed_out.terminal_classification,
+        Some(AgentHarnessTerminalClassification::Timeout)
+    );
 }

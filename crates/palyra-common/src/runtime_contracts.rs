@@ -445,7 +445,7 @@ fn agent_hook_contract_snapshot() -> Value {
 
 fn agent_harness_contract_snapshot() -> Value {
     json!({
-        "snapshot_version": "runtime-contracts.agent_harness.v3",
+        "snapshot_version": "runtime-contracts.agent_harness.v4",
         "changelog_note": "Agent harness contracts keep provider resolution, auth, transcript, workspace, sandbox, tool policy, callbacks, journal writes, and structured attempt results host-owned.",
         "selection_modes": enum_contract_snapshot(
             "AgentHarnessSelectionMode",
@@ -473,9 +473,15 @@ fn agent_harness_contract_snapshot() -> Value {
         ),
         "attempt_classifications": enum_contract_snapshot(
             "AgentHarnessAttemptClassification",
-            "runtime-contracts.agent_harness_attempt_classification.v1",
+            "runtime-contracts.agent_harness_attempt_classification.v2",
             "Harness attempt classifications avoid generic provider/runtime error strings in diagnostics and replay.",
             AgentHarnessAttemptClassification::wire_contract_values(),
+        ),
+        "terminal_classifications": enum_contract_snapshot(
+            "AgentHarnessTerminalClassification",
+            "runtime-contracts.agent_harness_terminal_classification.v1",
+            "Terminal classifications provide one shared wait, journal, and diagnostics vocabulary across harness owners.",
+            AgentHarnessTerminalClassification::wire_contract_values(),
         ),
         "attempt_replay_safety": enum_contract_snapshot(
             "AgentHarnessAttemptReplaySafety",
@@ -1928,7 +1934,7 @@ pub fn agent_hook_descriptor(kind: AgentHookKind) -> Option<&'static AgentHookDe
 runtime_contract_enum! {
     /// Host-owned policy for routing a prepared attempt to an agent harness.
     pub enum AgentHarnessSelectionMode {
-        Embedded => "embedded",
+        Embedded => "embedded" | "embedded_only",
         Auto => "auto",
         Explicit => "explicit",
         ExplicitPlugin => "explicit_plugin",
@@ -1993,7 +1999,26 @@ runtime_contract_enum! {
         ToolError => "tool_error",
         ToolLoopGuardrail => "tool_loop_guardrail",
         SideEffectUncertain => "side_effect_uncertain",
-        NativeRuntimeError => "native_runtime_error"
+        NativeRuntimeError => "native_runtime_error",
+        ApprovalDenied => "approval_denied",
+        InternalError => "internal_error",
+        DeterministicFailure => "deterministic_failure"
+    }
+}
+
+runtime_contract_enum! {
+    /// Stable terminal classification vocabulary shared by wait, journal, and diagnostics paths.
+    pub enum AgentHarnessTerminalClassification {
+        Ok => "ok",
+        Empty => "empty",
+        Cancelled => "cancelled",
+        Timeout => "timeout",
+        ProviderError => "provider_error",
+        ToolError => "tool_error",
+        PolicyBlocked => "policy_blocked",
+        ApprovalDenied => "approval_denied",
+        InternalError => "internal_error",
+        DeterministicFailure => "deterministic_failure"
     }
 }
 
@@ -2106,6 +2131,9 @@ pub struct AgentHarnessAttemptResult {
     pub terminal_status: AgentHarnessAttemptTerminalStatus,
     /// Typed outcome classification.
     pub classification: AgentHarnessAttemptClassification,
+    /// Terminal classification shared across embedded, plugin, and native harness owners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_classification: Option<AgentHarnessTerminalClassification>,
     /// Replay-safety posture for this attempt.
     pub replay_safety: AgentHarnessAttemptReplaySafety,
     /// Optional phase timing summaries.
@@ -2149,6 +2177,10 @@ impl AgentHarnessAttemptResult {
             schema_version: Self::SCHEMA_VERSION,
             terminal_status,
             classification,
+            terminal_classification: Some(classify_agent_harness_terminal(
+                terminal_status,
+                classification,
+            )),
             replay_safety,
             phase_timings: Vec::new(),
             error: None,
@@ -2159,6 +2191,89 @@ impl AgentHarnessAttemptResult {
             finalizer_summary: None,
             diagnostic_trace_id: crate::redaction::redact_diagnostic_text(&diagnostic_trace_id),
         }
+    }
+}
+
+/// Derives the host-wide terminal classification from a status/classification pair.
+#[must_use]
+pub const fn classify_agent_harness_terminal(
+    terminal_status: AgentHarnessAttemptTerminalStatus,
+    classification: AgentHarnessAttemptClassification,
+) -> AgentHarnessTerminalClassification {
+    match terminal_status {
+        AgentHarnessAttemptTerminalStatus::Cancelled => {
+            AgentHarnessTerminalClassification::Cancelled
+        }
+        AgentHarnessAttemptTerminalStatus::TimedOut => AgentHarnessTerminalClassification::Timeout,
+        AgentHarnessAttemptTerminalStatus::Blocked => match classification {
+            AgentHarnessAttemptClassification::ApprovalDenied => {
+                AgentHarnessTerminalClassification::ApprovalDenied
+            }
+            _ => AgentHarnessTerminalClassification::PolicyBlocked,
+        },
+        AgentHarnessAttemptTerminalStatus::Completed
+        | AgentHarnessAttemptTerminalStatus::Yielded => match classification {
+            AgentHarnessAttemptClassification::EmptyResponse => {
+                AgentHarnessTerminalClassification::Empty
+            }
+            AgentHarnessAttemptClassification::DeterministicFailure => {
+                AgentHarnessTerminalClassification::DeterministicFailure
+            }
+            AgentHarnessAttemptClassification::InternalError
+            | AgentHarnessAttemptClassification::NativeRuntimeError => {
+                AgentHarnessTerminalClassification::InternalError
+            }
+            AgentHarnessAttemptClassification::ToolError
+            | AgentHarnessAttemptClassification::ToolLoopGuardrail
+            | AgentHarnessAttemptClassification::SideEffectUncertain => {
+                AgentHarnessTerminalClassification::ToolError
+            }
+            AgentHarnessAttemptClassification::ProviderError
+            | AgentHarnessAttemptClassification::MalformedProviderStream => {
+                AgentHarnessTerminalClassification::ProviderError
+            }
+            AgentHarnessAttemptClassification::PolicyBlocked
+            | AgentHarnessAttemptClassification::HookBlocked => {
+                AgentHarnessTerminalClassification::PolicyBlocked
+            }
+            AgentHarnessAttemptClassification::ApprovalDenied => {
+                AgentHarnessTerminalClassification::ApprovalDenied
+            }
+            AgentHarnessAttemptClassification::Ok
+            | AgentHarnessAttemptClassification::ReasoningOnly
+            | AgentHarnessAttemptClassification::PlanningOnly => {
+                AgentHarnessTerminalClassification::Ok
+            }
+        },
+        AgentHarnessAttemptTerminalStatus::Failed => match classification {
+            AgentHarnessAttemptClassification::ProviderError
+            | AgentHarnessAttemptClassification::MalformedProviderStream => {
+                AgentHarnessTerminalClassification::ProviderError
+            }
+            AgentHarnessAttemptClassification::ToolError
+            | AgentHarnessAttemptClassification::ToolLoopGuardrail
+            | AgentHarnessAttemptClassification::SideEffectUncertain => {
+                AgentHarnessTerminalClassification::ToolError
+            }
+            AgentHarnessAttemptClassification::PolicyBlocked
+            | AgentHarnessAttemptClassification::HookBlocked => {
+                AgentHarnessTerminalClassification::PolicyBlocked
+            }
+            AgentHarnessAttemptClassification::ApprovalDenied => {
+                AgentHarnessTerminalClassification::ApprovalDenied
+            }
+            AgentHarnessAttemptClassification::DeterministicFailure => {
+                AgentHarnessTerminalClassification::DeterministicFailure
+            }
+            AgentHarnessAttemptClassification::Ok
+            | AgentHarnessAttemptClassification::EmptyResponse
+            | AgentHarnessAttemptClassification::ReasoningOnly
+            | AgentHarnessAttemptClassification::PlanningOnly
+            | AgentHarnessAttemptClassification::NativeRuntimeError
+            | AgentHarnessAttemptClassification::InternalError => {
+                AgentHarnessTerminalClassification::InternalError
+            }
+        },
     }
 }
 

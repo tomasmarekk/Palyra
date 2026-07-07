@@ -1,8 +1,8 @@
 # Runtime boundary decision matrix
 
-This report is the Phase 1 implementation map for the agent-runtime roadmap.
-It names the existing Palyra surfaces that future milestones must extend
-instead of creating parallel runtimes.
+This report is the implementation map for the agent-runtime roadmap. It names
+the existing Palyra surfaces that future milestones must extend instead of
+creating parallel runtimes.
 
 ## Scope exclusions
 
@@ -46,6 +46,43 @@ this roadmap wave. They do not unblock the backend runtime boundaries below.
 - Maturity diagnostics: `crates/palyra-daemon/src/feature_rollout_maturity.rs`
 - Runtime roadmap contracts: `crates/palyra-common/src/runtime_roadmap.rs`
 - Operator diagnostics: `crates/palyra-daemon/src/transport/http/handlers/console/diagnostics.rs`
+
+## Phase 2 harness execution anchors
+
+- Runtime owner: `HarnessRuntimeV1` in
+  `crates/palyra-daemon/src/application/agent_harness_lifecycle.rs`
+- Built-in harness: `BuiltinPalyraHarness` /
+  `EmbeddedPalyraHarness` in
+  `crates/palyra-daemon/src/application/agent_harness.rs`
+- Callback bridge: `HarnessCallbackProxy` in
+  `crates/palyra-daemon/src/application/agent_harness_callbacks.rs`
+- Tool bridge: `evaluate_harness_tool_call()` and
+  `project_harness_visible_tool_result()` in
+  `crates/palyra-daemon/src/application/agent_harness_tool_bridge.rs`
+- Native relay: `evaluate_native_harness_relay_with_audit()` in
+  `crates/palyra-daemon/src/application/native_harness_relay.rs`
+- Plugin adapter activation: `activate_agent_harness_plugins_before_selection()`
+  in `crates/palyra-daemon/src/plugins.rs`
+
+Harness attempts emit `harness.run.started`, one terminal event, and
+`harness.run.cleaned_up`. Terminal payloads include the stable
+`terminal_classification` field derived from the public runtime contract.
+`run.runtime_path_summary` includes `attempt_owner`; run-stream attempts use
+the selected harness id when available and `embedded_run_stream` when the
+legacy path owns the attempt.
+
+Plugin harness production execution remains fail-closed until the Wasm or IPC
+runner exposes the full host callback bridge. Test harness bindings may opt
+into the safe host-side contract with the `agent_harness:test` operator tag, a
+`test://` module path, or the `palyra_agent_harness_test` entrypoint. These
+test paths can emit assistant and final-outcome callback kinds but still never
+receive tool, approval, vault, sandbox, or direct journal authority.
+
+Native relay evaluations return both a decision and a metadata-only audit
+record. Permission requests deterministically project to the Palyra approval
+broker by hash, are rate-limited, and fail closed on stale generation,
+expiration, cancellation, oversized payloads, or spam. Post-tool relays cannot
+increase model visibility or rewrite canonical evidence.
 
 ## Baseline drift contract
 
@@ -100,7 +137,9 @@ The summary covers the harness, context engine, tool gate, hooks, provider
 recovery, compaction, LSP, verification, and delivery paths. It preserves
 terminal-state evidence for done, failed, and cancelled runs while redacting
 terminal reasons and excluding prompts, tool arguments, credentials, provider
-payloads, and local paths.
+payloads, and local paths. It also records the redacted `attempt_owner` so
+operators can distinguish the embedded run-stream path from harness-owned
+attempts without exposing raw runtime payloads.
 
 ## Host authority checklist
 

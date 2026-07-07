@@ -272,6 +272,7 @@ pub(crate) async fn console_diagnostics_handler(
         &state.runtime.config.feature_rollouts,
         None,
         Some("diagnostics_snapshot"),
+        None,
     );
     let active_tool_jobs = json!({
         "total": tool_jobs.len(),

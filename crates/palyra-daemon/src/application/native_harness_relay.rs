@@ -1,11 +1,10 @@
 //! Host-owned native harness relay contracts.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const NATIVE_HARNESS_RELAY_SCHEMA_VERSION: u32 = 1;
+pub const NATIVE_HARNESS_RELAY_AUDIT_EVENT: &str = "native_harness_relay.invocation";
 const MAX_RELAY_PAYLOAD_BYTES: usize = 16 * 1024;
 const MAX_RELAY_JSON_DEPTH: usize = 8;
 const MAX_RELAY_JSON_NODES: usize = 512;
@@ -64,6 +63,8 @@ pub enum NativeHarnessRelayReasonCode {
     PayloadTooDeep,
     PayloadTooManyNodes,
     PayloadStringTooLarge,
+    PostToolVisibilityEscalation,
+    PermissionRateLimited,
     ExpiredRelay,
     StaleGeneration,
     CancelledRelay,
@@ -81,6 +82,8 @@ impl NativeHarnessRelayReasonCode {
             Self::PayloadTooDeep => "native_relay.payload_too_deep",
             Self::PayloadTooManyNodes => "native_relay.payload_too_many_nodes",
             Self::PayloadStringTooLarge => "native_relay.payload_string_too_large",
+            Self::PostToolVisibilityEscalation => "native_relay.post_tool_visibility_escalation",
+            Self::PermissionRateLimited => "native_relay.permission_rate_limited",
             Self::ExpiredRelay => "native_relay.expired",
             Self::StaleGeneration => "native_relay.stale_generation",
             Self::CancelledRelay => "native_relay.cancelled",
@@ -105,9 +108,70 @@ pub struct NativeHarnessRelayDecision {
     pub event_kind: NativeHarnessRelayEventKind,
     pub decision: NativeHarnessRelayDecisionKind,
     pub reason_codes: Vec<NativeHarnessRelayReasonCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_projection: Option<NativeHarnessRelayApprovalProjection>,
     pub approval_authority_granted: bool,
     pub direct_journal_authority_granted: bool,
     pub tool_executor_authority_granted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHarnessRelayApprovalProjection {
+    pub broker: String,
+    pub subject_hash: String,
+    pub approval_reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHarnessRelayAuditRecord {
+    pub schema_version: u32,
+    pub event_name: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub harness_id: String,
+    pub event_kind: NativeHarnessRelayEventKind,
+    pub generation: u64,
+    pub decision: NativeHarnessRelayDecisionKind,
+    pub reason_codes: Vec<NativeHarnessRelayReasonCode>,
+    pub payload_bytes: usize,
+    pub fail_closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_requests_remaining: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHarnessRelayEvaluation {
+    pub decision: NativeHarnessRelayDecision,
+    pub audit: NativeHarnessRelayAuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeHarnessRelayRateLimit {
+    max_permission_requests: u32,
+    permission_requests_used: u32,
+}
+
+impl NativeHarnessRelayRateLimit {
+    #[must_use]
+    pub const fn new(max_permission_requests: u32) -> Self {
+        Self { max_permission_requests, permission_requests_used: 0 }
+    }
+
+    #[must_use]
+    pub const fn permission_requests_remaining(&self) -> u32 {
+        self.max_permission_requests.saturating_sub(self.permission_requests_used)
+    }
+
+    fn consume_permission_request(&mut self) -> bool {
+        if self.permission_requests_used >= self.max_permission_requests {
+            return false;
+        }
+        self.permission_requests_used = self.permission_requests_used.saturating_add(1);
+        true
+    }
 }
 
 #[must_use]
@@ -115,21 +179,67 @@ pub fn evaluate_native_harness_relay(
     registration: &NativeHarnessRelayRegistration,
     request: &NativeHarnessRelayRequest,
 ) -> NativeHarnessRelayDecision {
-    if registration.cancelled {
-        return rejected(request.event_kind, NativeHarnessRelayReasonCode::CancelledRelay);
-    }
-    if request.generation != registration.generation {
-        return rejected(request.event_kind, NativeHarnessRelayReasonCode::StaleGeneration);
-    }
-    if request.observed_at_unix_ms
+    evaluate_native_harness_relay_with_audit(registration, request, None).decision
+}
+
+#[must_use]
+pub fn evaluate_native_harness_relay_with_audit(
+    registration: &NativeHarnessRelayRegistration,
+    request: &NativeHarnessRelayRequest,
+    mut rate_limit: Option<&mut NativeHarnessRelayRateLimit>,
+) -> NativeHarnessRelayEvaluation {
+    let decision = if registration.cancelled {
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::CancelledRelay)
+    } else if request.generation != registration.generation {
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::StaleGeneration)
+    } else if request.observed_at_unix_ms
         > registration.registered_at_unix_ms.saturating_add(registration.ttl_ms.max(0))
     {
-        return rejected(request.event_kind, NativeHarnessRelayReasonCode::ExpiredRelay);
-    }
-    if let Some(reason) = relay_payload_cap_reason(&request.payload) {
-        return rejected(request.event_kind, reason);
-    }
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::ExpiredRelay)
+    } else if let Some(reason) = relay_payload_cap_reason(&request.payload) {
+        rejected(request.event_kind, reason)
+    } else if request.event_kind == NativeHarnessRelayEventKind::PostToolUse
+        && post_tool_visibility_escalates(&request.payload)
+    {
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::PostToolVisibilityEscalation)
+    } else if request.event_kind == NativeHarnessRelayEventKind::PermissionRequest
+        && rate_limit.as_deref_mut().is_some_and(|limit| !limit.consume_permission_request())
+    {
+        rejected(request.event_kind, NativeHarnessRelayReasonCode::PermissionRateLimited)
+    } else {
+        accepted_decision(registration, request)
+    };
 
+    let payload_bytes = serde_json::to_vec(&request.payload).map_or(0, |encoded| encoded.len());
+    let permission_requests_remaining =
+        rate_limit.as_deref().map(NativeHarnessRelayRateLimit::permission_requests_remaining);
+    NativeHarnessRelayEvaluation {
+        audit: NativeHarnessRelayAuditRecord {
+            schema_version: NATIVE_HARNESS_RELAY_SCHEMA_VERSION,
+            event_name: NATIVE_HARNESS_RELAY_AUDIT_EVENT.to_owned(),
+            run_id: palyra_common::redaction::redact_diagnostic_text(registration.run_id.as_str()),
+            session_id: palyra_common::redaction::redact_diagnostic_text(
+                registration.session_id.as_str(),
+            ),
+            harness_id: palyra_common::redaction::redact_diagnostic_text(
+                registration.harness_id.as_str(),
+            ),
+            event_kind: request.event_kind,
+            generation: request.generation,
+            decision: decision.decision,
+            reason_codes: decision.reason_codes.clone(),
+            payload_bytes,
+            fail_closed: decision.decision == NativeHarnessRelayDecisionKind::Rejected,
+            permission_requests_remaining,
+        },
+        decision,
+    }
+}
+
+fn accepted_decision(
+    registration: &NativeHarnessRelayRegistration,
+    request: &NativeHarnessRelayRequest,
+) -> NativeHarnessRelayDecision {
     match request.event_kind {
         NativeHarnessRelayEventKind::PermissionRequest => NativeHarnessRelayDecision {
             schema_version: NATIVE_HARNESS_RELAY_SCHEMA_VERSION,
@@ -139,6 +249,7 @@ pub fn evaluate_native_harness_relay(
                 NativeHarnessRelayReasonCode::RelayAccepted,
                 NativeHarnessRelayReasonCode::PermissionMappedToApproval,
             ],
+            approval_projection: Some(permission_approval_projection(registration, request)),
             approval_authority_granted: false,
             direct_journal_authority_granted: false,
             tool_executor_authority_granted: false,
@@ -152,6 +263,7 @@ pub fn evaluate_native_harness_relay(
                     NativeHarnessRelayReasonCode::RelayAccepted,
                     NativeHarnessRelayReasonCode::FinalizeRevisionRequested,
                 ],
+                approval_projection: None,
                 approval_authority_granted: false,
                 direct_journal_authority_granted: false,
                 tool_executor_authority_granted: false,
@@ -166,6 +278,7 @@ pub fn evaluate_native_harness_relay(
                 event_kind: request.event_kind,
                 decision: NativeHarnessRelayDecisionKind::Forwarded,
                 reason_codes: vec![NativeHarnessRelayReasonCode::RelayAccepted],
+                approval_projection: None,
                 approval_authority_granted: false,
                 direct_journal_authority_granted: false,
                 tool_executor_authority_granted: false,
@@ -183,9 +296,27 @@ fn rejected(
         event_kind,
         decision: NativeHarnessRelayDecisionKind::Rejected,
         reason_codes: vec![reason],
+        approval_projection: None,
         approval_authority_granted: false,
         direct_journal_authority_granted: false,
         tool_executor_authority_granted: false,
+    }
+}
+
+fn permission_approval_projection(
+    registration: &NativeHarnessRelayRegistration,
+    request: &NativeHarnessRelayRequest,
+) -> NativeHarnessRelayApprovalProjection {
+    let subject = format!(
+        "{}:{}:{}:{}",
+        registration.run_id, registration.session_id, registration.harness_id, request.generation
+    );
+    NativeHarnessRelayApprovalProjection {
+        broker: "palyra_approval_broker".to_owned(),
+        subject_hash: format!("sha256:{}", crate::sha256_hex(subject.as_bytes())),
+        approval_reason_code: NativeHarnessRelayReasonCode::PermissionMappedToApproval
+            .as_str()
+            .to_owned(),
     }
 }
 
@@ -224,6 +355,20 @@ fn inspect_json_caps(
     }
 }
 
+fn post_tool_visibility_escalates(payload: &Value) -> bool {
+    payload.get("visibility_escalation").and_then(Value::as_bool).unwrap_or(false)
+        || payload
+            .get("requested_visibility")
+            .and_then(Value::as_str)
+            .map(|visibility| {
+                matches!(
+                    visibility.trim().to_ascii_lowercase().as_str(),
+                    "model_visible" | "public" | "canonical_evidence"
+                )
+            })
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,14 +398,20 @@ mod tests {
 
     #[test]
     fn native_harness_requests_permission_without_authority() {
-        let decision = evaluate_native_harness_relay(
+        let mut rate_limit = NativeHarnessRelayRateLimit::new(2);
+        let evaluation = evaluate_native_harness_relay_with_audit(
             &registration(),
             &request(NativeHarnessRelayEventKind::PermissionRequest),
+            Some(&mut rate_limit),
         );
+        let decision = evaluation.decision;
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::ApprovalRequired);
+        assert!(decision.approval_projection.is_some());
         assert!(!decision.approval_authority_granted);
         assert!(!decision.tool_executor_authority_granted);
+        assert_eq!(evaluation.audit.event_name, NATIVE_HARNESS_RELAY_AUDIT_EVENT);
+        assert_eq!(evaluation.audit.permission_requests_remaining, Some(1));
         assert!(decision
             .reason_codes
             .contains(&NativeHarnessRelayReasonCode::PermissionMappedToApproval));
@@ -305,5 +456,49 @@ mod tests {
 
         assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
         assert_eq!(decision.reason_codes, [NativeHarnessRelayReasonCode::PayloadStringTooLarge]);
+    }
+
+    #[test]
+    fn permission_rate_limit_fails_closed() {
+        let mut rate_limit = NativeHarnessRelayRateLimit::new(1);
+        let first = evaluate_native_harness_relay_with_audit(
+            &registration(),
+            &request(NativeHarnessRelayEventKind::PermissionRequest),
+            Some(&mut rate_limit),
+        );
+        let second = evaluate_native_harness_relay_with_audit(
+            &registration(),
+            &request(NativeHarnessRelayEventKind::PermissionRequest),
+            Some(&mut rate_limit),
+        );
+
+        assert_eq!(first.decision.decision, NativeHarnessRelayDecisionKind::ApprovalRequired);
+        assert_eq!(second.decision.decision, NativeHarnessRelayDecisionKind::Rejected);
+        assert_eq!(
+            second.decision.reason_codes,
+            [NativeHarnessRelayReasonCode::PermissionRateLimited]
+        );
+        assert!(second.audit.fail_closed);
+    }
+
+    #[test]
+    fn post_tool_relay_cannot_escalate_visibility() {
+        let decision = evaluate_native_harness_relay(
+            &registration(),
+            &NativeHarnessRelayRequest {
+                event_kind: NativeHarnessRelayEventKind::PostToolUse,
+                payload: json!({
+                    "requested_visibility": "model_visible",
+                    "summary": "safe metadata",
+                }),
+                ..request(NativeHarnessRelayEventKind::PostToolUse)
+            },
+        );
+
+        assert_eq!(decision.decision, NativeHarnessRelayDecisionKind::Rejected);
+        assert_eq!(
+            decision.reason_codes,
+            [NativeHarnessRelayReasonCode::PostToolVisibilityEscalation]
+        );
     }
 }

@@ -18,8 +18,9 @@ use std::{future::Future, sync::Arc, time::Duration};
 use palyra_common::{
     redaction::REDACTED,
     runtime_contracts::{
-        AgentHarnessAttemptClassification, AgentHarnessAttemptReplaySafety,
-        AgentHarnessAttemptTerminalStatus, AgentHarnessSelectionMode, QueuedInputState,
+        classify_agent_harness_terminal, AgentHarnessAttemptClassification,
+        AgentHarnessAttemptReplaySafety, AgentHarnessAttemptTerminalStatus,
+        AgentHarnessSelectionMode, QueuedInputState,
     },
     runtime_preview::RuntimePreviewMode,
 };
@@ -36,8 +37,8 @@ use crate::{
         AgentHarnessRegistry, AgentHarnessSelectionDiagnostics, AgentHarnessSupportRequest,
     },
     application::agent_harness_lifecycle::{
-        HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_COMPLETED_EVENT, HARNESS_RUN_FAILED_EVENT,
-        HARNESS_RUN_STARTED_EVENT,
+        HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_CLEANED_UP_EVENT, HARNESS_RUN_COMPLETED_EVENT,
+        HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     },
     application::learning::schedule_post_run_reflection,
     application::provider_events::{
@@ -1527,6 +1528,8 @@ async fn maybe_start_run_stream_harness_lifecycle(
         diagnostics: selected.diagnostics(),
         trace_context: palyra_common::redaction::redact_diagnostic_text(request.trace_context),
     };
+    let selected_harness_id = lifecycle_state.diagnostics.harness_id.clone();
+    let embedded_default = lifecycle_state.diagnostics.embedded_default;
 
     append_agent_loop_tape_event(
         runtime_state,
@@ -1545,6 +1548,11 @@ async fn maybe_start_run_stream_harness_lifecycle(
     )
     .await?;
     *lifecycle = Some(lifecycle_state);
+    if !embedded_default {
+        return Err(Status::failed_precondition(format!(
+            "agent harness '{selected_harness_id}' requires an external run-stream execution bridge"
+        )));
+    }
     Ok(())
 }
 
@@ -1565,6 +1573,14 @@ async fn finish_run_stream_harness_lifecycle(
         tape_seq,
         run_stream_harness_terminal_event(terminal.status),
         run_stream_harness_terminal_payload(&lifecycle_state, terminal),
+    )
+    .await?;
+    append_agent_loop_tape_event(
+        runtime_state,
+        run_id,
+        tape_seq,
+        HARNESS_RUN_CLEANED_UP_EVENT,
+        run_stream_harness_cleanup_payload(&lifecycle_state, terminal),
     )
     .await
 }
@@ -1660,9 +1676,35 @@ fn run_stream_harness_terminal_payload(
         "trace_context": lifecycle.trace_context,
         "terminal_status": terminal.status,
         "classification": terminal.classification,
+        "terminal_classification": classify_agent_harness_terminal(
+            terminal.status,
+            terminal.classification
+        ),
         "replay_safety": terminal.replay_safety,
         "fallback_used": diagnostics.fallback_used,
         "fallback_policy": diagnostics.fallback_policy,
+    })
+    .to_string()
+}
+
+fn run_stream_harness_cleanup_payload(
+    lifecycle: &RunStreamHarnessLifecycle,
+    terminal: RunStreamHarnessTerminal,
+) -> String {
+    let diagnostics = &lifecycle.diagnostics;
+    json!({
+        "schema_version": 1,
+        "event": HARNESS_RUN_CLEANED_UP_EVENT,
+        "harness_id": diagnostics.harness_id,
+        "descriptor_hash": diagnostics.descriptor_hash,
+        "selection_reason_code": diagnostics.reason_code,
+        "trace_context": lifecycle.trace_context,
+        "terminal_status": terminal.status,
+        "terminal_classification": classify_agent_harness_terminal(
+            terminal.status,
+            terminal.classification
+        ),
+        "cleanup_completed": true,
     })
     .to_string()
 }
@@ -1692,12 +1734,12 @@ fn run_stream_harness_terminal_from_state(
         },
         RunLifecycleState::Cancelled => RunStreamHarnessTerminal {
             status: AgentHarnessAttemptTerminalStatus::Cancelled,
-            classification: AgentHarnessAttemptClassification::NativeRuntimeError,
+            classification: AgentHarnessAttemptClassification::InternalError,
             replay_safety: AgentHarnessAttemptReplaySafety::NotReplaySafe,
         },
         RunLifecycleState::Failed => RunStreamHarnessTerminal {
             status: AgentHarnessAttemptTerminalStatus::Failed,
-            classification: AgentHarnessAttemptClassification::ProviderError,
+            classification: AgentHarnessAttemptClassification::InternalError,
             replay_safety: AgentHarnessAttemptReplaySafety::NotReplaySafe,
         },
         RunLifecycleState::Pending
@@ -1722,12 +1764,17 @@ fn run_stream_harness_terminal_from_outcome(
         },
         Err(error) if error.code() == Code::Cancelled => RunStreamHarnessTerminal {
             status: AgentHarnessAttemptTerminalStatus::Cancelled,
-            classification: AgentHarnessAttemptClassification::NativeRuntimeError,
+            classification: AgentHarnessAttemptClassification::InternalError,
             replay_safety: AgentHarnessAttemptReplaySafety::NotReplaySafe,
         },
         Err(error) if error.code() == Code::DeadlineExceeded => RunStreamHarnessTerminal {
             status: AgentHarnessAttemptTerminalStatus::TimedOut,
             classification: AgentHarnessAttemptClassification::ProviderError,
+            replay_safety: AgentHarnessAttemptReplaySafety::NotReplaySafe,
+        },
+        Err(error) if error.code() == Code::FailedPrecondition => RunStreamHarnessTerminal {
+            status: AgentHarnessAttemptTerminalStatus::Failed,
+            classification: AgentHarnessAttemptClassification::InternalError,
             replay_safety: AgentHarnessAttemptReplaySafety::NotReplaySafe,
         },
         Err(_) => RunStreamHarnessTerminal {
@@ -2096,6 +2143,7 @@ pub(crate) async fn process_run_stream_message(
             run_state.state(),
             tape_seq,
             &outcome,
+            Some("embedded_run_stream"),
         )
         .await;
         let run_id_for_summary = active_run_id.as_deref().unwrap_or("unaccepted_run");
@@ -2131,6 +2179,10 @@ pub(crate) async fn process_run_stream_message(
         message,
     )
     .await;
+    let attempt_owner = lifecycle
+        .as_ref()
+        .map(|state| state.diagnostics.harness_id.clone())
+        .unwrap_or_else(|| "harness_runtime_v1".to_owned());
     let terminal = run_stream_harness_terminal_from_state(run_state.state(), &outcome);
     let finish_result = finish_run_stream_harness_lifecycle(
         runtime_state,
@@ -2148,6 +2200,7 @@ pub(crate) async fn process_run_stream_message(
                 run_state.state(),
                 tape_seq,
                 &outcome,
+                Some(attempt_owner.as_str()),
             )
             .await;
             merge_run_stream_audit_result(
@@ -2169,6 +2222,7 @@ pub(crate) async fn process_run_stream_message(
                 run_state.state(),
                 tape_seq,
                 &outcome,
+                Some(attempt_owner.as_str()),
             )
             .await;
             merge_run_stream_audit_result(
@@ -2211,6 +2265,7 @@ async fn append_run_runtime_path_summary_tape_event_if_terminal(
     terminal_state: RunLifecycleState,
     tape_seq: &mut i64,
     outcome: &Result<RunStreamMessageProcessingOutcome, Status>,
+    attempt_owner: Option<&str>,
 ) -> Result<(), Status> {
     if !terminal_state.is_terminal() && outcome.is_ok() {
         return Ok(());
@@ -2227,6 +2282,7 @@ async fn append_run_runtime_path_summary_tape_event_if_terminal(
         &runtime_state.config.feature_rollouts,
         Some(terminal_state.as_str()),
         Some(terminal_reason.as_str()),
+        attempt_owner,
     );
     let payload_json = serde_json::to_string(&summary).map_err(|error| {
         Status::internal(format!("failed to serialize run runtime path summary: {error}"))
@@ -5479,16 +5535,17 @@ mod tests {
         repeated_tool_failure_signature, run_loop_phase_timeout_message,
         run_loop_phase_timeout_partial_summary, run_loop_phase_timeout_payload,
         run_loop_phase_waiting_status_message, run_progress_attempt_from_tool_result,
-        run_stream_agent_harness_selection_mode, run_stream_harness_selection_payload,
-        run_stream_harness_started_payload, run_stream_harness_terminal_event,
-        run_stream_harness_terminal_from_outcome, run_stream_harness_terminal_from_state,
-        run_stream_harness_terminal_payload, should_emit_budget_exhausted_partial_summary,
-        terminal_tool_authorization_failure, tool_calls_finish_without_tool_payload,
-        tool_catalog_snapshot_phase_timeout, tool_followup_timeout_partial_summary,
-        tool_result_to_provider_message, truncated_final_answer_without_tools,
-        ProviderRequestDeadlineOverride, ProviderRequestTimeoutReason, RepeatedToolFailureTracker,
-        RunLoopPhase, RunStreamHarnessLifecycle, RunStreamHarnessStartRequest,
-        RunStreamHarnessTerminal, RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
+        run_stream_agent_harness_selection_mode, run_stream_harness_cleanup_payload,
+        run_stream_harness_selection_payload, run_stream_harness_started_payload,
+        run_stream_harness_terminal_event, run_stream_harness_terminal_from_outcome,
+        run_stream_harness_terminal_from_state, run_stream_harness_terminal_payload,
+        should_emit_budget_exhausted_partial_summary, terminal_tool_authorization_failure,
+        tool_calls_finish_without_tool_payload, tool_catalog_snapshot_phase_timeout,
+        tool_followup_timeout_partial_summary, tool_result_to_provider_message,
+        truncated_final_answer_without_tools, ProviderRequestDeadlineOverride,
+        ProviderRequestTimeoutReason, RepeatedToolFailureTracker, RunLoopPhase,
+        RunStreamHarnessLifecycle, RunStreamHarnessStartRequest, RunStreamHarnessTerminal,
+        RunStreamMessageProcessingOutcome, RunStreamToolResultForModel,
         BROWSER_FOLLOWUP_PROVIDER_TIMEOUT_MS, HARNESS_SELECTION_EVENT,
         MAX_LENGTH_RECOVERY_ATTEMPTS, TOOL_CATALOG_SNAPSHOT_PHASE_TIMEOUT_MS,
         TOOL_FOLLOWUP_PROVIDER_TIMEOUT_MS,
@@ -5498,8 +5555,8 @@ mod tests {
         AgentHarnessSelectionDiagnostics, EMBEDDED_PALYRA_HARNESS_ID,
     };
     use crate::application::agent_harness_lifecycle::{
-        HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_COMPLETED_EVENT, HARNESS_RUN_FAILED_EVENT,
-        HARNESS_RUN_STARTED_EVENT,
+        HARNESS_RUN_CANCELLED_EVENT, HARNESS_RUN_CLEANED_UP_EVENT, HARNESS_RUN_COMPLETED_EVENT,
+        HARNESS_RUN_FAILED_EVENT, HARNESS_RUN_STARTED_EVENT,
     };
     use crate::application::provider_turn_recovery::ProviderTurnAnomaly;
     use crate::application::run_stream::tape::RUN_STREAM_RESPONSE_CHANNEL_CLOSED_MESSAGE;
@@ -5769,6 +5826,9 @@ mod tests {
         ));
         let timeout =
             run_stream_harness_terminal_from_outcome(&Err(Status::deadline_exceeded("slow")));
+        let bridge_failure = run_stream_harness_terminal_from_outcome(&Err(
+            Status::failed_precondition("external bridge unavailable"),
+        ));
         let cancelled = run_stream_harness_terminal_from_state(
             crate::orchestrator::RunLifecycleState::Cancelled,
             &Ok(RunStreamMessageProcessingOutcome::Terminate),
@@ -5781,11 +5841,17 @@ mod tests {
         let payload: Value =
             serde_json::from_str(run_stream_harness_terminal_payload(&lifecycle, failed).as_str())
                 .expect("terminal payload should be JSON");
+        let cleanup: Value = serde_json::from_str(
+            run_stream_harness_cleanup_payload(&lifecycle, cancelled).as_str(),
+        )
+        .expect("cleanup payload should be JSON");
 
         assert_eq!(completed.status, AgentHarnessAttemptTerminalStatus::Completed);
         assert_eq!(completed.classification, AgentHarnessAttemptClassification::Ok);
         assert_eq!(timeout.status, AgentHarnessAttemptTerminalStatus::TimedOut);
         assert_eq!(timeout.classification, AgentHarnessAttemptClassification::ProviderError);
+        assert_eq!(bridge_failure.status, AgentHarnessAttemptTerminalStatus::Failed);
+        assert_eq!(bridge_failure.classification, AgentHarnessAttemptClassification::InternalError);
         assert_eq!(cancelled.status, AgentHarnessAttemptTerminalStatus::Cancelled);
         assert_eq!(
             run_stream_harness_terminal_event(completed.status),
@@ -5798,7 +5864,12 @@ mod tests {
         );
         assert_eq!(payload["event"], HARNESS_RUN_FAILED_EVENT);
         assert_eq!(payload["terminal_status"], "failed");
+        assert_eq!(payload["terminal_classification"], "provider_error");
         assert_eq!(payload["replay_safety"], "not_replay_safe");
+        assert_eq!(cleanup["event"], HARNESS_RUN_CLEANED_UP_EVENT);
+        assert_eq!(cleanup["terminal_status"], "cancelled");
+        assert_eq!(cleanup["terminal_classification"], "cancelled");
+        assert_eq!(cleanup["cleanup_completed"], true);
     }
 
     #[test]

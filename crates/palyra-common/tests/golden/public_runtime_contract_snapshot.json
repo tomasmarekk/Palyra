@@ -462,7 +462,7 @@
     "attempt_classifications": {
       "changelog_note": "Harness attempt classifications avoid generic provider/runtime error strings in diagnostics and replay.",
       "name": "AgentHarnessAttemptClassification",
-      "snapshot_version": "runtime-contracts.agent_harness_attempt_classification.v1",
+      "snapshot_version": "runtime-contracts.agent_harness_attempt_classification.v2",
       "values": [
         {
           "canonical": "ok",
@@ -510,6 +510,18 @@
         },
         {
           "canonical": "native_runtime_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval_denied",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "internal_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "deterministic_failure",
           "deprecated_aliases": []
         }
       ]
@@ -683,7 +695,9 @@
       "values": [
         {
           "canonical": "embedded",
-          "deprecated_aliases": []
+          "deprecated_aliases": [
+            "embedded_only"
+          ]
         },
         {
           "canonical": "auto",
@@ -715,7 +729,7 @@
         }
       ]
     },
-    "snapshot_version": "runtime-contracts.agent_harness.v3",
+    "snapshot_version": "runtime-contracts.agent_harness.v4",
     "support_outcomes": {
       "changelog_note": "Harness support outcomes are audited before an attempt is routed.",
       "name": "AgentHarnessSupportOutcome",
@@ -731,6 +745,53 @@
         },
         {
           "canonical": "preferred",
+          "deprecated_aliases": []
+        }
+      ]
+    },
+    "terminal_classifications": {
+      "changelog_note": "Terminal classifications provide one shared wait, journal, and diagnostics vocabulary across harness owners.",
+      "name": "AgentHarnessTerminalClassification",
+      "snapshot_version": "runtime-contracts.agent_harness_terminal_classification.v1",
+      "values": [
+        {
+          "canonical": "ok",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "empty",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "cancelled",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "timeout",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "provider_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "tool_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "policy_blocked",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "approval_denied",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "internal_error",
+          "deprecated_aliases": []
+        },
+        {
+          "canonical": "deterministic_failure",
           "deprecated_aliases": []
         }
       ]

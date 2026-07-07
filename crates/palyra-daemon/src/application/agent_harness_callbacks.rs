@@ -41,6 +41,9 @@ pub enum HarnessCallbackRedactionPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessCallbackRequest {
+    pub run_id: String,
+    pub attempt_id: String,
+    pub sequence: u64,
     pub callback_kind: AgentHarnessCallbackKind,
     pub capability_scope: HarnessCallbackCapabilityScope,
     pub redaction_policy: HarnessCallbackRedactionPolicy,
@@ -52,6 +55,9 @@ pub struct HarnessCallbackRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessCallbackRecord {
+    pub run_id: String,
+    pub attempt_id: String,
+    pub sequence: u64,
     pub callback_kind: AgentHarnessCallbackKind,
     pub capability_scope: HarnessCallbackCapabilityScope,
     pub redaction_policy: HarnessCallbackRedactionPolicy,
@@ -63,6 +69,10 @@ pub struct HarnessCallbackRecord {
 /// Callback proxy failure with stable safe codes.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HarnessCallbackError {
+    #[error("callback run id must be non-empty")]
+    EmptyRunId,
+    #[error("callback attempt id must be non-empty")]
+    EmptyAttemptId,
     #[error("callback is not allowed for this attempt: {callback_kind}")]
     CallbackNotAllowed { callback_kind: String },
     #[error("callback idempotency key must be non-empty")]
@@ -122,6 +132,12 @@ impl HarnessCallbackProxy {
         &mut self,
         request: HarnessCallbackRequest,
     ) -> Result<HarnessCallbackRecord, HarnessCallbackError> {
+        if request.run_id.trim().is_empty() {
+            return Err(HarnessCallbackError::EmptyRunId);
+        }
+        if request.attempt_id.trim().is_empty() {
+            return Err(HarnessCallbackError::EmptyAttemptId);
+        }
         if !self.allowed_callbacks.contains(&request.callback_kind) {
             return Err(HarnessCallbackError::CallbackNotAllowed {
                 callback_kind: request.callback_kind.as_str().to_owned(),
@@ -133,6 +149,9 @@ impl HarnessCallbackProxy {
 
         let duplicate = !self.observed_idempotency_keys.insert(request.idempotency_key.clone());
         let record = HarnessCallbackRecord {
+            run_id: request.run_id,
+            attempt_id: request.attempt_id,
+            sequence: request.sequence,
             callback_kind: request.callback_kind,
             capability_scope: request.capability_scope,
             redaction_policy: request.redaction_policy,
@@ -208,6 +227,9 @@ mod tests {
 
     fn request(key: &str) -> HarnessCallbackRequest {
         HarnessCallbackRequest {
+            run_id: "run-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            sequence: 1,
             callback_kind: AgentHarnessCallbackKind::ToolEvent,
             capability_scope: HarnessCallbackCapabilityScope::ToolBridge,
             redaction_policy: HarnessCallbackRedactionPolicy::RedactedPayload,

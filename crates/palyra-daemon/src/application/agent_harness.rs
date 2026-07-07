@@ -26,6 +26,9 @@ use serde_json::Value;
 /// Stable id for the embedded Palyra harness.
 pub const EMBEDDED_PALYRA_HARNESS_ID: &str = "embedded_palyra";
 
+/// Compatibility name for the built-in Palyra harness implementation.
+pub type BuiltinPalyraHarness = EmbeddedPalyraHarness;
+
 /// Stable descriptor for a native agent harness implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentHarnessDescriptor {
@@ -346,20 +349,8 @@ impl AgentHarnessRunOutcome {
         replay_safe: bool,
         diagnostic_trace_id: impl Into<String>,
     ) -> AgentHarnessAttemptResult {
-        let terminal_status = AgentHarnessAttemptTerminalStatus::parse(self.status.as_str())
-            .unwrap_or(AgentHarnessAttemptTerminalStatus::Failed);
-        let classification = match terminal_status {
-            AgentHarnessAttemptTerminalStatus::Completed
-            | AgentHarnessAttemptTerminalStatus::Yielded => AgentHarnessAttemptClassification::Ok,
-            AgentHarnessAttemptTerminalStatus::Blocked => {
-                AgentHarnessAttemptClassification::PolicyBlocked
-            }
-            AgentHarnessAttemptTerminalStatus::Cancelled => AgentHarnessAttemptClassification::Ok,
-            AgentHarnessAttemptTerminalStatus::TimedOut
-            | AgentHarnessAttemptTerminalStatus::Failed => {
-                AgentHarnessAttemptClassification::NativeRuntimeError
-            }
-        };
+        let (terminal_status, classification) =
+            terminal_status_and_classification(self.status.as_str());
         let replay_safety = if replay_safe {
             AgentHarnessAttemptReplaySafety::ReplaySafe
         } else if terminal_status == AgentHarnessAttemptTerminalStatus::Completed {
@@ -378,6 +369,65 @@ impl AgentHarnessRunOutcome {
             finish_reason: Some(self.status.clone()),
         });
         result
+    }
+}
+
+fn terminal_status_and_classification(
+    status: &str,
+) -> (AgentHarnessAttemptTerminalStatus, AgentHarnessAttemptClassification) {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "empty" | "empty_response" => (
+            AgentHarnessAttemptTerminalStatus::Completed,
+            AgentHarnessAttemptClassification::EmptyResponse,
+        ),
+        "policy_blocked" => (
+            AgentHarnessAttemptTerminalStatus::Blocked,
+            AgentHarnessAttemptClassification::PolicyBlocked,
+        ),
+        "approval_denied" => (
+            AgentHarnessAttemptTerminalStatus::Blocked,
+            AgentHarnessAttemptClassification::ApprovalDenied,
+        ),
+        "provider_error" => (
+            AgentHarnessAttemptTerminalStatus::Failed,
+            AgentHarnessAttemptClassification::ProviderError,
+        ),
+        "tool_error" => (
+            AgentHarnessAttemptTerminalStatus::Failed,
+            AgentHarnessAttemptClassification::ToolError,
+        ),
+        "internal_error" => (
+            AgentHarnessAttemptTerminalStatus::Failed,
+            AgentHarnessAttemptClassification::InternalError,
+        ),
+        "deterministic_failure" => (
+            AgentHarnessAttemptTerminalStatus::Failed,
+            AgentHarnessAttemptClassification::DeterministicFailure,
+        ),
+        _ => {
+            let terminal_status = AgentHarnessAttemptTerminalStatus::parse(normalized.as_str())
+                .unwrap_or(AgentHarnessAttemptTerminalStatus::Failed);
+            let classification = match terminal_status {
+                AgentHarnessAttemptTerminalStatus::Completed
+                | AgentHarnessAttemptTerminalStatus::Yielded => {
+                    AgentHarnessAttemptClassification::Ok
+                }
+                AgentHarnessAttemptTerminalStatus::Blocked => {
+                    AgentHarnessAttemptClassification::PolicyBlocked
+                }
+                AgentHarnessAttemptTerminalStatus::Cancelled => {
+                    AgentHarnessAttemptClassification::NativeRuntimeError
+                }
+                AgentHarnessAttemptTerminalStatus::TimedOut => {
+                    AgentHarnessAttemptClassification::ProviderError
+                }
+                AgentHarnessAttemptTerminalStatus::Failed => {
+                    AgentHarnessAttemptClassification::InternalError
+                }
+            };
+            (terminal_status, classification)
+        }
     }
 }
 
