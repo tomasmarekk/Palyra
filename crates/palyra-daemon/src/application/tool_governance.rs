@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use palyra_common::runtime_contracts::ToolResultVisibility;
+use palyra_common::runtime_contracts::{
+    validate_tool_result_visibility_downgrade, ToolResultVisibility,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -313,6 +315,16 @@ pub(crate) enum ToolResultMiddlewareClass {
 }
 
 impl ToolResultMiddlewareClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Presentation => "presentation",
+            Self::Redaction => "redaction",
+            Self::MemoryIngest => "memory_ingest",
+            Self::ArtifactPolicy => "artifact_policy",
+            Self::NativeMirror => "native_mirror",
+        }
+    }
+
     pub(crate) const fn fail_closed(self) -> bool {
         matches!(self, Self::Redaction | Self::ArtifactPolicy)
     }
@@ -325,7 +337,10 @@ pub(crate) struct ToolResultMiddlewareStep {
     pub(crate) plugin_id: String,
     pub(crate) input_digest: String,
     pub(crate) output_digest: String,
+    pub(crate) visibility_before: ToolResultVisibility,
+    pub(crate) visibility_after: ToolResultVisibility,
     pub(crate) visibility: ToolResultVisibility,
+    pub(crate) failure_posture: String,
     pub(crate) reason_code: String,
 }
 
@@ -339,7 +354,7 @@ pub(crate) struct ToolResultMiddlewareReport {
     pub(crate) steps: Vec<ToolResultMiddlewareStep>,
 }
 
-/// Validates and records the host no-op middleware path.
+/// Validates and records the host-owned middleware chain.
 pub(crate) fn apply_host_tool_result_middleware(
     tool_name: &str,
     output_json: &[u8],
@@ -349,21 +364,38 @@ pub(crate) fn apply_host_tool_result_middleware(
         .map_err(|error| format!("tool result middleware input must be JSON safe: {error}"))?;
     validate_middleware_shape(&value, 0)?;
     let digest = stable_hash_bytes(canonical_json_bytes(&value).as_slice());
-    let middleware_class = ToolResultMiddlewareClass::Presentation;
-    let failure_posture = if middleware_class.fail_closed() { "fail_closed" } else { "fail_open" };
+    let mut current_visibility = visibility;
+    let mut steps = Vec::new();
+    for middleware_class in host_tool_result_middleware_chain() {
+        let visibility_before = current_visibility;
+        let requested_visibility = visibility_before;
+        let visibility_after =
+            validate_tool_result_visibility_downgrade(visibility_before, requested_visibility)
+                .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        current_visibility = visibility_after;
+        let failure_posture =
+            if middleware_class.fail_closed() { "fail_closed" } else { "fail_open" };
+        steps.push(ToolResultMiddlewareStep {
+            class: middleware_class,
+            plugin_id: format!("host.{}", middleware_class.as_str()),
+            input_digest: digest.clone(),
+            output_digest: digest.clone(),
+            visibility_before,
+            visibility_after,
+            visibility: visibility_after,
+            failure_posture: failure_posture.to_owned(),
+            reason_code: format!(
+                "tool_result_middleware.host_{}.{failure_posture}.{tool_name}",
+                middleware_class.as_str()
+            ),
+        });
+    }
     Ok(ToolResultMiddlewareReport {
         schema_version: TOOL_GOVERNANCE_SCHEMA_VERSION,
         canonical_output_digest: digest.clone(),
         model_visible_output_digest: digest.clone(),
-        visibility,
-        steps: vec![ToolResultMiddlewareStep {
-            class: middleware_class,
-            plugin_id: "host.noop".to_owned(),
-            input_digest: digest.clone(),
-            output_digest: digest,
-            visibility,
-            reason_code: format!("tool_result_middleware.host_noop.{failure_posture}.{tool_name}"),
-        }],
+        visibility: current_visibility,
+        steps,
     })
 }
 
@@ -572,6 +604,16 @@ fn network_targets(value: &Value) -> Vec<String> {
     targets
 }
 
+fn host_tool_result_middleware_chain() -> [ToolResultMiddlewareClass; 5] {
+    [
+        ToolResultMiddlewareClass::Redaction,
+        ToolResultMiddlewareClass::ArtifactPolicy,
+        ToolResultMiddlewareClass::Presentation,
+        ToolResultMiddlewareClass::MemoryIngest,
+        ToolResultMiddlewareClass::NativeMirror,
+    ]
+}
+
 fn collect_string_field(value: Option<&Value>, values: &mut Vec<String>) {
     match value {
         Some(Value::String(value)) if !value.trim().is_empty() => {
@@ -683,6 +725,26 @@ mod tests {
         .expect_err("oversized strings should fail middleware validation");
 
         assert!(error.contains("oversized text field"), "{error}");
+    }
+
+    #[test]
+    fn middleware_chain_records_visibility_downgrade_invariant() {
+        let report = apply_host_tool_result_middleware(
+            "palyra.fs.read_file",
+            br#"{"content":"bounded"}"#,
+            ToolResultVisibility::ModelSummary,
+        )
+        .expect("bounded result should pass middleware");
+
+        assert_eq!(report.steps.len(), 5);
+        assert_eq!(report.steps[0].class, ToolResultMiddlewareClass::Redaction);
+        assert_eq!(report.steps[1].class, ToolResultMiddlewareClass::ArtifactPolicy);
+        assert_eq!(report.steps[2].class, ToolResultMiddlewareClass::Presentation);
+        assert!(report.steps.iter().all(|step| {
+            step.visibility_after.model_visibility_rank()
+                <= step.visibility_before.model_visibility_rank()
+        }));
+        assert!(report.steps.iter().any(|step| step.failure_posture == "fail_closed"));
     }
 
     #[test]

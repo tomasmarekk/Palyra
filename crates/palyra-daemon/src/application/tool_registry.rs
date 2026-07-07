@@ -20,6 +20,8 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use catalog::build_model_visible_tool_catalog_snapshot_with_external_tools;
+#[cfg(test)]
+pub(crate) use catalog::effective_tool_surface_report;
 pub(crate) use catalog::{
     build_model_visible_tool_catalog_snapshot,
     build_model_visible_tool_catalog_snapshot_with_external_records, describe_catalog_tool,

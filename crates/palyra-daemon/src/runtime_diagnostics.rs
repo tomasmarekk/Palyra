@@ -22,7 +22,8 @@ use crate::{
     application::{
         channel_commands::ChannelCommandRegistry,
         tool_registry::{
-            build_model_visible_tool_catalog_snapshot, ToolCatalogBuildRequest, ToolExposureSurface,
+            build_model_visible_tool_catalog_snapshot, effective_tool_surface_report,
+            ToolCatalogBuildRequest, ToolExposureSurface,
         },
     },
     tool_protocol::ToolRequestContext,
@@ -1416,6 +1417,7 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
             "recent_journal_refs",
             "provider_trace_refs",
             "tool_job_states",
+            "effective_tool_surface_report",
             "redacted_logs"
         ],
         "redaction": {
@@ -1609,6 +1611,7 @@ pub(crate) fn build_contract_snapshot_suite() -> Value {
             "catalog_hash": tool_snapshot.catalog_hash,
             "tool_names": tool_snapshot.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
             "filtered_reason_codes": tool_snapshot.filtered_tools.iter().map(|tool| tool.reason_code.as_str()).collect::<Vec<_>>(),
+            "effective_surface": effective_tool_surface_report(&tool_snapshot),
         },
         "channel_command_abi": {
             "catalog_hash": channel_registry.catalog_hash(),

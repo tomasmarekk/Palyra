@@ -488,8 +488,119 @@ pub(crate) fn tool_catalog_tape_payload(snapshot: &ModelVisibleToolCatalogSnapsh
                 "repair_hint": tool.repair_hint,
             })
         }).collect::<Vec<_>>(),
+        "effective_tool_surface": effective_tool_surface_report(snapshot),
     });
     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned())
+}
+
+/// Redacted per-run explanation for the effective tool surface.
+///
+/// The report is intentionally hash-heavy: it explains why each tool is
+/// visible, compact-only, hidden, unavailable, or denied without copying
+/// provider schemas or sensitive runtime inputs into support payloads.
+pub(crate) fn effective_tool_surface_report(snapshot: &ModelVisibleToolCatalogSnapshot) -> Value {
+    let exposed_names =
+        snapshot.tools.iter().map(|tool| tool.name.as_str()).collect::<BTreeSet<_>>();
+    let filtered_by_name = snapshot
+        .filtered_tools
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool))
+        .collect::<BTreeMap<_, _>>();
+    let indexed_names =
+        snapshot.indexed_tools.iter().map(|tool| tool.name.as_str()).collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+
+    for tool in &snapshot.indexed_tools {
+        let filtered = filtered_by_name.get(tool.name.as_str()).copied();
+        let compact_only = !exposed_names.contains(tool.name.as_str())
+            && filtered.is_some_and(|entry| {
+                entry.reason_code == ToolCatalogFilterReasonCode::PolicyInvisible
+            });
+        let status = if exposed_names.contains(tool.name.as_str()) {
+            "visible"
+        } else if compact_only {
+            "compact_only"
+        } else {
+            "hidden"
+        };
+        entries.push(json!({
+            "name": tool.name.as_str(),
+            "status": status,
+            "reason_code": filtered
+                .map(|entry| entry.reason_code.as_str())
+                .unwrap_or("tool_surface.visible"),
+            "reason": filtered
+                .map(|entry| entry.repair_hint.as_str())
+                .unwrap_or(tool.exposure_reason.as_str()),
+            "policy_source": "tool_call.allowed_tools",
+            "runtime_status": "available",
+            "provider_dialect": snapshot.provider_dialect.as_str(),
+            "catalog_hash": snapshot.catalog_hash.as_str(),
+            "index_digest": snapshot.index.index_digest.as_str(),
+            "provider_schema_hash": tool.provider_schema_hash.as_str(),
+            "internal_schema_hash": tool.internal_schema_hash.as_str(),
+            "projection_policy": tool.projection_policy.as_str(),
+            "approval_posture": tool.approval_posture.as_str(),
+        }));
+    }
+
+    for filtered in &snapshot.filtered_tools {
+        if indexed_names.contains(filtered.name.as_str()) {
+            continue;
+        }
+        entries.push(json!({
+            "name": filtered.name.as_str(),
+            "status": surface_status_for_filter(filtered.reason_code),
+            "reason_code": filtered.reason_code.as_str(),
+            "reason": filtered.repair_hint.as_str(),
+            "policy_source": "tool_call.allowed_tools",
+            "runtime_status": runtime_status_for_filter(filtered.reason_code),
+            "provider_dialect": snapshot.provider_dialect.as_str(),
+            "catalog_hash": snapshot.catalog_hash.as_str(),
+            "index_digest": snapshot.index.index_digest.as_str(),
+            "provider_schema_hash": Value::Null,
+            "internal_schema_hash": Value::Null,
+        }));
+    }
+
+    entries.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("name").and_then(Value::as_str))
+            .then(
+                left.get("status")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("status").and_then(Value::as_str)),
+            )
+    });
+    json!({
+        "schema_version": 1,
+        "snapshot_id": snapshot.snapshot_id.as_str(),
+        "catalog_hash": snapshot.catalog_hash.as_str(),
+        "index_digest": snapshot.index.index_digest.as_str(),
+        "exposure_mode": snapshot.exposure_mode.as_str(),
+        "provider_dialect": snapshot.provider_dialect.as_str(),
+        "entries": entries,
+    })
+}
+
+fn surface_status_for_filter(reason_code: ToolCatalogFilterReasonCode) -> &'static str {
+    match reason_code {
+        ToolCatalogFilterReasonCode::RuntimeUnavailable
+        | ToolCatalogFilterReasonCode::ProviderSchemaIncompatible => "unavailable",
+        ToolCatalogFilterReasonCode::NotAllowlisted
+        | ToolCatalogFilterReasonCode::UnknownTool
+        | ToolCatalogFilterReasonCode::BudgetExhausted => "denied",
+        ToolCatalogFilterReasonCode::SurfaceUnsupported
+        | ToolCatalogFilterReasonCode::PolicyInvisible => "hidden",
+    }
+}
+
+fn runtime_status_for_filter(reason_code: ToolCatalogFilterReasonCode) -> &'static str {
+    match reason_code {
+        ToolCatalogFilterReasonCode::RuntimeUnavailable => "unavailable",
+        _ => "not_applicable",
+    }
 }
 
 /// Returns the registry projection policy for `tool_name`, defaulting unknown

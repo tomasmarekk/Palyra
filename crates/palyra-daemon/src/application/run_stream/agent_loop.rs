@@ -229,10 +229,22 @@ impl ToolLoopGuardrailState {
         if counter.attempts < self.guidance_threshold {
             return None;
         }
-        let block_run = counter.signature.last_result_class.is_denial();
+        let denial = counter.signature.last_result_class.is_denial();
+        let mutating_failure = !denial
+            && is_mutating_tool_for_loop_guardrail(counter.signature.tool_name.as_str())
+            && !matches!(
+                counter.signature.last_result_class,
+                ToolResultClass::Success | ToolResultClass::ReadNoProgress
+            );
+        let block_run = denial || mutating_failure || counter.attempts > self.guidance_threshold;
         let event_type = if block_run { TOOL_LOOP_BLOCKED_EVENT } else { TOOL_LOOP_WARNING_EVENT };
+        let reason_code = if mutating_failure && block_run {
+            format!("tool.loop.mutating_{}", counter.signature.last_result_class.as_str())
+        } else {
+            format!("tool.loop.{}", counter.signature.last_result_class.as_str())
+        };
         Some(ToolLoopGuardrailDecision {
-            reason_code: format!("tool.loop.{}", counter.signature.last_result_class.as_str()),
+            reason_code,
             signature: counter.signature.clone(),
             attempts: counter.attempts,
             event_type,
@@ -243,6 +255,18 @@ impl ToolLoopGuardrailState {
     fn clear(&mut self) {
         self.attempt_counts.clear();
     }
+}
+
+fn is_mutating_tool_for_loop_guardrail(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        WORKSPACE_PATCH_TOOL_NAME
+            | PROCESS_RUN_TOOL_NAME
+            | PROCESS_STOP_TOOL_NAME
+            | BROWSER_SESSION_CREATE_TOOL_NAME
+            | BROWSER_SESSION_CLOSE_TOOL_NAME
+            | ROUTINES_CONTROL_TOOL_NAME
+    )
 }
 
 impl RunProgressAttempt {
@@ -2612,18 +2636,39 @@ mod tests {
     #[test]
     fn run_progress_controller_intervenes_after_repeated_failure() {
         let mut controller = RunProgressController::new(3);
+        let attempt = failed_attempt("palyra.fs.read_file", br#"{"path":"missing"}"#);
+
+        assert!(controller.observe(attempt.clone()).is_none());
+        assert!(controller.observe(attempt.clone()).is_none());
+        let intervention =
+            controller.observe(attempt.clone()).expect("third identical failure intervenes");
+
+        assert_eq!(intervention.attempts, 3);
+        assert!(!intervention.terminate_run);
+        assert!(intervention.guidance.contains("palyra.fs.read_file"));
+        assert_eq!(intervention.fingerprint.input_hash.len(), 64);
+        assert_eq!(intervention.event_type, TOOL_LOOP_WARNING_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.failure");
+
+        let blocked = controller.observe(attempt).expect("fourth identical failure blocks");
+        assert!(blocked.terminate_run);
+        assert_eq!(blocked.event_type, TOOL_LOOP_BLOCKED_EVENT);
+        assert_eq!(blocked.reason_code, "tool.loop.failure");
+    }
+
+    #[test]
+    fn run_progress_controller_blocks_mutating_failure_at_threshold() {
+        let mut controller = RunProgressController::new(3);
         let attempt = failed_attempt("palyra.fs.apply_patch", br#"{"patch":"bad"}"#);
 
         assert!(controller.observe(attempt.clone()).is_none());
         assert!(controller.observe(attempt.clone()).is_none());
-        let intervention = controller.observe(attempt).expect("third identical failure intervenes");
+        let intervention =
+            controller.observe(attempt).expect("third identical mutating failure should block");
 
-        assert_eq!(intervention.attempts, 3);
-        assert!(!intervention.terminate_run);
-        assert!(intervention.guidance.contains("palyra.fs.apply_patch"));
-        assert_eq!(intervention.fingerprint.input_hash.len(), 64);
-        assert_eq!(intervention.event_type, TOOL_LOOP_WARNING_EVENT);
-        assert_eq!(intervention.reason_code, "tool.loop.failure");
+        assert!(intervention.terminate_run);
+        assert_eq!(intervention.event_type, TOOL_LOOP_BLOCKED_EVENT);
+        assert_eq!(intervention.reason_code, "tool.loop.mutating_failure");
     }
 
     #[test]

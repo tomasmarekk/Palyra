@@ -7,8 +7,8 @@
 //! for journal/support-bundle output. The pipeline is fail-closed: the first
 //! blocking gate preempts policy evaluation, later gates report as skipped,
 //! and legacy budget counters are carried through without acting as terminal
-//! step limits. It runs alongside the legacy decision path
-//! during the `execution_gate_pipeline_v2` rollout;
+//! step limits. Registered tool proposals use this as the authoritative
+//! mediation path while legacy decisions are still computed for audit parity;
 //! [`append_audit_finalization_step`] records whether both paths agreed so a
 //! mismatch can be triaged (and the rollout rolled back) from audit data.
 

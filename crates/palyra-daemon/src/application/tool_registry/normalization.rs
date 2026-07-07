@@ -20,6 +20,8 @@ use super::types::{
     ToolCallRejectionKind, ToolCatalogFilterReasonCode, TOOL_REJECTION_SCHEMA_VERSION,
 };
 
+const MAX_ARGUMENT_SYNTAX_REPAIR_STEPS: usize = 2;
+
 /// Validates one proposed tool call against the catalog snapshot the model
 /// saw, returning canonicalized arguments plus the normalization audit.
 ///
@@ -116,6 +118,7 @@ fn parse_visible_tool_arguments(
         Err(error) => {
             let input = std::str::from_utf8(input_json).unwrap_or_default();
             truncated_json_repair_argument_object(input)
+                .or_else(|| conservative_json_syntax_repair_argument_object(input))
                 .or_else(|| {
                     strict_preview_repair_argument_object(input)
                         .map(|value| (value, strict_preview_repair_steps()))
@@ -192,6 +195,33 @@ fn truncated_json_repair_argument_object(
     })
 }
 
+fn conservative_json_syntax_repair_argument_object(
+    input: &str,
+) -> Option<(Value, Vec<ToolArgumentNormalizationStep>)> {
+    let mut repaired = input.trim().to_owned();
+    let mut steps = Vec::new();
+    if let Some(value) = replace_json_smart_quotes(repaired.as_str()) {
+        repaired = value;
+        steps.push(root_repair_step(
+            "smart_quote_json",
+            "object",
+            "tool_call.arguments.smart_quote_repair",
+        ));
+    }
+    if let Some(value) = remove_trailing_json_commas(repaired.as_str()) {
+        repaired = value;
+        steps.push(root_repair_step(
+            "trailing_comma_json",
+            "object",
+            "tool_call.arguments.trailing_comma_repair",
+        ));
+    }
+    if steps.is_empty() || steps.len() > MAX_ARGUMENT_SYNTAX_REPAIR_STEPS {
+        return None;
+    }
+    parse_json_object(repaired.as_str()).map(|value| (value, steps))
+}
+
 fn strict_preview_repair_steps() -> Vec<ToolArgumentNormalizationStep> {
     root_repair_steps("string", "object", "tool_call.arguments.strict_preview_repair")
 }
@@ -205,12 +235,20 @@ fn root_repair_steps(
     to_type: &str,
     reason_code: &str,
 ) -> Vec<ToolArgumentNormalizationStep> {
-    vec![ToolArgumentNormalizationStep {
+    vec![root_repair_step(from_type, to_type, reason_code)]
+}
+
+fn root_repair_step(
+    from_type: &str,
+    to_type: &str,
+    reason_code: &str,
+) -> ToolArgumentNormalizationStep {
+    ToolArgumentNormalizationStep {
         json_pointer: "/".to_owned(),
         from_type: from_type.to_owned(),
         to_type: to_type.to_owned(),
         reason_code: reason_code.to_owned(),
-    }]
+    }
 }
 
 fn missing_json_container_suffix(input: &str) -> Option<String> {
@@ -264,6 +302,58 @@ fn parse_wrapped_json_object(input: &str, tag: &str) -> Option<Value> {
 fn parse_json_object(input: &str) -> Option<Value> {
     let value = serde_json::from_str::<Value>(input).ok()?;
     value.is_object().then_some(value)
+}
+
+fn replace_json_smart_quotes(input: &str) -> Option<String> {
+    let mut changed = false;
+    let repaired = input
+        .chars()
+        .map(|ch| match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201c}' | '\u{201d}' => {
+                changed = true;
+                '"'
+            }
+            _ => ch,
+        })
+        .collect::<String>();
+    changed.then_some(repaired)
+}
+
+fn remove_trailing_json_commas(input: &str) -> Option<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+    let mut changed = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some((_, ch)) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            continue;
+        }
+        if ch == ',' {
+            let mut lookahead = chars.clone();
+            let next_non_ws = lookahead
+                .find_map(|(_, candidate)| (!candidate.is_whitespace()).then_some(candidate));
+            if matches!(next_non_ws, Some('}' | ']')) {
+                changed = true;
+                continue;
+            }
+        }
+        output.push(ch);
+    }
+    changed.then_some(output)
 }
 
 /// Canonicalizes arguments for a tool the catalog did not expose without

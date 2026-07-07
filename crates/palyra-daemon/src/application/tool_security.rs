@@ -331,16 +331,7 @@ fn backend_capability_label(capability: ToolCapability) -> &'static str {
 }
 
 fn execution_gate_pipeline_enabled_for_tool(tool_name: &str, rollout_enabled: bool) -> bool {
-    rollout_enabled
-        || tool_metadata(tool_name).is_some_and(|metadata| {
-            !metadata.capabilities.is_empty()
-                && metadata.capabilities.iter().all(|capability| {
-                    matches!(
-                        capability,
-                        ToolCapability::FilesystemRead | ToolCapability::ArtifactsRead
-                    )
-                })
-        })
+    rollout_enabled || tool_metadata(tool_name).is_some()
 }
 
 /// Denies tools that must not run on a networked worker.
@@ -719,8 +710,10 @@ fn resolve_tool_proposal_decision(
 /// The legacy decision is always computed (on a scratch copy of the budget)
 /// even when the v2 execution-gate pipeline is rolled out: the pipeline
 /// report records the legacy outcome via `append_audit_finalization_step` so
-/// divergence between the two paths is auditable. The rollout flag picks
-/// which decision and legacy counter become authoritative.
+/// divergence between the two paths is auditable. The v2 pipeline is the
+/// authoritative mediation path for registered tools; unregistered tools stay
+/// on the legacy fail-closed policy path so unknown names do not gain a new
+/// execution surface.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_tool_proposal_decision_for_context(
     runtime_state: &Arc<GatewayRuntimeState>,
@@ -1089,9 +1082,9 @@ mod tests {
     }
 
     #[test]
-    fn execution_gate_default_keeps_sensitive_tools_on_legacy_path() {
-        assert!(!execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", false));
-        assert!(!execution_gate_pipeline_enabled_for_tool("palyra.process.run", false));
+    fn execution_gate_default_covers_sensitive_tools() {
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", false));
+        assert!(execution_gate_pipeline_enabled_for_tool("palyra.process.run", false));
         assert!(execution_gate_pipeline_enabled_for_tool("palyra.fs.apply_patch", true));
     }
 

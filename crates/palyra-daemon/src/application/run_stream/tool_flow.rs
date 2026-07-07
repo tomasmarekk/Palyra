@@ -102,6 +102,9 @@ const TOOL_PARALLELISM_ENABLED_ENV: &str = "PALYRA_TOOL_PARALLELISM_ENABLED";
 const TOOL_RESULT_PROJECTION_POLICY_EVENT: &str = "tool.result.projection_policy";
 const TOOL_BEFORE_DECISION_EVENT: &str = "tool.before_decision";
 const TOOL_RESULT_MIDDLEWARE_EVENT: &str = "tool.result.middleware";
+const TOOL_REPAIR_CANDIDATE_DETECTED_EVENT: &str = "tool.repair.candidate_detected";
+const TOOL_REPAIR_ACCEPTED_EVENT: &str = "tool.repair.accepted";
+const TOOL_REPAIR_REJECTED_EVENT: &str = "tool.repair.rejected";
 
 /// Decision context produced by the proposal preparation pipeline.
 #[derive(Debug, Clone)]
@@ -514,7 +517,68 @@ async fn append_tool_argument_normalization_tape_event(
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
+    if audit_has_repair_steps(audit) {
+        append_tool_repair_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            TOOL_REPAIR_CANDIDATE_DETECTED_EVENT,
+            json!({
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "raw_json_hash": audit.raw_json_hash.as_str(),
+                "repair_step_count": audit.steps.len(),
+                "repair_reason_codes": repair_reason_codes(audit),
+            }),
+        )
+        .await?;
+        append_tool_repair_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            TOOL_REPAIR_ACCEPTED_EVENT,
+            json!({
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "tool_name": tool_name,
+                "raw_json_hash": audit.raw_json_hash.as_str(),
+                "normalized_json_hash": audit.normalized_json_hash.as_str(),
+                "repair_step_count": audit.steps.len(),
+                "repair_reason_codes": repair_reason_codes(audit),
+            }),
+        )
+        .await?;
+    }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_tool_repair_tape_event(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    run_id: &str,
+    tape_seq: &mut i64,
+    event_type: &str,
+    payload: Value,
+) -> Result<(), Status> {
+    runtime_state
+        .append_orchestrator_tape_event(OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: event_type.to_owned(),
+            payload_json: payload.to_string(),
+        })
+        .await?;
+    *tape_seq = (*tape_seq).saturating_add(1);
+    Ok(())
+}
+
+fn audit_has_repair_steps(audit: &ToolArgumentNormalizationAudit) -> bool {
+    audit.steps.iter().any(|step| step.reason_code.contains("_repair"))
+}
+
+fn repair_reason_codes(audit: &ToolArgumentNormalizationAudit) -> Vec<&str> {
+    audit.steps.iter().map(|step| step.reason_code.as_str()).collect()
 }
 
 #[allow(clippy::result_large_err)]
@@ -767,6 +831,25 @@ async fn reject_run_stream_tool_call(
         })
         .await?;
     *tape_seq = (*tape_seq).saturating_add(1);
+    if rejection.kind.as_str() == "malformed_arguments" {
+        append_tool_repair_tape_event(
+            runtime_state,
+            run_id,
+            tape_seq,
+            TOOL_REPAIR_REJECTED_EVENT,
+            json!({
+                "schema_version": 1,
+                "proposal_id": proposal_id,
+                "tool_name": rejection.tool_name.as_str(),
+                "raw_json_hash": rejection.raw_json_hash.as_str(),
+                "reason_code": rejection.reason_code.as_str(),
+                "kind": rejection.kind.as_str(),
+                "snapshot_id": rejection.snapshot_id.as_deref(),
+                "catalog_hash": rejection.catalog_hash.as_deref(),
+            }),
+        )
+        .await?;
+    }
 
     let execution_outcome = tool_call_rejection_outcome(proposal_id, input_json, &rejection);
     send_tool_result_with_tape(

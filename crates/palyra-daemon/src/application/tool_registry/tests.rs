@@ -9,7 +9,8 @@ use super::types::{
     ToolCatalogFilterReasonCode, ToolParallelismPolicy, ToolRegistryEntry, ToolReplaySafetyClass,
 };
 use super::{
-    build_model_visible_tool_catalog_snapshot, describe_catalog_tool, projection_policy_for_tool,
+    build_model_visible_tool_catalog_snapshot, describe_catalog_tool,
+    effective_tool_surface_report, projection_policy_for_tool,
     provider_tools_from_catalog_snapshot, resolve_catalog_invoke_target, search_tool_catalog_index,
     snapshot_to_provider_request_value, stable_hash_value,
     validate_tool_call_against_catalog_snapshot, ToolCatalogBuildRequest,
@@ -402,6 +403,44 @@ fn catalog_bridge_search_describe_and_invoke_use_current_index_digest() {
 }
 
 #[test]
+fn effective_tool_surface_report_explains_visible_compact_and_denied_tools() {
+    let config = config(&["palyra.echo", "palyra.unknown"]);
+    let mut policy = catalog_policy(&config);
+    policy.exposure_mode = ToolCatalogExposureMode::Compact;
+    let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
+        config: &config,
+        catalog_policy: &policy,
+        browser_service_enabled: false,
+        browser_service_configured: false,
+        request_context: &request_context(),
+        provider_kind: "openai_compatible",
+        provider_model_id: None,
+        surface: ToolExposureSurface::RunStream,
+        remaining_tool_budget: None,
+        created_at_unix_ms: 42,
+    });
+
+    let report = effective_tool_surface_report(&snapshot);
+    assert_eq!(report["catalog_hash"].as_str(), Some(snapshot.catalog_hash.as_str()));
+    let entries = report["entries"].as_array().expect("entries should be present");
+    let echo = entries
+        .iter()
+        .find(|entry| entry["name"] == "palyra.echo")
+        .expect("echo surface entry should exist");
+    assert_eq!(echo["status"], "compact_only");
+    assert_eq!(echo["reason_code"], "policy_invisible");
+    assert!(echo["provider_schema_hash"].as_str().is_some_and(|hash| hash.len() == 64));
+
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["name"] == "palyra.unknown")
+        .expect("unknown allowlist typo should be diagnosed");
+    assert_eq!(unknown["status"], "denied");
+    assert_eq!(unknown["reason_code"], "unknown_tool");
+    assert!(unknown["provider_schema_hash"].is_null());
+}
+
+#[test]
 fn intake_strict_preview_repairs_standalone_json_object_wrapper() {
     let config = config(&["palyra.echo"]);
     let snapshot = build_model_visible_tool_catalog_snapshot(ToolCatalogBuildRequest {
@@ -493,6 +532,65 @@ fn intake_repairs_unambiguous_truncated_json_arguments() {
 
     assert_eq!(normalized.audit.steps[0].reason_code, "tool_call.arguments.truncated_json_repair");
     assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
+fn intake_repairs_trailing_comma_and_smart_quote_json() {
+    let snapshot = echo_snapshot();
+
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        "{\"text\":\"hello\",}".as_bytes(),
+    )
+    .expect("trailing comma should repair after schema validation");
+    assert_eq!(normalized.audit.steps[0].reason_code, "tool_call.arguments.trailing_comma_repair");
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+
+    let smart_quote_input = "\u{201c}text\u{201d}:\u{201c}hello\u{201d}";
+    let normalized = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        format!("{{{smart_quote_input},}}").as_bytes(),
+    )
+    .expect("smart quotes plus trailing comma should stay within repair budget");
+    let reason_codes =
+        normalized.audit.steps.iter().map(|step| step.reason_code.as_str()).collect::<Vec<_>>();
+    assert_eq!(
+        reason_codes,
+        vec!["tool_call.arguments.smart_quote_repair", "tool_call.arguments.trailing_comma_repair"]
+    );
+    assert_eq!(normalized.input_json, br#"{"text":"hello"}"#);
+}
+
+#[test]
+fn intake_repair_still_requires_schema_validation() {
+    let snapshot = echo_snapshot();
+
+    let rejection = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.echo",
+        "{\"unknown\":\"hello\",}".as_bytes(),
+    )
+    .expect_err("repaired JSON must still match the visible tool schema");
+
+    assert_eq!(rejection.kind, ToolCallRejectionKind::MalformedArguments);
+    assert_eq!(rejection.reason_code, "tool_call.arguments.schema_mismatch");
+}
+
+#[test]
+fn unknown_tool_arguments_are_not_syntax_repaired() {
+    let snapshot = echo_snapshot();
+
+    let rejection = validate_tool_call_against_catalog_snapshot(
+        &snapshot,
+        "palyra.unknown",
+        "{\"text\":\"hello\",}".as_bytes(),
+    )
+    .expect_err("unknown tool passthrough must not repair malformed JSON");
+
+    assert_eq!(rejection.kind, ToolCallRejectionKind::MalformedArguments);
+    assert_eq!(rejection.reason_code, "tool_call.arguments.invalid_json");
 }
 
 #[test]
