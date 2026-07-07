@@ -112,11 +112,40 @@ pub(crate) struct PreparedModelProviderInput {
     pub(crate) prompt_cache_report: Option<PromptCacheReport>,
 }
 
+/// Hash-only cache identity derived by the context engine for one session turn.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromptCacheSessionMetadata {
+    pub(crate) stable_prefix_hash: Option<String>,
+    pub(crate) cache_scope_hash: Option<String>,
+    pub(crate) tool_catalog_hash: Option<String>,
+    pub(crate) memory_snapshot_hash: Option<String>,
+    pub(crate) provider_cache_strategy: String,
+}
+
+impl PromptCacheSessionMetadata {
+    pub(crate) fn prompt_cache_epoch(&self) -> u64 {
+        let digest = crate::sha256_hex(
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "stable_prefix_hash": self.stable_prefix_hash.as_deref(),
+                "cache_scope_hash": self.cache_scope_hash.as_deref(),
+                "tool_catalog_hash": self.tool_catalog_hash.as_deref(),
+                "memory_snapshot_hash": self.memory_snapshot_hash.as_deref(),
+                "provider_cache_strategy": self.provider_cache_strategy.as_str(),
+            }))
+            .unwrap_or_else(|_| b"null".to_vec())
+            .as_slice(),
+        );
+        u64::from_str_radix(&digest[..16], 16).unwrap_or(0)
+    }
+}
+
 pub(crate) fn build_prompt_cache_metadata(
     provider_input_text: &str,
     provider_messages: &[ProviderMessage],
     user_visible_input_text: Option<&str>,
     tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+    session_metadata: Option<&PromptCacheSessionMetadata>,
 ) -> (Vec<ProviderPromptSegment>, PromptCachePolicy, Option<PromptCacheReport>) {
     let mut segments = Vec::new();
     segments.push(prompt_segment(
@@ -173,9 +202,13 @@ pub(crate) fn build_prompt_cache_metadata(
             PromptCacheStrategy::StablePrefix
         },
         max_breakpoints: 4,
-        provider_compatibility: "metadata_only".to_owned(),
+        provider_compatibility: session_metadata
+            .map(|metadata| metadata.provider_cache_strategy.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "metadata_only".to_owned()),
     };
-    let report = prompt_cache_report(provider_input_text, segments.as_slice(), &policy);
+    let report =
+        prompt_cache_report(provider_input_text, segments.as_slice(), &policy, session_metadata);
     (segments, policy, Some(report))
 }
 
@@ -200,6 +233,7 @@ fn prompt_cache_report(
     provider_input_text: &str,
     segments: &[ProviderPromptSegment],
     policy: &PromptCachePolicy,
+    session_metadata: Option<&PromptCacheSessionMetadata>,
 ) -> PromptCacheReport {
     let mut eligible_bytes = 0usize;
     let mut invalidated_bytes = 0usize;
@@ -241,7 +275,22 @@ fn prompt_cache_report(
         breakpoint_count,
         cacheable_tokens: u64::try_from(eligible_bytes / 4).unwrap_or(u64::MAX),
         actual_cached_tokens: None,
+        prompt_cache_epoch: prompt_cache_epoch(session_metadata),
+        stable_prefix_hash: session_metadata
+            .and_then(|metadata| metadata.stable_prefix_hash.clone()),
+        cache_scope_hash: session_metadata.and_then(|metadata| metadata.cache_scope_hash.clone()),
+        tool_catalog_hash: session_metadata.and_then(|metadata| metadata.tool_catalog_hash.clone()),
+        memory_snapshot_hash: session_metadata
+            .and_then(|metadata| metadata.memory_snapshot_hash.clone()),
+        provider_cache_strategy: session_metadata
+            .map(|metadata| metadata.provider_cache_strategy.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| policy.provider_compatibility.clone()),
     }
+}
+
+fn prompt_cache_epoch(session_metadata: Option<&PromptCacheSessionMetadata>) -> u64 {
+    session_metadata.map_or(0, PromptCacheSessionMetadata::prompt_cache_epoch)
 }
 
 /// How memory-augmentation failures affect the overall input preparation.
@@ -1745,6 +1794,7 @@ async fn prepare_model_provider_input_legacy(
                 &[],
                 Some(input_text),
                 tool_catalog_snapshot,
+                None,
             );
         return Ok(PreparedModelProviderInput {
             provider_input_text,
@@ -1835,6 +1885,7 @@ async fn prepare_model_provider_input_legacy(
         previous_provider_messages.as_slice(),
         Some(input_text),
         tool_catalog_snapshot,
+        None,
     );
     Ok(PreparedModelProviderInput {
         provider_input_text,
@@ -2158,6 +2209,7 @@ mod tests {
         build_prompt_cache_metadata, curated_memory_sources_for_prompt_context,
         parse_provider_reasoning_effort_override, parse_provider_service_tier_override,
         render_legacy_runtime_context_prompt, sanitize_prompt_inline_value,
+        PromptCacheSessionMetadata,
     };
     use crate::journal::MemorySource;
     use crate::model_provider::{
@@ -2205,6 +2257,7 @@ mod tests {
             &[ProviderMessage::user_text("prior context")],
             Some("user asks current question"),
             None,
+            None,
         );
         let report = report.expect("cache report should be present");
 
@@ -2220,6 +2273,33 @@ mod tests {
             segments.iter().all(|segment| !segment.content_hash.contains("current question")),
             "segment metadata must stay hash-only"
         );
+    }
+
+    #[test]
+    fn prompt_cache_report_carries_session_cache_contract() {
+        let metadata = PromptCacheSessionMetadata {
+            stable_prefix_hash: Some("stable-prefix-hash".to_owned()),
+            cache_scope_hash: Some("cache-scope-hash".to_owned()),
+            tool_catalog_hash: Some("tool-catalog-hash".to_owned()),
+            memory_snapshot_hash: Some("memory-snapshot-hash".to_owned()),
+            provider_cache_strategy: "openai_prompt_cache_key".to_owned(),
+        };
+        let (_, policy, report) = build_prompt_cache_metadata(
+            "system prefix\n\nuser asks current question",
+            &[ProviderMessage::user_text("prior context")],
+            Some("user asks current question"),
+            None,
+            Some(&metadata),
+        );
+        let report = report.expect("cache report should be present");
+
+        assert_eq!(policy.provider_compatibility, "openai_prompt_cache_key");
+        assert_eq!(report.prompt_cache_epoch, metadata.prompt_cache_epoch());
+        assert_eq!(report.stable_prefix_hash.as_deref(), Some("stable-prefix-hash"));
+        assert_eq!(report.cache_scope_hash.as_deref(), Some("cache-scope-hash"));
+        assert_eq!(report.tool_catalog_hash.as_deref(), Some("tool-catalog-hash"));
+        assert_eq!(report.memory_snapshot_hash.as_deref(), Some("memory-snapshot-hash"));
+        assert_eq!(report.provider_cache_strategy, "openai_prompt_cache_key");
     }
 
     #[test]

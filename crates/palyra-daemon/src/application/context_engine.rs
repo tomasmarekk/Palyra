@@ -50,6 +50,7 @@ use crate::{
             parse_provider_service_tier_override, record_provider_pruning_decision,
             resolve_latest_session_compaction_artifact, MemoryPromptFailureMode,
             PrepareModelProviderInputRequest, PreparedModelProviderInput,
+            PromptCacheSessionMetadata,
         },
         session_pruning::{
             classify_pruning_task, context_engine_pruning_outcome, detect_pruning_risk,
@@ -288,11 +289,20 @@ pub(crate) struct ContextEngineBudgetExplain {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextEngineCacheExplain {
     pub(crate) provider_cache_supported: bool,
+    pub(crate) prompt_cache_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stable_prefix_hash: Option<String>,
     pub(crate) stable_prefix_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_scope_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_catalog_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_snapshot_hash: Option<String>,
+    pub(crate) provider_cache_strategy: String,
+    pub(crate) cache_hit_eligible: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) invalidation_reasons: Vec<String>,
     pub(crate) trust_scope: String,
 }
 
@@ -396,12 +406,20 @@ pub(crate) struct ContextInspectorWindow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ContextInspectorPromptCache {
     pub(crate) provider_cache_supported: bool,
+    pub(crate) prompt_cache_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stable_prefix_hash: Option<String>,
     pub(crate) stable_prefix_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_scope_hash: Option<String>,
     pub(crate) cache_scope_key_redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_catalog_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_snapshot_hash: Option<String>,
+    pub(crate) provider_cache_strategy: String,
+    pub(crate) cache_hit_eligible: bool,
+    pub(crate) invalidation_reasons: Vec<String>,
     pub(crate) trust_scope: String,
 }
 
@@ -776,7 +794,7 @@ impl ContextSegment {
             // input (priority 100) and can never be evicted; the shared group
             // id keeps system/developer segments traceable as one unit.
             priority: 99,
-            stable: true,
+            stable: matches!(kind, ContextSegmentKind::SystemInstructions),
             protected: true,
             group_id: Some("instruction_compiler:v1".to_owned()),
             trust_label: TrustLabel::TrustedLocal,
@@ -932,7 +950,7 @@ async fn prepare_model_provider_input_with_default_context_engine(
                 "preference_context",
                 preference_context,
                 92,
-                true,
+                false,
                 true,
                 None,
             ),
@@ -1177,6 +1195,9 @@ async fn prepare_model_provider_input_with_default_context_engine(
         Some(ContextEngineRegistry::production_default().snapshot());
     assembled.explain.provider_input_snapshot_hash =
         Some(context_inspector_provider_input_hash(&assembled.explain));
+    let prompt_cache_session_metadata =
+        context_prompt_cache_session_metadata(&assembled.explain, tool_catalog_snapshot);
+    apply_prompt_cache_session_metadata(&mut assembled.explain, &prompt_cache_session_metadata);
 
     record_context_engine_plan(runtime_state, run_id, tape_seq, assembled.explain.clone()).await?;
     if assembled.explain.budget.overflow_tokens > 0 {
@@ -1215,6 +1236,7 @@ async fn prepare_model_provider_input_with_default_context_engine(
             provider_messages.as_slice(),
             Some(input_text),
             tool_catalog_snapshot,
+            Some(&prompt_cache_session_metadata),
         );
 
     Ok(PreparedModelProviderInput {
@@ -1482,9 +1504,15 @@ fn assemble_segments(
             },
             cache: ContextEngineCacheExplain {
                 provider_cache_supported: budget.provider_cache_supported,
+                prompt_cache_epoch: 0,
                 stable_prefix_hash,
                 stable_prefix_tokens,
                 cache_scope_key,
+                tool_catalog_hash: None,
+                memory_snapshot_hash: None,
+                provider_cache_strategy: "metadata_only".to_owned(),
+                cache_hit_eligible: false,
+                invalidation_reasons: Vec::new(),
                 trust_scope,
             },
             summary_quality,
@@ -1712,6 +1740,104 @@ fn cache_scope_hash(value: &str) -> String {
     crate::sha256_hex(value.as_bytes())
 }
 
+fn context_prompt_cache_session_metadata(
+    explain: &ContextAssemblyTrace,
+    tool_catalog_snapshot: Option<&ModelVisibleToolCatalogSnapshot>,
+) -> PromptCacheSessionMetadata {
+    PromptCacheSessionMetadata {
+        stable_prefix_hash: explain.cache.stable_prefix_hash.clone(),
+        cache_scope_hash: explain.cache.cache_scope_key.as_deref().map(cache_scope_hash),
+        tool_catalog_hash: tool_catalog_snapshot.map(|snapshot| snapshot.catalog_hash.clone()),
+        memory_snapshot_hash: context_memory_snapshot_hash(explain),
+        provider_cache_strategy: provider_cache_strategy_for(explain),
+    }
+}
+
+fn apply_prompt_cache_session_metadata(
+    explain: &mut ContextAssemblyTrace,
+    metadata: &PromptCacheSessionMetadata,
+) {
+    explain.cache.prompt_cache_epoch = metadata.prompt_cache_epoch();
+    explain.cache.tool_catalog_hash = metadata.tool_catalog_hash.clone();
+    explain.cache.memory_snapshot_hash = metadata.memory_snapshot_hash.clone();
+    explain.cache.provider_cache_strategy = metadata.provider_cache_strategy.clone();
+    explain.cache.cache_hit_eligible = metadata.stable_prefix_hash.is_some()
+        && metadata.cache_scope_hash.is_some()
+        && explain.cache.stable_prefix_tokens > 0
+        && metadata.provider_cache_strategy != "metadata_only";
+    explain.cache.invalidation_reasons =
+        context_cache_invalidation_reasons(explain, metadata).into_iter().collect();
+}
+
+fn provider_cache_strategy_for(explain: &ContextAssemblyTrace) -> String {
+    if !explain.cache.provider_cache_supported {
+        return "metadata_only".to_owned();
+    }
+    let provider_kind = explain.budget.provider_kind.trim().to_ascii_lowercase();
+    if provider_kind.contains("anthropic") || provider_kind.contains("minimax") {
+        "anthropic_cache_control".to_owned()
+    } else if provider_kind.contains("openai") || provider_kind.contains("chatgpt") {
+        "openai_prompt_cache_key".to_owned()
+    } else {
+        "metadata_only".to_owned()
+    }
+}
+
+fn context_memory_snapshot_hash(explain: &ContextAssemblyTrace) -> Option<String> {
+    let memory_segments = explain
+        .selected_segments
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment.kind,
+                ContextSegmentKind::MemoryRecall | ContextSegmentKind::PreferenceContext
+            )
+        })
+        .map(|segment| {
+            json!({
+                "kind": segment.kind.as_str(),
+                "label": segment.label.as_str(),
+                "estimated_tokens": segment.estimated_tokens,
+                "trust_label": segment.trust_label.as_str(),
+                "redaction_status": segment.redaction_status.as_str(),
+                "source_ref_hashes": segment.source_refs.iter().map(|value| {
+                    let hash = cache_scope_hash(value);
+                    format!("ref_{}", &hash[..16])
+                }).collect::<Vec<_>>(),
+                "preview_hash": cache_scope_hash(segment.preview.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!memory_segments.is_empty()).then(|| {
+        stable_sha256_json(&json!({
+            "schema_version": 1,
+            "segments": memory_segments,
+        }))
+    })
+}
+
+fn context_cache_invalidation_reasons(
+    explain: &ContextAssemblyTrace,
+    metadata: &PromptCacheSessionMetadata,
+) -> BTreeSet<String> {
+    let mut reasons = BTreeSet::new();
+    if metadata.stable_prefix_hash.is_none() {
+        reasons.insert("stable_prefix_absent".to_owned());
+    }
+    if metadata.cache_scope_hash.is_none() {
+        reasons.insert("cache_scope_absent".to_owned());
+    }
+    if metadata.provider_cache_strategy == "metadata_only" {
+        reasons.insert("provider_cache_metadata_only".to_owned());
+    }
+    for segment in &explain.selected_segments {
+        if !segment.stable {
+            reasons.insert(format!("{}_volatile", segment.kind.as_str()));
+        }
+    }
+    reasons
+}
+
 #[derive(Default)]
 struct ContextInspectorBreakdownAccumulator {
     selected_segments: usize,
@@ -1838,10 +1964,16 @@ fn context_inspector_window(explain: &ContextAssemblyTrace) -> ContextInspectorW
 fn context_inspector_prompt_cache(explain: &ContextAssemblyTrace) -> ContextInspectorPromptCache {
     ContextInspectorPromptCache {
         provider_cache_supported: explain.cache.provider_cache_supported,
+        prompt_cache_epoch: explain.cache.prompt_cache_epoch,
         stable_prefix_hash: explain.cache.stable_prefix_hash.clone(),
         stable_prefix_tokens: explain.cache.stable_prefix_tokens,
         cache_scope_hash: explain.cache.cache_scope_key.as_deref().map(cache_scope_hash),
         cache_scope_key_redacted: explain.cache.cache_scope_key.is_some(),
+        tool_catalog_hash: explain.cache.tool_catalog_hash.clone(),
+        memory_snapshot_hash: explain.cache.memory_snapshot_hash.clone(),
+        provider_cache_strategy: explain.cache.provider_cache_strategy.clone(),
+        cache_hit_eligible: explain.cache.cache_hit_eligible,
+        invalidation_reasons: explain.cache.invalidation_reasons.clone(),
         trust_scope: explain.cache.trust_scope.clone(),
     }
 }
@@ -2771,10 +2903,16 @@ fn context_assembly_diagnostics_payload_with_previous(
         },
         "cache": {
             "provider_cache_supported": explain.cache.provider_cache_supported,
+            "prompt_cache_epoch": explain.cache.prompt_cache_epoch,
             "stable_prefix_hash": explain.cache.stable_prefix_hash.as_deref(),
             "stable_prefix_tokens": explain.cache.stable_prefix_tokens,
             "cache_scope_hash": explain.cache.cache_scope_key.as_deref().map(cache_scope_hash),
             "cache_scope_key_redacted": explain.cache.cache_scope_key.is_some(),
+            "tool_catalog_hash": explain.cache.tool_catalog_hash.as_deref(),
+            "memory_snapshot_hash": explain.cache.memory_snapshot_hash.as_deref(),
+            "provider_cache_strategy": explain.cache.provider_cache_strategy.as_str(),
+            "cache_hit_eligible": explain.cache.cache_hit_eligible,
+            "invalidation_reasons": explain.cache.invalidation_reasons.as_slice(),
             "trust_scope": explain.cache.trust_scope.as_str(),
         },
         "selected_segments": explain.selected_segments.iter().map(|segment| json!({
@@ -3099,10 +3237,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        assemble_segments, context_assembly_diagnostics_payload, context_inspector_snapshot,
-        diff_context_inspector_snapshots, render_agent_plan_context_block,
-        resolve_provider_context_budget, select_strategy, ContextEngine,
-        ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
+        apply_prompt_cache_session_metadata, assemble_segments,
+        context_assembly_diagnostics_payload, context_inspector_snapshot,
+        context_prompt_cache_session_metadata, diff_context_inspector_snapshots,
+        render_agent_plan_context_block, resolve_provider_context_budget, select_strategy,
+        ContextEngine, ContextEngineAfterTurnDisposition, ContextEngineAfterTurnInput,
         ContextEngineAfterTurnOutcome, ContextEngineCompactFuture,
         ContextEngineCompactionDisposition, ContextEngineCompactionOutcome,
         ContextEngineCompactionRequest, ContextEngineDescriptor, ContextEnginePrepareFuture,
@@ -3120,7 +3259,7 @@ mod tests {
     use crate::gateway::GatewayRuntimeState;
     use crate::model_provider::{
         ProviderCapabilitiesSnapshot, ProviderCircuitBreakerSnapshot, ProviderDiscoverySnapshot,
-        ProviderHealthProbeSnapshot, ProviderRegistryModelSnapshot,
+        ProviderHealthProbeSnapshot, ProviderMessageRole, ProviderRegistryModelSnapshot,
         ProviderRegistryProviderSnapshot, ProviderRegistrySnapshot, ProviderResponseCacheSnapshot,
         ProviderRetryPolicySnapshot, ProviderRouteSelectionTrace, ProviderRuntimeMetricsSnapshot,
         ProviderStatusSnapshot,
@@ -3751,9 +3890,12 @@ mod tests {
                 },
                 "cache": {
                     "provider_cache_supported": true,
+                    "prompt_cache_epoch": 0,
                     "stable_prefix_hash": actual.pointer("/cache/stable_prefix_hash").cloned().expect("stable prefix hash should exist"),
                     "stable_prefix_tokens": 64,
                     "cache_scope_key": actual.pointer("/cache/cache_scope_key").cloned().expect("cache scope key should exist"),
+                    "provider_cache_strategy": "metadata_only",
+                    "cache_hit_eligible": false,
                     "trust_scope": "mixed"
                 },
                 "summary_quality": null,
@@ -3842,6 +3984,107 @@ mod tests {
                 "dropped_segments": []
             })
         );
+    }
+
+    #[test]
+    fn stable_prefix_ignores_volatile_developer_and_memory_segments() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let system_segment = ContextSegment::instruction(
+            ContextSegmentKind::SystemInstructions,
+            "system",
+            "stable system contract".to_owned(),
+            ProviderMessageRole::System,
+            32,
+        );
+        let first_developer = ContextSegment::instruction(
+            ContextSegmentKind::DeveloperInstructions,
+            "developer",
+            "runtime context current_utc=2026-07-07T09:00:00Z".to_owned(),
+            ProviderMessageRole::Developer,
+            32,
+        );
+        let second_developer = ContextSegment::instruction(
+            ContextSegmentKind::DeveloperInstructions,
+            "developer",
+            "runtime context current_utc=2026-07-07T09:01:00Z".to_owned(),
+            ProviderMessageRole::Developer,
+            32,
+        );
+        let first = assemble_segments(
+            &[
+                system_segment.clone(),
+                first_developer,
+                segment(ContextSegmentKind::MemoryRecall, "memory v1", 48, 72, false, false, None),
+                segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None),
+            ],
+            ContextEngineStrategy::ProviderAware,
+            budget(4_096, 768, 256, 128, true),
+            &context,
+            "session-1",
+            None,
+        );
+        let second = assemble_segments(
+            &[
+                system_segment,
+                second_developer,
+                segment(ContextSegmentKind::MemoryRecall, "memory v2", 48, 72, false, false, None),
+                segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None),
+            ],
+            ContextEngineStrategy::ProviderAware,
+            budget(4_096, 768, 256, 128, true),
+            &context,
+            "session-1",
+            None,
+        );
+
+        assert_eq!(first.explain.cache.stable_prefix_hash, second.explain.cache.stable_prefix_hash);
+        assert!(first.explain.cache.stable_prefix_hash.is_some());
+    }
+
+    #[test]
+    fn prompt_cache_metadata_populates_inspector_epoch_and_memory_snapshot() {
+        let context = RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "device".to_owned(),
+            channel: Some("cli".to_owned()),
+        };
+        let mut assembled = assemble_segments(
+            &[
+                ContextSegment::instruction(
+                    ContextSegmentKind::SystemInstructions,
+                    "system",
+                    "stable system contract".to_owned(),
+                    ProviderMessageRole::System,
+                    32,
+                ),
+                segment(ContextSegmentKind::MemoryRecall, "memory", 48, 72, false, false, None),
+                segment(ContextSegmentKind::UserInput, "question", 24, 100, false, true, None),
+            ],
+            ContextEngineStrategy::ProviderAware,
+            budget(4_096, 768, 256, 128, true),
+            &context,
+            "session-1",
+            None,
+        );
+        assembled.explain.budget.provider_kind = "openai".to_owned();
+        let metadata = context_prompt_cache_session_metadata(&assembled.explain, None);
+        apply_prompt_cache_session_metadata(&mut assembled.explain, &metadata);
+        let snapshot = context_inspector_snapshot(&assembled.explain);
+
+        assert!(metadata.prompt_cache_epoch() > 0);
+        assert_eq!(snapshot.prompt_cache.prompt_cache_epoch, metadata.prompt_cache_epoch());
+        assert_eq!(snapshot.prompt_cache.memory_snapshot_hash, metadata.memory_snapshot_hash);
+        assert_eq!(snapshot.prompt_cache.provider_cache_strategy, "openai_prompt_cache_key");
+        assert!(snapshot.prompt_cache.cache_hit_eligible);
+        assert!(snapshot
+            .prompt_cache
+            .invalidation_reasons
+            .iter()
+            .any(|reason| reason == "memory_recall_volatile"));
     }
 
     #[test]

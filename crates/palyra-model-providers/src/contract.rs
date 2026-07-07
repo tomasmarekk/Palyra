@@ -424,6 +424,18 @@ pub struct PromptCacheReport {
     pub cacheable_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub prompt_cache_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_prefix_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_catalog_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_snapshot_hash: Option<String>,
+    #[serde(default)]
+    pub provider_cache_strategy: String,
 }
 
 impl ProviderRequest {
@@ -646,6 +658,10 @@ pub struct ProviderUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     pub source: String,
 }
 
@@ -657,8 +673,22 @@ impl ProviderUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             source: source.into(),
         }
+    }
+
+    /// Attaches provider-reported prompt-cache usage counters.
+    #[must_use]
+    pub fn with_cache_usage(
+        mut self,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Self {
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        self
     }
 }
 

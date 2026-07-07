@@ -417,6 +417,8 @@ pub fn qa_mock_provider_stream_events_for_turn(
         prompt_tokens,
         completion_tokens,
         total_tokens: Some(prompt_tokens.saturating_add(completion_tokens)),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
     });
     events.push(ProviderStreamEvent::Completed {
         finish_reason: finish_reason_for_behavior(&turn.behavior),

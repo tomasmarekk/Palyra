@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::config::{
     ProviderCapabilitiesSnapshot, ProviderCostTier, ProviderLatencyTier, ProviderMetadataSource,
@@ -254,9 +255,30 @@ fn openai_prompt_cache_key(request: &ProviderRequest) -> Option<String> {
     if report.cacheable_tokens == 0 {
         return None;
     }
+    if let (Some(stable_prefix_hash), Some(cache_scope_hash)) =
+        (report.stable_prefix_hash.as_deref(), report.cache_scope_hash.as_deref())
+    {
+        let digest = sha256_hex(
+            format!(
+                "openai_prompt_cache_key:v1:{}:{}:{}:{}",
+                cache_scope_hash,
+                stable_prefix_hash,
+                report.prompt_cache_epoch,
+                report.provider_cache_strategy
+            )
+            .as_bytes(),
+        );
+        return Some(format!("palyra:{}", &digest[..32]));
+    }
     let hash_prefix =
         report.provider_request_hash.get(..32).unwrap_or(report.provider_request_hash.as_str());
     Some(format!("palyra:{hash_prefix}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn openai_reasoning_effort_for_model(
@@ -593,6 +615,12 @@ mod tests {
             breakpoint_count: 2,
             cacheable_tokens: 32,
             actual_cached_tokens: None,
+            prompt_cache_epoch: 42,
+            stable_prefix_hash: Some("stable-prefix-hash".to_owned()),
+            cache_scope_hash: Some("cache-scope-hash".to_owned()),
+            tool_catalog_hash: Some("tool-catalog-hash".to_owned()),
+            memory_snapshot_hash: Some("memory-snapshot-hash".to_owned()),
+            provider_cache_strategy: "openai_prompt_cache_key".to_owned(),
         });
         request
     }
@@ -649,12 +677,29 @@ mod tests {
         let chat_payload = chat_completions_payload(&request, "gpt-5.5", Vec::new());
         let responses_payload = responses_payload(&request, "gpt-5.5", Vec::new());
 
-        assert_eq!(chat_payload["prompt_cache_key"], "palyra:0123456789abcdef0123456789abcdef");
-        assert_eq!(
-            responses_payload.body["prompt_cache_key"],
-            "palyra:0123456789abcdef0123456789abcdef"
+        let expected = format!(
+            "palyra:{}",
+            &sha256_hex(
+                "openai_prompt_cache_key:v1:cache-scope-hash:stable-prefix-hash:42:openai_prompt_cache_key"
+                    .as_bytes()
+            )[..32]
         );
+
+        assert_eq!(chat_payload["prompt_cache_key"], expected);
+        assert_eq!(responses_payload.body["prompt_cache_key"], chat_payload["prompt_cache_key"]);
         assert!(!chat_payload["prompt_cache_key"].as_str().unwrap().contains("secret user prompt"));
+    }
+
+    #[test]
+    fn openai_prompt_cache_key_ignores_current_turn_text() {
+        let first = prompt_cache_request();
+        let mut second = prompt_cache_request();
+        second.input_text = "different current turn".to_owned();
+
+        let first_payload = chat_completions_payload(&first, "gpt-5.5", Vec::new());
+        let second_payload = chat_completions_payload(&second, "gpt-5.5", Vec::new());
+
+        assert_eq!(first_payload["prompt_cache_key"], second_payload["prompt_cache_key"]);
     }
 
     #[test]

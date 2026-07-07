@@ -40,13 +40,37 @@ pub const PROVIDER_CANONICAL_STREAM_AUDIT_EVENT: &str = "provider.stream.canonic
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderStreamEvent {
-    Started { provider_id: String, model_id: String },
-    Delta { text: String },
-    ToolDelta { proposal_id: String, tool_name: String, input_json: Value },
-    UsageDelta { prompt_tokens: u64, completion_tokens: u64, total_tokens: Option<u64> },
-    Completed { finish_reason: ProviderFinishReason, raw_provider_refs: ProviderRawProviderRefs },
-    Failed { error: ProviderErrorEnvelope },
-    Cancelled { reason: String },
+    Started {
+        provider_id: String,
+        model_id: String,
+    },
+    Delta {
+        text: String,
+    },
+    ToolDelta {
+        proposal_id: String,
+        tool_name: String,
+        input_json: Value,
+    },
+    UsageDelta {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
+    },
+    Completed {
+        finish_reason: ProviderFinishReason,
+        raw_provider_refs: ProviderRawProviderRefs,
+    },
+    Failed {
+        error: ProviderErrorEnvelope,
+    },
+    Cancelled {
+        reason: String,
+    },
 }
 
 /// Provider-neutral incremental stream event consumed by tool-call assembly.
@@ -89,6 +113,10 @@ pub enum ProviderCanonicalEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
     },
     FinishReason {
         finish_reason: ProviderFinishReason,
@@ -101,6 +129,15 @@ pub enum ProviderCanonicalEvent {
         reason_code: String,
         recoverable: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderUsageDelta {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
 }
 
 /// Hash-only validation diagnostic for a canonical stream.
@@ -277,17 +314,21 @@ pub fn normalize_provider_sse_stream_with_idle_timeout(
             }
         };
 
-        if let Some((prompt_tokens, completion_tokens, total_tokens)) = usage_delta(&value) {
+        if let Some(usage) = usage_delta(&value) {
             usage_seen = true;
             report.events.push(ProviderStreamEvent::UsageDelta {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
             });
             report.canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
             });
         }
 
@@ -537,7 +578,7 @@ fn response_tool_index(value: &Value) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-fn usage_delta(value: &Value) -> Option<(u64, u64, Option<u64>)> {
+fn usage_delta(value: &Value) -> Option<ProviderUsageDelta> {
     let usage = value.get("usage").or_else(|| value.pointer("/response/usage"))?;
     let prompt_tokens = usage
         .get("prompt_tokens")
@@ -550,7 +591,19 @@ fn usage_delta(value: &Value) -> Option<(u64, u64, Option<u64>)> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_u64);
-    Some((prompt_tokens, completion_tokens, total_tokens))
+    let cache_read_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write_tokens = usage.get("cache_creation_input_tokens").and_then(Value::as_u64);
+    Some(ProviderUsageDelta {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    })
 }
 
 fn finish_reason(value: &Value, event_name: Option<&str>) -> Option<ProviderFinishReason> {
@@ -629,13 +682,19 @@ pub fn canonical_events_from_provider_stream_events(
                 });
                 canonical_events.push(ProviderCanonicalEvent::ToolCallEnd { index });
             }
-            ProviderStreamEvent::UsageDelta { prompt_tokens, completion_tokens, total_tokens } => {
-                canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
-                    prompt_tokens: *prompt_tokens,
-                    completion_tokens: *completion_tokens,
-                    total_tokens: *total_tokens,
-                })
-            }
+            ProviderStreamEvent::UsageDelta {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => canonical_events.push(ProviderCanonicalEvent::UsageUpdate {
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+                total_tokens: *total_tokens,
+                cache_read_tokens: *cache_read_tokens,
+                cache_write_tokens: *cache_write_tokens,
+            }),
             ProviderStreamEvent::Completed { finish_reason, .. } => {
                 canonical_events
                     .push(ProviderCanonicalEvent::FinishReason { finish_reason: *finish_reason });
@@ -929,13 +988,23 @@ impl ProviderStreamAccumulator {
                     input_json,
                 });
             }
-            ProviderStreamEvent::UsageDelta { prompt_tokens, completion_tokens, total_tokens } => {
+            ProviderStreamEvent::UsageDelta {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => {
                 self.usage.prompt_tokens = self.usage.prompt_tokens.saturating_add(prompt_tokens);
                 self.usage.completion_tokens =
                     self.usage.completion_tokens.saturating_add(completion_tokens);
                 self.usage.total_tokens = total_tokens.unwrap_or_else(|| {
                     self.usage.prompt_tokens.saturating_add(self.usage.completion_tokens)
                 });
+                self.usage.cache_read_tokens =
+                    merge_optional_usage_counter(self.usage.cache_read_tokens, cache_read_tokens);
+                self.usage.cache_write_tokens =
+                    merge_optional_usage_counter(self.usage.cache_write_tokens, cache_write_tokens);
             }
             ProviderStreamEvent::Completed { finish_reason, raw_provider_refs } => {
                 self.finish_reason = finish_reason;
@@ -976,6 +1045,14 @@ impl ProviderStreamAccumulator {
     }
 }
 
+fn merge_optional_usage_counter(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 /// Builds a turn output from a non-streaming response by replaying it
 /// through [`ProviderStreamAccumulator`], so HTTP and streamed paths share
 /// the same truncation, spill, and tool-call semantics.
@@ -1011,6 +1088,8 @@ pub fn provider_output_from_text_and_tools(
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: Some(usage.total_tokens),
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
     });
     accumulator.apply(ProviderStreamEvent::Completed { finish_reason, raw_provider_refs });
     let mut output = accumulator.finalize();
@@ -1087,6 +1166,40 @@ mod tests {
             .audit_events
             .iter()
             .any(|event| event.reason_code == "provider.stream.late_usage"));
+    }
+
+    #[test]
+    fn sse_normalizer_captures_provider_cache_usage() {
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10,",
+            "\"prompt_tokens_details\":{\"cached_tokens\":6},",
+            "\"cache_creation_input_tokens\":4}}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        );
+
+        let report = normalize_provider_sse_stream(input, "openai-compatible", "gpt-test");
+        let usage_event = report
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProviderStreamEvent::UsageDelta {
+                    cache_read_tokens, cache_write_tokens, ..
+                } => Some((*cache_read_tokens, *cache_write_tokens)),
+                _ => None,
+            })
+            .expect("usage event should be present");
+        let output = provider_output_from_text_and_tools(
+            "hello".to_owned(),
+            Vec::new(),
+            ProviderFinishReason::Stop,
+            ProviderUsage::new(8, 2, "provider").with_cache_usage(Some(6), Some(4)),
+            ProviderRawProviderRefs::default(),
+        );
+
+        assert_eq!(usage_event, (Some(6), Some(4)));
+        assert_eq!(output.usage.cache_read_tokens, Some(6));
+        assert_eq!(output.usage.cache_write_tokens, Some(4));
     }
 
     #[test]

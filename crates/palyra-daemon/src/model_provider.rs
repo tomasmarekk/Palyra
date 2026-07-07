@@ -1121,6 +1121,12 @@ impl RegistryBackedModelProvider {
                 "applied_strategy": report.applied_strategy.as_str(),
                 "breakpoint_count": report.breakpoint_count,
                 "cacheable_tokens": report.cacheable_tokens,
+                "prompt_cache_epoch": report.prompt_cache_epoch,
+                "stable_prefix_hash": report.stable_prefix_hash.as_deref(),
+                "cache_scope_hash": report.cache_scope_hash.as_deref(),
+                "tool_catalog_hash": report.tool_catalog_hash.as_deref(),
+                "memory_snapshot_hash": report.memory_snapshot_hash.as_deref(),
+                "provider_cache_strategy": report.provider_cache_strategy.as_str(),
             })),
         });
         crate::sha256_hex(
@@ -2723,6 +2729,8 @@ struct OpenAiResponsesUsage {
     output_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiTokenDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2733,6 +2741,14 @@ struct OpenAiUsage {
     completion_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiTokenDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2793,6 +2809,14 @@ struct AnthropicUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+fn non_zero_cache_tokens(tokens: u64) -> Option<u64> {
+    (tokens > 0).then_some(tokens)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3289,6 +3313,11 @@ impl OpenAiCompatibleProvider {
             } else {
                 usage.total_tokens
             },
+            cache_read_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| non_zero_cache_tokens(details.cached_tokens)),
+            cache_write_tokens: None,
             source: "provider".to_owned(),
         });
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
@@ -3802,6 +3831,11 @@ fn openai_codex_provider_response(
         } else {
             usage.total_tokens
         },
+        cache_read_tokens: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| non_zero_cache_tokens(details.cached_tokens)),
+        cache_write_tokens: None,
         source: "provider".to_owned(),
     });
 
@@ -4552,10 +4586,13 @@ impl AnthropicProvider {
         })?;
         let provider_response_id = parsed.id.clone();
         let provider_model_id = parsed.model.clone();
-        let provider_usage = parsed
-            .usage
-            .as_ref()
-            .map(|usage| ProviderUsage::new(usage.input_tokens, usage.output_tokens, "provider"));
+        let provider_usage = parsed.usage.as_ref().map(|usage| {
+            ProviderUsage::new(usage.input_tokens, usage.output_tokens, "provider")
+                .with_cache_usage(
+                    non_zero_cache_tokens(usage.cache_read_input_tokens),
+                    non_zero_cache_tokens(usage.cache_creation_input_tokens),
+                )
+        });
         let finish_reason = ProviderFinishReason::from_anthropic(parsed.stop_reason.as_deref());
         let mut tool_events = Vec::new();
         let mut completion_fragments = Vec::new();
@@ -5551,6 +5588,8 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 3,
             total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
         });
         harness.apply(ProviderStreamEvent::Completed {
             finish_reason: super::ProviderFinishReason::ToolCalls,

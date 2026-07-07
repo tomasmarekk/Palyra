@@ -1,5 +1,7 @@
 //! Anthropic provider identity and static capability defaults.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 use crate::config::{
@@ -114,6 +116,7 @@ fn anthropic_system_payload(request: &ProviderRequest, system: String) -> Value 
 fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>, Option<String>) {
     let mut system_blocks = Vec::new();
     let mut messages = request.effective_messages();
+    let cache_control_message_indexes = anthropic_cache_control_message_indexes(request, &messages);
     if !request.vision_inputs.is_empty() {
         if let Some(last_user) =
             messages.iter_mut().rev().find(|message| message.role == ProviderMessageRole::User)
@@ -170,6 +173,7 @@ fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>
                     &mut pending_tool_result_parts,
                 );
                 expected_tool_result_ids.clear();
+                let cache_control = cache_control_message_indexes.contains(&index);
                 if let Some(consumed_tool_results) = push_anthropic_expanded_multi_tool_exchange(
                     &mut provider_messages,
                     message,
@@ -179,7 +183,7 @@ fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>
                 } else {
                     provider_messages.push(json!({
                         "role": message.role.as_anthropic_role(),
-                        "content": build_anthropic_content_parts(message),
+                        "content": build_anthropic_content_parts(message, cache_control),
                     }));
                     if message.role == ProviderMessageRole::Assistant {
                         expected_tool_result_ids = message
@@ -197,12 +201,53 @@ fn build_anthropic_messages_and_system(request: &ProviderRequest) -> (Vec<Value>
     (provider_messages, (!system_blocks.is_empty()).then(|| system_blocks.join("\n\n")))
 }
 
-fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
+fn anthropic_cache_control_message_indexes(
+    request: &ProviderRequest,
+    messages: &[ProviderMessage],
+) -> BTreeSet<usize> {
+    if !request.prompt_cache_policy.enabled
+        || request.prompt_cache_report.as_ref().is_none_or(|report| report.cacheable_tokens == 0)
+    {
+        return BTreeSet::new();
+    }
+    let Some(report) = request.prompt_cache_report.as_ref() else {
+        return BTreeSet::new();
+    };
+    let system_marker_count = usize::from(messages.iter().any(|message| {
+        matches!(message.role, ProviderMessageRole::System | ProviderMessageRole::Developer)
+            && !message.text_content().trim().is_empty()
+    }));
+    let marker_budget = request
+        .prompt_cache_policy
+        .max_breakpoints
+        .min(report.breakpoint_count)
+        .saturating_sub(system_marker_count);
+    if marker_budget == 0 {
+        return BTreeSet::new();
+    }
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            index.saturating_add(1) < messages.len()
+                && matches!(
+                    message.role,
+                    ProviderMessageRole::User | ProviderMessageRole::Assistant
+                )
+                && !message.text_content().trim().is_empty()
+        })
+        .rev()
+        .take(marker_budget)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn build_anthropic_content_parts(message: &ProviderMessage, cache_control: bool) -> Vec<Value> {
     if message.role == ProviderMessageRole::Tool {
         return vec![build_anthropic_tool_result_content_part(message)];
     }
 
-    let mut parts = build_anthropic_non_tool_content_parts(message);
+    let mut parts = build_anthropic_non_tool_content_parts(message, cache_control);
     if message.role == ProviderMessageRole::Assistant {
         for tool_call in &message.tool_calls {
             parts.push(build_anthropic_tool_use_content_part(tool_call));
@@ -211,15 +256,27 @@ fn build_anthropic_content_parts(message: &ProviderMessage) -> Vec<Value> {
     parts
 }
 
-fn build_anthropic_non_tool_content_parts(message: &ProviderMessage) -> Vec<Value> {
+fn build_anthropic_non_tool_content_parts(
+    message: &ProviderMessage,
+    cache_control: bool,
+) -> Vec<Value> {
     let mut parts = Vec::new();
-    for content_part in &message.content {
+    let last_text_part_index = cache_control.then(|| {
+        message.content.iter().rposition(|content_part| {
+            matches!(content_part, ProviderMessageContentPart::Text { text } if !text.trim().is_empty())
+        })
+    }).flatten();
+    for (index, content_part) in message.content.iter().enumerate() {
         match content_part {
             ProviderMessageContentPart::Text { text } => {
-                parts.push(json!({
+                let mut part = json!({
                     "type": "text",
                     "text": text,
-                }));
+                });
+                if last_text_part_index == Some(index) {
+                    part["cache_control"] = json!({ "type": "ephemeral" });
+                }
+                parts.push(part);
             }
             ProviderMessageContentPart::Image { image } => {
                 parts.push(json!({
@@ -293,7 +350,7 @@ fn push_anthropic_expanded_multi_tool_exchange(
         assistant_message.tool_calls.iter().zip(tool_result_messages).enumerate()
     {
         let mut assistant_content = if index == 0 {
-            build_anthropic_non_tool_content_parts(assistant_message)
+            build_anthropic_non_tool_content_parts(assistant_message, false)
         } else {
             Vec::new()
         };
@@ -346,9 +403,15 @@ mod tests {
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
             requested_strategy: PromptCacheStrategy::SystemAndTool,
             applied_strategy: "metadata_only".to_owned(),
-            breakpoint_count: 1,
+            breakpoint_count: 3,
             cacheable_tokens: 64,
             actual_cached_tokens: None,
+            prompt_cache_epoch: 7,
+            stable_prefix_hash: Some("stable-prefix-hash".to_owned()),
+            cache_scope_hash: Some("cache-scope-hash".to_owned()),
+            tool_catalog_hash: Some("tool-catalog-hash".to_owned()),
+            memory_snapshot_hash: Some("memory-snapshot-hash".to_owned()),
+            provider_cache_strategy: "anthropic_cache_control".to_owned(),
         });
         request
     }
@@ -397,5 +460,33 @@ mod tests {
         let payload = messages_payload(&prompt_cache_request(false), "claude-test", Vec::new());
 
         assert_eq!(payload["system"], "stable system prompt");
+    }
+
+    #[test]
+    fn anthropic_payload_marks_recent_cacheable_non_system_turns() {
+        let mut request = prompt_cache_request(true);
+        request.messages.push(ProviderMessage::user_text("prior user context"));
+        request.messages.push(ProviderMessage {
+            role: ProviderMessageRole::Assistant,
+            content: vec![ProviderMessageContentPart::text("prior assistant context")],
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        });
+        request.messages.push(ProviderMessage::user_text("current turn must stay volatile"));
+
+        let payload = messages_payload(&request, "claude-test", Vec::new());
+        let messages = payload["messages"].as_array().expect("messages should be an array");
+
+        assert!(messages[0].pointer("/content/0/cache_control").is_none());
+        assert_eq!(messages[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(messages[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            messages
+                .last()
+                .and_then(|message| message.pointer("/content/0/cache_control"))
+                .is_none(),
+            "current turn should not receive an Anthropic cache marker"
+        );
     }
 }
