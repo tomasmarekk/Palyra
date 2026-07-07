@@ -22,7 +22,9 @@ use std::io::{BufRead, BufReader};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 use palyra_common::{
-    runtime_contracts::{AuxiliaryTaskKind, AuxiliaryTaskState, FlowStepState},
+    runtime_contracts::{
+        AuxiliaryTaskKind, AuxiliaryTaskState, FlowStepState, QueueMode, QueuedInputState,
+    },
     workspace_patch::WorkspacePatchRedactionPolicy,
 };
 use reqwest::Url;
@@ -71,10 +73,11 @@ use super::{
     tool_approval_response_proposal_id, verification_status_from_tool_outcome,
     workspace_patch_metrics_from_output, CachedMemorySearchEntry, GatewayAuthConfig,
     GatewayJournalConfigSnapshot, GatewayRuntimeConfigSnapshot, GatewayRuntimeState,
-    MemoryRuntimeConfig, ProviderRequest, RequestContext, ToolApprovalOutcome,
-    APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT, HEADER_CHANNEL,
-    HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT, TOOL_APPROVAL_RESPONSE_TIMEOUT,
-    VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS, VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
+    MemoryRuntimeConfig, ProviderRequest, RequestContext, SessionQueueAdmissionRequest,
+    ToolApprovalOutcome, APPROVAL_PROMPT_TIMEOUT_SECONDS, CANVAS_PATCH_HISTORY_RESPONSE_ROW_LIMIT,
+    HEADER_CHANNEL, HEADER_DEVICE_ID, HEADER_PRINCIPAL, MAX_APPROVAL_PAGE_LIMIT,
+    TOOL_APPROVAL_RESPONSE_TIMEOUT, VAULT_RATE_LIMIT_MAX_PRINCIPAL_BUCKETS,
+    VAULT_RATE_LIMIT_MAX_REQUESTS_PER_WINDOW,
 };
 use crate::application::run_stream::orchestration::{
     finalize_run_stream_after_provider_response, RunStreamPostProviderOutcome,
@@ -111,6 +114,7 @@ use crate::application::{
         apply_session_compaction, configure_test_safeguard_failure,
         configure_test_write_failure_path, SessionCompactionApplyRequest,
     },
+    session_queue::SessionQueueSafeBoundary,
     tool_runtime::{
         http_fetch::{
             execute_http_fetch_tool, http_fetch_allows_private_targets_for_url,
@@ -1146,6 +1150,67 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
 
 fn build_test_runtime_state(hash_chain_enabled: bool) -> std::sync::Arc<GatewayRuntimeState> {
     build_test_runtime_state_with_http_fetch_private_targets(hash_chain_enabled, false)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admit_session_queued_input_persists_followup_for_active_run() {
+    let state = build_test_runtime_state(false);
+    let context = RequestContext {
+        principal: "user:ops".to_owned(),
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+        channel: Some("discord:ops".to_owned()),
+    };
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    upsert_test_orchestrator_session(&state, &context, session_id.as_str());
+    state
+        .start_orchestrator_run(OrchestratorRunStartRequest {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            origin_kind: "session-queue-admission-test".to_owned(),
+            origin_run_id: None,
+            triggered_by_principal: Some(context.principal.clone()),
+            parameter_delta_json: None,
+        })
+        .await
+        .expect("active run should start");
+    state
+        .update_orchestrator_run_state(run_id.clone(), RunLifecycleState::InProgress, None)
+        .await
+        .expect("active run should enter in-progress state");
+
+    let outcome = state
+        .admit_session_queued_input(SessionQueueAdmissionRequest {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            origin_run_id: None,
+            text: "continue with the latest route message".to_owned(),
+            requested_mode: Some(QueueMode::Followup),
+            policy_channel: context.channel.clone(),
+            policy_agent_id: None,
+            safe_boundary: SessionQueueSafeBoundary::active(true, false),
+            actor_principal: context.principal.clone(),
+            actor_device_id: context.device_id.clone(),
+            actor_channel: context.channel.clone(),
+            source: "gateway_test".to_owned(),
+        })
+        .await
+        .expect("queued input admission should succeed");
+
+    assert!(outcome.decision.accepted);
+    assert_eq!(outcome.decision.mode, QueueMode::Followup);
+    assert_eq!(outcome.observed_queue_depth, 1);
+    assert_eq!(outcome.queued_input.state, QueuedInputState::Pending.as_str());
+    assert_eq!(outcome.queued_input.origin_run_id.as_deref(), Some(run_id.as_str()));
+    assert!(outcome.queued_input.accepted_at_unix_ms.is_some());
+
+    let queued_inputs = state
+        .list_orchestrator_queued_inputs(session_id)
+        .await
+        .expect("queued inputs should be readable");
+    assert_eq!(queued_inputs.len(), 1);
+    assert_eq!(queued_inputs[0].queued_input_id, outcome.queued_input.queued_input_id);
+    assert_eq!(queued_inputs[0].queue_mode, QueueMode::Followup.as_str());
 }
 
 #[test]

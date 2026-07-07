@@ -138,7 +138,7 @@ fn model_token_event(
     }
 }
 
-fn redact_run_stream_text(raw: &str) -> String {
+pub(crate) fn redact_run_stream_text(raw: &str) -> String {
     let url_redacted = redact_url_segments_in_text(raw);
     let auth_redacted = redact_auth_error(url_redacted.as_str());
     redact_text_for_export(

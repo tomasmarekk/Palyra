@@ -23,7 +23,10 @@ use crate::{
         route_message::tool_flow::process_route_tool_proposal_event,
         run_stream::{
             cancellation::transition_run_stream_to_cancelled,
-            tape::{append_runtime_decision_tape_event, send_model_token_with_tape},
+            tape::{
+                append_runtime_decision_tape_event, redact_run_stream_text,
+                send_model_token_with_tape,
+            },
             tool_flow::{
                 execute_prepared_run_stream_tool_proposals_ordered,
                 prepare_run_stream_tool_proposal_event, process_run_stream_tool_proposal_event,
@@ -33,12 +36,18 @@ use crate::{
         },
         tool_registry::ModelVisibleToolCatalogSnapshot,
     },
-    gateway::{GatewayRuntimeState, RunStreamToolExecutionOutcome},
+    gateway::{
+        current_unix_ms, GatewayRuntimeState, RunStreamToolExecutionOutcome, CANCELLED_REASON,
+    },
     model_provider::ProviderEvent,
     orchestrator::RunStateMachine,
     tool_protocol::ToolExecutionOutcome,
     transport::grpc::{auth::RequestContext, proto::palyra::common::v1 as common_v1},
 };
+use serde_json::{json, Value};
+
+const PARTIAL_ASSISTANT_ABORT_EVENT: &str = "partial_assistant.abort";
+const MAX_PARTIAL_ASSISTANT_ABORT_CHARS: usize = 4_096;
 
 /// Result of the pre-event cancellation gate.
 ///
@@ -87,6 +96,25 @@ struct PendingRunStreamToolProposal {
     input_json: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunStreamPartialAbortContext<'a> {
+    summary_tokens: &'a [String],
+    stream_model_tokens_immediately: bool,
+    model_token_tape_events: usize,
+    model_token_compaction_emitted: bool,
+}
+
+struct RunStreamProviderCancellationGate<'a> {
+    sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
+    runtime_state: &'a Arc<GatewayRuntimeState>,
+    request_context: &'a RequestContext,
+    run_state: &'a mut RunStateMachine,
+    session_id: &'a str,
+    run_id: &'a str,
+    tape_seq: &'a mut i64,
+    partial_abort: Option<RunStreamPartialAbortContext<'a>>,
+}
+
 /// Mutable run-stream state a provider event may touch while being handled.
 pub(crate) struct RunStreamProviderEventSurface<'a> {
     pub(crate) sender: &'a mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
@@ -120,16 +148,28 @@ pub(crate) enum ProviderEventSurface<'a> {
 /// [`RunStreamProviderEventGateOutcome::Cancelled`] to the caller.
 #[allow(clippy::result_large_err)]
 async fn gate_run_stream_provider_event_on_cancellation(
-    sender: &mpsc::Sender<Result<common_v1::RunStreamEvent, Status>>,
-    runtime_state: &Arc<GatewayRuntimeState>,
-    request_context: &RequestContext,
-    run_state: &mut RunStateMachine,
-    session_id: &str,
-    run_id: &str,
-    tape_seq: &mut i64,
+    context: RunStreamProviderCancellationGate<'_>,
 ) -> Result<RunStreamProviderEventGateOutcome, Status> {
+    let RunStreamProviderCancellationGate {
+        sender,
+        runtime_state,
+        request_context,
+        run_state,
+        session_id,
+        run_id,
+        tape_seq,
+        partial_abort,
+    } = context;
     match runtime_state.is_orchestrator_cancel_requested(run_id.to_owned()).await {
         Ok(true) => {
+            append_partial_assistant_abort_tape_event_if_visible(
+                runtime_state,
+                request_context,
+                run_id,
+                tape_seq,
+                partial_abort,
+            )
+            .await?;
             let event_payload = RuntimeDecisionPayload::new(
                 RuntimeDecisionEventType::FlowLifecycle,
                 runtime_state.runtime_decision_actor_from_context(
@@ -167,6 +207,104 @@ async fn gate_run_stream_provider_event_on_cancellation(
         Ok(false) => Ok(RunStreamProviderEventGateOutcome::Continue),
         Err(error) => Err(error),
     }
+}
+
+#[allow(clippy::result_large_err)]
+async fn append_partial_assistant_abort_tape_event_if_visible(
+    runtime_state: &Arc<GatewayRuntimeState>,
+    request_context: &RequestContext,
+    run_id: &str,
+    tape_seq: &mut i64,
+    partial_abort: Option<RunStreamPartialAbortContext<'_>>,
+) -> Result<(), Status> {
+    let Some(partial_abort) = partial_abort else {
+        return Ok(());
+    };
+    let abort_reason = runtime_state
+        .orchestrator_run_status_snapshot(run_id.to_owned())
+        .await?
+        .and_then(|snapshot| snapshot.cancel_reason)
+        .unwrap_or_else(|| CANCELLED_REASON.to_owned());
+    let Some(payload) = partial_assistant_abort_payload(
+        request_context,
+        run_id,
+        abort_reason.as_str(),
+        partial_abort,
+        current_unix_ms(),
+    ) else {
+        return Ok(());
+    };
+    runtime_state
+        .append_orchestrator_tape_event(crate::journal::OrchestratorTapeAppendRequest {
+            run_id: run_id.to_owned(),
+            seq: *tape_seq,
+            event_type: PARTIAL_ASSISTANT_ABORT_EVENT.to_owned(),
+            payload_json: payload.to_string(),
+        })
+        .await?;
+    *tape_seq += 1;
+    Ok(())
+}
+
+fn partial_assistant_abort_payload(
+    request_context: &RequestContext,
+    run_id: &str,
+    abort_reason: &str,
+    partial_abort: RunStreamPartialAbortContext<'_>,
+    observed_at_unix_ms: i64,
+) -> Option<Value> {
+    if !partial_abort.stream_model_tokens_immediately || partial_abort.summary_tokens.is_empty() {
+        return None;
+    }
+    let partial_text = partial_abort.summary_tokens.concat();
+    if partial_text.trim().is_empty() {
+        return None;
+    }
+    let redacted_partial_text = crate::model_provider::redact_remote_secret_fragments(
+        redact_run_stream_text(partial_text.as_str()).as_str(),
+    );
+    let partial_char_count = redacted_partial_text.chars().count();
+    if partial_char_count == 0 {
+        return None;
+    }
+    let (bounded_partial_text, truncated) =
+        bounded_partial_assistant_text(redacted_partial_text.as_str());
+    let persisted_char_count = bounded_partial_text.chars().count();
+    Some(json!({
+        "schema_version": 1,
+        "event": PARTIAL_ASSISTANT_ABORT_EVENT,
+        "run_id": run_id,
+        "observed_at_unix_ms": observed_at_unix_ms,
+        "aborted_by": {
+            "kind": "run_stream_cancel_request",
+            "principal": request_context.principal,
+            "device_id": request_context.device_id,
+            "channel": request_context.channel,
+        },
+        "abort_reason": abort_reason,
+        "partial_char_count": partial_char_count,
+        "persisted_char_count": persisted_char_count,
+        "truncated": truncated,
+        "redaction_level": "run_stream_text_redaction",
+        "content_visibility": "model_visible_streamed",
+        "internal_reasoning_persisted": false,
+        "source": {
+            "model_token_events_seen": partial_abort.model_token_tape_events,
+            "token_tape_compacted": partial_abort.model_token_compaction_emitted,
+        },
+        "partial_text": bounded_partial_text,
+    }))
+}
+
+fn bounded_partial_assistant_text(input: &str) -> (String, bool) {
+    let char_count = input.chars().count();
+    if char_count <= MAX_PARTIAL_ASSISTANT_ABORT_CHARS {
+        return (input.to_owned(), false);
+    }
+    let take_chars = MAX_PARTIAL_ASSISTANT_ABORT_CHARS.saturating_sub(3);
+    let mut bounded = input.chars().take(take_chars).collect::<String>();
+    bounded.push_str("...");
+    (bounded, true)
 }
 
 /// Handles one provider event for the given surface.
@@ -321,7 +459,7 @@ pub(crate) async fn process_run_stream_provider_events(
     let mut tool_results = Vec::new();
     let mut pending_tool_proposals = Vec::new();
     for provider_event in provider_events {
-        match gate_run_stream_provider_event_on_cancellation(
+        match gate_run_stream_provider_event_on_cancellation(RunStreamProviderCancellationGate {
             sender,
             runtime_state,
             request_context,
@@ -329,7 +467,13 @@ pub(crate) async fn process_run_stream_provider_events(
             session_id,
             run_id,
             tape_seq,
-        )
+            partial_abort: Some(RunStreamPartialAbortContext {
+                summary_tokens: summary_tokens.as_slice(),
+                stream_model_tokens_immediately,
+                model_token_tape_events: *model_token_tape_events,
+                model_token_compaction_emitted: *model_token_compaction_emitted,
+            }),
+        })
         .await?
         {
             RunStreamProviderEventGateOutcome::Continue => {}
@@ -466,7 +610,7 @@ async fn flush_pending_run_stream_tool_proposals(
     let proposals = std::mem::take(pending_tool_proposals);
     let mut prepared_tools = Vec::new();
     for proposal in proposals {
-        match gate_run_stream_provider_event_on_cancellation(
+        match gate_run_stream_provider_event_on_cancellation(RunStreamProviderCancellationGate {
             sender,
             runtime_state,
             request_context,
@@ -474,7 +618,8 @@ async fn flush_pending_run_stream_tool_proposals(
             session_id,
             run_id,
             tape_seq,
-        )
+            partial_abort: None,
+        })
         .await?
         {
             RunStreamProviderEventGateOutcome::Continue => {}
@@ -669,4 +814,67 @@ async fn process_run_stream_provider_event(
         }),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_request_context() -> RequestContext {
+        RequestContext {
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAA".to_owned(),
+            channel: Some("cli".to_owned()),
+        }
+    }
+
+    #[test]
+    fn partial_assistant_abort_payload_redacts_visible_streamed_tokens() {
+        let tokens = vec![
+            "Visible partial before abort with secret ".to_owned(),
+            "sk-test-secret-token".to_owned(),
+        ];
+        let payload = partial_assistant_abort_payload(
+            &test_request_context(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAB",
+            "operator_requested",
+            RunStreamPartialAbortContext {
+                summary_tokens: tokens.as_slice(),
+                stream_model_tokens_immediately: true,
+                model_token_tape_events: 2,
+                model_token_compaction_emitted: false,
+            },
+            1_700_000_000_000,
+        )
+        .expect("visible streamed partial should produce an abort payload");
+
+        assert_eq!(payload["event"], PARTIAL_ASSISTANT_ABORT_EVENT);
+        assert_eq!(payload["abort_reason"], "operator_requested");
+        assert_eq!(payload["content_visibility"], "model_visible_streamed");
+        assert_eq!(payload["internal_reasoning_persisted"], false);
+        assert_eq!(payload["source"]["model_token_events_seen"], 2);
+        let partial_text =
+            payload["partial_text"].as_str().expect("partial text should be serialized");
+        assert!(partial_text.contains("Visible partial before abort"));
+        assert!(!partial_text.contains("sk-test-secret-token"));
+    }
+
+    #[test]
+    fn partial_assistant_abort_payload_skips_unstreamed_tokens() {
+        let tokens = vec!["candidate final answer".to_owned()];
+        let payload = partial_assistant_abort_payload(
+            &test_request_context(),
+            "01ARZ3NDEKTSV4RRFFQ69G5FAC",
+            "operator_requested",
+            RunStreamPartialAbortContext {
+                summary_tokens: tokens.as_slice(),
+                stream_model_tokens_immediately: false,
+                model_token_tape_events: 0,
+                model_token_compaction_emitted: false,
+            },
+            1_700_000_000_000,
+        );
+
+        assert!(payload.is_none());
+    }
 }

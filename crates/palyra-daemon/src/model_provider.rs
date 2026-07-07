@@ -49,7 +49,7 @@ pub(crate) use palyra_model_providers::{
     anthropic_compatible_uses_anthropic_oauth_headers, anthropic_compatible_uses_bearer_auth,
     bounded_provider_turn_output_for_persistence, coerce_raw_tool_call_markup,
     normalize_tool_arguments, normalize_tool_input_value, provider_events_from_output,
-    sanitize_remote_error,
+    redact_remote_secret_fragments, sanitize_remote_error,
 };
 #[allow(unused_imports)]
 pub use palyra_model_providers::{

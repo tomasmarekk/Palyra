@@ -106,7 +106,7 @@ pub use qa_mock::{
     QaMockProviderValidationError, QA_MOCK_PROVIDER_FIXTURE_FORMAT,
     QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
 };
-pub use redaction::sanitize_remote_error;
+pub use redaction::{redact_remote_secret_fragments, sanitize_remote_error};
 pub use snapshots::{
     ProviderCircuitBreakerSnapshot, ProviderCredentialCapabilitySummary, ProviderDiscoverySnapshot,
     ProviderHealthProbeSnapshot, ProviderRegistryCredentialSnapshot, ProviderRegistryModelSnapshot,

@@ -12,6 +12,7 @@
 
 use std::sync::{atomic::Ordering, Arc};
 
+use palyra_common::runtime_contracts::QueueMode;
 use palyra_common::{runtime_preview::RuntimePreviewCapability, CANONICAL_PROTOCOL_MAJOR};
 use serde_json::json;
 use tonic::Status;
@@ -42,6 +43,7 @@ use crate::{
             PrepareModelProviderInputRequest,
         },
         service_authorization::authorize_message_action,
+        session_queue::SessionQueueSafeBoundary,
         tool_registry::{
             build_model_visible_tool_catalog_snapshot, snapshot_to_provider_request_value,
             tool_catalog_tape_payload, ModelVisibleToolCatalogSnapshot, ToolCatalogBuildRequest,
@@ -54,7 +56,7 @@ use crate::{
     gateway::{
         agent_resolution_source_label, current_unix_ms, ingest_memory_best_effort,
         record_message_router_journal_event, request_context_with_resolved_route_channel,
-        truncate_with_ellipsis, GatewayRuntimeState,
+        truncate_with_ellipsis, GatewayRuntimeState, SessionQueueAdmissionRequest,
     },
     journal::{
         MemorySource, OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
@@ -339,13 +341,26 @@ pub(crate) async fn handle_routed_route_message(
     .map_err(|error| {
         Status::resource_exhausted(format!("{}: {}", error.code(), error.safe_message()))
     })?;
+    let active_session_run = match previous_run_id_for_context.as_deref() {
+        Some(previous_run_id) => runtime_state
+            .orchestrator_run_status_snapshot(previous_run_id.to_owned())
+            .await?
+            .filter(|snapshot| {
+                snapshot.session_id == session_id
+                    && RunLifecycleState::from_str(snapshot.state.as_str())
+                        .is_none_or(|state| !state.is_terminal())
+            }),
+        None => None,
+    };
+    let coalescing_run_id =
+        active_session_run.as_ref().map_or(run_id.as_str(), |snapshot| snapshot.run_id.as_str());
     let inbound_coalescing_snapshot =
         coalescing_decision.safe_snapshot_json(runtime_state.inbound_coalescer.policy());
     record_inbound_coalescing_journal_event(
         runtime_state,
         &route_request_context,
         session_id.as_str(),
-        run_id.as_str(),
+        coalescing_run_id,
         input,
         &plan,
         route_config_hash,
@@ -391,6 +406,102 @@ pub(crate) async fn handle_routed_route_message(
         .map(|coalesced| coalesced.text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| input.text.clone());
+    if let Some(active_run) = active_session_run {
+        let active_run_id = active_run.run_id;
+        let requested_mode =
+            if input_urgent_stop { QueueMode::Interrupt } else { QueueMode::Followup };
+        let preferred_route_agent_id =
+            plan.route_target.as_ref().and_then(|target| target.agent_id.clone());
+        let queue_outcome = runtime_state
+            .admit_session_queued_input(SessionQueueAdmissionRequest {
+                session_id: session_id.clone(),
+                run_id: active_run_id.clone(),
+                origin_run_id: Some(active_run_id.clone()),
+                text: effective_input_text,
+                requested_mode: Some(requested_mode),
+                policy_channel: Some(plan.channel.clone()),
+                policy_agent_id: preferred_route_agent_id,
+                safe_boundary: SessionQueueSafeBoundary::active(true, false),
+                actor_principal: route_request_context.principal.clone(),
+                actor_device_id: route_request_context.device_id.clone(),
+                actor_channel: Some(plan.channel.clone()),
+                source: "route_message.active_session_run".to_owned(),
+            })
+            .await?;
+        let _ = record_message_router_journal_event(
+            runtime_state,
+            &route_request_context,
+            session_id.as_str(),
+            active_run_id.as_str(),
+            if binding_outcome.created {
+                "conversation.binding.created"
+            } else {
+                "conversation.binding.touched"
+            },
+            common_v1::journal_event::EventActor::System as i32,
+            json!({
+                "event": if binding_outcome.created {
+                    "conversation.binding.created"
+                } else {
+                    "conversation.binding.touched"
+                },
+                "binding": binding_outcome.record.safe_snapshot_json(),
+                "reason": binding_outcome.reason,
+                "route_key": plan.route_key.clone(),
+                "config_hash": route_config_hash,
+            }),
+        )
+        .await;
+        let _ = record_message_router_journal_event(
+            runtime_state,
+            &route_request_context,
+            session_id.as_str(),
+            active_run_id.as_str(),
+            "queued.input",
+            common_v1::journal_event::EventActor::User as i32,
+            json!({
+                "event": "queued.input",
+                "envelope_id": input.envelope_id.clone(),
+                "channel": input.channel.clone(),
+                "route_key": plan.route_key.clone(),
+                "binding_id": plan.binding_id.clone(),
+                "binding_kind": plan.binding_kind.clone(),
+                "queued_input_id": queue_outcome.queued_input.queued_input_id.clone(),
+                "queued_input_state": queue_outcome.queued_input.state.clone(),
+                "active_run_id": active_run_id.clone(),
+                "decision": queue_outcome.decision.decision.as_str(),
+                "queue_mode": queue_outcome.decision.mode.as_str(),
+                "reason": queue_outcome.decision.reason.clone(),
+                "queued_for_retry": false,
+                "config_hash": route_config_hash,
+                "actor": {
+                    "connector_channel": actor_connector,
+                    "gateway_principal": actor_gateway_principal,
+                    "gateway_device_id": actor_gateway_device_id,
+                }
+            }),
+        )
+        .await;
+        runtime_state.record_channel_message_routed();
+        if queue_outcome.decision.accepted {
+            runtime_state.counters.channel_messages_queued.fetch_add(1, Ordering::Relaxed);
+        } else {
+            runtime_state.counters.channel_messages_rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        runtime_state.refresh_channel_router_queue_depth();
+        return Ok(gateway_v1::RouteMessageResponse {
+            v: CANONICAL_PROTOCOL_MAJOR,
+            accepted: queue_outcome.decision.accepted,
+            queued_for_retry: false,
+            decision_reason: queue_outcome.decision.reason,
+            session_id: Some(common_v1::CanonicalId { ulid: session_id }),
+            run_id: Some(common_v1::CanonicalId { ulid: active_run_id }),
+            outputs: Vec::new(),
+            route_key: plan.route_key.clone(),
+            retry_attempt,
+            queue_depth: queue_outcome.observed_queue_depth.min(u32::MAX as u64) as u32,
+        });
+    }
     runtime_state
         .start_orchestrator_run(OrchestratorRunStartRequest {
             run_id: run_id.clone(),

@@ -16,7 +16,7 @@ pub fn sanitize_remote_error(body: &str) -> String {
     if trimmed.is_empty() {
         return "<empty>".to_owned();
     }
-    let redacted = redact_remote_error_secrets(trimmed);
+    let redacted = redact_remote_secret_fragments(trimmed);
     const MAX_CHARS: usize = 240;
     if redacted.chars().count() <= MAX_CHARS {
         redacted
@@ -24,6 +24,13 @@ pub fn sanitize_remote_error(body: &str) -> String {
         let truncated: String = redacted.chars().take(MAX_CHARS).collect();
         format!("{truncated}…")
     }
+}
+
+/// Redacts credential-shaped substrings without changing surrounding text
+/// length or applying the remote-error display truncation.
+#[must_use]
+pub fn redact_remote_secret_fragments(raw: &str) -> String {
+    redact_remote_error_secrets(raw)
 }
 
 // Byte-level scan that blanks bearer header values, provider API key prefixes,
@@ -112,7 +119,7 @@ fn is_secret_value_delimiter(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_remote_error;
+    use super::{redact_remote_secret_fragments, sanitize_remote_error};
 
     #[test]
     fn truncates_multibyte_text_without_panicking() {
@@ -135,6 +142,18 @@ mod tests {
             sanitized,
             "Bearer <redacted> api_key=<redacted> token=<redacted> secret=<redacted> <redacted>"
         );
+    }
+
+    #[test]
+    fn redacts_secret_fragments_without_display_truncation() {
+        let input = format!("{} sk-live123456789 token=value", "visible ".repeat(80));
+
+        let redacted = redact_remote_secret_fragments(input.as_str());
+
+        assert!(redacted.contains("visible visible visible"));
+        assert!(!redacted.contains("sk-live123456789"));
+        assert!(!redacted.contains("token=value"));
+        assert!(!redacted.ends_with('…'));
     }
 
     #[test]

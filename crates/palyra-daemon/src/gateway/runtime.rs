@@ -46,8 +46,9 @@ use crate::application::{
     progress_draft::project_progress_draft_tape_event,
     session_queue::{
         decide_queue_steering, decide_session_queue_mode, pending_queue_depth, QueueSteeringAction,
-        QueueSteeringDecision, QueueSteeringRequest, SessionQueuePolicy, SessionQueueSafeBoundary,
-        QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED, QUEUE_STEERING_EVENT_STARTED,
+        QueueSteeringDecision, QueueSteeringRequest, SessionQueueDecision, SessionQueuePolicy,
+        SessionQueueSafeBoundary, QUEUE_STEERING_EVENT_COMPLETED, QUEUE_STEERING_EVENT_FAILED,
+        QUEUE_STEERING_EVENT_STARTED,
     },
     turn_control::{
         decide_turn_control_request, ControlActivePhase, TurnControlAction,
@@ -293,6 +294,31 @@ pub struct OrchestratorRunWaitRequest {
 pub struct OrchestratorRunWaitOutcome {
     pub snapshot: OrchestratorRunStatusSnapshot,
     pub canonical_state: RunLifecyclePhase,
+}
+
+/// Request for the shared session queue admission path.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionQueueAdmissionRequest {
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) origin_run_id: Option<String>,
+    pub(crate) text: String,
+    pub(crate) requested_mode: Option<QueueMode>,
+    pub(crate) policy_channel: Option<String>,
+    pub(crate) policy_agent_id: Option<String>,
+    pub(crate) safe_boundary: SessionQueueSafeBoundary,
+    pub(crate) actor_principal: String,
+    pub(crate) actor_device_id: String,
+    pub(crate) actor_channel: Option<String>,
+    pub(crate) source: String,
+}
+
+/// Outcome from admitting an input into a session queue.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionQueueAdmissionOutcome {
+    pub(crate) queued_input: OrchestratorQueuedInputRecord,
+    pub(crate) decision: SessionQueueDecision,
+    pub(crate) observed_queue_depth: u64,
 }
 
 /// Live-tunable memory subsystem limits, auto-injection policy, and retention
@@ -6096,6 +6122,149 @@ impl GatewayRuntimeState {
                 "partial_evidence": "unchanged",
             },
         }))
+    }
+
+    /// Admits an input into the journal-backed session queue for an active run.
+    ///
+    /// # Errors
+    /// Returns `not_found` when the target run is absent, `invalid_argument`
+    /// when the run does not belong to the supplied session, or the mapped
+    /// journal/runtime error when queue persistence or audit recording fails.
+    #[allow(clippy::result_large_err)]
+    pub async fn admit_session_queued_input(
+        self: &Arc<Self>,
+        request: SessionQueueAdmissionRequest,
+    ) -> Result<SessionQueueAdmissionOutcome, Status> {
+        let snapshot =
+            self.orchestrator_run_status_snapshot(request.run_id.clone()).await?.ok_or_else(
+                || Status::not_found(format!("orchestrator run not found: {}", request.run_id)),
+            )?;
+        if snapshot.session_id != request.session_id {
+            return Err(Status::invalid_argument(format!(
+                "queued input session_id {} does not match run {} session {}",
+                request.session_id, request.run_id, snapshot.session_id
+            )));
+        }
+
+        let queued_inputs =
+            self.list_orchestrator_queued_inputs(request.session_id.clone()).await?;
+        let policy = SessionQueuePolicy::from_config(
+            &self.config.session_queue_policy,
+            request.session_id.as_str(),
+            request.policy_channel.as_deref(),
+            request.policy_agent_id.as_deref(),
+        );
+        let current_depth =
+            pending_queue_depth(queued_inputs.as_slice(), Some(policy.coalescing_group.as_str()));
+        let decision = decide_session_queue_mode(
+            policy,
+            request.requested_mode,
+            request.safe_boundary.clone(),
+            current_depth,
+        );
+        let timestamp_unix_ms = current_unix_ms();
+        let queued_input_id = Ulid::new().to_string();
+        let queued_state = if decision.accepted {
+            QueuedInputState::Pending
+        } else {
+            QueuedInputState::Overflowed
+        };
+        let queued_input = self
+            .create_orchestrator_queued_input(OrchestratorQueuedInputCreateRequest {
+                queued_input_id: queued_input_id.clone(),
+                run_id: request.run_id.clone(),
+                session_id: request.session_id.clone(),
+                state: queued_state.as_str().to_owned(),
+                text: request.text,
+                origin_run_id: request.origin_run_id.or_else(|| Some(request.run_id.clone())),
+                queue_mode: decision.mode.as_str().to_owned(),
+                priority_lane: decision.policy.priority_lane.clone(),
+                coalescing_group: Some(decision.policy.coalescing_group.clone()),
+                overflow_summary_ref: None,
+                safe_boundary_flags_json: serde_json::to_string(&decision.safe_boundary)
+                    .unwrap_or_else(|_| "{}".to_owned()),
+                decision_reason: decision.reason.clone(),
+                accepted_at_unix_ms: decision.accepted.then_some(timestamp_unix_ms),
+                policy_snapshot_json: decision.policy.snapshot_json().to_string(),
+                explain_json: decision.explain_json().to_string(),
+            })
+            .await?;
+
+        let observed_queue_depth =
+            if decision.accepted { current_depth.saturating_add(1) } else { current_depth } as u64;
+        let queue_event_type = match decision.decision {
+            QueueDecision::Interrupt => RuntimeDecisionEventType::QueueInterrupt,
+            QueueDecision::Steer | QueueDecision::SteerBacklog => {
+                RuntimeDecisionEventType::QueueSteer
+            }
+            QueueDecision::Merge => RuntimeDecisionEventType::QueueMerge,
+            QueueDecision::Overflow => RuntimeDecisionEventType::QueueOverflow,
+            QueueDecision::Enqueue | QueueDecision::Defer => RuntimeDecisionEventType::QueueEnqueue,
+        };
+        let runtime_decision = RuntimeDecisionPayload::new(
+            queue_event_type,
+            RuntimeDecisionActor::new(
+                RuntimeDecisionActorKind::Operator,
+                request.actor_principal.clone(),
+                request.actor_device_id.clone(),
+                request.actor_channel.clone(),
+            ),
+            decision.reason.clone(),
+            decision.policy.policy_id.clone(),
+            RuntimeDecisionTiming::observed(timestamp_unix_ms),
+        )
+        .with_input(
+            RuntimeEntityRef::new(
+                "queued_input",
+                "queued_input",
+                queued_input.queued_input_id.clone(),
+            )
+            .with_state(queued_input.state.as_str()),
+        )
+        .with_output(
+            RuntimeEntityRef::new("run", "run", request.run_id.clone())
+                .with_state(snapshot.state.as_str()),
+        )
+        .with_resource_budget(RuntimeResourceBudget {
+            queue_depth: Some(observed_queue_depth),
+            token_budget: None,
+            pruning_token_delta: None,
+            retrieval_branch_latency_ms: None,
+            retry_count: None,
+            suppression_count: None,
+        })
+        .with_related_entity(RuntimeEntityRef::new(
+            "session",
+            "session",
+            request.session_id.clone(),
+        ))
+        .with_details(json!({
+            "source": request.source,
+            "decision": decision.decision.as_str(),
+            "queue_mode": decision.mode.as_str(),
+            "safe_boundary": decision.safe_boundary,
+            "policy": decision.policy.snapshot_json(),
+        }));
+        self.record_system_runtime_decision_event(
+            request.actor_principal.as_str(),
+            request.actor_device_id.as_str(),
+            request.actor_channel.as_deref(),
+            Some(request.session_id.as_str()),
+            Some(request.run_id.as_str()),
+            runtime_decision.clone(),
+        )
+        .await?;
+        self.observability.observe_runtime_queue_depth(observed_queue_depth);
+        let mut tape_seq = snapshot.tape_events as i64;
+        crate::application::run_stream::tape::append_runtime_decision_tape_event(
+            self,
+            request.run_id.as_str(),
+            &mut tape_seq,
+            &runtime_decision,
+        )
+        .await?;
+
+        Ok(SessionQueueAdmissionOutcome { queued_input, decision, observed_queue_depth })
     }
 
     #[allow(clippy::result_large_err)]
