@@ -6,7 +6,6 @@
 //! conservative about path coverage; unknown coverage never becomes a fresh
 //! passing verification.
 
-// M35 lands the ledger schema before M36 wires process-run evidence into it.
 #![allow(dead_code)]
 
 use std::{collections::BTreeSet, fmt, path::Component};

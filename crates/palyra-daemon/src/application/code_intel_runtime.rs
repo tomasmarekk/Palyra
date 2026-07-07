@@ -31,16 +31,56 @@ const UNSCOPED_WORKSPACE_ROOT: &str = "unscoped";
 pub(crate) enum CodeIntelLanguage {
     Rust,
     TypeScript,
+    JavaScript,
     Python,
+    Go,
+    Java,
+    C,
+    Cpp,
+    CSharp,
+    Ruby,
+    Php,
+    Yaml,
+    Json,
+    Shell,
 }
 
 impl CodeIntelLanguage {
+    /// Stable, deterministic language catalog exposed by code-intelligence health.
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Rust,
+        Self::TypeScript,
+        Self::JavaScript,
+        Self::Python,
+        Self::Go,
+        Self::Java,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::Ruby,
+        Self::Php,
+        Self::Yaml,
+        Self::Json,
+        Self::Shell,
+    ];
+
     /// Stable lowercase language id used in reason codes and handle ids.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
+            Self::JavaScript => "javascript",
             Self::Python => "python",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Yaml => "yaml",
+            Self::Json => "json",
+            Self::Shell => "shell",
         }
     }
 
@@ -49,7 +89,17 @@ impl CodeIntelLanguage {
         match self {
             Self::Rust => "rust-analyzer",
             Self::TypeScript => "typescript-language-server",
+            Self::JavaScript => "typescript-language-server",
             Self::Python => "pyright",
+            Self::Go => "gopls",
+            Self::Java => "jdtls",
+            Self::C | Self::Cpp => "clangd",
+            Self::CSharp => "omnisharp",
+            Self::Ruby => "solargraph",
+            Self::Php => "intelephense",
+            Self::Yaml => "yaml-language-server",
+            Self::Json => "vscode-json-language-server",
+            Self::Shell => "bash-language-server",
         }
     }
 
@@ -58,16 +108,46 @@ impl CodeIntelLanguage {
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".rs") {
             Some(Self::Rust)
-        } else if lower.ends_with(".ts")
-            || lower.ends_with(".tsx")
-            || lower.ends_with(".js")
+        } else if lower.ends_with(".ts") || lower.ends_with(".tsx") {
+            Some(Self::TypeScript)
+        } else if lower.ends_with(".js")
             || lower.ends_with(".jsx")
             || lower.ends_with(".mjs")
             || lower.ends_with(".cjs")
         {
-            Some(Self::TypeScript)
+            Some(Self::JavaScript)
         } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
             Some(Self::Python)
+        } else if lower.ends_with(".go") {
+            Some(Self::Go)
+        } else if lower.ends_with(".java") {
+            Some(Self::Java)
+        } else if lower.ends_with(".c") || lower.ends_with(".h") {
+            Some(Self::C)
+        } else if lower.ends_with(".cc")
+            || lower.ends_with(".cpp")
+            || lower.ends_with(".cxx")
+            || lower.ends_with(".hh")
+            || lower.ends_with(".hpp")
+            || lower.ends_with(".hxx")
+        {
+            Some(Self::Cpp)
+        } else if lower.ends_with(".cs") {
+            Some(Self::CSharp)
+        } else if lower.ends_with(".rb") || lower.ends_with(".rake") || lower.ends_with("gemfile") {
+            Some(Self::Ruby)
+        } else if lower.ends_with(".php") || lower.ends_with(".phtml") {
+            Some(Self::Php)
+        } else if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+            Some(Self::Yaml)
+        } else if lower.ends_with(".json") || lower.ends_with(".jsonc") {
+            Some(Self::Json)
+        } else if lower.ends_with(".sh")
+            || lower.ends_with(".bash")
+            || lower.ends_with(".zsh")
+            || lower.ends_with(".ksh")
+        {
+            Some(Self::Shell)
         } else {
             None
         }

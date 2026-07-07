@@ -54,7 +54,7 @@ pub(crate) struct WorkspacePatchFileViewDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WorkspacePatchFileViewReport {
+pub struct WorkspacePatchFileViewReport {
     pub(crate) schema_version: u32,
     pub(crate) run_id: String,
     pub(crate) hard_block: bool,

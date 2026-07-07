@@ -72,6 +72,7 @@ const CODE_INTEL_SKIPPED_DIRS: &[&str] =
     &[".git", "node_modules", "target", "dist", "build", ".next", ".svelte-kit"];
 const CODE_INTEL_MANIFEST_NAMES: &[&str] =
     &["Cargo.toml", "package.json", "pyproject.toml", "tsconfig.json", "jsconfig.json"];
+const LSP_REGISTRY_ONLY_FALLBACK: &str = "registry_only_lexical_fallback";
 pub(crate) const CODE_INTEL_RUST_SNAPSHOT_CAPTURED_EVENT: &str =
     "code_intel.rust.snapshot_captured";
 pub(crate) const CODE_INTEL_TYPESCRIPT_SNAPSHOT_CAPTURED_EVENT: &str =
@@ -85,17 +86,28 @@ pub(crate) struct LanguageServerDescriptor {
     pub language: CodeIntelLanguage,
     pub provider: String,
     pub binary_label: String,
+    pub file_patterns: Vec<String>,
     pub diagnostics_only: bool,
     pub supports_symbols: bool,
     pub supports_references: bool,
+    pub fallback: String,
     pub timeout_ms: u64,
     pub idle_reap_ms: u64,
     pub redaction_level: String,
     #[serde(skip)]
     binary: String,
+    #[serde(skip)]
+    integration: LanguageServerIntegration,
 }
 
-/// Static registry for the first diagnostics-capable language servers.
+/// Whether this rollout executes the provider or only exposes safe fallback metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanguageServerIntegration {
+    ExternalDiagnostics,
+    RegistryOnly,
+}
+
+/// Static registry for diagnostics-capable and fallback language servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LanguageServerRegistry {
     descriptors: BTreeMap<CodeIntelLanguage, LanguageServerDescriptor>,
@@ -103,37 +115,126 @@ pub(crate) struct LanguageServerRegistry {
 
 impl LanguageServerRegistry {
     fn from_config(config: &CodeIntelConfig) -> Self {
-        let descriptors = [
-            (CodeIntelLanguage::Rust, config.rust_analyzer_binary.as_str()),
-            (CodeIntelLanguage::TypeScript, config.typescript_server_binary.as_str()),
-            (CodeIntelLanguage::Python, config.pyright_binary.as_str()),
-        ]
-        .into_iter()
-        .map(|(language, binary)| {
-            (
-                language,
-                LanguageServerDescriptor {
+        let descriptors = CodeIntelLanguage::ALL
+            .iter()
+            .copied()
+            .map(|language| {
+                let binary = configured_lsp_binary(language, config);
+                (
                     language,
-                    provider: language.provider_name().to_owned(),
-                    binary_label: diagnostic_binary_label(binary),
-                    diagnostics_only: true,
-                    supports_symbols: true,
-                    supports_references: true,
-                    timeout_ms: config.timeout_ms,
-                    idle_reap_ms: config.idle_reap_ms,
-                    redaction_level:
-                        crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
-                            .to_owned(),
-                    binary: binary.to_owned(),
-                },
-            )
-        })
-        .collect();
+                    LanguageServerDescriptor {
+                        language,
+                        provider: language.provider_name().to_owned(),
+                        binary_label: diagnostic_binary_label(binary),
+                        file_patterns: language_file_patterns(language),
+                        diagnostics_only: true,
+                        supports_symbols: language_supports_symbols(language),
+                        supports_references: language_supports_references(language),
+                        fallback: language_fallback(language).to_owned(),
+                        timeout_ms: config.timeout_ms,
+                        idle_reap_ms: config.idle_reap_ms,
+                        redaction_level:
+                            crate::application::code_intel_runtime::CODE_INTEL_REDACTION_LEVEL
+                                .to_owned(),
+                        binary: binary.to_owned(),
+                        integration: language_server_integration(language),
+                    },
+                )
+            })
+            .collect();
         Self { descriptors }
     }
 
     fn descriptors(&self) -> Vec<LanguageServerDescriptor> {
         self.descriptors.values().cloned().collect()
+    }
+}
+
+fn configured_lsp_binary(language: CodeIntelLanguage, config: &CodeIntelConfig) -> &str {
+    match language {
+        CodeIntelLanguage::Rust => config.rust_analyzer_binary.as_str(),
+        CodeIntelLanguage::TypeScript => config.typescript_server_binary.as_str(),
+        CodeIntelLanguage::JavaScript => config.typescript_server_binary.as_str(),
+        CodeIntelLanguage::Python => config.pyright_binary.as_str(),
+        CodeIntelLanguage::Go => "gopls",
+        CodeIntelLanguage::Java => "jdtls",
+        CodeIntelLanguage::C | CodeIntelLanguage::Cpp => "clangd",
+        CodeIntelLanguage::CSharp => "omnisharp",
+        CodeIntelLanguage::Ruby => "solargraph",
+        CodeIntelLanguage::Php => "intelephense",
+        CodeIntelLanguage::Yaml => "yaml-language-server",
+        CodeIntelLanguage::Json => "vscode-json-language-server",
+        CodeIntelLanguage::Shell => "bash-language-server",
+    }
+}
+
+fn language_file_patterns(language: CodeIntelLanguage) -> Vec<String> {
+    match language {
+        CodeIntelLanguage::Rust => &["**/*.rs"][..],
+        CodeIntelLanguage::TypeScript => &["**/*.ts", "**/*.tsx"][..],
+        CodeIntelLanguage::JavaScript => &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"][..],
+        CodeIntelLanguage::Python => &["**/*.py", "**/*.pyi"][..],
+        CodeIntelLanguage::Go => &["**/*.go"][..],
+        CodeIntelLanguage::Java => &["**/*.java"][..],
+        CodeIntelLanguage::C => &["**/*.c", "**/*.h"][..],
+        CodeIntelLanguage::Cpp => &["**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hh", "**/*.hpp"][..],
+        CodeIntelLanguage::CSharp => &["**/*.cs"][..],
+        CodeIntelLanguage::Ruby => &["**/*.rb", "**/*.rake", "**/Gemfile"][..],
+        CodeIntelLanguage::Php => &["**/*.php", "**/*.phtml"][..],
+        CodeIntelLanguage::Yaml => &["**/*.yaml", "**/*.yml"][..],
+        CodeIntelLanguage::Json => &["**/*.json", "**/*.jsonc"][..],
+        CodeIntelLanguage::Shell => &["**/*.sh", "**/*.bash", "**/*.zsh", "**/*.ksh"][..],
+    }
+    .iter()
+    .map(|pattern| (*pattern).to_owned())
+    .collect()
+}
+
+const fn language_supports_symbols(language: CodeIntelLanguage) -> bool {
+    matches!(
+        language,
+        CodeIntelLanguage::Rust
+            | CodeIntelLanguage::TypeScript
+            | CodeIntelLanguage::JavaScript
+            | CodeIntelLanguage::Python
+            | CodeIntelLanguage::Go
+            | CodeIntelLanguage::Java
+            | CodeIntelLanguage::C
+            | CodeIntelLanguage::Cpp
+            | CodeIntelLanguage::CSharp
+            | CodeIntelLanguage::Ruby
+            | CodeIntelLanguage::Php
+            | CodeIntelLanguage::Shell
+    )
+}
+
+const fn language_supports_references(language: CodeIntelLanguage) -> bool {
+    language_supports_symbols(language)
+}
+
+const fn language_fallback(language: CodeIntelLanguage) -> &'static str {
+    if language_supports_symbols(language) {
+        "bounded_lexical_index"
+    } else {
+        LSP_REGISTRY_ONLY_FALLBACK
+    }
+}
+
+const fn language_server_integration(language: CodeIntelLanguage) -> LanguageServerIntegration {
+    match language {
+        CodeIntelLanguage::Rust | CodeIntelLanguage::TypeScript | CodeIntelLanguage::Python => {
+            LanguageServerIntegration::ExternalDiagnostics
+        }
+        _ => LanguageServerIntegration::RegistryOnly,
+    }
+}
+
+const fn provider_binary_config_key(language: CodeIntelLanguage) -> Option<&'static str> {
+    match language {
+        CodeIntelLanguage::Rust => Some("rust_analyzer"),
+        CodeIntelLanguage::TypeScript | CodeIntelLanguage::JavaScript => Some("typescript_server"),
+        CodeIntelLanguage::Python => Some("pyright"),
+        _ => None,
     }
 }
 
@@ -237,7 +338,6 @@ pub(crate) struct RangeShiftMapper {
 }
 
 impl RangeShiftMapper {
-    #[cfg(test)]
     fn new(shifts: Vec<RangeShift>) -> Self {
         let mut shifts_by_path = BTreeMap::<String, Vec<RangeShift>>::new();
         for shift in shifts {
@@ -562,6 +662,32 @@ pub(crate) fn diagnostic_delta(
     before: &DiagnosticSnapshot,
     after: &DiagnosticSnapshot,
 ) -> DiagnosticDelta {
+    diagnostic_delta_with_range_shifts(config, before, after, Vec::new())
+}
+
+/// Computes diagnostics delta while mapping after-patch line positions back to baseline lines.
+#[must_use]
+pub(crate) fn diagnostic_delta_with_range_shifts(
+    config: &CodeIntelConfig,
+    before: &DiagnosticSnapshot,
+    after: &DiagnosticSnapshot,
+    range_shifts: Vec<RangeShift>,
+) -> DiagnosticDelta {
+    let range_shift_mapper = if range_shifts.is_empty() {
+        let touched = after.files.iter().cloned().collect::<BTreeSet<_>>();
+        RangeShiftMapper::identity_for_files(&touched)
+    } else {
+        RangeShiftMapper::new(range_shifts)
+    };
+    diagnostic_delta_with_mapper(config, before, after, &range_shift_mapper)
+}
+
+fn diagnostic_delta_with_mapper(
+    config: &CodeIntelConfig,
+    before: &DiagnosticSnapshot,
+    after: &DiagnosticSnapshot,
+    range_shift_mapper: &RangeShiftMapper,
+) -> DiagnosticDelta {
     if !after.enabled {
         return DiagnosticDelta {
             schema_version: CODE_INTEL_SCHEMA_VERSION,
@@ -577,7 +703,6 @@ pub(crate) fn diagnostic_delta(
     }
 
     let touched = after.files.iter().cloned().collect::<BTreeSet<_>>();
-    let range_shift_mapper = RangeShiftMapper::identity_for_files(&touched);
     let before_severity_by_key = before
         .items
         .iter()
@@ -591,7 +716,7 @@ pub(crate) fn diagnostic_delta(
             continue;
         }
         let previous = before_severity_by_key
-            .get(&diagnostic_key_without_severity_with_mapper(item, &range_shift_mapper));
+            .get(&diagnostic_key_without_severity_with_mapper(item, range_shift_mapper));
         if previous.is_none_or(|severity| item.severity > *severity) {
             if items.len() >= config.max_items {
                 truncated = true;
@@ -1091,9 +1216,11 @@ fn code_intel_health_output(
                 "language": descriptor.language,
                 "provider": descriptor.provider,
                 "binary_label": descriptor.binary_label,
+                "file_patterns": descriptor.file_patterns,
                 "diagnostics_only": descriptor.diagnostics_only,
                 "supports_symbols": descriptor.supports_symbols,
                 "supports_references": descriptor.supports_references,
+                "fallback": descriptor.fallback,
                 "timeout_ms": descriptor.timeout_ms,
                 "idle_reap_ms": descriptor.idle_reap_ms,
                 "redaction_level": descriptor.redaction_level,
@@ -1377,8 +1504,34 @@ fn parse_symbol_line(
 ) -> Option<CodeSymbol> {
     match language {
         CodeIntelLanguage::Rust => parse_rust_symbol_line(path, line_number, line),
-        CodeIntelLanguage::TypeScript => parse_typescript_symbol_line(path, line_number, line),
+        CodeIntelLanguage::TypeScript => {
+            parse_typescript_symbol_line(CodeIntelLanguage::TypeScript, path, line_number, line)
+        }
+        CodeIntelLanguage::JavaScript => {
+            parse_typescript_symbol_line(CodeIntelLanguage::JavaScript, path, line_number, line)
+        }
         CodeIntelLanguage::Python => parse_python_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Go => parse_go_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Java => parse_java_symbol_line(path, line_number, line),
+        CodeIntelLanguage::C => parse_c_family_symbol_line(
+            CodeIntelLanguage::C,
+            path,
+            line_number,
+            line,
+            &["struct ", "enum ", "typedef "],
+        ),
+        CodeIntelLanguage::Cpp => parse_c_family_symbol_line(
+            CodeIntelLanguage::Cpp,
+            path,
+            line_number,
+            line,
+            &["class ", "struct ", "enum ", "namespace "],
+        ),
+        CodeIntelLanguage::CSharp => parse_csharp_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Ruby => parse_ruby_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Php => parse_php_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Shell => parse_shell_symbol_line(path, line_number, line),
+        CodeIntelLanguage::Yaml | CodeIntelLanguage::Json => None,
     }
 }
 
@@ -1420,7 +1573,12 @@ fn parse_rust_symbol_line(path: &str, line_number: usize, line: &str) -> Option<
     None
 }
 
-fn parse_typescript_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+fn parse_typescript_symbol_line(
+    language: CodeIntelLanguage,
+    path: &str,
+    line_number: usize,
+    line: &str,
+) -> Option<CodeSymbol> {
     let trimmed = line.trim_start();
     let visibility = if trimmed.starts_with("export ") { "public" } else { "module_private" };
     let without_export = trimmed
@@ -1439,15 +1597,7 @@ fn parse_typescript_symbol_line(path: &str, line_number: usize, line: &str) -> O
     ] {
         if let Some(rest) = without_async.strip_prefix(keyword) {
             let name = take_identifier(rest)?;
-            return Some(code_symbol(
-                CodeIntelLanguage::TypeScript,
-                path,
-                line_number,
-                line,
-                name,
-                kind,
-                visibility,
-            ));
+            return Some(code_symbol(language, path, line_number, line, name, kind, visibility));
         }
     }
     None
@@ -1463,6 +1613,263 @@ fn parse_python_symbol_line(path: &str, line_number: usize, line: &str) -> Optio
     let name = take_identifier(rest)?;
     let visibility = if name.starts_with('_') { "private" } else { "public" };
     Some(code_symbol(CodeIntelLanguage::Python, path, line_number, line, name, kind, visibility))
+}
+
+fn parse_go_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("func ") {
+        let rest = rest.trim_start();
+        let rest = if rest.starts_with('(') {
+            rest.find(')').and_then(|index| rest.get(index.saturating_add(1)..))?.trim_start()
+        } else {
+            rest
+        };
+        let name = take_identifier(rest)?;
+        let visibility = if name.chars().next().is_some_and(char::is_uppercase) {
+            "public"
+        } else {
+            "package_private"
+        };
+        return Some(code_symbol(
+            CodeIntelLanguage::Go,
+            path,
+            line_number,
+            line,
+            name,
+            "function",
+            visibility,
+        ));
+    }
+    for (keyword, kind) in [("type ", "type"), ("const ", "constant"), ("var ", "variable")] {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                CodeIntelLanguage::Go,
+                path,
+                line_number,
+                line,
+                name,
+                kind,
+                "package_private",
+            ));
+        }
+    }
+    None
+}
+
+fn parse_java_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = strip_leading_modifiers(
+        line.trim_start(),
+        &["public", "private", "protected", "static", "final", "abstract", "sealed"],
+    );
+    for (keyword, kind) in
+        [("class ", "class"), ("interface ", "interface"), ("enum ", "enum"), ("record ", "record")]
+    {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                CodeIntelLanguage::Java,
+                path,
+                line_number,
+                line,
+                name,
+                kind,
+                java_visibility(line),
+            ));
+        }
+    }
+    parse_callable_symbol_line(
+        CodeIntelLanguage::Java,
+        path,
+        line_number,
+        line,
+        "method",
+        java_visibility(line),
+    )
+}
+
+fn parse_c_family_symbol_line(
+    language: CodeIntelLanguage,
+    path: &str,
+    line_number: usize,
+    line: &str,
+    type_keywords: &[&str],
+) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    for keyword in type_keywords {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                language,
+                path,
+                line_number,
+                line,
+                name,
+                keyword.trim(),
+                "translation_unit",
+            ));
+        }
+    }
+    parse_callable_symbol_line(language, path, line_number, line, "function", "translation_unit")
+}
+
+fn parse_csharp_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = strip_leading_modifiers(
+        line.trim_start(),
+        &["public", "private", "protected", "internal", "static", "sealed", "abstract"],
+    );
+    for (keyword, kind) in [
+        ("class ", "class"),
+        ("interface ", "interface"),
+        ("enum ", "enum"),
+        ("struct ", "struct"),
+        ("record ", "record"),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(keyword) {
+            let name = take_identifier(rest)?;
+            return Some(code_symbol(
+                CodeIntelLanguage::CSharp,
+                path,
+                line_number,
+                line,
+                name,
+                kind,
+                csharp_visibility(line),
+            ));
+        }
+    }
+    parse_callable_symbol_line(
+        CodeIntelLanguage::CSharp,
+        path,
+        line_number,
+        line,
+        "method",
+        csharp_visibility(line),
+    )
+}
+
+fn parse_ruby_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    let (rest, kind) = trimmed
+        .strip_prefix("def ")
+        .map(|rest| (rest, "function"))
+        .or_else(|| trimmed.strip_prefix("class ").map(|rest| (rest, "class")))
+        .or_else(|| trimmed.strip_prefix("module ").map(|rest| (rest, "module")))?;
+    let name = take_identifier(rest)?;
+    Some(code_symbol(CodeIntelLanguage::Ruby, path, line_number, line, name, kind, "public"))
+}
+
+fn parse_php_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = strip_leading_modifiers(
+        line.trim_start(),
+        &["public", "private", "protected", "static", "final", "abstract"],
+    );
+    let (rest, kind) = trimmed
+        .strip_prefix("function ")
+        .map(|rest| (rest, "function"))
+        .or_else(|| trimmed.strip_prefix("class ").map(|rest| (rest, "class")))
+        .or_else(|| trimmed.strip_prefix("interface ").map(|rest| (rest, "interface")))
+        .or_else(|| trimmed.strip_prefix("trait ").map(|rest| (rest, "trait")))?;
+    let name = take_identifier(rest.trim_start_matches('&'))?;
+    Some(code_symbol(CodeIntelLanguage::Php, path, line_number, line, name, kind, "public"))
+}
+
+fn parse_shell_symbol_line(path: &str, line_number: usize, line: &str) -> Option<CodeSymbol> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("function ") {
+        let name = take_identifier(rest)?;
+        return Some(code_symbol(
+            CodeIntelLanguage::Shell,
+            path,
+            line_number,
+            line,
+            name,
+            "function",
+            "script",
+        ));
+    }
+    let (candidate, rest) = trimmed.split_once("()")?;
+    if !rest.trim_start().starts_with('{') {
+        return None;
+    }
+    let name = take_identifier(candidate.trim())?;
+    Some(code_symbol(CodeIntelLanguage::Shell, path, line_number, line, name, "function", "script"))
+}
+
+fn parse_callable_symbol_line(
+    language: CodeIntelLanguage,
+    path: &str,
+    line_number: usize,
+    line: &str,
+    kind: &str,
+    visibility: &str,
+) -> Option<CodeSymbol> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.ends_with(';')
+        || !trimmed.contains('(')
+        || !trimmed.contains(')')
+    {
+        return None;
+    }
+    for control in ["if", "for", "while", "switch", "catch", "return"] {
+        if trimmed.starts_with(control) {
+            return None;
+        }
+    }
+    let before_paren = trimmed.split_once('(')?.0.trim_end();
+    let name_start = before_paren
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| (!is_identifier_char(ch)).then_some(index + ch.len_utf8()))
+        .unwrap_or(0);
+    let name = before_paren.get(name_start..)?.trim();
+    let name = take_identifier(name)?;
+    Some(code_symbol(language, path, line_number, line, name, kind, visibility))
+}
+
+fn strip_leading_modifiers<'a>(mut value: &'a str, modifiers: &[&str]) -> &'a str {
+    loop {
+        let before = value;
+        for modifier in modifiers {
+            if let Some(rest) = value.strip_prefix(modifier) {
+                if rest.chars().next().is_some_and(char::is_whitespace) {
+                    value = rest.trim_start();
+                    break;
+                }
+            }
+        }
+        if value == before {
+            return value;
+        }
+    }
+}
+
+fn java_visibility(line: &str) -> &'static str {
+    if line.trim_start().starts_with("public ") {
+        "public"
+    } else if line.trim_start().starts_with("private ") {
+        "private"
+    } else if line.trim_start().starts_with("protected ") {
+        "protected"
+    } else {
+        "package_private"
+    }
+}
+
+fn csharp_visibility(line: &str) -> &'static str {
+    if line.trim_start().starts_with("public ") {
+        "public"
+    } else if line.trim_start().starts_with("private ") {
+        "private"
+    } else if line.trim_start().starts_with("protected ") {
+        "protected"
+    } else if line.trim_start().starts_with("internal ") {
+        "internal"
+    } else {
+        "private"
+    }
 }
 
 fn code_symbol(
@@ -1791,10 +2198,7 @@ fn code_intel_provider_health(
     if !config.enabled {
         return manager.disabled_provider_statuses();
     }
-    let languages =
-        [CodeIntelLanguage::Rust, CodeIntelLanguage::TypeScript, CodeIntelLanguage::Python]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+    let languages = CodeIntelLanguage::ALL.iter().copied().collect::<BTreeSet<_>>();
     let mut statuses = manager.provider_statuses(&languages);
     if workspace_roots.is_empty() {
         for status in &mut statuses {
@@ -1928,6 +2332,29 @@ fn patch_impact_verification_guidance(
     if languages.contains(&CodeIntelLanguage::Python) {
         guidance
             .push("Run the relevant Python type or unit checks for touched modules.".to_owned());
+    }
+    if languages.contains(&CodeIntelLanguage::Go) {
+        guidance.push("Run go test or go test ./... for touched Go packages.".to_owned());
+    }
+    if languages.iter().any(|language| {
+        matches!(
+            language,
+            CodeIntelLanguage::Java
+                | CodeIntelLanguage::C
+                | CodeIntelLanguage::Cpp
+                | CodeIntelLanguage::CSharp
+                | CodeIntelLanguage::Ruby
+                | CodeIntelLanguage::Php
+                | CodeIntelLanguage::JavaScript
+                | CodeIntelLanguage::Yaml
+                | CodeIntelLanguage::Json
+                | CodeIntelLanguage::Shell
+        )
+    }) {
+        guidance.push(
+            "Run the project-specific lint, typecheck, or unit checks for touched languages."
+                .to_owned(),
+        );
     }
     if risk_level == "medium" || risk_level == "high" {
         guidance.push("Inspect references for public or multi-file symbol changes.".to_owned());
@@ -3407,6 +3834,21 @@ fn provider_status_for_descriptor(
             repair_hint: "No touched file uses this language provider.".to_owned(),
         };
     }
+    if descriptor.integration == LanguageServerIntegration::RegistryOnly {
+        return CodeIntelProviderStatus {
+            provider: descriptor.provider,
+            language: descriptor.language,
+            status: "degraded".to_owned(),
+            binary: descriptor.binary_label,
+            reason_code: format!(
+                "code_intel.provider_registry_only.{}",
+                descriptor.language.as_str()
+            ),
+            repair_hint:
+                "Provider is registered for routing and semantic fallback; external diagnostics are not executed by this rollout."
+                    .to_owned(),
+        };
+    }
     if executable_is_available(descriptor.binary.as_str()) {
         CodeIntelProviderStatus {
             provider: descriptor.provider,
@@ -3424,13 +3866,14 @@ fn provider_status_for_descriptor(
             binary: descriptor.binary_label.clone(),
             reason_code: format!("code_intel.provider_missing.{}", descriptor.language.as_str()),
             repair_hint: format!(
-                "Install '{}' or set tool_call.code_intel.{}_binary to an executable path.",
+                "Install '{}'{}.",
                 descriptor.binary_label,
-                match descriptor.language {
-                    CodeIntelLanguage::Rust => "rust_analyzer",
-                    CodeIntelLanguage::TypeScript => "typescript_server",
-                    CodeIntelLanguage::Python => "pyright",
-                }
+                provider_binary_config_key(descriptor.language).map_or_else(
+                    || " before enabling this provider".to_owned(),
+                    |key| format!(
+                        " or set tool_call.code_intel.{key}_binary to an executable path"
+                    ),
+                )
             ),
         }
     }
@@ -3595,11 +4038,11 @@ mod tests {
         );
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.reason_codes, vec!["code_intel.disabled"]);
-        assert_eq!(snapshot.provider_status.len(), 3);
+        assert_eq!(snapshot.provider_status.len(), CodeIntelLanguage::ALL.len());
     }
 
     #[test]
-    fn language_server_registry_redacts_binary_paths_and_limits_scope() {
+    fn language_server_registry_redacts_binary_paths_and_lists_supported_languages() {
         let config = CodeIntelConfig {
             enabled: true,
             rust_analyzer_binary: "tools/rust-analyzer".to_owned(),
@@ -3617,6 +4060,7 @@ mod tests {
             .find(|status| status.language == CodeIntelLanguage::Rust)
             .expect("rust status should exist");
 
+        assert_eq!(descriptors.len(), CodeIntelLanguage::ALL.len());
         assert!(rust.diagnostics_only);
         assert_eq!(rust.binary_label, "rust-analyzer");
         assert_eq!(rust_status.binary, "rust-analyzer");
@@ -3626,12 +4070,31 @@ mod tests {
     }
 
     #[test]
-    fn lexical_symbol_extractor_supports_rust_typescript_and_python() {
+    fn registry_only_language_degrades_to_explicit_fallback() {
+        let config = CodeIntelConfig { enabled: true, ..CodeIntelConfig::default() };
+        let manager = LspProcessManager::from_config(&config);
+        let statuses = manager.provider_statuses(&BTreeSet::from([CodeIntelLanguage::Go]));
+        let go_status = statuses
+            .iter()
+            .find(|status| status.language == CodeIntelLanguage::Go)
+            .expect("go status should exist");
+
+        assert_eq!(go_status.status, "degraded");
+        assert_eq!(go_status.reason_code, "code_intel.provider_registry_only.go");
+        assert!(go_status.repair_hint.contains("semantic fallback"));
+    }
+
+    #[test]
+    fn lexical_symbol_extractor_supports_primary_and_fallback_languages() {
         let rust_fixture = include_str!("../../../../../fixtures/code-intel/rust/src/lib.rs");
         let typescript_fixture =
             include_str!("../../../../../fixtures/code-intel/typescript/src/widget.ts");
         let python_fixture =
             include_str!("../../../../../fixtures/code-intel/python/src/widget.py");
+        let javascript_fixture =
+            include_str!("../../../../../fixtures/code-intel/javascript/src/widget.js");
+        let go_fixture = include_str!("../../../../../fixtures/code-intel/go/widget.go");
+        let java_fixture = include_str!("../../../../../fixtures/code-intel/java/src/Widget.java");
 
         let (rust_symbols, rust_truncated) = extract_symbols_from_source(
             Some(CodeIntelLanguage::Rust),
@@ -3651,13 +4114,33 @@ mod tests {
             python_fixture,
             16,
         );
+        let (javascript_symbols, javascript_truncated) = extract_symbols_from_source(
+            Some(CodeIntelLanguage::JavaScript),
+            "src/widget.js",
+            javascript_fixture,
+            16,
+        );
+        let (go_symbols, go_truncated) =
+            extract_symbols_from_source(Some(CodeIntelLanguage::Go), "widget.go", go_fixture, 16);
+        let (java_symbols, java_truncated) = extract_symbols_from_source(
+            Some(CodeIntelLanguage::Java),
+            "src/Widget.java",
+            java_fixture,
+            16,
+        );
 
         assert!(!rust_truncated);
         assert!(!typescript_truncated);
         assert!(!python_truncated);
+        assert!(!javascript_truncated);
+        assert!(!go_truncated);
+        assert!(!java_truncated);
         assert!(rust_symbols.iter().any(|symbol| symbol.name == "build_widget"));
         assert!(typescript_symbols.iter().any(|symbol| symbol.name == "buildWidget"));
         assert!(python_symbols.iter().any(|symbol| symbol.name == "build_widget"));
+        assert!(javascript_symbols.iter().any(|symbol| symbol.name == "buildWidget"));
+        assert!(go_symbols.iter().any(|symbol| symbol.name == "BuildWidget"));
+        assert!(java_symbols.iter().any(|symbol| symbol.name == "Widget"));
     }
 
     #[test]
@@ -4111,6 +4594,50 @@ mod tests {
         assert_eq!(delta.new_errors, 1);
         assert_eq!(delta.items.len(), 1);
         assert_eq!(delta.items[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn diagnostic_delta_maps_after_lines_to_baseline_positions() {
+        let config = CodeIntelConfig { enabled: true, max_items: 8, ..CodeIntelConfig::default() };
+        let before = DiagnosticSnapshot {
+            schema_version: CODE_INTEL_SCHEMA_VERSION,
+            enabled: true,
+            workspace_root: Some("workspace".to_owned()),
+            files: vec!["src/lib.rs".to_owned()],
+            provider_status: Vec::new(),
+            items: vec![CodeDiagnostic {
+                language: CodeIntelLanguage::Rust,
+                path: "src/lib.rs".to_owned(),
+                line: 12,
+                column: 4,
+                severity: DiagnosticSeverity::Warning,
+                code: Some("unused".to_owned()),
+                message: "same issue".to_owned(),
+                source: "rust-analyzer".to_owned(),
+            }],
+            truncated: false,
+            degraded: false,
+            reason_codes: Vec::new(),
+        };
+        let after = DiagnosticSnapshot {
+            items: vec![CodeDiagnostic { line: 14, ..before.items[0].clone() }],
+            ..before.clone()
+        };
+
+        let delta = diagnostic_delta_with_range_shifts(
+            &config,
+            &before,
+            &after,
+            vec![RangeShift {
+                path: "src/lib.rs".to_owned(),
+                start_line: 10,
+                old_line_count: 1,
+                new_line_count: 3,
+            }],
+        );
+
+        assert_eq!(delta.new_warnings, 0);
+        assert!(delta.items.is_empty());
     }
 
     #[test]

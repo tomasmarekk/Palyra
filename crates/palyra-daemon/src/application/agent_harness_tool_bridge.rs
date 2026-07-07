@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::application::{
+    codex_app_server_harness::CODEX_APP_SERVER_HARNESS_ID,
+    file_view_registry::WorkspacePatchFileViewReport,
+};
+
+pub const CODEX_EVENT_PROJECTOR_SCHEMA_VERSION: u32 = 1;
+pub const CODEX_EVENT_PROJECTOR_REDACTION_LEVEL: &str = "metadata_and_redacted_summary";
+pub const CODEX_EVENT_QUEUE_MAX_PENDING: usize = 128;
+
 /// Tool call proposed by a harness against a catalog snapshot it observed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +101,32 @@ pub struct HarnessVisibleToolResult {
     pub summary: String,
 }
 
+/// Projected Codex app-server event before host-owned executor dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexEventProjection {
+    pub schema_version: u32,
+    pub allowed: bool,
+    pub reason_code: String,
+    pub route: String,
+    pub normalized_tool_name: Option<String>,
+    pub approval_required: bool,
+    pub execution_gate_required: bool,
+    pub synthetic_result: Option<HarnessVisibleToolResult>,
+    pub journal_event_type: String,
+    pub redaction_level: String,
+}
+
+/// Backpressure decision for the Codex event queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexEventBackpressureDecision {
+    pub accepted: bool,
+    pub pending_events: usize,
+    pub max_pending_events: usize,
+    pub reason_code: &'static str,
+}
+
 /// Bridge validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum HarnessToolBridgeError {
@@ -150,6 +185,167 @@ pub fn evaluate_harness_tool_call(
         execution_gate_required: true,
         harness_visible_result: None,
     })
+}
+
+/// Maps a Codex command event onto the host-owned process execution tool.
+///
+/// # Errors
+/// Returns [`HarnessToolBridgeError`] when the synthetic host tool request is malformed
+/// or references a stale catalog snapshot.
+pub fn project_codex_command_event(
+    run_id: &str,
+    tool_call_id: &str,
+    raw_args: Value,
+    catalog_snapshot_id: &str,
+    policy: &HarnessToolBridgePolicy,
+) -> Result<CodexEventProjection, HarnessToolBridgeError> {
+    let request = HarnessToolCallRequest {
+        harness_id: CODEX_APP_SERVER_HARNESS_ID.to_owned(),
+        run_id: run_id.to_owned(),
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "palyra.process.run".to_owned(),
+        raw_args,
+        catalog_snapshot_id: catalog_snapshot_id.to_owned(),
+        replay_metadata: HarnessToolReplayMetadata {
+            replay_safe: false,
+            tool_surface_hash: "codex-command-event".to_owned(),
+        },
+        mutating: true,
+    };
+    let decision = evaluate_harness_tool_call(&request, policy)?;
+    Ok(codex_projection_from_tool_decision(
+        decision,
+        "codex.command.mapped_to_process",
+        "host_tool:palyra.process.run",
+    ))
+}
+
+/// Maps a Codex fileChange event onto the patch pipeline and file-view guard.
+#[must_use]
+pub fn project_codex_file_change_event(
+    file_view_report: &WorkspacePatchFileViewReport,
+) -> CodexEventProjection {
+    if file_view_report.hard_block {
+        return CodexEventProjection {
+            schema_version: CODEX_EVENT_PROJECTOR_SCHEMA_VERSION,
+            allowed: false,
+            reason_code: "codex.file_change.stale_view_blocked".to_owned(),
+            route: "host_tool:palyra.fs.apply_patch".to_owned(),
+            normalized_tool_name: Some("palyra.fs.apply_patch".to_owned()),
+            approval_required: false,
+            execution_gate_required: true,
+            synthetic_result: Some(HarnessVisibleToolResult {
+                status: "denied".to_owned(),
+                summary: "File change was denied by the stale file-view guard.".to_owned(),
+            }),
+            journal_event_type: "codex.event.file_change.denied".to_owned(),
+            redaction_level: CODEX_EVENT_PROJECTOR_REDACTION_LEVEL.to_owned(),
+        };
+    }
+    CodexEventProjection {
+        schema_version: CODEX_EVENT_PROJECTOR_SCHEMA_VERSION,
+        allowed: true,
+        reason_code: "codex.file_change.patch_pipeline".to_owned(),
+        route: "host_tool:palyra.fs.apply_patch".to_owned(),
+        normalized_tool_name: Some("palyra.fs.apply_patch".to_owned()),
+        approval_required: true,
+        execution_gate_required: true,
+        synthetic_result: None,
+        journal_event_type: "codex.event.file_change.projected".to_owned(),
+        redaction_level: CODEX_EVENT_PROJECTOR_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+/// Maps an MCP or dynamic tool request through the visible host tool catalog.
+///
+/// # Errors
+/// Returns [`HarnessToolBridgeError`] for malformed or stale request metadata.
+pub fn project_codex_dynamic_tool_event(
+    request: &HarnessToolCallRequest,
+    policy: &HarnessToolBridgePolicy,
+) -> Result<CodexEventProjection, HarnessToolBridgeError> {
+    let decision = evaluate_harness_tool_call(request, policy)?;
+    Ok(codex_projection_from_tool_decision(
+        decision,
+        "codex.tool.mapped_through_catalog",
+        "host_tool_catalog",
+    ))
+}
+
+/// Records an opaque Codex event without letting unrecognized payloads crash the adapter.
+#[must_use]
+pub fn project_codex_opaque_event(event_kind: &str) -> CodexEventProjection {
+    CodexEventProjection {
+        schema_version: CODEX_EVENT_PROJECTOR_SCHEMA_VERSION,
+        allowed: true,
+        reason_code: "codex.event.opaque_recorded".to_owned(),
+        route: "journal:redacted_opaque_event".to_owned(),
+        normalized_tool_name: None,
+        approval_required: false,
+        execution_gate_required: false,
+        synthetic_result: None,
+        journal_event_type: format!("codex.event.opaque.{}", sanitize_event_kind(event_kind)),
+        redaction_level: CODEX_EVENT_PROJECTOR_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+/// Applies bounded queue backpressure before accepting another Codex event.
+#[must_use]
+pub const fn codex_event_backpressure(
+    pending_events: usize,
+    max_pending_events: usize,
+) -> CodexEventBackpressureDecision {
+    if pending_events >= max_pending_events {
+        CodexEventBackpressureDecision {
+            accepted: false,
+            pending_events,
+            max_pending_events,
+            reason_code: "codex.event_queue.backpressure",
+        }
+    } else {
+        CodexEventBackpressureDecision {
+            accepted: true,
+            pending_events,
+            max_pending_events,
+            reason_code: "codex.event_queue.accepted",
+        }
+    }
+}
+
+fn codex_projection_from_tool_decision(
+    decision: HarnessToolBridgeDecision,
+    reason_code: &str,
+    route: &str,
+) -> CodexEventProjection {
+    CodexEventProjection {
+        schema_version: CODEX_EVENT_PROJECTOR_SCHEMA_VERSION,
+        allowed: decision.allowed,
+        reason_code: if decision.allowed { reason_code.to_owned() } else { decision.reason_code },
+        route: route.to_owned(),
+        normalized_tool_name: Some(decision.normalized_tool_name),
+        approval_required: decision.approval_required,
+        execution_gate_required: decision.execution_gate_required,
+        synthetic_result: decision.harness_visible_result,
+        journal_event_type: if decision.allowed {
+            "codex.event.projected".to_owned()
+        } else {
+            "codex.event.denied".to_owned()
+        },
+        redaction_level: CODEX_EVENT_PROJECTOR_REDACTION_LEVEL.to_owned(),
+    }
+}
+
+fn sanitize_event_kind(event_kind: &str) -> String {
+    let sanitized = event_kind
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_owned()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
 }
 
 fn denied_decision(normalized_tool_name: String, reason_code: &str) -> HarnessToolBridgeDecision {
@@ -328,5 +524,79 @@ mod tests {
             .expect_err("snapshot mismatch should fail before projection");
 
         assert_eq!(error, HarnessToolBridgeError::CatalogSnapshotMismatch);
+    }
+
+    #[test]
+    fn codex_command_projection_uses_host_process_tool_and_approval() {
+        let policy = HarnessToolBridgePolicy::new(["palyra.process.run"], "catalog-1");
+
+        let projection = project_codex_command_event(
+            "run-1",
+            "call-1",
+            json!({"command":"cargo","args":["test"]}),
+            "catalog-1",
+            &policy,
+        )
+        .expect("codex command should project");
+
+        assert!(projection.allowed);
+        assert_eq!(projection.normalized_tool_name.as_deref(), Some("palyra.process.run"));
+        assert!(projection.approval_required);
+        assert!(projection.execution_gate_required);
+    }
+
+    #[test]
+    fn codex_file_change_projection_uses_stale_view_guard() {
+        let report = crate::application::file_view_registry::WorkspacePatchFileViewReport {
+            schema_version: 1,
+            run_id: "run-1".to_owned(),
+            hard_block: true,
+            diagnostics: Vec::new(),
+        };
+
+        let projection = project_codex_file_change_event(&report);
+
+        assert!(!projection.allowed);
+        assert_eq!(projection.reason_code, "codex.file_change.stale_view_blocked");
+        assert_eq!(
+            projection.synthetic_result.as_ref().map(|result| result.status.as_str()),
+            Some("denied")
+        );
+    }
+
+    #[test]
+    fn codex_dynamic_tool_denial_returns_synthetic_result() {
+        let policy = HarnessToolBridgePolicy::new(["palyra.fs.read_file"], "catalog-1");
+        let request = request("palyra.mcp.unseen", false);
+
+        let projection = project_codex_dynamic_tool_event(&request, &policy)
+            .expect("unknown dynamic tool should project to denied result");
+
+        assert!(!projection.allowed);
+        assert_eq!(projection.reason_code, "harness_tool.not_in_catalog_snapshot");
+        assert_eq!(
+            projection.synthetic_result.as_ref().map(|result| result.status.as_str()),
+            Some("denied")
+        );
+    }
+
+    #[test]
+    fn codex_opaque_event_is_sanitized_and_recorded() {
+        let projection = project_codex_opaque_event("trace.delta/raw");
+
+        assert!(projection.allowed);
+        assert_eq!(projection.reason_code, "codex.event.opaque_recorded");
+        assert_eq!(projection.journal_event_type, "codex.event.opaque.trace_delta_raw");
+    }
+
+    #[test]
+    fn codex_event_backpressure_rejects_full_queue() {
+        let accepted = codex_event_backpressure(2, 3);
+        let rejected =
+            codex_event_backpressure(CODEX_EVENT_QUEUE_MAX_PENDING, CODEX_EVENT_QUEUE_MAX_PENDING);
+
+        assert!(accepted.accepted);
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.reason_code, "codex.event_queue.backpressure");
     }
 }
