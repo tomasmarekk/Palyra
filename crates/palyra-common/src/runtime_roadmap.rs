@@ -540,7 +540,8 @@ runtime_roadmap_enum! {
         ToolCall => "tool_call",
         FilePatch => "file_patch",
         Lsp => "lsp",
-        Compaction => "compaction"
+        Compaction => "compaction",
+        ExecutionBackends => "execution_backends"
     }
 }
 
@@ -1022,6 +1023,22 @@ pub fn backend_runtime_fixture_taxonomy() -> Vec<BackendRuntimeFixture> {
             expected_terminal_state: "done",
             expected_journal_events: &["compaction.safeguard.recorded", "tool.gate.decision"],
             evidence_refs: &["qa/scenarios/compaction_retry_mutating_tool.yaml"],
+        }),
+        backend_runtime_fixture(BackendRuntimeFixtureInput {
+            fixture_id: "execution_backend_security_matrix",
+            area: BackendRuntimeFixtureArea::ExecutionBackends,
+            source_path: "fixtures/golden/execution_backend_security_matrix.json",
+            risk_classification: "p0_execution_backend_security",
+            expected_runtime_path: "execution_backend_security_matrix",
+            expected_terminal_state: "blocked_until_suite_passed",
+            expected_journal_events: &[
+                "execution_backend.parity.cleanup_verified",
+                "execution_backend.parity.forbidden_fallback_checked",
+            ],
+            evidence_refs: &[
+                "qa/scenarios/execution_backends/backend_parity.yaml",
+                "fixtures/golden/execution_backend_security_matrix.json",
+            ],
         }),
     ]
 }
@@ -2226,7 +2243,7 @@ mod tests {
         assert_eq!(from_disk, generated);
         let projection = project_backend_runtime_fixture_taxonomy(from_disk.as_slice())
             .expect("backend runtime fixture taxonomy should project");
-        assert_eq!(projection.fixtures_total, 6);
+        assert_eq!(projection.fixtures_total, 7);
         assert_eq!(
             projection.areas,
             vec![
@@ -2236,6 +2253,7 @@ mod tests {
                 BackendRuntimeFixtureArea::FilePatch,
                 BackendRuntimeFixtureArea::Lsp,
                 BackendRuntimeFixtureArea::Compaction,
+                BackendRuntimeFixtureArea::ExecutionBackends,
             ]
         );
         assert!(projection
