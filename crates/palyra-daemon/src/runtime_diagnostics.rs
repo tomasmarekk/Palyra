@@ -59,6 +59,8 @@ pub(crate) const RUNTIME_TIMELINE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const METRICS_CATALOG_SCHEMA_VERSION: u32 = 1;
 /// Schema version for redacted local trace export records.
 pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
+/// Schema version for per-run stage timing records.
+pub(crate) const RUN_STAGE_TIMING_SCHEMA_VERSION: u32 = 1;
 /// Schema version for per-run runtime path summaries.
 pub(crate) const RUN_RUNTIME_PATH_SCHEMA_VERSION: u32 = 1;
 /// Journal/tape event name for terminal runtime path summaries.
@@ -84,6 +86,18 @@ const DAEMON_STARTUP_BASELINE_RSS_BYTES: u64 = 256 * 1024 * 1024;
 const AGENT_LOOP_BASELINE_RSS_BYTES: u64 = 384 * 1024 * 1024;
 const DIAGNOSTICS_TIMELINE_PAYLOAD_LIMIT_BYTES: usize = 2_048;
 const PROMETHEUS_SERIES_CAP: u64 = 256;
+const RUN_STAGE_NAMES: &[&str] = &[
+    "prepare",
+    "context_assembly",
+    "provider_request",
+    "first_token",
+    "first_tool_call",
+    "tool_wait",
+    "compaction",
+    "finalization",
+    "delivery",
+    "abort_settle",
+];
 const FORBIDDEN_METRIC_LABEL_KEYS: &[&str] =
     &["run_id", "session_id", "tool_call_id", "path", "principal", "raw_user", "prompt"];
 const BOUNDED_METRIC_LABEL_KEYS: &[&str] =
@@ -295,6 +309,84 @@ pub(crate) struct TraceSpanRecord {
     pub(crate) correlation: BTreeMap<String, String>,
     pub(crate) attributes: Value,
     pub(crate) redaction_level: String,
+}
+
+/// Phase that owns a timeout. This keeps provider hard timeouts, provider
+/// stream idleness, tool wait timeouts, and abort settling separate in exports.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunStageTimeoutKind {
+    ProviderHard,
+    ProviderIdle,
+    ToolWait,
+    AbortSettle,
+}
+
+impl RunStageTimeoutKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderHard => "provider_hard_timeout",
+            Self::ProviderIdle => "provider_idle_timeout",
+            Self::ToolWait => "tool_wait_timeout",
+            Self::AbortSettle => "abort_settle_timeout",
+        }
+    }
+}
+
+/// Raw stage timing input collected by a run loop or reconstructed from a
+/// replay capture. Payload-bearing fields deliberately stay out of this type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunStageTimingInput {
+    pub(crate) stage: String,
+    pub(crate) started_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_signal_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_kind: Option<RunStageTimeoutKind>,
+    pub(crate) outcome: String,
+}
+
+/// Redacted and bounded stage timing record stored in run traces and support
+/// bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunStageTimingRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) stage: String,
+    pub(crate) started_at_unix_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) first_signal_at_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) idle_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timeout_classification: Option<String>,
+    pub(crate) outcome: String,
+    pub(crate) diagnostics_code: String,
+    pub(crate) redaction_level: String,
+}
+
+/// Full timing summary for one run. Missing stages are reported explicitly so
+/// support can distinguish "not observed" from "observed and fast".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunStageTimingReport {
+    pub(crate) schema_version: u32,
+    pub(crate) redaction_level: String,
+    pub(crate) records: Vec<RunStageTimingRecord>,
+    pub(crate) missing_stages: Vec<String>,
+    pub(crate) timeout_classifications: Vec<String>,
+    pub(crate) idle_breaker_triggered: bool,
 }
 
 /// Three-level health verdict used per component and overall.
@@ -970,6 +1062,139 @@ pub(crate) fn render_trace_jsonl(spans: &[TraceSpanRecord]) -> Result<String, se
     Ok(output)
 }
 
+/// Builds a per-run stage timing report with timeout classification and
+/// missing-stage visibility.
+#[must_use]
+pub(crate) fn build_run_stage_timing_report(
+    inputs: &[RunStageTimingInput],
+) -> RunStageTimingReport {
+    let mut records = inputs.iter().map(run_stage_timing_record).collect::<Vec<_>>();
+    records.sort_by_key(|record| (record.started_at_unix_ms, record.stage.clone()));
+
+    let observed = records
+        .iter()
+        .map(|record| record.stage.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let missing_stages = RUN_STAGE_NAMES
+        .iter()
+        .filter(|stage| !observed.contains(**stage))
+        .map(|stage| (*stage).to_owned())
+        .collect::<Vec<_>>();
+    let mut timeout_classifications = records
+        .iter()
+        .filter_map(|record| record.timeout_classification.clone())
+        .collect::<Vec<_>>();
+    timeout_classifications.sort();
+    timeout_classifications.dedup();
+    let idle_breaker_triggered = timeout_classifications
+        .iter()
+        .any(|classification| classification == "provider_idle_timeout");
+
+    RunStageTimingReport {
+        schema_version: RUN_STAGE_TIMING_SCHEMA_VERSION,
+        redaction_level: "metadata_only".to_owned(),
+        records,
+        missing_stages,
+        timeout_classifications,
+        idle_breaker_triggered,
+    }
+}
+
+pub(crate) fn build_run_stage_timing_contract() -> Value {
+    let timeout_classes = [
+        RunStageTimeoutKind::ProviderHard,
+        RunStageTimeoutKind::ProviderIdle,
+        RunStageTimeoutKind::ToolWait,
+        RunStageTimeoutKind::AbortSettle,
+    ]
+    .into_iter()
+    .map(RunStageTimeoutKind::as_str)
+    .collect::<Vec<_>>();
+    let sample = build_run_stage_timing_report(&[
+        RunStageTimingInput {
+            stage: "prepare".to_owned(),
+            started_at_unix_ms: 1_000,
+            completed_at_unix_ms: Some(1_010),
+            first_signal_at_unix_ms: None,
+            timeout_ms: None,
+            timeout_kind: None,
+            outcome: "ok".to_owned(),
+        },
+        RunStageTimingInput {
+            stage: "provider_request".to_owned(),
+            started_at_unix_ms: 1_020,
+            completed_at_unix_ms: Some(1_800),
+            first_signal_at_unix_ms: Some(1_800),
+            timeout_ms: Some(500),
+            timeout_kind: None,
+            outcome: "timeout".to_owned(),
+        },
+    ]);
+
+    json!({
+        "schema_version": RUN_STAGE_TIMING_SCHEMA_VERSION,
+        "required_stages": RUN_STAGE_NAMES,
+        "timeout_classes": timeout_classes,
+        "idle_breaker_class": RunStageTimeoutKind::ProviderIdle.as_str(),
+        "support_bundle_section": "runtime.stage_timings",
+        "sample": sample,
+    })
+}
+
+fn run_stage_timing_record(input: &RunStageTimingInput) -> RunStageTimingRecord {
+    let stage = sanitize_low_cardinality_value(input.stage.as_str(), "stage");
+    let outcome = sanitize_low_cardinality_value(input.outcome.as_str(), "stage.outcome");
+    let duration_ms = input
+        .completed_at_unix_ms
+        .and_then(|completed| completed.checked_sub(input.started_at_unix_ms))
+        .and_then(|duration| u64::try_from(duration).ok());
+    let idle_ms = input
+        .first_signal_at_unix_ms
+        .and_then(|first_signal| first_signal.checked_sub(input.started_at_unix_ms))
+        .and_then(|duration| u64::try_from(duration).ok());
+    let timeout_classification =
+        classify_stage_timeout(stage.as_str(), input.timeout_kind, input.timeout_ms, idle_ms)
+            .map(ToOwned::to_owned);
+    let diagnostics_code = timeout_classification
+        .as_ref()
+        .map(|classification| format!("run_stage.timeout.{classification}"))
+        .unwrap_or_else(|| format!("run_stage.{}.{}", stage, outcome));
+
+    RunStageTimingRecord {
+        schema_version: RUN_STAGE_TIMING_SCHEMA_VERSION,
+        stage,
+        started_at_unix_ms: input.started_at_unix_ms,
+        completed_at_unix_ms: input.completed_at_unix_ms,
+        duration_ms,
+        first_signal_at_unix_ms: input.first_signal_at_unix_ms,
+        idle_ms,
+        timeout_ms: input.timeout_ms,
+        timeout_classification,
+        outcome,
+        diagnostics_code,
+        redaction_level: "metadata_only".to_owned(),
+    }
+}
+
+fn classify_stage_timeout(
+    stage: &str,
+    timeout_kind: Option<RunStageTimeoutKind>,
+    timeout_ms: Option<u64>,
+    idle_ms: Option<u64>,
+) -> Option<&'static str> {
+    match timeout_kind {
+        Some(kind) => Some(kind.as_str()),
+        None if stage == "provider_request"
+            && idle_ms.zip(timeout_ms).is_some_and(|(observed_idle_ms, threshold_ms)| {
+                observed_idle_ms >= threshold_ms
+            }) =>
+        {
+            Some(RunStageTimeoutKind::ProviderIdle.as_str())
+        }
+        None => None,
+    }
+}
+
 /// Renders the Prometheus text exposition for the daemon's core counters and
 /// gauges. Labels are restricted to bounded values (provider kind, job
 /// state, delivery status) -- never principals, sessions, or paths -- to keep
@@ -1440,6 +1665,7 @@ pub(crate) fn build_support_bundle_collector_contract() -> Value {
             ],
             "observability_counters": true,
         },
+        "run_stage_timings": build_run_stage_timing_contract(),
         "component_health_registry": build_component_health_registry_contract(),
     })
 }
@@ -2611,6 +2837,93 @@ mod tests {
         assert!(!jsonl.contains("token=raw"));
         assert!(!jsonl.contains("raw-refresh"));
         assert_eq!(build_trace_exporter_contract()["default_exporter"], "jsonl");
+    }
+
+    #[test]
+    fn run_stage_timing_report_tracks_success_and_missing_stages() {
+        let report = build_run_stage_timing_report(&[
+            RunStageTimingInput {
+                stage: "prepare".to_owned(),
+                started_at_unix_ms: 1_000,
+                completed_at_unix_ms: Some(1_010),
+                first_signal_at_unix_ms: None,
+                timeout_ms: None,
+                timeout_kind: None,
+                outcome: "ok".to_owned(),
+            },
+            RunStageTimingInput {
+                stage: "provider_request".to_owned(),
+                started_at_unix_ms: 1_020,
+                completed_at_unix_ms: Some(1_080),
+                first_signal_at_unix_ms: Some(1_030),
+                timeout_ms: Some(500),
+                timeout_kind: None,
+                outcome: "ok".to_owned(),
+            },
+        ]);
+
+        assert_eq!(report.schema_version, RUN_STAGE_TIMING_SCHEMA_VERSION);
+        assert_eq!(report.records.len(), 2);
+        assert!(report.missing_stages.contains(&"tool_wait".to_owned()));
+        assert!(!report.idle_breaker_triggered);
+        assert!(report.timeout_classifications.is_empty());
+    }
+
+    #[test]
+    fn run_stage_timing_report_classifies_timeout_owners() {
+        let report = build_run_stage_timing_report(&[
+            RunStageTimingInput {
+                stage: "provider_request".to_owned(),
+                started_at_unix_ms: 1_000,
+                completed_at_unix_ms: Some(1_900),
+                first_signal_at_unix_ms: Some(1_900),
+                timeout_ms: Some(500),
+                timeout_kind: None,
+                outcome: "timeout".to_owned(),
+            },
+            RunStageTimingInput {
+                stage: "provider_request".to_owned(),
+                started_at_unix_ms: 2_000,
+                completed_at_unix_ms: Some(3_000),
+                first_signal_at_unix_ms: Some(2_050),
+                timeout_ms: Some(1_000),
+                timeout_kind: Some(RunStageTimeoutKind::ProviderHard),
+                outcome: "timeout".to_owned(),
+            },
+            RunStageTimingInput {
+                stage: "tool_wait".to_owned(),
+                started_at_unix_ms: 3_000,
+                completed_at_unix_ms: Some(4_000),
+                first_signal_at_unix_ms: None,
+                timeout_ms: Some(1_000),
+                timeout_kind: Some(RunStageTimeoutKind::ToolWait),
+                outcome: "timeout".to_owned(),
+            },
+            RunStageTimingInput {
+                stage: "abort_settle".to_owned(),
+                started_at_unix_ms: 4_000,
+                completed_at_unix_ms: Some(4_250),
+                first_signal_at_unix_ms: None,
+                timeout_ms: Some(250),
+                timeout_kind: Some(RunStageTimeoutKind::AbortSettle),
+                outcome: "timeout".to_owned(),
+            },
+        ]);
+
+        assert!(report.idle_breaker_triggered);
+        assert_eq!(
+            report.timeout_classifications,
+            vec![
+                "abort_settle_timeout".to_owned(),
+                "provider_hard_timeout".to_owned(),
+                "provider_idle_timeout".to_owned(),
+                "tool_wait_timeout".to_owned(),
+            ]
+        );
+        assert!(report.records.iter().any(|record| {
+            record.stage == "tool_wait"
+                && record.timeout_classification.as_deref() == Some("tool_wait_timeout")
+        }));
     }
 
     #[test]

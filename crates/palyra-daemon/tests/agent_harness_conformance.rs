@@ -18,12 +18,32 @@ use palyra_daemon::application::{
         HarnessToolCallRequest, HarnessToolReplayMetadata,
     },
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 #[derive(Debug)]
 struct ConformanceHarness {
     descriptor: AgentHarnessDescriptor,
     status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConformanceMatrix {
+    schema_version: u32,
+    profiles: Vec<String>,
+    common_adapters: Vec<String>,
+    cases: Vec<ConformanceMatrixCase>,
+    ci_profiles: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConformanceMatrixCase {
+    id: String,
+    package: String,
+    quick: bool,
+    expected_terminal_status: String,
+    expected_classification: String,
 }
 
 impl ConformanceHarness {
@@ -108,6 +128,38 @@ fn conformance_selects_embedded_and_records_lifecycle() {
         &request(AgentHarnessSelectionMode::Embedded, None, false),
     )
     .expect("embedded selection should pass");
+    let auth = json!({});
+    let transcript = Vec::new();
+    let tools = json!({});
+    let policy = json!({});
+
+    let trace = run_selected_harness_attempt(
+        &selected,
+        attempt(
+            PreparedAgentAttemptCallbacks::host_controlled(),
+            AgentHarnessCancellation::default(),
+            &auth,
+            transcript.as_slice(),
+            &tools,
+            &policy,
+        ),
+        true,
+    );
+
+    assert_eq!(trace.result.terminal_status, AgentHarnessAttemptTerminalStatus::Completed);
+    assert_eq!(trace.events.len(), 3);
+    assert!(!trace.fallback_used);
+}
+
+#[test]
+fn conformance_selects_fake_plugin_subset_and_records_lifecycle() {
+    let fake_plugin = ConformanceHarness::new("fake.plugin", "completed");
+    let harnesses: [&dyn AgentHarness; 1] = [&fake_plugin];
+    let selected = select_agent_harness(
+        &harnesses,
+        &request(AgentHarnessSelectionMode::ExplicitPlugin, Some("fake.plugin"), false),
+    )
+    .expect("fake plugin subset should select explicitly");
     let auth = json!({});
     let transcript = Vec::new();
     let tools = json!({});
@@ -267,4 +319,48 @@ fn conformance_distinguishes_cancellation_and_timeout_results() {
         timed_out.terminal_classification,
         Some(AgentHarnessTerminalClassification::Timeout)
     );
+}
+
+#[test]
+fn conformance_matrix_fixture_covers_p0_recovery_cases() {
+    let matrix: ConformanceMatrix = serde_json::from_str(include_str!(
+        "../../../fixtures/golden/backend_harness_conformance_matrix.json"
+    ))
+    .expect("conformance matrix should parse");
+    let packages = matrix.cases.iter().map(|case| case.package.as_str()).collect::<BTreeSet<_>>();
+    let quick_count = matrix.cases.iter().filter(|case| case.quick).count();
+    let quick_max = matrix
+        .ci_profiles
+        .pointer("/quick/max_cases")
+        .and_then(Value::as_u64)
+        .expect("quick max cases should be present") as usize;
+
+    assert_eq!(matrix.schema_version, 1);
+    assert!(matrix.profiles.contains(&"quick".to_owned()));
+    assert!(matrix.profiles.contains(&"full".to_owned()));
+    assert!(matrix.common_adapters.contains(&"embedded_palyra".to_owned()));
+    assert!(matrix.common_adapters.contains(&"fake_plugin_subset".to_owned()));
+    for required in [
+        "agent_loop_recovery",
+        "provider_stream_normalizer",
+        "tool_guardrail_loop",
+        "approval_mapping",
+        "native_harness_relay",
+        "codex_adapter",
+        "lsp_service",
+        "verification_evidence",
+        "context_compaction",
+        "hook_runner",
+    ] {
+        assert!(packages.contains(required), "missing conformance package {required}");
+    }
+    assert!(quick_count <= quick_max);
+    assert!(matrix.cases.iter().any(|case| {
+        case.id == "approval_denied"
+            && case.expected_terminal_status == "denied"
+            && case.expected_classification == "approval_denied"
+    }));
+    assert!(matrix.cases.iter().any(|case| {
+        case.id == "cancel_during_tool" && case.expected_terminal_status == "cancelled"
+    }));
 }

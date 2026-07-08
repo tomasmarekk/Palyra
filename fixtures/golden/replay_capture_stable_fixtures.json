@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "fixture_contract": "replay-capture-stable-fixtures-v1",
+  "cases": [
+    {
+      "id": "successful_text_run",
+      "capture_kind": "incident_replay",
+      "expected_terminal_state": "done",
+      "required_sections": ["run", "tape_events", "lifecycle", "idempotency_records", "redaction"],
+      "artifact_refs": []
+    },
+    {
+      "id": "provider_failure_timeout",
+      "capture_kind": "incident_replay",
+      "expected_terminal_state": "failed",
+      "expected_failure_class": "provider_timeout",
+      "required_sections": ["run", "provider", "stage_timings", "redaction"],
+      "artifact_refs": []
+    },
+    {
+      "id": "tool_denied_by_policy",
+      "capture_kind": "incident_replay",
+      "expected_terminal_state": "failed",
+      "expected_failure_class": "policy_denial",
+      "required_sections": ["run", "tool_exchanges", "approvals", "policy", "redaction"],
+      "artifact_refs": [
+        {
+          "artifact_id": "tool-denied-policy-ref",
+          "kind": "tool_result",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "id": "compaction_successor_created",
+      "capture_kind": "trajectory",
+      "expected_terminal_state": "done",
+      "expected_compaction": true,
+      "required_sections": ["run", "compaction", "artifact_refs", "redaction"],
+      "artifact_refs": [
+        {
+          "artifact_id": "compaction-successor-summary",
+          "kind": "compaction_summary",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ]
+    },
+    {
+      "id": "cancel_during_tool_wait",
+      "capture_kind": "incident_replay",
+      "expected_terminal_state": "cancelled",
+      "expected_failure_class": "operator_cancel",
+      "required_sections": ["run", "tool_exchanges", "lifecycle", "stage_timings", "redaction"],
+      "artifact_refs": []
+    }
+  ],
+  "redaction_snapshot": {
+    "raw_secrets_allowed": false,
+    "raw_paths_allowed": false,
+    "raw_prompts_allowed": false,
+    "model_visible_default": false,
+    "stable_fields": [
+      "redaction_level",
+      "redacted_fields",
+      "path_redactions",
+      "truncated_payloads",
+      "omitted_events"
+    ]
+  }
+}

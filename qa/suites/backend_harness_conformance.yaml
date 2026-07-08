@@ -1,0 +1,50 @@
+schema_version: 1
+id: backend_harness_conformance
+mode: conformance
+scenario_roots:
+  - qa/scenarios
+  - qa/scenarios/provider
+include_tags:
+  - harness_conformance
+allow_provider_modes:
+  - mock
+available_capabilities:
+  - agent_run
+  - approvals
+  - context_compaction
+  - hook_policy
+  - lsp_service
+  - patch_verification
+  - provider_recovery
+  - provider_stream_normalizer
+  - redaction
+  - workspace_context
+capability_skips:
+  - capability: live_provider
+    reason: "Harness conformance uses deterministic mock or recorded fixtures."
+profiles:
+  quick:
+    command: "cargo test -p palyra-daemon --test agent_harness_conformance --locked"
+    fixture: fixtures/golden/backend_harness_conformance_matrix.json
+  full:
+    command: "PALYRA_HARNESS_CONFORMANCE_PROFILE=full cargo test -p palyra-daemon --test agent_harness_conformance --locked"
+    fixture: fixtures/golden/backend_harness_conformance_matrix.json
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: provider_stream_normalizer
+      label: Provider stream normalizer
+      labels: [provider, harness_conformance]
+    - id: tool_guardrail_loop
+      label: Tool guardrail loop
+      labels: [tool, harness_conformance]
+    - id: approval_mapping
+      label: Approval mapping
+      labels: [approval, harness_conformance]
+    - id: context_compaction
+      label: Context compaction
+      labels: [context, harness_conformance]
+    - id: lsp_service
+      label: LSP service
+      labels: [lsp, harness_conformance]

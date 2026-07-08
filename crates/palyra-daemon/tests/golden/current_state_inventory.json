@@ -2221,7 +2221,308 @@
       "stable": 0
     },
     "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
-    "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
+    "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders",
+    "release_dashboard_contract": {
+      "schema_version": 1,
+      "generated_at_unix_ms": 0,
+      "p0_area_count": 8,
+      "stable_candidate_count": 0,
+      "areas": [
+        {
+          "area": "agent_harness_runtime",
+          "owner_component": "application/agent_harness",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": true,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "cargo test -p palyra-daemon --test admin_surface --locked"
+          ],
+          "acceptance_criteria": [
+            "rollout appears in /console/v1/diagnostics with maturity metadata",
+            "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+            "current_state_inventory golden records maturity changes"
+          ],
+          "dependencies": [],
+          "gates": [
+            {
+              "id": "harness-conformance",
+              "area": "agent_harness_runtime",
+              "passed": false,
+              "required": true,
+              "evidence_ref": "qa://agent_harness_runtime/harness-conformance",
+              "blocking_dependencies": [
+                "execution_gate_pipeline_v2"
+              ],
+              "manual_override": {
+                "approval_ref": "manual-review-required",
+                "actor_ref": "operator:release",
+                "reason_code": "release_dashboard.contract_sample",
+                "audit_required": true
+              }
+            }
+          ],
+          "blockers": [
+            "harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing",
+            "failing required gates: harness-conformance",
+            "execution_gate_pipeline_v2"
+          ]
+        },
+        {
+          "area": "execution_gate_pipeline_v2",
+          "owner_component": "execution gate",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "cargo test -p palyra-daemon --test admin_surface --locked"
+          ],
+          "acceptance_criteria": [
+            "rollout appears in /console/v1/diagnostics with maturity metadata",
+            "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+            "current_state_inventory golden records maturity changes"
+          ],
+          "dependencies": [],
+          "gates": [],
+          "blockers": [
+            "execution gate v2 must keep denial and degraded outcomes byte-stable before production"
+          ]
+        },
+        {
+          "area": "provider_recovery",
+          "owner_component": "model provider recovery",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-model-providers --locked",
+            "cargo test -p palyra-daemon provider_stream --locked",
+            "cargo test -p palyra-daemon responses_failed_stream_event --locked"
+          ],
+          "acceptance_criteria": [
+            "provider recovery diagnostics expose retryability and terminal failure reasons",
+            "auth failover and malformed-output recovery stay bounded by provider policy",
+            "raw provider payloads are redacted before diagnostics and support bundle export"
+          ],
+          "dependencies": [
+            "provider_stream_normalizer"
+          ],
+          "gates": [],
+          "blockers": [
+            "recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes"
+          ]
+        },
+        {
+          "area": "replay_capture",
+          "owner_component": "replay",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": true,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon runtime_preview --locked",
+            "cargo test -p palyra-daemon --test current_state_inventory --locked"
+          ],
+          "acceptance_criteria": [
+            "runtime preview controls expose activation blockers for the capability",
+            "enabled mode requires the matching rollout flag",
+            "golden inventory records the effective state"
+          ],
+          "dependencies": [],
+          "gates": [
+            {
+              "id": "replay-fixtures",
+              "area": "replay_capture",
+              "passed": false,
+              "required": true,
+              "evidence_ref": "qa://replay_capture/replay-fixtures",
+              "blocking_dependencies": [
+                "run_trace_v1"
+              ],
+              "manual_override": null
+            }
+          ],
+          "blockers": [
+            "runtime decision capture must respect replay redaction limits",
+            "failing required gates: replay-fixtures",
+            "run_trace_v1"
+          ]
+        },
+        {
+          "area": "verification_runtime",
+          "owner_component": "verification runtime",
+          "maturity": "gated_production",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": true,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "cargo test -p palyra-daemon --test admin_surface --locked"
+          ],
+          "acceptance_criteria": [
+            "rollout appears in /console/v1/diagnostics with maturity metadata",
+            "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+            "current_state_inventory golden records maturity changes"
+          ],
+          "dependencies": [],
+          "gates": [],
+          "blockers": [
+            "verification evidence must remain redacted and durable before stable rollout"
+          ]
+        },
+        {
+          "area": "compaction_safeguard",
+          "owner_component": "session compaction",
+          "maturity": "gated_production",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": true,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon session_compaction --locked",
+            "bash scripts/test/run-replay-gate.sh"
+          ],
+          "acceptance_criteria": [
+            "compaction path records replay-safe evidence",
+            "provider-backed work degrades to local evidence when rollout is disabled"
+          ],
+          "dependencies": [],
+          "gates": [],
+          "blockers": [
+            "compaction decisions must be replay-safe and expose bounded evidence"
+          ]
+        },
+        {
+          "area": "advisor_fanout",
+          "owner_component": "advisors",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "cargo test -p palyra-daemon --test admin_surface --locked"
+          ],
+          "acceptance_criteria": [
+            "rollout appears in /console/v1/diagnostics with maturity metadata",
+            "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+            "current_state_inventory golden records maturity changes"
+          ],
+          "dependencies": [],
+          "gates": [],
+          "blockers": [
+            "advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization"
+          ]
+        },
+        {
+          "area": "lsp_service",
+          "owner_component": "code intelligence",
+          "maturity": "preview_only",
+          "enabled": false,
+          "code_complete": false,
+          "acceptance_complete": false,
+          "tested": false,
+          "gated_production": false,
+          "stable_candidate": false,
+          "required_tests": [
+            "cargo test -p palyra-daemon --test current_state_inventory --locked",
+            "cargo test -p palyra-daemon --test admin_surface --locked"
+          ],
+          "acceptance_criteria": [
+            "rollout appears in /console/v1/diagnostics with maturity metadata",
+            "rollout appears in palyra doctor --json when admin diagnostics are reachable",
+            "current_state_inventory golden records maturity changes"
+          ],
+          "dependencies": [],
+          "gates": [],
+          "blockers": [
+            "LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it"
+          ]
+        }
+      ],
+      "failing_gates": [
+        {
+          "id": "replay-fixtures",
+          "area": "replay_capture",
+          "passed": false,
+          "required": true,
+          "evidence_ref": "qa://replay_capture/replay-fixtures",
+          "blocking_dependencies": [
+            "run_trace_v1"
+          ],
+          "manual_override": null
+        },
+        {
+          "id": "harness-conformance",
+          "area": "agent_harness_runtime",
+          "passed": false,
+          "required": true,
+          "evidence_ref": "qa://agent_harness_runtime/harness-conformance",
+          "blocking_dependencies": [
+            "execution_gate_pipeline_v2"
+          ],
+          "manual_override": {
+            "approval_ref": "manual-review-required",
+            "actor_ref": "operator:release",
+            "reason_code": "release_dashboard.contract_sample",
+            "audit_required": true
+          }
+        }
+      ],
+      "manual_overrides": [
+        {
+          "gate_id": "harness-conformance",
+          "area": "agent_harness_runtime",
+          "approval_ref": "manual-review-required",
+          "actor_ref": "operator:release",
+          "reason_code": "release_dashboard.contract_sample",
+          "audit_required": true
+        }
+      ],
+      "maturity_summary": {
+        "schema_version": 1,
+        "flag_count": 35,
+        "enabled_flags": 0,
+        "inactive_flags": 35,
+        "blocked_flags": 5,
+        "maturity_counts": {
+          "blocked": 5,
+          "deprecated": 0,
+          "gated_production": 4,
+          "preview_only": 25,
+          "scaffold": 1,
+          "stable": 0
+        },
+        "deprecated_alias_policy": "deprecated rollout aliases are not accepted; use the listed config_path or env_var",
+        "migration_note": "flag renames must add a deprecated_aliases entry here before aliases are removed from loaders"
+      },
+      "roadmap_checkbox_policy": "roadmap acceptance complete does not imply stable candidate",
+      "markdown_preview": "# Release Acceptance Dashboard\n\n- P0 areas: 8\n- Stable candidates: 0\n- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |\n| --- | --- | --- | --- | --- | --- |\n| agent_harness_runtime | preview_only | true | false | false | harness selection, callbacks, transcript mirroring, and lifecycle attempts must stay host-owned before production routing; failing required gates: harness-conformance; execution_gate_pipeline_v2 |\n| execution_gate_pipeline_v2 | preview_only | false | false | false | execution gate v2 must keep denial and degraded outcomes byte-stable before production |\n| provider_recovery | preview_only | false | false | false | recovery classifiers must keep retries bounded, idempotent, and visible through replay-safe reason codes |\n| replay_capture | preview_only | true | false | false | runtime decision capture must respect replay redaction limits; failing required gates: replay-fixtures; run_trace_v1 |\n| verification_runtime | gated_production | false | false | false | verification evidence must remain redacted and durable before stable rollout |\n| compaction_safeguard | gated_production | false | false | false | compaction decisions must be replay-safe and expose bounded evidence |\n| advisor_fanout | preview_only | false | false | false | advisor fanout must enforce budget governance, trace attribution, and non-authoritative finalization |\n| lsp_service | preview_only | false | false | false | LSP lifecycle must keep diagnostics bounded, workspace-scoped, and restart-safe before model-visible tools consume it |\n"
+    }
   },
   "method_registry": {
     "schema_version": 1,

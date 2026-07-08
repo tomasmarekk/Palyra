@@ -1110,6 +1110,17 @@ pub(crate) fn build_feature_rollout_diagnostics(config: &FeatureRolloutsConfig) 
 }
 
 pub(crate) fn build_feature_rollout_maturity_summary(config: &FeatureRolloutsConfig) -> Value {
+    let mut summary = build_feature_rollout_maturity_summary_base(config);
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "release_dashboard_contract".to_owned(),
+            build_release_dashboard_contract(config),
+        );
+    }
+    summary
+}
+
+fn build_feature_rollout_maturity_summary_base(config: &FeatureRolloutsConfig) -> Value {
     let mut maturity_counts = BTreeMap::new();
     for maturity in FEATURE_ROLLOUT_MATURITY_STATES {
         maturity_counts.insert(maturity.as_str(), 0_usize);
@@ -1143,12 +1154,279 @@ pub(crate) fn build_feature_rollout_maturity_summary(config: &FeatureRolloutsCon
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseAcceptanceGate {
+    pub(crate) id: String,
+    pub(crate) area: String,
+    pub(crate) passed: bool,
+    pub(crate) required: bool,
+    pub(crate) evidence_ref: String,
+    pub(crate) blocking_dependencies: Vec<String>,
+    pub(crate) manual_override: Option<ReleaseManualOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseManualOverride {
+    pub(crate) approval_ref: String,
+    pub(crate) actor_ref: String,
+    pub(crate) reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseMilestoneStatus {
+    pub(crate) area: String,
+    pub(crate) code_complete: bool,
+    pub(crate) acceptance_complete: bool,
+}
+
+pub(crate) struct ReleaseDashboardInput<'a> {
+    pub(crate) generated_at_unix_ms: i64,
+    pub(crate) gates: &'a [ReleaseAcceptanceGate],
+    pub(crate) milestone_statuses: &'a [ReleaseMilestoneStatus],
+}
+
+pub(crate) fn build_release_acceptance_dashboard(
+    config: &FeatureRolloutsConfig,
+    input: ReleaseDashboardInput<'_>,
+) -> Value {
+    let milestone_statuses = input
+        .milestone_statuses
+        .iter()
+        .map(|status| (status.area.as_str(), status))
+        .collect::<BTreeMap<_, _>>();
+    let p0_areas = [
+        FeatureRolloutFlag::AgentHarnessRuntime,
+        FeatureRolloutFlag::ExecutionGatePipelineV2,
+        FeatureRolloutFlag::ProviderRecovery,
+        FeatureRolloutFlag::ReplayCapture,
+        FeatureRolloutFlag::VerificationRuntime,
+        FeatureRolloutFlag::CompactionSafeguard,
+        FeatureRolloutFlag::AdvisorFanout,
+        FeatureRolloutFlag::LspService,
+    ];
+    let area_reports = p0_areas
+        .iter()
+        .filter_map(|flag| {
+            FEATURE_ROLLOUT_DESCRIPTORS.iter().find(|descriptor| descriptor.flag == *flag).map(
+                |descriptor| {
+                    release_dashboard_area_report(
+                        *descriptor,
+                        config,
+                        &milestone_statuses,
+                        input.gates,
+                    )
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let failing_gates = input
+        .gates
+        .iter()
+        .filter(|gate| gate.required && !gate.passed)
+        .map(release_gate_value)
+        .collect::<Vec<_>>();
+    let manual_overrides = input
+        .gates
+        .iter()
+        .filter_map(|gate| {
+            gate.manual_override.as_ref().map(|override_record| {
+                json!({
+                    "gate_id": gate.id,
+                    "area": gate.area,
+                    "approval_ref": override_record.approval_ref,
+                    "actor_ref": override_record.actor_ref,
+                    "reason_code": override_record.reason_code,
+                    "audit_required": true,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let stable_candidate_count = area_reports
+        .iter()
+        .filter(|report| report.get("stable_candidate").and_then(Value::as_bool).unwrap_or(false))
+        .count();
+
+    json!({
+        "schema_version": 1,
+        "generated_at_unix_ms": input.generated_at_unix_ms,
+        "p0_area_count": area_reports.len(),
+        "stable_candidate_count": stable_candidate_count,
+        "areas": area_reports,
+        "failing_gates": failing_gates,
+        "manual_overrides": manual_overrides,
+        "maturity_summary": build_feature_rollout_maturity_summary_base(config),
+        "roadmap_checkbox_policy": "roadmap acceptance complete does not imply stable candidate",
+    })
+}
+
+fn build_release_dashboard_contract(config: &FeatureRolloutsConfig) -> Value {
+    let gates = [
+        ReleaseAcceptanceGate {
+            id: "replay-fixtures".to_owned(),
+            area: "replay_capture".to_owned(),
+            passed: false,
+            required: true,
+            evidence_ref: "qa://replay_capture/replay-fixtures".to_owned(),
+            blocking_dependencies: vec!["run_trace_v1".to_owned()],
+            manual_override: None,
+        },
+        ReleaseAcceptanceGate {
+            id: "harness-conformance".to_owned(),
+            area: "agent_harness_runtime".to_owned(),
+            passed: false,
+            required: true,
+            evidence_ref: "qa://agent_harness_runtime/harness-conformance".to_owned(),
+            blocking_dependencies: vec!["execution_gate_pipeline_v2".to_owned()],
+            manual_override: Some(ReleaseManualOverride {
+                approval_ref: "manual-review-required".to_owned(),
+                actor_ref: "operator:release".to_owned(),
+                reason_code: "release_dashboard.contract_sample".to_owned(),
+            }),
+        },
+    ];
+    let milestones = [
+        ReleaseMilestoneStatus {
+            area: "replay_capture".to_owned(),
+            code_complete: true,
+            acceptance_complete: false,
+        },
+        ReleaseMilestoneStatus {
+            area: "agent_harness_runtime".to_owned(),
+            code_complete: true,
+            acceptance_complete: false,
+        },
+    ];
+
+    let mut dashboard = build_release_acceptance_dashboard(
+        config,
+        ReleaseDashboardInput {
+            generated_at_unix_ms: 0,
+            gates: gates.as_slice(),
+            milestone_statuses: milestones.as_slice(),
+        },
+    );
+    let markdown_preview = render_release_acceptance_dashboard_markdown(&dashboard);
+    if let Some(object) = dashboard.as_object_mut() {
+        object.insert("markdown_preview".to_owned(), Value::String(markdown_preview));
+    }
+    dashboard
+}
+
+pub(crate) fn render_release_acceptance_dashboard_markdown(dashboard: &Value) -> String {
+    let mut output = String::new();
+    output.push_str("# Release Acceptance Dashboard\n\n");
+    output.push_str(&format!(
+        "- P0 areas: {}\n",
+        dashboard.get("p0_area_count").and_then(Value::as_u64).unwrap_or_default()
+    ));
+    output.push_str(&format!(
+        "- Stable candidates: {}\n",
+        dashboard.get("stable_candidate_count").and_then(Value::as_u64).unwrap_or_default()
+    ));
+    output.push_str("- Roadmap checkbox policy: acceptance complete is not stable by itself\n\n");
+    output.push_str("| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |\n");
+    output.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    if let Some(areas) = dashboard.get("areas").and_then(Value::as_array) {
+        for area in areas {
+            let blockers = area
+                .get("blockers")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")
+                })
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} |\n",
+                area.get("area").and_then(Value::as_str).unwrap_or("unknown"),
+                area.get("maturity").and_then(Value::as_str).unwrap_or("unknown"),
+                area.get("code_complete").and_then(Value::as_bool).unwrap_or(false),
+                area.get("tested").and_then(Value::as_bool).unwrap_or(false),
+                area.get("stable_candidate").and_then(Value::as_bool).unwrap_or(false),
+                blockers
+            ));
+        }
+    }
+    output
+}
+
+fn release_dashboard_area_report(
+    descriptor: FeatureRolloutDescriptor,
+    config: &FeatureRolloutsConfig,
+    milestone_statuses: &BTreeMap<&str, &ReleaseMilestoneStatus>,
+    gates: &[ReleaseAcceptanceGate],
+) -> Value {
+    let flag = descriptor.flag.as_str();
+    let status = milestone_statuses.get(flag).copied();
+    let area_gates = gates.iter().filter(|gate| gate.area == flag).collect::<Vec<_>>();
+    let failing_required_gates = area_gates
+        .iter()
+        .filter(|gate| gate.required && !gate.passed)
+        .map(|gate| gate.id.clone())
+        .collect::<Vec<_>>();
+    let tested = !area_gates.is_empty() && failing_required_gates.is_empty();
+    let code_complete = status.is_some_and(|status| status.code_complete);
+    let acceptance_complete = status.is_some_and(|status| status.acceptance_complete);
+    let default_enable_allowed = descriptor.maturity.default_enable_allowed();
+    let stable_candidate = code_complete && acceptance_complete && tested && default_enable_allowed;
+    let setting = descriptor.flag.setting(config);
+    let mut blockers = descriptor
+        .activation_blockers
+        .iter()
+        .map(|blocker| (*blocker).to_owned())
+        .collect::<Vec<_>>();
+    if !failing_required_gates.is_empty() {
+        blockers.push(format!("failing required gates: {}", failing_required_gates.join(", ")));
+    }
+    for gate in &area_gates {
+        blockers.extend(gate.blocking_dependencies.iter().cloned());
+    }
+
+    json!({
+        "area": flag,
+        "owner_component": descriptor.owner_component,
+        "maturity": descriptor.maturity.as_str(),
+        "enabled": setting.enabled,
+        "code_complete": code_complete,
+        "acceptance_complete": acceptance_complete,
+        "tested": tested,
+        "gated_production": matches!(descriptor.maturity, FeatureRolloutMaturity::GatedProduction | FeatureRolloutMaturity::Stable),
+        "stable_candidate": stable_candidate,
+        "required_tests": descriptor.required_tests,
+        "acceptance_criteria": descriptor.acceptance_criteria,
+        "dependencies": descriptor.stable_dependencies.iter().map(|flag| flag.as_str()).collect::<Vec<_>>(),
+        "gates": area_gates.iter().map(|gate| release_gate_value(gate)).collect::<Vec<_>>(),
+        "blockers": blockers,
+    })
+}
+
+fn release_gate_value(gate: &ReleaseAcceptanceGate) -> Value {
+    json!({
+        "id": gate.id,
+        "area": gate.area,
+        "passed": gate.passed,
+        "required": gate.required,
+        "evidence_ref": gate.evidence_ref,
+        "blocking_dependencies": gate.blocking_dependencies,
+        "manual_override": gate.manual_override.as_ref().map(|override_record| {
+            json!({
+                "approval_ref": override_record.approval_ref,
+                "actor_ref": override_record.actor_ref,
+                "reason_code": override_record.reason_code,
+                "audit_required": true,
+            })
+        }),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_feature_rollout_diagnostics, validate_feature_rollout_maturity_descriptors,
-        FeatureRolloutDescriptor, FeatureRolloutFlag, FeatureRolloutMaturity,
-        FeatureRolloutMaturityValidationError, DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS,
+        build_feature_rollout_diagnostics, build_release_acceptance_dashboard,
+        render_release_acceptance_dashboard_markdown,
+        validate_feature_rollout_maturity_descriptors, FeatureRolloutDescriptor,
+        FeatureRolloutFlag, FeatureRolloutMaturity, FeatureRolloutMaturityValidationError,
+        ReleaseAcceptanceGate, ReleaseDashboardInput, ReleaseManualOverride,
+        ReleaseMilestoneStatus, DIAGNOSTICS_ACCEPTANCE, FEATURE_ROLLOUT_DESCRIPTORS,
         NO_DEPRECATED_ALIASES, NO_STABLE_DEPENDENCIES,
     };
     use crate::config::FeatureRolloutsConfig;
@@ -1289,5 +1567,81 @@ mod tests {
                 dependency: "execution_backend_networked_worker",
             }
         );
+    }
+
+    #[test]
+    fn release_dashboard_blocks_stable_candidate_on_failing_gate() {
+        let gates = vec![
+            release_gate("replay_capture", "replay-redaction", true, true),
+            release_gate("replay_capture", "replay-fixtures", false, true),
+        ];
+        let milestones = vec![ReleaseMilestoneStatus {
+            area: "replay_capture".to_owned(),
+            code_complete: true,
+            acceptance_complete: true,
+        }];
+        let dashboard = build_release_acceptance_dashboard(
+            &FeatureRolloutsConfig::default(),
+            ReleaseDashboardInput {
+                generated_at_unix_ms: 1_730_000_000_000,
+                gates: gates.as_slice(),
+                milestone_statuses: milestones.as_slice(),
+            },
+        );
+        let replay = dashboard["areas"]
+            .as_array()
+            .expect("areas should be an array")
+            .iter()
+            .find(|area| area["area"] == "replay_capture")
+            .expect("replay area should be present");
+
+        assert_eq!(replay["code_complete"], true);
+        assert_eq!(replay["tested"], false);
+        assert_eq!(replay["stable_candidate"], false);
+        assert_eq!(dashboard["failing_gates"].as_array().expect("failing gates").len(), 1);
+    }
+
+    #[test]
+    fn release_dashboard_renders_dependencies_and_manual_override_audit() {
+        let mut gate = release_gate("agent_harness_runtime", "harness-conformance", false, true);
+        gate.blocking_dependencies.push("execution_gate_pipeline_v2".to_owned());
+        gate.manual_override = Some(ReleaseManualOverride {
+            approval_ref: "approval-123".to_owned(),
+            actor_ref: "operator:release".to_owned(),
+            reason_code: "release_review.exception".to_owned(),
+        });
+        let gates = vec![gate];
+        let milestones = vec![ReleaseMilestoneStatus {
+            area: "agent_harness_runtime".to_owned(),
+            code_complete: true,
+            acceptance_complete: true,
+        }];
+        let dashboard = build_release_acceptance_dashboard(
+            &FeatureRolloutsConfig::default(),
+            ReleaseDashboardInput {
+                generated_at_unix_ms: 1_730_000_000_000,
+                gates: gates.as_slice(),
+                milestone_statuses: milestones.as_slice(),
+            },
+        );
+        let markdown = render_release_acceptance_dashboard_markdown(&dashboard);
+
+        assert!(markdown.contains("Release Acceptance Dashboard"));
+        assert!(markdown.contains("agent_harness_runtime"));
+        assert!(markdown.contains("execution_gate_pipeline_v2"));
+        assert_eq!(dashboard["manual_overrides"].as_array().expect("manual overrides").len(), 1);
+        assert_eq!(dashboard["manual_overrides"][0]["audit_required"], true);
+    }
+
+    fn release_gate(area: &str, id: &str, passed: bool, required: bool) -> ReleaseAcceptanceGate {
+        ReleaseAcceptanceGate {
+            id: id.to_owned(),
+            area: area.to_owned(),
+            passed,
+            required,
+            evidence_ref: format!("qa://{area}/{id}"),
+            blocking_dependencies: Vec::new(),
+            manual_override: None,
+        }
     }
 }

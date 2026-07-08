@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "suite_id": "backend_harness_conformance",
+  "profiles": ["quick", "full"],
+  "common_adapters": ["embedded_palyra", "fake_plugin_subset"],
+  "cases": [
+    {
+      "id": "empty_provider_response",
+      "package": "provider_stream_normalizer",
+      "quick": true,
+      "expected_terminal_status": "failed",
+      "expected_classification": "provider_failure"
+    },
+    {
+      "id": "reasoning_only_response",
+      "package": "agent_loop_recovery",
+      "quick": true,
+      "expected_terminal_status": "needs_revision",
+      "expected_classification": "model_repair"
+    },
+    {
+      "id": "partial_tool_call",
+      "package": "tool_guardrail_loop",
+      "quick": true,
+      "expected_terminal_status": "failed",
+      "expected_classification": "malformed_tool_call"
+    },
+    {
+      "id": "malformed_json_arguments",
+      "package": "tool_guardrail_loop",
+      "quick": true,
+      "expected_terminal_status": "failed",
+      "expected_classification": "malformed_tool_call"
+    },
+    {
+      "id": "context_overflow",
+      "package": "context_compaction",
+      "quick": true,
+      "expected_terminal_status": "recovered",
+      "expected_classification": "context_recovery"
+    },
+    {
+      "id": "stale_file_patch",
+      "package": "codex_adapter",
+      "quick": true,
+      "expected_terminal_status": "failed",
+      "expected_classification": "stale_view_guard"
+    },
+    {
+      "id": "lsp_crash",
+      "package": "lsp_service",
+      "quick": true,
+      "expected_terminal_status": "degraded",
+      "expected_classification": "tool_unavailable"
+    },
+    {
+      "id": "approval_denied",
+      "package": "approval_mapping",
+      "quick": true,
+      "expected_terminal_status": "denied",
+      "expected_classification": "approval_denied"
+    },
+    {
+      "id": "cancel_during_tool",
+      "package": "native_harness_relay",
+      "quick": true,
+      "expected_terminal_status": "cancelled",
+      "expected_classification": "cancelled"
+    },
+    {
+      "id": "hook_blocks_tool",
+      "package": "hook_runner",
+      "quick": false,
+      "expected_terminal_status": "failed",
+      "expected_classification": "policy_denial"
+    },
+    {
+      "id": "verification_evidence_missing",
+      "package": "verification_evidence",
+      "quick": false,
+      "expected_terminal_status": "needs_revision",
+      "expected_classification": "verification_blocked"
+    }
+  ],
+  "ci_profiles": {
+    "quick": {
+      "max_cases": 9,
+      "command": "cargo test -p palyra-daemon --test agent_harness_conformance --locked"
+    },
+    "full": {
+      "max_cases": 64,
+      "command": "PALYRA_HARNESS_CONFORMANCE_PROFILE=full cargo test -p palyra-daemon --test agent_harness_conformance --locked"
+    }
+  }
+}
