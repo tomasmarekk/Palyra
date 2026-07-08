@@ -37,6 +37,10 @@ use crate::{
         CronJobUpdatePatch, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
         CronRunRecord, CronRunStartRequest, CronRunStatus, CronScheduleType,
     },
+    routines::operations::{
+        routine_cron_security_projection, routine_lease_ledger_projection,
+        routine_lease_policy_from_job, routine_startup_catch_up_plan,
+    },
     routines::{
         default_outcome_from_cron_status, join_run_metadata, natural_language_schedule_preview,
         normalize_file_watch_trigger_payload, routine_allows_sensitive_tools,
@@ -408,24 +412,34 @@ async fn list_routine_runs(
         .await
         .map_err(sanitize_status_message)?;
     let now_unix_ms = current_unix_ms();
-    let mapped_runs = runs
-        .iter()
-        .map(|run| {
-            let metadata =
-                registry.find_run_metadata(run.run_id.as_str()).map_err(map_registry_error)?;
-            Ok::<_, String>(join_run_metadata(
-                routine.metadata.routine_id.as_str(),
-                run,
-                metadata.as_ref(),
-                Some(&routine.metadata.approval_policy),
-                Some(now_unix_ms),
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut run_metadata = Vec::new();
+    let mut mapped_runs = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let metadata =
+            registry.find_run_metadata(run.run_id.as_str()).map_err(map_registry_error)?;
+        if let Some(metadata) = metadata.as_ref() {
+            run_metadata.push(metadata.clone());
+        }
+        mapped_runs.push(join_run_metadata(
+            routine.metadata.routine_id.as_str(),
+            run,
+            metadata.as_ref(),
+            Some(&routine.metadata.approval_policy),
+            Some(now_unix_ms),
+        ));
+    }
+    let lease_ledger = routine_lease_ledger_projection(
+        routine.metadata.routine_id.as_str(),
+        &routine.job,
+        runs.as_slice(),
+        run_metadata.as_slice(),
+        now_unix_ms,
+    );
     Ok(json!({
         "operation": "list_runs",
         "routine_id": routine.metadata.routine_id,
         "runs": mapped_runs,
+        "lease_ledger": lease_ledger,
         "next_after_run_id": next_after_run_id,
     }))
 }
@@ -2059,6 +2073,15 @@ async fn enrich_routine_view_with_latest_run(
 }
 
 fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord) -> Value {
+    let lease_policy = routine_lease_policy_from_job(job);
+    let cron_security = routine_cron_security_projection(job, metadata, job.updated_at_unix_ms);
+    let startup_catch_up = routine_startup_catch_up_plan(
+        job,
+        metadata.trigger_kind,
+        &[],
+        &lease_policy,
+        job.updated_at_unix_ms,
+    );
     json!({
         "routine_id": metadata.routine_id,
         "job_id": job.job_id,
@@ -2082,6 +2105,9 @@ fn routine_view_from_parts(job: &CronJobRecord, metadata: &RoutineMetadataRecord
         },
         "misfire_policy": job.misfire_policy.as_str(),
         "jitter_ms": job.jitter_ms,
+        "lease_policy": lease_policy,
+        "startup_catch_up": startup_catch_up,
+        "cron_security": cron_security,
         "trigger_kind": metadata.trigger_kind.as_str(),
         "trigger_payload": serde_json::from_str::<Value>(metadata.trigger_payload_json.as_str()).unwrap_or_else(|_| json!({ "raw": metadata.trigger_payload_json })),
         "run_mode": metadata.execution.run_mode.as_str(),

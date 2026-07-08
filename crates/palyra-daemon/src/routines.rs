@@ -32,7 +32,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub(crate) mod operations;
 mod suggestion_guard;
+
+use operations::{
+    routine_lease_ledger_entry, RoutineLeasePolicy, DEFAULT_ROUTINE_CATCH_UP_STAGGER_MS,
+    DEFAULT_ROUTINE_MAX_MISSED_JOBS_PER_RESTART, DEFAULT_ROUTINE_MAX_RUN_DURATION_MS,
+    DEFAULT_ROUTINE_OUTPUT_RETENTION_MS,
+};
 
 const ROUTINE_REGISTRY_VERSION: u32 = 1;
 const ROUTINES_DIR: &str = "routines";
@@ -2506,6 +2513,21 @@ pub fn join_run_metadata(
         now_unix_ms.unwrap_or(run.updated_at_unix_ms),
         None,
     );
+    let lease_policy = RoutineLeasePolicy {
+        heartbeat_ttl_ms: ROUTINE_RUN_LEASE_TTL_MS,
+        max_run_duration_ms: DEFAULT_ROUTINE_MAX_RUN_DURATION_MS,
+        max_retry_count: run.attempt.saturating_sub(1),
+        max_missed_jobs_per_restart: DEFAULT_ROUTINE_MAX_MISSED_JOBS_PER_RESTART,
+        catch_up_stagger_ms: DEFAULT_ROUTINE_CATCH_UP_STAGGER_MS,
+        output_retention_ms: DEFAULT_ROUTINE_OUTPUT_RETENTION_MS,
+    };
+    let lease_ledger = routine_lease_ledger_entry(
+        routine_id,
+        run,
+        metadata,
+        &lease_policy,
+        now_unix_ms.unwrap_or(run.updated_at_unix_ms),
+    );
     let why_fired_audit = cron_routine_preview_audit_projection(CronRoutinePreviewAuditInput {
         routine_id,
         trigger_kind,
@@ -2543,6 +2565,7 @@ pub fn join_run_metadata(
         "delivery_contract": delivery_contract,
         "lifecycle": lifecycle,
         "heartbeat_delivery": heartbeat_delivery,
+        "lease_ledger": lease_ledger,
         "effective_delivery_mode": effective_delivery.mode.as_str(),
         "effective_delivery_channel": effective_delivery.channel,
         "delivery_reason": delivery_reason,

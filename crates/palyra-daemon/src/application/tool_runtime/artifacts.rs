@@ -19,6 +19,10 @@ use crate::{
 };
 
 const TOOL_RESULT_ARTIFACT_TRUNCATION_RESERVE_BYTES: usize = 2 * 1024;
+// PDF and transcript extraction front-ends are intentionally not wired here;
+// these projection contracts stay unit-tested until a parser backend calls them.
+#[allow(dead_code)]
+const PDF_EXTRACTION_SCHEMA_VERSION: u64 = 1;
 const TOOL_RESULT_ARTIFACT_TRUNCATION_MESSAGE: &str =
     "Original tool output exceeded the journal artifact payload limit; this artifact stores a bounded UTF-8 prefix.";
 // Must stay byte-identical to the denial reason emitted by the journal's
@@ -36,6 +40,70 @@ pub(crate) struct BoundedToolResultArtifactContent {
     pub original_output_bytes: usize,
     pub stored_output_bytes: usize,
     pub truncated: bool,
+}
+
+/// Inclusive page range requested from a PDF extraction.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdfExtractionPageRange {
+    pub start_page: u32,
+    pub end_page: u32,
+}
+
+/// Text extracted from a single PDF page by an upstream parser.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdfPageText {
+    pub page: u32,
+    pub text: String,
+}
+
+/// Stable citation anchor for one extracted page.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PdfExtractionAnchor {
+    pub source_ref: String,
+    pub artifact_id: String,
+    pub page: u32,
+    pub run_id: String,
+    pub turn_id: String,
+    pub tool_call_id: String,
+}
+
+/// One bounded PDF page extraction result.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PdfExtractionPage {
+    pub page: u32,
+    pub text: String,
+    pub truncated: bool,
+    pub anchor: PdfExtractionAnchor,
+}
+
+/// Budgeted PDF extraction projection returned to model-visible surfaces.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PdfExtractionProjection {
+    pub schema_version: u64,
+    pub artifact_id: String,
+    pub pages: Vec<PdfExtractionPage>,
+    pub returned_chars: usize,
+    pub truncated: bool,
+    pub next_page: Option<u32>,
+    pub trust_label: String,
+    pub redaction_level: String,
+}
+
+/// Stable citation anchor for transcript-backed reads and searches.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TranscriptCitationAnchor {
+    pub source_ref: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_id: String,
+    pub tool_call_id: Option<String>,
+    pub timestamp_unix_ms: i64,
 }
 
 /// Bounds a tool output to `max_payload_bytes` for journal artifact storage.
@@ -124,6 +192,117 @@ fn truncate_utf8_lossy(output_json: &[u8], max_bytes: usize) -> String {
         .take_while(|(index, ch)| index.saturating_add(ch.len_utf8()) <= max_bytes)
         .map(|(_, ch)| ch)
         .collect()
+}
+
+/// Projects already-extracted PDF page text into a bounded, page-anchored
+/// response. The parser stays outside this function; this layer enforces
+/// model-visible budget, stable citation anchors, and trust labeling.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn build_pdf_extraction_projection(
+    artifact_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    tool_call_id: &str,
+    pages: &[PdfPageText],
+    page_ranges: &[PdfExtractionPageRange],
+    max_chars: usize,
+) -> PdfExtractionProjection {
+    let mut returned_chars = 0usize;
+    let mut projected_pages = Vec::new();
+    let mut truncated = false;
+    let mut next_page = None;
+    for page in pages.iter().filter(|page| page_selected(page.page, page_ranges)) {
+        if returned_chars >= max_chars {
+            truncated = true;
+            next_page = Some(page.page);
+            break;
+        }
+        let remaining = max_chars.saturating_sub(returned_chars);
+        let (text, page_truncated) = truncate_chars(page.text.as_str(), remaining);
+        returned_chars = returned_chars.saturating_add(text.chars().count());
+        truncated |= page_truncated;
+        if page_truncated {
+            next_page = Some(page.page);
+        }
+        projected_pages.push(PdfExtractionPage {
+            page: page.page,
+            text,
+            truncated: page_truncated,
+            anchor: pdf_extraction_anchor(artifact_id, run_id, turn_id, tool_call_id, page.page),
+        });
+        if page_truncated {
+            break;
+        }
+    }
+    PdfExtractionProjection {
+        schema_version: PDF_EXTRACTION_SCHEMA_VERSION,
+        artifact_id: artifact_id.to_owned(),
+        pages: projected_pages,
+        returned_chars,
+        truncated,
+        next_page,
+        trust_label: "extracted_document_text".to_owned(),
+        redaction_level: "bounded_text".to_owned(),
+    }
+}
+
+/// Builds a stable transcript citation anchor for old turns returned by
+/// transcript read/search surfaces.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn transcript_citation_anchor(
+    session_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    tool_call_id: Option<&str>,
+    timestamp_unix_ms: i64,
+) -> TranscriptCitationAnchor {
+    let tool_part = tool_call_id.unwrap_or("none");
+    TranscriptCitationAnchor {
+        source_ref: format!(
+            "transcript:{session_id}:run:{run_id}:turn:{turn_id}:tool:{tool_part}:ts:{timestamp_unix_ms}"
+        ),
+        session_id: session_id.to_owned(),
+        run_id: run_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        tool_call_id: tool_call_id.map(ToOwned::to_owned),
+        timestamp_unix_ms,
+    }
+}
+
+#[allow(dead_code)]
+fn page_selected(page: u32, page_ranges: &[PdfExtractionPageRange]) -> bool {
+    page_ranges.is_empty()
+        || page_ranges.iter().any(|range| page >= range.start_page && page <= range.end_page)
+}
+
+#[allow(dead_code)]
+fn pdf_extraction_anchor(
+    artifact_id: &str,
+    run_id: &str,
+    turn_id: &str,
+    tool_call_id: &str,
+    page: u32,
+) -> PdfExtractionAnchor {
+    PdfExtractionAnchor {
+        source_ref: format!(
+            "artifact:{artifact_id}:page:{page}:run:{run_id}:turn:{turn_id}:tool:{tool_call_id}"
+        ),
+        artifact_id: artifact_id.to_owned(),
+        page,
+        run_id: run_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        tool_call_id: tool_call_id.to_owned(),
+    }
+}
+
+#[allow(dead_code)]
+fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let text = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (text, truncated)
 }
 
 /// Executes a `palyra.artifact.read` tool call against the journal.
@@ -275,7 +454,11 @@ fn artifact_read_outcome(
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_tool_result_artifact_content, should_retry_artifact_read_as_text_preview};
+    use super::{
+        bounded_tool_result_artifact_content, build_pdf_extraction_projection,
+        should_retry_artifact_read_as_text_preview, transcript_citation_anchor,
+        PdfExtractionPageRange, PdfPageText, PDF_EXTRACTION_SCHEMA_VERSION,
+    };
     use crate::journal::ToolResultArtifactReadRequest;
     use serde_json::{json, Value};
     use tonic::{Code, Status};
@@ -369,5 +552,51 @@ mod tests {
         );
 
         assert!(!should_retry_artifact_read_as_text_preview(&request, &status));
+    }
+
+    #[test]
+    fn pdf_extraction_projection_is_page_anchored_and_budgeted() {
+        let pages = vec![
+            PdfPageText { page: 1, text: "cover".to_owned() },
+            PdfPageText { page: 2, text: "alpha beta gamma".to_owned() },
+            PdfPageText { page: 3, text: "delta".to_owned() },
+        ];
+
+        let projection = build_pdf_extraction_projection(
+            "artifact-1",
+            "run-1",
+            "turn-1",
+            "tool-1",
+            pages.as_slice(),
+            &[PdfExtractionPageRange { start_page: 2, end_page: 3 }],
+            10,
+        );
+
+        assert_eq!(projection.schema_version, PDF_EXTRACTION_SCHEMA_VERSION);
+        assert_eq!(projection.pages.len(), 1);
+        assert_eq!(projection.pages[0].page, 2);
+        assert_eq!(projection.pages[0].text, "alpha beta");
+        assert!(projection.pages[0].truncated);
+        assert!(projection.truncated);
+        assert_eq!(projection.next_page, Some(2));
+        assert_eq!(
+            projection.pages[0].anchor.source_ref,
+            "artifact:artifact-1:page:2:run:run-1:turn:turn-1:tool:tool-1"
+        );
+        assert_eq!(projection.trust_label, "extracted_document_text");
+    }
+
+    #[test]
+    fn transcript_citation_anchor_is_stable_for_old_turns() {
+        let anchor =
+            transcript_citation_anchor("session-1", "run-1", "turn-7", Some("tool-3"), 42_000);
+
+        assert_eq!(
+            anchor.source_ref,
+            "transcript:session-1:run:run-1:turn:turn-7:tool:tool-3:ts:42000"
+        );
+        assert_eq!(anchor.tool_call_id.as_deref(), Some("tool-3"));
+        let serialized = serde_json::to_value(anchor).expect("anchor should serialize");
+        assert_eq!(serialized["timestamp_unix_ms"], 42_000);
     }
 }

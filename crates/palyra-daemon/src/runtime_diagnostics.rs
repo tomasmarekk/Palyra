@@ -33,6 +33,13 @@ use crate::{
     gateway::GatewayStatusSnapshot,
     journal::{ToolJobRecord, ToolJobState},
     model_provider::ProviderRuntimeMetricsSnapshot,
+    routines::{
+        operations::{
+            ROUTINE_CRON_SECURITY_SCHEMA_VERSION, ROUTINE_LEASE_LEDGER_SCHEMA_VERSION,
+            ROUTINE_STARTUP_CATCH_UP_SCHEMA_VERSION,
+        },
+        ROUTINE_RUN_LEASE_TTL_MS,
+    },
 };
 #[cfg(test)]
 use palyra_common::runtime_contracts::{
@@ -2105,6 +2112,10 @@ fn routines_health_component(status: &GatewayStatusSnapshot) -> RuntimeHealthCom
             ("runs_completed", status.counters.cron_runs_completed),
             ("runs_failed", status.counters.cron_runs_failed),
             ("runs_skipped", status.counters.cron_runs_skipped),
+            ("lease_ttl_ms", ROUTINE_RUN_LEASE_TTL_MS as u64),
+            ("lease_ledger_schema_version", ROUTINE_LEASE_LEDGER_SCHEMA_VERSION),
+            ("startup_catch_up_schema_version", ROUTINE_STARTUP_CATCH_UP_SCHEMA_VERSION),
+            ("cron_security_schema_version", ROUTINE_CRON_SECURITY_SCHEMA_VERSION),
         ]),
         vec!["inspect_routine_runs".to_owned()],
     )

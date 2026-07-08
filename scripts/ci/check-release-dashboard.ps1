@@ -18,10 +18,37 @@ foreach ($required in @(
     "# Release Acceptance Dashboard",
     "Stable candidates:",
     "Roadmap checkbox policy:",
+    "Runbooks: [Runtime Incident Runbooks](runtime_incident_runbooks.md)",
     "| Area | Maturity | Code complete | Tested | Stable candidate | Blockers |"
 )) {
     if (-not $report.Contains($required)) {
         throw "release dashboard report is missing required content: $required"
+    }
+}
+
+$runbookPath = Join-Path (Split-Path -Parent $fullPath) "runtime_incident_runbooks.md"
+if (-not (Test-Path $runbookPath)) {
+    throw "runtime incident runbook not found: $runbookPath"
+}
+
+$runbook = Get-Content -Raw -Encoding UTF8 $runbookPath
+foreach ($required in @(
+    "# Runtime Incident Runbooks",
+    "## Shared Evidence",
+    "## Security Invariants",
+    "## Agent Harness Runtime",
+    "## Execution Gate Pipeline",
+    "## Provider Recovery",
+    "## Replay Capture",
+    "## Verification Runtime",
+    "## Compaction Safeguard",
+    "## Advisor Fanout",
+    "## LSP Service",
+    "## Routine Scheduler",
+    "## ACP Runtime"
+)) {
+    if (-not $runbook.Contains($required)) {
+        throw "runtime incident runbook is missing required content: $required"
     }
 }
 

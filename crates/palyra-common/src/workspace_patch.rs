@@ -1999,6 +1999,7 @@ fn apply_hunks_to_bytes(
 ) -> Result<Vec<u8>, WorkspacePatchError> {
     let text = std::str::from_utf8(before)
         .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path_label.to_owned() })?;
+    let (had_bom, text) = strip_utf8_bom(text);
     let line_ending = detect_existing_line_ending(before);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let had_trailing_newline = normalized.ends_with('\n');
@@ -2047,7 +2048,8 @@ fn apply_hunks_to_bytes(
         search_cursor = start.saturating_add(inserted_len);
     }
 
-    Ok(render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending))
+    let rendered = render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending);
+    Ok(with_utf8_bom_if_needed(had_bom, rendered))
 }
 
 fn replace_exact_line_bytes(
@@ -2058,6 +2060,7 @@ fn replace_exact_line_bytes(
 ) -> Result<Vec<u8>, WorkspacePatchError> {
     let text = std::str::from_utf8(before)
         .map_err(|_| WorkspacePatchError::InvalidUtf8File { path: path_label.to_owned() })?;
+    let (had_bom, text) = strip_utf8_bom(text);
     let line_ending = detect_existing_line_ending(before);
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let had_trailing_newline = normalized.ends_with('\n');
@@ -2090,7 +2093,8 @@ fn replace_exact_line_bytes(
     }
 
     lines[index] = new.to_owned();
-    Ok(render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending))
+    let rendered = render_lines_with_existing_ending(&lines, had_trailing_newline, line_ending);
+    Ok(with_utf8_bom_if_needed(had_bom, rendered))
 }
 
 fn render_lines_with_existing_ending(
@@ -2104,6 +2108,20 @@ fn render_lines_with_existing_ending(
         output.push_str(separator);
     }
     output.into_bytes()
+}
+
+fn strip_utf8_bom(text: &str) -> (bool, &str) {
+    text.strip_prefix('\u{feff}').map_or((false, text), |rest| (true, rest))
+}
+
+fn with_utf8_bom_if_needed(had_bom: bool, mut bytes: Vec<u8>) -> Vec<u8> {
+    if !had_bom {
+        return bytes;
+    }
+    let mut with_bom = Vec::with_capacity(bytes.len().saturating_add(3));
+    with_bom.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    with_bom.append(&mut bytes);
+    with_bom
 }
 
 fn detect_existing_line_ending(bytes: &[u8]) -> ExistingLineEnding {
@@ -2477,6 +2495,85 @@ mod tests {
             fs::read(workspace.join("app.ts")).expect("updated file should read"),
             b"alpha\r\nbeta\r\ngamma();\r\n"
         );
+    }
+
+    #[test]
+    fn apply_workspace_patch_preserves_utf8_bom_for_update_hunks() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("config.txt"), b"\xEF\xBB\xBFtitle=old\nmode=safe\n")
+            .expect("seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Update File: config.txt\n@@\n-title=old\n+title=new\n mode=safe\n*** End Patch\n";
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("BOM update hunk should apply");
+
+        assert_eq!(
+            fs::read(workspace.join("config.txt")).expect("patched file should read"),
+            b"\xEF\xBB\xBFtitle=new\nmode=safe\n"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_preserves_missing_trailing_newline() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("settings.txt"), b"alpha\nbeta").expect("seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Update File: settings.txt\n@@\n alpha\n-beta\n+beta-updated\n*** End Patch\n";
+        apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect("no-trailing-newline update hunk should apply");
+
+        assert_eq!(
+            fs::read(workspace.join("settings.txt")).expect("patched file should read"),
+            b"alpha\nbeta-updated"
+        );
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_windows_drive_letter_paths() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        let patch = "*** Begin Patch\n*** Add File: C:\\repo\\owned.txt\n+owned\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("drive-letter paths should be rejected");
+
+        assert!(matches!(error, WorkspacePatchError::InvalidPatchPath { .. }));
+    }
+
+    #[test]
+    fn apply_workspace_patch_rejects_binary_update_targets() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(workspace.join("asset.bin"), [0xff, 0x00, 0xfe])
+            .expect("binary seed file should exist");
+
+        let patch = "*** Begin Patch\n*** Update File: asset.bin\n@@\n-old\n+new\n*** End Patch\n";
+        let error = apply_workspace_patch(
+            std::slice::from_ref(&workspace),
+            &default_request(patch, false),
+            &default_limits(),
+        )
+        .expect_err("binary file update should be rejected");
+
+        assert!(matches!(error, WorkspacePatchError::InvalidUtf8File { .. }));
     }
 
     #[test]

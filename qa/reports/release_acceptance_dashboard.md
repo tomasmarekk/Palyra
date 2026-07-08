@@ -3,6 +3,7 @@
 - P0 areas: 8
 - Stable candidates: 0
 - Roadmap checkbox policy: acceptance complete is not stable by itself
+- Runbooks: [Runtime Incident Runbooks](runtime_incident_runbooks.md)
 
 | Area | Maturity | Code complete | Tested | Stable candidate | Blockers |
 | --- | --- | --- | --- | --- | --- |

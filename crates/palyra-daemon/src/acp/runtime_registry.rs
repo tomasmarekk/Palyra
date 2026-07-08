@@ -10,6 +10,7 @@ use palyra_common::runtime_contracts::{
 use serde::{Deserialize, Serialize};
 
 pub(crate) const ACP_RUNTIME_REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const ACP_RUNTIME_PROMOTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,10 +68,111 @@ pub(crate) struct AcpRuntimeAdapterDescriptor {
     pub rollout_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AcpRuntimeMaturityStatus {
+    Preview,
+    GatedProduction,
+    RollbackPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcpRuntimePromotionInput {
+    pub session_lifecycle_ready: bool,
+    pub harness_conformance_ready: bool,
+    pub permission_relay_host_owned: bool,
+    pub resources_redacted: bool,
+    pub method_registry_updated: bool,
+    pub rollback_preview_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcpRuntimeMethodMaturity {
+    pub method: String,
+    pub status: AcpRuntimeMaturityStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcpRuntimePromotionProjection {
+    pub schema_version: u32,
+    pub status: AcpRuntimeMaturityStatus,
+    pub production_enabled: bool,
+    pub rollback_status: AcpRuntimeMaturityStatus,
+    pub failing_gates: Vec<String>,
+    pub method_registry: Vec<AcpRuntimeMethodMaturity>,
+    pub permission_relay_owner: String,
+    pub resource_redaction: String,
+}
+
 impl AcpRuntimeAdapterDescriptor {
     #[must_use]
     pub(crate) fn supports_feature(&self, feature: AcpRuntimeFeature) -> bool {
         self.features.contains(&feature)
+    }
+}
+
+pub(crate) fn build_acp_runtime_promotion_projection(
+    input: AcpRuntimePromotionInput,
+) -> AcpRuntimePromotionProjection {
+    let mut failing_gates = Vec::new();
+    if !input.session_lifecycle_ready {
+        failing_gates.push("session_lifecycle".to_owned());
+    }
+    if !input.harness_conformance_ready {
+        failing_gates.push("harness_conformance".to_owned());
+    }
+    if !input.permission_relay_host_owned {
+        failing_gates.push("permission_relay_host_owned".to_owned());
+    }
+    if !input.resources_redacted {
+        failing_gates.push("resources_redacted".to_owned());
+    }
+    if !input.method_registry_updated {
+        failing_gates.push("method_registry_updated".to_owned());
+    }
+    if !input.rollback_preview_available {
+        failing_gates.push("rollback_preview_available".to_owned());
+    }
+    let production_enabled = failing_gates.is_empty();
+    let status = if production_enabled {
+        AcpRuntimeMaturityStatus::GatedProduction
+    } else {
+        AcpRuntimeMaturityStatus::Preview
+    };
+    let method_status = if input.method_registry_updated && production_enabled {
+        AcpRuntimeMaturityStatus::GatedProduction
+    } else {
+        AcpRuntimeMaturityStatus::Preview
+    };
+    AcpRuntimePromotionProjection {
+        schema_version: ACP_RUNTIME_PROMOTION_SCHEMA_VERSION,
+        status,
+        production_enabled,
+        rollback_status: AcpRuntimeMaturityStatus::RollbackPreview,
+        failing_gates,
+        method_registry: [
+            "session.create",
+            "session.list",
+            "session.fork",
+            "run.wait",
+            "run.cancel",
+            "session.delete",
+        ]
+        .into_iter()
+        .map(|method| AcpRuntimeMethodMaturity { method: method.to_owned(), status: method_status })
+        .collect(),
+        permission_relay_owner: if input.permission_relay_host_owned {
+            "host_owned".to_owned()
+        } else {
+            "blocked".to_owned()
+        },
+        resource_redaction: if input.resources_redacted {
+            "redacted_contracts".to_owned()
+        } else {
+            "blocked".to_owned()
+        },
     }
 }
 
@@ -543,5 +645,50 @@ mod tests {
             .audit
             .iter()
             .any(|entry| entry.reason_code == AcpRuntimeHandleReasonCode::Disposed));
+    }
+
+    #[test]
+    fn promotion_projection_requires_all_gates_for_production() {
+        let projection = build_acp_runtime_promotion_projection(AcpRuntimePromotionInput {
+            session_lifecycle_ready: true,
+            harness_conformance_ready: true,
+            permission_relay_host_owned: true,
+            resources_redacted: true,
+            method_registry_updated: true,
+            rollback_preview_available: true,
+        });
+
+        assert_eq!(projection.schema_version, ACP_RUNTIME_PROMOTION_SCHEMA_VERSION);
+        assert_eq!(projection.status, AcpRuntimeMaturityStatus::GatedProduction);
+        assert!(projection.production_enabled);
+        assert!(projection.failing_gates.is_empty());
+        assert!(projection
+            .method_registry
+            .iter()
+            .all(|entry| entry.status == AcpRuntimeMaturityStatus::GatedProduction));
+        assert_eq!(projection.permission_relay_owner, "host_owned");
+        assert_eq!(projection.resource_redaction, "redacted_contracts");
+    }
+
+    #[test]
+    fn promotion_projection_keeps_preview_when_security_gates_fail() {
+        let projection = build_acp_runtime_promotion_projection(AcpRuntimePromotionInput {
+            session_lifecycle_ready: true,
+            harness_conformance_ready: true,
+            permission_relay_host_owned: false,
+            resources_redacted: false,
+            method_registry_updated: true,
+            rollback_preview_available: true,
+        });
+
+        assert_eq!(projection.status, AcpRuntimeMaturityStatus::Preview);
+        assert!(!projection.production_enabled);
+        assert_eq!(projection.rollback_status, AcpRuntimeMaturityStatus::RollbackPreview);
+        assert!(projection.failing_gates.contains(&"permission_relay_host_owned".to_owned()));
+        assert!(projection.failing_gates.contains(&"resources_redacted".to_owned()));
+        assert!(projection
+            .method_registry
+            .iter()
+            .all(|entry| entry.status == AcpRuntimeMaturityStatus::Preview));
     }
 }

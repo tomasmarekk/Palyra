@@ -1,0 +1,283 @@
+# Runtime Incident Runbooks
+
+These runbooks cover the P0 runtime surfaces listed in
+[Release Acceptance Dashboard](release_acceptance_dashboard.md). They are
+operator guidance for diagnosing, mitigating, and rolling back runtime incidents
+without exposing prompts, credentials, raw provider payloads, or local paths.
+
+## Shared Evidence
+
+- Release status: [Release Acceptance Dashboard](release_acceptance_dashboard.md)
+- Runtime boundaries and security invariants:
+  [Runtime boundary decision matrix](runtime_boundary_decision_matrix.md)
+- Runtime path diagnostics: inspect `/console/v1/diagnostics` under
+  `run_runtime_path` and `runtime_diagnostics.run_runtime_path`.
+- Support bundle diagnostics: export with
+  `palyra support-bundle export --output <path>` and verify that payloads are
+  redacted before sharing outside the operator boundary.
+- Admin health: inspect `/admin/v1/status` and `/admin/v1/metrics` for bounded,
+  low-cardinality runtime health and counter evidence.
+
+## Security Invariants
+
+- Secrets remain vault-owned and never enter diagnostics, support bundles,
+  model-visible tool results, stdout/stderr previews, or replay fixtures.
+- Approval denial is terminal for mutating tools unless a new operator decision
+  is recorded.
+- Policy, execution gate, sandbox, and process-runner checks remain host-owned.
+- External harnesses, plugins, ACP actors, and middleware never receive direct
+  journal write authority.
+- Runtime decisions use stable reason codes, redacted metadata, and replay-safe
+  event names before model-visible projection.
+
+## Agent Harness Runtime
+
+### Symptoms
+
+- Runs do not start after harness selection.
+- Terminal events are missing `harness.run.cleaned_up`.
+- Runtime path diagnostics show a harness owner that does not match the
+  configured rollout posture.
+
+### Diagnostics
+
+- Check `/console/v1/diagnostics` for harness rollout posture and attempt owner.
+- Run `cargo test -p palyra-daemon --test current_state_inventory --locked`.
+- Compare run-stream tape events against the golden trajectory fixtures.
+
+### Safe Mitigation
+
+- Disable the harness rollout flag and keep the embedded run-stream path active.
+- Preserve support bundle evidence before restarting the daemon.
+
+### Rollback
+
+- Revert the rollout flag to preview or disabled posture.
+- Re-run the inventory drift check and confirm the dashboard remains
+  `preview_only` until all required gates pass.
+
+## Execution Gate Pipeline
+
+### Symptoms
+
+- Mutating tools run without a gate decision.
+- Denied actions retry as continuations.
+- Audit records are missing stable denial reason codes.
+
+### Diagnostics
+
+- Inspect tool security diagnostics and approval denial events.
+- Run `bash scripts/test/run-critical-attack-scenarios.sh`.
+- Check that model-visible tool projections never exceed audit visibility.
+
+### Safe Mitigation
+
+- Force the execution gate pipeline to fail closed.
+- Quarantine affected tool families until denial and approval paths are
+  deterministic again.
+
+### Rollback
+
+- Disable the critical-path rollout knob for the new gate path.
+- Keep legacy host-owned checks enabled until targeted gate tests are green.
+
+## Provider Recovery
+
+### Symptoms
+
+- Malformed stream chunks terminate turns without bounded recovery events.
+- Provider auth failures loop instead of failing with safe metadata.
+- Runtime diagnostics show recovery counters without terminal outcomes.
+
+### Diagnostics
+
+- Run provider stream recovery fixtures.
+- Inspect `/console/v1/diagnostics` for provider recovery observations.
+- Verify that support bundles contain redacted provider metadata only.
+
+### Safe Mitigation
+
+- Disable provider repair retries for the affected provider.
+- Prefer explicit failure over speculative stream reconstruction when evidence
+  is incomplete.
+
+### Rollback
+
+- Revert provider recovery rollout posture to preview.
+- Keep normalized stream fixtures as the required promotion gate.
+
+## Replay Capture
+
+### Symptoms
+
+- Replay fixtures contain prompts, secrets, or local paths.
+- Captured events cannot reproduce terminal state.
+- Golden replay checks drift without a reviewed source change.
+
+### Diagnostics
+
+- Run `bash scripts/test/run-replay-gate.sh`.
+- Inspect fixture diffs for metadata-only redaction and stable event names.
+- Compare failed captures with support bundle runtime path diagnostics.
+
+### Safe Mitigation
+
+- Stop publishing new replay fixtures from the affected runtime path.
+- Keep live runs operational only if diagnostics remain redacted and bounded.
+
+### Rollback
+
+- Disable the capture path and restore the last known-good golden fixtures.
+- Re-run replay and current-state inventory checks before promotion.
+
+## Verification Runtime
+
+### Symptoms
+
+- Verification claims pass without linked evidence.
+- Support bundles disagree with runtime status counters.
+- Release acceptance marks a runtime stable without release review.
+
+### Diagnostics
+
+- Inspect `/admin/v1/status`, `/admin/v1/metrics`, and support bundle payloads.
+- Run `cargo test -p palyra-daemon --locked runtime_diagnostics`.
+- Confirm dashboard blockers still require release review for stable promotion.
+
+### Safe Mitigation
+
+- Treat verification output as advisory until counters and support bundles
+  agree.
+- Keep the runtime in gated production while evidence is incomplete.
+
+### Rollback
+
+- Revert verification maturity to preview or gated production as appropriate.
+- Require release dashboard review before restoring stable candidacy.
+
+## Compaction Safeguard
+
+### Symptoms
+
+- Mutating tool state changes after compaction retry.
+- Transcript continuity loses approval or policy context.
+- Runtime path diagnostics do not show compaction posture.
+
+### Diagnostics
+
+- Run compaction retry fixtures and replay gate checks.
+- Inspect transcript and run path metadata for redacted continuity markers.
+- Verify that support bundles exclude raw prompts and tool arguments.
+
+### Safe Mitigation
+
+- Disable automatic continuation through compaction for mutating workflows.
+- Require a fresh operator approval when continuity evidence is incomplete.
+
+### Rollback
+
+- Revert the compaction safeguard rollout to gated production or preview.
+- Keep replay gate evidence attached to any promotion attempt.
+
+## Advisor Fanout
+
+### Symptoms
+
+- Advisor outputs are treated as authoritative decisions.
+- Fanout tasks write directly to journal or tool state.
+- Diagnostics include high-cardinality advisor payload labels.
+
+### Diagnostics
+
+- Inspect advisor runtime diagnostics for non-authoritative projection markers.
+- Verify host authority checklist evidence.
+- Confirm support bundles contain bounded summary metadata only.
+
+### Safe Mitigation
+
+- Disable advisor fanout and keep single-owner host decisions active.
+- Drop advisor results that lack source and projection metadata.
+
+### Rollback
+
+- Return advisor fanout to preview-only posture.
+- Re-run host authority boundary checks before re-enabling.
+
+## LSP Service
+
+### Symptoms
+
+- LSP startup failures block unrelated runtime work.
+- Diagnostics stream full source files or local paths.
+- Process cleanup leaves stale server handles.
+
+### Diagnostics
+
+- Inspect LSP diagnostics deltas and process-runner cleanup evidence.
+- Run code-intelligence focused tests.
+- Check support bundles for redacted path and source previews.
+
+### Safe Mitigation
+
+- Disable the affected LSP adapter and keep file-based diagnostics available.
+- Cancel stale process handles through the host-owned process runner.
+
+### Rollback
+
+- Restore preview-only LSP posture.
+- Require unavailable-server fallback coverage before promotion.
+
+## Routine Scheduler
+
+### Symptoms
+
+- Cron jobs fire twice for the same schedule slot.
+- Lease heartbeat timestamps stop advancing.
+- Startup catch-up creates an unbounded queue or repeated failures never reach a
+  dead-letter state.
+
+### Diagnostics
+
+- Inspect routine lease ledger entries, run ids, idempotency keys, and
+  heartbeat epochs.
+- Check `/admin/v1/status` for routine lease, catch-up, and cron security
+  schema versions.
+- Verify delivery targets and provider/model snapshots in routine diagnostics.
+
+### Safe Mitigation
+
+- Pause affected routines and preserve the lease ledger before restart.
+- Cap startup catch-up to the configured missed-job limit.
+- Route repeated failures to operator review instead of retrying indefinitely.
+
+### Rollback
+
+- Disable the routine rollout that introduced the incident.
+- Keep existing routines paused until duplicate-fire and dead-letter evidence is
+  reviewed.
+
+## ACP Runtime
+
+### Symptoms
+
+- ACP actors bypass host-owned permission relay.
+- Runtime registry exposes unredacted resources or model state.
+- Method maturity claims production while required lifecycle methods are still
+  preview-only.
+
+### Diagnostics
+
+- Inspect ACP runtime registry maturity and rollback preview metadata.
+- Verify create, list, fork, wait, cancel, and delete method status.
+- Confirm support bundles expose only redacted ACP resources and model posture.
+
+### Safe Mitigation
+
+- Keep ACP runtime methods in preview unless every lifecycle gate is complete.
+- Route all permission requests through the host-owned approval broker.
+
+### Rollback
+
+- Revert ACP runtime maturity to preview.
+- Disable production registration until permission relay and lifecycle tests are
+  green.
