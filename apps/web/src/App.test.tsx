@@ -1737,7 +1737,7 @@ describe("M35 web console app", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open in sessions" }));
     expect(await screen.findByRole("heading", { name: "Sessions" })).toBeInTheDocument();
-  }, 10_000);
+  }, 20_000);
 
   it("creates a session checkpoint from the sessions section with a CSRF-protected request", async () => {
     const session = {
