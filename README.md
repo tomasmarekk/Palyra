@@ -1,6 +1,6 @@
 [![CI](https://repo-badges.46.224.229.218.sslip.io/github/ci/tomasmarekk/palyra.svg?workflow=ci.yml&branch=main&variant=secondary&v=public)](https://github.com/tomasmarekk/palyra/actions/workflows/ci.yml)
 ![badge](https://repo-badges.46.224.229.218.sslip.io/badge/Win%20•%20MacOS%20•%20Linux.svg?variant=secondary&logo=ri%3ABsLaptop&valueColor=ffffff&labelTextColor=ffffff)
-[![Repo License](https://repo-badges.46.224.229.218.sslip.io/github/license/tomasmarekk/palyra.svg?variant=secondary&v=public)](https://github.com/tomasmarekk/palyra/blob/main/LICENSE)
+[![Repo License](https://repo-badges.46.224.229.218.sslip.io/github/license/tomasmarekk/Palyra.svg?variant=secondary&v=public)](https://github.com/tomasmarekk/palyra/blob/main/LICENSE)
 [![X Follow](https://repo-badges.46.224.229.218.sslip.io/x/follow/palyra_com.svg?variant=secondary)](https://x.com/palyra_com)
 
 This repository is currently in the development phase.
