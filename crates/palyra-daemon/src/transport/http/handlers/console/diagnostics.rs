@@ -314,6 +314,7 @@ pub(crate) async fn console_diagnostics_handler(
             "run_runtime_path": run_runtime_path.clone(),
         }),
     );
+    let feature_usage = state.runtime.feature_usage_snapshot();
 
     Ok(Json(json!({
         "contract": contract_descriptor(),
@@ -372,9 +373,13 @@ pub(crate) async fn console_diagnostics_handler(
             "rollout": access_snapshot.rollout,
             "telemetry": access_snapshot.telemetry,
         },
-        "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state),
-        "feature_rollout_maturity": crate::feature_rollout_maturity::build_feature_rollout_maturity_summary(
+        "feature_rollouts": collect_console_feature_rollouts_diagnostics(&state, &feature_usage),
+        "feature_rollout_maturity": crate::feature_rollout_maturity::build_feature_rollout_maturity_summary_v1(
             &state.runtime.config.feature_rollouts,
+        ),
+        "feature_rollout_maturity_v2": crate::feature_rollout_maturity::build_feature_rollout_maturity_summary_v2(
+            &state.runtime.config.feature_rollouts,
+            &feature_usage,
         ),
         "runtime_roadmap": collect_console_runtime_roadmap_diagnostics(),
         "context_engine": context_engine_payload,
@@ -1180,9 +1185,13 @@ fn networked_worker_action_descriptors() -> Value {
 
 /// Reports every feature-rollout flag with its effective value and source,
 /// plus the config path and env var an operator can use to change it.
-fn collect_console_feature_rollouts_diagnostics(state: &AppState) -> Value {
+fn collect_console_feature_rollouts_diagnostics(
+    state: &AppState,
+    usage: &crate::feature_usage::FeatureUsageSnapshot,
+) -> Value {
     let mut payload = crate::feature_rollout_maturity::build_feature_rollout_diagnostics(
         &state.runtime.config.feature_rollouts,
+        usage,
     );
     let Some(entries) = payload.as_object_mut() else {
         return payload;

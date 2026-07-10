@@ -336,27 +336,98 @@ fn doctor_json_surfaces_feature_rollout_maturity_from_admin_payload() -> Result<
         "counters":{"journal_events":1,"denied_requests":0},
         "auth":{"summary":{"total_profiles":0,"ok":0,"missing":0,"expired":0,"expiring":0}},
         "feature_rollouts":{
-            "tool_repair":{
+            "compaction_safeguard":{
                 "enabled":true,
                 "source":"env",
+                "rollout_activation":{
+                    "configured_enabled":true,
+                    "source":"env",
+                    "authoritative":true,
+                    "effective_enabled":true,
+                    "effective_posture":"enabled_by_env",
+                    "reason_code":"feature_rollout.activation_enabled"
+                },
                 "maturity":"gated_production",
-                "owner_component":"run stream/tool repair",
+                "promotion_state":"gated_production",
+                "contract_availability":"runtime_available",
+                "execution_completeness":"complete",
+                "support_maturity":"preview",
+                "lifecycle":"active",
+                "runtime_usage":{
+                    "instrumented":true,
+                    "observed_unique_runs":3,
+                    "active_run_count":0,
+                    "terminal_run_count":3,
+                    "direct_unique_runs":3,
+                    "fallback_unique_runs":0,
+                    "mixed_path_unique_runs":0,
+                    "terminal_direct_unique_runs":3,
+                    "terminal_fallback_unique_runs":0,
+                    "terminal_mixed_path_unique_runs":0,
+                    "dropped_observation_count":0,
+                    "fallback_reason_counts":{},
+                    "dropped_observation_reason_counts":{},
+                    "qualified_hot_path":true,
+                    "qualification_reason_code":"feature_usage.qualified_hot_path"
+                },
+                "owner_component":"session compaction",
                 "public_api_exposure":"operator diagnostics",
-                "activation_blockers":["tool repair fixes must remain replay-safe"],
+                "activation_blockers":["stable promotion requires qualified production-window usage evidence"],
                 "required_tests":["cargo test -p palyra-daemon --test current_state_inventory --locked"]
             },
             "networked_workers":{
                 "enabled":false,
                 "source":"default",
+                "rollout_activation":{
+                    "configured_enabled":false,
+                    "source":"default",
+                    "authoritative":false,
+                    "effective_enabled":null,
+                    "effective_posture":"not_authoritative",
+                    "reason_code":"feature_rollout.activation_not_authoritative"
+                },
                 "maturity":"blocked",
+                "promotion_state":"contract_only",
+                "contract_availability":"blocked",
+                "execution_completeness":"partial",
+                "support_maturity":"unsupported",
+                "lifecycle":"active",
+                "runtime_usage":{"qualified_hot_path":false},
                 "owner_component":"workerd/execution backends",
                 "public_api_exposure":"runtime preview controls",
                 "activation_blockers":["Enable feature_rollouts.execution_backend_networked_worker first"],
                 "required_tests":["bash scripts/test/run-critical-attack-scenarios.sh"]
+            },
+            "safety_boundary":{
+                "enabled":true,
+                "source":"config",
+                "rollout_activation":{
+                    "configured_enabled":true,
+                    "source":"config",
+                    "authoritative":false,
+                    "effective_enabled":true,
+                    "effective_posture":"not_authoritative",
+                    "reason_code":"feature_rollout.activation_enabled"
+                },
+                "maturity":"preview_only",
+                "promotion_state":"contract_only",
+                "contract_availability":"runtime_available",
+                "execution_completeness":"partial",
+                "support_maturity":"preview",
+                "lifecycle":"active",
+                "runtime_usage":{"qualified_hot_path":false},
+                "owner_component":"safety",
+                "public_api_exposure":"operator diagnostics",
+                "activation_blockers":["feature_rollouts.safety_boundary cannot activate runtime behavior"],
+                "required_tests":["cargo test -p palyra-daemon --test current_state_inventory --locked"]
             }
         },
         "feature_rollout_maturity":{
             "schema_version":1,
+            "migration_note":"legacy v1 migration note"
+        },
+        "feature_rollout_maturity_v2":{
+            "schema_version":2,
             "migration_note":"flag renames must add deprecated_aliases before aliases are removed"
         }
     }"#;
@@ -423,13 +494,87 @@ auth_token = "{admin_token}"
     );
     assert_eq!(
         payload.pointer("/diagnostics/feature_rollouts/flag_count").and_then(Value::as_u64),
+        Some(3)
+    );
+    assert_eq!(
+        payload.pointer("/diagnostics/feature_rollouts/enabled_flags").and_then(Value::as_u64),
         Some(2)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/effective_active_flags")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/not_effectively_active_flags")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/non_authoritative_flags")
+            .and_then(Value::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        payload.pointer("/diagnostics/feature_rollouts/inactive_flags").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/unknown_activation_authority_flags")
+            .and_then(Value::as_u64),
+        Some(0)
     );
     assert_eq!(
         payload
             .pointer("/diagnostics/feature_rollouts/maturity_counts/blocked")
             .and_then(Value::as_u64),
         Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/promotion_state_counts/gated_production",)
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        payload
+            .pointer("/diagnostics/feature_rollouts/qualified_hot_path_flags")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    let usage = payload
+        .pointer("/diagnostics/feature_rollouts/usage")
+        .and_then(Value::as_array)
+        .context("doctor feature rollout snapshot should include bounded usage entries")?;
+    assert!(
+        usage.iter().any(|entry| {
+            entry.get("flag").and_then(Value::as_str) == Some("compaction_safeguard")
+                && entry.get("enabled").and_then(Value::as_bool) == Some(true)
+                && entry.get("configured_enabled").and_then(Value::as_bool) == Some(true)
+                && entry.get("activation_authoritative").and_then(Value::as_bool) == Some(true)
+                && entry.get("effective_enabled").and_then(Value::as_bool) == Some(true)
+                && entry.get("direct_unique_runs").and_then(Value::as_u64) == Some(3)
+                && entry.get("fallback_unique_runs").and_then(Value::as_u64) == Some(0)
+                && entry.get("terminal_direct_unique_runs").and_then(Value::as_u64) == Some(3)
+                && entry.get("qualified_hot_path").and_then(Value::as_bool) == Some(true)
+        }),
+        "doctor should retain enabled rollout usage counters: {payload}"
+    );
+    assert!(
+        usage.iter().any(|entry| {
+            entry.get("flag").and_then(Value::as_str) == Some("safety_boundary")
+                && entry.get("enabled").and_then(Value::as_bool) == Some(true)
+                && entry.get("configured_enabled").and_then(Value::as_bool) == Some(true)
+                && entry.get("activation_authoritative").and_then(Value::as_bool) == Some(false)
+                && entry.get("effective_enabled").is_some_and(Value::is_null)
+                && entry.get("activation_reason_code").and_then(Value::as_str)
+                    == Some("feature_rollout.activation_not_authoritative")
+        }),
+        "doctor must fail closed when a non-authoritative payload claims effective activation: {payload}"
     );
     let inactive = payload
         .pointer("/diagnostics/feature_rollouts/inactive")
@@ -438,6 +583,9 @@ auth_token = "{admin_token}"
     assert!(
         inactive.iter().any(|entry| {
             entry.get("flag").and_then(Value::as_str) == Some("networked_workers")
+                && entry.get("promotion_state").and_then(Value::as_str) == Some("contract_only")
+                && entry.get("contract_availability").and_then(Value::as_str) == Some("blocked")
+                && entry.get("execution_completeness").and_then(Value::as_str) == Some("partial")
                 && entry.get("activation_blockers").and_then(Value::as_array).is_some_and(
                     |blockers| {
                         blockers.iter().any(|blocker| {
@@ -449,6 +597,12 @@ auth_token = "{admin_token}"
                 )
         }),
         "doctor should explain why networked workers are inactive: {payload}"
+    );
+    assert!(
+        !inactive
+            .iter()
+            .any(|entry| { entry.get("flag").and_then(Value::as_str) == Some("safety_boundary") }),
+        "legacy inactive detail remains keyed to configured flag state: {payload}"
     );
     assert_eq!(
         payload.pointer("/diagnostics/feature_rollouts/migration_note").and_then(Value::as_str),

@@ -1733,8 +1733,15 @@ fn collect_doctor_feature_rollouts_snapshot(
             fetched: false,
             flag_count: 0,
             enabled_flags: 0,
+            effective_active_flags: 0,
+            not_effectively_active_flags: 0,
+            non_authoritative_flags: 0,
+            unknown_activation_authority_flags: 0,
             inactive_flags: 0,
             maturity_counts: BTreeMap::new(),
+            promotion_state_counts: BTreeMap::new(),
+            qualified_hot_path_flags: 0,
+            usage: Vec::new(),
             inactive: Vec::new(),
             migration_note: None,
             error: Some(
@@ -1749,8 +1756,15 @@ fn collect_doctor_feature_rollouts_snapshot(
             fetched: false,
             flag_count: 0,
             enabled_flags: 0,
+            effective_active_flags: 0,
+            not_effectively_active_flags: 0,
+            non_authoritative_flags: 0,
+            unknown_activation_authority_flags: 0,
             inactive_flags: 0,
             maturity_counts: BTreeMap::new(),
+            promotion_state_counts: BTreeMap::new(),
+            qualified_hot_path_flags: 0,
+            usage: Vec::new(),
             inactive: Vec::new(),
             migration_note: None,
             error: Some("admin status payload did not include feature_rollouts".to_owned()),
@@ -1758,19 +1772,133 @@ fn collect_doctor_feature_rollouts_snapshot(
     };
 
     let mut maturity_counts = BTreeMap::new();
+    let mut promotion_state_counts = BTreeMap::new();
     let mut enabled_flags = 0_usize;
+    let mut effective_active_flags = 0_usize;
+    let mut not_effectively_active_flags = 0_usize;
+    let mut non_authoritative_flags = 0_usize;
+    let mut unknown_activation_authority_flags = 0_usize;
+    let mut qualified_hot_path_flags = 0_usize;
+    let mut usage = Vec::new();
     let mut inactive = Vec::new();
     for (flag, entry) in feature_rollouts {
-        let enabled = entry.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let legacy_enabled = entry.get("enabled").and_then(Value::as_bool).unwrap_or(false);
         let maturity =
             entry.get("maturity").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        let promotion_state =
+            entry.get("promotion_state").and_then(Value::as_str).unwrap_or("unknown").to_owned();
+        let activation = entry.get("rollout_activation").unwrap_or(&Value::Null);
+        let configured_enabled =
+            activation.get("configured_enabled").and_then(Value::as_bool).unwrap_or(legacy_enabled);
+        let declared_activation_authority =
+            activation.get("authoritative").and_then(Value::as_bool);
+        let activation_authoritative = match promotion_state.as_str() {
+            "contract_only" => Some(false),
+            _ => declared_activation_authority,
+        };
+        let effective_enabled =
+            match (activation_authoritative, activation.get("effective_enabled")) {
+                (Some(true), Some(Value::Bool(enabled))) => Some(*enabled),
+                (Some(true), Some(Value::Null)) => None,
+                _ => None,
+            };
+        let activation_reason_code = match (activation_authoritative, effective_enabled) {
+            (Some(false), _) => Some("feature_rollout.activation_not_authoritative".to_owned()),
+            (Some(true), Some(true)) => Some("feature_rollout.activation_enabled".to_owned()),
+            (Some(true), Some(false)) => Some("feature_rollout.activation_disabled".to_owned()),
+            _ => None,
+        };
+        let qualified_hot_path = entry
+            .pointer("/runtime_usage/qualified_hot_path")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         *maturity_counts.entry(maturity.clone()).or_insert(0_usize) += 1;
-        if enabled {
+        *promotion_state_counts.entry(promotion_state.clone()).or_insert(0_usize) += 1;
+        if qualified_hot_path {
+            qualified_hot_path_flags = qualified_hot_path_flags.saturating_add(1);
+        }
+        let runtime_usage = entry.get("runtime_usage").unwrap_or(&Value::Null);
+        usage.push(DoctorFeatureRolloutUsageSnapshot {
+            flag: flag.clone(),
+            enabled: configured_enabled,
+            configured_enabled,
+            activation_authoritative,
+            effective_enabled,
+            activation_reason_code: activation_reason_code.clone(),
+            promotion_state: promotion_state.clone(),
+            instrumented: runtime_usage
+                .get("instrumented")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            observed_unique_runs: runtime_usage.get("observed_unique_runs").and_then(Value::as_u64),
+            active_run_count: runtime_usage.get("active_run_count").and_then(Value::as_u64),
+            terminal_run_count: runtime_usage.get("terminal_run_count").and_then(Value::as_u64),
+            direct_unique_runs: runtime_usage.get("direct_unique_runs").and_then(Value::as_u64),
+            fallback_unique_runs: runtime_usage.get("fallback_unique_runs").and_then(Value::as_u64),
+            mixed_path_unique_runs: runtime_usage
+                .get("mixed_path_unique_runs")
+                .and_then(Value::as_u64),
+            terminal_direct_unique_runs: runtime_usage
+                .get("terminal_direct_unique_runs")
+                .and_then(Value::as_u64),
+            terminal_fallback_unique_runs: runtime_usage
+                .get("terminal_fallback_unique_runs")
+                .and_then(Value::as_u64),
+            terminal_mixed_path_unique_runs: runtime_usage
+                .get("terminal_mixed_path_unique_runs")
+                .and_then(Value::as_u64),
+            dropped_observation_count: runtime_usage
+                .get("dropped_observation_count")
+                .and_then(Value::as_u64),
+            fallback_reason_counts: json_u64_map_field(runtime_usage, "fallback_reason_counts"),
+            dropped_observation_reason_counts: json_u64_map_field(
+                runtime_usage,
+                "dropped_observation_reason_counts",
+            ),
+            qualified_hot_path,
+            qualification_reason_code: runtime_usage
+                .get("qualification_reason_code")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        });
+        if configured_enabled {
             enabled_flags = enabled_flags.saturating_add(1);
+        }
+        if effective_enabled == Some(true) {
+            effective_active_flags = effective_active_flags.saturating_add(1);
         } else {
+            not_effectively_active_flags = not_effectively_active_flags.saturating_add(1);
+        }
+        if !configured_enabled {
             inactive.push(DoctorInactiveFeatureRolloutSnapshot {
                 flag: flag.clone(),
+                configured_enabled,
+                activation_authoritative,
+                effective_enabled,
+                activation_reason_code,
                 maturity,
+                promotion_state,
+                contract_availability: entry
+                    .get("contract_availability")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                execution_completeness: entry
+                    .get("execution_completeness")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                support_maturity: entry
+                    .get("support_maturity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                lifecycle: entry
+                    .get("lifecycle")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                qualified_hot_path,
                 owner_component: entry
                     .get("owner_component")
                     .and_then(Value::as_str)
@@ -1782,13 +1910,33 @@ fn collect_doctor_feature_rollouts_snapshot(
                     .unwrap_or("unknown")
                     .to_owned(),
                 activation_blockers: json_string_array_field(entry, "activation_blockers"),
-                required_tests: json_string_array_field(entry, "required_tests"),
+                required_tests: {
+                    let promotion_tests =
+                        json_string_array_pointer(entry, "/promotion_manifest/required_test_refs");
+                    if promotion_tests.is_empty() {
+                        json_string_array_field(entry, "required_tests")
+                    } else {
+                        promotion_tests
+                    }
+                },
             });
         }
+        match activation_authoritative {
+            Some(false) => {
+                non_authoritative_flags = non_authoritative_flags.saturating_add(1);
+            }
+            None => {
+                unknown_activation_authority_flags =
+                    unknown_activation_authority_flags.saturating_add(1);
+            }
+            Some(true) => {}
+        }
     }
+    usage.sort_by(|left, right| left.flag.cmp(&right.flag));
     inactive.sort_by(|left, right| left.flag.cmp(&right.flag));
     let migration_note = payload
-        .pointer("/feature_rollout_maturity/migration_note")
+        .pointer("/feature_rollout_maturity_v2/migration_note")
+        .or_else(|| payload.pointer("/feature_rollout_maturity/migration_note"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
@@ -1796,8 +1944,15 @@ fn collect_doctor_feature_rollouts_snapshot(
         fetched: true,
         flag_count: feature_rollouts.len(),
         enabled_flags,
+        effective_active_flags,
+        not_effectively_active_flags,
+        non_authoritative_flags,
+        unknown_activation_authority_flags,
         inactive_flags: inactive.len(),
         maturity_counts,
+        promotion_state_counts,
+        qualified_hot_path_flags,
+        usage,
         inactive,
         migration_note,
         error: admin_error.map(ToOwned::to_owned),
@@ -1812,6 +1967,116 @@ fn json_string_array_field(entry: &Value, field: &str) -> Vec<String> {
             values.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn json_string_array_pointer(entry: &Value, pointer: &str) -> Vec<String> {
+    entry
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn json_u64_map_field(entry: &Value, field: &str) -> BTreeMap<String, u64> {
+    entry
+        .get(field)
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(key, value)| value.as_u64().map(|value| (key.clone(), value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod doctor_feature_rollout_snapshot_tests {
+    use serde_json::json;
+
+    use super::collect_doctor_feature_rollouts_snapshot;
+
+    #[test]
+    fn activation_projection_fails_closed_for_dead_and_legacy_flags() {
+        let payload = json!({
+            "feature_rollouts": {
+                "configured_dead_flag": {
+                    "enabled": true,
+                    "promotion_state": "contract_only",
+                    "rollout_activation": {
+                        "configured_enabled": true,
+                        "authoritative": true,
+                        "effective_enabled": true,
+                        "reason_code": "feature_rollout.activation_enabled"
+                    }
+                },
+                "legacy_v1_flag": {
+                    "enabled": true
+                },
+                "partial_v2_flag": {
+                    "enabled": true,
+                    "promotion_state": "canary",
+                    "rollout_activation": {
+                        "configured_enabled": true
+                    }
+                },
+                "missing_effective_flag": {
+                    "enabled": true,
+                    "promotion_state": "gated_production",
+                    "rollout_activation": {
+                        "configured_enabled": true,
+                        "authoritative": true
+                    }
+                }
+            }
+        });
+
+        let snapshot = collect_doctor_feature_rollouts_snapshot(Some(&payload), None);
+
+        assert_eq!(snapshot.enabled_flags, 4);
+        assert_eq!(snapshot.inactive_flags, 0);
+        assert_eq!(snapshot.effective_active_flags, 0);
+        assert_eq!(snapshot.not_effectively_active_flags, 4);
+        assert_eq!(snapshot.non_authoritative_flags, 1);
+        assert_eq!(snapshot.unknown_activation_authority_flags, 2);
+        let dead = snapshot
+            .usage
+            .iter()
+            .find(|rollout| rollout.flag == "configured_dead_flag")
+            .expect("configured dead flag must be retained in doctor usage");
+        assert_eq!(dead.activation_authoritative, Some(false));
+        assert_eq!(dead.effective_enabled, None);
+        assert_eq!(
+            dead.activation_reason_code.as_deref(),
+            Some("feature_rollout.activation_not_authoritative")
+        );
+        let legacy = snapshot
+            .usage
+            .iter()
+            .find(|rollout| rollout.flag == "legacy_v1_flag")
+            .expect("legacy flag must be retained in doctor usage");
+        assert_eq!(legacy.activation_authoritative, None);
+        assert_eq!(legacy.effective_enabled, None);
+        assert_eq!(legacy.activation_reason_code, None);
+        let partial = snapshot
+            .usage
+            .iter()
+            .find(|rollout| rollout.flag == "partial_v2_flag")
+            .expect("partial v2 flag must be retained in doctor usage");
+        assert_eq!(partial.activation_authoritative, None);
+        assert_eq!(partial.effective_enabled, None);
+        assert_eq!(partial.activation_reason_code, None);
+        let missing_effective = snapshot
+            .usage
+            .iter()
+            .find(|rollout| rollout.flag == "missing_effective_flag")
+            .expect("incomplete authoritative flag must be retained in doctor usage");
+        assert_eq!(missing_effective.activation_authoritative, Some(true));
+        assert_eq!(missing_effective.effective_enabled, None);
+        assert_eq!(missing_effective.activation_reason_code, None);
+    }
 }
 
 fn doctor_browser_diagnostics_unavailable_message(admin_error: Option<&str>) -> String {
@@ -12635,8 +12900,15 @@ struct DoctorFeatureRolloutsSnapshot {
     fetched: bool,
     flag_count: usize,
     enabled_flags: usize,
+    effective_active_flags: usize,
+    not_effectively_active_flags: usize,
+    non_authoritative_flags: usize,
+    unknown_activation_authority_flags: usize,
     inactive_flags: usize,
     maturity_counts: BTreeMap<String, usize>,
+    promotion_state_counts: BTreeMap<String, usize>,
+    qualified_hot_path_flags: usize,
+    usage: Vec<DoctorFeatureRolloutUsageSnapshot>,
     inactive: Vec<DoctorInactiveFeatureRolloutSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     migration_note: Option<String>,
@@ -12645,9 +12917,58 @@ struct DoctorFeatureRolloutsSnapshot {
 }
 
 #[derive(Debug, Serialize)]
+struct DoctorFeatureRolloutUsageSnapshot {
+    flag: String,
+    enabled: bool,
+    configured_enabled: bool,
+    activation_authoritative: Option<bool>,
+    effective_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_reason_code: Option<String>,
+    promotion_state: String,
+    instrumented: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_run_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_run_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mixed_path_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_direct_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_fallback_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_mixed_path_unique_runs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dropped_observation_count: Option<u64>,
+    fallback_reason_counts: BTreeMap<String, u64>,
+    dropped_observation_reason_counts: BTreeMap<String, u64>,
+    qualified_hot_path: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualification_reason_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct DoctorInactiveFeatureRolloutSnapshot {
     flag: String,
+    configured_enabled: bool,
+    activation_authoritative: Option<bool>,
+    effective_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_reason_code: Option<String>,
     maturity: String,
+    promotion_state: String,
+    contract_availability: String,
+    execution_completeness: String,
+    support_maturity: String,
+    lifecycle: String,
+    qualified_hot_path: bool,
     owner_component: String,
     public_api_exposure: String,
     activation_blockers: Vec<String>,
@@ -14838,8 +15159,15 @@ mod diagnostics_bundle_tests {
                 fetched: true,
                 flag_count: 0,
                 enabled_flags: 0,
+                effective_active_flags: 0,
+                not_effectively_active_flags: 0,
+                non_authoritative_flags: 0,
+                unknown_activation_authority_flags: 0,
                 inactive_flags: 0,
                 maturity_counts: BTreeMap::new(),
+                promotion_state_counts: BTreeMap::new(),
+                qualified_hot_path_flags: 0,
+                usage: Vec::new(),
                 inactive: Vec::new(),
                 migration_note: None,
                 error: None,

@@ -1483,6 +1483,7 @@ async fn maybe_apply_automatic_session_compaction(
         session: &session,
         actor_principal: context.principal.as_str(),
         run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
         mode: "automatic",
         trigger_reason: Some("automatic_compaction_policy"),
         trigger_policy: Some("budget_guard_v1"),

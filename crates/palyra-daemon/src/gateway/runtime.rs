@@ -55,6 +55,9 @@ use crate::application::{
         TurnControlApplyOutcome, TurnControlDecision, TurnControlOperation, TurnControlRequest,
     },
 };
+use crate::feature_usage::{
+    FeatureUsageCapability, FeatureUsagePath, FeatureUsageRegistry, FeatureUsageSnapshot,
+};
 use crate::journal::state_health::{
     JournalHashChainVerificationReport, JournalHashVerificationScope, JournalHealthReport,
     JournalStateRepairReport, JournalStateRepairRequest, JournalWalCheckpointMode,
@@ -835,6 +838,7 @@ pub struct GatewayRuntimeState {
     pub(crate) config: GatewayRuntimeConfigSnapshot,
     pub(crate) journal_config: GatewayJournalConfigSnapshot,
     pub(crate) counters: RuntimeCounters,
+    feature_usage: FeatureUsageRegistry,
     pub(crate) journal_store: JournalStore,
     revoked_certificate_count: usize,
     model_provider: RwLock<Arc<dyn ModelProvider>>,
@@ -1891,6 +1895,7 @@ impl GatewayRuntimeState {
                 canvas_closed: AtomicU64::new(0),
                 canvas_denied: AtomicU64::new(0),
             },
+            feature_usage: FeatureUsageRegistry::new(),
             journal_store,
             revoked_certificate_count,
             model_provider: RwLock::new(model_provider),
@@ -1945,6 +1950,26 @@ impl GatewayRuntimeState {
     /// Counts an admin status request.
     pub fn record_admin_status_request(&self) {
         self.counters.admin_status_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a redacted direct or fallback observation for one rollout capability.
+    pub(crate) fn record_feature_usage(
+        &self,
+        run_id: &str,
+        capability: FeatureUsageCapability,
+        path: FeatureUsagePath,
+    ) {
+        self.feature_usage.record(run_id, capability, path);
+    }
+
+    /// Returns aggregate rollout usage for the bounded process-local run window.
+    pub(crate) fn feature_usage_snapshot(&self) -> FeatureUsageSnapshot {
+        self.feature_usage.snapshot()
+    }
+
+    /// Freezes retained rollout evidence after the durable run transition succeeds.
+    pub(crate) fn mark_feature_usage_run_terminal(&self, run_id: &str) {
+        self.feature_usage.mark_terminal(run_id);
     }
 
     /// Registers a browser session for cleanup when the run terminates,
@@ -5370,9 +5395,10 @@ impl GatewayRuntimeState {
     ) -> Result<(), Status> {
         let state_ref = Arc::clone(self);
         let error_message_ref = error_message.clone();
+        let persisted_run_id = run_id.clone();
         tokio::task::spawn_blocking(move || {
             state_ref.update_orchestrator_run_state_blocking(
-                run_id.as_str(),
+                persisted_run_id.as_str(),
                 state,
                 error_message_ref.as_deref(),
             )
@@ -5392,6 +5418,12 @@ impl GatewayRuntimeState {
             RunLifecycleState::Pending
             | RunLifecycleState::Accepted
             | RunLifecycleState::InProgress => {}
+        }
+        if matches!(
+            state,
+            RunLifecycleState::Done | RunLifecycleState::Failed | RunLifecycleState::Cancelled
+        ) {
+            self.mark_feature_usage_run_terminal(run_id.as_str());
         }
         self.orchestrator_run_notify.notify_waiters();
         Ok(())
@@ -6480,9 +6512,9 @@ impl GatewayRuntimeState {
             .map_err(|error| map_orchestrator_store_error("request orchestrator cancel", error))
     }
 
-    /// Records a cancel request for a run, bumps the cancel counter, and returns the resulting
-    /// cancel snapshot. The run loop observes the flag at its next checkpoint; cancellation is
-    /// cooperative.
+    /// Persists a terminal `Cancelled` transition and cancel flag, bumps the cancel counter, and
+    /// returns the resulting snapshot. In-flight work observes the flag at a checkpoint, so
+    /// process cleanup remains cooperative even though the journal lifecycle is already terminal.
     ///
     /// # Errors
     /// Returns the mapped journal store error, or `internal` if the worker panicked.
@@ -6498,6 +6530,7 @@ impl GatewayRuntimeState {
         .await
         .map_err(|_| Status::internal("orchestrator cancel worker panicked"))??;
         self.counters.orchestrator_cancel_requests.fetch_add(1, Ordering::Relaxed);
+        self.mark_feature_usage_run_terminal(snapshot.run_id.as_str());
         Ok(RunCancelSnapshot {
             run_id: snapshot.run_id,
             state: snapshot.state,

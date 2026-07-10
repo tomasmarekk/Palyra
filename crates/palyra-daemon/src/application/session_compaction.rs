@@ -38,6 +38,7 @@ use crate::{
         WorkspaceManagedBlockDiff, WorkspaceManagedBlockOutcome, WorkspaceManagedBlockUpdate,
         WorkspaceManagedEntry,
     },
+    feature_usage::{FeatureUsageCapability, FeatureUsagePath, FeatureUsageReason},
     gateway::GatewayRuntimeState,
     journal::{
         OrchestratorCheckpointCreateRequest, OrchestratorCheckpointRecord,
@@ -224,7 +225,12 @@ pub(crate) struct SessionCompactionApplyRequest<'a> {
     pub(crate) runtime_state: &'a Arc<GatewayRuntimeState>,
     pub(crate) session: &'a OrchestratorSessionRecord,
     pub(crate) actor_principal: &'a str,
+    /// Run stored on compaction artifacts and checkpoints for traceability.
     pub(crate) run_id: Option<&'a str>,
+    /// Active run whose hot-path execution contributes rollout usage evidence.
+    /// Post-run operator actions leave this unset even when their artifacts
+    /// retain a terminal run attribution.
+    pub(crate) usage_observation_run_id: Option<&'a str>,
     /// `"automatic"` forces operator review for all durable writes;
     /// any other mode (for example `"manual"`) honors auto-write candidates.
     pub(crate) mode: &'a str,
@@ -1138,6 +1144,18 @@ pub(crate) async fn apply_session_compaction(
             rollout_enabled: safeguard_rollout_enabled,
         }),
     );
+    if let Some(run_id) = request.usage_observation_run_id {
+        let usage_path = if safeguard_rollout_enabled {
+            FeatureUsagePath::Direct
+        } else {
+            FeatureUsagePath::Fallback { reason: FeatureUsageReason::RolloutDisabled }
+        };
+        request.runtime_state.record_feature_usage(
+            run_id,
+            FeatureUsageCapability::CompactionSafeguard,
+            usage_path,
+        );
+    }
     if compaction_safeguard_blocks_apply(&applied_safeguard) {
         rollback_applied_workspace_writes(
             request.runtime_state,

@@ -19,9 +19,9 @@
     },
     "feature_rollout_maturity": {
       "blocked": 5,
-      "deprecated": 0,
-      "gated_production": 4,
-      "preview_only": 25,
+      "deprecated": 1,
+      "gated_production": 1,
+      "preview_only": 27,
       "scaffold": 1,
       "stable": 0
     },
@@ -68,10 +68,15 @@
       "surface": "feature_rollout_maturity",
       "source_paths": [
         "crates/palyra-daemon/src/feature_rollout_maturity.rs",
+        "crates/palyra-daemon/src/feature_rollout_maturity/manifest.rs",
+        "crates/palyra-daemon/src/feature_rollout_maturity/manifest/state_validation.rs",
+        "crates/palyra-daemon/src/feature_usage.rs",
         "crates/palyra-daemon/src/config/schema.rs",
+        "infra/release/feature-rollout-promotions.json",
+        "schemas/json/common/feature-rollout-promotion-manifest.v1.json",
         "crates/palyra-daemon/tests/current_state_inventory.rs"
       ],
-      "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
+      "reason": "rollout contract, execution, promotion, observed usage, support lifecycle, and evidence gates"
     },
     {
       "surface": "method_registry",

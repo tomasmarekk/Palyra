@@ -510,6 +510,7 @@ async fn session_compact_apply(
         session: &session,
         actor_principal: request_context.principal.as_str(),
         run_id: run_id.as_deref(),
+        usage_observation_run_id: None,
         mode: mode.as_str(),
         trigger_reason: trigger_reason.as_deref(),
         trigger_policy: trigger_policy.as_deref(),

@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -38,6 +38,9 @@ use tokio::{
 use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::agents::AgentCreateRequest;
+use crate::feature_usage::{
+    FeatureUsageCapability, FeatureUsageCapabilitySnapshot, FeatureUsagePath, FeatureUsageReason,
+};
 use crate::journal::{
     ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
     ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
@@ -5739,6 +5742,404 @@ async fn terminal_cancel_cleanup_drains_registered_resources_after_noop_snapshot
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn orchestrator_cancel_freezes_existing_and_late_feature_usage() {
+    let state = build_test_runtime_state(false);
+    let run_id = Ulid::new().to_string();
+    let session_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    state.record_feature_usage(
+        run_id.as_str(),
+        FeatureUsageCapability::VerificationRuntime,
+        FeatureUsagePath::Direct,
+    );
+
+    let before_cancel = state.feature_usage_snapshot();
+    assert_eq!(before_cancel.active_runs, 1);
+    assert_eq!(before_cancel.terminal_runs, 0);
+
+    let cancel = state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: run_id.clone(),
+            reason: "test_cancel_usage_terminalization".to_owned(),
+        })
+        .await
+        .expect("cancel request should persist the terminal transition");
+    assert_eq!(cancel.run_id, run_id);
+    assert!(cancel.cancel_requested);
+    state.record_feature_usage(
+        cancel.run_id.as_str(),
+        FeatureUsageCapability::VerificationRuntime,
+        FeatureUsagePath::Fallback {
+            reason: crate::feature_usage::FeatureUsageReason::RolloutDisabled,
+        },
+    );
+
+    let late_run_id = Ulid::new().to_string();
+    let late_session_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, late_session_id.as_str(), late_run_id.as_str()).await;
+    let late_cancel = state
+        .request_orchestrator_cancel(OrchestratorCancelRequest {
+            run_id: late_run_id,
+            reason: "test_cancel_before_usage_observation".to_owned(),
+        })
+        .await
+        .expect("cancel should persist before the first usage observation");
+    state.record_feature_usage(
+        late_cancel.run_id.as_str(),
+        FeatureUsageCapability::VerificationRuntime,
+        FeatureUsagePath::Direct,
+    );
+
+    let after_cancel = state.feature_usage_snapshot();
+    assert_eq!(after_cancel.active_runs, 0);
+    assert_eq!(after_cancel.terminal_runs, 1);
+    let verification_usage = after_cancel
+        .capabilities
+        .iter()
+        .find(|snapshot| snapshot.capability == FeatureUsageCapability::VerificationRuntime)
+        .expect("verification usage bucket should exist");
+    assert_eq!(verification_usage.terminal_direct_runs, 1);
+    assert_eq!(verification_usage.fallback_runs, 0);
+    assert_eq!(verification_usage.dropped_observations, 2);
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedTerminalFeatureUsage {
+    Direct,
+    RolloutDisabledFallback,
+}
+
+fn feature_usage_capability_snapshot(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    capability: FeatureUsageCapability,
+) -> FeatureUsageCapabilitySnapshot {
+    state
+        .feature_usage_snapshot()
+        .capabilities
+        .into_iter()
+        .find(|snapshot| snapshot.capability == capability)
+        .expect("instrumented feature usage bucket should exist")
+}
+
+fn assert_feature_usage_window_empty(state: &std::sync::Arc<GatewayRuntimeState>) {
+    let usage = state.feature_usage_snapshot();
+    assert_eq!(usage.retained_runs, 0);
+    assert_eq!(usage.active_runs, 0);
+    assert_eq!(usage.terminal_runs, 0);
+    assert!(usage.capabilities.iter().all(|snapshot| snapshot.observed_runs == 0));
+}
+
+fn assert_terminal_feature_usage(
+    snapshot: &FeatureUsageCapabilitySnapshot,
+    expected: ExpectedTerminalFeatureUsage,
+) {
+    assert_eq!(snapshot.observed_runs, 1);
+    assert_eq!(snapshot.active_runs, 0);
+    assert_eq!(snapshot.terminal_observed_runs, 1);
+    assert_eq!(snapshot.mixed_runs, 0);
+    assert_eq!(snapshot.terminal_mixed_runs, 0);
+    assert_eq!(snapshot.dropped_observations, 0);
+    match expected {
+        ExpectedTerminalFeatureUsage::Direct => {
+            assert_eq!(snapshot.direct_runs, 1);
+            assert_eq!(snapshot.fallback_runs, 0);
+            assert_eq!(snapshot.terminal_direct_runs, 1);
+            assert_eq!(snapshot.terminal_fallback_runs, 0);
+            assert!(snapshot.reason_counts.is_empty());
+        }
+        ExpectedTerminalFeatureUsage::RolloutDisabledFallback => {
+            assert_eq!(snapshot.direct_runs, 0);
+            assert_eq!(snapshot.fallback_runs, 1);
+            assert_eq!(snapshot.terminal_direct_runs, 0);
+            assert_eq!(snapshot.terminal_fallback_runs, 1);
+            assert_eq!(snapshot.reason_counts.get(&FeatureUsageReason::RolloutDisabled), Some(&1));
+        }
+    }
+}
+
+fn feature_rollouts_with_verification_runtime(
+    enabled: bool,
+) -> crate::config::FeatureRolloutsConfig {
+    crate::config::FeatureRolloutsConfig {
+        verification_runtime: palyra_common::feature_rollouts::FeatureRolloutSetting::from_config(
+            enabled,
+        ),
+        ..crate::config::FeatureRolloutsConfig::default()
+    }
+}
+
+async fn configure_feature_usage_test_agent(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    agent_id: &str,
+    workspace: &Path,
+) {
+    fs::create_dir_all(workspace).expect("feature usage workspace should exist");
+    state
+        .create_agent(AgentCreateRequest {
+            agent_id: agent_id.to_owned(),
+            display_name: "Feature Usage Test".to_owned(),
+            agent_dir: None,
+            workspace_roots: vec![workspace.to_string_lossy().into_owned()],
+            default_model_profile: None,
+            execution_backend_preference: None,
+            default_tool_allowlist: Vec::new(),
+            default_skill_allowlist: Vec::new(),
+            set_default: true,
+            allow_absolute_paths: true,
+        })
+        .await
+        .expect("feature usage test agent should be created");
+}
+
+async fn exercise_process_verification_usage(
+    rollout_enabled: bool,
+) -> FeatureUsageCapabilitySnapshot {
+    #[cfg(windows)]
+    let (command, args) = ("hostname.exe", Vec::<&str>::new());
+    #[cfg(not(windows))]
+    let (command, args) = ("true", Vec::<&str>::new());
+
+    let tempdir = gateway_tempdir("feature-usage-process-");
+    let workspace = tempdir.path().join("workspace");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.execution_timeout_ms = 10_000;
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.allowed_executables = vec![command.to_owned()];
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    tool_call.process_runner.workspace_root = workspace.clone();
+    let state = build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        false,
+        false,
+        feature_rollouts_with_verification_runtime(rollout_enabled),
+        tool_call,
+    );
+    configure_feature_usage_test_agent(&state, "feature-usage-process", workspace.as_path()).await;
+
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let context = super::ToolRuntimeExecutionContext {
+        principal: "user:ops",
+        device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        channel: Some("cli"),
+        session_id: session_id.as_str(),
+        run_id: run_id.as_str(),
+        execution_backend: ExecutionBackendPreference::LocalSandbox,
+        backend_reason_code: "backend.default.local_sandbox",
+    };
+    let input = serde_json::to_vec(&json!({
+        "command": command,
+        "args": args,
+        "cwd": ".",
+    }))
+    .expect("process usage input should serialize");
+    let proposal_id = Ulid::new().to_string();
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        context,
+        proposal_id.as_str(),
+        super::PROCESS_RUNNER_TOOL_NAME,
+        input.as_slice(),
+        None,
+    )
+    .await;
+    assert!(outcome.success, "process hot path should succeed: {}", outcome.error);
+    state
+        .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+        .await
+        .expect("process usage run should terminalize");
+
+    feature_usage_capability_snapshot(&state, FeatureUsageCapability::VerificationRuntime)
+}
+
+async fn exercise_workspace_patch_verification_usage(
+    rollout_enabled: bool,
+) -> FeatureUsageCapabilitySnapshot {
+    let tempdir = gateway_tempdir("feature-usage-patch-");
+    let workspace = tempdir.path().join("workspace");
+    let state = build_test_runtime_state_with_runtime_overrides(
+        false,
+        false,
+        feature_rollouts_with_verification_runtime(rollout_enabled),
+    );
+    configure_feature_usage_test_agent(&state, "feature-usage-patch", workspace.as_path()).await;
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("feature usage patch fixture should be written");
+
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let patch =
+        "*** Begin Patch\n*** Update File: notes.txt\n@@\n-beta\n+beta-updated\n*** End Patch\n";
+    let input = serde_json::to_vec(&json!({ "patch": patch }))
+        .expect("workspace patch usage input should serialize");
+    let proposal_id = Ulid::new().to_string();
+    let outcome = execute_workspace_patch_tool(
+        &state,
+        crate::application::tool_runtime::workspace_patch::WorkspacePatchToolRequest {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            proposal_id: proposal_id.as_str(),
+            input_json: input.as_slice(),
+        },
+    )
+    .await;
+    assert!(outcome.success, "workspace patch hot path should succeed: {}", outcome.error);
+    state
+        .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+        .await
+        .expect("workspace patch usage run should terminalize");
+
+    feature_usage_capability_snapshot(&state, FeatureUsageCapability::VerificationRuntime)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_verification_usage_records_direct_on_enabled_hot_path() {
+    let usage = exercise_process_verification_usage(true).await;
+    assert_terminal_feature_usage(&usage, ExpectedTerminalFeatureUsage::Direct);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_verification_usage_records_explicit_fallback_when_disabled() {
+    let usage = exercise_process_verification_usage(false).await;
+    assert_terminal_feature_usage(&usage, ExpectedTerminalFeatureUsage::RolloutDisabledFallback);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_patch_verification_usage_records_direct_on_enabled_hot_path() {
+    let usage = exercise_workspace_patch_verification_usage(true).await;
+    assert_terminal_feature_usage(&usage, ExpectedTerminalFeatureUsage::Direct);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workspace_patch_verification_usage_records_explicit_fallback_when_disabled() {
+    let usage = exercise_workspace_patch_verification_usage(false).await;
+    assert_terminal_feature_usage(&usage, ExpectedTerminalFeatureUsage::RolloutDisabledFallback);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ordinary_terminal_run_does_not_enter_feature_usage_window() {
+    let state = build_test_runtime_state(false);
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let proposal_id = Ulid::new().to_string();
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        proposal_id.as_str(),
+        "palyra.echo",
+        br#"{"text":"ordinary run"}"#,
+        None,
+    )
+    .await;
+    assert!(outcome.success, "ordinary echo should succeed: {}", outcome.error);
+    state
+        .update_orchestrator_run_state(run_id, RunLifecycleState::Done, None)
+        .await
+        .expect("ordinary run should terminalize");
+
+    assert_feature_usage_window_empty(&state);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_process_input_does_not_record_verification_usage() {
+    let tempdir = gateway_tempdir("feature-usage-invalid-process-");
+    let workspace = tempdir.path().join("workspace");
+    fs::create_dir_all(workspace.as_path()).expect("invalid process workspace should exist");
+    let mut tool_call = default_test_tool_call_config();
+    tool_call.allowed_tools = vec![super::PROCESS_RUNNER_TOOL_NAME.to_owned()];
+    tool_call.process_runner.enabled = true;
+    tool_call.process_runner.egress_enforcement_mode = EgressEnforcementMode::None;
+    tool_call.process_runner.workspace_root = workspace;
+    let state = build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
+        false,
+        false,
+        feature_rollouts_with_verification_runtime(true),
+        tool_call,
+    );
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let proposal_id = Ulid::new().to_string();
+    let outcome = super::execute_tool_with_runtime_dispatch(
+        &state,
+        super::ToolRuntimeExecutionContext {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            execution_backend: ExecutionBackendPreference::LocalSandbox,
+            backend_reason_code: "backend.default.local_sandbox",
+        },
+        proposal_id.as_str(),
+        super::PROCESS_RUNNER_TOOL_NAME,
+        b"{not-json",
+        None,
+    )
+    .await;
+    assert!(!outcome.success, "malformed process input must fail before verification usage");
+    state
+        .update_orchestrator_run_state(run_id, RunLifecycleState::Failed, None)
+        .await
+        .expect("invalid process run should terminalize");
+
+    assert_feature_usage_window_empty(&state);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_workspace_patch_does_not_record_verification_usage() {
+    let tempdir = gateway_tempdir("feature-usage-rejected-patch-");
+    let workspace = tempdir.path().join("workspace");
+    let state = build_test_runtime_state_with_runtime_overrides(
+        false,
+        false,
+        feature_rollouts_with_verification_runtime(true),
+    );
+    configure_feature_usage_test_agent(&state, "feature-usage-rejected-patch", workspace.as_path())
+        .await;
+    let session_id = Ulid::new().to_string();
+    let run_id = Ulid::new().to_string();
+    start_tool_program_test_run(&state, session_id.as_str(), run_id.as_str()).await;
+    let input = serde_json::to_vec(&json!({ "patch": "not a workspace patch" }))
+        .expect("rejected patch input should serialize");
+    let proposal_id = Ulid::new().to_string();
+    let outcome = execute_workspace_patch_tool(
+        &state,
+        crate::application::tool_runtime::workspace_patch::WorkspacePatchToolRequest {
+            principal: "user:ops",
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            channel: Some("cli"),
+            session_id: session_id.as_str(),
+            run_id: run_id.as_str(),
+            proposal_id: proposal_id.as_str(),
+            input_json: input.as_slice(),
+        },
+    )
+    .await;
+    assert!(!outcome.success, "malformed patch must fail before mutation usage");
+    state
+        .update_orchestrator_run_state(run_id, RunLifecycleState::Failed, None)
+        .await
+        .expect("rejected patch run should terminalize");
+
+    assert_feature_usage_window_empty(&state);
+}
+
 #[test]
 fn cleanup_stale_pid_files_removes_only_matching_pid_artifacts() {
     let tempdir = gateway_tempdir("gateway-");
@@ -10699,6 +11100,7 @@ async fn session_compaction_manual_apply_persists_durable_writes_and_quality_gat
         session: &session,
         actor_principal: "user:ops",
         run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
         mode: "manual",
         trigger_reason: Some("test_quality_gate"),
         trigger_policy: Some("test_policy"),
@@ -10811,6 +11213,67 @@ async fn session_compaction_manual_apply_persists_durable_writes_and_quality_gat
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn post_run_manual_compaction_keeps_attribution_without_usage_observation() {
+    let _test_guard = lock_session_compaction_test_guard().await;
+    configure_test_write_failure_path(None);
+    configure_test_safeguard_failure(None);
+    let state = build_test_runtime_state(false);
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FC5";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FC6";
+    seed_session_compaction_fixture(&state, session_id, run_id);
+    state
+        .update_orchestrator_run_state(run_id.to_owned(), RunLifecycleState::Done, None)
+        .await
+        .expect("fixture run should terminalize before manual compaction");
+    let session = state
+        .journal_store
+        .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            require_existing: true,
+            reset_session: false,
+        })
+        .expect("session should resolve")
+        .session;
+
+    let execution = apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state,
+        session: &session,
+        actor_principal: "user:ops",
+        run_id: Some(run_id),
+        usage_observation_run_id: None,
+        mode: "manual",
+        trigger_reason: Some("post_run_operator_compaction"),
+        trigger_policy: Some("operator_review"),
+        operator_instruction: None,
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await
+    .expect("post-run manual compaction should succeed");
+
+    assert_eq!(execution.artifact.run_id.as_deref(), Some(run_id));
+    assert_eq!(execution.pre_checkpoint.run_id.as_deref(), Some(run_id));
+    assert_eq!(execution.post_checkpoint.run_id.as_deref(), Some(run_id));
+    let usage = state.feature_usage_snapshot();
+    assert_eq!(usage.dropped_observations, 0);
+    let compaction_usage = usage
+        .capabilities
+        .iter()
+        .find(|snapshot| snapshot.capability == FeatureUsageCapability::CompactionSafeguard)
+        .expect("compaction usage bucket should exist");
+    assert_eq!(compaction_usage.observed_runs, 0);
+    assert_eq!(compaction_usage.active_runs, 0);
+    assert_eq!(compaction_usage.direct_runs, 0);
+    assert_eq!(compaction_usage.fallback_runs, 0);
+    assert_eq!(compaction_usage.terminal_observed_runs, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn session_compaction_automatic_apply_requires_review_before_durable_writes() {
     let _test_guard = lock_session_compaction_test_guard().await;
     configure_test_write_failure_path(None);
@@ -10838,6 +11301,7 @@ async fn session_compaction_automatic_apply_requires_review_before_durable_write
         session: &session,
         actor_principal: "user:ops",
         run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
         mode: "automatic",
         trigger_reason: Some("test_automatic_review_gate"),
         trigger_policy: Some("test_policy"),
@@ -10956,6 +11420,7 @@ async fn session_compaction_manual_apply_rolls_back_workspace_writes_on_partial_
         session: &session,
         actor_principal: "user:ops",
         run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
         mode: "manual",
         trigger_reason: Some("test_rollback"),
         trigger_policy: Some("test_policy"),
@@ -11053,6 +11518,7 @@ async fn session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_fa
         session: &session,
         actor_principal: "user:ops",
         run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
         mode: "manual",
         trigger_reason: Some("test_safeguard_rollback"),
         trigger_policy: Some("test_policy"),
@@ -11103,6 +11569,85 @@ async fn session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_fa
     assert_eq!(
         checkpoint.referenced_compaction_ids_json, "[]",
         "pre checkpoint must not reference a blocked artifact"
+    );
+
+    state
+        .update_orchestrator_run_state(run_id.to_owned(), RunLifecycleState::Failed, None)
+        .await
+        .expect("failed compaction run should terminalize");
+    let usage = state.feature_usage_snapshot();
+    let compaction_usage = usage
+        .capabilities
+        .iter()
+        .find(|snapshot| snapshot.capability == FeatureUsageCapability::CompactionSafeguard)
+        .expect("compaction safeguard usage bucket should exist");
+    assert_eq!(compaction_usage.direct_runs, 1);
+    assert_eq!(compaction_usage.fallback_runs, 0);
+    assert_eq!(compaction_usage.terminal_direct_runs, 1);
+    assert_eq!(compaction_usage.terminal_fallback_runs, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_compaction_safeguard_records_explicit_fallback_when_disabled() {
+    let _test_guard = lock_session_compaction_test_guard().await;
+    configure_test_write_failure_path(None);
+    configure_test_safeguard_failure(None);
+    let state = build_test_runtime_state(false);
+    let session_id = "01ARZ3NDEKTSV4RRFFQ69G5FB5";
+    let run_id = "01ARZ3NDEKTSV4RRFFQ69G5FB6";
+    seed_session_compaction_fixture(&state, session_id, run_id);
+    let session = state
+        .journal_store
+        .resolve_orchestrator_session(&OrchestratorSessionResolveRequest {
+            session_id: Some(session_id.to_owned()),
+            session_key: None,
+            session_label: None,
+            principal: "user:ops".to_owned(),
+            device_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            channel: Some("cli".to_owned()),
+            require_existing: true,
+            reset_session: false,
+        })
+        .expect("session should resolve")
+        .session;
+
+    let _safeguard_guard =
+        TestSafeguardFailureGuard::set("injected observe-only safeguard failure");
+    apply_session_compaction(SessionCompactionApplyRequest {
+        runtime_state: &state,
+        session: &session,
+        actor_principal: "user:ops",
+        run_id: Some(run_id),
+        usage_observation_run_id: Some(run_id),
+        mode: "manual",
+        trigger_reason: Some("test_safeguard_fallback"),
+        trigger_policy: Some("test_policy"),
+        operator_instruction: None,
+        accept_candidate_ids: &[],
+        reject_candidate_ids: &[],
+    })
+    .await
+    .expect("disabled safeguard should preserve the explicit observe-only fallback");
+
+    state
+        .update_orchestrator_run_state(run_id.to_owned(), RunLifecycleState::Done, None)
+        .await
+        .expect("fallback compaction run should terminalize");
+    let usage = state.feature_usage_snapshot();
+    let compaction_usage = usage
+        .capabilities
+        .iter()
+        .find(|snapshot| snapshot.capability == FeatureUsageCapability::CompactionSafeguard)
+        .expect("compaction safeguard usage bucket should exist");
+    assert_eq!(compaction_usage.direct_runs, 0);
+    assert_eq!(compaction_usage.fallback_runs, 1);
+    assert_eq!(compaction_usage.terminal_direct_runs, 0);
+    assert_eq!(compaction_usage.terminal_fallback_runs, 1);
+    assert_eq!(
+        compaction_usage
+            .reason_counts
+            .get(&crate::feature_usage::FeatureUsageReason::RolloutDisabled),
+        Some(&1)
     );
 }
 

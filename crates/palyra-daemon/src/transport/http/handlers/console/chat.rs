@@ -1708,6 +1708,7 @@ pub(crate) async fn console_chat_compaction_apply_handler(
         session: &session_record,
         actor_principal: session.context.principal.as_str(),
         run_id: session_record.last_run_id.as_deref(),
+        usage_observation_run_id: None,
         mode: "manual",
         trigger_reason: payload.trigger_reason.as_deref(),
         trigger_policy: payload.trigger_policy.as_deref(),

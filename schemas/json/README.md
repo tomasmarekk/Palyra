@@ -2,7 +2,7 @@
 
 Canonical JSON schemas are split into:
 
-- `schemas/json/common/`: shared primitives (canonical IDs, replay protection, runtime resource manifests).
+- `schemas/json/common/`: shared primitives (canonical IDs, replay protection, runtime resource manifests, feature-rollout promotion evidence).
 - `schemas/json/envelopes/`: public envelope payloads (`message`, `a2ui`, `config export/import`, `webhook`).
 
 Every public JSON envelope must:

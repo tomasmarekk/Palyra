@@ -3417,7 +3417,58 @@ fn console_system_surface_returns_presence_and_enforces_emit_csrf() -> Result<()
             .pointer("/feature_rollout_maturity/schema_version")
             .and_then(Value::as_u64),
         Some(1),
-        "diagnostics should publish the feature rollout maturity schema version"
+        "the established diagnostics key must preserve the version 1 contract"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollout_maturity_v2/schema_version")
+            .and_then(Value::as_u64),
+        Some(2),
+        "diagnostics should publish the additive feature rollout maturity model separately"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/tool_repair/promotion_state")
+            .and_then(Value::as_str),
+        Some("contract_only"),
+        "the non-authoritative tool repair flag must not claim a side-effect-free shadow"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/tool_repair/execution_completeness")
+            .and_then(Value::as_str),
+        Some("partial")
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/channel_turn_kernel/lifecycle")
+            .and_then(Value::as_str),
+        Some("deprecated"),
+        "the ineffective channel kernel flag should expose its retirement workflow"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollouts/compaction_safeguard/runtime_usage/qualified_hot_path")
+            .and_then(Value::as_bool),
+        Some(false),
+        "an enabled flag without terminal direct usage must not qualify the hot path"
+    );
+    assert_eq!(
+        diagnostics_response
+            .pointer("/feature_rollout_maturity_v2/promotion_manifest/schema_id")
+            .and_then(Value::as_str),
+        Some("palyra.feature-rollout-promotions.v1")
+    );
+    assert!(
+        diagnostics_response
+            .pointer("/feature_rollouts/channel_turn_kernel/activation_blockers")
+            .and_then(Value::as_array)
+            .is_some_and(|blockers| {
+                blockers.iter().any(|blocker| {
+                    blocker.as_str().is_some_and(|text| text.contains("Do not enable deprecated"))
+                })
+            }),
+        "deprecated rollout guidance must direct migration instead of activation"
     );
     assert_eq!(
         diagnostics_response.pointer("/runtime_roadmap/schema_version").and_then(Value::as_u64),

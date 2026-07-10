@@ -49,6 +49,7 @@ use crate::{
         capture_workspace_patch_checkpoint, compare_workspace_anchors, WorkspaceCompareAnchor,
         WorkspacePatchCheckpointCapture, WorkspacePatchCheckpointStage,
     },
+    feature_usage::{FeatureUsageCapability, FeatureUsagePath, FeatureUsageReason},
     gateway::{current_unix_ms, record_agent_journal_event, GatewayRuntimeState},
     journal::{
         JournalAppendRequest, WorkspaceCheckpointPairLinkRequest, WorkspaceCheckpointRecord,
@@ -225,6 +226,17 @@ pub(super) async fn execute_workspace_patch_mutation(
         }
     };
     super::augment_workspace_patch_output_paths(&mut output_value, workspace_roots);
+    let verification_usage_path =
+        if runtime_state.config.feature_rollouts.verification_runtime.enabled {
+            FeatureUsagePath::Direct
+        } else {
+            FeatureUsagePath::Fallback { reason: FeatureUsageReason::RolloutDisabled }
+        };
+    runtime_state.record_feature_usage(
+        run_id,
+        FeatureUsageCapability::VerificationRuntime,
+        verification_usage_path,
+    );
 
     let mut post_change_checkpoint = None;
     let mut post_change_error = None;

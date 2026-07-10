@@ -20,6 +20,31 @@ For mechanical local refresh only, run the failing test with:
 "@
 }
 
+function Invoke-CargoCapture {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CargoArgs
+    )
+
+    $previousNativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $ErrorActionPreference = "Continue"
+        $output = @(& cargo @CargoArgs 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $PSNativeCommandUseErrorActionPreference = $previousNativeErrorPreference
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    [PSCustomObject]@{
+        Output = $output
+        ExitCode = $exitCode
+    }
+}
+
 function Invoke-ContractCheck {
     param(
         [Parameter(Mandatory = $true)]
@@ -29,10 +54,42 @@ function Invoke-ContractCheck {
     )
 
     Write-Output "==> $Label"
-    & cargo @CargoArgs
-    if ($LASTEXITCODE -ne 0) {
+    $result = Invoke-CargoCapture -CargoArgs $CargoArgs
+    $result.Output | ForEach-Object { Write-Output $_ }
+    if ($result.ExitCode -ne 0) {
         Write-SnapshotFailureGuidance
-        exit $LASTEXITCODE
+        exit $result.ExitCode
+    }
+}
+
+function Invoke-ExactContractCheck {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedTest,
+        [Parameter(Mandatory = $true)]
+        [string[]]$CargoArgs
+    )
+
+    Write-Output "==> $Label"
+    $result = Invoke-CargoCapture -CargoArgs $CargoArgs
+    $result.Output | ForEach-Object { Write-Output $_ }
+    if ($result.ExitCode -ne 0) {
+        Write-SnapshotFailureGuidance
+        exit $result.ExitCode
+    }
+
+    $expectedResult = "test $ExpectedTest ... ok"
+    $executedCount = @(
+        $result.Output | Where-Object { "$($_)".Trim() -eq $expectedResult }
+    ).Count
+    if ($executedCount -ne 1) {
+        [Console]::Error.WriteLine(
+            "Expected exactly one executed Rust test result for ${ExpectedTest}; observed $executedCount."
+        )
+        Write-SnapshotFailureGuidance
+        exit 1
     }
 }
 
@@ -54,3 +111,15 @@ Invoke-ContractCheck `
 Invoke-ContractCheck `
     -Label "daemon aggregate runtime ABI snapshot" `
     -CargoArgs @("test", "-p", "palyra-daemon", "runtime_diagnostics::tests::contract_snapshot_suite_covers_phase11_abi_surfaces", "--locked")
+Invoke-ExactContractCheck `
+    -Label "feature rollout promotion manifest contract" `
+    -ExpectedTest "feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid", "--locked", "--", "--exact")
+Invoke-ExactContractCheck `
+    -Label "feature rollout direct hot-path proof" `
+    -ExpectedTest "gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure", "--locked", "--", "--exact")
+Invoke-ExactContractCheck `
+    -Label "feature rollout no-hidden-fallback proof" `
+    -ExpectedTest "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" `
+    -CargoArgs @("test", "-p", "palyra-daemon", "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled", "--locked", "--", "--exact")

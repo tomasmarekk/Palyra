@@ -143,6 +143,7 @@ pub(crate) async fn admin_status_handler(
             "trace_export": trace_export.clone(),
         }),
     );
+    let feature_usage = state.runtime.feature_usage_snapshot();
     if let Value::Object(ref mut map) = payload {
         map.insert("auth".to_owned(), auth_payload);
         map.insert("mcp".to_owned(), mcp_payload);
@@ -152,12 +153,20 @@ pub(crate) async fn admin_status_handler(
             "feature_rollouts".to_owned(),
             crate::feature_rollout_maturity::build_feature_rollout_diagnostics(
                 &state.runtime.config.feature_rollouts,
+                &feature_usage,
             ),
         );
         map.insert(
             "feature_rollout_maturity".to_owned(),
-            crate::feature_rollout_maturity::build_feature_rollout_maturity_summary(
+            crate::feature_rollout_maturity::build_feature_rollout_maturity_summary_v1(
                 &state.runtime.config.feature_rollouts,
+            ),
+        );
+        map.insert(
+            "feature_rollout_maturity_v2".to_owned(),
+            crate::feature_rollout_maturity::build_feature_rollout_maturity_summary_v2(
+                &state.runtime.config.feature_rollouts,
+                &feature_usage,
             ),
         );
         map.insert(

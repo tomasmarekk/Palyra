@@ -88,6 +88,7 @@ use crate::{
         ExecutionBackendPreference, ExecutionBackendProcessRunRequest,
         ExecutionBackendRunnerCapability, ExecutionBackendRunnerRegistry,
     },
+    feature_usage::{FeatureUsageCapability, FeatureUsagePath, FeatureUsageReason},
     journal::{
         ApprovalCreateRequest, ApprovalDecision, ApprovalDecisionScope, ApprovalPolicySnapshot,
         ApprovalPromptOption, ApprovalPromptRecord, ApprovalRecord, ApprovalResolveRequest,
@@ -1407,12 +1408,22 @@ async fn record_process_run_verification_classification(
     input_json: &[u8],
     outcome: &ToolExecutionOutcome,
 ) {
-    if !runtime_state.config.feature_rollouts.verification_runtime.enabled {
-        return;
-    }
     let Ok(input) = parse_process_runner_tool_input(input_json) else {
         return;
     };
+    if !runtime_state.config.feature_rollouts.verification_runtime.enabled {
+        runtime_state.record_feature_usage(
+            context.run_id,
+            FeatureUsageCapability::VerificationRuntime,
+            FeatureUsagePath::Fallback { reason: FeatureUsageReason::RolloutDisabled },
+        );
+        return;
+    }
+    runtime_state.record_feature_usage(
+        context.run_id,
+        FeatureUsageCapability::VerificationRuntime,
+        FeatureUsagePath::Direct,
+    );
     let classification =
         crate::application::verification::VerificationCommandClassifier::classify_process_run(
             &input,

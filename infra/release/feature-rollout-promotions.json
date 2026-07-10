@@ -1,0 +1,656 @@
+{
+  "schema_version": 1,
+  "schema_id": "palyra.feature-rollout-promotions.v1",
+  "schema_sha256": "98fc09a7db5f2249867e6925707273a5ed6e0980dc6732c23de463f7d067f1aa",
+  "evidence_profiles": {
+    "descriptor_only": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "sli": {
+        "indicator": "registered descriptor inventory coverage",
+        "objective": "100 percent of registered descriptors expose owner and lifecycle metadata",
+        "window": "each runtime-contract CI run"
+      },
+      "rollback": {
+        "mechanism": "revert promotion metadata while preserving accepted rollout configuration keys",
+        "verification": "runtime-contract snapshots pass with the prior compatible maturity projection"
+      },
+      "compatibility_commitment": "Existing configuration keys and the legacy maturity projection remain accepted through the documented retirement gate.",
+      "legacy_removal_condition": "Remove a legacy descriptor only after its configuration key completes one compatibility window and inventory no longer advertises it."
+    },
+    "runtime_canary": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon runtime_preview --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "sli": {
+        "indicator": "canary terminal error and degraded-outcome rate",
+        "objective": "no unclassified terminal errors and no regression from the disabled control path",
+        "window": "each targeted canary suite and release candidate"
+      },
+      "rollback": {
+        "mechanism": "disable the canonical feature rollout setting",
+        "verification": "the disabled control path passes its targeted regression suite and inventory reports inactive activation"
+      },
+      "compatibility_commitment": "Default-off behavior and existing API response fields remain stable while the canary implementation evolves.",
+      "legacy_removal_condition": "Remove the disabled control path only after stable promotion and one supported compatibility window."
+    },
+    "execution_backend_blocked": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon execution_backend_parity --locked",
+        "cargo test -p palyra-workerd remote_tool_kind_maps_backend_parity_tools --locked",
+        "bash scripts/test/run-critical-attack-scenarios.sh"
+      ],
+      "sli": {
+        "indicator": "backend parity scenario completion",
+        "objective": "all policy, attestation, cancellation, cleanup, and unavailable-backend scenarios pass",
+        "window": "each execution-backend release qualification run"
+      },
+      "rollback": {
+        "mechanism": "retain the backend in blocked posture and route only to established local execution",
+        "verification": "backend diagnostics report blocked and critical attack scenarios remain green"
+      },
+      "compatibility_commitment": "Blocked backend identifiers remain parseable but cannot become execution targets until qualification completes.",
+      "legacy_removal_condition": "Remove a blocked backend identifier only after callers migrate to a supported backend and one compatibility window elapses."
+    },
+    "tool_repair_contract": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon tool_repair --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "sli": {
+        "indicator": "observe-only repair audit integrity",
+        "objective": "eligible repair decisions emit bounded redacted durable audit records without changing tool outcomes",
+        "window": "each tool-repair regression run"
+      },
+      "rollback": {
+        "mechanism": "revert future rollout-controlled execution changes while retaining established repair behavior and durable audit evidence",
+        "verification": "tool-repair regressions pass and diagnostics retain the contract-only posture"
+      },
+      "compatibility_commitment": "The established repair result and durable observe-only audit envelope remain unchanged while the rollout flag is non-authoritative.",
+      "legacy_removal_condition": "Remove the non-authoritative flag only after diagnostics consumers migrate and durable audit replay compatibility is proven."
+    },
+    "non_authoritative_runtime_contract": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon --test current_state_inventory --locked",
+        "cargo test -p palyra-daemon --test admin_surface --locked"
+      ],
+      "sli": {
+        "indicator": "non-authoritative rollout contract accuracy",
+        "objective": "every accepted but unwired rollout key reports contract-only posture and no effective runtime activation",
+        "window": "each runtime-contract CI run"
+      },
+      "rollback": {
+        "mechanism": "revert promotion metadata without claiming that the accepted rollout key changes established runtime behavior",
+        "verification": "runtime-contract snapshots preserve the contract-only posture and explicit non-authoritative activation reason"
+      },
+      "compatibility_commitment": "Existing runtime behavior remains independent of the accepted rollout key until a reviewed activation boundary is wired.",
+      "legacy_removal_condition": "Remove the non-authoritative key only after diagnostics consumers migrate or replace it with a tested authoritative activation boundary."
+    },
+    "provider_canary": {
+      "required_test_refs": [
+        "cargo test -p palyra-model-providers --locked",
+        "cargo test -p palyra-daemon provider_stream --locked",
+        "cargo test -p palyra-daemon responses_failed_stream_event --locked"
+      ],
+      "sli": {
+        "indicator": "provider normalization and recovery terminal failure rate",
+        "objective": "all failures produce one classified terminal outcome with no raw provider payload exposure",
+        "window": "each provider regression suite and release candidate"
+      },
+      "rollback": {
+        "mechanism": "disable the provider rollout and use the established provider path",
+        "verification": "provider regressions pass and diagnostics report the rollout inactive"
+      },
+      "compatibility_commitment": "Provider-facing error envelopes and terminal stream semantics remain backward compatible during canary qualification.",
+      "legacy_removal_condition": "Remove the established provider path only after stable promotion and replay fixtures prove compatibility."
+    },
+    "security_canary": {
+      "required_test_refs": [
+        "cargo test -p palyra-cli security --locked",
+        "bash scripts/check-high-risk-patterns.sh"
+      ],
+      "sli": {
+        "indicator": "security regression and redaction gate result",
+        "objective": "zero high-risk pattern violations and zero unredacted diagnostic fields",
+        "window": "each security gate run"
+      },
+      "rollback": {
+        "mechanism": "disable the rollout and retain the established fail-closed security boundary",
+        "verification": "security tests and the high-risk pattern scan pass"
+      },
+      "compatibility_commitment": "Security rollouts may only preserve or strengthen existing denials and redaction guarantees.",
+      "legacy_removal_condition": "Remove a legacy security path only after equivalent denial and redaction coverage is proven on the replacement."
+    },
+    "channel_kernel_deprecated": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon channel_turn --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "sli": {
+        "indicator": "always-on channel turn completion and error rate",
+        "objective": "the always-on runtime preserves classified outcomes while the diagnostic-only flag receives no routing authority",
+        "window": "each channel-turn regression run"
+      },
+      "rollback": {
+        "mechanism": "revert the always-on channel runtime change independently of the ignored legacy flag",
+        "verification": "channel-turn regressions pass and diagnostics continue to identify the flag as ineffective"
+      },
+      "compatibility_commitment": "Older configurations may continue to contain the flag while it remains ignored and visibly deprecated.",
+      "legacy_removal_condition": "Remove the flag after old clients tolerate its deprecated projection and the always-on runtime retains rollback coverage."
+    },
+    "verification_canary": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon verification_runtime --locked",
+        "cargo test -p palyra-daemon --test current_state_inventory --locked"
+      ],
+      "sli": {
+        "indicator": "verification evidence completion and fallback classification rate",
+        "objective": "all verification attempts produce redacted classified evidence with no unreported fallback",
+        "window": "each verification runtime regression run"
+      },
+      "rollback": {
+        "mechanism": "disable verification_runtime and use the established checkpoint flow",
+        "verification": "checkpoint regressions pass and runtime usage reports only the explicit fallback path"
+      },
+      "compatibility_commitment": "Verification evidence remains additive and existing checkpoint result fields retain their meaning.",
+      "legacy_removal_condition": "Remove the established checkpoint path only after direct and fallback usage evidence qualifies stable promotion."
+    },
+    "compaction_gated": {
+      "required_test_refs": [
+        "cargo test -p palyra-daemon session_compaction --locked",
+        "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure --locked -- --exact",
+        "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact",
+        "bash scripts/test/run-replay-gate.sh"
+      ],
+      "sli": {
+        "indicator": "qualified compaction run completion and hidden fallback count",
+        "objective": "100 percent of finalized enabled runs record direct usage and zero hidden fallbacks",
+        "window": "each compaction qualification suite and release candidate"
+      },
+      "rollback": {
+        "mechanism": "disable compaction_safeguard and retain the replay-safe local compaction path",
+        "verification": "compaction regressions and replay gate pass while usage records the explicit fallback path"
+      },
+      "compatibility_commitment": "Compaction output remains replay-compatible and provider-backed evidence stays additive across rollout changes.",
+      "legacy_removal_condition": "Remove the local fallback only after stable promotion proves direct-path usage with zero hidden fallback for one supported release window.",
+      "direct_hot_path_test_ref": "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure --locked -- --exact",
+      "no_hidden_fallback_test_ref": "cargo test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact"
+    }
+  },
+  "rollouts": [
+    {
+      "capability": "dynamic_tool_builder",
+      "owner_component": "skills/tool runtime",
+      "contract_availability": "descriptor_only",
+      "execution_completeness": "not_implemented",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "descriptor_only",
+      "promotion_blockers": ["builder execution and production policy boundaries are not implemented"],
+      "removal_condition": "remove only after callers migrate to a supported replacement or the descriptor is formally abandoned",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "context_engine",
+      "owner_component": "application/context_engine",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["budget enforcement and retrieval attribution require production qualification"],
+      "removal_condition": "remove the disabled path only after stable qualification and one supported compatibility window",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "execution_backend_remote_node",
+      "owner_component": "execution backends",
+      "contract_availability": "blocked",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["remote attestation and cleanup parity are incomplete"],
+      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "execution_backend_networked_worker",
+      "owner_component": "workerd/execution backends",
+      "contract_availability": "blocked",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["worker transport attestation and failure cleanup are incomplete"],
+      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "execution_backend_docker",
+      "owner_component": "execution backends",
+      "contract_availability": "blocked",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["container policy, attestation, and cleanup parity are incomplete"],
+      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "execution_backend_ssh_tunnel",
+      "owner_component": "execution backends",
+      "contract_availability": "blocked",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["SSH identity, host verification, and cleanup parity are incomplete"],
+      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "safety_boundary",
+      "owner_component": "safety",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "non_authoritative_runtime_contract",
+      "promotion_blockers": [
+        "feature_rollouts.safety_boundary is not wired to the safety execution boundary and cannot activate a candidate hot path",
+        "prompt-injection and secret-redaction regressions must remain fail closed"
+      ],
+      "removal_condition": "remove the disabled path only after equivalent security coverage is proven",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "execution_gate_pipeline_v2",
+      "owner_component": "execution gate",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["denial and degraded outcomes require release qualification"],
+      "removal_condition": "remove the established gate only after stable qualification and compatibility review",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "agent_harness_runtime",
+      "owner_component": "application/agent_harness",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["harness lifecycle and transcript mirroring require production qualification"],
+      "removal_condition": "remove the established harness path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "inline_runtime_hooks",
+      "owner_component": "hooks/runtime loop",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["timeout, panic, policy, and audit behavior require release qualification"],
+      "removal_condition": "remove the established hook path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "tool_result_middleware",
+      "owner_component": "tool runtime",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["model-visible projections and audit retention require release qualification"],
+      "removal_condition": "remove the established projection path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "session_queue_policy",
+      "owner_component": "session lifecycle",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["queue depth and merge-window limits require production evidence"],
+      "removal_condition": "remove the established queue policy only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "pruning_policy_matrix",
+      "owner_component": "memory/context pruning",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["token-savings and quality thresholds require production evidence"],
+      "removal_condition": "remove the established pruning path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "retrieval_dual_path",
+      "owner_component": "memory/retrieval",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["branch timeout and prompt budget limits require production evidence"],
+      "removal_condition": "remove the established retrieval path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "auxiliary_executor",
+      "owner_component": "agent delegation",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["auxiliary task budget and cancellation require production evidence"],
+      "removal_condition": "remove the established delegation path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "flow_orchestration",
+      "owner_component": "flow orchestration",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["flow cancellation and retry budgets require replay-visible production evidence"],
+      "removal_condition": "remove the established flow path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "delivery_arbitration",
+      "owner_component": "channel delivery",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["bounded suppression and flow dependencies require production evidence"],
+      "removal_condition": "remove the established delivery path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "replay_capture",
+      "owner_component": "replay",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["decision capture redaction and replay compatibility require production evidence"],
+      "removal_condition": "remove the established replay path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "networked_workers",
+      "owner_component": "workerd/execution backends",
+      "contract_availability": "blocked",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "unsupported",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["networked worker execution backend qualification is incomplete"],
+      "removal_condition": "remove only after callers migrate to a qualified execution backend",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "tool_repair",
+      "owner_component": "run stream/tool repair",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "tool_repair_contract",
+      "promotion_blockers": ["the rollout flag does not control the always-on observe-only audit writer and its durable tape effects are not usage-instrumented"],
+      "removal_condition": "remove the non-authoritative flag only after diagnostics consumers migrate and durable audit replay compatibility is proven",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "provider_stream_normalizer",
+      "owner_component": "model provider streaming",
+      "contract_availability": "api_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "experimental",
+      "lifecycle": "active",
+      "evidence_profile": "provider_canary",
+      "promotion_blockers": ["the rollout is diagnostic-only and lacks direct activation evidence"],
+      "removal_condition": "remove the established stream path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "provider_recovery",
+      "owner_component": "model provider recovery",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "non_authoritative_runtime_contract",
+      "promotion_blockers": [
+        "feature_rollouts.provider_recovery does not select the established recovery state machine and cannot activate a candidate hot path",
+        "retry classification and failover require production qualification"
+      ],
+      "removal_condition": "remove the established recovery path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "terminal_sessions",
+      "owner_component": "process runtime",
+      "contract_availability": "api_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "experimental",
+      "lifecycle": "active",
+      "evidence_profile": "execution_backend_blocked",
+      "promotion_blockers": ["the rollout lacks a wired runtime activation path and cleanup evidence"],
+      "removal_condition": "remove the descriptor only after callers migrate or runtime activation qualifies",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "browser_rescue",
+      "owner_component": "browserd/browser rescue",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["policy, redaction, and rescue trigger coverage require production qualification"],
+      "removal_condition": "remove the established browser failure path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "lsp_service",
+      "owner_component": "code intelligence",
+      "contract_availability": "api_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "experimental",
+      "lifecycle": "active",
+      "evidence_profile": "descriptor_only",
+      "promotion_blockers": ["the rollout lacks a wired runtime activation path and lifecycle evidence"],
+      "removal_condition": "remove the descriptor only after callers migrate or runtime activation qualifies",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "advisor_fanout",
+      "owner_component": "advisors",
+      "contract_availability": "api_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "non_authoritative_runtime_contract",
+      "promotion_blockers": [
+        "feature_rollouts.advisor_fanout has no production caller or wired activation boundary",
+        "budget governance and non-authoritative finalization require production evidence"
+      ],
+      "removal_condition": "remove the established advisor path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "acp_runtime",
+      "owner_component": "acp runtime",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "non_authoritative_runtime_contract",
+      "promotion_blockers": [
+        "feature_rollouts.acp_runtime does not gate ACP initialization or dispatch and cannot activate a candidate hot path",
+        "permission, session, replay, and compaction boundaries require production evidence"
+      ],
+      "removal_condition": "remove the established ACP path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "channel_turn_kernel",
+      "owner_component": "channel router",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "contract_only",
+      "support_maturity": "deprecated",
+      "lifecycle": "deprecated",
+      "evidence_profile": "channel_kernel_deprecated",
+      "promotion_blockers": ["the legacy rollout gate is diagnostic-only while production routing is always on"],
+      "replacement": "always_on_channel_turn_runtime",
+      "removal_condition": "remove the ignored flag after old clients tolerate its deprecated projection and always-on channel turns retain rollback coverage",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "agent_plan_state",
+      "owner_component": "agent plan state",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["model-visible plan projection requires production evidence"],
+      "removal_condition": "remove the established plan path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "objective_judge",
+      "owner_component": "objective judge",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "contract_only",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "non_authoritative_runtime_contract",
+      "promotion_blockers": [
+        "feature_rollouts.objective_judge only affects diagnostics metadata and does not gate auxiliary execution",
+        "judge outcomes remain advisory until acceptance gates qualify"
+      ],
+      "removal_condition": "remove the established objective path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "verification_runtime",
+      "owner_component": "verification runtime",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "verification_canary",
+      "promotion_blockers": ["verification_finalizer_not_rollout_gated: final verification guard remains outside the rollout-controlled execution path"],
+      "removal_condition": "remove the established checkpoint path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "progress_drafts",
+      "owner_component": "progress drafts",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["draft projection redaction requires production evidence"],
+      "removal_condition": "remove the established progress path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "compaction_safeguard",
+      "owner_component": "session compaction",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "complete",
+      "promotion_state": "gated_production",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "compaction_gated",
+      "promotion_blockers": ["stable promotion requires qualified production-window usage evidence"],
+      "removal_condition": "remove the local fallback only after stable direct-path evidence across one supported release window",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "provider_backed_evidence_compaction",
+      "owner_component": "session compaction",
+      "contract_availability": "runtime_available",
+      "execution_completeness": "partial",
+      "promotion_state": "canary",
+      "support_maturity": "preview",
+      "lifecycle": "active",
+      "evidence_profile": "runtime_canary",
+      "promotion_blockers": ["provider failures must retain explicit local fallback evidence"],
+      "removal_condition": "remove the local evidence path only after stable qualification",
+      "shadow_side_effect_posture": "not_applicable"
+    },
+    {
+      "capability": "attack_surface_audit",
+      "owner_component": "security audit",
+      "contract_availability": "descriptor_only",
+      "execution_completeness": "not_implemented",
+      "promotion_state": "contract_only",
+      "support_maturity": "experimental",
+      "lifecycle": "active",
+      "evidence_profile": "security_canary",
+      "promotion_blockers": ["runtime audit activation and redacted evidence are not implemented"],
+      "removal_condition": "remove the descriptor only after callers migrate or runtime activation qualifies",
+      "shadow_side_effect_posture": "not_applicable"
+    }
+  ]
+}

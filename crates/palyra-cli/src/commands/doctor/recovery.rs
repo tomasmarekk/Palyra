@@ -3415,15 +3415,72 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
     )?;
     output::print_text_line(
         format!(
-            "doctor.feature_rollouts fetched={} flags={} enabled={} inactive={}",
+            "doctor.feature_rollouts fetched={} flags={} configured_enabled={} effective_active={} not_effectively_active={} configured_inactive={} non_authoritative={} authority_unknown={} qualified_hot_paths={}",
             execution.diagnostics.feature_rollouts.fetched,
             execution.diagnostics.feature_rollouts.flag_count,
             execution.diagnostics.feature_rollouts.enabled_flags,
-            execution.diagnostics.feature_rollouts.inactive_flags
+            execution.diagnostics.feature_rollouts.effective_active_flags,
+            execution.diagnostics.feature_rollouts.not_effectively_active_flags,
+            execution.diagnostics.feature_rollouts.inactive_flags,
+            execution.diagnostics.feature_rollouts.non_authoritative_flags,
+            execution.diagnostics.feature_rollouts.unknown_activation_authority_flags,
+            execution.diagnostics.feature_rollouts.qualified_hot_path_flags
         )
         .as_str(),
     )?;
+    for rollout in execution
+        .diagnostics
+        .feature_rollouts
+        .usage
+        .iter()
+        .filter(|rollout| {
+            rollout.configured_enabled
+                || rollout.instrumented
+                || rollout.activation_authoritative != Some(true)
+        })
+        .take(8)
+    {
+        let activation_authoritative = rollout
+            .activation_authoritative
+            .map_or("unknown", |authoritative| if authoritative { "true" } else { "false" });
+        let effective_enabled = match (rollout.activation_authoritative, rollout.effective_enabled)
+        {
+            (None, _) | (Some(true), None) => "unknown",
+            (Some(false), _) => "not_authoritative",
+            (Some(true), Some(true)) => "true",
+            (Some(true), Some(false)) => "false",
+        };
+        output::print_text_line(
+            format!(
+                "doctor.feature_rollout_usage flag={} configured_enabled={} activation_authoritative={} effective_enabled={} instrumented={} direct={} fallback={} mixed={} terminal_direct={} terminal_fallback={} qualified_hot_path={} activation_reason={} qualification_reason={}",
+                rollout.flag,
+                rollout.configured_enabled,
+                activation_authoritative,
+                effective_enabled,
+                rollout.instrumented,
+                rollout.direct_unique_runs.unwrap_or_default(),
+                rollout.fallback_unique_runs.unwrap_or_default(),
+                rollout.mixed_path_unique_runs.unwrap_or_default(),
+                rollout.terminal_direct_unique_runs.unwrap_or_default(),
+                rollout.terminal_fallback_unique_runs.unwrap_or_default(),
+                rollout.qualified_hot_path,
+                rollout.activation_reason_code.as_deref().unwrap_or("unavailable"),
+                rollout.qualification_reason_code.as_deref().unwrap_or("unavailable"),
+            )
+            .as_str(),
+        )?;
+    }
     for rollout in execution.diagnostics.feature_rollouts.inactive.iter().take(8) {
+        let activation_authoritative = rollout
+            .activation_authoritative
+            .map_or("unknown", |authoritative| if authoritative { "true" } else { "false" });
+        let effective_enabled = match (rollout.activation_authoritative, rollout.effective_enabled)
+        {
+            (None, _) | (Some(true), None) => "unknown",
+            (Some(false), _) => "not_authoritative",
+            (Some(true), Some(true)) => "true",
+            (Some(true), Some(false)) => "false",
+        };
         let blockers = if rollout.activation_blockers.is_empty() {
             "none published".to_owned()
         } else {
@@ -3431,8 +3488,21 @@ fn render_doctor_text(execution: &DoctorExecutionReport) -> Result<()> {
         };
         output::print_text_line(
             format!(
-                "doctor.feature_rollout flag={} maturity={} owner={} blockers={}",
-                rollout.flag, rollout.maturity, rollout.owner_component, blockers
+                "doctor.feature_rollout flag={} configured_enabled={} activation_authoritative={} effective_enabled={} activation_reason={} maturity={} promotion={} contract={} execution={} support={} lifecycle={} qualified_hot_path={} owner={} blockers={}",
+                rollout.flag,
+                rollout.configured_enabled,
+                activation_authoritative,
+                effective_enabled,
+                rollout.activation_reason_code.as_deref().unwrap_or("unavailable"),
+                rollout.maturity,
+                rollout.promotion_state,
+                rollout.contract_availability,
+                rollout.execution_completeness,
+                rollout.support_maturity,
+                rollout.lifecycle,
+                rollout.qualified_hot_path,
+                rollout.owner_component,
+                blockers
             )
             .as_str(),
         )?;

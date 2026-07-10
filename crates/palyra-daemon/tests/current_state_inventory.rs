@@ -231,6 +231,7 @@ fn build_current_state_inventory_snapshot(
         "migration_notes": capability_catalog.get("migration_notes").cloned().unwrap_or(Value::Null),
         "feature_rollouts": diagnostics.get("feature_rollouts").cloned().unwrap_or(Value::Null),
         "feature_rollout_maturity": diagnostics.get("feature_rollout_maturity").cloned().unwrap_or(Value::Null),
+        "feature_rollout_maturity_v2": diagnostics.get("feature_rollout_maturity_v2").cloned().unwrap_or(Value::Null),
         "method_registry": method_registry,
         "runtime_roadmap": diagnostics.get("runtime_roadmap").cloned().unwrap_or(Value::Null),
         "runtime_controls": {
@@ -308,7 +309,7 @@ fn build_runtime_audit_baseline(snapshot: &Value) -> Result<Value> {
     let compat_routes = required_array(snapshot, "/compat_routes")?;
     let execution_backends = required_array(snapshot, "/execution_backends")?;
     let feature_rollouts = required_object(snapshot, "/feature_rollouts")?;
-    let feature_rollout_maturity = required_object(snapshot, "/feature_rollout_maturity")?;
+    let feature_rollout_maturity = required_object(snapshot, "/feature_rollout_maturity_v2")?;
     let method_registry = required_object(snapshot, "/method_registry")?;
     let method_registry_methods = required_array(snapshot, "/method_registry/methods")?;
     let method_registry_scopes = required_array(snapshot, "/method_registry/scopes")?;
@@ -469,10 +470,15 @@ fn runtime_audit_source_map() -> Vec<Value> {
             "surface": "feature_rollout_maturity",
             "source_paths": [
                 "crates/palyra-daemon/src/feature_rollout_maturity.rs",
+                "crates/palyra-daemon/src/feature_rollout_maturity/manifest.rs",
+                "crates/palyra-daemon/src/feature_rollout_maturity/manifest/state_validation.rs",
+                "crates/palyra-daemon/src/feature_usage.rs",
                 "crates/palyra-daemon/src/config/schema.rs",
+                "infra/release/feature-rollout-promotions.json",
+                "schemas/json/common/feature-rollout-promotion-manifest.v1.json",
                 "crates/palyra-daemon/tests/current_state_inventory.rs"
             ],
-            "reason": "rollout maturity states, owners, required tests, public exposure, and promotion blockers"
+            "reason": "rollout contract, execution, promotion, observed usage, support lifecycle, and evidence gates"
         }),
         json!({
             "surface": "method_registry",

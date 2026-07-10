@@ -44,6 +44,30 @@ run_contract_check() {
   fi
 }
 
+run_exact_contract_check() {
+  local label="$1"
+  local expected_test="$2"
+  shift 2
+  echo "==> ${label}"
+
+  local output
+  if ! output="$("$@" 2>&1)"; then
+    printf '%s\n' "$output"
+    print_snapshot_failure_guidance
+    exit 1
+  fi
+  printf '%s\n' "$output"
+
+  local expected_result="test ${expected_test} ... ok"
+  local executed_count
+  executed_count="$(tr -d '\r' <<<"$output" | grep -Fxc "$expected_result" || true)"
+  if [[ "$executed_count" -ne 1 ]]; then
+    echo "Expected exactly one executed Rust test result for ${expected_test}; observed ${executed_count}." >&2
+    print_snapshot_failure_guidance
+    exit 1
+  fi
+}
+
 run_contract_check \
   "public runtime contract snapshot" \
   "$CARGO_BIN" test -p palyra-common public_runtime_contract_snapshot --locked
@@ -62,3 +86,15 @@ run_contract_check \
 run_contract_check \
   "daemon aggregate runtime ABI snapshot" \
   "$CARGO_BIN" test -p palyra-daemon runtime_diagnostics::tests::contract_snapshot_suite_covers_phase11_abi_surfaces --locked
+run_exact_contract_check \
+  "feature rollout promotion manifest contract" \
+  "feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid" \
+  "$CARGO_BIN" test -p palyra-daemon feature_rollout_maturity::manifest::tests::builtin_promotion_manifest_is_valid --locked -- --exact
+run_exact_contract_check \
+  "feature rollout direct hot-path proof" \
+  "gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure" \
+  "$CARGO_BIN" test -p palyra-daemon gateway::tests::session_compaction_safeguard_rolls_back_writes_when_rollout_enforces_failure --locked -- --exact
+run_exact_contract_check \
+  "feature rollout no-hidden-fallback proof" \
+  "gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled" \
+  "$CARGO_BIN" test -p palyra-daemon gateway::tests::session_compaction_safeguard_records_explicit_fallback_when_disabled --locked -- --exact
