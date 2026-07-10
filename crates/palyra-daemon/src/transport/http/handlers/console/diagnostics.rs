@@ -1428,6 +1428,8 @@ async fn collect_console_flows_diagnostics(
     let mut retrying_steps = 0_u64;
     let mut timed_out_steps = 0_u64;
     let mut waiting_steps = 0_u64;
+    let mut sampled_invalid_dependency_flows = 0_u64;
+    let mut dependency_issues_by_reason = std::collections::BTreeMap::<String, u64>::new();
     let mut recent = Vec::new();
     // Step-level counters are sampled from the 10 most recent flows only;
     // hydrating a full bundle per flow is too expensive for a diagnostics
@@ -1465,6 +1467,19 @@ async fn collect_console_flows_diagnostics(
             crate::gateway::current_unix_ms(),
         )
         .snapshot_json();
+        let dependency_validation =
+            crate::flows::flow_dependency_validation_diagnostics(bundle.steps.as_slice());
+        if dependency_validation.get("valid").and_then(Value::as_bool) == Some(false) {
+            sampled_invalid_dependency_flows = sampled_invalid_dependency_flows.saturating_add(1);
+            if let Some(issues) = dependency_validation.get("issues").and_then(Value::as_array) {
+                for issue in issues {
+                    if let Some(reason_code) = issue.get("reason_code").and_then(Value::as_str) {
+                        *dependency_issues_by_reason.entry(reason_code.to_owned()).or_default() +=
+                            1;
+                    }
+                }
+            }
+        }
         recent.push(json!({
             "flow_id": bundle.flow.flow_id,
             "mode": bundle.flow.mode,
@@ -1477,6 +1492,7 @@ async fn collect_console_flows_diagnostics(
             "event_count": bundle.events.len(),
             "latest_event": latest_event,
             "delivery_progress": delivery_progress,
+            "dependency_validation": dependency_validation,
         }));
     }
 
@@ -1491,6 +1507,12 @@ async fn collect_console_flows_diagnostics(
             "retrying": retrying_steps,
             "timed_out": timed_out_steps,
             "waiting_for_approval": waiting_steps,
+        },
+        "dependency_validation": {
+            "sampled_flow_count": recent.len(),
+            "sampled_invalid_flow_count": sampled_invalid_dependency_flows,
+            "sampled_issues_by_reason": dependency_issues_by_reason,
+            "repair": "replace affected step dependencies using the CAS-guarded flow repair operation",
         },
         "runtime": {
             "mode": state.runtime.config.flow_orchestration.mode.as_str(),

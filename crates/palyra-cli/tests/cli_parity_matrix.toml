@@ -170,6 +170,17 @@ path = "flows"
 file = "flows-help.txt"
 
 [[entries]]
+path = "flows repair-dependencies"
+category = "nested_surface"
+status = "done"
+summary = "Atomically repair an invalid flow dependency graph with optimistic concurrency."
+required_flags = ["id", "expected-revision", "replacements-json-file", "json"]
+
+[entries.snapshot]
+path = "flows repair-dependencies"
+file = "flows-repair-dependencies-help.txt"
+
+[[entries]]
 path = "tasks"
 category = "top_level"
 status = "done"

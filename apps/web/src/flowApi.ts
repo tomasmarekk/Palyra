@@ -95,12 +95,23 @@ export interface ConsoleFlowBundleEnvelope {
   blockers?: ConsoleFlowStepRecord[];
   retry_history?: ConsoleFlowEventRecord[];
   lineage?: JsonValue;
+  dependency_validation?: JsonValue;
   adapters?: JsonValue;
   rollout?: JsonValue;
 }
 
 export interface ConsoleFlowActionPayload {
   reason?: string;
+}
+
+export interface ConsoleFlowDependencyRepairPayload {
+  expected_revision: number;
+  replacements: ConsoleFlowDependencyReplacement[];
+}
+
+export interface ConsoleFlowDependencyReplacement {
+  step_id: string;
+  depends_on_step_ids: string[];
 }
 
 export function listFlows(
@@ -166,6 +177,18 @@ export function compensateFlowStep(
   payload: ConsoleFlowActionPayload = {},
 ): Promise<ConsoleFlowBundleEnvelope> {
   return mutateFlowStep(api, flowId, stepId, "compensate", payload);
+}
+
+export function repairFlowDependencies(
+  api: ConsoleRequestClient,
+  flowId: string,
+  payload: ConsoleFlowDependencyRepairPayload,
+): Promise<ConsoleFlowBundleEnvelope> {
+  return api.request(
+    `/console/v1/flows/${encodeURIComponent(flowId)}/dependencies/repair`,
+    { method: "POST", body: JSON.stringify(payload) },
+    { csrf: true },
+  );
 }
 
 function mutateFlow(

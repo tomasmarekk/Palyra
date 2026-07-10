@@ -1,6 +1,7 @@
 //! Arguments for `palyra flows`: inspecting and steering durable orchestration
-//! flows (pause/resume/cancel plus per-step retry/skip/compensate). Help text
-//! is pinned by snapshot tests; see the doc-comment rules in `mod.rs`.
+//! flows (pause/resume/cancel, per-step retry/skip/compensate, and dependency
+//! graph repair). Help text is pinned by snapshot tests; see the doc-comment
+//! rules in `mod.rs`.
 
 use clap::{Subcommand, ValueEnum};
 
@@ -73,6 +74,21 @@ pub enum FlowsCommand {
         step_id: String,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Atomically repair an invalid dependency graph from a JSON replacement batch.
+    RepairDependencies {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        expected_revision: i64,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Read a JSON array of {step_id, depends_on_step_ids} replacements"
+        )]
+        replacements_json_file: std::path::PathBuf,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

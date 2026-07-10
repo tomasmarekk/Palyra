@@ -7,19 +7,19 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 
 ## Summary
 
-- Total entries: `157`
-- Verified entries: `157`
+- Total entries: `161`
+- Verified entries: `161`
 - Regression entries: `0`
-- Help snapshot coverage: `157` entries
+- Help snapshot coverage: `161` entries
 
 ### Expected parity status counts
 
-- `done`: `153`
+- `done`: `157`
 - `partial`: `4`
 
 ### Validation status counts
 
-- `verified`: `157`
+- `verified`: `161`
 
 ## Entries
 
@@ -41,6 +41,7 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `routines` | `top_level` | `done` | `verified` | `routines-help.txt` | - | - | - |
 | `objectives` | `top_level` | `done` | `verified` | `objectives-help.txt` | - | - | - |
 | `flows` | `top_level` | `done` | `verified` | `flows-help.txt` | - | - | - |
+| `flows repair-dependencies` | `nested_surface` | `done` | `verified` | `flows-repair-dependencies-help.txt` | - | `--id`, `--expected-revision`, `--replacements-json-file`, `--json` | - |
 | `tasks` | `top_level` | `done` | `verified` | `tasks-help.txt` | - | - | - |
 | `tasks workboard` | `nested_surface` | `done` | `verified` | `tasks-workboard-help.txt` | - | - | - |
 | `commitments` | `top_level` | `done` | `verified` | `commitments-help.txt` | - | - | - |
@@ -105,6 +106,8 @@ It distinguishes expected parity posture (`done` / `partial` / `intentional_devi
 | `patch bundles` | `nested_surface` | `done` | `verified` | `patch-bundles-help.txt` | - | - | - |
 | `workers` | `canonical_family` | `done` | `verified` | `workers-help.txt` | - | - | - |
 | `run` | `top_level` | `done` | `verified` | `run-help.txt` | - | - | - |
+| `run wait` | `nested_surface` | `done` | `verified` | `run-wait-help.txt` | - | `--timeout-ms`, `--return-on-waiting`, `--json` | - |
+| `run control` | `nested_surface` | `done` | `verified` | `run-control-help.txt` | - | `--command`, `--active-phase`, `--instruction`, `--queued-input-id`, `--priority-lane`, `--reason`, `--dry-run`, `--json` | - |
 | `run export` | `nested_surface` | `done` | `verified` | `run-export-help.txt` | - | `--run-id`, `--output`, `--format`, `--redacted`, `--journal-db`, `--max-events`, `--trajectory` | - |
 | `run replay` | `nested_surface` | `done` | `verified` | `run-replay-help.txt` | - | `--golden`, `--diff-output`, `--json` | - |
 | `skills` | `top_level` | `done` | `verified` | `skills-help.txt` | `skill` | - | - |

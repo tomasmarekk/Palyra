@@ -6888,6 +6888,20 @@
       },
       {
         "surface": "console",
+        "route": "/console/v1/flows/{flow_id}/dependencies/repair",
+        "http_method": "POST",
+        "method_name": "console.post.console.v1.flows.by_flow_id.dependencies.repair",
+        "stability": "gated_production",
+        "required_scope": "console.write",
+        "request_schema_id": "console.post.console.v1.flows.by_flow_id.dependencies.repair.request.method-registry.v1",
+        "request_schema_hash": "a6c7e59bfff5bc16b4ab5b2059788d1cf36636d31bf27dc35ffc0748bce2d5a0",
+        "response_schema_id": "console.post.console.v1.flows.by_flow_id.dependencies.repair.response.method-registry.v1",
+        "response_schema_hash": "b9fe02efd453bc556e2ca9e11002909d6d38b331ba4db4e390c6886177ed3655",
+        "streaming_supported": false,
+        "idempotency_supported": false
+      },
+      {
+        "surface": "console",
         "route": "/console/v1/flows/{flow_id}/pause",
         "http_method": "POST",
         "method_name": "console.post.console.v1.flows.by_flow_id.pause",
@@ -11006,7 +11020,7 @@
       "diagnostics_sections": 52,
       "execution_backends": 5,
       "feature_rollout_flags": 35,
-      "method_registry_methods": 507,
+      "method_registry_methods": 508,
       "method_registry_scopes": 18,
       "runtime_control_capabilities": 8
     },
@@ -11038,7 +11052,7 @@
         "admin": 52,
         "canvas": 5,
         "compat": 16,
-        "console": 431,
+        "console": 432,
         "public": 2,
         "realtime": 1
       }

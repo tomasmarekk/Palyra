@@ -18,7 +18,7 @@ bash scripts/dev/generate-runtime-audit-baseline.sh
 
 - Capability catalog entries: `32`
 - CLI families: `60`
-- Method registry entries: `507`
+- Method registry entries: `508`
 - Compat routes registered: `16/16`
 - Feature rollout flags: `35`
 - Runtime preview controls: `8` capabilities

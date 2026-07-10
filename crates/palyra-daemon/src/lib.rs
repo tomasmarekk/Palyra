@@ -336,6 +336,8 @@ pub(crate) const CANVAS_HTTP_MAX_TOKEN_BYTES: usize = 8 * 1024;
 pub(crate) const CANVAS_HTTP_MAX_CANVAS_ID_BYTES: usize = 64;
 /// Request body cap applied across the admin/console HTTP surface.
 pub(crate) const HTTP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+/// Larger bounded body cap for atomic flow dependency repair batches.
+pub(crate) const FLOW_DEPENDENCY_REPAIR_MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_ONBOARDING_HTTP_TIMEOUT_MS: u64 = 5_000;
 const DISCORD_ONBOARDING_CONFIG_BACKUPS: usize = 2;
@@ -2548,6 +2550,20 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    let startup_flow_dependency_audit = runtime
+        .audit_flow_dependencies_on_startup()
+        .await
+        .context("failed to audit durable flow dependencies during startup")?;
+    if startup_flow_dependency_audit.invalid_flow_count > 0 {
+        warn!(
+            inspected_flow_count = startup_flow_dependency_audit.inspected_flow_count,
+            invalid_flow_count = startup_flow_dependency_audit.invalid_flow_count,
+            newly_recorded_invalid_count =
+                startup_flow_dependency_audit.newly_recorded_invalid_count,
+            "startup flow dependency audit found invalid durable graphs"
+        );
+    }
+
     let startup_run_recovery = runtime
         .terminalize_orphaned_orchestrator_runs_on_startup(
             "daemon startup detected an orphaned active run from a previous runtime; marked failed and manual same-session resume is required",
@@ -3309,6 +3325,9 @@ pub(crate) fn runtime_status_response(status: tonic::Status) -> Response {
             control_plane::ErrorCategory::Dependency,
             false,
         ),
+        tonic::Code::Aborted => {
+            (StatusCode::CONFLICT, "conflict", control_plane::ErrorCategory::Conflict, false)
+        }
         tonic::Code::NotFound => {
             (StatusCode::NOT_FOUND, "not_found", control_plane::ErrorCategory::NotFound, false)
         }
@@ -5428,6 +5447,23 @@ mod tests {
     fn runtime_status_response_maps_resource_exhausted_to_too_many_requests() {
         let response = runtime_status_response(tonic::Status::resource_exhausted("rate limited"));
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn runtime_status_response_maps_aborted_to_non_retryable_conflict() {
+        let response = runtime_status_response(tonic::Status::aborted(
+            "flow revision conflict for flow-1: expected 1, found 2",
+        ));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("conflict response body should be readable");
+        let envelope = serde_json::from_slice::<serde_json::Value>(body.as_ref())
+            .expect("conflict response should be JSON");
+
+        assert_eq!(envelope["code"], "conflict");
+        assert_eq!(envelope["category"], "conflict");
+        assert_eq!(envelope["retryable"], false);
     }
 
     #[test]

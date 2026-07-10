@@ -1,5 +1,5 @@
 //! Console HTTP handlers for durable flows (`/console/v1/flows*`): list,
-//! create, get, pause/resume/cancel, and per-step retry/skip/compensate.
+//! create, get, pause/resume/cancel, per-step retry/skip/compensate, and graph repair.
 //!
 //! Flows are multi-step orchestrations persisted in the journal; handlers
 //! here only request state transitions through the runtime, which owns the
@@ -26,7 +26,8 @@ use crate::{
     app::state::AppState,
     flows::{self, FlowLineage, FlowMode},
     journal::{
-        FlowListFilter, FlowRecord, FlowStepCreateRequest, FlowStepRecord, FlowStepUpdateRequest,
+        FlowDependenciesRepairRequest, FlowListFilter, FlowRecord, FlowStepCreateRequest,
+        FlowStepDependenciesReplacement, FlowStepRecord, FlowStepUpdateRequest,
         FlowTransitionRequest,
     },
     runtime_status_response,
@@ -36,6 +37,7 @@ use crate::{
 const DEFAULT_FLOW_PAGE_LIMIT: usize = 100;
 const MAX_FLOW_PAGE_LIMIT: usize = 500;
 const DEFAULT_FLOW_EVENT_LIMIT: usize = 512;
+const MAX_FLOW_STEP_KEY_CHARS: usize = 64;
 
 /// Query filters for `GET /console/v1/flows`; terminal flows are included by
 /// default.
@@ -85,6 +87,8 @@ pub(crate) struct ConsoleFlowCreateRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConsoleFlowStepCreateRequest {
+    #[serde(default)]
+    step_key: Option<String>,
     adapter: String,
     #[serde(default)]
     step_kind: Option<String>,
@@ -95,6 +99,8 @@ pub(crate) struct ConsoleFlowStepCreateRequest {
     lineage: Option<Value>,
     #[serde(default)]
     depends_on_step_ids: Option<Vec<String>>,
+    #[serde(default)]
+    depends_on_step_keys: Option<Vec<String>>,
     #[serde(default)]
     max_attempts: Option<u64>,
     #[serde(default)]
@@ -112,6 +118,21 @@ pub(crate) struct ConsoleFlowStepCreateRequest {
 pub(crate) struct ConsoleFlowActionRequest {
     #[serde(default)]
     reason: Option<String>,
+}
+
+/// CAS parameters for atomically replacing all affected dependency lists.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleFlowDependenciesRepairRequest {
+    expected_revision: i64,
+    replacements: Vec<ConsoleFlowStepDependenciesReplacement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsoleFlowStepDependenciesReplacement {
+    step_id: String,
+    depends_on_step_ids: Vec<String>,
 }
 
 // Parameter object describing one operator-initiated step transition.
@@ -401,9 +422,49 @@ pub(crate) async fn console_flow_step_compensate_handler(
     .await
 }
 
+/// Replaces an owned flow's affected dependencies after validating the complete proposed graph
+/// (`POST /console/v1/flows/{flow_id}/dependencies/repair`).
+///
+/// # Errors
+/// Returns not-found for missing flows/steps, permission-denied for foreign flows,
+/// invalid-argument for an unsafe graph, or conflict for a stale expected revision.
+pub(crate) async fn console_flow_dependencies_repair_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(flow_id): Path<String>,
+    Json(payload): Json<ConsoleFlowDependenciesRepairRequest>,
+) -> Result<Json<Value>, Response> {
+    let session = authorize_console_session(&state, &headers, true)?;
+    load_owned_flow_bundle(&state, &session.context, flow_id.as_str()).await?;
+    state
+        .runtime
+        .repair_flow_dependencies(FlowDependenciesRepairRequest {
+            flow_id: flow_id.clone(),
+            expected_revision: payload.expected_revision,
+            replacements: payload
+                .replacements
+                .into_iter()
+                .map(|replacement| FlowStepDependenciesReplacement {
+                    step_id: replacement.step_id,
+                    depends_on_step_ids: replacement.depends_on_step_ids,
+                })
+                .collect(),
+            actor_principal: session.context.principal,
+        })
+        .await
+        .map_err(runtime_status_response)?;
+    let updated = state
+        .runtime
+        .get_flow_bundle(flow_id, DEFAULT_FLOW_EVENT_LIMIT)
+        .await
+        .map_err(runtime_status_response)?
+        .ok_or_else(|| runtime_status_response(tonic::Status::not_found("flow not found")))?;
+    Ok(Json(flow_bundle_view(&updated)))
+}
+
 // Validates adapters against the registered contracts and converts console
-// step payloads into journal create requests, preserving request order as
-// the step index.
+// step payloads into journal create requests. Caller-local keys are resolved
+// only after every server-owned durable step id has been allocated.
 fn build_console_flow_steps(
     steps: Vec<ConsoleFlowStepCreateRequest>,
 ) -> Result<Vec<FlowStepCreateRequest>, tonic::Status> {
@@ -411,41 +472,101 @@ fn build_console_flow_steps(
         .into_iter()
         .map(|contract| contract.adapter)
         .collect::<Vec<_>>();
-    steps
-        .into_iter()
-        .enumerate()
-        .map(|(index, step)| {
-            if !adapter_names.contains(&step.adapter.as_str()) {
+    let mut step_ids_by_key = std::collections::BTreeMap::<String, String>::new();
+    let mut prepared = Vec::with_capacity(steps.len());
+    for (index, step) in steps.into_iter().enumerate() {
+        let ConsoleFlowStepCreateRequest {
+            step_key,
+            adapter,
+            step_kind,
+            title,
+            input,
+            lineage,
+            depends_on_step_ids,
+            depends_on_step_keys,
+            max_attempts,
+            backoff_ms,
+            timeout_ms,
+            not_before_unix_ms,
+        } = step;
+        if !adapter_names.contains(&adapter.as_str()) {
+            return Err(tonic::Status::invalid_argument(format!(
+                "unsupported flow step adapter '{adapter}'"
+            )));
+        }
+        let lineage = match lineage {
+            Some(lineage) => serde_json::from_value::<FlowLineage>(lineage).map_err(|error| {
+                tonic::Status::invalid_argument(format!("invalid step lineage: {error}"))
+            })?,
+            None => FlowLineage::default(),
+        };
+        let mut request = flows::build_flow_step(
+            i64::try_from(index).unwrap_or(i64::MAX),
+            adapter.as_str(),
+            step_kind.as_deref().unwrap_or(adapter.as_str()),
+            title,
+            input.unwrap_or_else(|| json!({})),
+            lineage,
+        );
+        request.max_attempts = max_attempts.unwrap_or(request.max_attempts).max(1);
+        request.backoff_ms = backoff_ms.unwrap_or(request.backoff_ms);
+        request.timeout_ms = timeout_ms;
+        request.not_before_unix_ms = not_before_unix_ms;
+        if let Some(step_key) = step_key.as_deref() {
+            let step_key = normalize_flow_step_key(step_key)?;
+            if step_ids_by_key.insert(step_key.clone(), request.step_id.clone()).is_some() {
                 return Err(tonic::Status::invalid_argument(format!(
-                    "unsupported flow step adapter '{}'",
-                    step.adapter
+                    "duplicate flow step_key '{step_key}'"
                 )));
             }
-            let lineage = match step.lineage {
-                Some(lineage) => {
-                    serde_json::from_value::<FlowLineage>(lineage).map_err(|error| {
-                        tonic::Status::invalid_argument(format!("invalid step lineage: {error}"))
-                    })?
-                }
-                None => FlowLineage::default(),
+        }
+        prepared.push((request, depends_on_step_ids, depends_on_step_keys));
+    }
+
+    prepared
+        .into_iter()
+        .map(|(mut request, dependency_ids, dependency_keys)| {
+            if dependency_ids.is_some() && dependency_keys.is_some() {
+                return Err(tonic::Status::invalid_argument(
+                    "flow step must use depends_on_step_ids or depends_on_step_keys, not both",
+                ));
+            }
+            let dependency_ids = match dependency_keys {
+                Some(keys) => keys
+                    .into_iter()
+                    .map(|key| {
+                        let key = normalize_flow_step_key(key.as_str())?;
+                        step_ids_by_key.get(key.as_str()).cloned().ok_or_else(|| {
+                            tonic::Status::invalid_argument(format!(
+                                "unknown flow dependency step_key '{key}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => dependency_ids.unwrap_or_default(),
             };
-            let mut request = flows::build_flow_step(
-                i64::try_from(index).unwrap_or(i64::MAX),
-                step.adapter.as_str(),
-                step.step_kind.as_deref().unwrap_or(step.adapter.as_str()),
-                step.title,
-                step.input.unwrap_or_else(|| json!({})),
-                lineage,
-            );
-            request.depends_on_step_ids_json =
-                json!(step.depends_on_step_ids.unwrap_or_default()).to_string();
-            request.max_attempts = step.max_attempts.unwrap_or(request.max_attempts).max(1);
-            request.backoff_ms = step.backoff_ms.unwrap_or(request.backoff_ms);
-            request.timeout_ms = step.timeout_ms;
-            request.not_before_unix_ms = step.not_before_unix_ms;
+            request.depends_on_step_ids_json = json!(dependency_ids).to_string();
             Ok(request)
         })
         .collect()
+}
+
+fn normalize_flow_step_key(raw: &str) -> Result<String, tonic::Status> {
+    let key = raw.trim();
+    if key.is_empty() || key.chars().count() > MAX_FLOW_STEP_KEY_CHARS {
+        return Err(tonic::Status::invalid_argument(format!(
+            "flow step_key must contain 1 to {MAX_FLOW_STEP_KEY_CHARS} characters"
+        )));
+    }
+    if !key
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(tonic::Status::invalid_argument(
+            "flow step_key may contain only ASCII letters, digits, '-', '_', or '.'",
+        ));
+    }
+    Ok(key.to_owned())
 }
 
 // Shared body of the pause/resume/cancel handlers. The transition carries the
@@ -627,14 +748,23 @@ fn authorize_console_flow_bundle(
 }
 
 fn flow_bundle_view(bundle: &crate::journal::FlowBundleRecord) -> Value {
+    let dependency_views = flows::flow_step_dependency_views(bundle.steps.as_slice());
+    let steps = bundle
+        .steps
+        .iter()
+        .map(|step| step_view(step, dependency_views.get(step.step_id.as_str())))
+        .collect::<Vec<_>>();
     json!({
         "flow": flow_view(&bundle.flow),
-        "steps": bundle.steps.iter().map(step_view).collect::<Vec<_>>(),
+        "steps": steps,
         "events": bundle.events.iter().map(event_view).collect::<Vec<_>>(),
         "revisions": bundle.revisions.iter().map(revision_view).collect::<Vec<_>>(),
         "blockers": current_blockers(bundle.steps.as_slice()),
         "retry_history": retry_history(bundle.events.as_slice()),
         "lineage": bundle.steps.iter().map(step_lineage_view).collect::<Vec<_>>(),
+        "dependency_validation": flows::flow_dependency_validation_diagnostics(
+            bundle.steps.as_slice()
+        ),
     })
 }
 
@@ -666,7 +796,13 @@ fn flow_view(flow: &FlowRecord) -> Value {
     })
 }
 
-fn step_view(step: &FlowStepRecord) -> Value {
+fn step_view(step: &FlowStepRecord, dependency_view: Option<&Value>) -> Value {
+    let dependency_view = dependency_view.cloned().unwrap_or_else(|| {
+        json!({
+            "valid": false,
+            "reason_code": "malformed_dependency_json",
+        })
+    });
     json!({
         "step_id": step.step_id,
         "flow_id": step.flow_id,
@@ -678,7 +814,7 @@ fn step_view(step: &FlowStepRecord) -> Value {
         "input": json_value(step.input_json.as_str()),
         "output": step.output_json.as_deref().map(json_value),
         "lineage": json_value(step.lineage_json.as_str()),
-        "depends_on_step_ids": json_value(step.depends_on_step_ids_json.as_str()),
+        "depends_on_step_ids": dependency_view,
         "attempt_count": step.attempt_count,
         "max_attempts": step.max_attempts,
         "backoff_ms": step.backoff_ms,
@@ -747,6 +883,9 @@ fn current_blockers(steps: &[FlowStepRecord]) -> Vec<Value> {
                 "step_id": step.step_id,
                 "state": step.state,
                 "reason": step.waiting_reason.as_ref().or(step.last_error.as_ref()),
+                "reason_code": step.waiting_reason.as_deref().filter(|reason| {
+                    crate::domain::flow_dependencies::is_dependency_validation_reason(reason)
+                }),
             })
         })
         .collect()
@@ -792,7 +931,9 @@ fn json_value(raw: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::authorize_console_flow_bundle;
+    use super::{
+        authorize_console_flow_bundle, build_console_flow_steps, ConsoleFlowStepCreateRequest,
+    };
     use crate::{
         journal::{FlowBundleRecord, FlowRecord},
         transport::grpc::auth::RequestContext,
@@ -827,6 +968,50 @@ mod tests {
         let response = authorize_console_flow_bundle(&bundle, &cross_principal_context)
             .expect_err("cross-principal flow access must still be rejected");
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn console_flow_step_keys_resolve_to_server_owned_ids() {
+        let steps = build_console_flow_steps(vec![
+            console_step("parent", None),
+            console_step("child", Some(vec!["parent".to_owned()])),
+        ])
+        .expect("valid local dependency keys should resolve");
+        let dependencies =
+            serde_json::from_str::<Vec<String>>(steps[1].depends_on_step_ids_json.as_str())
+                .expect("resolved dependency ids should be JSON");
+
+        assert_eq!(dependencies, vec![steps[0].step_id.clone()]);
+        assert_ne!(steps[0].step_id, "parent");
+    }
+
+    #[test]
+    fn console_flow_step_keys_reject_unknown_dependencies() {
+        let error =
+            build_console_flow_steps(vec![console_step("child", Some(vec!["missing".to_owned()]))])
+                .expect_err("unknown local dependency key must fail closed");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    fn console_step(
+        step_key: &str,
+        depends_on_step_keys: Option<Vec<String>>,
+    ) -> ConsoleFlowStepCreateRequest {
+        ConsoleFlowStepCreateRequest {
+            step_key: Some(step_key.to_owned()),
+            adapter: "auxiliary_task".to_owned(),
+            step_kind: None,
+            title: step_key.to_owned(),
+            input: None,
+            lineage: None,
+            depends_on_step_ids: None,
+            depends_on_step_keys,
+            max_attempts: None,
+            backoff_ms: None,
+            timeout_ms: None,
+            not_before_unix_ms: None,
+        }
     }
 
     fn flow_bundle(principal: &str, device_id: &str, channel: Option<&str>) -> FlowBundleRecord {

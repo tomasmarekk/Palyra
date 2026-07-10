@@ -7,6 +7,7 @@ import {
   getFlow,
   listFlows,
   pauseFlow,
+  repairFlowDependencies,
   resumeFlow,
   retryFlowStep,
   skipFlowStep,
@@ -52,6 +53,7 @@ describe("flowApi", () => {
       jsonResponse(bundle),
       jsonResponse(bundle),
       jsonResponse(bundle),
+      jsonResponse(bundle),
     ];
     const fetcher: typeof fetch = (input, init) => {
       calls.push({ input, init });
@@ -77,6 +79,10 @@ describe("flowApi", () => {
     await retryFlowStep(client, "FLOW1", "STEP1", { reason: "operator" });
     await skipFlowStep(client, "FLOW1", "STEP1", { reason: "operator" });
     await compensateFlowStep(client, "FLOW1", "STEP1", { reason: "operator" });
+    await repairFlowDependencies(client, "FLOW1", {
+      expected_revision: 1,
+      replacements: [{ step_id: "STEP1", depends_on_step_ids: ["STEP0"] }],
+    });
 
     expect(requestUrl(calls[1]?.input)).toBe("/console/v1/flows?limit=5&include_terminal=true");
     expect(new Headers(calls[1]?.init?.headers).get("x-palyra-csrf-token")).toBeNull();
@@ -93,6 +99,8 @@ describe("flowApi", () => {
     expect(requestUrl(calls[7]?.input)).toBe("/console/v1/flows/FLOW1/steps/STEP1/skip");
     expect(requestUrl(calls[8]?.input)).toBe("/console/v1/flows/FLOW1/steps/STEP1/compensate");
     expect(new Headers(calls[8]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
+    expect(requestUrl(calls[9]?.input)).toBe("/console/v1/flows/FLOW1/dependencies/repair");
+    expect(new Headers(calls[9]?.init?.headers).get("x-palyra-csrf-token")).toBe("csrf-1");
   });
 });
 

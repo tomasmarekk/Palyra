@@ -69,6 +69,11 @@ pub(crate) fn map_orchestrator_store_error(operation: &str, error: JournalError)
         } => Status::aborted(format!(
             "flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}"
         )),
+        JournalError::InvalidFlowDependencies { flow_id, step_id, reason_code } => {
+            Status::invalid_argument(format!(
+                "invalid flow dependencies for {flow_id}/{step_id}: {reason_code}"
+            ))
+        }
         JournalError::DuplicateWorkItemId { work_item_id } => {
             Status::already_exists(format!("work item already exists: {work_item_id}"))
         }

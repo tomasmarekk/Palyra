@@ -3122,6 +3122,7 @@ dependencies = [
  "palyra-transport-quic",
  "palyra-vault",
  "palyra-workerd",
+ "proptest",
  "prost",
  "protoc-bin-vendored",
  "quick-xml",

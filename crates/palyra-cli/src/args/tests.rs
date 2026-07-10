@@ -2157,6 +2157,33 @@ fn parse_sessions_retry_branch_search_and_export() {
 }
 
 #[test]
+fn parse_flows_dependency_repair_batch() {
+    let repair = Cli::parse_from([
+        "palyra",
+        "flows",
+        "repair-dependencies",
+        "--id",
+        "flow-01",
+        "--expected-revision",
+        "7",
+        "--replacements-json-file",
+        "repairs.json",
+        "--json",
+    ]);
+    assert_eq!(
+        repair.command,
+        Command::Flows {
+            command: FlowsCommand::RepairDependencies {
+                id: "flow-01".to_owned(),
+                expected_revision: 7,
+                replacements_json_file: std::path::PathBuf::from("repairs.json"),
+                json: true,
+            }
+        }
+    );
+}
+
+#[test]
 fn parse_sessions_background_enqueue_with_stdin_budget() {
     let parsed = Cli::parse_from([
         "palyra",

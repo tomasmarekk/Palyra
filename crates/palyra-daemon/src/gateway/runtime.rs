@@ -64,11 +64,13 @@ use crate::journal::{
     CommitmentCreateRequest, CommitmentDeliveryAttemptCreateRequest,
     CommitmentDeliveryAttemptRecord, CommitmentEventRecord, CommitmentListFilter, CommitmentRecord,
     CommitmentSourceRecord, CommitmentUpdateRequest, FlowBundleRecord, FlowCreateRequest,
-    FlowListFilter, FlowRecord, FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
-    IdempotencyBeginRequest, IdempotencyCompleteRequest, IdempotencyFailRequest,
-    LearningCandidateCreateRequest, LearningCandidateEvalCreateRequest,
-    LearningCandidateEvalRecord, LearningCandidateHistoryRecord, LearningCandidateListFilter,
-    LearningCandidateRecord, LearningCandidateReviewRequest, LearningCandidateRolloutCreateRequest,
+    FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest,
+    FlowDependencyStartupAuditReport, FlowListFilter, FlowRecord, FlowStepRecord,
+    FlowStepUpdateRequest, FlowTransitionRequest, IdempotencyBeginRequest,
+    IdempotencyCompleteRequest, IdempotencyFailRequest, LearningCandidateCreateRequest,
+    LearningCandidateEvalCreateRequest, LearningCandidateEvalRecord,
+    LearningCandidateHistoryRecord, LearningCandidateListFilter, LearningCandidateRecord,
+    LearningCandidateReviewRequest, LearningCandidateRolloutCreateRequest,
     LearningCandidateRolloutRecord, LearningPreferenceListFilter, LearningPreferenceRecord,
     LearningPreferenceUpsertRequest, MemoryEmbeddingsStatus, MemoryItemLifecycleUpdateRequest,
     MemoryItemRecord, OrchestratorBackgroundTaskCreateRequest,
@@ -7974,6 +7976,31 @@ impl GatewayRuntimeState {
     }
 
     #[allow(clippy::result_large_err)]
+    fn list_flows_for_reconciliation_blocking(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FlowRecord>, Status> {
+        self.journal_store
+            .list_flows_for_reconciliation(limit)
+            .map_err(|error| map_orchestrator_store_error("list flows for reconciliation", error))
+    }
+
+    /// Lists the next fair batch of runnable flow-coordinator candidates.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn list_flows_for_reconciliation(
+        self: &Arc<Self>,
+        limit: usize,
+    ) -> Result<Vec<FlowRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.list_flows_for_reconciliation_blocking(limit))
+            .await
+            .map_err(|_| Status::internal("flow reconciliation list worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
     fn get_flow_bundle_blocking(
         &self,
         flow_id: &str,
@@ -8050,6 +8077,81 @@ impl GatewayRuntimeState {
         tokio::task::spawn_blocking(move || state.update_flow_step_blocking(&request))
             .await
             .map_err(|_| Status::internal("flow step update worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn audit_flow_dependencies_on_startup_blocking(
+        &self,
+    ) -> Result<FlowDependencyStartupAuditReport, Status> {
+        self.journal_store.audit_flow_dependencies_on_startup().map_err(|error| {
+            map_orchestrator_store_error("audit flow dependencies on startup", error)
+        })
+    }
+
+    /// Validates every durable flow graph and records missing invalid-graph lifecycle evidence.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn audit_flow_dependencies_on_startup(
+        self: &Arc<Self>,
+    ) -> Result<FlowDependencyStartupAuditReport, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.audit_flow_dependencies_on_startup_blocking())
+            .await
+            .map_err(|_| Status::internal("flow dependency startup audit worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn quarantine_invalid_flow_dependencies_blocking(
+        &self,
+        request: &FlowDependenciesQuarantineRequest,
+    ) -> Result<Option<FlowRecord>, Status> {
+        self.journal_store
+            .quarantine_invalid_flow_dependencies(request)
+            .map_err(|error| map_orchestrator_store_error("quarantine flow dependencies", error))
+    }
+
+    /// Revalidates and quarantines an invalid graph with optimistic revision checking.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn quarantine_invalid_flow_dependencies(
+        self: &Arc<Self>,
+        request: FlowDependenciesQuarantineRequest,
+    ) -> Result<Option<FlowRecord>, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            state.quarantine_invalid_flow_dependencies_blocking(&request)
+        })
+        .await
+        .map_err(|_| Status::internal("flow dependency quarantine worker panicked"))?
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn repair_flow_dependencies_blocking(
+        &self,
+        request: &FlowDependenciesRepairRequest,
+    ) -> Result<FlowRecord, Status> {
+        self.journal_store
+            .repair_flow_dependencies(request)
+            .map_err(|error| map_orchestrator_store_error("repair flow dependencies", error))
+    }
+
+    /// Replaces dependency lists as one optimistic, graph-wide mutation.
+    ///
+    /// # Errors
+    /// Returns the mapped journal store error, or `internal` if the worker panicked.
+    #[allow(clippy::result_large_err)]
+    pub async fn repair_flow_dependencies(
+        self: &Arc<Self>,
+        request: FlowDependenciesRepairRequest,
+    ) -> Result<FlowRecord, Status> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || state.repair_flow_dependencies_blocking(&request))
+            .await
+            .map_err(|_| Status::internal("flow dependency repair worker panicked"))?
     }
 
     #[allow(clippy::result_large_err)]

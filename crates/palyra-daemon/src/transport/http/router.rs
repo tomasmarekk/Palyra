@@ -18,7 +18,7 @@ use crate::{
         handlers::{admin, canvas, compat, console, health, realtime, web_ui},
         middleware as http_middleware,
     },
-    HTTP_MAX_REQUEST_BODY_BYTES,
+    FLOW_DEPENDENCY_REPAIR_MAX_REQUEST_BODY_BYTES, HTTP_MAX_REQUEST_BODY_BYTES,
 };
 
 /// Builds the HTTP router with all per-surface middleware and shared app state.
@@ -1124,6 +1124,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/console/v1/flows/{flow_id}/steps/{step_id}/compensate",
             post(console::flows::console_flow_step_compensate_handler),
+        )
+        .route(
+            "/console/v1/flows/{flow_id}/dependencies/repair",
+            post(console::flows::console_flow_dependencies_repair_handler)
+                .layer(DefaultBodyLimit::max(FLOW_DEPENDENCY_REPAIR_MAX_REQUEST_BODY_BYTES)),
         )
         .route(
             "/console/v1/commitments",

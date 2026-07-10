@@ -32,7 +32,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use palyra_a2ui::{apply_patch_document, parse_patch_document};
 use palyra_common::runtime_contracts::{
-    ArtifactReadResponse, ArtifactRetentionPolicy, IdempotencyOperationState,
+    ArtifactReadResponse, ArtifactRetentionPolicy, FlowState, IdempotencyOperationState,
     IdempotencyRecordSnapshot, IdempotencyReplayDecision, RunLifecyclePhase,
     RunLifecycleTransitionRecord, RuntimeActorKind, RuntimeActorRef, StableErrorEnvelope,
     ToolResultArtifactRef, ToolResultSensitivity, ToolResultVisibility,
@@ -57,6 +57,9 @@ use crate::{
         ResumeTapeObservation, DEFAULT_RESUME_FRESHNESS_TTL_MS, RUN_RESUME_DECISION_RECORDED_EVENT,
     },
     delegation::{DelegationMergeResult, DelegationSnapshot},
+    domain::flow_dependencies::{
+        validate_flow_dependency_graph, FlowDependencyNode, FlowDependencyValidationReport,
+    },
     domain::workspace::{
         curated_workspace_templates, normalize_workspace_path,
         normalize_workspace_prefix as normalize_workspace_path_prefix,
@@ -81,6 +84,9 @@ const MEMORY_EMBEDDING_JOB_RETRY_DELAY_MS: i64 = 60_000;
 const SESSION_WRITE_LEASE_TTL_MS: i64 = 30_000;
 const SESSION_WRITE_LEASE_OWNER_LABEL: &str = "journal.session_writer";
 const SESSION_WRITE_LEASE_MAX_TEXT_LEN: usize = 128;
+const FLOW_DEPENDENCY_STARTUP_AUDIT_ACTOR: &str = "system:flow-dependency-startup-audit";
+const FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE: usize = 64;
+const FLOW_DEPENDENCY_STARTUP_AUDIT_CONFLICT_RETRIES: usize = 1;
 const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
     "secret",
     "token",
@@ -2919,6 +2925,53 @@ pub struct FlowStepUpdateRequest {
     pub payload_json: String,
 }
 
+/// One step dependency replacement inside an atomic flow graph repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowStepDependenciesReplacement {
+    pub step_id: String,
+    pub depends_on_step_ids: Vec<String>,
+}
+
+/// CAS-guarded replacement of one or more dependency lists in the same flow graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowDependenciesRepairRequest {
+    pub flow_id: String,
+    pub expected_revision: i64,
+    pub replacements: Vec<FlowStepDependenciesReplacement>,
+    pub actor_principal: String,
+}
+
+/// Expected-revision request for atomically revalidating and quarantining a corrupt graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowDependenciesQuarantineRequest {
+    pub flow_id: String,
+    pub expected_revision: i64,
+    pub actor_principal: String,
+}
+
+/// Summary of the durable dependency-graph validation performed during daemon startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowDependencyStartupAuditReport {
+    /// Total flow headers inspected, including valid graphs and flows without steps.
+    pub inspected_flow_count: usize,
+    /// Invalid graphs observed during this startup scan.
+    pub invalid_flow_count: usize,
+    /// Invalid lifecycle events newly persisted by this scan.
+    pub newly_recorded_invalid_count: usize,
+}
+
+#[derive(Debug)]
+struct FlowDependencyAuditHeader {
+    flow_id: String,
+    revision: i64,
+}
+
+#[derive(Debug)]
+struct FlowDependencyAuditStep {
+    step_id: String,
+    dependencies_json: String,
+}
+
 /// Durable operator-visible work item shown on the WorkBoard.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WorkItemRecord {
@@ -4473,6 +4526,8 @@ pub enum JournalError {
     FlowStepNotFound { flow_id: String, step_id: String },
     #[error("flow revision conflict for {flow_id}: expected {expected_revision}, found {actual_revision}")]
     FlowRevisionConflict { flow_id: String, expected_revision: i64, actual_revision: i64 },
+    #[error("invalid flow dependencies for {flow_id}/{step_id}: {reason_code}")]
+    InvalidFlowDependencies { flow_id: String, step_id: String, reason_code: String },
     #[error("work item already exists: {work_item_id}")]
     DuplicateWorkItemId { work_item_id: String },
     #[error("work item not found: {work_item_id}")]
@@ -6618,6 +6673,46 @@ const MIGRATIONS: &[Migration] = &[
                 ON work_items(parent_work_item_ulid, updated_at_unix_ms DESC, work_item_ulid DESC);
             CREATE INDEX IF NOT EXISTS idx_work_items_objective_routine
                 ON work_items(objective_id, routine_id, updated_at_unix_ms DESC, work_item_ulid DESC);
+        "#,
+    },
+    Migration {
+        version: 43,
+        name: "flow_dependency_reconciliation_projection",
+        sql: r#"
+            ALTER TABLE flows
+                ADD COLUMN dependency_health TEXT NOT NULL DEFAULT 'valid'
+                CHECK (dependency_health IN ('valid', 'invalid'));
+
+            UPDATE flows
+            SET dependency_health = CASE
+                WHEN COALESCE((
+                    SELECT revisions.change_kind
+                    FROM flow_revisions revisions
+                    WHERE revisions.flow_ulid = flows.flow_ulid
+                      AND revisions.change_kind IN (
+                          'flow.dependencies_invalid',
+                          'flow.dependencies_repaired'
+                      )
+                    ORDER BY revisions.revision DESC
+                    LIMIT 1
+                ), '') = 'flow.dependencies_invalid'
+                THEN 'invalid'
+                ELSE 'valid'
+            END;
+
+            CREATE INDEX IF NOT EXISTS idx_flows_reconciliation_eligible
+                ON flows(updated_at_unix_ms ASC, created_at_unix_ms ASC, flow_ulid ASC)
+                WHERE state = 'cancel_requested'
+                   OR (
+                       dependency_health = 'valid'
+                       AND state NOT IN (
+                           'paused',
+                           'succeeded',
+                           'failed',
+                           'timed_out',
+                           'cancelled'
+                       )
+                   );
         "#,
     },
 ];
@@ -14448,6 +14543,11 @@ impl JournalStore {
     pub fn create_flow(&self, request: &FlowCreateRequest) -> Result<FlowRecord, JournalError> {
         ensure_json_field(request.retry_policy_json.as_str(), "retry_policy_json")?;
         ensure_json_field(request.metadata_json.as_str(), "metadata_json")?;
+        validate_flow_dependency_graph(request.steps.iter().map(|step| FlowDependencyNode {
+            step_id: step.step_id.as_str(),
+            dependencies_json: step.depends_on_step_ids_json.as_str(),
+        }))
+        .map_err(|report| invalid_flow_dependencies_error(request.flow_id.as_str(), &report))?;
         for step in &request.steps {
             ensure_json_field(step.input_json.as_str(), "input_json")?;
             ensure_json_field(step.lineage_json.as_str(), "lineage_json")?;
@@ -14654,6 +14754,65 @@ impl JournalStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
     }
 
+    /// Lists runnable reconciliation candidates without paused or blocked dependency-quarantined
+    /// flows; cancel-requested flows remain eligible even when their dependency graph is invalid.
+    ///
+    /// A blocked flow re-enters this set after the CAS repair records
+    /// `flow.dependencies_repaired`; blocked flows with unrelated causes remain eligible.
+    ///
+    /// # Errors
+    /// Returns [`JournalError`] if the storage query fails.
+    pub fn list_flows_for_reconciliation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<FlowRecord>, JournalError> {
+        let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let mut statement = guard.prepare(
+            r#"
+                SELECT
+                    flow_ulid,
+                    mode,
+                    state,
+                    owner_principal,
+                    device_id,
+                    channel,
+                    session_ulid,
+                    origin_run_ulid,
+                    objective_id,
+                    routine_id,
+                    webhook_id,
+                    title,
+                    summary,
+                    current_step_ulid,
+                    revision,
+                    lock_owner,
+                    lock_expires_at_unix_ms,
+                    retry_policy_json,
+                    timeout_ms,
+                    metadata_json,
+                    created_at_unix_ms,
+                    updated_at_unix_ms,
+                    completed_at_unix_ms
+                FROM flows
+                WHERE state = 'cancel_requested'
+                   OR (
+                       dependency_health = 'valid'
+                       AND state NOT IN (
+                           'paused',
+                           'succeeded',
+                           'failed',
+                           'timed_out',
+                           'cancelled'
+                       )
+                   )
+                ORDER BY updated_at_unix_ms ASC, created_at_unix_ms ASC, flow_ulid ASC
+                LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map(params![limit.clamp(1, 500) as i64], map_flow_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+    }
+
     /// Returns a flow, or `None` if absent.
     ///
     /// # Errors
@@ -14689,38 +14848,7 @@ impl JournalStore {
     /// Returns [`JournalError`] if the storage query fails.
     pub fn list_flow_steps(&self, flow_id: &str) -> Result<Vec<FlowStepRecord>, JournalError> {
         let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
-        let mut statement = guard.prepare(
-            r#"
-                SELECT
-                    step_ulid,
-                    flow_ulid,
-                    step_index,
-                    step_kind,
-                    adapter,
-                    state,
-                    title,
-                    input_json,
-                    output_json,
-                    lineage_json,
-                    depends_on_step_ids_json,
-                    attempt_count,
-                    max_attempts,
-                    backoff_ms,
-                    timeout_ms,
-                    not_before_unix_ms,
-                    waiting_reason,
-                    last_error,
-                    created_at_unix_ms,
-                    updated_at_unix_ms,
-                    started_at_unix_ms,
-                    completed_at_unix_ms
-                FROM flow_steps
-                WHERE flow_ulid = ?1
-                ORDER BY step_index ASC, created_at_unix_ms ASC
-            "#,
-        )?;
-        let rows = statement.query_map(params![flow_id], map_flow_step_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+        query_flow_steps(&guard, flow_id)
     }
 
     /// Returns one flow step, or `None` if absent.
@@ -15066,6 +15194,405 @@ impl JournalStore {
                 step_id: request.step_id.clone(),
             }
         })
+    }
+
+    /// Validates every durable flow graph and records any missing invalid lifecycle evidence.
+    ///
+    /// The scan captures an initial upper flow-id watermark, pages only bounded headers, and
+    /// validates one complete graph at a time. Each invalid candidate is reloaded and revalidated
+    /// inside the same CAS-guarded transaction that records its audit event. One concurrent
+    /// revision change and bounded SQLite-busy windows are retried; continued contention fails
+    /// startup.
+    ///
+    /// # Errors
+    /// Returns a storage, validation, or revision-conflict error. Callers must fail startup rather
+    /// than continue with an unaudited dependency graph.
+    pub fn audit_flow_dependencies_on_startup(
+        &self,
+    ) -> Result<FlowDependencyStartupAuditReport, JournalError> {
+        let upper_flow_id = state_health::retry_sqlite_busy(|| {
+            let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+            query_flow_dependency_audit_upper_bound(&guard)
+        })?;
+        let Some(upper_flow_id) = upper_flow_id else {
+            return Ok(FlowDependencyStartupAuditReport {
+                inspected_flow_count: 0,
+                invalid_flow_count: 0,
+                newly_recorded_invalid_count: 0,
+            });
+        };
+        let mut cursor = None::<String>;
+        let mut inspected_flow_count = 0_usize;
+        let mut invalid_flow_count = 0_usize;
+        let mut newly_recorded_invalid_count = 0_usize;
+
+        loop {
+            let headers = state_health::retry_sqlite_busy(|| {
+                let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+                query_flow_dependency_audit_headers_page(
+                    &guard,
+                    cursor.as_deref(),
+                    upper_flow_id.as_str(),
+                    FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE,
+                )
+            })?;
+            if headers.is_empty() {
+                break;
+            }
+            cursor = headers.last().map(|header| header.flow_id.clone());
+            inspected_flow_count = inspected_flow_count.saturating_add(headers.len());
+
+            for header in headers {
+                let steps = state_health::retry_sqlite_busy(|| {
+                    let guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+                    query_flow_dependency_audit_steps(&guard, header.flow_id.as_str())
+                })?;
+                let invalid =
+                    validate_flow_dependency_graph(steps.iter().map(|step| FlowDependencyNode {
+                        step_id: step.step_id.as_str(),
+                        dependencies_json: step.dependencies_json.as_str(),
+                    }))
+                    .is_err();
+                if !invalid {
+                    continue;
+                }
+                invalid_flow_count = invalid_flow_count.saturating_add(1);
+                if self.record_invalid_flow_dependency_candidate(
+                    header.flow_id.as_str(),
+                    header.revision,
+                )? {
+                    newly_recorded_invalid_count = newly_recorded_invalid_count.saturating_add(1);
+                }
+            }
+        }
+
+        Ok(FlowDependencyStartupAuditReport {
+            inspected_flow_count,
+            invalid_flow_count,
+            newly_recorded_invalid_count,
+        })
+    }
+
+    fn record_invalid_flow_dependency_candidate(
+        &self,
+        flow_id: &str,
+        initial_revision: i64,
+    ) -> Result<bool, JournalError> {
+        let mut expected_revision = initial_revision;
+        let mut conflict_retries = 0_usize;
+        loop {
+            let request = FlowDependenciesQuarantineRequest {
+                flow_id: flow_id.to_owned(),
+                expected_revision,
+                actor_principal: FLOW_DEPENDENCY_STARTUP_AUDIT_ACTOR.to_owned(),
+            };
+            match state_health::retry_sqlite_busy(|| {
+                self.quarantine_invalid_flow_dependencies(&request)
+            }) {
+                Ok(recorded) => return Ok(recorded.is_some()),
+                Err(JournalError::FlowRevisionConflict { actual_revision, .. })
+                    if conflict_retries < FLOW_DEPENDENCY_STARTUP_AUDIT_CONFLICT_RETRIES =>
+                {
+                    expected_revision = actual_revision;
+                    conflict_retries = conflict_retries.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Revalidates the current graph and quarantines it in the same CAS-guarded transaction.
+    ///
+    /// Returns None without writing when the graph is valid or an invalid dependency lifecycle is
+    /// already current. Step execution state remains authoritative; affected steps are identified
+    /// by the validation report rather than destructive state projection. Paused,
+    /// cancel-requested, and terminal lifecycle states are preserved with durable evidence.
+    ///
+    /// # Errors
+    /// Returns flow-not-found or revision-conflict errors, plus storage failures.
+    pub fn quarantine_invalid_flow_dependencies(
+        &self,
+        request: &FlowDependenciesQuarantineRequest,
+    ) -> Result<Option<FlowRecord>, JournalError> {
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let (previous_state, actual_revision) = transaction
+            .query_row(
+                "SELECT state, revision FROM flows WHERE flow_ulid = ?1",
+                params![request.flow_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })?;
+        if request.expected_revision != actual_revision {
+            return Err(JournalError::FlowRevisionConflict {
+                flow_id: request.flow_id.clone(),
+                expected_revision: request.expected_revision,
+                actual_revision,
+            });
+        }
+
+        let steps = query_flow_steps(&transaction, request.flow_id.as_str())?;
+        let report =
+            match validate_flow_dependency_graph(steps.iter().map(|step| FlowDependencyNode {
+                step_id: step.step_id.as_str(),
+                dependencies_json: step.depends_on_step_ids_json.as_str(),
+            })) {
+                Ok(_) => return Ok(None),
+                Err(report) => report,
+            };
+        let latest_dependency_lifecycle = transaction
+            .query_row(
+                r#"
+                    SELECT change_kind
+                    FROM flow_revisions
+                    WHERE flow_ulid = ?1
+                      AND change_kind IN (
+                          'flow.dependencies_invalid',
+                          'flow.dependencies_repaired'
+                      )
+                    ORDER BY revision DESC
+                    LIMIT 1
+                "#,
+                params![request.flow_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let preserve_lifecycle_state =
+            FlowState::from_str(previous_state.as_str()).is_some_and(|state| {
+                state == FlowState::Paused
+                    || state == FlowState::CancelRequested
+                    || state.is_terminal()
+            });
+        if (previous_state == FlowState::Blocked.as_str() || preserve_lifecycle_state)
+            && latest_dependency_lifecycle.as_deref() == Some("flow.dependencies_invalid")
+        {
+            return Ok(None);
+        }
+
+        let next_state = if preserve_lifecycle_state {
+            previous_state.as_str()
+        } else {
+            FlowState::Blocked.as_str()
+        };
+        let next_revision = actual_revision + 1;
+        transaction.execute(
+            r#"
+                UPDATE flows
+                SET
+                    state = ?2,
+                    dependency_health = 'invalid',
+                    revision = ?3,
+                    lock_owner = NULL,
+                    lock_expires_at_unix_ms = NULL,
+                    updated_at_unix_ms = ?4
+                WHERE flow_ulid = ?1
+            "#,
+            params![request.flow_id, next_state, next_revision, now],
+        )?;
+        let event_payload = json!({
+            "dependency_validation": report.diagnostic_value(),
+            "repair": "replace all affected dependencies with one CAS-guarded repair",
+            "lifecycle_state_preserved": preserve_lifecycle_state,
+        })
+        .to_string();
+        insert_flow_event(
+            &transaction,
+            FlowEventInsert {
+                event_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                step_id: None,
+                event_type: "flow.dependencies_invalid",
+                actor_principal: request.actor_principal.as_str(),
+                from_state: Some(previous_state.as_str()),
+                to_state: Some(next_state),
+                summary: "flow dependency graph requires repair",
+                payload_json: event_payload.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_flow_revision(
+            &transaction,
+            FlowRevisionInsert {
+                revision_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                revision: next_revision,
+                parent_revision: Some(actual_revision),
+                change_kind: "flow.dependencies_invalid",
+                actor_principal: request.actor_principal.as_str(),
+                payload_json: event_payload.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_flow(request.flow_id.as_str())
+    }
+
+    /// Replaces one or more dependency lists after validating the complete proposed graph.
+    ///
+    /// All dependency updates, the audit event, and revision increment commit atomically. Step
+    /// execution states are never inferred or rewritten by this graph repair.
+    ///
+    /// # Errors
+    /// Returns [`JournalError::FlowNotFound`], [`JournalError::FlowStepNotFound`],
+    /// [`JournalError::FlowRevisionConflict`], or [`JournalError::InvalidFlowDependencies`], plus
+    /// storage and serialization failures.
+    pub fn repair_flow_dependencies(
+        &self,
+        request: &FlowDependenciesRepairRequest,
+    ) -> Result<FlowRecord, JournalError> {
+        if request.replacements.is_empty() {
+            return Err(JournalError::InvalidArgument(
+                "flow dependency repair requires at least one replacement".to_owned(),
+            ));
+        }
+        let mut replacement_ids = BTreeSet::new();
+        let mut serialized_replacements = Vec::with_capacity(request.replacements.len());
+        for replacement in &request.replacements {
+            if !replacement_ids.insert(replacement.step_id.as_str()) {
+                return Err(JournalError::InvalidArgument(
+                    "dependency repair contains duplicate step replacements".to_owned(),
+                ));
+            }
+            serialized_replacements.push((
+                replacement.step_id.clone(),
+                serde_json::to_string(&replacement.depends_on_step_ids)?,
+            ));
+        }
+        serialized_replacements.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let now = current_unix_ms()?;
+        let mut guard = self.connection.lock().map_err(|_| JournalError::LockPoisoned)?;
+        let transaction = guard.transaction()?;
+        let (previous_flow_state, actual_revision) = transaction
+            .query_row(
+                "SELECT state, revision FROM flows WHERE flow_ulid = ?1",
+                params![request.flow_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })?;
+        if request.expected_revision != actual_revision {
+            return Err(JournalError::FlowRevisionConflict {
+                flow_id: request.flow_id.clone(),
+                expected_revision: request.expected_revision,
+                actual_revision,
+            });
+        }
+
+        let mut steps = query_flow_steps(&transaction, request.flow_id.as_str())?;
+        let previous_report =
+            match validate_flow_dependency_graph(steps.iter().map(|step| FlowDependencyNode {
+                step_id: step.step_id.as_str(),
+                dependencies_json: step.depends_on_step_ids_json.as_str(),
+            })) {
+                Ok(_) => {
+                    return Err(JournalError::InvalidArgument(
+                        "dependency repair requires a currently invalid graph".to_owned(),
+                    ))
+                }
+                Err(report) => report,
+            };
+        for (step_id, _) in &serialized_replacements {
+            if !steps.iter().any(|step| step.step_id == *step_id) {
+                return Err(JournalError::FlowStepNotFound {
+                    flow_id: request.flow_id.clone(),
+                    step_id: step_id.clone(),
+                });
+            }
+            if !previous_report.affects_step(step_id.as_str()) {
+                return Err(JournalError::InvalidArgument(
+                    "dependency replacement target is not affected by the invalid graph".to_owned(),
+                ));
+            }
+        }
+        for (step_id, dependencies_json) in &serialized_replacements {
+            let step = steps.iter_mut().find(|step| step.step_id == *step_id).ok_or_else(|| {
+                JournalError::FlowStepNotFound {
+                    flow_id: request.flow_id.clone(),
+                    step_id: step_id.clone(),
+                }
+            })?;
+            step.depends_on_step_ids_json.clone_from(dependencies_json);
+        }
+        validate_flow_dependency_graph(steps.iter().map(|step| FlowDependencyNode {
+            step_id: step.step_id.as_str(),
+            dependencies_json: step.depends_on_step_ids_json.as_str(),
+        }))
+        .map_err(|report| invalid_flow_dependencies_error(request.flow_id.as_str(), &report))?;
+
+        for (step_id, dependencies_json) in &serialized_replacements {
+            let changed = transaction.execute(
+                r#"
+                    UPDATE flow_steps
+                    SET depends_on_step_ids_json = ?3, updated_at_unix_ms = ?4
+                    WHERE flow_ulid = ?1 AND step_ulid = ?2
+                "#,
+                params![request.flow_id, step_id, dependencies_json, now],
+            )?;
+            if changed != 1 {
+                return Err(JournalError::FlowStepNotFound {
+                    flow_id: request.flow_id.clone(),
+                    step_id: step_id.clone(),
+                });
+            }
+        }
+
+        let next_revision = actual_revision + 1;
+        transaction.execute(
+            r#"
+                UPDATE flows
+                SET
+                    dependency_health = 'valid',
+                    revision = ?2,
+                    lock_owner = NULL,
+                    lock_expires_at_unix_ms = NULL,
+                    updated_at_unix_ms = ?3
+                WHERE flow_ulid = ?1
+            "#,
+            params![request.flow_id, next_revision, now],
+        )?;
+        let event_payload = json!({
+            "reason_code": "dependency_graph_repaired",
+            "replacement_count": request.replacements.len(),
+            "previous_dependency_validation": previous_report.diagnostic_value(),
+            "reconciliation_required": true,
+        })
+        .to_string();
+        insert_flow_event(
+            &transaction,
+            FlowEventInsert {
+                event_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                step_id: None,
+                event_type: "flow.dependencies_repaired",
+                actor_principal: request.actor_principal.as_str(),
+                from_state: Some(previous_flow_state.as_str()),
+                to_state: Some(previous_flow_state.as_str()),
+                summary: "flow dependencies repaired; readiness reconciliation pending",
+                payload_json: event_payload.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        insert_flow_revision(
+            &transaction,
+            FlowRevisionInsert {
+                revision_id: Ulid::new().to_string(),
+                flow_id: request.flow_id.as_str(),
+                revision: next_revision,
+                parent_revision: Some(actual_revision),
+                change_kind: "flow.dependencies_repaired",
+                actor_principal: request.actor_principal.as_str(),
+                payload_json: event_payload.as_str(),
+                created_at_unix_ms: now,
+            },
+        )?;
+        transaction.commit()?;
+        drop(guard);
+        self.get_flow(request.flow_id.as_str())?
+            .ok_or_else(|| JournalError::FlowNotFound { flow_id: request.flow_id.clone() })
     }
 
     /// Creates a durable WorkBoard item with its initial audit event.
@@ -25020,6 +25547,120 @@ fn query_flow_by_id(
         .map_err(JournalError::from)
 }
 
+fn invalid_flow_dependencies_error(
+    flow_id: &str,
+    report: &FlowDependencyValidationReport,
+) -> JournalError {
+    let issue = report.primary_issue();
+    JournalError::InvalidFlowDependencies {
+        flow_id: flow_id.to_owned(),
+        step_id: issue.step_id().to_owned(),
+        reason_code: issue.reason_code().as_str().to_owned(),
+    }
+}
+
+fn query_flow_dependency_audit_upper_bound(
+    connection: &Connection,
+) -> Result<Option<String>, JournalError> {
+    connection
+        .query_row("SELECT MAX(flow_ulid) FROM flows", [], |row| row.get(0))
+        .map_err(JournalError::from)
+}
+
+fn query_flow_dependency_audit_headers_page(
+    connection: &Connection,
+    after_flow_id: Option<&str>,
+    upper_flow_id: &str,
+    limit: usize,
+) -> Result<Vec<FlowDependencyAuditHeader>, JournalError> {
+    let limit = limit.clamp(1, 500) as i64;
+    if let Some(after_flow_id) = after_flow_id {
+        let mut statement = connection.prepare(
+            r#"
+                SELECT flow_ulid, revision
+                FROM flows
+                WHERE flow_ulid > ?1 AND flow_ulid <= ?2
+                ORDER BY flow_ulid ASC
+                LIMIT ?3
+            "#,
+        )?;
+        let rows = statement.query_map(params![after_flow_id, upper_flow_id, limit], |row| {
+            Ok(FlowDependencyAuditHeader { flow_id: row.get(0)?, revision: row.get(1)? })
+        })?;
+        return rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from);
+    }
+
+    let mut statement = connection.prepare(
+        r#"
+            SELECT flow_ulid, revision
+            FROM flows
+            WHERE flow_ulid <= ?1
+            ORDER BY flow_ulid ASC
+            LIMIT ?2
+        "#,
+    )?;
+    let rows = statement.query_map(params![upper_flow_id, limit], |row| {
+        Ok(FlowDependencyAuditHeader { flow_id: row.get(0)?, revision: row.get(1)? })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+}
+
+fn query_flow_dependency_audit_steps(
+    connection: &Connection,
+    flow_id: &str,
+) -> Result<Vec<FlowDependencyAuditStep>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT step_ulid, depends_on_step_ids_json
+            FROM flow_steps
+            WHERE flow_ulid = ?1
+            ORDER BY step_index ASC, created_at_unix_ms ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![flow_id], |row| {
+        Ok(FlowDependencyAuditStep { step_id: row.get(0)?, dependencies_json: row.get(1)? })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+}
+
+fn query_flow_steps(
+    connection: &Connection,
+    flow_id: &str,
+) -> Result<Vec<FlowStepRecord>, JournalError> {
+    let mut statement = connection.prepare(
+        r#"
+            SELECT
+                step_ulid,
+                flow_ulid,
+                step_index,
+                step_kind,
+                adapter,
+                state,
+                title,
+                input_json,
+                output_json,
+                lineage_json,
+                depends_on_step_ids_json,
+                attempt_count,
+                max_attempts,
+                backoff_ms,
+                timeout_ms,
+                not_before_unix_ms,
+                waiting_reason,
+                last_error,
+                created_at_unix_ms,
+                updated_at_unix_ms,
+                started_at_unix_ms,
+                completed_at_unix_ms
+            FROM flow_steps
+            WHERE flow_ulid = ?1
+            ORDER BY step_index ASC, created_at_unix_ms ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![flow_id], map_flow_step_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(JournalError::from)
+}
+
 fn query_flow_step_by_id(
     connection: &Connection,
     flow_id: &str,
@@ -27937,11 +28578,13 @@ mod tests {
         CompatResponseUpsertRequest, CronConcurrencyPolicy, CronJobCreateRequest,
         CronJobsListFilter, CronMisfirePolicy, CronRetryPolicy, CronRunFinalizeRequest,
         CronRunStartRequest, CronRunStatus, CronRunsListFilter, CronScheduleType,
-        HashMemoryEmbeddingProvider, IdempotencyBeginRequest, IdempotencyCompleteRequest,
-        JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryEmbeddingProvider,
-        MemoryItemCreateRequest, MemoryItemsListFilter, MemoryMaintenanceRequest,
-        MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest, MemorySource,
-        OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
+        FlowCreateRequest, FlowDependenciesQuarantineRequest, FlowDependenciesRepairRequest,
+        FlowStepCreateRequest, FlowStepDependenciesReplacement, FlowStepUpdateRequest,
+        FlowTransitionRequest, HashMemoryEmbeddingProvider, IdempotencyBeginRequest,
+        IdempotencyCompleteRequest, JournalAppendRequest, JournalConfig, JournalError,
+        JournalStore, MemoryEmbeddingProvider, MemoryItemCreateRequest, MemoryItemsListFilter,
+        MemoryMaintenanceRequest, MemoryPurgeRequest, MemoryRetentionPolicy, MemorySearchRequest,
+        MemorySource, OrchestratorCancelRequest, OrchestratorQueuedInputCreateRequest,
         OrchestratorRunStartRequest, OrchestratorSessionPinCreateRequest,
         OrchestratorSessionResolveRequest, OrchestratorSessionUpsertRequest,
         OrchestratorTapeAppendRequest, OrchestratorUsageDelta, ProgressDraftListFilter,
@@ -29284,6 +29927,850 @@ mod tests {
             max_payload_bytes: 256 * 1024,
             max_events: 10_000,
         }
+    }
+
+    fn flow_create_request(flow_id: &str, child_dependencies_json: &str) -> FlowCreateRequest {
+        FlowCreateRequest {
+            flow_id: flow_id.to_owned(),
+            mode: "managed".to_owned(),
+            state: "pending".to_owned(),
+            owner_principal: "operator:test".to_owned(),
+            device_id: "device:test".to_owned(),
+            channel: Some("test".to_owned()),
+            session_id: None,
+            origin_run_id: None,
+            objective_id: None,
+            routine_id: None,
+            webhook_id: None,
+            title: "Dependency test flow".to_owned(),
+            summary: "Dependency test flow".to_owned(),
+            retry_policy_json: "{}".to_owned(),
+            timeout_ms: None,
+            metadata_json: "{}".to_owned(),
+            actor_principal: "operator:test".to_owned(),
+            steps: vec![
+                flow_step_create_request("parent", 0, "[]"),
+                flow_step_create_request("child", 1, child_dependencies_json),
+            ],
+        }
+    }
+
+    fn flow_create_request_with_unique_step_ids(flow_id: &str) -> FlowCreateRequest {
+        let parent_step_id = format!("{flow_id}-parent");
+        let child_step_id = format!("{flow_id}-child");
+        let mut request = flow_create_request(flow_id, "[]");
+        request.steps[0].step_id = parent_step_id.clone();
+        request.steps[0].title.clone_from(&parent_step_id);
+        request.steps[1].step_id = child_step_id.clone();
+        request.steps[1].title.clone_from(&child_step_id);
+        request.steps[1].depends_on_step_ids_json =
+            serde_json::to_string(&[parent_step_id]).expect("dependency ids should encode");
+        request
+    }
+
+    fn flow_step_create_request(
+        step_id: &str,
+        step_index: i64,
+        dependencies: &str,
+    ) -> FlowStepCreateRequest {
+        FlowStepCreateRequest {
+            step_id: step_id.to_owned(),
+            step_index,
+            step_kind: "auxiliary_task".to_owned(),
+            adapter: "auxiliary_task".to_owned(),
+            state: "pending".to_owned(),
+            title: step_id.to_owned(),
+            input_json: "{}".to_owned(),
+            lineage_json: "{}".to_owned(),
+            depends_on_step_ids_json: dependencies.to_owned(),
+            max_attempts: 1,
+            backoff_ms: 0,
+            timeout_ms: None,
+            not_before_unix_ms: None,
+        }
+    }
+
+    fn inject_flow_dependency_json(
+        db_path: &std::path::Path,
+        flow_id: &str,
+        replacements: &[(&str, &str)],
+    ) {
+        let connection = Connection::open(db_path).expect("journal db should reopen");
+        for (step_id, dependencies_json) in replacements {
+            connection
+                .execute(
+                    r#"
+                        UPDATE flow_steps
+                        SET depends_on_step_ids_json = ?3
+                        WHERE flow_ulid = ?1 AND step_ulid = ?2
+                    "#,
+                    params![flow_id, step_id, dependencies_json],
+                )
+                .expect("test should inject legacy dependency corruption");
+        }
+    }
+
+    #[test]
+    fn flow_create_rejects_invalid_dependency_graphs_before_persistence() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        for (flow_id, dependencies, reason_code) in [
+            ("malformed", "{", "malformed_dependency_json"),
+            ("unknown", r#"["missing"]"#, "unknown_dependency"),
+            ("cycle", r#"["child"]"#, "dependency_cycle"),
+        ] {
+            let error = store
+                .create_flow(&flow_create_request(flow_id, dependencies))
+                .expect_err("invalid dependency graph must be rejected");
+            assert!(matches!(
+                error,
+                JournalError::InvalidFlowDependencies {
+                    reason_code: ref actual,
+                    ..
+                } if actual == reason_code
+            ));
+            assert!(store.get_flow(flow_id).expect("flow lookup should succeed").is_none());
+        }
+    }
+
+    #[test]
+    fn startup_dependency_audit_preserves_non_dispatch_lifecycle_states() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            for (flow_id, state) in [
+                ("cancel-corrupt", "cancel_requested"),
+                ("paused-corrupt", "paused"),
+                ("terminal-corrupt", "succeeded"),
+            ] {
+                let mut request = flow_create_request_with_unique_step_ids(flow_id);
+                request.state = state.to_owned();
+                store.create_flow(&request).expect("valid flow should be created");
+            }
+        }
+        for (flow_id, child_step_id) in [
+            ("cancel-corrupt", "cancel-corrupt-child"),
+            ("paused-corrupt", "paused-corrupt-child"),
+            ("terminal-corrupt", "terminal-corrupt-child"),
+        ] {
+            inject_flow_dependency_json(db_path.as_path(), flow_id, &[(child_step_id, "{")]);
+        }
+
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report = store
+            .audit_flow_dependencies_on_startup()
+            .expect("startup dependency audit should succeed");
+        assert_eq!(report.inspected_flow_count, 3);
+        assert_eq!(report.invalid_flow_count, 3);
+        assert_eq!(report.newly_recorded_invalid_count, 3);
+
+        for (flow_id, expected_state) in [
+            ("cancel-corrupt", "cancel_requested"),
+            ("paused-corrupt", "paused"),
+            ("terminal-corrupt", "succeeded"),
+        ] {
+            let flow = store
+                .get_flow(flow_id)
+                .expect("flow lookup should succeed")
+                .expect("flow should exist");
+            assert_eq!(flow.state, expected_state);
+            let invalid_events = store
+                .list_flow_events(flow_id, 32)
+                .expect("flow events should load")
+                .into_iter()
+                .filter(|event| event.event_type == "flow.dependencies_invalid")
+                .collect::<Vec<_>>();
+            assert_eq!(invalid_events.len(), 1);
+            assert_eq!(invalid_events[0].from_state.as_deref(), Some(expected_state));
+            assert_eq!(invalid_events[0].to_state.as_deref(), Some(expected_state));
+            assert_eq!(
+                invalid_events[0].actor_principal,
+                super::FLOW_DEPENDENCY_STARTUP_AUDIT_ACTOR
+            );
+        }
+
+        let repeat = store
+            .audit_flow_dependencies_on_startup()
+            .expect("repeat startup dependency audit should succeed");
+        assert_eq!(repeat.invalid_flow_count, 3);
+        assert_eq!(repeat.newly_recorded_invalid_count, 0);
+    }
+
+    #[test]
+    fn startup_dependency_audit_pages_complete_graphs_and_parks_invalid_flows() {
+        let db_path = temp_db_path();
+        let invalid_flow_count = super::FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE + 1;
+        let mut corruptions = Vec::<(String, String)>::new();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            for index in 0..invalid_flow_count {
+                let flow_id = format!("audit-page-{index:03}");
+                let request = if index == 0 {
+                    let mut request = flow_create_request_with_unique_step_ids(flow_id.as_str());
+                    request.steps.clear();
+                    let mut previous_step_id = None::<String>;
+                    for step_index in 0..=super::FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE {
+                        let step_id = format!("{flow_id}-step-{step_index:03}");
+                        let dependencies_json = previous_step_id.as_ref().map_or_else(
+                            || "[]".to_owned(),
+                            |dependency_id| {
+                                serde_json::to_string(&[dependency_id])
+                                    .expect("dependency ids should encode")
+                            },
+                        );
+                        request.steps.push(flow_step_create_request(
+                            step_id.as_str(),
+                            step_index as i64,
+                            dependencies_json.as_str(),
+                        ));
+                        previous_step_id = Some(step_id);
+                    }
+                    request
+                } else {
+                    flow_create_request_with_unique_step_ids(flow_id.as_str())
+                };
+                let corruption_step_id = request
+                    .steps
+                    .last()
+                    .expect("fixture flow should include steps")
+                    .step_id
+                    .clone();
+                store.create_flow(&request).expect("valid flow should be created");
+                corruptions.push((flow_id, corruption_step_id));
+            }
+            store
+                .create_flow(&flow_create_request_with_unique_step_ids("zz-audit-valid"))
+                .expect("valid reconciliation candidate should be created");
+        }
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        for (flow_id, step_id) in &corruptions {
+            connection
+                .execute(
+                    r#"
+                        UPDATE flow_steps
+                        SET depends_on_step_ids_json = '{'
+                        WHERE flow_ulid = ?1 AND step_ulid = ?2
+                    "#,
+                    params![flow_id, step_id],
+                )
+                .expect("test should inject legacy dependency corruption");
+        }
+        drop(connection);
+
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let report =
+            store.audit_flow_dependencies_on_startup().expect("paged startup audit should succeed");
+        assert_eq!(report.inspected_flow_count, invalid_flow_count + 1);
+        assert_eq!(report.invalid_flow_count, invalid_flow_count);
+        assert_eq!(report.newly_recorded_invalid_count, invalid_flow_count);
+
+        let query_plan = {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            let mut statement = guard
+                .prepare(
+                    r#"
+                        EXPLAIN QUERY PLAN
+                        SELECT flow_ulid
+                        FROM flows
+                        WHERE state = 'cancel_requested'
+                           OR (
+                               dependency_health = 'valid'
+                               AND state NOT IN (
+                                   'paused',
+                                   'succeeded',
+                                   'failed',
+                                   'timed_out',
+                                   'cancelled'
+                               )
+                           )
+                        ORDER BY updated_at_unix_ms ASC, created_at_unix_ms ASC, flow_ulid ASC
+                        LIMIT 64
+                    "#,
+                )
+                .expect("reconciliation query plan should prepare");
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .expect("reconciliation query plan should execute")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("reconciliation query plan should collect")
+        };
+        assert!(
+            query_plan.iter().any(|detail| detail.contains("idx_flows_reconciliation_eligible")),
+            "reconciliation query must use the bounded eligibility index: {query_plan:?}"
+        );
+
+        let eligible = store
+            .list_flows_for_reconciliation(super::FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE)
+            .expect("reconciliation candidates should list");
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].flow_id, "zz-audit-valid");
+
+        let repaired_flow_id = "audit-page-001";
+        let quarantined = store
+            .get_flow(repaired_flow_id)
+            .expect("flow lookup should succeed")
+            .expect("quarantined flow should exist");
+        store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: repaired_flow_id.to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: format!("{repaired_flow_id}-child"),
+                    depends_on_step_ids: vec![format!("{repaired_flow_id}-parent")],
+                }],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect("repair should re-enable reconciliation eligibility");
+        let eligible = store
+            .list_flows_for_reconciliation(super::FLOW_DEPENDENCY_STARTUP_AUDIT_PAGE_SIZE)
+            .expect("repaired reconciliation candidates should list");
+        let eligible_ids = eligible
+            .iter()
+            .map(|flow| flow.flow_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(eligible_ids.len(), 2);
+        assert!(eligible_ids.contains("zz-audit-valid"));
+        assert!(eligible_ids.contains(repaired_flow_id));
+    }
+
+    #[test]
+    fn dependency_audit_watermark_excludes_later_flow_ids() {
+        let store = JournalStore::open(test_journal_config(temp_db_path(), false))
+            .expect("journal store should open");
+        for flow_id in ["watermark-a", "watermark-b"] {
+            store
+                .create_flow(&flow_create_request_with_unique_step_ids(flow_id))
+                .expect("watermark fixture flow should be created");
+        }
+        let upper_flow_id = {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            super::query_flow_dependency_audit_upper_bound(&guard)
+                .expect("audit watermark should load")
+                .expect("audit watermark should exist")
+        };
+        let first_page = {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            super::query_flow_dependency_audit_headers_page(&guard, None, upper_flow_id.as_str(), 1)
+                .expect("first audit page should load")
+        };
+        assert_eq!(first_page.len(), 1);
+
+        store
+            .create_flow(&flow_create_request_with_unique_step_ids("zzzz-watermark-later"))
+            .expect("later flow should be created through validated admission");
+        let second_page = {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            super::query_flow_dependency_audit_headers_page(
+                &guard,
+                Some(first_page[0].flow_id.as_str()),
+                upper_flow_id.as_str(),
+                8,
+            )
+            .expect("second audit page should load")
+        };
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].flow_id, "watermark-b");
+        let terminal_page = {
+            let guard = store.connection.lock().expect("journal lock should be available");
+            super::query_flow_dependency_audit_headers_page(
+                &guard,
+                Some(second_page[0].flow_id.as_str()),
+                upper_flow_id.as_str(),
+                8,
+            )
+            .expect("terminal audit page should load")
+        };
+        assert!(terminal_page.is_empty());
+    }
+
+    #[test]
+    fn startup_dependency_audit_reloads_concurrent_revision_winners() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            for flow_id in ["audit-repair-wins", "audit-revision-wins"] {
+                store
+                    .create_flow(&flow_create_request_with_unique_step_ids(flow_id))
+                    .expect("valid flow should be created");
+            }
+        }
+        for flow_id in ["audit-repair-wins", "audit-revision-wins"] {
+            let child_step_id = format!("{flow_id}-child");
+            inject_flow_dependency_json(
+                db_path.as_path(),
+                flow_id,
+                &[(child_step_id.as_str(), "{")],
+            );
+        }
+
+        let auditor = JournalStore::open(test_journal_config(db_path.clone(), false))
+            .expect("auditor store should open");
+        let writer = JournalStore::open(test_journal_config(db_path, false))
+            .expect("writer store should open");
+
+        let repair_flow_id = "audit-repair-wins";
+        let repair_initial_revision = auditor
+            .get_flow(repair_flow_id)
+            .expect("flow lookup should succeed")
+            .expect("flow should exist")
+            .revision;
+        let quarantined = writer
+            .quarantine_invalid_flow_dependencies(&FlowDependenciesQuarantineRequest {
+                flow_id: repair_flow_id.to_owned(),
+                expected_revision: repair_initial_revision,
+                actor_principal: "system:concurrent-writer".to_owned(),
+            })
+            .expect("concurrent quarantine should succeed")
+            .expect("concurrent quarantine should write");
+        writer
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: repair_flow_id.to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: format!("{repair_flow_id}-child"),
+                    depends_on_step_ids: vec![format!("{repair_flow_id}-parent")],
+                }],
+                actor_principal: "operator:concurrent-writer".to_owned(),
+            })
+            .expect("concurrent repair should succeed");
+        assert!(!auditor
+            .record_invalid_flow_dependency_candidate(repair_flow_id, repair_initial_revision,)
+            .expect("audit should accept the repaired winner"));
+
+        let revision_flow_id = "audit-revision-wins";
+        let revision_initial = auditor
+            .get_flow(revision_flow_id)
+            .expect("flow lookup should succeed")
+            .expect("flow should exist")
+            .revision;
+        writer
+            .transition_flow(&FlowTransitionRequest {
+                flow_id: revision_flow_id.to_owned(),
+                expected_revision: Some(revision_initial),
+                state: "pending".to_owned(),
+                current_step_id: None,
+                lock_owner: None,
+                lock_expires_at_unix_ms: None,
+                completed_at_unix_ms: None,
+                actor_principal: "system:concurrent-writer".to_owned(),
+                event_type: "flow.concurrent_observation".to_owned(),
+                summary: "concurrent flow observation".to_owned(),
+                payload_json: "{}".to_owned(),
+            })
+            .expect("unrelated concurrent revision should succeed");
+        assert!(auditor
+            .record_invalid_flow_dependency_candidate(revision_flow_id, revision_initial)
+            .expect("audit should retry the unrelated revision"));
+        let quarantined = auditor
+            .get_flow(revision_flow_id)
+            .expect("flow lookup should succeed")
+            .expect("flow should exist");
+        assert_eq!(quarantined.state, "blocked");
+        assert_eq!(quarantined.revision, revision_initial + 2);
+    }
+
+    #[test]
+    fn flow_dependency_quarantine_is_idempotent_and_preserves_execution_state() {
+        let db_path = temp_db_path();
+        let current_revision;
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let flow = store
+                .create_flow(&flow_create_request("quarantine", r#"["parent"]"#))
+                .expect("valid flow should be created");
+            store
+                .update_flow_step(&FlowStepUpdateRequest {
+                    flow_id: flow.flow_id,
+                    step_id: "child".to_owned(),
+                    state: Some("retrying".to_owned()),
+                    increment_attempt_count: true,
+                    output_json: Some(Some(r#"{"partial":true}"#.to_owned())),
+                    lineage_json: Some(r#"{"external_task_id":"task-1"}"#.to_owned()),
+                    not_before_unix_ms: Some(Some(99)),
+                    waiting_reason: Some(Some("retry_backoff".to_owned())),
+                    last_error: Some(Some("transient failure".to_owned())),
+                    started_at_unix_ms: Some(Some(7)),
+                    completed_at_unix_ms: Some(None),
+                    actor_principal: "system:test".to_owned(),
+                    event_type: "flow.step.retrying".to_owned(),
+                    summary: "retry scheduled".to_owned(),
+                    payload_json: "{}".to_owned(),
+                })
+                .expect("retry state should be stored");
+            current_revision =
+                store.get_flow("quarantine").expect("flow lookup should succeed").unwrap().revision;
+        }
+        let raw = r#"{"secret":"secret_should_not_appear"}"#;
+        inject_flow_dependency_json(db_path.as_path(), "quarantine", &[("child", raw)]);
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let step_before = store
+            .get_flow_step("quarantine", "child")
+            .expect("step lookup should succeed")
+            .expect("child step should exist");
+
+        let quarantined = store
+            .quarantine_invalid_flow_dependencies(&FlowDependenciesQuarantineRequest {
+                flow_id: "quarantine".to_owned(),
+                expected_revision: current_revision,
+                actor_principal: "system:test".to_owned(),
+            })
+            .expect("invalid graph should quarantine")
+            .expect("first quarantine should mutate");
+        assert_eq!(quarantined.state, "blocked");
+        assert_eq!(quarantined.revision, current_revision + 1);
+        let step_after = store
+            .get_flow_step("quarantine", "child")
+            .expect("step lookup should succeed")
+            .expect("child step should exist");
+        assert_eq!(step_after, step_before);
+
+        let events_before = store.list_flow_events("quarantine", 32).expect("events should load");
+        let invalid_events = events_before
+            .iter()
+            .filter(|event| event.event_type == "flow.dependencies_invalid")
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_events.len(), 1);
+        assert!(!invalid_events[0].payload_json.contains("secret_should_not_appear"));
+        assert!(store
+            .quarantine_invalid_flow_dependencies(&FlowDependenciesQuarantineRequest {
+                flow_id: "quarantine".to_owned(),
+                expected_revision: quarantined.revision,
+                actor_principal: "system:test".to_owned(),
+            })
+            .expect("repeat quarantine should be a no-op")
+            .is_none());
+        let unchanged = store.get_flow("quarantine").expect("flow lookup should succeed").unwrap();
+        assert_eq!(unchanged.revision, quarantined.revision);
+        assert_eq!(
+            store.list_flow_events("quarantine", 32).expect("events should load").len(),
+            events_before.len()
+        );
+    }
+
+    #[test]
+    fn flow_dependency_batch_repair_is_cas_guarded_and_atomic() {
+        let db_path = temp_db_path();
+        let current_revision;
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let mut request = flow_create_request("repair", r#"["parent"]"#);
+            request.steps.push(flow_step_create_request("sibling", 2, "[]"));
+            store.create_flow(&request).expect("valid flow should be created");
+            store
+                .update_flow_step(&FlowStepUpdateRequest {
+                    flow_id: "repair".to_owned(),
+                    step_id: "child".to_owned(),
+                    state: Some("retrying".to_owned()),
+                    increment_attempt_count: true,
+                    output_json: None,
+                    lineage_json: None,
+                    not_before_unix_ms: Some(Some(42)),
+                    waiting_reason: Some(Some("retry_backoff".to_owned())),
+                    last_error: Some(Some("transient failure".to_owned())),
+                    started_at_unix_ms: Some(Some(11)),
+                    completed_at_unix_ms: None,
+                    actor_principal: "system:test".to_owned(),
+                    event_type: "flow.step.retrying".to_owned(),
+                    summary: "retry scheduled".to_owned(),
+                    payload_json: "{}".to_owned(),
+                })
+                .expect("retry state should be stored");
+            current_revision =
+                store.get_flow("repair").expect("flow lookup should succeed").unwrap().revision;
+        }
+        inject_flow_dependency_json(
+            db_path.as_path(),
+            "repair",
+            &[("child", "{"), ("sibling", "{")],
+        );
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let quarantined = store
+            .quarantine_invalid_flow_dependencies(&FlowDependenciesQuarantineRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: current_revision,
+                actor_principal: "system:test".to_owned(),
+            })
+            .expect("invalid graph should quarantine")
+            .expect("first quarantine should mutate");
+        let child_before = store
+            .get_flow_step("repair", "child")
+            .expect("step lookup should succeed")
+            .expect("child should exist");
+
+        let missing_error = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: "missing".to_owned(),
+                    depends_on_step_ids: Vec::new(),
+                }],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect_err("repair should distinguish a missing target step");
+        assert!(matches!(missing_error, JournalError::FlowStepNotFound { .. }));
+
+        let unaffected_error = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: "parent".to_owned(),
+                    depends_on_step_ids: Vec::new(),
+                }],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect_err("repair must not edit an unaffected valid edge");
+        assert!(matches!(unaffected_error, JournalError::InvalidArgument(_)));
+
+        let partial_error = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: "child".to_owned(),
+                    depends_on_step_ids: vec!["parent".to_owned()],
+                }],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect_err("partial repair must not persist an invalid graph");
+        assert!(matches!(partial_error, JournalError::InvalidFlowDependencies { .. }));
+        assert_eq!(
+            store
+                .get_flow_step("repair", "child")
+                .expect("step lookup should succeed")
+                .expect("child should exist")
+                .depends_on_step_ids_json,
+            "{"
+        );
+
+        let repaired = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: quarantined.revision,
+                replacements: vec![
+                    FlowStepDependenciesReplacement {
+                        step_id: "child".to_owned(),
+                        depends_on_step_ids: vec!["parent".to_owned()],
+                    },
+                    FlowStepDependenciesReplacement {
+                        step_id: "sibling".to_owned(),
+                        depends_on_step_ids: Vec::new(),
+                    },
+                ],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect("complete batch repair should succeed");
+        assert_eq!(repaired.revision, quarantined.revision + 1);
+        let child_after = store
+            .get_flow_step("repair", "child")
+            .expect("step lookup should succeed")
+            .expect("child should exist");
+        assert_eq!(child_after.state, child_before.state);
+        assert_eq!(child_after.attempt_count, child_before.attempt_count);
+        assert_eq!(child_after.not_before_unix_ms, child_before.not_before_unix_ms);
+        assert_eq!(child_after.waiting_reason, child_before.waiting_reason);
+        assert_eq!(child_after.last_error, child_before.last_error);
+        assert_eq!(child_after.started_at_unix_ms, child_before.started_at_unix_ms);
+        assert_eq!(child_after.completed_at_unix_ms, child_before.completed_at_unix_ms);
+
+        let stale_quarantine = store
+            .quarantine_invalid_flow_dependencies(&FlowDependenciesQuarantineRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: quarantined.revision,
+                actor_principal: "system:test".to_owned(),
+            })
+            .expect_err("stale quarantine must lose to completed repair");
+        assert!(matches!(stale_quarantine, JournalError::FlowRevisionConflict { .. }));
+        let valid_graph_error = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair".to_owned(),
+                expected_revision: repaired.revision,
+                replacements: vec![FlowStepDependenciesReplacement {
+                    step_id: "child".to_owned(),
+                    depends_on_step_ids: Vec::new(),
+                }],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect_err("repair must not become a general valid-DAG editor");
+        assert!(matches!(valid_graph_error, JournalError::InvalidArgument(_)));
+
+        let events = store.list_flow_events("repair", 32).expect("events should load");
+        assert_eq!(
+            events.iter().filter(|event| event.event_type == "flow.dependencies_invalid").count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.event_type == "flow.dependencies_repaired").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn flow_dependency_batch_repair_handles_mixed_corruption() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let mut request = flow_create_request("repair-mixed", r#"["parent"]"#);
+            request.steps.push(flow_step_create_request("cycle-a", 2, "[]"));
+            request.steps.push(flow_step_create_request("cycle-b", 3, "[]"));
+            store.create_flow(&request).expect("valid flow should be created");
+        }
+        inject_flow_dependency_json(
+            db_path.as_path(),
+            "repair-mixed",
+            &[("child", "{"), ("cycle-a", r#"["cycle-b"]"#), ("cycle-b", r#"["cycle-a"]"#)],
+        );
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let revision = store
+            .get_flow("repair-mixed")
+            .expect("flow lookup should succeed")
+            .expect("flow should exist")
+            .revision;
+
+        store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair-mixed".to_owned(),
+                expected_revision: revision,
+                replacements: vec![
+                    FlowStepDependenciesReplacement {
+                        step_id: "child".to_owned(),
+                        depends_on_step_ids: vec!["parent".to_owned()],
+                    },
+                    FlowStepDependenciesReplacement {
+                        step_id: "cycle-a".to_owned(),
+                        depends_on_step_ids: Vec::new(),
+                    },
+                ],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect("one batch should repair parse and cycle failures together");
+        let steps =
+            store.list_flow_steps("repair-mixed").expect("repaired steps should remain readable");
+        crate::domain::flow_dependencies::validate_flow_dependency_graph(steps.iter().map(
+            |step| crate::domain::flow_dependencies::FlowDependencyNode {
+                step_id: step.step_id.as_str(),
+                dependencies_json: step.depends_on_step_ids_json.as_str(),
+            },
+        ))
+        .expect("mixed repair should leave a valid graph");
+    }
+
+    #[test]
+    fn flow_dependency_batch_repair_rolls_back_mid_write_failure() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            let mut request = flow_create_request("repair-rollback", r#"["parent"]"#);
+            request.steps.push(flow_step_create_request("sibling", 2, "[]"));
+            store.create_flow(&request).expect("valid flow should be created");
+        }
+        inject_flow_dependency_json(
+            db_path.as_path(),
+            "repair-rollback",
+            &[("child", "{"), ("sibling", "{")],
+        );
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute_batch(
+                r#"
+                    CREATE TRIGGER fail_second_dependency_repair
+                    BEFORE UPDATE OF depends_on_step_ids_json ON flow_steps
+                    WHEN NEW.step_ulid = 'sibling'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected dependency repair failure');
+                    END;
+                "#,
+            )
+            .expect("test failure trigger should be installed");
+        drop(connection);
+        let store = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let revision_before = store
+            .get_flow("repair-rollback")
+            .expect("flow lookup should succeed")
+            .expect("flow should exist")
+            .revision;
+
+        let error = store
+            .repair_flow_dependencies(&FlowDependenciesRepairRequest {
+                flow_id: "repair-rollback".to_owned(),
+                expected_revision: revision_before,
+                replacements: vec![
+                    FlowStepDependenciesReplacement {
+                        step_id: "child".to_owned(),
+                        depends_on_step_ids: vec!["parent".to_owned()],
+                    },
+                    FlowStepDependenciesReplacement {
+                        step_id: "sibling".to_owned(),
+                        depends_on_step_ids: Vec::new(),
+                    },
+                ],
+                actor_principal: "operator:test".to_owned(),
+            })
+            .expect_err("injected second-row failure must abort the whole batch");
+        assert!(matches!(error, JournalError::Sqlite(_)));
+        for step_id in ["child", "sibling"] {
+            let step = store
+                .get_flow_step("repair-rollback", step_id)
+                .expect("step lookup should succeed")
+                .expect("step should exist");
+            assert_eq!(step.depends_on_step_ids_json, "{");
+        }
+        let flow = store
+            .get_flow("repair-rollback")
+            .expect("flow lookup should succeed")
+            .expect("flow should exist");
+        assert_eq!(flow.revision, revision_before);
+        assert!(!store
+            .list_flow_events("repair-rollback", 32)
+            .expect("events should load")
+            .iter()
+            .any(|event| event.event_type == "flow.dependencies_repaired"));
+    }
+
+    #[test]
+    fn corrupt_dependency_payload_remains_fail_closed_after_reopen() {
+        let db_path = temp_db_path();
+        {
+            let store = JournalStore::open(test_journal_config(db_path.clone(), false))
+                .expect("journal store should open");
+            store
+                .create_flow(&flow_create_request("restart", r#"["parent"]"#))
+                .expect("valid flow should be created");
+        }
+        let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+        connection
+            .execute(
+                "UPDATE flow_steps SET depends_on_step_ids_json = '{' WHERE flow_ulid = 'restart' AND step_ulid = 'child'",
+                [],
+            )
+            .expect("test should inject legacy corruption");
+        drop(connection);
+
+        let reopened = JournalStore::open(test_journal_config(db_path, false))
+            .expect("journal store should reopen");
+        let steps = reopened.list_flow_steps("restart").expect("steps should remain inspectable");
+        let report = crate::domain::flow_dependencies::validate_flow_dependency_graph(
+            steps.iter().map(|step| crate::domain::flow_dependencies::FlowDependencyNode {
+                step_id: step.step_id.as_str(),
+                dependencies_json: step.depends_on_step_ids_json.as_str(),
+            }),
+        )
+        .expect_err("reloaded corrupt dependency graph must fail closed");
+        assert_eq!(report.primary_issue().reason_code().as_str(), "malformed_dependency_json");
     }
 
     #[test]

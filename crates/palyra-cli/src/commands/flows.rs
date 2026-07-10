@@ -1,15 +1,21 @@
 //! Flow orchestration commands over the daemon console API: list, show,
-//! pause/resume/cancel, and per-step retry/skip/compensate actions.
+//! pause/resume/cancel, per-step retry/skip/compensate, and graph repair.
 //!
 //! Payloads stay as raw JSON values so the CLI tolerates console schema
 //! additions; the fetch helpers are shared with other command surfaces.
 
+use anyhow::{bail, Context};
 use palyra_control_plane as control_plane;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cli::{FlowStateArg, FlowsCommand};
 use crate::commands::routines::{json_optional_string_at, json_value_at};
 use crate::*;
+
+// The daemon reserves a 2 MiB route budget, leaving room for the JSON envelope
+// after this replacement array is parsed and serialized again.
+const MAX_FLOW_DEPENDENCY_REPAIR_FILE_BYTES: u64 = 1_048_576;
 
 /// Runs a `palyra flows` subcommand on a fresh Tokio runtime.
 ///
@@ -71,6 +77,22 @@ pub(crate) async fn run_flows_async(command: FlowsCommand) -> Result<()> {
             )
             .await?;
             emit_flow_envelope("flows.compensate_step", &payload, output::preferred_json(json))
+        }
+        FlowsCommand::RepairDependencies {
+            id,
+            expected_revision,
+            replacements_json_file,
+            json,
+        } => {
+            let replacements = read_dependency_replacements(replacements_json_file.as_path())?;
+            let payload = repair_dependencies_value(
+                &context.client,
+                id.as_str(),
+                expected_revision,
+                replacements,
+            )
+            .await?;
+            emit_flow_envelope("flows.repair_dependencies", &payload, output::preferred_json(json))
         }
     }
 }
@@ -159,6 +181,58 @@ pub(crate) async fn step_action_value(
         )
         .await
         .map_err(Into::into)
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FlowDependencyReplacementInput {
+    step_id: String,
+    depends_on_step_ids: Vec<String>,
+}
+
+/// Replaces affected dependency lists using the caller's observed flow revision.
+///
+/// # Errors
+/// Fails when the console request fails, the revision is stale, or the proposed graph is invalid.
+async fn repair_dependencies_value(
+    client: &control_plane::ControlPlaneClient,
+    flow_id: &str,
+    expected_revision: i64,
+    replacements: Vec<FlowDependencyReplacementInput>,
+) -> Result<Value> {
+    client
+        .post_json_value(
+            format!("console/v1/flows/{}/dependencies/repair", percent_encode_component(flow_id)),
+            &json!({
+                "expected_revision": expected_revision,
+                "replacements": replacements,
+            }),
+        )
+        .await
+        .map_err(Into::into)
+}
+
+fn read_dependency_replacements(
+    path: &std::path::Path,
+) -> Result<Vec<FlowDependencyReplacementInput>> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect dependency repairs at {}", path.display()))?;
+    if metadata.len() > MAX_FLOW_DEPENDENCY_REPAIR_FILE_BYTES {
+        bail!("dependency repairs file exceeds {} bytes", MAX_FLOW_DEPENDENCY_REPAIR_FILE_BYTES);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read dependency repairs from {}", path.display()))?;
+    let replacements = serde_json::from_str::<Vec<FlowDependencyReplacementInput>>(raw.as_str())
+        .with_context(|| {
+            format!(
+                "dependency repairs in {} must be a JSON array of step replacements",
+                path.display()
+            )
+        })?;
+    if replacements.is_empty() {
+        bail!("dependency repairs file must contain at least one replacement");
+    }
+    Ok(replacements)
 }
 
 fn emit_flows_list(payload: &Value, json: bool) -> Result<()> {

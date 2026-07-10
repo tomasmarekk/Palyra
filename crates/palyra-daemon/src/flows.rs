@@ -25,12 +25,17 @@ use crate::{
         merge_delivery_progress_updates, DeliveryProgressUpdate, DeliverySurface,
         MergedDeliveryProgress,
     },
+    domain::flow_dependencies::{
+        parse_flow_dependency_ids, validate_flow_dependency_graph, FlowDependencyGate,
+        FlowDependencyNode, FlowDependencyReasonCode, FlowDependencyValidationReport,
+        ValidatedFlowDependencyGraph,
+    },
     gateway::GatewayRuntimeState,
     journal::{
-        ApprovalDecision, FlowBundleRecord, FlowCreateRequest, FlowListFilter, FlowRecord,
-        FlowStepCreateRequest, FlowStepRecord, FlowStepUpdateRequest, FlowTransitionRequest,
-        OrchestratorBackgroundTaskCreateRequest, OrchestratorBackgroundTaskUpdateRequest,
-        OrchestratorCancelRequest,
+        ApprovalDecision, FlowBundleRecord, FlowCreateRequest, FlowDependenciesQuarantineRequest,
+        FlowRecord, FlowStepCreateRequest, FlowStepRecord, FlowStepUpdateRequest,
+        FlowTransitionRequest, OrchestratorBackgroundTaskCreateRequest,
+        OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
     },
 };
 
@@ -126,7 +131,7 @@ pub(crate) struct FlowAdapterContract {
 pub(crate) struct FlowCoordinator;
 
 impl FlowCoordinator {
-    /// Reconciles every non-terminal flow once; no-op when flow orchestration is disabled.
+    /// Reconciles the next bounded, fair batch of eligible flows.
     ///
     /// # Errors
     ///
@@ -137,16 +142,7 @@ impl FlowCoordinator {
             return Ok(());
         }
 
-        let flows = runtime
-            .list_flows(FlowListFilter {
-                owner_principal: None,
-                device_id: None,
-                channel: None,
-                state: None,
-                include_terminal: false,
-                limit: FLOW_COORDINATOR_LIMIT,
-            })
-            .await?;
+        let flows = runtime.list_flows_for_reconciliation(FLOW_COORDINATOR_LIMIT).await?;
         for flow in flows {
             Self::reconcile_flow(runtime, &flow).await?;
         }
@@ -260,6 +256,23 @@ impl FlowCoordinator {
                     payload_json: json!({ "source": "flow_coordinator" }).to_string(),
                 })
                 .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn drive_cancel_requested_flow_and_audit(
+        runtime: &Arc<GatewayRuntimeState>,
+        bundle: &FlowBundleRecord,
+    ) -> Result<(), Status> {
+        Self::drive_cancel_requested_flow(runtime, bundle).await?;
+        let Some(latest) =
+            runtime.get_flow_bundle(bundle.flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
+        else {
+            return Ok(());
+        };
+        if validated_dependency_graph(latest.steps.as_slice()).is_err() {
+            Self::quarantine_invalid_dependencies(runtime, &latest).await?;
         }
         Ok(())
     }
@@ -402,21 +415,52 @@ impl FlowCoordinator {
             return Ok(());
         }
         if matches!(state, Some(FlowState::CancelRequested)) {
-            Self::drive_cancel_requested_flow(runtime, &bundle).await?;
+            Self::drive_cancel_requested_flow_and_audit(runtime, &bundle).await?;
             return Ok(());
         }
+
+        let dependency_graph = match validated_dependency_graph(bundle.steps.as_slice()) {
+            Ok(graph) => graph,
+            Err(_) => {
+                Self::quarantine_invalid_dependencies(runtime, &bundle).await?;
+                return Ok(());
+            }
+        };
 
         let Some(leased_flow) = Self::acquire_flow_lease(runtime, &bundle.flow).await? else {
             return Ok(());
         };
-        let Some(bundle) =
+        let Some(leased_bundle) =
             runtime.get_flow_bundle(leased_flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
         else {
             return Ok(());
         };
+        let leased_state = FlowState::from_str(leased_bundle.flow.state.as_str());
+        if leased_state.is_some_and(FlowState::is_terminal)
+            || matches!(leased_state, Some(FlowState::Paused))
+        {
+            return Ok(());
+        }
+        if matches!(leased_state, Some(FlowState::CancelRequested)) {
+            Self::drive_cancel_requested_flow_and_audit(runtime, &leased_bundle).await?;
+            return Ok(());
+        }
+        let dependency_graph = match dependency_graph_for_reloaded_snapshot(
+            bundle.steps.as_slice(),
+            leased_bundle.steps.as_slice(),
+            dependency_graph,
+        ) {
+            Ok(graph) => graph,
+            Err(_) => {
+                Self::quarantine_invalid_dependencies(runtime, &leased_bundle).await?;
+                return Ok(());
+            }
+        };
 
-        for step in &bundle.steps {
-            if let Some(next_state) = Self::sync_external_step(runtime, &bundle.flow, step).await? {
+        for step in &leased_bundle.steps {
+            if let Some(next_state) =
+                Self::sync_external_step(runtime, &leased_bundle.flow, step).await?
+            {
                 if next_state.is_terminal() {
                     continue;
                 }
@@ -429,6 +473,27 @@ impl FlowCoordinator {
         let Some(updated) = runtime.get_flow_bundle(flow.flow_id.clone(), FLOW_EVENT_LIMIT).await?
         else {
             return Ok(());
+        };
+        let updated_state = FlowState::from_str(updated.flow.state.as_str());
+        if updated_state.is_some_and(FlowState::is_terminal)
+            || matches!(updated_state, Some(FlowState::Paused))
+        {
+            return Ok(());
+        }
+        if matches!(updated_state, Some(FlowState::CancelRequested)) {
+            Self::drive_cancel_requested_flow_and_audit(runtime, &updated).await?;
+            return Ok(());
+        }
+        let dependency_graph = match dependency_graph_for_reloaded_snapshot(
+            leased_bundle.steps.as_slice(),
+            updated.steps.as_slice(),
+            dependency_graph,
+        ) {
+            Ok(graph) => graph,
+            Err(_) => {
+                Self::quarantine_invalid_dependencies(runtime, &updated).await?;
+                return Ok(());
+            }
         };
         let next_flow_state = derive_flow_state(updated.steps.as_slice());
         if Some(next_flow_state) != FlowState::from_str(updated.flow.state.as_str()) {
@@ -460,12 +525,54 @@ impl FlowCoordinator {
         else {
             return Ok(());
         };
+        let latest_state = FlowState::from_str(latest.flow.state.as_str());
+        if latest_state.is_some_and(FlowState::is_terminal)
+            || matches!(latest_state, Some(FlowState::Paused))
+        {
+            return Ok(());
+        }
+        if matches!(latest_state, Some(FlowState::CancelRequested)) {
+            Self::drive_cancel_requested_flow_and_audit(runtime, &latest).await?;
+            return Ok(());
+        }
+        let dependency_graph = match dependency_graph_for_reloaded_snapshot(
+            updated.steps.as_slice(),
+            latest.steps.as_slice(),
+            dependency_graph,
+        ) {
+            Ok(graph) => graph,
+            Err(_) => {
+                Self::quarantine_invalid_dependencies(runtime, &latest).await?;
+                return Ok(());
+            }
+        };
         if !has_active_step(latest.steps.as_slice()) {
-            if let Some(step) = next_dispatchable_step(latest.steps.as_slice()) {
+            if let Some(step) =
+                next_dispatchable_step_with_graph(latest.steps.as_slice(), &dependency_graph)
+            {
                 Self::dispatch_step(runtime, &latest.flow, step).await?;
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn quarantine_invalid_dependencies(
+        runtime: &Arc<GatewayRuntimeState>,
+        bundle: &FlowBundleRecord,
+    ) -> Result<(), Status> {
+        match runtime
+            .quarantine_invalid_flow_dependencies(FlowDependenciesQuarantineRequest {
+                flow_id: bundle.flow.flow_id.clone(),
+                expected_revision: bundle.flow.revision,
+                actor_principal: FLOW_COORDINATOR_ACTOR.to_owned(),
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::Aborted => Ok(()),
+            Err(status) => Err(status),
+        }
     }
 
     /// Mirrors the state of a step's external lineage (background task, child run, or approval)
@@ -1106,33 +1213,101 @@ fn has_active_step(steps: &[FlowStepRecord]) -> bool {
     })
 }
 
-fn next_dispatchable_step(steps: &[FlowStepRecord]) -> Option<&FlowStepRecord> {
+#[cfg(test)]
+fn next_dispatchable_step(
+    steps: &[FlowStepRecord],
+) -> Result<Option<&FlowStepRecord>, FlowDependencyValidationReport> {
+    let graph = validated_dependency_graph(steps)?;
+    Ok(next_dispatchable_step_with_graph(steps, &graph))
+}
+
+fn next_dispatchable_step_with_graph<'a>(
+    steps: &'a [FlowStepRecord],
+    graph: &ValidatedFlowDependencyGraph,
+) -> Option<&'a FlowStepRecord> {
     let now = crate::gateway::current_unix_ms();
     steps.iter().find(|step| {
         matches!(
             FlowStepState::from_str(step.state.as_str()),
             Some(FlowStepState::Pending | FlowStepState::Ready | FlowStepState::Retrying)
         ) && step.not_before_unix_ms.is_none_or(|not_before| not_before <= now)
-            && dependencies_satisfied(steps, step)
+            && matches!(
+                graph.gate_for(step.step_id.as_str(), |dependency_id| {
+                    steps
+                        .iter()
+                        .find(|candidate| candidate.step_id == dependency_id)
+                        .and_then(|candidate| FlowStepState::from_str(candidate.state.as_str()))
+                }),
+                Some(FlowDependencyGate::Satisfied)
+            )
     })
 }
 
-fn dependencies_satisfied(steps: &[FlowStepRecord], step: &FlowStepRecord) -> bool {
-    // Malformed dependency JSON degrades to "no dependencies" (fail-open); the field is only
-    // ever written by build_flow_step, which serializes a plain string list.
-    let dependencies = serde_json::from_str::<Vec<String>>(step.depends_on_step_ids_json.as_str())
-        .unwrap_or_default();
-    dependencies.iter().all(|dependency_id| {
-        steps
-            .iter()
-            .find(|candidate| candidate.step_id == *dependency_id)
-            .and_then(|candidate| FlowStepState::from_str(candidate.state.as_str()))
-            .is_some_and(|state| {
-                matches!(
-                    state,
-                    FlowStepState::Succeeded | FlowStepState::Skipped | FlowStepState::Compensated
-                )
-            })
+fn validated_dependency_graph(
+    steps: &[FlowStepRecord],
+) -> Result<ValidatedFlowDependencyGraph, FlowDependencyValidationReport> {
+    validate_flow_dependency_graph(steps.iter().map(|step| FlowDependencyNode {
+        step_id: step.step_id.as_str(),
+        dependencies_json: step.depends_on_step_ids_json.as_str(),
+    }))
+}
+
+fn dependency_graph_for_reloaded_snapshot(
+    previous_steps: &[FlowStepRecord],
+    reloaded_steps: &[FlowStepRecord],
+    previous_graph: ValidatedFlowDependencyGraph,
+) -> Result<ValidatedFlowDependencyGraph, FlowDependencyValidationReport> {
+    if flow_dependency_snapshots_match(previous_steps, reloaded_steps) {
+        Ok(previous_graph)
+    } else {
+        validated_dependency_graph(reloaded_steps)
+    }
+}
+
+fn flow_dependency_snapshots_match(
+    previous_steps: &[FlowStepRecord],
+    reloaded_steps: &[FlowStepRecord],
+) -> bool {
+    previous_steps.len() == reloaded_steps.len()
+        && previous_steps.iter().zip(reloaded_steps).all(|(previous, reloaded)| {
+            previous.step_id == reloaded.step_id
+                && previous.depends_on_step_ids_json == reloaded.depends_on_step_ids_json
+        })
+}
+
+/// Builds the redacted dependency validation projection used by console and runtime diagnostics.
+pub(crate) fn flow_dependency_validation_diagnostics(steps: &[FlowStepRecord]) -> Value {
+    match validated_dependency_graph(steps) {
+        Ok(graph) => graph.diagnostic_value(),
+        Err(report) => report.diagnostic_value(),
+    }
+}
+
+/// Builds dependency-list projections that hide ids for every affected or invalid step.
+pub(crate) fn flow_step_dependency_views(
+    steps: &[FlowStepRecord],
+) -> std::collections::BTreeMap<String, Value> {
+    let invalid_report = validated_dependency_graph(steps).err();
+    steps
+        .iter()
+        .map(|step| {
+            let reason_code = invalid_report
+                .as_ref()
+                .and_then(|report| report.reason_code_for_step(step.step_id.as_str()));
+            let view = match reason_code {
+                Some(reason_code) => invalid_dependency_view(reason_code),
+                None => parse_flow_dependency_ids(step.depends_on_step_ids_json.as_str())
+                    .map_or_else(invalid_dependency_view, |dependency_ids| json!(dependency_ids)),
+            };
+            (step.step_id.clone(), view)
+        })
+        .collect()
+}
+
+fn invalid_dependency_view(reason_code: FlowDependencyReasonCode) -> Value {
+    json!({
+        "valid": false,
+        "reason_code": reason_code.as_str(),
     })
 }
 
@@ -1367,6 +1542,8 @@ async fn update_step_to_external_terminal(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn step(id: &str, state: FlowStepState) -> FlowStepRecord {
@@ -1439,14 +1616,59 @@ mod tests {
     fn dependency_gate_requires_terminal_success_like_state() {
         let mut dependent = step("two", FlowStepState::Pending);
         dependent.depends_on_step_ids_json = json!(["one"]).to_string();
-        assert!(dependencies_satisfied(
-            &[step("one", FlowStepState::Succeeded), dependent.clone()],
-            &dependent
-        ));
-        assert!(!dependencies_satisfied(
-            &[step("one", FlowStepState::Failed), dependent.clone()],
-            &dependent
-        ));
+        for state in [FlowStepState::Succeeded, FlowStepState::Skipped, FlowStepState::Compensated]
+        {
+            let steps = [step("one", state), dependent.clone()];
+            assert_eq!(
+                next_dispatchable_step(&steps)
+                    .expect("valid graph should evaluate")
+                    .map(|step| step.step_id.as_str()),
+                Some("two")
+            );
+        }
+        for state in [FlowStepState::Failed, FlowStepState::Cancelled, FlowStepState::TimedOut] {
+            let steps = [step("one", state), dependent.clone()];
+            assert!(next_dispatchable_step(&steps).expect("valid graph should evaluate").is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_dependency_graph_blocks_all_dispatch() {
+        let mut invalid = step("invalid", FlowStepState::Pending);
+        invalid.depends_on_step_ids_json = "{".to_owned();
+        let independent = step("independent", FlowStepState::Pending);
+
+        let report = next_dispatchable_step(&[invalid, independent])
+            .expect_err("graph-wide corruption must prevent later dispatch");
+
+        assert_eq!(report.primary_issue().reason_code().as_str(), "malformed_dependency_json");
+    }
+
+    #[test]
+    fn invalid_dependency_projection_never_reflects_unknown_ids() {
+        let marker = "api_key=secret_should_not_appear";
+        let mut invalid = step("child", FlowStepState::Pending);
+        invalid.depends_on_step_ids_json =
+            serde_json::to_string(&vec![marker]).expect("fixture should serialize");
+
+        let views = flow_step_dependency_views(&[invalid]);
+        let child = views.get("child").expect("child projection should exist");
+
+        assert_eq!(child["valid"], false);
+        assert_eq!(child["reason_code"], "unknown_dependency");
+        assert!(!child.to_string().contains(marker));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_invalid_dependency_payload_never_dispatches(raw in ".*") {
+            prop_assume!(serde_json::from_str::<Vec<String>>(raw.as_str()).is_err());
+            let mut invalid = step("invalid", FlowStepState::Pending);
+            invalid.depends_on_step_ids_json = raw;
+            let independent = step("independent", FlowStepState::Pending);
+
+            prop_assert!(next_dispatchable_step(&[invalid, independent]).is_err());
+        }
     }
 
     #[test]

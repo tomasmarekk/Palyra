@@ -1,20 +1,18 @@
-Inspect and control durable orchestration flows
+Atomically repair an invalid dependency graph from a JSON replacement batch
 
-Usage: palyra flows [OPTIONS] <COMMAND>
-
-Commands:
-  list
-  show
-  pause
-  resume
-  cancel
-  retry-step
-  skip-step
-  compensate-step
-  repair-dependencies  Atomically repair an invalid dependency graph from a JSON replacement batch
+Usage: palyra flows repair-dependencies [OPTIONS] --id <ID> --expected-revision <EXPECTED_REVISION> --replacements-json-file <PATH>
 
 Options:
-  -h, --help  Print help
+      --id <ID>
+
+      --expected-revision <EXPECTED_REVISION>
+
+      --replacements-json-file <PATH>
+          Read a JSON array of {step_id, depends_on_step_ids} replacements
+      --json
+
+  -h, --help
+          Print help
 
 Global Options:
       --profile <PROFILE>

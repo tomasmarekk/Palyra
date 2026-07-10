@@ -23,11 +23,13 @@ use std::io::{BufRead, BufReader};
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
 use palyra_common::{
     runtime_contracts::{
-        AuxiliaryTaskKind, AuxiliaryTaskState, FlowStepState, QueueMode, QueuedInputState,
+        AuxiliaryTaskKind, AuxiliaryTaskState, FlowState, FlowStepState, QueueMode,
+        QueuedInputState,
     },
     workspace_patch::WorkspacePatchRedactionPolicy,
 };
 use reqwest::Url;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use tokio::{
     net::TcpListener as TokioTcpListener,
@@ -41,11 +43,12 @@ use crate::journal::{
     ApprovalPromptOption, ApprovalPromptRecord, ApprovalResolveRequest, ApprovalRiskLevel,
     ApprovalSubjectType, CronConcurrencyPolicy, CronJobCreateRequest, CronJobUpdatePatch,
     CronMisfirePolicy, CronRetryPolicy, CronRunStartRequest, CronRunStatus, CronScheduleType,
+    FlowDependenciesRepairRequest, FlowStepDependenciesReplacement, FlowTransitionRequest,
     JournalAppendRequest, JournalConfig, JournalError, JournalStore, MemoryItemCreateRequest,
     MemoryItemLifecycleUpdateRequest, MemoryItemRecord, MemoryScoreBreakdown, MemorySearchHit,
     MemorySearchRequest, MemorySource, OrchestratorBackgroundTaskCreateRequest,
-    OrchestratorBackgroundTaskUpdateRequest, OrchestratorCancelRequest,
-    OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
+    OrchestratorBackgroundTaskListFilter, OrchestratorBackgroundTaskUpdateRequest,
+    OrchestratorCancelRequest, OrchestratorRunStartRequest, OrchestratorSessionResolveRequest,
     OrchestratorSessionUpsertRequest, OrchestratorTapeAppendRequest,
     SessionProjectContextStateUpsertRequest, ToolJobTailReadRequest, ToolJobsListFilter,
     WorkspaceDocumentWriteRequest,
@@ -1045,6 +1048,24 @@ fn build_test_runtime_state_with_tool_call_config_and_runtime_overrides(
 ) -> std::sync::Arc<GatewayRuntimeState> {
     let db_path = unique_temp_journal_path();
     let state_root = unique_temp_test_root("palyra-gateway-unit-state");
+    build_test_runtime_state_at(
+        db_path,
+        state_root,
+        hash_chain_enabled,
+        allow_private_targets,
+        feature_rollouts,
+        tool_call,
+    )
+}
+
+fn build_test_runtime_state_at(
+    db_path: PathBuf,
+    state_root: PathBuf,
+    hash_chain_enabled: bool,
+    allow_private_targets: bool,
+    feature_rollouts: crate::config::FeatureRolloutsConfig,
+    tool_call: crate::tool_protocol::ToolCallConfig,
+) -> std::sync::Arc<GatewayRuntimeState> {
     let agent_registry =
         crate::agents::AgentRegistry::open_for_test_state_root(state_root.as_path())
             .expect("agent registry should initialize");
@@ -11482,12 +11503,11 @@ fn workspace_patch_metrics_from_output_extracts_files_and_rollback() {
     assert_eq!(workspace_patch_metrics_from_output(b"{\"files_touched\":\"invalid\"}"), (0, false));
 }
 
-async fn create_completed_flow_background_task(
+async fn create_queued_flow_background_task(
     state: &std::sync::Arc<GatewayRuntimeState>,
     owner_principal: &str,
     device_id: &str,
     channel: Option<&str>,
-    result_json: Value,
 ) -> String {
     let task_id = Ulid::new().to_string();
     let session_id = Ulid::new().to_string();
@@ -11526,6 +11546,18 @@ async fn create_completed_flow_background_task(
         })
         .await
         .expect("background task should be created");
+    task_id
+}
+
+async fn create_completed_flow_background_task(
+    state: &std::sync::Arc<GatewayRuntimeState>,
+    owner_principal: &str,
+    device_id: &str,
+    channel: Option<&str>,
+    result_json: Value,
+) -> String {
+    let task_id =
+        create_queued_flow_background_task(state, owner_principal, device_id, channel).await;
     state
         .update_orchestrator_background_task(OrchestratorBackgroundTaskUpdateRequest {
             task_id: task_id.clone(),
@@ -11583,6 +11615,373 @@ async fn create_running_flow_for_background_task(
         .await
         .expect("flow should be created");
     flow.flow_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_flow_dependencies_fail_closed_after_runtime_restart() {
+    let db_path = unique_temp_journal_path();
+    let first_state = build_test_runtime_state_at(
+        db_path.clone(),
+        unique_temp_test_root("palyra-flow-restart-state"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let session_id = Ulid::new().to_string();
+    first_state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.clone(),
+            session_key: format!("flow-restart:{session_id}"),
+            session_label: Some("Flow dependency restart test".to_owned()),
+            principal: "principal:flow-restart".to_owned(),
+            device_id: "device:flow-restart".to_owned(),
+            channel: Some("test".to_owned()),
+        })
+        .expect("flow session should be created");
+    let invalid_step = flows::build_flow_step(
+        0,
+        "background_prompt",
+        "background_prompt",
+        "First background task".to_owned(),
+        json!({ "input_text": "first" }),
+        FlowLineage::default(),
+    );
+    let invalid_step_id = invalid_step.step_id.clone();
+    let independent_step = flows::build_flow_step(
+        1,
+        "background_prompt",
+        "background_prompt",
+        "Independent background task".to_owned(),
+        json!({ "input_text": "independent" }),
+        FlowLineage::default(),
+    );
+    let flow = first_state
+        .create_flow(flows::build_flow_create_request(FlowCreateDescriptor {
+            owner_principal: "principal:flow-restart".to_owned(),
+            device_id: "device:flow-restart".to_owned(),
+            channel: Some("test".to_owned()),
+            title: "Restart dependency quarantine".to_owned(),
+            summary: "Restart dependency quarantine".to_owned(),
+            mode: FlowMode::Managed,
+            session_id: Some(session_id),
+            origin_run_id: None,
+            steps: vec![invalid_step, independent_step],
+        }))
+        .await
+        .expect("valid flow should be created");
+    let flow_id = flow.flow_id;
+    drop(first_state);
+
+    let raw = r#"{"secret":"secret_should_not_appear"}"#;
+    let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+    connection
+        .execute(
+            r#"
+                UPDATE flow_steps
+                SET depends_on_step_ids_json = ?3
+                WHERE flow_ulid = ?1 AND step_ulid = ?2
+            "#,
+            params![flow_id, invalid_step_id, raw],
+        )
+        .expect("test should inject legacy corruption");
+    drop(connection);
+
+    let restarted = build_test_runtime_state_at(
+        db_path,
+        unique_temp_test_root("palyra-flow-restarted-state"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let startup_audit = restarted
+        .audit_flow_dependencies_on_startup()
+        .await
+        .expect("restart dependency audit should succeed");
+    assert_eq!(startup_audit.invalid_flow_count, 1);
+    assert_eq!(startup_audit.newly_recorded_invalid_count, 1);
+    FlowCoordinator::poll(&restarted).await.expect("restart reconciliation should succeed");
+    let quarantined = restarted
+        .get_flow_bundle(flow_id.clone(), 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("flow should exist");
+    assert_eq!(FlowState::from_str(quarantined.flow.state.as_str()), Some(FlowState::Blocked));
+    assert!(quarantined.steps.iter().all(|step| step.state == FlowStepState::Pending.as_str()));
+    let invalid_events = quarantined
+        .events
+        .iter()
+        .filter(|event| event.event_type == "flow.dependencies_invalid")
+        .collect::<Vec<_>>();
+    assert_eq!(invalid_events.len(), 1);
+    assert!(!invalid_events[0].payload_json.contains("secret_should_not_appear"));
+    let tasks = restarted
+        .list_orchestrator_background_tasks(OrchestratorBackgroundTaskListFilter {
+            owner_principal: Some("principal:flow-restart".to_owned()),
+            device_id: Some("device:flow-restart".to_owned()),
+            channel: Some("test".to_owned()),
+            session_id: None,
+            include_completed: true,
+            limit: 10,
+        })
+        .await
+        .expect("background tasks should list");
+    assert!(tasks.is_empty(), "corrupt graph must not dispatch any step");
+
+    FlowCoordinator::poll(&restarted)
+        .await
+        .expect("repeat quarantine reconciliation should succeed");
+    let unchanged = restarted
+        .get_flow_bundle(flow_id.clone(), 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("flow should exist");
+    assert_eq!(
+        unchanged
+            .events
+            .iter()
+            .filter(|event| event.event_type == "flow.dependencies_invalid")
+            .count(),
+        1
+    );
+
+    restarted
+        .repair_flow_dependencies(FlowDependenciesRepairRequest {
+            flow_id: flow_id.clone(),
+            expected_revision: unchanged.flow.revision,
+            replacements: vec![FlowStepDependenciesReplacement {
+                step_id: invalid_step_id,
+                depends_on_step_ids: Vec::new(),
+            }],
+            actor_principal: "principal:flow-restart".to_owned(),
+        })
+        .await
+        .expect("valid dependency repair should succeed");
+    FlowCoordinator::poll(&restarted).await.expect("repaired flow should reconcile");
+    let repaired = restarted
+        .get_flow_bundle(flow_id, 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("flow should exist");
+    assert_ne!(FlowState::from_str(repaired.flow.state.as_str()), Some(FlowState::Blocked));
+    assert!(repaired.events.iter().any(|event| event.event_type == "flow.step.dispatched"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_flow_dependencies_do_not_suppress_cancellation() {
+    let db_path = unique_temp_journal_path();
+    let owner_principal = "principal:flow-cancel-corrupt";
+    let device_id = "device:flow-cancel-corrupt";
+    let channel = Some("test");
+    let first_state = build_test_runtime_state_at(
+        db_path.clone(),
+        unique_temp_test_root("palyra-flow-cancel-corrupt"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let task_id =
+        create_queued_flow_background_task(&first_state, owner_principal, device_id, channel).await;
+    let session_id = Ulid::new().to_string();
+    first_state
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: session_id.clone(),
+            session_key: format!("flow-cancel-corrupt:{session_id}"),
+            session_label: Some("Corrupt flow cancellation test".to_owned()),
+            principal: owner_principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+        })
+        .expect("flow session should be created");
+    let mut external_step = flows::build_flow_step(
+        0,
+        "background_prompt",
+        "background_prompt",
+        "Cancel active background task".to_owned(),
+        json!({ "input_text": "cancel me" }),
+        FlowLineage { background_task_id: Some(task_id.clone()), ..FlowLineage::default() },
+    );
+    external_step.state = FlowStepState::Running.as_str().to_owned();
+    let external_step_id = external_step.step_id.clone();
+    let external_flow = first_state
+        .create_flow(flows::build_flow_create_request(FlowCreateDescriptor {
+            owner_principal: owner_principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+            title: "Corrupt external cancellation".to_owned(),
+            summary: "Corrupt external cancellation".to_owned(),
+            mode: FlowMode::Managed,
+            session_id: Some(session_id),
+            origin_run_id: None,
+            steps: vec![external_step],
+        }))
+        .await
+        .expect("external flow should be created");
+    first_state
+        .transition_flow(FlowTransitionRequest {
+            flow_id: external_flow.flow_id.clone(),
+            expected_revision: Some(external_flow.revision),
+            state: FlowState::CancelRequested.as_str().to_owned(),
+            current_step_id: Some(Some(external_step_id.clone())),
+            lock_owner: Some(None),
+            lock_expires_at_unix_ms: Some(None),
+            completed_at_unix_ms: None,
+            actor_principal: owner_principal.to_owned(),
+            event_type: "flow.cancel_requested".to_owned(),
+            summary: "operator requested cancellation".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("external flow cancellation should be requested");
+    drop(first_state);
+
+    let connection = Connection::open(db_path.clone()).expect("journal db should reopen");
+    connection
+        .execute(
+            r#"
+                UPDATE flow_steps
+                SET depends_on_step_ids_json = '{'
+                WHERE flow_ulid = ?1 AND step_ulid = ?2
+            "#,
+            params![external_flow.flow_id, external_step_id],
+        )
+        .expect("test should inject cancellation dependency corruption");
+    drop(connection);
+
+    let restarted = build_test_runtime_state_at(
+        db_path.clone(),
+        unique_temp_test_root("palyra-flow-cancel-corrupt-restarted"),
+        false,
+        false,
+        crate::config::FeatureRolloutsConfig::default(),
+        default_test_tool_call_config(),
+    );
+    let startup_audit = restarted
+        .audit_flow_dependencies_on_startup()
+        .await
+        .expect("startup dependency audit should succeed");
+    assert_eq!(startup_audit.invalid_flow_count, 1);
+    let audited = restarted
+        .get_flow_bundle(external_flow.flow_id.clone(), 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("external flow should exist");
+    assert_eq!(FlowState::from_str(audited.flow.state.as_str()), Some(FlowState::CancelRequested));
+
+    FlowCoordinator::poll(&restarted)
+        .await
+        .expect("corrupt cancellation reconciliation should succeed");
+    let task = restarted
+        .get_orchestrator_background_task(task_id)
+        .await
+        .expect("background task lookup should succeed")
+        .expect("background task should exist");
+    assert_eq!(task.state, AuxiliaryTaskState::CancelRequested.as_str());
+    let external_after = restarted
+        .get_flow_bundle(external_flow.flow_id, 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("external flow should exist");
+    assert_eq!(
+        FlowState::from_str(external_after.flow.state.as_str()),
+        Some(FlowState::CancelRequested)
+    );
+    assert_eq!(
+        external_after
+            .events
+            .iter()
+            .filter(|event| event.event_type == "flow.dependencies_invalid")
+            .count(),
+        1
+    );
+
+    let local_session_id = Ulid::new().to_string();
+    restarted
+        .journal_store
+        .upsert_orchestrator_session(&OrchestratorSessionUpsertRequest {
+            session_id: local_session_id.clone(),
+            session_key: format!("flow-cancel-local:{local_session_id}"),
+            session_label: Some("Local corrupt flow cancellation test".to_owned()),
+            principal: owner_principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+        })
+        .expect("local flow session should be created");
+    let local_step = flows::build_flow_step(
+        0,
+        "routine",
+        "routine",
+        "Cancel local step".to_owned(),
+        json!({}),
+        FlowLineage::default(),
+    );
+    let local_step_id = local_step.step_id.clone();
+    let local_flow = restarted
+        .create_flow(flows::build_flow_create_request(FlowCreateDescriptor {
+            owner_principal: owner_principal.to_owned(),
+            device_id: device_id.to_owned(),
+            channel: channel.map(str::to_owned),
+            title: "Corrupt local cancellation".to_owned(),
+            summary: "Corrupt local cancellation".to_owned(),
+            mode: FlowMode::Managed,
+            session_id: Some(local_session_id),
+            origin_run_id: None,
+            steps: vec![local_step],
+        }))
+        .await
+        .expect("local flow should be created");
+    restarted
+        .transition_flow(FlowTransitionRequest {
+            flow_id: local_flow.flow_id.clone(),
+            expected_revision: Some(local_flow.revision),
+            state: FlowState::CancelRequested.as_str().to_owned(),
+            current_step_id: Some(Some(local_step_id.clone())),
+            lock_owner: Some(None),
+            lock_expires_at_unix_ms: Some(None),
+            completed_at_unix_ms: None,
+            actor_principal: owner_principal.to_owned(),
+            event_type: "flow.cancel_requested".to_owned(),
+            summary: "operator requested cancellation".to_owned(),
+            payload_json: "{}".to_owned(),
+        })
+        .await
+        .expect("local flow cancellation should be requested");
+    let connection = Connection::open(db_path).expect("journal db should reopen");
+    connection
+        .execute(
+            r#"
+                UPDATE flow_steps
+                SET depends_on_step_ids_json = '{'
+                WHERE flow_ulid = ?1 AND step_ulid = ?2
+            "#,
+            params![local_flow.flow_id, local_step_id],
+        )
+        .expect("test should inject local cancellation dependency corruption");
+    drop(connection);
+
+    FlowCoordinator::poll(&restarted).await.expect("local corrupt cancellation should reconcile");
+    let local_after = restarted
+        .get_flow_bundle(local_flow.flow_id, 64)
+        .await
+        .expect("flow lookup should succeed")
+        .expect("local flow should exist");
+    assert_eq!(FlowState::from_str(local_after.flow.state.as_str()), Some(FlowState::Cancelled));
+    assert_eq!(
+        FlowStepState::from_str(local_after.steps[0].state.as_str()),
+        Some(FlowStepState::Cancelled)
+    );
+    assert_eq!(
+        local_after
+            .events
+            .iter()
+            .filter(|event| event.event_type == "flow.dependencies_invalid")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
