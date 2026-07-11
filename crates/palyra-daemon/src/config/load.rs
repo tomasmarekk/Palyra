@@ -1765,6 +1765,10 @@ pub fn load_config() -> Result<LoadedConfig> {
         model_provider.openai_base_url = parse_openai_base_url(openai_base_url.as_str())?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL)");
     }
+    if let Ok(anthropic_base_url) = env::var("PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL") {
+        model_provider.anthropic_base_url = parse_anthropic_base_url(anthropic_base_url.as_str())?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL)");
+    }
 
     if let Ok(allow_private_base_url) = env::var("PALYRA_MODEL_PROVIDER_ALLOW_PRIVATE_BASE_URL") {
         model_provider.allow_private_base_url = allow_private_base_url
@@ -1776,6 +1780,10 @@ pub fn load_config() -> Result<LoadedConfig> {
     if let Ok(openai_model) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_MODEL") {
         model_provider.openai_model = parse_openai_model(openai_model.as_str())?;
         source.push_str(" +env(PALYRA_MODEL_PROVIDER_OPENAI_MODEL)");
+    }
+    if let Ok(anthropic_model) = env::var("PALYRA_MODEL_PROVIDER_ANTHROPIC_MODEL") {
+        model_provider.anthropic_model = parse_anthropic_model(anthropic_model.as_str())?;
+        source.push_str(" +env(PALYRA_MODEL_PROVIDER_ANTHROPIC_MODEL)");
     }
     if let Ok(openai_embeddings_model) = env::var("PALYRA_MODEL_PROVIDER_OPENAI_EMBEDDINGS_MODEL") {
         model_provider.openai_embeddings_model =
@@ -7552,6 +7560,34 @@ state_dir = "browserd-state"
             !message.contains("openai model"),
             "anthropic errors should not mention openai model: {message}"
         );
+    }
+
+    #[test]
+    fn load_config_applies_anthropic_runtime_environment() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let root = tempfile::tempdir().expect("config root should exist");
+        let config_path = root.path().join("palyra.toml");
+        std::fs::write(config_path.as_path(), "version = 1\n")
+            .expect("minimal config should be written");
+        let _config = ScopedEnvVar::set(
+            "PALYRA_CONFIG",
+            config_path.to_str().expect("test path should be UTF-8"),
+        );
+        let _kind = ScopedEnvVar::set("PALYRA_MODEL_PROVIDER_KIND", "anthropic");
+        let _model =
+            ScopedEnvVar::set("PALYRA_MODEL_PROVIDER_ANTHROPIC_MODEL", "claude-test-model");
+        let _base_url = ScopedEnvVar::set(
+            "PALYRA_MODEL_PROVIDER_ANTHROPIC_BASE_URL",
+            "https://api.anthropic.com",
+        );
+        let _openai_model = ScopedEnvVar::unset("PALYRA_MODEL_PROVIDER_OPENAI_MODEL");
+        let _openai_base_url = ScopedEnvVar::unset("PALYRA_MODEL_PROVIDER_OPENAI_BASE_URL");
+
+        let loaded = load_config().expect("Anthropic runtime environment should load");
+
+        assert_eq!(loaded.model_provider.kind, ModelProviderKind::Anthropic);
+        assert_eq!(loaded.model_provider.anthropic_model, "claude-test-model");
+        assert_eq!(loaded.model_provider.anthropic_base_url, "https://api.anthropic.com");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 # This scorecard is the first real-runtime release baseline. The preserved
 # non-runtime predecessor lives in release_schema_preview.yaml and is exercised
 # with `palyra qa run-pack`, never counted as runtime qualification.
@@ -11,14 +11,23 @@ include_tags:
   - real_runtime
 allow_provider_modes:
   - mock
+  - recorded
 allow_runner_modes:
   - fixture
+  - record_replay
+allow_live_providers: false
+resume:
+  enabled: true
+  reuse_passed: true
+  rerun_failed: true
+  rerun_partial: true
 require_p0_green: true
 available_capabilities:
   - agent_run
   - qa_lab
   - approvals
   - provider_recovery
+  - record_replay
   - workspace_context
 capability_skips: []
 flaky_policy:
@@ -45,3 +54,7 @@ scorecard:
       label: Provider recovery
       areas: [provider]
       labels: [provider_recovery]
+    - id: replay
+      label: Record replay
+      areas: [replay]
+      labels: [record_replay]

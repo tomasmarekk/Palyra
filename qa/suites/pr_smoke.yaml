@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 id: pr_smoke
 mode: pr
 scenario_roots:
@@ -10,6 +10,12 @@ allow_provider_modes:
   - mock
 allow_runner_modes:
   - fixture
+allow_live_providers: false
+resume:
+  enabled: true
+  reuse_passed: true
+  rerun_failed: true
+  rerun_partial: true
 require_p0_green: true
 available_capabilities:
   - agent_run

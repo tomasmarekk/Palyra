@@ -59,4 +59,8 @@ tonic-prost-build.workspace = true
 reqwest.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Globalization", "Win32_System_Console"] }
+windows-sys = { workspace = true, features = [
+  "Win32_Globalization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+] }

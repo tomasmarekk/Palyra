@@ -1,14 +1,15 @@
-# Exercises exact text projection through the production daemon and journal path.
-# The evidence artifact remains separate from the bounded gate result descriptor.
-schema_version: 2
-id: real_runtime.text_exact
-title: Exact fixture text through the real runtime
-area: text
+# Replays a pre-redacted provider capture through the production daemon path.
+schema_version: 3
+id: real_runtime.record_replay_text
+title: Redacted provider replay through the real runtime
+area: replay
 mode:
-  runner: fixture
+  runner: record_replay
   deterministic: true
 runner:
-  provider_fixture: qa/fixtures/real_agent_runner.yaml
+  replay_fixture: qa/fixtures/record_replay/real_agent_runner_replay.yaml
+  fixture_redacted: true
+  raw_payload_storage: false
   workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
   policy_profile: qa_no_tools
 requires:
@@ -16,9 +17,10 @@ requires:
   capabilities:
     - agent_run
     - qa_lab
+    - record_replay
   tools: []
   fixtures:
-    - qa/fixtures/real_agent_runner.yaml
+    - qa/fixtures/record_replay/real_agent_runner_replay.yaml
     - qa/fixtures/sandbox_workspaces/repo_basic
 steps:
   - id: prompt
@@ -45,17 +47,16 @@ forbidden:
   artifacts: []
   claims: []
 artifacts:
-  - path: qa/reports/real_runtime/text_exact.evidence.json
+  - path: qa/reports/real_runtime/record_replay_text.evidence.json
     kind: evidence
     required: true
 maturity:
   labels:
     - p0
-    - release_smoke
     - real_runtime
     - nightly
     - deterministic
-    - text_only
+    - record_replay
 timeout:
   run_ms: 30000
   step_ms: 10000

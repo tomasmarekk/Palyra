@@ -1,0 +1,39 @@
+schema_version: 2
+id: live_smoke
+mode: live
+scenario_roots:
+  - qa/scenarios/live
+include_tags:
+  - live
+  - real_runtime
+allow_provider_modes:
+  - live
+allow_runner_modes:
+  - live
+allow_live_providers: true
+resume:
+  enabled: true
+  reuse_passed: true
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: false
+available_capabilities:
+  - agent_run
+  - qa_lab
+  - live_provider
+capability_skips:
+  - capability: live_provider
+    reason: Live provider execution requires both suite permission and --allow-live.
+flaky_policy:
+  max_retries: 0
+  fail_on_flaky: true
+  require_issue: true
+scorecard:
+  baseline_score_bps: 0
+  fail_on_required_blockers: true
+  categories:
+    - id: api
+      label: Live API
+      areas: [text]
+      labels: [live]
+      required: true

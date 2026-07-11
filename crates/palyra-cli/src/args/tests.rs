@@ -133,6 +133,8 @@ fn parse_qa_gate_with_reports_and_json() {
         "--output-markdown",
         "artifacts/qa-lab/release.md",
         "--allow-live",
+        "--resume",
+        "--force-rerun",
         "--json",
     ]);
     assert_eq!(
@@ -143,6 +145,8 @@ fn parse_qa_gate_with_reports_and_json() {
                 output_json: Some("artifacts/qa-lab/release.json".to_owned()),
                 output_markdown: Some("artifacts/qa-lab/release.md".to_owned()),
                 allow_live: true,
+                resume: true,
+                force_rerun: true,
                 json: true,
             }
         }

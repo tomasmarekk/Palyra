@@ -1,37 +1,33 @@
-schema_version: 1
-id: nightly
+schema_version: 2
+# The legacy schema-preview inventory remains in nightly_schema_preview.yaml.
+id: nightly_runtime_v1
 mode: nightly
 scenario_roots:
-  - qa/scenarios
-  - qa/scenarios/execution_backends
-  - qa/scenarios/provider
+  - qa/scenarios/real_runtime
 include_tags:
   - nightly
+  - real_runtime
 allow_provider_modes:
   - mock
   - recorded
-  - live
-allow_live_providers: true
+allow_runner_modes:
+  - fixture
+  - record_replay
+allow_live_providers: false
+resume:
+  enabled: true
+  reuse_passed: true
+  rerun_failed: true
+  rerun_partial: true
+require_p0_green: true
 available_capabilities:
   - agent_run
   - qa_lab
   - approvals
-  - context_compaction
-  - delegation
-  - execution_backend_parity
-  - gateway_recovery
-  - hook_policy
-  - patch_verification
-  - process_background
-  - provider_compat
   - provider_recovery
-  - provider_routing
-  - provider_stream_normalizer
-  - redaction
-  - session_compaction
-capability_skips:
-  - capability: live_provider
-    reason: "Nightly live provider scenarios run only when provider secrets are present."
+  - record_replay
+  - workspace_context
+capability_skips: []
 flaky_policy:
   max_retries: 1
   fail_on_flaky: true
@@ -44,24 +40,19 @@ scorecard:
       label: API
       areas: [text]
       labels: [text_only]
-    - id: mcp
-      label: MCP
-      labels: [mcp]
-    - id: subagents
-      label: Subagents
-      labels: [delegation]
+    - id: tools
+      label: Tools
+      areas: [tools]
+      labels: [read_only]
+    - id: approvals
+      label: Approvals
+      areas: [approvals]
+      labels: [approval_denied]
     - id: provider_recovery
       label: Provider recovery
-      labels: [provider, provider_compat]
-    - id: execution_backends
-      label: Execution backends
-      labels: [execution_backend_parity, process, mutating]
-    - id: hooks
-      label: Hooks
-      labels: [security]
-    - id: observability
-      label: Observability
-      labels: [workflow, gateway]
-    - id: security
-      label: Security
-      labels: [security]
+      areas: [provider]
+      labels: [provider_recovery]
+    - id: replay
+      label: Record replay
+      areas: [replay]
+      labels: [record_replay]

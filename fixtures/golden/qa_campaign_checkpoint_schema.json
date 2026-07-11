@@ -1,0 +1,69 @@
+{
+  "artifact_kind": "campaign_checkpoint",
+  "artifact_reference": {
+    "execution_result_kind": "execution_result",
+    "fields": [
+      "path",
+      "kind",
+      "sha256",
+      "size_bytes"
+    ],
+    "path": "relative_no_parent_components",
+    "sha256": "lowercase_hex_64",
+    "size_bytes": "positive_u64"
+  },
+  "attempt_fields": [
+    "generation",
+    "execution_id",
+    "state",
+    "runner_version",
+    "resume_reason_code",
+    "expected_result_path",
+    "result_artifact",
+    "previous_result_artifact",
+    "reason_codes"
+  ],
+  "attempt_states": [
+    "partial",
+    "passed",
+    "failed"
+  ],
+  "entry_fields": [
+    "execution_key",
+    "scenario_id",
+    "current_attempt_generation",
+    "attempts"
+  ],
+  "entry_map_key": "execution_key.digest",
+  "execution_key_contract": "palyra-qa-scenario-execution-key/v1",
+  "format": "palyra-qa-campaign-checkpoint",
+  "optional_attempt_fields": [
+    "result_artifact",
+    "previous_result_artifact"
+  ],
+  "recovery_posture": {
+    "conflicting_generation": "force_rerun_all",
+    "failed_attempt": "rerun",
+    "highest_valid_snapshot": "selected",
+    "invalid_at_or_after_latest": "force_rerun_all",
+    "partial_attempt": "rerun",
+    "passed_attempt": "reuse_only_after_result_and_evidence_verification",
+    "temporary_files": "ignored"
+  },
+  "schema_version": 1,
+  "top_level_fields": [
+    "schema_version",
+    "format",
+    "campaign_key",
+    "suite_id",
+    "generation",
+    "runner_version",
+    "entries"
+  ],
+  "write_posture": {
+    "append_only": true,
+    "checkpoint_file_name": "zero_padded_generation-sha256.json",
+    "checkpoint_publication": "same_directory_temp_sync_atomic_no_clobber",
+    "coordinator": "exclusive_os_file_lock"
+  }
+}

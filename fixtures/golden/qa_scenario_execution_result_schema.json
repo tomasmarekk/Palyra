@@ -3,7 +3,7 @@
     "path": "relative_no_parent_components",
     "sha256": "lowercase_hex_64",
     "size_bytes": "u64",
-    "write_policy": "create_new_no_overwrite"
+    "write_policy": "same_directory_temp_sync_atomic_no_clobber"
   },
   "artifact_reference_base": "qa_gate_report.artifact_reference_base",
   "cleanup_fields": [
@@ -20,7 +20,32 @@
     "provider_secrets",
     "absolute_paths"
   ],
+  "execution_key_fields": [
+    "schema_version",
+    "format",
+    "digest",
+    "normalized_manifest_sha256",
+    "fixture_set_sha256",
+    "runtime_version",
+    "runtime_contract_version",
+    "runner_version",
+    "provider_lane",
+    "provider_binding_sha256"
+  ],
   "format": "palyra-qa-scenario-execution-result",
+  "attempt_fields": [
+    "generation",
+    "runner_version",
+    "runtime_version",
+    "runtime_contract_version",
+    "palyrad_binary_sha256",
+    "palyrad_version",
+    "palyrad_git_hash",
+    "palyrad_build_profile"
+  ],
+  "optional_attempt_fields": [
+    "previous_result_artifact"
+  ],
   "optional_runtime_fields": [
     "run_id",
     "session_id",
@@ -29,6 +54,8 @@
   "required_fields": [
     "schema_version",
     "format",
+    "execution_key",
+    "attempt",
     "execution_id",
     "scenario_id",
     "runner_mode",
@@ -37,5 +64,5 @@
     "evidence_artifacts",
     "cleanup"
   ],
-  "schema_version": 1
+  "schema_version": 2
 }

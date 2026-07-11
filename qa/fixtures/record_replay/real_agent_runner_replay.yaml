@@ -1,0 +1,77 @@
+# Redacted record-replay copy of the deterministic real-agent provider fixture.
+# Provenance binds this projection to its source without retaining raw request or response payloads.
+schema_version: 2
+id: qa.mock.provider.real-agent-runner-replay
+capture_provenance:
+  provider_label: palyra-qa-mock
+  model_label: deterministic-agent-runner
+  source_capture_sha256: 5419d3ca2450b8cb8fa2f9664261ff4e68fdd8dadf10c37f39ded05c7378f933
+  redaction_contract: palyra-provider-replay.v1
+  raw_payloads_stored: false
+turns:
+  - id: read_only_after_tool_result
+    match:
+      tool_result_call_id: qa-real-read
+      tool_result_success: true
+    behavior:
+      kind: text
+      deltas:
+        - "The workspace fixture contains "
+        - "initial sandbox content."
+      finish_reason: stop
+      prompt_tokens: 10
+      completion_tokens: 7
+      latency_ms: 2
+  - id: denied_mutation_after_tool_result
+    match:
+      tool_result_call_id: qa-real-denied-patch
+      tool_result_success: false
+    behavior:
+      kind: text
+      text: "The requested mutation was denied; no file changed."
+      finish_reason: stop
+      prompt_tokens: 12
+      completion_tokens: 9
+      latency_ms: 2
+  - id: exact_text
+    match:
+      prompt_contains:
+        - return the exact deterministic qa response
+    behavior:
+      kind: text
+      deltas:
+        - "The deterministic QA "
+        - "response is exact."
+      finish_reason: stop
+      prompt_tokens: 7
+      completion_tokens: 6
+      latency_ms: 2
+  - id: read_only_tool
+    match:
+      prompt_contains:
+        - inspect the qa workspace fixture with the read-only tool
+    behavior:
+      kind: tool_calls
+      tool_calls:
+        - proposal_id: qa-real-read
+          tool_name: palyra.fs.read_file
+          input_json:
+            path: src/app.txt
+            max_bytes: 4096
+      prompt_tokens: 11
+      completion_tokens: 8
+      latency_ms: 2
+  - id: denied_mutation
+    match:
+      prompt_contains:
+        - propose the qa mutation that must be denied
+    behavior:
+      kind: approval_required
+      tool_calls:
+        - proposal_id: qa-real-denied-patch
+          tool_name: palyra.fs.apply_patch
+          input_json:
+            patch: "*** Begin Patch\n*** Add File: src/denied.txt\n+must-not-exist\n*** End Patch\n"
+      prompt_tokens: 10
+      completion_tokens: 12
+      latency_ms: 2

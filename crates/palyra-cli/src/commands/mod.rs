@@ -44,6 +44,7 @@ pub mod policy;
 pub mod profile;
 pub mod protocol;
 pub mod qa;
+pub(crate) mod qa_checkpoint;
 pub(crate) mod qa_runner;
 pub mod reset;
 pub mod routines;

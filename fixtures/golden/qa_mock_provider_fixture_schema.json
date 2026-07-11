@@ -9,6 +9,24 @@
     "stream_error",
     "approval_required"
   ],
+  "capture_provenance_contract": {
+    "fields": [
+      "provider_label",
+      "model_label",
+      "source_capture_sha256",
+      "redaction_contract",
+      "raw_payloads_stored"
+    ],
+    "label_max_chars": 64,
+    "raw_payloads_stored": false,
+    "redaction_contract": "palyra-provider-replay.v1",
+    "required_from_schema_version": 2,
+    "schema_v1_serialization": "omitted",
+    "source_capture_sha256": {
+      "encoding": "lowercase_hex",
+      "length": 64
+    }
+  },
   "encoding": "yaml",
   "examples_root": "qa/fixtures",
   "execution_contract": {
@@ -65,7 +83,12 @@
   "required_sections": [
     "schema_version",
     "id",
+    "capture_provenance",
     "turns"
   ],
-  "schema_version": 1
+  "schema_version": 2,
+  "supported_schema_versions": [
+    1,
+    2
+  ]
 }

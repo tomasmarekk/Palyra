@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Current QA scenario manifest schema version.
-pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 2;
+pub const QA_SCENARIO_SCHEMA_VERSION: u32 = 3;
 
 /// Stable format label embedded in the schema snapshot and reports.
 pub const QA_SCENARIO_FORMAT: &str = "palyra-qa-scenario";
@@ -32,9 +32,11 @@ const AREA_VALUES: &[&str] = &[
     "security",
     "replay",
 ];
-const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, QA_SCENARIO_SCHEMA_VERSION];
+const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, QA_SCENARIO_SCHEMA_VERSION];
 const PROVIDER_MODE_VALUES: &[&str] = &["mock", "recorded", "live"];
 const RUNNER_MODE_VALUES: &[&str] = &["fixture", "record_replay", "live"];
+const LIVE_PROVIDER_KIND_VALUES: &[&str] = &["openai_compatible", "anthropic"];
+const LIVE_SECRET_PROFILE_ENV_PREFIX: &str = "PALYRA_QA_LIVE_";
 const APPROVAL_DECISION_VALUES: &[&str] = &["allow", "deny"];
 const STEP_ACTION_VALUES: &[&str] =
     &["user_prompt", "tool_result", "approval_decision", "wait_for_event"];
@@ -55,7 +57,7 @@ pub struct QaScenarioManifest {
     pub area: QaScenarioArea,
     /// Provider and execution posture.
     pub mode: QaScenarioMode,
-    /// Typed runner inputs for schema-v2 fixture scenarios.
+    /// Typed provider binding and common runner inputs when the schema supports them.
     pub runner: Option<QaScenarioRunnerConfig>,
     /// Runtime capabilities and fixtures required before the scenario can run.
     pub requires: QaScenarioRequires,
@@ -269,17 +271,301 @@ pub struct QaScenarioMode {
     pub deterministic: bool,
 }
 
-/// Validated fixture inputs used to prepare an isolated QA runner.
+/// Validated provider binding and common inputs used to prepare an isolated QA runner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QaScenarioRunnerConfig {
-    /// Repository-relative deterministic provider fixture path.
-    pub provider_fixture: String,
-    /// Optional repository-relative workspace fixture path.
+    #[serde(flatten)]
+    binding: QaScenarioProviderBinding,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_fixture: Option<String>,
-    /// Optional non-empty policy profile identifier.
+    workspace_fixture: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_profile: Option<String>,
+    policy_profile: Option<String>,
+}
+
+impl QaScenarioRunnerConfig {
+    /// Returns the lane-specific provider binding.
+    #[must_use]
+    pub const fn binding(&self) -> &QaScenarioProviderBinding {
+        &self.binding
+    }
+
+    /// Returns the canonical runner lane represented by this configuration.
+    #[must_use]
+    pub const fn runner_mode(&self) -> QaScenarioRunnerMode {
+        self.binding.runner_mode()
+    }
+
+    /// Returns the deterministic provider fixture path for fixture lanes.
+    #[must_use]
+    pub fn provider_fixture(&self) -> Option<&str> {
+        self.binding.provider_fixture()
+    }
+
+    /// Returns the redacted replay fixture path for record-replay lanes.
+    #[must_use]
+    pub fn replay_fixture(&self) -> Option<&str> {
+        self.binding.replay_fixture()
+    }
+
+    /// Returns whether a record-replay fixture was declared redacted.
+    #[must_use]
+    pub const fn fixture_redacted(&self) -> Option<bool> {
+        self.binding.fixture_redacted()
+    }
+
+    /// Returns the live credential-profile environment variable name.
+    #[must_use]
+    pub fn live_secret_profile_env(&self) -> Option<&str> {
+        self.binding.live_secret_profile_env()
+    }
+
+    /// Returns the typed live provider kind.
+    #[must_use]
+    pub const fn live_provider_kind(&self) -> Option<QaScenarioLiveProviderKind> {
+        self.binding.live_provider_kind()
+    }
+
+    /// Returns the live model identifier.
+    #[must_use]
+    pub fn live_model(&self) -> Option<&str> {
+        self.binding.live_model()
+    }
+
+    /// Returns the optional live provider base URL.
+    #[must_use]
+    pub fn live_base_url(&self) -> Option<&str> {
+        self.binding.live_base_url()
+    }
+
+    /// Returns the explicit raw-payload storage posture for lanes that declare it.
+    #[must_use]
+    pub const fn raw_payload_storage(&self) -> Option<bool> {
+        self.binding.raw_payload_storage()
+    }
+
+    /// Returns the optional repository-relative workspace fixture path.
+    #[must_use]
+    pub fn workspace_fixture(&self) -> Option<&str> {
+        self.workspace_fixture.as_deref()
+    }
+
+    /// Returns the optional non-empty policy profile identifier.
+    #[must_use]
+    pub fn policy_profile(&self) -> Option<&str> {
+        self.policy_profile.as_deref()
+    }
+}
+
+/// Lane-specific provider binding for a validated QA scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum QaScenarioProviderBinding {
+    /// Deterministic provider fixture binding.
+    Fixture(QaScenarioFixtureProviderBinding),
+    /// Redacted record-replay provider fixture binding.
+    RecordReplay(QaScenarioRecordReplayProviderBinding),
+    /// Explicit live-provider binding that references credentials indirectly.
+    Live(QaScenarioLiveProviderBinding),
+}
+
+impl QaScenarioProviderBinding {
+    /// Returns the canonical runner lane represented by this binding.
+    #[must_use]
+    pub const fn runner_mode(&self) -> QaScenarioRunnerMode {
+        match self {
+            Self::Fixture(_) => QaScenarioRunnerMode::Fixture,
+            Self::RecordReplay(_) => QaScenarioRunnerMode::RecordReplay,
+            Self::Live(_) => QaScenarioRunnerMode::Live,
+        }
+    }
+
+    /// Returns the deterministic provider fixture path for fixture bindings.
+    #[must_use]
+    pub fn provider_fixture(&self) -> Option<&str> {
+        match self {
+            Self::Fixture(binding) => Some(binding.provider_fixture()),
+            Self::RecordReplay(_) | Self::Live(_) => None,
+        }
+    }
+
+    /// Returns the redacted replay fixture path for record-replay bindings.
+    #[must_use]
+    pub fn replay_fixture(&self) -> Option<&str> {
+        match self {
+            Self::RecordReplay(binding) => Some(binding.replay_fixture()),
+            Self::Fixture(_) | Self::Live(_) => None,
+        }
+    }
+
+    /// Returns whether a record-replay fixture was declared redacted.
+    #[must_use]
+    pub const fn fixture_redacted(&self) -> Option<bool> {
+        match self {
+            Self::RecordReplay(binding) => Some(binding.fixture_redacted()),
+            Self::Fixture(_) | Self::Live(_) => None,
+        }
+    }
+
+    /// Returns the live credential-profile environment variable name.
+    #[must_use]
+    pub fn live_secret_profile_env(&self) -> Option<&str> {
+        match self {
+            Self::Live(binding) => Some(binding.secret_profile_env()),
+            Self::Fixture(_) | Self::RecordReplay(_) => None,
+        }
+    }
+
+    /// Returns the typed live provider kind.
+    #[must_use]
+    pub const fn live_provider_kind(&self) -> Option<QaScenarioLiveProviderKind> {
+        match self {
+            Self::Live(binding) => Some(binding.provider_kind()),
+            Self::Fixture(_) | Self::RecordReplay(_) => None,
+        }
+    }
+
+    /// Returns the live model identifier.
+    #[must_use]
+    pub fn live_model(&self) -> Option<&str> {
+        match self {
+            Self::Live(binding) => Some(binding.model()),
+            Self::Fixture(_) | Self::RecordReplay(_) => None,
+        }
+    }
+
+    /// Returns the optional live provider base URL.
+    #[must_use]
+    pub fn live_base_url(&self) -> Option<&str> {
+        match self {
+            Self::Live(binding) => binding.base_url(),
+            Self::Fixture(_) | Self::RecordReplay(_) => None,
+        }
+    }
+
+    /// Returns the explicit raw-payload storage posture for record-replay and live bindings.
+    #[must_use]
+    pub const fn raw_payload_storage(&self) -> Option<bool> {
+        match self {
+            Self::RecordReplay(binding) => Some(binding.raw_payload_storage()),
+            Self::Live(binding) => Some(binding.raw_payload_storage()),
+            Self::Fixture(_) => None,
+        }
+    }
+}
+
+/// Validated deterministic provider fixture binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaScenarioFixtureProviderBinding {
+    provider_fixture: String,
+}
+
+impl QaScenarioFixtureProviderBinding {
+    /// Returns the safe repository-relative deterministic provider fixture path.
+    #[must_use]
+    pub fn provider_fixture(&self) -> &str {
+        self.provider_fixture.as_str()
+    }
+}
+
+/// Validated redacted provider replay binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaScenarioRecordReplayProviderBinding {
+    replay_fixture: String,
+    fixture_redacted: bool,
+    raw_payload_storage: bool,
+}
+
+impl QaScenarioRecordReplayProviderBinding {
+    /// Returns the safe repository-relative replay fixture path.
+    #[must_use]
+    pub fn replay_fixture(&self) -> &str {
+        self.replay_fixture.as_str()
+    }
+
+    /// Returns whether the replay fixture was explicitly declared redacted.
+    #[must_use]
+    pub const fn fixture_redacted(&self) -> bool {
+        self.fixture_redacted
+    }
+
+    /// Returns whether raw provider payload storage is enabled.
+    #[must_use]
+    pub const fn raw_payload_storage(&self) -> bool {
+        self.raw_payload_storage
+    }
+}
+
+/// Supported live provider implementation family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QaScenarioLiveProviderKind {
+    /// OpenAI-compatible chat-completions provider.
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    /// Anthropic Messages API provider.
+    Anthropic,
+}
+
+impl QaScenarioLiveProviderKind {
+    /// Returns the manifest string representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai_compatible" => Some(Self::OpenAiCompatible),
+            "anthropic" => Some(Self::Anthropic),
+            _ => None,
+        }
+    }
+}
+
+/// Validated live-provider binding with indirect credential lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaScenarioLiveProviderBinding {
+    secret_profile_env: String,
+    provider_kind: QaScenarioLiveProviderKind,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    raw_payload_storage: bool,
+}
+
+impl QaScenarioLiveProviderBinding {
+    /// Returns the validated environment variable that names the live secret profile.
+    #[must_use]
+    pub fn secret_profile_env(&self) -> &str {
+        self.secret_profile_env.as_str()
+    }
+
+    /// Returns the live provider implementation family.
+    #[must_use]
+    pub const fn provider_kind(&self) -> QaScenarioLiveProviderKind {
+        self.provider_kind
+    }
+
+    /// Returns the non-empty live model identifier.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.model.as_str()
+    }
+
+    /// Returns the optional non-empty live provider base URL.
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    /// Returns whether raw provider payload storage is enabled.
+    #[must_use]
+    pub const fn raw_payload_storage(&self) -> bool {
+        self.raw_payload_storage
+    }
 }
 
 /// Runtime requirements declared by a scenario.
@@ -674,6 +960,20 @@ struct QaScenarioRunnerConfigWire {
     #[serde(default)]
     provider_fixture: Option<String>,
     #[serde(default)]
+    replay_fixture: Option<String>,
+    #[serde(default)]
+    fixture_redacted: Option<bool>,
+    #[serde(default)]
+    secret_profile_env: Option<String>,
+    #[serde(default)]
+    provider_kind: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    raw_payload_storage: Option<bool>,
+    #[serde(default)]
     workspace_fixture: Option<String>,
     #[serde(default)]
     policy_profile: Option<String>,
@@ -812,6 +1112,7 @@ pub fn qa_scenario_manifest_schema_snapshot() -> Value {
             "id",
             "area",
             "mode",
+            "runner",
             "requires",
             "steps",
             "expect",
@@ -824,9 +1125,17 @@ pub fn qa_scenario_manifest_schema_snapshot() -> Value {
         "supported_schema_versions": SUPPORTED_SCHEMA_VERSIONS,
         "provider_modes": PROVIDER_MODE_VALUES,
         "runner_modes": RUNNER_MODE_VALUES,
+        "live_provider_kinds": LIVE_PROVIDER_KIND_VALUES,
         "approval_decisions": APPROVAL_DECISION_VALUES,
         "runner_config_fields": [
             "provider_fixture",
+            "replay_fixture",
+            "fixture_redacted",
+            "secret_profile_env",
+            "provider_kind",
+            "model",
+            "base_url",
+            "raw_payload_storage",
             "workspace_fixture",
             "policy_profile"
         ],
@@ -1051,6 +1360,171 @@ fn validate_runner_config(
         }
         return None;
     }
+    if schema_version == 2 {
+        return validate_schema_v2_runner_config(value, runner_mode, issues);
+    }
+    let runner_mode = runner_mode?;
+    let Some(value) = value else {
+        let recovery_hint = match runner_mode {
+            QaScenarioRunnerMode::Fixture => {
+                "Add runner.provider_fixture with a safe repository-relative fixture path."
+            }
+            QaScenarioRunnerMode::RecordReplay => {
+                "Add a redacted runner.replay_fixture and explicitly disable raw payload storage."
+            }
+            QaScenarioRunnerMode::Live => {
+                "Add an explicit live provider binding that references a QA secret profile env."
+            }
+        };
+        push_issue(
+            issues,
+            "missing_runner_config",
+            "$.runner",
+            format!("{} runner mode requires runner configuration", runner_mode.as_str()),
+            recovery_hint,
+        );
+        return None;
+    };
+
+    let QaScenarioRunnerConfigWire {
+        provider_fixture,
+        replay_fixture,
+        fixture_redacted,
+        secret_profile_env,
+        provider_kind,
+        model,
+        base_url,
+        raw_payload_storage,
+        workspace_fixture,
+        policy_profile,
+    } = value;
+    let workspace_fixture = validate_runner_path(
+        workspace_fixture,
+        "$.runner.workspace_fixture",
+        "workspace fixture",
+        false,
+        issues,
+    );
+    let policy_profile =
+        validate_optional_nonempty(policy_profile, "$.runner.policy_profile", issues);
+
+    let binding = match runner_mode {
+        QaScenarioRunnerMode::Fixture => {
+            reject_runner_fields_for_mode(
+                &[
+                    (replay_fixture.is_some(), "$.runner.replay_fixture", "replay_fixture"),
+                    (fixture_redacted.is_some(), "$.runner.fixture_redacted", "fixture_redacted"),
+                    (
+                        secret_profile_env.is_some(),
+                        "$.runner.secret_profile_env",
+                        "secret_profile_env",
+                    ),
+                    (provider_kind.is_some(), "$.runner.provider_kind", "provider_kind"),
+                    (model.is_some(), "$.runner.model", "model"),
+                    (base_url.is_some(), "$.runner.base_url", "base_url"),
+                    (
+                        raw_payload_storage.is_some(),
+                        "$.runner.raw_payload_storage",
+                        "raw_payload_storage",
+                    ),
+                ],
+                runner_mode,
+                issues,
+            );
+            validate_runner_path(
+                provider_fixture,
+                "$.runner.provider_fixture",
+                "provider fixture",
+                true,
+                issues,
+            )
+            .map(|provider_fixture| {
+                QaScenarioProviderBinding::Fixture(QaScenarioFixtureProviderBinding {
+                    provider_fixture,
+                })
+            })
+        }
+        QaScenarioRunnerMode::RecordReplay => {
+            reject_runner_fields_for_mode(
+                &[
+                    (provider_fixture.is_some(), "$.runner.provider_fixture", "provider_fixture"),
+                    (
+                        secret_profile_env.is_some(),
+                        "$.runner.secret_profile_env",
+                        "secret_profile_env",
+                    ),
+                    (provider_kind.is_some(), "$.runner.provider_kind", "provider_kind"),
+                    (model.is_some(), "$.runner.model", "model"),
+                    (base_url.is_some(), "$.runner.base_url", "base_url"),
+                ],
+                runner_mode,
+                issues,
+            );
+            let replay_fixture = validate_runner_path(
+                replay_fixture,
+                "$.runner.replay_fixture",
+                "replay fixture",
+                true,
+                issues,
+            );
+            let fixture_redacted = validate_fixture_redacted(fixture_redacted, issues);
+            let raw_payload_storage =
+                validate_raw_payload_storage_disabled(raw_payload_storage, runner_mode, issues);
+            match (replay_fixture, fixture_redacted, raw_payload_storage) {
+                (Some(replay_fixture), Some(fixture_redacted), Some(raw_payload_storage)) => {
+                    Some(QaScenarioProviderBinding::RecordReplay(
+                        QaScenarioRecordReplayProviderBinding {
+                            replay_fixture,
+                            fixture_redacted,
+                            raw_payload_storage,
+                        },
+                    ))
+                }
+                _ => None,
+            }
+        }
+        QaScenarioRunnerMode::Live => {
+            reject_runner_fields_for_mode(
+                &[
+                    (provider_fixture.is_some(), "$.runner.provider_fixture", "provider_fixture"),
+                    (replay_fixture.is_some(), "$.runner.replay_fixture", "replay_fixture"),
+                    (fixture_redacted.is_some(), "$.runner.fixture_redacted", "fixture_redacted"),
+                ],
+                runner_mode,
+                issues,
+            );
+            let secret_profile_env = validate_live_secret_profile_env(secret_profile_env, issues);
+            let provider_kind = validate_live_provider_kind(provider_kind, issues);
+            let model = validate_required_string(model, "$.runner.model", "live model", issues);
+            let base_url = validate_optional_nonempty(base_url, "$.runner.base_url", issues);
+            let raw_payload_storage =
+                validate_raw_payload_storage_disabled(raw_payload_storage, runner_mode, issues);
+            match (secret_profile_env, provider_kind, model, raw_payload_storage) {
+                (
+                    Some(secret_profile_env),
+                    Some(provider_kind),
+                    Some(model),
+                    Some(raw_payload_storage),
+                ) => Some(QaScenarioProviderBinding::Live(QaScenarioLiveProviderBinding {
+                    secret_profile_env,
+                    provider_kind,
+                    model,
+                    base_url,
+                    raw_payload_storage,
+                })),
+                _ => None,
+            }
+        }
+    };
+
+    binding.map(|binding| QaScenarioRunnerConfig { binding, workspace_fixture, policy_profile })
+}
+
+fn validate_schema_v2_runner_config(
+    value: Option<QaScenarioRunnerConfigWire>,
+    runner_mode: Option<QaScenarioRunnerMode>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<QaScenarioRunnerConfig> {
     match runner_mode {
         Some(QaScenarioRunnerMode::Fixture) => {
             let Some(value) = value else {
@@ -1063,24 +1537,59 @@ fn validate_runner_config(
                 );
                 return None;
             };
+            let QaScenarioRunnerConfigWire {
+                provider_fixture,
+                replay_fixture,
+                fixture_redacted,
+                secret_profile_env,
+                provider_kind,
+                model,
+                base_url,
+                raw_payload_storage,
+                workspace_fixture,
+                policy_profile,
+            } = value;
+            reject_runner_fields_for_mode(
+                &[
+                    (replay_fixture.is_some(), "$.runner.replay_fixture", "replay_fixture"),
+                    (fixture_redacted.is_some(), "$.runner.fixture_redacted", "fixture_redacted"),
+                    (
+                        secret_profile_env.is_some(),
+                        "$.runner.secret_profile_env",
+                        "secret_profile_env",
+                    ),
+                    (provider_kind.is_some(), "$.runner.provider_kind", "provider_kind"),
+                    (model.is_some(), "$.runner.model", "model"),
+                    (base_url.is_some(), "$.runner.base_url", "base_url"),
+                    (
+                        raw_payload_storage.is_some(),
+                        "$.runner.raw_payload_storage",
+                        "raw_payload_storage",
+                    ),
+                ],
+                QaScenarioRunnerMode::Fixture,
+                issues,
+            );
             let provider_fixture = validate_runner_path(
-                value.provider_fixture,
+                provider_fixture,
                 "$.runner.provider_fixture",
                 "provider fixture",
                 true,
                 issues,
             );
             let workspace_fixture = validate_runner_path(
-                value.workspace_fixture,
+                workspace_fixture,
                 "$.runner.workspace_fixture",
                 "workspace fixture",
                 false,
                 issues,
             );
             let policy_profile =
-                validate_optional_nonempty(value.policy_profile, "$.runner.policy_profile", issues);
+                validate_optional_nonempty(policy_profile, "$.runner.policy_profile", issues);
             provider_fixture.map(|provider_fixture| QaScenarioRunnerConfig {
-                provider_fixture,
+                binding: QaScenarioProviderBinding::Fixture(QaScenarioFixtureProviderBinding {
+                    provider_fixture,
+                }),
                 workspace_fixture,
                 policy_profile,
             })
@@ -1091,14 +1600,161 @@ fn validate_runner_config(
                     issues,
                     "runner_config_not_supported_for_mode",
                     "$.runner",
-                    "runner configuration is only supported for fixture mode",
-                    "Remove the runner section for record_replay or live mode.",
+                    "schema_version 2 runner configuration is only supported for fixture mode",
+                    format!(
+                        "Remove the runner section or use schema_version {QA_SCENARIO_SCHEMA_VERSION} for typed provider bindings."
+                    ),
                 );
             }
             None
         }
         None => None,
     }
+}
+
+fn reject_runner_fields_for_mode(
+    fields: &[(bool, &str, &str)],
+    runner_mode: QaScenarioRunnerMode,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) {
+    for &(present, path, field) in fields {
+        if present {
+            push_issue(
+                issues,
+                "runner_field_not_supported_for_mode",
+                path,
+                format!(
+                    "runner.{field} is not supported when mode.runner is '{}'",
+                    runner_mode.as_str()
+                ),
+                format!(
+                    "Remove runner.{field} from the {} runner configuration.",
+                    runner_mode.as_str()
+                ),
+            );
+        }
+    }
+}
+
+fn validate_fixture_redacted(
+    value: Option<bool>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<bool> {
+    match value {
+        Some(true) => Some(true),
+        Some(false) => {
+            push_issue(
+                issues,
+                "fixture_must_be_redacted",
+                "$.runner.fixture_redacted",
+                "record-replay fixtures must be explicitly marked as redacted",
+                "Set runner.fixture_redacted to true after verifying the replay fixture is redacted.",
+            );
+            None
+        }
+        None => {
+            push_issue(
+                issues,
+                "missing_fixture_redacted",
+                "$.runner.fixture_redacted",
+                "record-replay runner requires an explicit fixture redaction declaration",
+                "Set runner.fixture_redacted to true after verifying the replay fixture is redacted.",
+            );
+            None
+        }
+    }
+}
+
+fn validate_raw_payload_storage_disabled(
+    value: Option<bool>,
+    runner_mode: QaScenarioRunnerMode,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<bool> {
+    match value {
+        Some(false) => Some(false),
+        Some(true) => {
+            push_issue(
+                issues,
+                "raw_payload_storage_must_be_disabled",
+                "$.runner.raw_payload_storage",
+                format!(
+                    "raw provider payload storage must be disabled for {} runner mode",
+                    runner_mode.as_str()
+                ),
+                "Set runner.raw_payload_storage to false.",
+            );
+            None
+        }
+        None => {
+            push_issue(
+                issues,
+                "missing_raw_payload_storage",
+                "$.runner.raw_payload_storage",
+                format!(
+                    "{} runner mode requires an explicit raw payload storage posture",
+                    runner_mode.as_str()
+                ),
+                "Set runner.raw_payload_storage to false.",
+            );
+            None
+        }
+    }
+}
+
+fn validate_live_secret_profile_env(
+    value: Option<String>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<String> {
+    let value = validate_required_string(
+        value,
+        "$.runner.secret_profile_env",
+        "live secret profile env",
+        issues,
+    )?;
+    if live_secret_profile_env_is_valid(value.as_str()) {
+        return Some(value);
+    }
+    push_issue(
+        issues,
+        "invalid_live_secret_profile_env",
+        "$.runner.secret_profile_env",
+        format!(
+            "live secret profile env must be an uppercase environment identifier prefixed with {LIVE_SECRET_PROFILE_ENV_PREFIX}"
+        ),
+        format!(
+            "Use a name such as {LIVE_SECRET_PROFILE_ENV_PREFIX}OPENAI without embedding a credential value."
+        ),
+    );
+    None
+}
+
+fn live_secret_profile_env_is_valid(value: &str) -> bool {
+    value.strip_prefix(LIVE_SECRET_PROFILE_ENV_PREFIX).is_some_and(|suffix| !suffix.is_empty())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_live_provider_kind(
+    value: Option<String>,
+    issues: &mut Vec<QaScenarioManifestIssue>,
+) -> Option<QaScenarioLiveProviderKind> {
+    let value =
+        validate_required_string(value, "$.runner.provider_kind", "live provider kind", issues)?;
+    if let Some(provider_kind) = QaScenarioLiveProviderKind::parse(value.as_str()) {
+        return Some(provider_kind);
+    }
+    push_issue(
+        issues,
+        "unknown_live_provider_kind",
+        "$.runner.provider_kind",
+        format!(
+            "unknown live provider kind '{value}', expected one of {}",
+            LIVE_PROVIDER_KIND_VALUES.join(", ")
+        ),
+        "Use openai_compatible or anthropic for runner.provider_kind.",
+    );
+    None
 }
 
 fn validate_requires(
@@ -1863,6 +2519,27 @@ mod tests {
         include_str!("../../../qa/scenarios/mcp/mcp_write_tool_approval.yaml");
     const SCHEMA_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_scenario_manifest_schema.json");
+    const FIXTURE_RUNNER_BLOCK: &str = r#"runner:
+  provider_fixture: qa/fixtures/provider_basic.yaml
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_read_only
+"#;
+    const RECORD_REPLAY_RUNNER_BLOCK: &str = r#"runner:
+  replay_fixture: qa/fixtures/provider_basic.yaml
+  fixture_redacted: true
+  raw_payload_storage: false
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_read_only
+"#;
+    const LIVE_RUNNER_BLOCK: &str = r#"runner:
+  secret_profile_env: PALYRA_QA_LIVE_OPENAI
+  provider_kind: openai_compatible
+  model: qa-live-model
+  base_url: https://api.example.test/v1
+  raw_payload_storage: false
+  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
+  policy_profile: qa_read_only
+"#;
     const V2_FIXTURE_SCENARIO: &str = r#"
 schema_version: 2
 id: runner.fixture.basic
@@ -2007,17 +2684,17 @@ timeout:
         let manifest = parse_qa_scenario_manifest_yaml(V2_FIXTURE_SCENARIO)
             .expect("schema-v2 fixture scenario should parse");
 
-        assert_eq!(manifest.schema_version, QA_SCENARIO_SCHEMA_VERSION);
+        assert_eq!(manifest.schema_version, 2);
         assert_eq!(manifest.mode.runner, QaScenarioRunnerMode::Fixture);
         assert_eq!(manifest.mode.provider, QaScenarioProviderMode::Mock);
-        assert_eq!(
-            manifest.runner,
-            Some(QaScenarioRunnerConfig {
-                provider_fixture: "qa/fixtures/provider_basic.yaml".to_owned(),
-                workspace_fixture: Some("qa/fixtures/sandbox_workspaces/repo_basic".to_owned()),
-                policy_profile: Some("qa_read_only".to_owned()),
-            })
-        );
+        let runner = manifest.runner.as_ref().expect("fixture runner config should be present");
+        assert!(matches!(runner.binding(), QaScenarioProviderBinding::Fixture(_)));
+        assert_eq!(runner.runner_mode(), QaScenarioRunnerMode::Fixture);
+        assert_eq!(runner.provider_fixture(), Some("qa/fixtures/provider_basic.yaml"));
+        assert_eq!(runner.replay_fixture(), None);
+        assert_eq!(runner.workspace_fixture(), Some("qa/fixtures/sandbox_workspaces/repo_basic"));
+        assert_eq!(runner.policy_profile(), Some("qa_read_only"));
+        assert_eq!(runner.raw_payload_storage(), None);
         assert_eq!(manifest.steps[1].decision, Some(QaScenarioApprovalDecision::Deny));
         assert_eq!(manifest.steps[1].proposal_id.as_deref(), Some("qa-approval-read"));
     }
@@ -2039,25 +2716,72 @@ timeout:
 
     #[test]
     fn maps_schema_v2_runner_modes_to_legacy_provider_modes() {
-        let runner_block = r#"runner:
-  provider_fixture: qa/fixtures/provider_basic.yaml
-  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
-  policy_profile: qa_read_only
-"#;
         for (runner, expected_provider) in [
             ("record_replay", QaScenarioProviderMode::Recorded),
             ("live", QaScenarioProviderMode::Live),
         ] {
             let scenario = V2_FIXTURE_SCENARIO
                 .replace("runner: fixture", &format!("runner: {runner}"))
-                .replace(runner_block, "");
+                .replace(FIXTURE_RUNNER_BLOCK, "");
             let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
-                .expect("non-fixture schema-v2 runner mode should parse without fixture config");
+                .expect("schema-v2 non-fixture mode should retain its config-free projection");
 
             assert_eq!(manifest.mode.runner.as_str(), runner);
             assert_eq!(manifest.mode.provider, expected_provider);
             assert_eq!(manifest.runner, None);
         }
+    }
+
+    #[test]
+    fn schema_v2_rejects_record_replay_and_live_runner_config() {
+        for (runner_mode, runner_block) in
+            [("record_replay", RECORD_REPLAY_RUNNER_BLOCK), ("live", LIVE_RUNNER_BLOCK)]
+        {
+            let scenario = V2_FIXTURE_SCENARIO
+                .replace("runner: fixture", &format!("runner: {runner_mode}"))
+                .replace(FIXTURE_RUNNER_BLOCK, runner_block);
+
+            assert_validation_issue(&scenario, "$.runner", "runner_config_not_supported_for_mode");
+        }
+    }
+
+    #[test]
+    fn schema_v3_fixture_uses_typed_provider_binding() {
+        let scenario = V2_FIXTURE_SCENARIO.replace("schema_version: 2", "schema_version: 3");
+        let manifest = parse_qa_scenario_manifest_yaml(scenario.as_str())
+            .expect("schema-v3 fixture binding should parse");
+        let runner = manifest.runner.as_ref().expect("schema-v3 fixture config should be present");
+
+        assert_eq!(runner.runner_mode(), QaScenarioRunnerMode::Fixture);
+        assert_eq!(runner.provider_fixture(), Some("qa/fixtures/provider_basic.yaml"));
+    }
+
+    #[test]
+    fn parses_and_round_trips_record_replay_binding() {
+        let scenario = schema_v3_scenario_with_runner("record_replay", RECORD_REPLAY_RUNNER_BLOCK);
+        let manifest = assert_schema_v3_scenario_round_trips(scenario.as_str());
+        let runner = manifest.runner.as_ref().expect("record-replay config should be present");
+
+        assert!(matches!(runner.binding(), QaScenarioProviderBinding::RecordReplay(_)));
+        assert_eq!(runner.replay_fixture(), Some("qa/fixtures/provider_basic.yaml"));
+        assert_eq!(runner.fixture_redacted(), Some(true));
+        assert_eq!(runner.raw_payload_storage(), Some(false));
+        assert_eq!(runner.provider_fixture(), None);
+    }
+
+    #[test]
+    fn parses_and_round_trips_live_binding() {
+        let scenario = schema_v3_scenario_with_runner("live", LIVE_RUNNER_BLOCK);
+        let manifest = assert_schema_v3_scenario_round_trips(scenario.as_str());
+        let runner = manifest.runner.as_ref().expect("live config should be present");
+
+        assert!(matches!(runner.binding(), QaScenarioProviderBinding::Live(_)));
+        assert_eq!(runner.live_secret_profile_env(), Some("PALYRA_QA_LIVE_OPENAI"));
+        assert_eq!(runner.live_provider_kind(), Some(QaScenarioLiveProviderKind::OpenAiCompatible));
+        assert_eq!(runner.live_model(), Some("qa-live-model"));
+        assert_eq!(runner.live_base_url(), Some("https://api.example.test/v1"));
+        assert_eq!(runner.raw_payload_storage(), Some(false));
+        assert_eq!(runner.provider_fixture(), None);
     }
 
     #[test]
@@ -2105,16 +2829,21 @@ timeout:
 
     #[test]
     fn schema_v2_fixture_mode_requires_runner_config() {
-        let scenario = V2_FIXTURE_SCENARIO.replace(
-            r#"runner:
-  provider_fixture: qa/fixtures/provider_basic.yaml
-  workspace_fixture: qa/fixtures/sandbox_workspaces/repo_basic
-  policy_profile: qa_read_only
-"#,
-            "",
-        );
+        let scenario = V2_FIXTURE_SCENARIO.replace(FIXTURE_RUNNER_BLOCK, "");
 
         assert_validation_issue(&scenario, "$.runner", "missing_runner_config");
+    }
+
+    #[test]
+    fn schema_v3_non_fixture_modes_require_runner_config() {
+        for (runner_mode, runner_block) in
+            [("record_replay", RECORD_REPLAY_RUNNER_BLOCK), ("live", LIVE_RUNNER_BLOCK)]
+        {
+            let scenario =
+                schema_v3_scenario_with_runner(runner_mode, runner_block).replace(runner_block, "");
+
+            assert_validation_issue(&scenario, "$.runner", "missing_runner_config");
+        }
     }
 
     #[test]
@@ -2126,7 +2855,7 @@ timeout:
     }
 
     #[test]
-    fn schema_v2_rejects_unsafe_runner_paths_with_precise_paths() {
+    fn rejects_unsafe_runner_paths_with_precise_paths() {
         for unsafe_path in ["../secret.yaml", r"..\secret.yaml", r"C:\secret.yaml", "/secret.yaml"]
         {
             let scenario =
@@ -2141,6 +2870,151 @@ timeout:
             "$.runner.workspace_fixture",
             "unsafe_runner_path",
         );
+
+        let unsafe_replay =
+            schema_v3_scenario_with_runner("record_replay", RECORD_REPLAY_RUNNER_BLOCK)
+                .replace("qa/fixtures/provider_basic.yaml", "../provider-secret.yaml");
+        assert_validation_issue(&unsafe_replay, "$.runner.replay_fixture", "unsafe_runner_path");
+    }
+
+    #[test]
+    fn record_replay_requires_explicit_redacted_fixture_posture() {
+        let scenario = schema_v3_scenario_with_runner("record_replay", RECORD_REPLAY_RUNNER_BLOCK);
+        let omitted = scenario.replace("  fixture_redacted: true\n", "");
+        assert_validation_issue(&omitted, "$.runner.fixture_redacted", "missing_fixture_redacted");
+
+        let false_value = scenario.replace("  fixture_redacted: true", "  fixture_redacted: false");
+        assert_validation_issue(
+            &false_value,
+            "$.runner.fixture_redacted",
+            "fixture_must_be_redacted",
+        );
+    }
+
+    #[test]
+    fn record_replay_and_live_require_raw_payload_storage_disabled() {
+        for (runner_mode, runner_block) in
+            [("record_replay", RECORD_REPLAY_RUNNER_BLOCK), ("live", LIVE_RUNNER_BLOCK)]
+        {
+            let scenario = schema_v3_scenario_with_runner(runner_mode, runner_block);
+            let omitted = scenario.replace("  raw_payload_storage: false\n", "");
+            assert_validation_issue(
+                &omitted,
+                "$.runner.raw_payload_storage",
+                "missing_raw_payload_storage",
+            );
+
+            let enabled =
+                scenario.replace("  raw_payload_storage: false", "  raw_payload_storage: true");
+            assert_validation_issue(
+                &enabled,
+                "$.runner.raw_payload_storage",
+                "raw_payload_storage_must_be_disabled",
+            );
+        }
+    }
+
+    #[test]
+    fn live_binding_requires_valid_indirect_secret_profile_env() {
+        for invalid_env in [
+            "PALYRA_QA_LIVE_",
+            "PALYRA_QA_LIVE_openai",
+            "PALYRA_QA_LIVE_OPENAI-PROD",
+            "PALYRA_LIVE_OPENAI",
+        ] {
+            let scenario = schema_v3_scenario_with_runner("live", LIVE_RUNNER_BLOCK)
+                .replace("PALYRA_QA_LIVE_OPENAI", invalid_env);
+            assert_validation_issue(
+                &scenario,
+                "$.runner.secret_profile_env",
+                "invalid_live_secret_profile_env",
+            );
+        }
+    }
+
+    #[test]
+    fn live_binding_requires_supported_provider_kind_and_nonempty_model() {
+        let scenario = schema_v3_scenario_with_runner("live", LIVE_RUNNER_BLOCK);
+        let anthropic = scenario.replace("openai_compatible", "anthropic");
+        let anthropic_manifest = parse_qa_scenario_manifest_yaml(anthropic.as_str())
+            .expect("anthropic live provider kind should parse");
+        assert_eq!(
+            anthropic_manifest.runner.as_ref().and_then(QaScenarioRunnerConfig::live_provider_kind),
+            Some(QaScenarioLiveProviderKind::Anthropic)
+        );
+
+        let unknown_provider = scenario.replace("openai_compatible", "deterministic");
+        assert_validation_issue(
+            &unknown_provider,
+            "$.runner.provider_kind",
+            "unknown_live_provider_kind",
+        );
+
+        let empty_model = scenario.replace("model: qa-live-model", "model: '   '");
+        assert_validation_issue(&empty_model, "$.runner.model", "missing_live_model");
+
+        let empty_base_url =
+            scenario.replace("base_url: https://api.example.test/v1", "base_url: '   '");
+        assert_validation_issue(&empty_base_url, "$.runner.base_url", "empty_string");
+
+        let without_base_url = scenario.replace("  base_url: https://api.example.test/v1\n", "");
+        let manifest = parse_qa_scenario_manifest_yaml(without_base_url.as_str())
+            .expect("live base URL should remain optional");
+        assert_eq!(manifest.runner.as_ref().and_then(QaScenarioRunnerConfig::live_base_url), None);
+    }
+
+    #[test]
+    fn schema_v3_rejects_every_lane_incompatible_runner_field() {
+        let cases = [
+            (
+                "fixture",
+                FIXTURE_RUNNER_BLOCK,
+                [
+                    ("replay_fixture", "qa/fixtures/replay.yaml"),
+                    ("fixture_redacted", "true"),
+                    ("secret_profile_env", "PALYRA_QA_LIVE_OPENAI"),
+                    ("provider_kind", "openai_compatible"),
+                    ("model", "qa-live-model"),
+                    ("base_url", "https://api.example.test/v1"),
+                    ("raw_payload_storage", "false"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "record_replay",
+                RECORD_REPLAY_RUNNER_BLOCK,
+                [
+                    ("provider_fixture", "qa/fixtures/provider.yaml"),
+                    ("secret_profile_env", "PALYRA_QA_LIVE_OPENAI"),
+                    ("provider_kind", "openai_compatible"),
+                    ("model", "qa-live-model"),
+                    ("base_url", "https://api.example.test/v1"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "live",
+                LIVE_RUNNER_BLOCK,
+                [
+                    ("provider_fixture", "qa/fixtures/provider.yaml"),
+                    ("replay_fixture", "qa/fixtures/replay.yaml"),
+                    ("fixture_redacted", "true"),
+                ]
+                .as_slice(),
+            ),
+        ];
+
+        for (runner_mode, runner_block, incompatible_fields) in cases {
+            for (field, value) in incompatible_fields {
+                let scenario = schema_v3_scenario_with_extra_runner_field(
+                    runner_mode,
+                    runner_block,
+                    field,
+                    value,
+                );
+                assert_runner_field_not_supported(&scenario, runner_mode, field);
+            }
+        }
     }
 
     #[test]
@@ -2234,6 +3108,70 @@ timeout:
 
         let issues = error.issues().expect("validation issues should be available");
         assert!(issues.iter().any(|issue| issue.path == "$.area" && issue.code == "unknown_area"));
+    }
+
+    fn schema_v3_scenario_with_runner(runner_mode: &str, runner_block: &str) -> String {
+        V2_FIXTURE_SCENARIO
+            .replace("schema_version: 2", "schema_version: 3")
+            .replace("runner: fixture", &format!("runner: {runner_mode}"))
+            .replace(FIXTURE_RUNNER_BLOCK, runner_block)
+    }
+
+    fn schema_v3_scenario_with_extra_runner_field(
+        runner_mode: &str,
+        runner_block: &str,
+        field: &str,
+        value: &str,
+    ) -> String {
+        schema_v3_scenario_with_runner(runner_mode, runner_block).replace(
+            "  policy_profile: qa_read_only\n",
+            &format!("  policy_profile: qa_read_only\n  {field}: {value}\n"),
+        )
+    }
+
+    fn assert_schema_v3_scenario_round_trips(scenario: &str) -> QaScenarioManifest {
+        let manifest = parse_qa_scenario_manifest_yaml(scenario)
+            .expect("schema-v3 provider binding should parse");
+
+        let json =
+            serde_json::to_string(&manifest).expect("schema-v3 manifest should serialize as JSON");
+        let json_round_trip = parse_qa_scenario_manifest_yaml(json.as_str())
+            .expect("schema-v3 JSON projection should remain valid");
+        assert_eq!(json_round_trip, manifest);
+
+        let yaml =
+            yaml_serde::to_string(&manifest).expect("schema-v3 manifest should serialize as YAML");
+        let yaml_round_trip = parse_qa_scenario_manifest_yaml(yaml.as_str())
+            .expect("schema-v3 YAML projection should remain valid");
+        assert_eq!(yaml_round_trip, manifest);
+
+        manifest
+    }
+
+    fn assert_runner_field_not_supported(scenario: &str, runner_mode: &str, field: &str) {
+        let error = parse_qa_scenario_manifest_yaml(scenario)
+            .expect_err("lane-incompatible runner field should fail validation");
+        let issues = error.issues().expect("validation issues should be available");
+        let expected_path = format!("$.runner.{field}");
+        let issue = issues
+            .iter()
+            .find(|issue| {
+                issue.path == expected_path && issue.code == "runner_field_not_supported_for_mode"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing incompatible-field issue for mode={runner_mode} field={field}; issues={issues:?}"
+                )
+            });
+
+        assert_eq!(
+            issue.message,
+            format!("runner.{field} is not supported when mode.runner is '{runner_mode}'")
+        );
+        assert_eq!(
+            issue.recovery_hint,
+            format!("Remove runner.{field} from the {runner_mode} runner configuration.")
+        );
     }
 
     fn assert_validation_issue(scenario: &str, expected_path: &str, expected_code: &str) {

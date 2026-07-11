@@ -1,6 +1,10 @@
 //! Integration tests for the `palyra qa` command family.
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -21,6 +25,25 @@ fn is_sha256(value: &str) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn run_live_gate(suite: &Path, output_path: &Path, allow_live: bool) -> Result<(Output, Value)> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_palyra"));
+    command
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite"])
+        .arg(suite)
+        .arg("--output-json")
+        .arg(output_path)
+        .arg("--json")
+        .env_remove("PALYRA_QA_LIVE_AUTH_PROFILE_ID");
+    if allow_live {
+        command.arg("--allow-live");
+    }
+    let output = command.output().context("failed to execute live QA gate")?;
+    let report = serde_json::from_slice(output.stdout.as_slice())
+        .context("live QA gate JSON output should parse")?;
+    Ok((output, report))
 }
 
 #[test]
@@ -244,7 +267,7 @@ fn qa_provider_compat_reports_failure_classes_and_recovery_paths() -> Result<()>
 }
 
 #[test]
-fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
+fn qa_gate_pr_smoke_writes_v3_reports_and_resumes_selectively() -> Result<()> {
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let json_path = temp_dir.path().join("qa-lab").join("pr-smoke.json");
     let markdown_path = temp_dir.path().join("qa-lab").join("pr-smoke.md");
@@ -254,6 +277,7 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         .arg(json_path.as_os_str())
         .arg("--output-markdown")
         .arg(markdown_path.as_os_str())
+        .arg("--resume")
         .arg("--json")
         .output()
         .context("failed to execute palyra qa gate")?;
@@ -273,8 +297,10 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         .context("qa gate should write Markdown report")?;
 
     assert_eq!(stdout_payload, file_payload, "stdout and JSON report should match");
-    assert_eq!(stdout_payload.pointer("/schema_version").and_then(Value::as_u64), Some(2));
+    assert_eq!(stdout_payload.pointer("/schema_version").and_then(Value::as_u64), Some(3));
     assert_eq!(stdout_payload.pointer("/decision").and_then(Value::as_str), Some("pass"));
+    assert_eq!(stdout_payload.pointer("/resume_requested").and_then(Value::as_bool), Some(true));
+    assert_eq!(stdout_payload.pointer("/force_rerun").and_then(Value::as_bool), Some(false));
     assert_eq!(
         stdout_payload.pointer("/artifact_reference_base").and_then(Value::as_str),
         Some(".")
@@ -284,8 +310,25 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         .get("scenarios")
         .and_then(Value::as_array)
         .context("real QA gate should include scenario executions")?;
-    assert_eq!(scenarios.len(), 4);
-    assert!(scenarios.iter().all(|scenario| {
+    assert_eq!(scenarios.len(), 5);
+    let executed_scenarios =
+        scenarios.iter().filter(|scenario| scenario.get("execution").is_some()).collect::<Vec<_>>();
+    assert_eq!(executed_scenarios.len(), 4);
+    let replay_scenario = scenarios
+        .iter()
+        .find(|scenario| scenario["id"].as_str() == Some("real_runtime.record_replay_text"))
+        .context("PR smoke report should include the filtered record-replay scenario")?;
+    assert_eq!(replay_scenario["status"].as_str(), Some("skipped"));
+    assert!(replay_scenario.get("execution").is_none());
+    assert!(stdout_payload
+        .pointer("/campaign_checkpoint/campaign_key")
+        .and_then(Value::as_str)
+        .is_some_and(is_sha256));
+    assert!(stdout_payload
+        .pointer("/campaign_checkpoint/checkpoint_artifact/sha256")
+        .and_then(Value::as_str)
+        .is_some_and(is_sha256));
+    assert!(executed_scenarios.iter().all(|scenario| {
         let execution = &scenario["execution"];
         execution["run_id"].as_str().is_some_and(|value| value.len() == 26)
             && execution["session_id"].as_str().is_some_and(|value| value.len() == 26)
@@ -304,7 +347,21 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
     assert!(markdown.contains("- Artifact reference base: `.`"));
     assert!(markdown.contains("## Maturity Scorecard"));
 
-    let first_references = scenarios
+    let first_attempts = executed_scenarios
+        .iter()
+        .map(|scenario| {
+            let id = scenario["id"].as_str().context("scenario report should contain an id")?;
+            let execution = &scenario["execution"];
+            let execution_id = execution["execution_id"]
+                .as_str()
+                .context("scenario execution should contain an execution id")?;
+            let result_path = execution["result_artifact"]["path"]
+                .as_str()
+                .context("scenario execution should reference its result artifact")?;
+            Ok((id.to_owned(), execution_id.to_owned(), result_path.to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first_references = executed_scenarios
         .iter()
         .flat_map(|scenario| {
             let execution = &scenario["execution"];
@@ -329,6 +386,7 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         .current_dir(repo_root())
         .args(["qa", "gate", "--suite", "qa/suites/pr_smoke.yaml", "--output-json"])
         .arg(second_json_path.as_os_str())
+        .arg("--resume")
         .arg("--json")
         .output()
         .context("failed to execute a second palyra qa gate")?;
@@ -337,17 +395,193 @@ fn qa_gate_pr_smoke_writes_json_and_markdown_reports() -> Result<()> {
         "second QA gate should pass: {}",
         String::from_utf8_lossy(&second_output.stderr)
     );
+    let second_payload: Value = serde_json::from_slice(second_output.stdout.as_slice())
+        .context("second QA gate JSON should parse")?;
+    let second_scenarios = second_payload
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .context("second QA gate should include scenario executions")?;
+    assert_eq!(second_scenarios.len(), scenarios.len());
+    for (scenario_id, execution_id, result_path) in &first_attempts {
+        let scenario = second_scenarios
+            .iter()
+            .find(|scenario| scenario["id"].as_str() == Some(scenario_id.as_str()))
+            .with_context(|| format!("second QA gate should include {scenario_id}"))?;
+        assert_eq!(scenario["reused"].as_bool(), Some(true));
+        assert_eq!(scenario["resume_reason_code"].as_str(), Some("qa.resume.passed_reused"));
+        assert_eq!(scenario["execution"]["execution_id"].as_str(), Some(execution_id.as_str()));
+        assert_eq!(
+            scenario["execution"]["result_artifact"]["path"].as_str(),
+            Some(result_path.as_str())
+        );
+    }
+
+    let artifact_root = json_path.parent().context("QA report should have a parent directory")?;
     for (relative_path, expected_hash) in first_references {
         assert!(!PathBuf::from(relative_path.as_str()).is_absolute());
-        let bytes = fs::read(
-            json_path
-                .parent()
-                .context("QA report should have a parent directory")?
-                .join(relative_path.as_str()),
-        )
-        .with_context(|| format!("failed to reopen referenced artifact {relative_path}"))?;
+        let bytes = fs::read(artifact_root.join(relative_path.as_str()))
+            .with_context(|| format!("failed to reopen referenced artifact {relative_path}"))?;
         assert_eq!(sha256_hex(bytes.as_slice()), expected_hash);
     }
+
+    let (corrupted_scenario_id, corrupted_execution_id, corrupted_result_path) = first_attempts
+        .first()
+        .cloned()
+        .context("PR smoke gate should execute at least one scenario")?;
+    assert!(!PathBuf::from(corrupted_result_path.as_str()).is_absolute());
+    fs::write(artifact_root.join(corrupted_result_path.as_str()), b"corrupted QA result")
+        .context("failed to corrupt one QA result artifact")?;
+
+    let third_json_path = temp_dir.path().join("qa-lab").join("pr-smoke-third.json");
+    let third_output = Command::new(env!("CARGO_BIN_EXE_palyra"))
+        .current_dir(repo_root())
+        .args(["qa", "gate", "--suite", "qa/suites/pr_smoke.yaml", "--output-json"])
+        .arg(third_json_path.as_os_str())
+        .arg("--resume")
+        .arg("--json")
+        .output()
+        .context("failed to execute a third palyra qa gate")?;
+    assert!(
+        third_output.status.success(),
+        "third QA gate should pass after rerunning one corrupt result: {}",
+        String::from_utf8_lossy(&third_output.stderr)
+    );
+    let third_payload: Value = serde_json::from_slice(third_output.stdout.as_slice())
+        .context("third QA gate JSON should parse")?;
+    let third_scenarios = third_payload
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .context("third QA gate should include scenario executions")?;
+    let mut rerun_count = 0;
+    let mut reused_count = 0;
+    for (scenario_id, execution_id, result_path) in &first_attempts {
+        let scenario = third_scenarios
+            .iter()
+            .find(|scenario| scenario["id"].as_str() == Some(scenario_id.as_str()))
+            .with_context(|| format!("third QA gate should include {scenario_id}"))?;
+        if scenario_id == &corrupted_scenario_id {
+            rerun_count += 1;
+            assert_eq!(scenario.get("reused").and_then(Value::as_bool), None);
+            assert_eq!(scenario["resume_reason_code"].as_str(), Some("qa.resume.result_untrusted"));
+            assert_ne!(
+                scenario["execution"]["execution_id"].as_str(),
+                Some(corrupted_execution_id.as_str())
+            );
+            assert_eq!(scenario["execution"]["attempt"]["generation"].as_u64(), Some(2));
+            assert_eq!(
+                scenario["execution"]["attempt"]["previous_result_artifact"]["path"].as_str(),
+                Some(corrupted_result_path.as_str())
+            );
+        } else {
+            reused_count += 1;
+            assert_eq!(scenario["reused"].as_bool(), Some(true));
+            assert_eq!(scenario["resume_reason_code"].as_str(), Some("qa.resume.passed_reused"));
+            assert_eq!(scenario["execution"]["execution_id"].as_str(), Some(execution_id.as_str()));
+            assert_eq!(
+                scenario["execution"]["result_artifact"]["path"].as_str(),
+                Some(result_path.as_str())
+            );
+        }
+    }
+    assert_eq!(rerun_count, 1);
+    assert_eq!(reused_count, first_attempts.len() - 1);
+
+    let checkpoint_path = third_payload
+        .pointer("/campaign_checkpoint/checkpoint_artifact/path")
+        .and_then(Value::as_str)
+        .context("third QA gate should reference its campaign checkpoint")?;
+    assert!(!PathBuf::from(checkpoint_path).is_absolute());
+    let checkpoint: Value = serde_json::from_slice(
+        fs::read(artifact_root.join(checkpoint_path))
+            .context("failed to read the latest campaign checkpoint")?
+            .as_slice(),
+    )
+    .context("campaign checkpoint JSON should parse")?;
+    assert_eq!(
+        checkpoint.pointer("/generation").and_then(Value::as_u64),
+        third_payload.pointer("/campaign_checkpoint/checkpoint_generation").and_then(Value::as_u64)
+    );
+    let entries = checkpoint
+        .pointer("/entries")
+        .and_then(Value::as_object)
+        .context("campaign checkpoint should retain scenario entries")?;
+    let corrupted_entry = entries
+        .values()
+        .find(|entry| entry["scenario_id"].as_str() == Some(corrupted_scenario_id.as_str()))
+        .context("campaign checkpoint should retain the rerun scenario")?;
+    let corrupted_history = corrupted_entry["attempts"]
+        .as_array()
+        .context("rerun checkpoint entry should retain attempt history")?;
+    assert_eq!(corrupted_history.len(), 2);
+    assert_eq!(
+        corrupted_history[0]["result_artifact"]["path"].as_str(),
+        Some(corrupted_result_path.as_str())
+    );
+    assert_eq!(
+        corrupted_history[1]["previous_result_artifact"]["path"].as_str(),
+        Some(corrupted_result_path.as_str())
+    );
+    assert_eq!(
+        entries
+            .values()
+            .filter(|entry| entry["scenario_id"].as_str() != Some(corrupted_scenario_id.as_str()))
+            .filter(|entry| entry["attempts"]
+                .as_array()
+                .is_some_and(|attempts| attempts.len() == 1))
+            .count(),
+        first_attempts.len() - 1
+    );
+    Ok(())
+}
+
+#[test]
+fn qa_gate_live_lane_requires_suite_cli_and_secret_profile_authorization() -> Result<()> {
+    let temp_dir = tempfile::tempdir().context("failed to create live gate temp dir")?;
+    let live_suite = repo_root().join("qa/suites/live_smoke.yaml");
+
+    let (cli_denied, cli_denied_report) =
+        run_live_gate(live_suite.as_path(), &temp_dir.path().join("cli-denied.json"), false)?;
+    assert!(!cli_denied.status.success());
+    assert_eq!(cli_denied_report.pointer("/decision").and_then(Value::as_str), Some("fail"));
+    assert_eq!(
+        cli_denied_report.pointer("/scenarios/0/status").and_then(Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        cli_denied_report.pointer("/scenarios/0/issue_codes/0").and_then(Value::as_str),
+        Some("qa.runner.live_not_enabled")
+    );
+
+    let suite_denied_path = temp_dir.path().join("suite-denied.yaml");
+    let suite_denied = fs::read_to_string(live_suite.as_path())
+        .context("failed to read live smoke suite")?
+        .replace("id: live_smoke", "id: live_smoke_suite_denied")
+        .replace("allow_live_providers: true", "allow_live_providers: false");
+    fs::write(suite_denied_path.as_path(), suite_denied)
+        .context("failed to write suite-denied live fixture")?;
+    let (suite_denied, suite_denied_report) = run_live_gate(
+        suite_denied_path.as_path(),
+        &temp_dir.path().join("suite-denied.json"),
+        true,
+    )?;
+    assert!(!suite_denied.status.success());
+    assert_eq!(
+        suite_denied_report.pointer("/scenarios/0/issue_codes/0").and_then(Value::as_str),
+        Some("qa.runner.live_not_enabled")
+    );
+
+    let (profile_denied, profile_denied_report) =
+        run_live_gate(live_suite.as_path(), &temp_dir.path().join("profile-denied.json"), true)?;
+    assert!(!profile_denied.status.success());
+    assert_eq!(
+        profile_denied_report.pointer("/scenarios/0/status").and_then(Value::as_str),
+        Some("fail")
+    );
+    assert_eq!(
+        profile_denied_report.pointer("/scenarios/0/issue_codes/0").and_then(Value::as_str),
+        Some("qa.runner.live_profile_unavailable")
+    );
+    assert!(profile_denied_report.pointer("/scenarios/0/execution").is_none());
     Ok(())
 }
 
@@ -751,7 +985,9 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
     );
     let payload: Value = serde_json::from_slice(output.stdout.as_slice())
         .context("qa gate release JSON should parse")?;
-    assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(2));
+    assert_eq!(payload.pointer("/schema_version").and_then(Value::as_u64), Some(3));
+    assert_eq!(payload.pointer("/summary/selected_count").and_then(Value::as_u64), Some(5));
+    assert_eq!(payload.pointer("/summary/passed").and_then(Value::as_u64), Some(5));
     let scorecard = payload
         .get("maturity_scorecard")
         .context("QA gate report should include maturity_scorecard")?;
@@ -765,6 +1001,15 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
     .context("golden QA maturity scorecard should parse")?;
 
     assert_eq!(scorecard, &golden, "release maturity scorecard drifted");
+    let replay = scorecard["categories"]
+        .as_array()
+        .and_then(|categories| {
+            categories.iter().find(|category| category["id"].as_str() == Some("replay"))
+        })
+        .context("release scorecard should include the record-replay category")?;
+    assert_eq!(replay["total"].as_u64(), Some(1));
+    assert_eq!(replay["passed"].as_u64(), Some(1));
+    assert_eq!(replay["score_bps"].as_u64(), Some(10_000));
     Ok(())
 }
 
@@ -772,9 +1017,9 @@ fn qa_gate_release_scorecard_matches_snapshot() -> Result<()> {
 fn qa_gate_rejects_legacy_suite_as_schema_preview_instead_of_simulating_runtime() -> Result<()> {
     let output = Command::new(env!("CARGO_BIN_EXE_palyra"))
         .current_dir(repo_root())
-        .args(["qa", "gate", "--suite", "qa/suites/nightly.yaml", "--json"])
+        .args(["qa", "gate", "--suite", "qa/suites/nightly_schema_preview.yaml", "--json"])
         .output()
-        .context("failed to execute legacy nightly gate")?;
+        .context("failed to execute legacy nightly schema-preview gate")?;
 
     assert!(!output.status.success(), "schema preview must not qualify as a runtime gate");
     let payload: Value = serde_json::from_slice(output.stdout.as_slice())

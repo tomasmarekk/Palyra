@@ -68,6 +68,7 @@ maturity:
     - p0
     - release_smoke
     - real_runtime
+    - nightly
     - deterministic
     - approval_denied
 timeout:

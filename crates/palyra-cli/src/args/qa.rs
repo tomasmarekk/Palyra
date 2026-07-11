@@ -41,6 +41,12 @@ pub enum QaCommand {
         output_markdown: Option<String>,
         #[arg(long, default_value_t = false)]
         allow_live: bool,
+        /// Reuse compatible passed attempts according to the suite policy.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+        /// Run every selected scenario as a new attempt generation.
+        #[arg(long, default_value_t = false)]
+        force_rerun: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },

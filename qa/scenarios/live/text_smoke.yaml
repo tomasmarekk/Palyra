@@ -1,0 +1,57 @@
+# This scenario runs only when both the suite and CLI explicitly allow live providers.
+schema_version: 3
+id: live.text_smoke
+title: Live provider text smoke through the isolated runtime
+area: text
+mode:
+  runner: live
+  deterministic: false
+runner:
+  secret_profile_env: PALYRA_QA_LIVE_AUTH_PROFILE_ID
+  provider_kind: openai_compatible
+  model: gpt-4.1-mini
+  raw_payload_storage: false
+  policy_profile: qa_no_tools
+requires:
+  model: text
+  capabilities:
+    - agent_run
+    - qa_lab
+    - live_provider
+  tools: []
+  fixtures: []
+steps:
+  - id: prompt
+    action: user_prompt
+    prompt: "Reply with exactly LIVE_OK."
+expect:
+  terminal_state: completed
+  final_answer:
+    contains:
+      - LIVE_OK
+  events:
+    - event_type: run.started
+      min_count: 1
+    - event_type: run.completed
+      min_count: 1
+  tool_calls: []
+forbidden:
+  tool_calls:
+    - "*"
+  events:
+    - run.failed
+    - secret.exposed
+  artifacts: []
+  claims: []
+artifacts:
+  - path: qa/reports/live/text_smoke.evidence.json
+    kind: evidence
+    required: true
+maturity:
+  labels:
+    - live
+    - real_runtime
+    - text_only
+timeout:
+  run_ms: 120000
+  step_ms: 30000

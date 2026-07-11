@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::{
     errors::provider_failure_classification, invalid_response_classification,
-    provider_events_from_output, retry_provider_classification,
+    provider_events_from_output, redact_remote_secret_fragments, retry_provider_classification,
     retryable_invalid_response_classification, sanitize_remote_error, ProviderError, ProviderEvent,
     ProviderFailureAction, ProviderFailureClass, ProviderFinishReason, ProviderMessageRole,
     ProviderRawProviderRefs, ProviderRequest, ProviderStreamAccumulator, ProviderStreamEvent,
@@ -18,7 +18,13 @@ use crate::{
 };
 
 /// Current QA mock-provider fixture schema version.
-pub const QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION: u32 = 1;
+pub const QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION: u32 = 2;
+
+/// Required redaction contract for record-replay provider captures.
+pub const QA_MOCK_PROVIDER_REDACTION_CONTRACT: &str = "palyra-provider-replay.v1";
+
+/// Maximum length of a provider or model provenance label.
+pub const MAX_QA_MOCK_PROVIDER_PROVENANCE_LABEL_LEN: usize = 64;
 
 /// Stable format label embedded in fixture schema snapshots.
 pub const QA_MOCK_PROVIDER_FIXTURE_FORMAT: &str = "palyra-qa-mock-provider-fixture";
@@ -51,6 +57,7 @@ const RETRYABLE_INTERMEDIATE_BEHAVIOR_KIND_VALUES: &[&str] =
     &["malformed_output", "malformed_tool_args", "stream_error"];
 const SUCCESS_CAPABLE_TERMINAL_BEHAVIOR_KIND_VALUES: &[&str] =
     &["text", "tool_calls", "empty", "approval_required"];
+const SUPPORTED_FIXTURE_SCHEMA_VERSIONS: &[u32] = &[1, QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION];
 
 /// Parsed and validated QA mock-provider fixture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,8 +66,61 @@ pub struct QaMockProviderFixture {
     pub schema_version: u32,
     /// Stable fixture identifier.
     pub id: String,
+    /// Redacted capture provenance required by schema-v2 replay fixtures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_provenance: Option<QaMockProviderCaptureProvenance>,
     /// Ordered turns; the first matching turn is selected for a request.
     pub turns: Vec<QaMockProviderTurn>,
+}
+
+impl QaMockProviderFixture {
+    /// Returns validated redacted capture provenance for replay fixtures.
+    #[must_use]
+    pub fn capture_provenance(&self) -> Option<&QaMockProviderCaptureProvenance> {
+        self.capture_provenance.as_ref()
+    }
+}
+
+/// Validated, secret-free identity of a provider capture used for replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QaMockProviderCaptureProvenance {
+    provider_label: String,
+    model_label: String,
+    source_capture_sha256: String,
+    redaction_contract: String,
+    raw_payloads_stored: bool,
+}
+
+impl QaMockProviderCaptureProvenance {
+    /// Returns the bounded provider family label.
+    #[must_use]
+    pub fn provider_label(&self) -> &str {
+        self.provider_label.as_str()
+    }
+
+    /// Returns the bounded provider model label.
+    #[must_use]
+    pub fn model_label(&self) -> &str {
+        self.model_label.as_str()
+    }
+
+    /// Returns the lowercase SHA-256 digest identifying the redacted source capture.
+    #[must_use]
+    pub fn source_capture_sha256(&self) -> &str {
+        self.source_capture_sha256.as_str()
+    }
+
+    /// Returns the redaction contract applied before fixture persistence.
+    #[must_use]
+    pub fn redaction_contract(&self) -> &str {
+        self.redaction_contract.as_str()
+    }
+
+    /// Returns whether raw provider payloads were retained in the fixture.
+    #[must_use]
+    pub const fn raw_payloads_stored(&self) -> bool {
+        self.raw_payloads_stored
+    }
 }
 
 /// One deterministic provider turn from a QA fixture.
@@ -353,7 +413,19 @@ impl Error for QaMockProviderFixtureError {
 struct QaMockProviderFixtureWire {
     schema_version: Option<u32>,
     id: Option<String>,
+    #[serde(default)]
+    capture_provenance: Option<QaMockProviderCaptureProvenanceWire>,
     turns: Option<Vec<QaMockProviderTurnWire>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QaMockProviderCaptureProvenanceWire {
+    provider_label: Option<String>,
+    model_label: Option<String>,
+    source_capture_sha256: Option<String>,
+    redaction_contract: Option<String>,
+    raw_payloads_stored: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -434,8 +506,28 @@ pub fn qa_mock_provider_fixture_schema_snapshot() -> Value {
         "required_sections": [
             "schema_version",
             "id",
+            "capture_provenance",
             "turns"
         ],
+        "supported_schema_versions": SUPPORTED_FIXTURE_SCHEMA_VERSIONS,
+        "capture_provenance_contract": {
+            "required_from_schema_version": 2,
+            "schema_v1_serialization": "omitted",
+            "fields": [
+                "provider_label",
+                "model_label",
+                "source_capture_sha256",
+                "redaction_contract",
+                "raw_payloads_stored"
+            ],
+            "label_max_chars": MAX_QA_MOCK_PROVIDER_PROVENANCE_LABEL_LEN,
+            "source_capture_sha256": {
+                "encoding": "lowercase_hex",
+                "length": 64
+            },
+            "redaction_contract": QA_MOCK_PROVIDER_REDACTION_CONTRACT,
+            "raw_payloads_stored": false
+        },
         "behavior_kinds": BEHAVIOR_KIND_VALUES,
         "finish_reasons": FINISH_REASON_VALUES,
         "execution_contract": {
@@ -705,12 +797,15 @@ fn build_validated_fixture(
     let mut issues = Vec::new();
     let schema_version = validate_schema_version(wire.schema_version, &mut issues);
     let id = validate_required_slug(wire.id, "$.id", "fixture id", &mut issues);
+    let capture_provenance =
+        validate_capture_provenance(wire.capture_provenance, schema_version, &mut issues);
     let turns = validate_turns(wire.turns, &mut issues);
 
     if issues.is_empty() {
         Ok(QaMockProviderFixture {
             schema_version: schema_version.unwrap_or(QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION),
             id: id.unwrap_or_default(),
+            capture_provenance,
             turns: turns.unwrap_or_default(),
         })
     } else {
@@ -723,16 +818,19 @@ fn validate_schema_version(
     issues: &mut Vec<QaMockProviderFixtureIssue>,
 ) -> Option<u32> {
     match value {
-        Some(QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION) => {
-            Some(QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION)
-        }
+        Some(version) if SUPPORTED_FIXTURE_SCHEMA_VERSIONS.contains(&version) => Some(version),
         Some(value) => {
             push_issue(
                 issues,
                 "unsupported_schema_version",
                 "$.schema_version",
                 format!(
-                    "schema_version must be {QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION}, got {value}"
+                    "schema_version must be one of {}, got {value}",
+                    SUPPORTED_FIXTURE_SCHEMA_VERSIONS
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 "Update the fixture to the supported QA mock-provider schema version.",
             );
@@ -745,6 +843,226 @@ fn validate_schema_version(
                 "$.schema_version",
                 "schema_version is required",
                 "Add the supported QA mock-provider schema version.",
+            );
+            None
+        }
+    }
+}
+
+fn validate_capture_provenance(
+    value: Option<QaMockProviderCaptureProvenanceWire>,
+    schema_version: Option<u32>,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<QaMockProviderCaptureProvenance> {
+    match schema_version {
+        Some(1) => {
+            if value.is_some() {
+                push_issue(
+                    issues,
+                    "capture_provenance_requires_schema_v2",
+                    "$.capture_provenance",
+                    "capture provenance is not supported by schema_version 1",
+                    "Remove capture_provenance or migrate the fixture to schema_version 2.",
+                );
+            }
+            None
+        }
+        Some(QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION) => {
+            let Some(value) = value else {
+                push_issue(
+                    issues,
+                    "missing_capture_provenance",
+                    "$.capture_provenance",
+                    "schema_version 2 requires redacted capture provenance",
+                    "Add a typed capture_provenance section with raw_payloads_stored set to false.",
+                );
+                return None;
+            };
+            let provider_label = validate_capture_provenance_label(
+                value.provider_label,
+                "$.capture_provenance.provider_label",
+                "provider label",
+                issues,
+            );
+            let model_label = validate_capture_provenance_label(
+                value.model_label,
+                "$.capture_provenance.model_label",
+                "model label",
+                issues,
+            );
+            let source_capture_sha256 =
+                validate_source_capture_sha256(value.source_capture_sha256, issues);
+            let redaction_contract =
+                validate_capture_redaction_contract(value.redaction_contract, issues);
+            let raw_payloads_stored =
+                validate_raw_payloads_not_stored(value.raw_payloads_stored, issues);
+
+            match (
+                provider_label,
+                model_label,
+                source_capture_sha256,
+                redaction_contract,
+                raw_payloads_stored,
+            ) {
+                (
+                    Some(provider_label),
+                    Some(model_label),
+                    Some(source_capture_sha256),
+                    Some(redaction_contract),
+                    Some(raw_payloads_stored),
+                ) => Some(QaMockProviderCaptureProvenance {
+                    provider_label,
+                    model_label,
+                    source_capture_sha256,
+                    redaction_contract,
+                    raw_payloads_stored,
+                }),
+                _ => None,
+            }
+        }
+        Some(_) | None => None,
+    }
+}
+
+fn validate_capture_provenance_label(
+    value: Option<String>,
+    path: &str,
+    label: &str,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<String> {
+    let value = validate_required_string(value, path, label, issues)?;
+    if value.chars().count() > MAX_QA_MOCK_PROVIDER_PROVENANCE_LABEL_LEN {
+        push_issue(
+            issues,
+            "capture_provenance_label_too_long",
+            path,
+            format!(
+                "{label} must contain at most {MAX_QA_MOCK_PROVIDER_PROVENANCE_LABEL_LEN} characters"
+            ),
+            format!("Shorten the {label} to a bounded non-sensitive identifier."),
+        );
+        return None;
+    }
+    if !is_slug(value.as_str()) {
+        push_issue(
+            issues,
+            "invalid_capture_provenance_label",
+            path,
+            format!("{label} must use lowercase ASCII letters, digits, '.', '_' or '-'"),
+            format!("Replace the {label} with a safe lowercase slug."),
+        );
+        return None;
+    }
+    if capture_provenance_label_looks_secret_shaped(value.as_str()) {
+        push_issue(
+            issues,
+            "secret_shaped_capture_provenance_label",
+            path,
+            format!("{label} must identify a provider or model without credential-shaped text"),
+            format!("Replace the {label} with a non-sensitive descriptive slug."),
+        );
+        return None;
+    }
+    Some(value)
+}
+
+fn capture_provenance_label_looks_secret_shaped(value: &str) -> bool {
+    const SENSITIVE_MARKERS: &[&str] = &[
+        "api-key",
+        "apikey",
+        "secret",
+        "token",
+        "bearer",
+        "password",
+        "credential",
+        "private-key",
+        "access-key",
+    ];
+    const SENSITIVE_PREFIXES: &[&str] =
+        &["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "ya29.", "eyj"];
+
+    let normalized = value.replace(['.', '_'], "-");
+    redact_remote_secret_fragments(value) != value
+        || SENSITIVE_PREFIXES.iter().any(|prefix| value.starts_with(prefix))
+        || SENSITIVE_MARKERS.iter().any(|marker| {
+            normalized == *marker
+                || normalized.starts_with(format!("{marker}-").as_str())
+                || normalized.ends_with(format!("-{marker}").as_str())
+                || normalized.contains(format!("-{marker}-").as_str())
+        })
+}
+
+fn validate_source_capture_sha256(
+    value: Option<String>,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<String> {
+    let value = validate_required_string(
+        value,
+        "$.capture_provenance.source_capture_sha256",
+        "source capture sha256",
+        issues,
+    )?;
+    if value.len() == 64
+        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Some(value);
+    }
+    push_issue(
+        issues,
+        "invalid_source_capture_sha256",
+        "$.capture_provenance.source_capture_sha256",
+        "source capture SHA-256 must contain exactly 64 lowercase hexadecimal characters",
+        "Replace source_capture_sha256 with the lowercase digest of the redacted source capture.",
+    );
+    None
+}
+
+fn validate_capture_redaction_contract(
+    value: Option<String>,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<String> {
+    let value = validate_required_string(
+        value,
+        "$.capture_provenance.redaction_contract",
+        "redaction contract",
+        issues,
+    )?;
+    if value == QA_MOCK_PROVIDER_REDACTION_CONTRACT {
+        return Some(value);
+    }
+    push_issue(
+        issues,
+        "unsupported_capture_redaction_contract",
+        "$.capture_provenance.redaction_contract",
+        "capture provenance uses an unsupported redaction contract",
+        format!("Set redaction_contract to {QA_MOCK_PROVIDER_REDACTION_CONTRACT}."),
+    );
+    None
+}
+
+fn validate_raw_payloads_not_stored(
+    value: Option<bool>,
+    issues: &mut Vec<QaMockProviderFixtureIssue>,
+) -> Option<bool> {
+    match value {
+        Some(false) => Some(false),
+        Some(true) => {
+            push_issue(
+                issues,
+                "raw_provider_payload_storage_forbidden",
+                "$.capture_provenance.raw_payloads_stored",
+                "record-replay fixtures must not retain raw provider payloads",
+                "Set raw_payloads_stored to false and persist only the redacted replay projection.",
+            );
+            None
+        }
+        None => {
+            push_issue(
+                issues,
+                "missing_raw_payloads_stored",
+                "$.capture_provenance.raw_payloads_stored",
+                "capture provenance requires an explicit raw payload storage posture",
+                "Set raw_payloads_stored to false.",
             );
             None
         }
@@ -1431,12 +1749,24 @@ fn push_issue(
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::{ProviderMessage, ProviderMessageContentPart};
 
     const EXAMPLE_FIXTURE: &str = include_str!("../../../qa/fixtures/provider_basic.yaml");
     const RETRY_FIXTURE: &str = include_str!("../../../qa/fixtures/provider_retry_recovery.yaml");
+    const RECORD_REPLAY_FIXTURE: &str =
+        include_str!("../../../qa/fixtures/record_replay/real_agent_runner_replay.yaml");
+    const RECORD_REPLAY_SOURCE: &[u8] =
+        include_bytes!("../../../qa/fixtures/real_agent_runner.yaml");
+    const CAPTURE_PROVENANCE_BLOCK: &str = r#"capture_provenance:
+  provider_label: palyra-qa-mock
+  model_label: deterministic-agent-runner
+  source_capture_sha256: 5419d3ca2450b8cb8fa2f9664261ff4e68fdd8dadf10c37f39ded05c7378f933
+  redaction_contract: palyra-provider-replay.v1
+  raw_payloads_stored: false
+"#;
     const SCHEMA_GOLDEN: &str =
         include_str!("../../../fixtures/golden/qa_mock_provider_fixture_schema.json");
 
@@ -1468,6 +1798,181 @@ mod tests {
             .any(|event| matches!(event, ProviderStreamEvent::Delta { text } if text.contains("friendly"))));
         assert!(output.full_text.contains("friendly"));
         assert_eq!(output.usage.source, "qa_mock_fixture");
+    }
+
+    #[test]
+    fn schema_v1_round_trips_without_capture_provenance() {
+        let fixture = parse_qa_mock_provider_fixture_yaml(EXAMPLE_FIXTURE)
+            .expect("schema-v1 fixture should remain valid");
+
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(fixture.capture_provenance(), None);
+
+        let json = serde_json::to_string(&fixture).expect("schema-v1 fixture should serialize");
+        let json_value: Value = serde_json::from_str(json.as_str())
+            .expect("serialized schema-v1 fixture should be valid JSON");
+        assert_eq!(json_value.get("capture_provenance"), None);
+        assert_eq!(
+            parse_qa_mock_provider_fixture_yaml(json.as_str())
+                .expect("schema-v1 JSON projection should parse"),
+            fixture
+        );
+
+        let yaml = yaml_serde::to_string(&fixture).expect("schema-v1 fixture should serialize");
+        assert_eq!(
+            parse_qa_mock_provider_fixture_yaml(yaml.as_str())
+                .expect("schema-v1 YAML projection should parse"),
+            fixture
+        );
+    }
+
+    #[test]
+    fn schema_v2_record_replay_fixture_round_trips_with_safe_provenance() {
+        let fixture = parse_qa_mock_provider_fixture_yaml(RECORD_REPLAY_FIXTURE)
+            .expect("schema-v2 record-replay fixture should parse");
+        let provenance = fixture
+            .capture_provenance()
+            .expect("schema-v2 fixture should expose capture provenance");
+
+        assert_eq!(fixture.schema_version, QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION);
+        assert_eq!(provenance.provider_label(), "palyra-qa-mock");
+        assert_eq!(provenance.model_label(), "deterministic-agent-runner");
+        let source_digest = Sha256::digest(RECORD_REPLAY_SOURCE)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(provenance.source_capture_sha256(), source_digest);
+        assert_eq!(provenance.redaction_contract(), QA_MOCK_PROVIDER_REDACTION_CONTRACT);
+        assert!(!provenance.raw_payloads_stored());
+
+        let json = serde_json::to_string(&fixture).expect("schema-v2 fixture should serialize");
+        assert_eq!(
+            parse_qa_mock_provider_fixture_yaml(json.as_str())
+                .expect("schema-v2 JSON projection should parse"),
+            fixture
+        );
+        let yaml = yaml_serde::to_string(&fixture).expect("schema-v2 fixture should serialize");
+        assert_eq!(
+            parse_qa_mock_provider_fixture_yaml(yaml.as_str())
+                .expect("schema-v2 YAML projection should parse"),
+            fixture
+        );
+    }
+
+    #[test]
+    fn schema_versions_enforce_capture_provenance_boundary() {
+        let missing_v2 = RECORD_REPLAY_FIXTURE.replace(CAPTURE_PROVENANCE_BLOCK, "");
+        assert_fixture_issue(
+            missing_v2.as_str(),
+            "$.capture_provenance",
+            "missing_capture_provenance",
+        );
+
+        let provenance_on_v1 =
+            RECORD_REPLAY_FIXTURE.replace("schema_version: 2", "schema_version: 1");
+        assert_fixture_issue(
+            provenance_on_v1.as_str(),
+            "$.capture_provenance",
+            "capture_provenance_requires_schema_v2",
+        );
+    }
+
+    #[test]
+    fn schema_v2_requires_every_capture_provenance_field() {
+        for (line, path, code) in [
+            (
+                "  provider_label: palyra-qa-mock\n",
+                "$.capture_provenance.provider_label",
+                "missing_provider_label",
+            ),
+            (
+                "  model_label: deterministic-agent-runner\n",
+                "$.capture_provenance.model_label",
+                "missing_model_label",
+            ),
+            (
+                "  source_capture_sha256: 5419d3ca2450b8cb8fa2f9664261ff4e68fdd8dadf10c37f39ded05c7378f933\n",
+                "$.capture_provenance.source_capture_sha256",
+                "missing_source_capture_sha256",
+            ),
+            (
+                "  redaction_contract: palyra-provider-replay.v1\n",
+                "$.capture_provenance.redaction_contract",
+                "missing_redaction_contract",
+            ),
+            (
+                "  raw_payloads_stored: false\n",
+                "$.capture_provenance.raw_payloads_stored",
+                "missing_raw_payloads_stored",
+            ),
+        ] {
+            let fixture = RECORD_REPLAY_FIXTURE.replace(line, "");
+            assert_fixture_issue(fixture.as_str(), path, code);
+        }
+    }
+
+    #[test]
+    fn schema_v2_rejects_raw_payload_storage_and_invalid_capture_contracts() {
+        let raw_payloads = RECORD_REPLAY_FIXTURE
+            .replace("raw_payloads_stored: false", "raw_payloads_stored: true");
+        assert_fixture_issue(
+            raw_payloads.as_str(),
+            "$.capture_provenance.raw_payloads_stored",
+            "raw_provider_payload_storage_forbidden",
+        );
+
+        let uppercase_digest = RECORD_REPLAY_FIXTURE.replace(
+            "5419d3ca2450b8cb8fa2f9664261ff4e68fdd8dadf10c37f39ded05c7378f933",
+            "5419D3CA2450B8CB8FA2F9664261FF4E68FDD8DADF10C37F39DED05C7378F933",
+        );
+        assert_fixture_issue(
+            uppercase_digest.as_str(),
+            "$.capture_provenance.source_capture_sha256",
+            "invalid_source_capture_sha256",
+        );
+
+        let unsupported_contract =
+            RECORD_REPLAY_FIXTURE.replace("palyra-provider-replay.v1", "palyra-provider-replay.v2");
+        assert_fixture_issue(
+            unsupported_contract.as_str(),
+            "$.capture_provenance.redaction_contract",
+            "unsupported_capture_redaction_contract",
+        );
+    }
+
+    #[test]
+    fn schema_v2_rejects_secret_shaped_or_unsafe_capture_labels() {
+        for secret_label in ["sk-secret1234567890", "ghp_1234567890abcdef"] {
+            let fixture = RECORD_REPLAY_FIXTURE.replace("palyra-qa-mock", secret_label);
+            assert_fixture_issue(
+                fixture.as_str(),
+                "$.capture_provenance.provider_label",
+                "secret_shaped_capture_provenance_label",
+            );
+        }
+
+        for unsafe_label in [r#""../unsafe""#, r#""provider\ncontrol""#] {
+            let fixture = RECORD_REPLAY_FIXTURE.replace(
+                "model_label: deterministic-agent-runner",
+                format!("model_label: {unsafe_label}").as_str(),
+            );
+            assert_fixture_issue(
+                fixture.as_str(),
+                "$.capture_provenance.model_label",
+                "invalid_capture_provenance_label",
+            );
+        }
+
+        let oversized_label = "a".repeat(MAX_QA_MOCK_PROVIDER_PROVENANCE_LABEL_LEN + 1);
+        let fixture = RECORD_REPLAY_FIXTURE.replace(
+            "model_label: deterministic-agent-runner",
+            format!("model_label: {oversized_label}").as_str(),
+        );
+        assert_fixture_issue(
+            fixture.as_str(),
+            "$.capture_provenance.model_label",
+            "capture_provenance_label_too_long",
+        );
     }
 
     #[test]
@@ -1841,8 +2346,9 @@ turns:
     #[test]
     fn empty_behavior_projects_no_text_or_tools() {
         let fixture = QaMockProviderFixture {
-            schema_version: QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
+            schema_version: 1,
             id: "qa.mock.empty".to_owned(),
+            capture_provenance: None,
             turns: vec![QaMockProviderTurn {
                 id: "empty".to_owned(),
                 matcher: QaMockProviderTurnMatcher {
@@ -1884,5 +2390,16 @@ turns:
         };
 
         assert_eq!(tool_call.input_json["text"], "hello");
+    }
+
+    fn assert_fixture_issue(fixture: &str, expected_path: &str, expected_code: &str) {
+        let error = parse_qa_mock_provider_fixture_yaml(fixture)
+            .expect_err("fixture should fail validation");
+        let issues = error.issues().expect("validation issues should be available");
+
+        assert!(
+            issues.iter().any(|issue| issue.path == expected_path && issue.code == expected_code),
+            "missing issue code={expected_code} path={expected_path}; issues={issues:?}"
+        );
     }
 }

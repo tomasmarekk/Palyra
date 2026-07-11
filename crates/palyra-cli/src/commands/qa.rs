@@ -1,6 +1,16 @@
 //! `palyra qa`: schema previews and runtime-backed QA Lab qualification gates.
 
-use super::qa_runner::{execute_fixture_scenario, QaScenarioExecutionReport};
+use super::{
+    qa_checkpoint::{
+        QaAttemptCompletion, QaCampaignCheckpointReport, QaCampaignIdentity, QaCheckpointStore,
+        QaResumeDecision, QaResumePolicy,
+    },
+    qa_runner::{
+        execute_prepared_scenario, load_execution_report, prepare_scenario_execution,
+        qa_runner_version, recover_execution_report, scenario_result_artifact_path,
+        QaPreparedScenarioExecution, QaScenarioExecutionReport, QaScenarioExecutionRequest,
+    },
+};
 use crate::*;
 use palyra_common::{
     qa_evidence::{
@@ -20,6 +30,7 @@ use palyra_model_providers::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use ulid::Ulid;
 
 /// Runs a `palyra qa` subcommand.
 ///
@@ -35,11 +46,21 @@ pub(crate) fn run_qa(command: QaCommand) -> Result<()> {
         QaCommand::ProviderCompat { path, output, json } => {
             run_provider_compat(Path::new(path.as_str()), output.as_deref(), json)
         }
-        QaCommand::Gate { suite, output_json, output_markdown, allow_live, json } => run_gate(
+        QaCommand::Gate {
+            suite,
+            output_json,
+            output_markdown,
+            allow_live,
+            resume,
+            force_rerun,
+            json,
+        } => run_gate(
             Path::new(suite.as_str()),
             output_json.as_deref(),
             output_markdown.as_deref(),
             allow_live,
+            resume,
+            force_rerun,
             json,
         ),
     }
@@ -101,6 +122,10 @@ struct QaPackScenarioReport {
     sandbox_cleanup_verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     execution: Option<QaScenarioExecutionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_reason_code: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    reused: bool,
     reason: Option<String>,
 }
 
@@ -116,7 +141,7 @@ struct QaProviderCompatReport {
     packs: Vec<ProviderCompatPackReport>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct QaSuiteConfig {
     schema_version: u32,
     id: String,
@@ -133,6 +158,8 @@ struct QaSuiteConfig {
     #[serde(default)]
     allow_live_providers: bool,
     #[serde(default)]
+    resume: Option<QaResumePolicyConfig>,
+    #[serde(default)]
     require_p0_green: bool,
     #[serde(default)]
     available_capabilities: Vec<String>,
@@ -143,13 +170,24 @@ struct QaSuiteConfig {
     scorecard: QaScorecardConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QaResumePolicyConfig {
+    enabled: bool,
+    reuse_passed: bool,
+    rerun_failed: bool,
+    rerun_partial: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QaCapabilitySkipConfig {
     capability: String,
     reason: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QaFlakyPolicyConfig {
     max_retries: u32,
     fail_on_flaky: bool,
@@ -162,7 +200,8 @@ impl Default for QaFlakyPolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QaScorecardConfig {
     #[serde(default)]
     baseline_score_bps: Option<u32>,
@@ -171,7 +210,8 @@ struct QaScorecardConfig {
     categories: Vec<QaScorecardCategoryConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct QaScorecardCategoryConfig {
     id: String,
     label: String,
@@ -194,6 +234,9 @@ struct QaGateReport {
     artifact_reference_base: String,
     suite_path: String,
     scenario_roots: Vec<String>,
+    resume_requested: bool,
+    force_rerun: bool,
+    campaign_checkpoint: QaCampaignCheckpointReport,
     decision: QaGateDecision,
     summary: QaGateSummary,
     flaky_policy: QaFlakyPolicyConfig,
@@ -269,6 +312,10 @@ enum QaPackScenarioStatus {
     Fail,
     Skipped,
     Unsupported,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl QaPackScenarioStatus {
@@ -406,15 +453,19 @@ fn run_gate(
     output_json: Option<&str>,
     output_markdown: Option<&str>,
     allow_live: bool,
+    resume: bool,
+    force_rerun: bool,
     json: bool,
 ) -> Result<()> {
     validate_gate_output_directories(output_json, output_markdown)?;
     let artifact_root = gate_artifact_root(output_json, output_markdown);
     let artifact_reference_base = gate_artifact_reference_base(output_json, output_markdown);
     let runtime = build_runtime()?;
-    let report = runtime.block_on(build_gate_report(
+    let (report, _checkpoint_store) = runtime.block_on(build_gate_report(
         suite_path,
         allow_live,
+        resume,
+        force_rerun,
         artifact_root.as_path(),
         artifact_reference_base,
     ))?;
@@ -501,10 +552,27 @@ fn gate_artifact_reference_base(
 async fn build_gate_report(
     suite_path: &Path,
     allow_live: bool,
+    resume: bool,
+    force_rerun: bool,
     artifact_root: &Path,
     artifact_reference_base: &str,
-) -> Result<QaGateReport> {
+) -> Result<(QaGateReport, QaCheckpointStore)> {
     let suite = load_suite_config(suite_path)?;
+    let normalized_suite =
+        serde_json::to_vec(&suite).context("qa.resume.suite_normalization_failed")?;
+    let campaign_identity = QaCampaignIdentity::new(
+        suite.id.as_str(),
+        normalized_suite.as_slice(),
+        qa_runner_version().as_str(),
+    )?;
+    let mut checkpoint_store = QaCheckpointStore::load(artifact_root, campaign_identity)?;
+    let resume_policy = suite.resume.as_ref().map_or(
+        QaResumePolicy { enabled: false, reuse_passed: false },
+        |policy| QaResumePolicy {
+            enabled: resume && policy.enabled,
+            reuse_passed: policy.reuse_passed,
+        },
+    );
     let scenario_paths = collect_suite_scenario_paths(&suite)?;
     let available_capabilities =
         suite.available_capabilities.iter().cloned().collect::<BTreeSet<_>>();
@@ -513,20 +581,27 @@ async fn build_gate_report(
         .iter()
         .map(|skip| (skip.capability.clone(), skip.reason.clone()))
         .collect::<BTreeMap<_, _>>();
+    let scenario_context = QaGateScenarioContext {
+        suite: &suite,
+        available_capabilities: &available_capabilities,
+        capability_skip_reasons: &capability_skip_reasons,
+        allow_live,
+        resume_policy,
+        force_rerun,
+        artifact_root,
+    };
     let mut scenarios = Vec::with_capacity(scenario_paths.len());
     for scenario_path in scenario_paths {
         scenarios.push(
             build_gate_scenario_report(
                 scenario_path.as_path(),
-                &suite,
-                &available_capabilities,
-                &capability_skip_reasons,
-                allow_live,
-                artifact_root,
+                &scenario_context,
+                &mut checkpoint_store,
             )
             .await,
         );
     }
+    scenarios.sort_by(|left, right| left.id.cmp(&right.id).then(left.path.cmp(&right.path)));
     let summary = build_gate_summary(&scenarios);
     let mut policy_violations = skip_reason_policy_violations(&scenarios);
     policy_violations.extend(schema_preview_policy_violations(&scenarios));
@@ -559,8 +634,8 @@ async fn build_gate_report(
         } else {
             QaGateDecision::Fail
         };
-    Ok(QaGateReport {
-        schema_version: 2,
+    let report = QaGateReport {
+        schema_version: 3,
         format: "palyra-qa-gate-report",
         suite_id: suite.id,
         suite_mode: suite.mode,
@@ -571,26 +646,73 @@ async fn build_gate_report(
             .iter()
             .map(|root| report_path(Path::new(root)))
             .collect(),
+        resume_requested: resume,
+        force_rerun,
+        campaign_checkpoint: checkpoint_store.report(),
         decision,
         summary,
         flaky_policy: suite.flaky_policy,
         policy_violations,
         maturity_scorecard,
         scenarios,
-    })
+    };
+    Ok((report, checkpoint_store))
+}
+
+struct QaGateScenarioContext<'a> {
+    suite: &'a QaSuiteConfig,
+    available_capabilities: &'a BTreeSet<String>,
+    capability_skip_reasons: &'a BTreeMap<String, String>,
+    allow_live: bool,
+    resume_policy: QaResumePolicy,
+    force_rerun: bool,
+    artifact_root: &'a Path,
 }
 
 fn load_suite_config(path: &Path) -> Result<QaSuiteConfig> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read QA suite {}", path.display()))?;
+    let raw = yaml_serde::from_str::<serde_json::Value>(text.as_str())
+        .with_context(|| format!("failed to parse QA suite {}", path.display()))?;
+    validate_suite_v2_fields(&raw, path)?;
     let suite = yaml_serde::from_str::<QaSuiteConfig>(text.as_str())
         .with_context(|| format!("failed to parse QA suite {}", path.display()))?;
     validate_suite_config(&suite, path)?;
     Ok(suite)
 }
 
+fn validate_suite_v2_fields(value: &serde_json::Value, path: &Path) -> Result<()> {
+    if value.get("schema_version").and_then(serde_json::Value::as_u64) != Some(2) {
+        return Ok(());
+    }
+    const FIELDS: &[&str] = &[
+        "schema_version",
+        "id",
+        "mode",
+        "scenario_roots",
+        "include_tags",
+        "exclude_tags",
+        "allow_provider_modes",
+        "allow_runner_modes",
+        "allow_live_providers",
+        "resume",
+        "require_p0_green",
+        "available_capabilities",
+        "capability_skips",
+        "flaky_policy",
+        "scorecard",
+    ];
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("QA suite {} must be a mapping", path.display()))?;
+    if let Some(field) = object.keys().find(|field| !FIELDS.contains(&field.as_str())) {
+        anyhow::bail!("QA suite {} contains unsupported field {}", path.display(), field);
+    }
+    Ok(())
+}
+
 fn validate_suite_config(suite: &QaSuiteConfig, path: &Path) -> Result<()> {
-    if suite.schema_version != 1 {
+    if !matches!(suite.schema_version, 1 | 2) {
         anyhow::bail!(
             "QA suite {} uses unsupported schema_version {}",
             path.display(),
@@ -605,6 +727,26 @@ fn validate_suite_config(suite: &QaSuiteConfig, path: &Path) -> Result<()> {
     }
     if suite.scorecard.categories.is_empty() {
         anyhow::bail!("QA suite {} must define scorecard categories", path.display());
+    }
+    if suite.schema_version == 1 && suite.resume.is_some() {
+        anyhow::bail!(
+            "QA suite {} must use schema_version 2 before configuring resume",
+            path.display()
+        );
+    }
+    if let Some(resume) = &suite.resume {
+        if !resume.rerun_failed || !resume.rerun_partial {
+            anyhow::bail!(
+                "QA suite {} resume policy must rerun failed and partial attempts",
+                path.display()
+            );
+        }
+        if resume.enabled && !resume.reuse_passed {
+            anyhow::bail!(
+                "QA suite {} cannot enable resume while disabling passed-result reuse",
+                path.display()
+            );
+        }
     }
     for mode in &suite.allow_runner_modes {
         if !matches!(mode.as_str(), "fixture" | "record_replay" | "live") {
@@ -637,12 +779,18 @@ fn collect_suite_scenario_paths(suite: &QaSuiteConfig) -> Result<Vec<PathBuf>> {
 
 async fn build_gate_scenario_report(
     path: &Path,
-    suite: &QaSuiteConfig,
-    available_capabilities: &BTreeSet<String>,
-    capability_skip_reasons: &BTreeMap<String, String>,
-    allow_live: bool,
-    artifact_root: &Path,
+    context: &QaGateScenarioContext<'_>,
+    checkpoint_store: &mut QaCheckpointStore,
 ) -> QaPackScenarioReport {
+    let QaGateScenarioContext {
+        suite,
+        available_capabilities,
+        capability_skip_reasons,
+        allow_live,
+        resume_policy,
+        force_rerun,
+        artifact_root,
+    } = *context;
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(_) => {
@@ -691,7 +839,7 @@ async fn build_gate_scenario_report(
         );
     }
     if manifest.mode.runner == QaScenarioRunnerMode::Live
-        && !(suite.allow_live_providers || allow_live)
+        && !(suite.allow_live_providers && allow_live)
     {
         return gate_manifest_report(
             path,
@@ -729,32 +877,153 @@ async fn build_gate_scenario_report(
         );
     }
 
-    match manifest.mode.runner {
-        QaScenarioRunnerMode::Fixture => {
-            match execute_fixture_scenario(&manifest, artifact_root).await {
-                Ok(execution) => execution_scenario_report(path, &manifest, execution),
-                Err(error) => {
-                    let reason_code = runner_error_reason_code(&error);
-                    manifest_gate_failure(path, &manifest, reason_code.as_str())
-                }
-            }
+    let prepared = match prepare_scenario_execution(&manifest) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let reason_code = runner_error_reason_code(&error);
+            return manifest_gate_failure(path, &manifest, reason_code.as_str());
         }
-        QaScenarioRunnerMode::RecordReplay => gate_manifest_report(
-            path,
-            &manifest,
-            QaPackScenarioStatus::Unsupported,
-            "unsupported",
-            vec!["qa.runner.record_replay_unsupported".to_owned()],
-            Some("qa.runner.record_replay_unsupported".to_owned()),
-        ),
-        QaScenarioRunnerMode::Live => gate_manifest_report(
-            path,
-            &manifest,
-            QaPackScenarioStatus::Unsupported,
-            "unsupported",
-            vec!["qa.runner.live_unsupported".to_owned()],
-            Some("qa.runner.live_unsupported".to_owned()),
-        ),
+    };
+    if let Err(error) = recover_partial_execution(checkpoint_store, artifact_root, &prepared) {
+        let reason_code = runner_error_reason_code(&error);
+        return manifest_gate_failure(path, &manifest, reason_code.as_str());
+    }
+    let live_force_rerun = manifest.mode.runner == QaScenarioRunnerMode::Live;
+    let decision = checkpoint_store.resume_decision(
+        &prepared.execution_key,
+        resume_policy,
+        force_rerun || live_force_rerun,
+    );
+    match decision {
+        QaResumeDecision::Reuse {
+            reason_code,
+            attempt_generation,
+            execution_id,
+            result_artifact,
+        } => match load_execution_report(
+            artifact_root,
+            result_artifact,
+            &prepared.execution_key,
+            attempt_generation,
+            execution_id.as_str(),
+        ) {
+            Ok(execution) => {
+                let mut report = execution_scenario_report(path, &manifest, execution);
+                report.resume_reason_code = Some(reason_code);
+                report.reused = true;
+                report
+            }
+            Err(_) => {
+                execute_checkpointed_scenario(
+                    path,
+                    &manifest,
+                    prepared,
+                    artifact_root,
+                    checkpoint_store,
+                    "qa.resume.result_untrusted",
+                )
+                .await
+            }
+        },
+        QaResumeDecision::Run { mut reason_code } => {
+            if live_force_rerun && !force_rerun {
+                reason_code = "qa.resume.live_rerun".to_owned();
+            }
+            execute_checkpointed_scenario(
+                path,
+                &manifest,
+                prepared,
+                artifact_root,
+                checkpoint_store,
+                reason_code.as_str(),
+            )
+            .await
+        }
+    }
+}
+
+fn recover_partial_execution(
+    checkpoint_store: &mut QaCheckpointStore,
+    artifact_root: &Path,
+    prepared: &QaPreparedScenarioExecution,
+) -> Result<()> {
+    let Some(token) = checkpoint_store.current_partial_attempt_token(&prepared.execution_key)
+    else {
+        return Ok(());
+    };
+    let Ok(report) = recover_execution_report(
+        artifact_root,
+        token.expected_result_path.as_str(),
+        &token.execution_key,
+        token.attempt_generation,
+        token.execution_id.as_str(),
+    ) else {
+        return Ok(());
+    };
+    let completion = attempt_completion(&report);
+    checkpoint_store.recover_published_attempt(&token, completion)
+}
+
+async fn execute_checkpointed_scenario(
+    path: &Path,
+    manifest: &QaScenarioManifest,
+    prepared: QaPreparedScenarioExecution,
+    artifact_root: &Path,
+    checkpoint_store: &mut QaCheckpointStore,
+    resume_reason_code: &str,
+) -> QaPackScenarioReport {
+    let execution_id = Ulid::new().to_string();
+    let result_path = scenario_result_artifact_path(execution_id.as_str(), &prepared.execution_key);
+    let result_path = display_path_slash(result_path.as_path());
+    let token = match checkpoint_store.begin_attempt(
+        prepared.execution_key.clone(),
+        manifest.id.as_str(),
+        execution_id.as_str(),
+        result_path.as_str(),
+        resume_reason_code,
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let reason_code = runner_error_reason_code(&error);
+            return manifest_gate_failure(path, manifest, reason_code.as_str());
+        }
+    };
+    let request = QaScenarioExecutionRequest {
+        execution_key: token.execution_key.clone(),
+        execution_id: token.execution_id.clone(),
+        attempt_generation: token.attempt_generation,
+        runner_version: token.runner_version.clone(),
+        previous_result_artifact: token.previous_result_artifact.clone(),
+    };
+    match execute_prepared_scenario(manifest, &prepared, request, artifact_root).await {
+        Ok(execution) => {
+            let completion = attempt_completion(&execution);
+            if let Err(error) = checkpoint_store.complete_attempt(&token, completion) {
+                let reason_code = runner_error_reason_code(&error);
+                return manifest_gate_failure(path, manifest, reason_code.as_str());
+            }
+            let mut report = execution_scenario_report(path, manifest, execution);
+            report.resume_reason_code = Some(resume_reason_code.to_owned());
+            report.reused = false;
+            report
+        }
+        Err(error) => {
+            let reason_code = runner_error_reason_code(&error);
+            manifest_gate_failure(path, manifest, reason_code.as_str())
+        }
+    }
+}
+
+fn attempt_completion(execution: &QaScenarioExecutionReport) -> QaAttemptCompletion {
+    QaAttemptCompletion {
+        execution_key: execution.result.execution_key.clone(),
+        attempt_generation: execution.result.attempt.generation,
+        execution_id: execution.result.execution_id.clone(),
+        runner_version: execution.result.attempt.runner_version.clone(),
+        verdict: execution.result.verdict.clone(),
+        result_artifact: execution.result_artifact.clone(),
+        previous_result_artifact: execution.result.attempt.previous_result_artifact.clone(),
+        reason_codes: execution.result.reason_codes.clone(),
     }
 }
 
@@ -824,6 +1093,8 @@ fn execution_scenario_report(
         sandbox_fixture: manifest_requires_sandbox_fixture(manifest),
         sandbox_cleanup_verified: cleanup_verified,
         execution: Some(execution),
+        resume_reason_code: None,
+        reused: false,
         reason,
     }
 }
@@ -879,6 +1150,8 @@ fn gate_failure(path: &Path, id: &str, reason_code: &str) -> QaPackScenarioRepor
         sandbox_fixture: false,
         sandbox_cleanup_verified: false,
         execution: None,
+        resume_reason_code: None,
+        reused: false,
         reason: Some(reason_code.to_owned()),
     }
 }
@@ -894,8 +1167,8 @@ fn runner_error_reason_code(error: &anyhow::Error) -> String {
                 .map(str::to_owned)
         })
         .find(|code| {
-            code.starts_with("qa.runner.")
-                && code.len() <= 96
+            (code.starts_with("qa.runner.") || code.starts_with("qa.resume."))
+                && code.len() <= 160
                 && code.bytes().all(|byte| {
                     byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
                 })
@@ -1087,6 +1360,15 @@ fn render_gate_markdown(report: &QaGateReport) -> String {
     markdown.push_str(format!("- Passed: `{}`\n", report.summary.passed).as_str());
     markdown.push_str(format!("- Failed: `{}`\n", report.summary.failed).as_str());
     markdown.push_str(format!("- Unsupported: `{}`\n", report.summary.unsupported).as_str());
+    markdown.push_str(format!("- Resume requested: `{}`\n", report.resume_requested).as_str());
+    markdown.push_str(format!("- Force rerun: `{}`\n", report.force_rerun).as_str());
+    markdown.push_str(
+        format!(
+            "- Checkpoint generation: `{}`\n",
+            report.campaign_checkpoint.checkpoint_generation
+        )
+        .as_str(),
+    );
     markdown.push_str(
         format!("- Maturity score: `{}` bps\n\n", report.maturity_scorecard.overall_score_bps)
             .as_str(),
@@ -1137,16 +1419,20 @@ fn render_gate_markdown(report: &QaGateReport) -> String {
         }
     }
     markdown.push_str("\n## Scenario Results\n\n");
-    markdown.push_str("| Scenario | Status | Area | Labels | Failure class | Reason |\n");
-    markdown.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    markdown.push_str(
+        "| Scenario | Status | Area | Labels | Reused | Resume reason | Failure class | Reason |\n",
+    );
+    markdown.push_str("| --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for scenario in &report.scenarios {
         markdown.push_str(
             format!(
-                "| `{}` | `{}` | `{}` | {} | `{}` | {} |\n",
+                "| `{}` | `{}` | `{}` | {} | `{}` | `{}` | `{}` | {} |\n",
                 markdown_escape(scenario.id.as_str()),
                 scenario.status.as_str(),
                 markdown_escape(scenario.area.as_str()),
                 markdown_escape(scenario.labels.join(", ").as_str()),
+                scenario.reused,
+                markdown_escape(scenario.resume_reason_code.as_deref().unwrap_or("-")),
                 markdown_escape(scenario.failure_class.as_deref().unwrap_or("-")),
                 markdown_escape(scenario.reason.as_deref().unwrap_or("-"))
             )
@@ -1310,6 +1596,8 @@ fn pack_failure(path: &Path, id: &str, issue_code: &str, reason: String) -> QaPa
         sandbox_fixture: false,
         sandbox_cleanup_verified: false,
         execution: None,
+        resume_reason_code: None,
+        reused: false,
         reason: Some(reason),
     }
 }
@@ -1339,6 +1627,8 @@ fn pack_manifest_report(
         sandbox_fixture,
         sandbox_cleanup_verified: !sandbox_fixture || status == QaPackScenarioStatus::Pass,
         execution: None,
+        resume_reason_code: None,
+        reused: false,
         reason,
     }
 }
@@ -1438,7 +1728,7 @@ fn matches_excluded_tags(manifest: &QaScenarioManifest, excluded_tags: &[String]
 
 fn manifest_requires_sandbox_fixture(manifest: &QaScenarioManifest) -> bool {
     manifest.requires.fixtures.iter().any(|fixture| fixture.contains("sandbox_workspaces"))
-        || manifest.runner.as_ref().is_some_and(|runner| runner.workspace_fixture.is_some())
+        || manifest.runner.as_ref().is_some_and(|runner| runner.workspace_fixture().is_some())
 }
 
 fn classify_manifest_failure(
@@ -1546,7 +1836,92 @@ fn write_qa_report(path: &Path, bytes: &[u8]) -> Result<()> {
             format!("failed to create QA report directory {}", parent.display())
         })?;
     }
-    fs::write(path, bytes).with_context(|| format!("failed to write QA report {}", path.display()))
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("qa.runner.report_path_invalid"))?;
+    let temporary_path = path.with_file_name(format!(".{file_name}.{}.tmp", Ulid::new()));
+    let mut temporary = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary_path.as_path())
+        .with_context(|| format!("failed to create QA report temp {}", temporary_path.display()))?;
+    let publish_result = (|| -> Result<()> {
+        temporary.write_all(bytes).with_context(|| {
+            format!("failed to write QA report temp {}", temporary_path.display())
+        })?;
+        temporary.flush().with_context(|| {
+            format!("failed to flush QA report temp {}", temporary_path.display())
+        })?;
+        temporary.sync_all().with_context(|| {
+            format!("failed to sync QA report temp {}", temporary_path.display())
+        })?;
+        drop(temporary);
+        replace_qa_report(temporary_path.as_path(), path)?;
+        sync_qa_report_directory(path)?;
+        let persisted = fs::read(path)
+            .with_context(|| format!("failed to verify QA report {}", path.display()))?;
+        if persisted != bytes {
+            anyhow::bail!("qa.runner.report_verify_failed");
+        }
+        Ok(())
+    })();
+    if publish_result.is_err() {
+        let _ = fs::remove_file(temporary_path.as_path());
+    }
+    publish_result
+}
+
+#[cfg(not(windows))]
+fn replace_qa_report(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "qa.runner.report_publish_failed: {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_qa_report(source: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let destination =
+        destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let moved = unsafe {
+        // SAFETY: Both vectors are owned, valid, nul-terminated UTF-16 paths for
+        // the duration of the Win32 call; the flags request an atomic replacement.
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error()).context("qa.runner.report_publish_failed");
+    }
+    Ok(())
+}
+
+fn sync_qa_report_directory(
+    #[cfg_attr(not(unix), allow(unused_variables))] path: &Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent).and_then(|directory| directory.sync_all()).with_context(|| {
+            format!("qa.runner.report_directory_sync_failed: {}", parent.display())
+        })?;
+    }
+    Ok(())
 }
 
 fn display_path_slash(path: &Path) -> String {
@@ -1686,7 +2061,8 @@ fn is_yaml_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::commands::qa_runner::{
-        QaExecutionArtifactRef, QaScenarioCleanupResult, QaScenarioExecutionResult,
+        QaExecutionArtifactRef, QaScenarioAttemptProvenance, QaScenarioCleanupResult,
+        QaScenarioExecutionKey, QaScenarioExecutionResult,
     };
 
     #[test]
@@ -1798,8 +2174,20 @@ mod tests {
         let manifest = mcp_manifest();
         let execution = QaScenarioExecutionReport {
             result: QaScenarioExecutionResult {
-                schema_version: 1,
+                schema_version: 2,
                 format: "palyra-qa-scenario-execution-result".to_owned(),
+                execution_key: test_execution_key(),
+                attempt: QaScenarioAttemptProvenance {
+                    generation: 1,
+                    runner_version: "qa-runner.test".to_owned(),
+                    runtime_version: "palyrad-test".to_owned(),
+                    runtime_contract_version: "runtime-contracts.test".to_owned(),
+                    palyrad_binary_sha256: "1".repeat(64),
+                    palyrad_version: "0.1.0".to_owned(),
+                    palyrad_git_hash: "test".to_owned(),
+                    palyrad_build_profile: "debug".to_owned(),
+                    previous_result_artifact: None,
+                },
                 execution_id: "execution-opaque".to_owned(),
                 scenario_id: manifest.id.clone(),
                 runner_mode: "fixture".to_owned(),
@@ -1847,6 +2235,35 @@ mod tests {
             runner_error_reason_code(&anyhow::anyhow!("qa.runner.run_timeout")),
             "qa.runner.run_timeout"
         );
+        assert_eq!(
+            runner_error_reason_code(&anyhow::anyhow!(
+                "qa.resume.attempt_completion_invalid: untrusted descriptor details"
+            )),
+            "qa.resume.attempt_completion_invalid"
+        );
+    }
+
+    #[test]
+    fn qa_report_write_atomically_replaces_existing_content() {
+        let root = tempfile::tempdir().expect("report root should be available");
+        let report_path = root.path().join("gate.json");
+
+        write_qa_report(report_path.as_path(), b"first")
+            .expect("initial report should be published");
+        write_qa_report(report_path.as_path(), b"second")
+            .expect("replacement report should be published");
+
+        assert_eq!(
+            fs::read(report_path.as_path()).expect("report should remain readable"),
+            b"second"
+        );
+        assert!(fs::read_dir(root.path()).expect("report directory should be readable").all(
+            |entry| !entry
+                .expect("report entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        ));
     }
 
     #[test]
@@ -1907,6 +2324,21 @@ mod tests {
         }
     }
 
+    fn test_execution_key() -> QaScenarioExecutionKey {
+        QaScenarioExecutionKey {
+            schema_version: 1,
+            format: "palyra-qa-scenario-execution-key".to_owned(),
+            digest: "2".repeat(64),
+            normalized_manifest_sha256: "3".repeat(64),
+            fixture_set_sha256: "4".repeat(64),
+            runtime_version: "palyrad-test".to_owned(),
+            runtime_contract_version: "runtime-contracts.test".to_owned(),
+            runner_version: "qa-runner.test".to_owned(),
+            provider_lane: "fixture".to_owned(),
+            provider_binding_sha256: "5".repeat(64),
+        }
+    }
+
     fn qa_suite_config() -> QaSuiteConfig {
         QaSuiteConfig {
             schema_version: 1,
@@ -1918,6 +2350,7 @@ mod tests {
             allow_provider_modes: vec!["mock".to_owned()],
             allow_runner_modes: Vec::new(),
             allow_live_providers: false,
+            resume: None,
             require_p0_green: false,
             available_capabilities: Vec::new(),
             capability_skips: Vec::new(),

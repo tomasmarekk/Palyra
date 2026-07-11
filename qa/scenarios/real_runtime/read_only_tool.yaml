@@ -59,6 +59,7 @@ maturity:
     - p0
     - release_smoke
     - real_runtime
+    - nightly
     - deterministic
     - read_only
 timeout:

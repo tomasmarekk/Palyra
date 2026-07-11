@@ -3,12 +3,22 @@ Run a QA Lab suite gate and maturity scorecard
 Usage: palyra qa gate [OPTIONS]
 
 Options:
-      --suite <SUITE>                      [default: qa/suites/pr_smoke.yaml]
+      --suite <SUITE>
+          [default: qa/suites/pr_smoke.yaml]
       --output-json <OUTPUT_JSON>
+
       --output-markdown <OUTPUT_MARKDOWN>
+
       --allow-live
+
+      --resume
+          Reuse compatible passed attempts according to the suite policy
+      --force-rerun
+          Run every selected scenario as a new attempt generation
       --json
-  -h, --help                               Print help
+
+  -h, --help
+          Print help
 
 Global Options:
       --profile <PROFILE>

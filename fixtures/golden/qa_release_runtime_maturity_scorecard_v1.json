@@ -59,6 +59,20 @@
       "skipped": 0,
       "unsupported": 0,
       "blockers": []
+    },
+    {
+      "id": "replay",
+      "label": "Record replay",
+      "required": false,
+      "score_bps": 10000,
+      "baseline_score_bps": null,
+      "trend_delta_bps": null,
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "unsupported": 0,
+      "blockers": []
     }
   ]
 }

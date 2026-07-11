@@ -38,6 +38,10 @@
   "limits": {
     "max_timeout_ms": 3600000
   },
+  "live_provider_kinds": [
+    "openai_compatible",
+    "anthropic"
+  ],
   "path_convention": "jsonpath",
   "provider_modes": [
     "mock",
@@ -49,6 +53,7 @@
     "id",
     "area",
     "mode",
+    "runner",
     "requires",
     "steps",
     "expect",
@@ -59,6 +64,13 @@
   ],
   "runner_config_fields": [
     "provider_fixture",
+    "replay_fixture",
+    "fixture_redacted",
+    "secret_profile_env",
+    "provider_kind",
+    "model",
+    "base_url",
+    "raw_payload_storage",
     "workspace_fixture",
     "policy_profile"
   ],
@@ -67,7 +79,7 @@
     "record_replay",
     "live"
   ],
-  "schema_version": 2,
+  "schema_version": 3,
   "step_actions": [
     "user_prompt",
     "tool_result",
@@ -76,7 +88,8 @@
   ],
   "supported_schema_versions": [
     1,
-    2
+    2,
+    3
   ],
   "terminal_states": [
     "completed",

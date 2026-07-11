@@ -8,13 +8,39 @@ use axum::{
     response::{Html, IntoResponse},
     Json,
 };
-use palyra_common::{health_response, HealthResponse};
+use palyra_common::{
+    health_response, qa_scenarios::QA_SCENARIO_SCHEMA_VERSION,
+    runtime_contracts::PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION, HealthResponse,
+};
+use palyra_model_providers::QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION;
+use serde::Serialize;
 
 use crate::app::state::AppState;
 
+/// Daemon-owned health handshake with the legacy health shape flattened intact.
+#[derive(Debug, Serialize)]
+struct DaemonHealthResponse {
+    #[serde(flatten)]
+    health: HealthResponse,
+    public_runtime_contract_version: &'static str,
+    qa_scenario_schema_version: u32,
+    qa_mock_provider_fixture_schema_version: u32,
+}
+
+impl DaemonHealthResponse {
+    fn new(health: HealthResponse) -> Self {
+        Self {
+            health,
+            public_runtime_contract_version: PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
+            qa_scenario_schema_version: QA_SCENARIO_SCHEMA_VERSION,
+            qa_mock_provider_fixture_schema_version: QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
+        }
+    }
+}
+
 /// Returns the JSON daemon health response.
 pub(crate) async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json::<HealthResponse>(health_response("palyrad", state.started_at))
+    Json(DaemonHealthResponse::new(health_response("palyrad", state.started_at)))
 }
 
 /// Renders the legacy runtime landing page with links to dashboard surfaces.
@@ -115,4 +141,49 @@ pub(crate) async fn dashboard_handoff_handler(State(state): State<AppState>) -> 
 </html>"#,
         status = health.status
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn daemon_health_serialization_preserves_legacy_fields_and_pins_qa_contracts() {
+        let response = DaemonHealthResponse::new(HealthResponse {
+            service: "palyrad".to_owned(),
+            status: "ok".to_owned(),
+            version: "1.2.3".to_owned(),
+            git_hash: "abc123".to_owned(),
+            build_profile: "test".to_owned(),
+            uptime_seconds: 42,
+        });
+
+        let value = serde_json::to_value(response).expect("daemon health should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "service": "palyrad",
+                "status": "ok",
+                "version": "1.2.3",
+                "git_hash": "abc123",
+                "build_profile": "test",
+                "uptime_seconds": 42,
+                "public_runtime_contract_version": PUBLIC_RUNTIME_CONTRACT_SNAPSHOT_VERSION,
+                "qa_scenario_schema_version": QA_SCENARIO_SCHEMA_VERSION,
+                "qa_mock_provider_fixture_schema_version":
+                    QA_MOCK_PROVIDER_FIXTURE_SCHEMA_VERSION,
+            })
+        );
+        let legacy = serde_json::from_value::<HealthResponse>(value)
+            .expect("legacy health consumers should ignore additive handshake fields");
+        assert_eq!(legacy.service, "palyrad");
+        assert_eq!(legacy.status, "ok");
+        assert_eq!(legacy.version, "1.2.3");
+        assert_eq!(legacy.git_hash, "abc123");
+        assert_eq!(legacy.build_profile, "test");
+        assert_eq!(legacy.uptime_seconds, 42);
+    }
 }
